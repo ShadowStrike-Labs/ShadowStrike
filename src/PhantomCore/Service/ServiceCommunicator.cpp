@@ -38,6 +38,7 @@
  */
 
 #include "ServiceCommunicator.hpp"
+#include "BootTrace.hpp"          // ShadowStrikeAppendBootTrace - startup stall localisation
 #include "../Utils/ThreadPool.hpp"
 
 // Standard library includes
@@ -358,7 +359,16 @@ bool ServiceCommunicatorImpl::CreatePipeSecurityDescriptor() {
 bool ServiceCommunicatorImpl::Initialize() {
     if (m_initialized) return true;
 
-    if (!CreatePipeSecurityDescriptor()) {
+    // This call was measured taking 62 seconds on the service start thread
+    // (boot trace: Initialize-enter 12:38:08.073, -leave 12:39:10.327). Nothing
+    // in here should take more than milliseconds, so each stage is traced to
+    // find which one does. A minute of dead time on the start path matters even
+    // though it eventually completes: the service is not servicing verdicts for
+    // that whole window, and the kernel is blocking file creates waiting for it.
+    ::ShadowStrikeAppendBootTrace(L"svccomm-SecurityDescriptor-enter");
+    const bool sdOk = CreatePipeSecurityDescriptor();
+    ::ShadowStrikeAppendBootTrace(L"svccomm-SecurityDescriptor-leave");
+    if (!sdOk) {
         return false;
     }
 
@@ -391,7 +401,10 @@ bool ServiceCommunicatorImpl::Initialize() {
     // never read or answered, the UI's handshake timed out, and the dashboard
     // reported "ShadowStrike service offline" on every boot. Initialize it and
     // fail loudly if the worker threads cannot be created.
-    if (!m_clientThreadPool->Initialize()) {
+    ::ShadowStrikeAppendBootTrace(L"svccomm-ThreadPoolInitialize-enter");
+    const bool poolOk = m_clientThreadPool->Initialize();
+    ::ShadowStrikeAppendBootTrace(L"svccomm-ThreadPoolInitialize-leave");
+    if (!poolOk) {
         SS_LOG_ERROR(L"IPC",
             L"Client-handler ThreadPool::Initialize() failed — UI IPC cannot service clients.");
         m_clientThreadPool.reset();
