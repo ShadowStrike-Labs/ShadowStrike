@@ -30,6 +30,7 @@
 
 // ── Own header ────────────────────────────────────────────────────────────────
 #include "AmsiProvider.hpp"
+#include "PhantomCore/Utils/DataStorePaths.hpp"   // shared signature DB location
 
 // ── PhantomCore infrastructure ────────────────────────────────────────────────
 #include "PhantomCore/Utils/Logger.hpp"
@@ -471,16 +472,26 @@ bool AmsiProvider::Initialize() {
     m_impl->sigStore = std::make_unique<SignatureStore::SignatureStore>();
     {
         auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
-        const std::wstring sigDbPath =
+        std::wstring sigDbPath =
             cfg.GetValue<std::wstring>(std::string(kSignatureDbPathKey), std::wstring{});
 
         if (sigDbPath.empty()) {
+            // An unset config key is not a decision to run without signatures.
+            // AMSI is the interception point for PowerShell, JScript, VBScript and
+            // Office macro content, so dropping the store here left script
+            // scanning with no hash or pattern matching whatsoever - and it said so
+            // only once, at INFO, on a line that reads like a normal status
+            // message. Fall back to the same hardened database the scan engine
+            // uses (ScanEngine.hpp:578), leaving the config key as an override
+            // rather than a prerequisite.
+            sigDbPath = ::ShadowStrike::Utils::DataStorePaths::SignatureDatabase();
             SS_LOG_INFO(kLogCategory,
-                L"Initialize: signature database path not configured "
-                L"('%hs' is empty); hash/pattern scanning will be skipped",
-                kSignatureDbPathKey);
-            m_impl->sigStore.reset();
-        } else {
+                L"Initialize: '%hs' is unset; using the shared signature database "
+                L"at '%ls'",
+                kSignatureDbPathKey, sigDbPath.c_str());
+        }
+
+        {
             const auto sigStatus =
                 m_impl->sigStore->Initialize(sigDbPath, /*readOnly=*/true);
             if (!sigStatus.IsSuccess()) {
