@@ -1592,18 +1592,43 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(L"Database", L"Rejected unsafe database path");
                 return false;
             }
-            if (config.autoBackup && !isSafePath(config.backupDirectory)) {
+            // The default config has autoBackup enabled (DatabaseManager.hpp:318)
+            // and backupDirectory empty (:321), and isSafePath rejects an empty
+            // path - so the shipped default could never validate. Any caller that
+            // did not override one of the two failed to initialize at all, which is
+            // how QuarantineManager died: "Rejected unsafe backup directory", and
+            // with no quarantine database there is nowhere to put a detected file,
+            // so the entire response path was unavailable. LogDB had quietly worked
+            // around it by disabling autoBackup (LogDB.cpp:856).
+            //
+            // The validation was also disagreeing with the code it protects:
+            // CreateAutoBackup already substitutes "<database directory>/backups"
+            // when the field is empty. So resolve that same default here and
+            // validate the directory that will actually be used. Genuinely unsafe
+            // values - traversal segments, embedded NULs - are still rejected.
+            std::wstring effectiveBackupDir = config.backupDirectory;
+            if (config.autoBackup && effectiveBackupDir.empty()) {
+                const std::filesystem::path dbPath(config.databasePath);
+                effectiveBackupDir = (dbPath.parent_path() / L"backups").wstring();
+            }
+            if (config.autoBackup && !isSafePath(effectiveBackupDir)) {
                 if (err) {
                     err->sqliteCode = SQLITE_MISUSE;
                     err->message = L"Backup directory failed safety validation";
                     err->context = L"Initialize";
                 }
-                SS_LOG_ERROR(L"Database", L"Rejected unsafe backup directory");
+                SS_LOG_ERROR(L"Database",
+                    L"Rejected unsafe backup directory '%ls'",
+                    effectiveBackupDir.c_str());
                 return false;
             }
 
             std::unique_lock<std::shared_mutex> lock(m_configMutex);
             m_config = config;
+            // Keep the resolved directory rather than the empty original, so the
+            // path that was validated above is the path that later gets used and
+            // reported, instead of being re-derived independently.
+            m_config.backupDirectory = effectiveBackupDir;
 
             // Cleanup existing pool if re-initializing
             if (m_connectionPool) {
