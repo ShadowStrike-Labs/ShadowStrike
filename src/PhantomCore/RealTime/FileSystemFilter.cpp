@@ -608,14 +608,23 @@ struct FileSystemFilter::Impl {
             }
 
             const void* bodyPtr = payload + sizeof(FilterMessageHeader);
-            ProcessMessage(header, bodyPtr, dataSize);
+            bool needsFailOpenReply = false;
+            ProcessMessage(header, bodyPtr, dataSize, &needsFailOpenReply);
+            if (needsFailOpenReply) {
+                answerUnparsableFrame("unusable scan request body");
+            }
         }
 
         Utils::Logger::Info("FileSystemFilter: Message thread exiting");
     }
 
+    // needsFailOpenReply is set when the body of a request the kernel is
+    // WAITING on turns out to be unusable. The caller owns the reply because
+    // only it has the filter manager's MessageId; without this the kernel thread
+    // stays parked until the 500 ms create timeout expires.
     void ProcessMessage(const FilterMessageHeader* header,
-                        const void* data, size_t dataSize) {
+                        const void* data, size_t dataSize,
+                        bool* needsFailOpenReply = nullptr) {
         switch (header->messageType) {
             case FilterMessageType::FileScanOnOpen:
             case FilterMessageType::FileScanOnExecute:
@@ -625,6 +634,7 @@ struct FileSystemFilter::Impl {
                     Utils::Logger::Warn(
                         "FileSystemFilter: Scan request body too small ({} < {}) - dropping",
                         dataSize, sizeof(FileScanRequest));
+                    if (needsFailOpenReply) *needsFailOpenReply = true;
                     return;
                 }
                 {
@@ -634,6 +644,7 @@ struct FileSystemFilter::Impl {
                                          request->processNameLength)) {
                         Utils::Logger::Warn(
                             "FileSystemFilter: Scan request string lengths exceed body size - dropping");
+                        if (needsFailOpenReply) *needsFailOpenReply = true;
                         return;
                     }
                     HandleScanRequest(request, data);
