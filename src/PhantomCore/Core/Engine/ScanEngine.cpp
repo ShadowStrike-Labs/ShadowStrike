@@ -1974,7 +1974,32 @@ EngineResult ScanEngine::ScanFile(
 
         {
             auto& execAnalyzer = FileSystem::ExecutableAnalyzer::Instance();
-            if (execAnalyzer.IsPE(filePath)) {
+
+            // IsPE(filePath) opened and read the file a second time purely to
+            // check magic bytes - a question the shared file-type analysis has
+            // already answered for this scan. Reuse that instead.
+            //
+            // The fallback matters for detection integrity: if type detection did
+            // not reach a conclusion we run the original probe rather than assume.
+            // An undetected or unknown type must never silently mean "this is not
+            // a PE, skip structural analysis", because that is exactly what a
+            // deliberately malformed header would produce.
+            const auto& execTypeInfo = resolveFileType();
+            const bool typeConclusive =
+                execTypeInfo.detected &&
+                execTypeInfo.format != FileSystem::FileFormat::Unknown;
+            const bool isPortableExecutable =
+                typeConclusive
+                    ? (execTypeInfo.format == FileSystem::FileFormat::PE32 ||
+                       execTypeInfo.format == FileSystem::FileFormat::PE64 ||
+                       execTypeInfo.format == FileSystem::FileFormat::DLL32 ||
+                       execTypeInfo.format == FileSystem::FileFormat::DLL64 ||
+                       execTypeInfo.format == FileSystem::FileFormat::SYS32 ||
+                       execTypeInfo.format == FileSystem::FileFormat::SYS64 ||
+                       execTypeInfo.format == FileSystem::FileFormat::DotNetAssembly)
+                    : execAnalyzer.IsPE(filePath);
+
+            if (isPortableExecutable) {
                 const auto stageEAStart = steady_clock::now();
 
                 // Full structural analysis walks imports, exports, resources, the
