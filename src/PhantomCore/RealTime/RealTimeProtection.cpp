@@ -2417,6 +2417,14 @@ public:
                 ctx.priority = Core::Engine::ScanPriority::Low;
                 ctx.processId = item.second;
                 ctx.filePath = item.first;
+                // ScanContext::deepScan defaults to false (ScanEngine.hpp:287),
+                // so without this the "deferred deep scan" was not deep at all:
+                // the deep signature sweep, sandbox, emulation and zero-day
+                // stages are each gated on this flag and were all being skipped.
+                // Everything the on-access path declines to do synchronously is
+                // supposed to land here, so this is the flag that makes deferring
+                // a scheduling decision instead of a coverage hole.
+                ctx.deepScan = true;
 
                 auto result = Core::Engine::ScanEngine::Instance().ScanFile(item.first, ctx);
                 if (result.verdict == Core::Engine::ScanVerdict::Infected) {
@@ -2796,6 +2804,22 @@ public:
             }
             return Communication::KernelVerdict::Allow;
         }
+
+        // The on-access context leaves ScanContext::deepScan at its default of
+        // false (ScanEngine.hpp:287), which is correct here - the deep signature
+        // sweep, sandbox, emulation, zero-day and packed-PE unpacking stages are
+        // far too slow to run while the minifilter holds a file create open. But
+        // until now those stages were only reached when the synchronous budget had
+        // already been blown, so on a healthy scan they ran nowhere at all.
+        //
+        // Handing every scanned file to the deferred worker makes the fast path a
+        // scheduling decision rather than a coverage decision: the quick verdict
+        // unblocks the process, and the thorough pass still happens moments later
+        // with deepScan set, remediating through the existing quarantine path if
+        // it finds something. The queue de-duplicates by path, is bounded at 4096
+        // entries, and its worker runs below normal priority, so this cannot
+        // become a backlog that competes with the verdict path.
+        QueueDeferredDeepScan(filePath, req.ProcessId);
 
         // 5. Map Result
         ScanResult scanResult = MapEngineResult(engineResult, filePath);

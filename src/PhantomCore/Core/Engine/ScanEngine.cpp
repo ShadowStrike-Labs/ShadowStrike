@@ -1983,8 +1983,23 @@ EngineResult ScanEngine::ScanFile(
                     goto finalize_scan;
                 }
 
-                // Route packed executables to EmulationEngine for unpacking
-                if (execInfo.packer.isPacked && m_impl->m_emulationEngine &&
+                // Route packed executables to EmulationEngine for unpacking.
+                //
+                // Deep scans only. Emulating a PE means loading it, reading the
+                // whole file, and executing instructions in the virtual CPU -
+                // hundreds of milliseconds. On the on-access path the minifilter
+                // is holding a file create open waiting for this verdict, so the
+                // process that touched the file is blocked for the duration, and
+                // PreCreate's 500ms budget (PreCreate.h:137) is exceeded outright.
+                // A measured on-access scan reached 636ms, which is what a user
+                // experiences as the machine freezing.
+                //
+                // Coverage is not lost: RealTimeProtection queues the file to its
+                // deferred deep-scan worker, which re-runs this pipeline with
+                // deepScan set and quarantines on detection. The analysis still
+                // happens - it just stops happening while the system waits.
+                if (execInfo.packer.isPacked && context.deepScan &&
+                    m_impl->m_emulationEngine &&
                     m_impl->m_emulationEngine->IsInitialized()) {
                     SS_LOG_INFO(L"ScanEngine",
                         L"Packed PE detected (%hs), routing to EmulationEngine",
