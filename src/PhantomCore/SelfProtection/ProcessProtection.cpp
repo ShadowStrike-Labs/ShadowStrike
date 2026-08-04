@@ -640,6 +640,13 @@ private:
     [[nodiscard]] ThreatAction ClassifyAccessRequest(const AccessRequest& request) const;
     [[nodiscard]] bool LoadNtdllFunctions();
     [[nodiscard]] std::vector<uint32_t> EnumerateThreadIds(uint32_t processId) const;
+
+    /// @brief One system-wide thread snapshot, bucketed by owning process.
+    /// TH32CS_SNAPTHREAD always enumerates every thread on the machine, so
+    /// calling it per protected process multiplied a fixed cost by the number of
+    /// processes. Callers that need several processes should use this instead.
+    [[nodiscard]] std::unordered_map<uint32_t, std::vector<uint32_t>>
+        SnapshotThreadsByProcess() const;
     [[nodiscard]] bool IsOwnProcess(uint32_t processId) const;
     [[nodiscard]] bool IsShadowStrikeComponent(uint32_t processId) const;
     [[nodiscard]] bool VerifyAuthToken(std::string_view token) const;
@@ -2267,11 +2274,58 @@ void ProcessProtectionImpl::MonitoringThreadFunc() {
                 }
             }
 
+            // One system-wide thread snapshot serves every protected process.
+            const auto threadsByProcess = SnapshotThreadsByProcess();
             for (uint32_t pid : currentPids) {
-                (void)ProtectAllThreads(pid);
+                const auto it = threadsByProcess.find(pid);
+                if (it == threadsByProcess.end()) {
+                    continue;
+                }
+                size_t count = 0;
+                for (uint32_t tid : it->second) {
+                    if (ProtectThread(tid)) {
+                        ++count;
+                    }
+                }
+                Utils::Logger::Info("[ProcessProtection] Protected {} threads for process {}",
+                                    count, pid);
             }
         }
     }
+}
+
+std::unordered_map<uint32_t, std::vector<uint32_t>>
+ProcessProtectionImpl::SnapshotThreadsByProcess() const {
+    std::unordered_map<uint32_t, std::vector<uint32_t>> byProcess;
+
+#ifdef _WIN32
+    // CreateToolhelp32Snapshot with TH32CS_SNAPTHREAD ignores its process
+    // argument and snapshots EVERY thread on the machine, walking the whole
+    // system process and thread list. EnumerateThreadIds then throws away all
+    // but one process's entries - so protecting N processes took N complete
+    // system-wide snapshots, on a five second timer, to answer a question one
+    // snapshot could have answered for all of them.
+    //
+    // Take it once and bucket by owning process. Identical result, and the cost
+    // stops multiplying as the EDR and XDR tiers add processes to protect.
+    HANDLE hSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return byProcess;
+    }
+
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+
+    if (::Thread32First(hSnapshot, &te)) {
+        do {
+            byProcess[te.th32OwnerProcessID].push_back(te.th32ThreadID);
+        } while (::Thread32Next(hSnapshot, &te));
+    }
+
+    ::CloseHandle(hSnapshot);
+#endif
+
+    return byProcess;
 }
 
 void ProcessProtectionImpl::NotifyBlockedAccess(const BlockedAccessEvent& event) {
