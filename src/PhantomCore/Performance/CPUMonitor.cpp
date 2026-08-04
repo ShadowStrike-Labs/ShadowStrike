@@ -729,9 +729,39 @@ public:
                 self = m_selfCpuUsage;
             }
             if (self > cfg.selfUsageAlertThreshold) {
-                SS_LOG_WARN(L"CPUMonitor",
-                    L"EDR self-usage excessive: %.2f%% (threshold %.1f%%)",
-                    self, cfg.selfUsageAlertThreshold);
+                // Aggregated, not per-sample. This fires about once a second
+                // whenever we are over threshold, which produced 273 identical
+                // lines in a 5.5 minute run - roughly a sixth of the entire log,
+                // and enough to bury the handful of lines that actually explained
+                // a system-wide freeze. The signal that matters is "we were over
+                // threshold, this often, peaking here", not each individual
+                // sample. Emit a rollup at most every 30 seconds and keep the
+                // very first breach immediate so a sudden spike is never delayed.
+                static std::atomic<uint64_t> s_breaches{ 0 };
+                static std::atomic<double>   s_peak{ 0.0 };
+                static std::atomic<int64_t>  s_lastEmitMs{ 0 };
+
+                const uint64_t breaches = s_breaches.fetch_add(1, std::memory_order_relaxed) + 1;
+                double peak = s_peak.load(std::memory_order_relaxed);
+                while (self > peak &&
+                       !s_peak.compare_exchange_weak(peak, self, std::memory_order_relaxed)) {
+                }
+
+                const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const int64_t lastMs = s_lastEmitMs.load(std::memory_order_relaxed);
+                constexpr int64_t kRollupIntervalMs = 30000;
+
+                if (breaches == 1 || (nowMs - lastMs) >= kRollupIntervalMs) {
+                    s_lastEmitMs.store(nowMs, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"CPUMonitor",
+                        L"EDR self-usage over threshold %.1f%%: %llu sample(s) so far, "
+                        L"current %.2f%%, peak %.2f%%",
+                        cfg.selfUsageAlertThreshold,
+                        static_cast<unsigned long long>(breaches),
+                        self,
+                        s_peak.load(std::memory_order_relaxed));
+                }
 
                 // Thread attribution is a DIAGNOSTIC and is off unless asked for.
                 //
