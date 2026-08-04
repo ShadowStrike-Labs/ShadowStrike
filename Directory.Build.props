@@ -1,0 +1,21 @@
+<Project>
+  <!--
+    ShadowStrike solution-wide MSBuild defaults.
+
+    Pin the 64-bit hosted MSVC toolchain for every C++ project.
+
+    Rationale: PhantomEmulator/Core/JIT/JITCompiler.cpp defines JITCompiler::Impl,
+    which embeds std::array<RuntimeBlock, kMaxCompiledBlocks> runtimeBlocks{} where
+    each RuntimeBlock itself contains a large std::array<DecodedInstruction, ...>.
+    Value-initializing that deeply-nested, multi-megabyte aggregate under /O2 makes
+    the optimizer's working set exceed the ~3-4 GB address space of the 32-bit
+    hosted cl.exe, which then aborts with:
+        fatal error C1060: compiler is out of heap space
+    The 64-bit hosted compiler (HostX64) has no such address-space ceiling and
+    compiles the translation unit cleanly. PreferredToolArchitecture=x64 selects it.
+    This is the Microsoft-recommended remedy for C1060 and does not alter codegen.
+  -->
+  <PropertyGroup>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+</Project>
