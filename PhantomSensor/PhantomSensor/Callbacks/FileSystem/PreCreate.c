@@ -1535,12 +1535,33 @@ Return Value:
             LARGE_INTEGER ScanStart, ScanEnd;
             KeQuerySystemTime(&ScanStart);
 
+            //
+            // Deadline proportional to how close this operation is to executing
+            // code. The configured value remains the ceiling: an administrator
+            // who lowers ScanTimeoutMs must not have it silently raised here.
+            //
+            ULONG ScanDeadlineMs;
+            switch (ScanAccessType) {
+                case ShadowStrikeAccessExecute:
+                    ScanDeadlineMs = PC_SCAN_TIMEOUT_EXECUTE_MS;
+                    break;
+                case ShadowStrikeAccessWrite:
+                    ScanDeadlineMs = PC_SCAN_TIMEOUT_WRITE_MS;
+                    break;
+                default:
+                    ScanDeadlineMs = PC_SCAN_TIMEOUT_READ_MS;
+                    break;
+            }
+            if (ScanDeadlineMs > g_PcState.Config.ScanTimeoutMs) {
+                ScanDeadlineMs = g_PcState.Config.ScanTimeoutMs;
+            }
+
             Status = SbSendScanRequest(
                 RequestMsg,
                 RequestSize,
                 &ReplyMsg,
                 &ReplySize,
-                g_PcState.Config.ScanTimeoutMs
+                ScanDeadlineMs
                 );
 
             KeQuerySystemTime(&ScanEnd);

@@ -110,9 +110,19 @@ extern "C" {
 #define SB_DEFAULT_SCAN_TIMEOUT_MS          30000
 
 /**
- * @brief Minimum scan timeout
+ * @brief Minimum scan timeout.
+ *
+ * This floor exists to stop a caller accidentally requesting a timeout of zero
+ * or one millisecond, which would make every scan fail before the scanner could
+ * possibly answer. It was 100 ms, which silently raised the create path's
+ * deliberately tight read deadline (PC_SCAN_TIMEOUT_READ_MS) back up - a floor
+ * intended to catch mistakes was overriding a considered decision.
+ *
+ * 25 ms still rejects nonsense while leaving the blocking file-create path free
+ * to bound its in-line wait as tightly as the risk of the operation warrants.
+ * No existing caller passes a value below 100 ms, so nothing else changes.
  */
-#define SB_MIN_SCAN_TIMEOUT_MS              100
+#define SB_MIN_SCAN_TIMEOUT_MS              25
 
 /**
  * @brief Maximum scan timeout (5 minutes)

@@ -137,6 +137,40 @@ extern "C" {
 #define PC_DEFAULT_SCAN_TIMEOUT_MS      500
 
 /**
+ * @brief Risk-proportional in-line deadlines, by access type.
+ *
+ * One deadline for every create was the wrong model. The cost of waiting is
+ * paid by whatever else is queued behind that create, so the deadline should be
+ * proportional to how close the operation actually is to running code - not to
+ * how much analysis we would like to do.
+ *
+ * EXECUTE is the moment that matters. The image is about to become runnable, so
+ * this is where a synchronous verdict is worth blocking for, and it keeps the
+ * full budget. It is also comparatively rare, so a generous deadline here costs
+ * almost nothing in throughput.
+ *
+ * WRITE cannot execute anything by itself. It matters for ransomware and for
+ * dropper detection, both of which are also covered by write-rate and entropy
+ * analysis and by the execute-time scan of whatever gets dropped, so a shorter
+ * deadline loses no coverage that is not recovered a moment later.
+ *
+ * READ of a code-bearing file is the furthest from execution: opening a PE to
+ * read its bytes does not run it. Anything genuinely dangerous must still pass
+ * through the EXECUTE path with its full budget before a single instruction is
+ * fetched. This is also the highest-volume class that still reaches the
+ * blocking path, so it gets the tightest deadline.
+ *
+ * Every one of these already fails open on expiry, and since the deferred
+ * deep-scan worker now receives every on-access scanned file, a request that
+ * misses its in-line deadline is still fully analysed - the analysis moves in
+ * time, it does not disappear. That is what makes shortening these safe:
+ * coverage is preserved, only the waiting is bounded.
+ */
+#define PC_SCAN_TIMEOUT_EXECUTE_MS      500
+#define PC_SCAN_TIMEOUT_WRITE_MS        150
+#define PC_SCAN_TIMEOUT_READ_MS          50
+
+/**
  * @brief Fail-open cache TTL (seconds).
  *
  * When a create-path scan times out under a fail-open policy, the verdict is
