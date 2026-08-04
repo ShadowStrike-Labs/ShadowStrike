@@ -24,6 +24,7 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../Utils/DataStorePaths.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -1033,13 +1034,45 @@ bool SignatureUpdater::Initialize(const SignatureUpdaterConfiguration& config) {
         SigUpdateConstants::VERSION_MINOR,
         SigUpdateConstants::VERSION_PATCH);
 
-    if (!config.IsValid()) {
+    // The shipped default has enabled = true but leaves databaseDirectory and
+    // stagingDirectory empty, and IsValid() rejects an empty path - so the
+    // default configuration could never validate, and any caller that did not
+    // set both paths itself failed here with "Invalid configuration provided".
+    //
+    // The consequence was not a missing feature, it was a missing product: with
+    // the signature updater dead there is no path by which signature or hash
+    // content can ever be installed, which is why signatures.sdb does not exist
+    // on disk and the hash store comes up empty on every start. The cheapest and
+    // most valuable tier of the scan cascade had nothing to match against, so
+    // every file fell through to the expensive stages.
+    //
+    // Resolve the same data directory the rest of the product uses, then
+    // validate what will actually be used. An explicitly configured path is
+    // still honoured, and a genuinely invalid configuration is still rejected.
+    SignatureUpdaterConfiguration effectiveConfig = config;
+    if (effectiveConfig.enabled) {
+        if (effectiveConfig.databaseDirectory.empty()) {
+            effectiveConfig.databaseDirectory =
+                fs::path(::ShadowStrike::Utils::DataStorePaths::GetDataDirectory());
+        }
+        if (effectiveConfig.stagingDirectory.empty()) {
+            effectiveConfig.stagingDirectory =
+                effectiveConfig.databaseDirectory / L"staging";
+        }
+    }
+
+    if (!effectiveConfig.IsValid()) {
         SS_LOG_ERROR(kLogCategory, L"Invalid configuration provided");
         m_impl->m_status = SigUpdaterStatus::Error;
         return false;
     }
 
-    m_impl->m_config = config;
+    m_impl->m_config = effectiveConfig;
+
+    SS_LOG_INFO(kLogCategory,
+        L"Signature database directory: %ls (staging: %ls)",
+        effectiveConfig.databaseDirectory.c_str(),
+        effectiveConfig.stagingDirectory.c_str());
 
     // Ensure directories exist
     std::error_code ec;
