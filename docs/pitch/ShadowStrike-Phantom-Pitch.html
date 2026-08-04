@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>ShadowStrike Phantom — Company Pitch</title>
+<style>
+  @page { size: 1280px 720px; margin: 0; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  html,body { font-family:"Segoe UI","Helvetica Neue",Arial,sans-serif; color:#12181F; }
+
+  .slide {
+    position:relative; width:1280px; height:720px; overflow:hidden;
+    page-break-after:always; break-after:page; background:#FFFFFF;
+    padding:64px 76px;
+  }
+  .slide:last-child { page-break-after:auto; }
+
+  /* ---------- accents ---------- */
+  .rule { width:56px; height:3px; background:#B5761F; margin-bottom:26px; }
+  .kicker { font-size:13px; letter-spacing:.20em; text-transform:uppercase; color:#8A6224; font-weight:600; margin-bottom:14px; }
+  h1 { font-size:44px; line-height:1.12; font-weight:600; letter-spacing:-.015em; }
+  h2 { font-size:34px; line-height:1.18; font-weight:600; letter-spacing:-.01em; margin-bottom:8px; }
+  h3 { font-size:17px; font-weight:600; margin-bottom:6px; }
+  p  { font-size:16px; line-height:1.62; color:#39424D; }
+  .lead { font-size:19px; line-height:1.58; color:#2A323B; }
+  .foot { position:absolute; left:76px; right:76px; bottom:30px; display:flex; justify-content:space-between;
+          font-size:11.5px; color:#95A0AC; letter-spacing:.04em; border-top:1px solid #E6E9ED; padding-top:12px; }
+
+  /* ---------- cover ---------- */
+  .cover { background:#0C1219; color:#F2F5F8; padding:88px 76px; }
+  .cover h1 { font-size:62px; color:#FFFFFF; letter-spacing:-.02em; }
+  .cover .sub { font-size:22px; color:#B9C3CE; margin-top:20px; font-weight:300; }
+  .cover .tag { font-size:15px; color:#C89A4A; margin-top:34px; letter-spacing:.11em; text-transform:uppercase; font-weight:600; }
+  .cover .rule { background:#C89A4A; width:74px; }
+  .cover-meta { position:absolute; left:76px; bottom:64px; font-size:14px; color:#8F9BA8; line-height:1.9; }
+  .cover-badge { position:absolute; right:76px; bottom:64px; text-align:right; font-size:13px; color:#8F9BA8; line-height:1.9; }
+  .cover-badge strong { color:#E8EDF2; font-weight:600; }
+
+  /* ---------- layout helpers ---------- */
+  .two { display:flex; gap:52px; margin-top:30px; }
+  .two > div { flex:1; }
+  .three { display:flex; gap:30px; margin-top:34px; }
+  .three > div { flex:1; }
+
+  .card { background:#F7F9FA; border:1px solid #E3E8EC; border-left:3px solid #B5761F; padding:20px 22px; }
+  .card h3 { color:#12181F; }
+  .card p { font-size:14.5px; line-height:1.55; }
+
+  table { width:100%; border-collapse:collapse; margin-top:26px; }
+  th { text-align:left; font-size:11.5px; letter-spacing:.13em; text-transform:uppercase; color:#7C8794;
+       font-weight:600; padding:0 14px 10px 0; border-bottom:1.5px solid #D6DBE0; }
+  td { font-size:15px; color:#2E3742; padding:13px 14px 13px 0; border-bottom:1px solid #EDF0F2; vertical-align:top; }
+  td.n { font-variant-numeric:tabular-nums; white-space:nowrap; color:#12181F; font-weight:600; }
+  td.d { color:#5B6673; font-size:14px; }
+  tr:last-child td { border-bottom:none; }
+  .total td { border-top:1.5px solid #D6DBE0; font-weight:700; color:#0C1219; padding-top:15px; }
+
+  ul { list-style:none; margin-top:8px; }
+  li { font-size:15.5px; line-height:1.55; color:#39424D; padding-left:19px; position:relative; margin-bottom:11px; }
+  li:before { content:""; position:absolute; left:0; top:9px; width:6px; height:6px; background:#B5761F; }
+
+  .stat { font-size:40px; font-weight:600; color:#0C1219; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
+  .stat-l { font-size:13px; color:#7C8794; letter-spacing:.05em; margin-top:5px; line-height:1.45; }
+
+  /* ---------- architecture ---------- */
+  .arch { margin-top:20px; border:1px solid #E3E8EC; }
+  .band { padding:10px 17px; border-bottom:1px solid #E3E8EC; }
+  .band:last-child { border-bottom:none; }
+  .band-l { font-size:10px; letter-spacing:.16em; text-transform:uppercase; color:#8A6224; font-weight:700; margin-bottom:7px; }
+  .row { display:flex; gap:8px; }
+  .box { flex:1; background:#F7F9FA; border:1px solid #DFE4E9; padding:8px 10px; font-size:11.5px; color:#2E3742; line-height:1.38; }
+  .box b { display:block; font-size:11.5px; color:#0C1219; font-weight:600; margin-bottom:2px; }
+
+  /* dense slides: tighter tables so nothing reaches the footer rule */
+  .dense h2 { font-size:31px; }
+  .dense table { margin-top:18px; }
+  .dense td { font-size:14px; padding:9.5px 14px 9.5px 0; }
+  .dense td.d { font-size:13px; line-height:1.5; }
+  .dense th { padding-bottom:8px; }
+  .dense .total td { padding-top:11px; }
+  .xdense h2 { font-size:30px; }
+  .xdense table { margin-top:14px; }
+  .xdense td { font-size:13.5px; padding:7.5px 14px 7.5px 0; }
+  .xdense td.d { font-size:12.5px; line-height:1.45; }
+  .xdense th { padding-bottom:7px; font-size:11px; }
+  .xdense .total td { padding-top:9px; }
+  .band.k { background:#0C1219; }
+  .band.k .band-l { color:#C89A4A; }
+  .band.k .box { background:#161F29; border-color:#28323D; color:#B9C3CE; }
+  .band.k .box b { color:#F2F5F8; }
+  .band.hw { background:#F2F4F6; text-align:center; font-size:12px; color:#6B7683; letter-spacing:.09em; }
+
+  .quote { border-left:3px solid #B5761F; padding:4px 0 4px 22px; margin-top:28px; }
+  .quote p { font-size:18px; line-height:1.6; color:#2A323B; font-style:italic; }
+
+  .closing { background:#0C1219; color:#F2F5F8; }
+  .closing h2 { color:#FFFFFF; }
+  .closing p { color:#B9C3CE; }
+  .closing .rule { background:#C89A4A; }
+  .closing .card { background:#161F29; border-color:#28323D; border-left-color:#C89A4A; }
+  .closing .card h3 { color:#F2F5F8; }
+  .closing .card p { color:#A7B2BE; }
+  .closing .foot { color:#5E6B78; border-top-color:#232D37; }
+</style>
+</head>
+<body>
+
+<!-- 1 ------------------------------------------------------------------ -->
+<div class="slide cover">
+  <div class="rule"></div>
+  <h1>ShadowStrike Phantom</h1>
+  <div class="sub">Open-source next-generation endpoint protection for Windows.<br/>
+  Kernel sensor, on-device analysis, and full-system emulation — built from scratch.</div>
+  <div class="tag">Every line auditable</div>
+  <div class="cover-meta">
+    ShadowStrike-Labs<br/>
+    contact@shadowstrike.dev<br/>
+    shadowstrike.dev
+  </div>
+  <div class="cover-badge">
+    <strong>AWS Activate</strong><br/>
+    Credit application<br/>
+    August 2026
+  </div>
+</div>
+
+<!-- 2 ------------------------------------------------------------------ -->
+<div class="slide">
+  <div class="kicker">The problem</div>
+  <div class="rule"></div>
+  <h2>Security software demands the deepest trust<br/>and offers the least transparency.</h2>
+  <p class="lead" style="margin-top:18px;">Endpoint protection runs in the Windows kernel. It sees every file, every process,
+  every network flow. It can stop a machine from booting. And at every major vendor, it is code the customer is not
+  permitted to read.</p>
+
+  <div class="three">
+    <div class="card">
+      <h3>The risk is not theoretical</h3>
+      <p>In July 2024 a single faulty kernel update disabled roughly 8.5 million Windows machines worldwide, grounding
+      airlines and interrupting hospitals. The affected organisations had no ability to inspect the code that did it.</p>
+    </div>
+    <div class="card">
+      <h3>Verification is becoming mandatory</h3>
+      <p>Software supply-chain requirements in regulated sectors increasingly call for provenance and auditability
+      that closed-source kernel agents structurally cannot provide.</p>
+    </div>
+    <div class="card">
+      <h3>Open source has not filled the gap</h3>
+      <p>Existing open tools are scanners, log shippers, or rule engines. None is a complete kernel-to-user
+      endpoint protection platform with its own detection engine.</p>
+    </div>
+  </div>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>2</span></div>
+</div>
+
+<!-- 3 ------------------------------------------------------------------ -->
+<div class="slide">
+  <div class="kicker">What we built</div>
+  <div class="rule"></div>
+  <h2>Five purpose-built subsystems. No third-party detection engine.</h2>
+  <p style="margin-top:14px;">ShadowStrike Phantom is not a wrapper around existing tools and not a proof of concept.
+  Each layer was written from the ground up so that the entire detection path — from the kernel callback to the
+  final verdict — is inspectable.</p>
+
+  <table>
+    <tr><th style="width:23%">Subsystem</th><th style="width:52%">What it is</th><th style="width:25%">Scale</th></tr>
+    <tr><td><strong>PhantomSensor</strong></td>
+        <td class="d">WDM minifilter kernel driver. 20 detection subsystems covering syscalls, memory, process,
+        registry, network and self-protection.</td>
+        <td class="n">305,000 lines of C</td></tr>
+    <tr><td><strong>PhantomCore</strong></td>
+        <td class="d">Shared user-mode detection stack: real-time protection, signature and pattern stores,
+        anti-evasion, script scanners, self-defence.</td>
+        <td class="n">667,000 lines of C++</td></tr>
+    <tr><td><strong>PhantomEmulator</strong></td>
+        <td class="d">Custom x86/x64 CPU emulator for safe malware detonation. Virtual OS, 10 emulated DLLs,
+        12 analysis engines. No hypervisor dependency.</td>
+        <td class="n">122,000 lines of C++</td></tr>
+    <tr><td><strong>PhantomHome</strong></td>
+        <td class="d">Consumer product layer: 47 protection modules spanning banking, privacy, web, email,
+        USB and ransomware defence.</td>
+        <td class="n">167,000 lines of C++</td></tr>
+    <tr><td><strong>PhantomCortex</strong></td>
+        <td class="d">On-device machine learning. Five model architectures for static, behavioural, emulation,
+        memory and network classification.</td>
+        <td class="n">Python training pipeline</td></tr>
+  </table>
+
+  <p style="margin-top:22px; font-size:14.5px; color:#6B7683;">Approximately 2.3 million lines in total across C, C++,
+  assembly and Python, including test suites and tooling.</p>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>3</span></div>
+</div>
+
+<!-- 4 ------------------------------------------------------------------ -->
+<div class="slide">
+  <div class="kicker">Architecture</div>
+  <div class="rule"></div>
+  <h2 style="font-size:31px;">One detection core, three products, one kernel sensor.</h2>
+
+  <div class="arch">
+    <div class="band">
+      <div class="band-l">User mode — products</div>
+      <div class="row">
+        <div class="box"><b>Phantom Home</b>Consumer endpoint, local desktop UI</div>
+        <div class="box"><b>Phantom EDR</b>Enterprise detection and response</div>
+        <div class="box"><b>Phantom XDR</b>Fleet-wide extended detection</div>
+        <div class="box"><b>Management dashboard</b>Planned, EDR and XDR tiers</div>
+      </div>
+    </div>
+    <div class="band">
+      <div class="band-l">Shared detection infrastructure</div>
+      <div class="row">
+        <div class="box"><b>Real-time protection</b>On-access orchestration, exploit and behaviour blocking</div>
+        <div class="box"><b>Detection stores</b>Signature B-tree, Aho-Corasick patterns, Bloom-filter hashes, threat intel</div>
+        <div class="box"><b>PhantomEmulator</b>Detonation, unpacking, OEP recovery, import reconstruction</div>
+        <div class="box"><b>PhantomCortex</b>Five on-device models, ONNX inference, no cloud verdicts</div>
+      </div>
+    </div>
+    <div class="band">
+      <div class="band-l">Encrypted kernel bridge</div>
+      <div class="row">
+        <div class="box" style="text-align:center;"><b>AES-256-GCM over FilterConnectPort</b>Authenticated, per-session keyed channel between kernel and user mode</div>
+      </div>
+    </div>
+    <div class="band k">
+      <div class="band-l">Kernel mode — PhantomSensor.sys, minifilter altitude 385210</div>
+      <div class="row">
+        <div class="box"><b>File system</b>Pre and post I/O, ransomware heuristics</div>
+        <div class="box"><b>Process and thread</b>Injection, hollowing, hijack detection</div>
+        <div class="box"><b>Syscall monitor</b>Direct syscall, Heaven's and Hell's Gate</div>
+        <div class="box"><b>Memory</b>VAD tracking, ROP, shellcode, code caves</div>
+        <div class="box"><b>Self-protection</b>Anti-tamper, callback guard, integrity</div>
+      </div>
+    </div>
+    <div class="band hw">Hardware and firmware — Secure Boot, TPM attestation, firmware integrity</div>
+  </div>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>4</span></div>
+</div>
+
+<!-- 5 ------------------------------------------------------------------ -->
+<div class="slide">
+  <div class="kicker">Differentiation</div>
+  <div class="rule"></div>
+  <h2>Why building it ourselves is the product.</h2>
+
+  <div class="two" style="margin-top:26px;">
+    <div>
+      <h3 style="font-size:19px; margin-bottom:14px;">Owning the detection path</h3>
+      <ul>
+        <li>No licensed third-party scanning engine, so no per-seat royalty and no opaque component inside our own kernel driver.</li>
+        <li>Custom minifilter, custom CPU emulator, custom instruction decoder, and a clean-room fuzzy hasher with no GPL dependency.</li>
+        <li>Detection logic, heuristics and model weights are all in the repository. A customer can read the rule that flagged their file.</li>
+        <li>Kernel and user mode share memory-mapped type definitions, so the protocol between them is verifiable rather than assumed.</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="font-size:19px; margin-bottom:14px;">Engineering evidence</h3>
+      <div class="two" style="margin-top:0; gap:26px;">
+        <div>
+          <div class="stat">0.25</div>
+          <div class="stat-l">Coverity defects per thousand lines, kernel driver</div>
+        </div>
+        <div>
+          <div class="stat">550+</div>
+          <div class="stat-l">MITRE ATT&amp;CK technique IDs mapped across 14 tactics</div>
+        </div>
+      </div>
+      <div class="two" style="margin-top:28px; gap:26px;">
+        <div>
+          <div class="stat">103</div>
+          <div class="stat-l">Packer families identified by the unpacking engine</div>
+        </div>
+        <div>
+          <div class="stat">8</div>
+          <div class="stat-l">Independent original-entry-point recovery methods</div>
+        </div>
+      </div>
+      <p style="margin-top:26px; font-size:14.5px; color:#6B7683;">The kernel driver passes Windows Driver Verifier
+      with zero violations under the full standard and low-resource simulation suites.</p>
+    </div>
+  </div>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>5</span></div>
+</div>
+
+<!-- 6 ------------------------------------------------------------------ -->
+<div class="slide">
+  <div class="kicker">Capability depth</div>
+  <div class="rule"></div>
+  <h2>Detection that does not depend on knowing the sample.</h2>
+  <p style="margin-top:14px;">Signature matching alone cannot address packed, obfuscated or evasion-aware malware.
+  The emulation engine executes a sample inside a fully virtual environment and draws conclusions from behaviour.</p>
+
+  <div class="three" style="margin-top:30px;">
+    <div class="card">
+      <h3>Generic unpacking</h3>
+      <p>Detects the write-then-execute transition every runtime packer must perform, tracks each decryption layer
+      with entropy analysis, recovers the original entry point through eight independent heuristics, rebuilds the
+      import table from observed API calls, and dumps a clean executable image.</p>
+    </div>
+    <div class="card">
+      <h3>Anti-evasion</h3>
+      <p>Timing, debugger, virtual-machine and environment countermeasures are emulated so that samples which
+      check whether they are being watched proceed down their real execution path instead of a decoy.</p>
+    </div>
+    <div class="card">
+      <h3>On-device inference</h3>
+      <p>Five model architectures — gradient boosting, 1D convolutional, recurrent, feedforward and autoencoder —
+      score static, behavioural, emulation, memory and network features locally. Detection never requires sending
+      a customer file to a server.</p>
+    </div>
+  </div>
+
+  <div class="quote">
+    <p>A product whose selling point is transparency cannot outsource the part that matters. That constraint shaped
+    every engineering decision, and it is the reason the codebase is the size it is.</p>
+  </div>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>6</span></div>
+</div>
+
+<!-- 7 ------------------------------------------------------------------ -->
+<div class="slide">
+  <div class="kicker">Market and model</div>
+  <div class="rule"></div>
+  <h2>Three tiers on one engine.</h2>
+
+  <table>
+    <tr><th style="width:19%">Tier</th><th style="width:25%">Customer</th><th style="width:33%">Position</th><th style="width:23%">Commercial model</th></tr>
+    <tr><td><strong>Phantom Home</strong></td><td class="d">Consumer and prosumer endpoints</td>
+        <td class="d">Lightweight local protection with desktop UI. Serves as the proving ground for the shared engine.</td>
+        <td class="d">Free and open source; paid support</td></tr>
+    <tr><td><strong>Phantom EDR</strong></td><td class="d">Small and mid-sized organisations</td>
+        <td class="d">Full detection and response with centralised management and forensic collection.</td>
+        <td class="d">Per-endpoint subscription</td></tr>
+    <tr><td><strong>Phantom XDR</strong></td><td class="d">Enterprise and regulated sectors</td>
+        <td class="d">Extended detection across endpoint, network and identity, with fleet correlation.</td>
+        <td class="d">Per-endpoint subscription, annual</td></tr>
+  </table>
+
+  <div class="two" style="margin-top:34px;">
+    <div class="card">
+      <h3>Why the licence works commercially</h3>
+      <p>AGPL-3.0 makes the code auditable and makes proprietary redistribution by competitors impractical.
+      Revenue comes from the managed backend, support and the enterprise tiers, not from withholding source.</p>
+    </div>
+    <div class="card">
+      <h3>Where transparency is worth paying for</h3>
+      <p>Public sector, healthcare, finance and critical infrastructure increasingly need to demonstrate what their
+      kernel-level software does. That is a requirement no closed agent can satisfy, and it is our entry point.</p>
+    </div>
+  </div>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>7</span></div>
+</div>
+
+<!-- 8 ------------------------------------------------------------------ -->
+<div class="slide dense xdense">
+  <div class="kicker">The ask</div>
+  <div class="rule"></div>
+  <h2>What the AWS credits would fund.</h2>
+  <p style="margin-top:10px;">Detection runs on the endpoint, so we carry no per-customer cloud cost. Our cloud requirement sits in three places: training the models, distributing definitions, and building and testing a Windows kernel driver safely.</p>
+
+  <table>
+    <tr><th style="width:31%">Workload</th><th style="width:46%">AWS services</th><th style="width:23%">Allocation</th></tr>
+    <tr><td><strong>Model training</strong></td>
+        <td class="d">GPU compute for five architectures over 3.5 million labelled PE samples from EMBER 2018 and 2024, plus synthetic behavioural and emulation traces. SageMaker, EC2 accelerated instances.</td>
+        <td class="n">$11,000</td></tr>
+    <tr><td><strong>Kernel driver CI</strong></td>
+        <td class="d">Windows build agents for WDK compilation plus an isolated Driver Verifier and boot-integrity matrix. A kernel regression must never reach a user. EC2 Windows, CodeBuild.</td>
+        <td class="n">$4,000</td></tr>
+    <tr><td><strong>Definition delivery</strong></td>
+        <td class="d">Signed signature, hash and model artefacts distributed to endpoints with delta updates and
+        rollback. S3, CloudFront.</td>
+        <td class="n">$3,500</td></tr>
+    <tr><td><strong>Sample and dataset storage</strong></td>
+        <td class="d">Versioned corpora, extracted feature sets and reproducible training snapshots. S3 with
+        lifecycle tiering, KMS encryption.</td>
+        <td class="n">$3,500</td></tr>
+    <tr><td><strong>Retraining automation</strong></td>
+        <td class="d">Scheduled ingestion from six threat-intelligence feeds, feature extraction, evaluation gates and model promotion. Batch, Step Functions, Lambda.</td>
+        <td class="n">$2,000</td></tr>
+    <tr><td><strong>Observability and security</strong></td>
+        <td class="d">Pipeline monitoring, artefact signing key custody, least-privilege access. CloudWatch, KMS, IAM.</td>
+        <td class="n">$1,000</td></tr>
+    <tr class="total"><td>Total requested</td><td></td><td class="n">$25,000</td></tr>
+  </table>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>8</span></div>
+</div>
+
+<!-- 9 ------------------------------------------------------------------ -->
+<div class="slide dense">
+  <div class="kicker">Status</div>
+  <div class="rule"></div>
+  <h2>Where the project stands today.</h2>
+  <p style="margin-top:12px;">We would rather be precise than flattering. The platform is in alpha and under active
+  daily development.</p>
+
+  <table>
+    <tr><th style="width:27%">Component</th><th style="width:17%">State</th><th style="width:56%">Detail</th></tr>
+    <tr><td><strong>PhantomSensor.sys</strong></td><td class="d">Complete</td>
+        <td class="d">20 subsystems. Coverity 0.25 defects per KLoC. Driver Verifier clean. Loads and runs under test signing.</td></tr>
+    <tr><td><strong>PhantomCore</strong></td><td class="d">Complete, hardening</td>
+        <td class="d">All module families implemented. Currently in a security and reliability audit phase.</td></tr>
+    <tr><td><strong>PhantomEmulator</strong></td><td class="d">Operational</td>
+        <td class="d">CPU emulation, virtual OS and the full analysis suite are functional and integrated into the scan pipeline.</td></tr>
+    <tr><td><strong>PhantomCortex</strong></td><td class="d">Four of five models</td>
+        <td class="d">Trained and exported to ONNX. The fifth is pending retraining on the expanded corpus — the primary use of the requested credits.</td></tr>
+    <tr><td><strong>Phantom Home</strong></td><td class="d">Integration</td>
+        <td class="d">47 modules wired to the orchestrator. End-to-end reliability work in progress ahead of beta.</td></tr>
+    <tr><td><strong>EDR and XDR tiers</strong></td><td class="d">In development</td>
+        <td class="d">Share the completed sensor and detection core; management backend is the remaining work.</td></tr>
+  </table>
+
+  <p style="margin-top:26px; font-size:16px; color:#2A323B;"><strong>Public beta target: early 2027.</strong>
+  No paying customers yet; the Home tier ships first and free, deliberately, so the engine is proven in the open
+  before anyone is asked to pay for it.</p>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>9</span></div>
+</div>
+
+<!-- 10 ----------------------------------------------------------------- -->
+<div class="slide closing">
+  <div class="kicker" style="color:#C89A4A;">Why it matters</div>
+  <div class="rule"></div>
+  <h2>The code with the most privilege<br/>should be the code you can read.</h2>
+  <p class="lead" style="color:#B9C3CE; margin-top:22px; max-width:880px;">Endpoint security is the one category
+  where customers are asked to grant total access on trust alone. We think that trade is avoidable, and that
+  demonstrating so requires building the whole thing in the open — kernel driver included.</p>
+
+  <div class="three" style="margin-top:40px;">
+    <div class="card">
+      <h3>What credits accelerate</h3>
+      <p>Model training is the single dependency we cannot satisfy on local hardware. Credits move the remaining
+      model and the retraining pipeline from constrained to continuous.</p>
+    </div>
+    <div class="card">
+      <h3>What we bring to AWS</h3>
+      <p>A reference open-source security workload: reproducible ML training, signed artefact distribution, and
+      Windows kernel CI, all publicly documented and auditable.</p>
+    </div>
+    <div class="card">
+      <h3>Contact</h3>
+      <p>ShadowStrike-Labs<br/>contact@shadowstrike.dev<br/>shadowstrike.dev<br/>github.com/ShadowStrike-Labs</p>
+    </div>
+  </div>
+
+  <div class="foot"><span>ShadowStrike Phantom — Company Pitch</span><span>10</span></div>
+</div>
+
+</body>
+</html>
