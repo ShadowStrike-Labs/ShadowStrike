@@ -1,0 +1,153 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PhantomTests.vcxproj
+  ====================
+  The test runner this repository has never had.
+
+  There are roughly 5,960 GoogleTest cases across 131,420 lines under tests\,
+  written against real interfaces with real assertions - and until this project
+  existed not one of them could be built, let alone executed. There was no test
+  project in the solution, no CMake, and no runner script. The only automated
+  test execution in the entire repository was 22 Python methods in
+  tests\kernel_contracts, which check source-level invariants of five sensor
+  files without loading the driver.
+
+  That is why defects have been found by reading logs on a virtual machine
+  instead of by a test failing on a build machine, and why four modules could
+  sit silently inert for months.
+
+  Deliberately incremental. Test sources are enabled a directory at a time
+  rather than all at once, because 131,420 lines of never-compiled code will not
+  compile on the first attempt and a wall of thousands of errors is not
+  actionable. The order below follows the open problem list: the communication
+  pipeline first, because the last unknown in the freeze chain is why kernel
+  frames fail validation, and those 156 cases exercise exactly that framing.
+
+  gtest and gmock are already vendored under vendor\gtest_framework, so nothing
+  new is introduced here - the dependency was paid for long ago and never used.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{3D7E5A18-9C42-4B60-8E11-7F2A6D9C4E85}</ProjectGuid>
+    <RootNamespace>PhantomTests</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <IntDir>$(ProjectDir)build\$(Configuration)\Tests\</IntDir>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <TargetName>phantom-tests</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level3</WarningLevel>
+      <!-- Tests are not held to /WX: a warning in a test is not a product defect
+           and turning them into errors would stall the effort to get the suite
+           running at all. Product code keeps its stricter setting. -->
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Test sources include product headers as "src/PhantomCore/..." from the
+           repository root, so the root itself must be on the include path. -->
+      <AdditionalIncludeDirectories>
+        $(ProjectDir);
+        $(ProjectDir)include;
+        $(ProjectDir)src;
+        $(ProjectDir)src\PhantomCore;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>
+        WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;
+        SHADOWSTRIKE_PRODUCT_HOME=1;
+        SHADOWSTRIKE_TESTING=1;
+        SHADOWSTRIKE_DIAG_TRACE=0;
+        GTEST_HAS_PTHREAD=0;%(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <SDLCheck>false</SDLCheck>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>
+        $(SolutionDir)lib\$(Configuration);
+        $(SolutionDir)vendor\gtest_framework;
+        $(SolutionDir)vendor\openssl_lib;
+        $(SolutionDir)vendor\yara_lib;
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <AdditionalDependencies>
+        PhantomCoreLib.lib;gtest.lib;gmock.lib;
+        libyara.lib;libcrypto.lib;libssl.lib;
+        advapi32.lib;kernel32.lib;user32.lib;shell32.lib;ole32.lib;oleaut32.lib;
+        crypt32.lib;wintrust.lib;version.lib;ws2_32.lib;wbemuuid.lib;
+        iphlpapi.lib;psapi.lib;shlwapi.lib;bcrypt.lib;ncrypt.lib;userenv.lib;
+        wtsapi32.lib;normaliz.lib;winhttp.lib;fltlib.lib;rpcrt4.lib;
+        %(AdditionalDependencies)
+      </AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <!-- The runner entry point. -->
+    <ClCompile Include="tests\test_main.cpp" />
+
+    <!-- Enabled suite 1: kernel/user framing. 156 cases. Chosen first because
+         task 22 - why kernel frames fail validation - is the last unknown in
+         the freeze chain, and this is the code that would prove it. -->
+    <ClCompile Include="tests\integration\communication_pipeline\CommunicationPipeline_Integration_Tests.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="PhantomCoreLib.vcxproj">
+      <Project>{8A5C6B4D-2E1F-4A3B-9C7D-0E1F2A3B4C5D}</Project>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>
