@@ -1,0 +1,239 @@
+===============================================================================
+ ShadowStrike Phantom Home - VM test session quick reference
+ Everything here is run in an ADMIN PowerShell on the TEST VM.
+===============================================================================
+
+
+-------------------------------------------------------------------------------
+ 1. RUN A SCRIPT WITHOUT THE EXECUTION POLICY BLOCKING IT
+-------------------------------------------------------------------------------
+
+The one you keep looking up - run a single script, policy bypassed, nothing
+about the machine changed:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Script.ps1
+
+PowerShell 7 (pwsh) is the same:
+
+    pwsh -NoProfile -ExecutionPolicy Bypass -File .\Script.ps1
+
+With arguments after the file:
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Script.ps1 -Verbose
+
+
+Bypass for THIS WINDOW ONLY (then paste/run whatever you like in it).
+Reverts when you close the window. This is the safest form:
+
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+
+
+Bypass for YOUR USER, persists across reboots. Use on a throwaway test VM
+only - do not do this on your real machine:
+
+    Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+
+Check what is in effect and where each level came from:
+
+    Get-ExecutionPolicy -List
+
+
+"File downloaded from the internet" / "not digitally signed" even after a
+bypass = the Zone.Identifier alternate data stream, which is a SEPARATE block
+from the execution policy. Remove it:
+
+    Unblock-File .\Script.ps1
+    Get-ChildItem . -Recurse | Unblock-File          # whole folder
+
+Note our own product strips ADS on protected paths, so if Unblock-File is
+needed repeatedly on the same file, that is worth telling me about.
+
+
+-------------------------------------------------------------------------------
+ 2. TURN DEFENDER OFF PROPERLY  (do this BEFORE any timing measurement)
+-------------------------------------------------------------------------------
+
+ORDER MATTERS. Tamper Protection re-enables real-time protection behind you,
+so disabling RTP first silently does nothing. Every log so far has had
+MsMpEng.exe running, which contaminates all latency numbers.
+
+STEP 1 - Tamper Protection. This CANNOT be scripted by design. Do it by hand:
+    Windows Security -> Virus & threat protection
+      -> Manage settings -> Tamper Protection -> Off
+
+STEP 2 - then, in an admin shell:
+    Set-MpPreference -DisableRealtimeMonitoring $true
+    Set-MpPreference -DisableBehaviorMonitoring $true
+    Set-MpPreference -DisableIOAVProtection $true
+    Set-MpPreference -DisableScriptScanning $true
+
+STEP 3 - CONFIRM. This is the check that matters, not the settings UI:
+    Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, IsTamperProtected
+    Get-Process MsMpEng -ErrorAction SilentlyContinue
+
+    Want: RealTimeProtectionEnabled False, IsTamperProtected False,
+          and NO MsMpEng process listed.
+
+If MsMpEng is still running, the measurement is not clean - two real-time
+filters are both inspecting every file and neither number is ours.
+
+Belt and braces, exclude our paths anyway:
+    Add-MpPreference -ExclusionPath 'C:\Program Files\ShadowStrike'
+    Add-MpPreference -ExclusionPath 'C:\ProgramData\ShadowStrike'
+
+
+-------------------------------------------------------------------------------
+ 3. INSTALL / UNINSTALL
+-------------------------------------------------------------------------------
+
+Install, with a verbose MSI log (use the EXE - it carries prerequisites):
+    .\ShadowStrikePhantom-Home-Setup.exe /l*v C:\install.log
+
+MSI directly, silent:
+    msiexec /i .\ShadowStrikePhantom-Home-Setup.msi /qn /l*v C:\install.log
+
+Uninstall:
+    msiexec /x .\ShadowStrikePhantom-Home-Setup.msi /qn /l*v C:\uninstall.log
+
+Confirm the version that is actually installed (not the one you think is):
+    Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+      Where-Object DisplayName -like '*ShadowStrike*' |
+      Select-Object DisplayName, DisplayVersion
+
+
+-------------------------------------------------------------------------------
+ 4. SERVICE AND DRIVER CONTROL
+-------------------------------------------------------------------------------
+
+    Get-Service ShadowStrikePhantomService
+    Start-Service ShadowStrikePhantomService
+    Stop-Service  ShadowStrikePhantomService -Force
+    Restart-Service ShadowStrikePhantomService -Force
+
+Service start is currently DEFERRED to delayed-auto-start, so after install it
+does not run until a reboot. To start it immediately without rebooting:
+    Start-Service ShadowStrikePhantomService
+
+Driver (minifilter):
+    fltmc filters                      # is PhantomSensor listed?
+    fltmc instances -f PhantomSensor   # which volumes it is attached to
+    fltmc unload PhantomSensor         # unload  - THIS DROPS PROTECTION
+    fltmc load   PhantomSensor         # load
+
+>>> IF THE MACHINE IS STALLING ON FILE I/O, "fltmc unload PhantomSensor" is
+>>> the fastest way to get it responsive again without a hard power off.
+>>> It removes protection until you reload or reboot. Try this BEFORE
+>>> holding the power button - it also tells us something: if unloading the
+>>> driver clears the stall, the stall is on our file path.
+
+Query with full detail:
+    sc.exe qc ShadowStrikePhantomService
+    sc.exe query ShadowStrikePhantomService
+
+
+-------------------------------------------------------------------------------
+ 5. COLLECT THE LOGS FOR ME  (one command, do this after every freeze)
+-------------------------------------------------------------------------------
+
+Copy everything I need into the shared folder. Adjust the destination if your
+share is mounted elsewhere:
+
+    $dst = 'X:\PhantomHome\diag'          # <-- your shared folder
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item 'C:\ProgramData\ShadowStrike\Logs\*' $dst -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $dst | Sort-Object LastWriteTime |
+      Format-Table Name, Length, LastWriteTime -AutoSize
+
+The four files that matter:
+
+    PhantomHome.Service.log         normal service log
+    PhantomHome.Service.boot.log    start-up trace, survives a crash
+    PhantomHome.Service.trace.log   DIAGNOSTIC TRACE, microsecond timings
+    PhantomHome.Service.trace.ring  the raw ring - SEND THIS ONE TOO
+
+About the trace: it is written to memory, not to a file, so it survives a hard
+power off. It is converted to the .log on the NEXT service start. So the
+sequence after a freeze is:
+
+    hard power off  ->  boot  ->  let the service start  ->  copy the logs
+
+If you copy .trace.ring before the service has restarted, that is fine - send
+it as-is, I can decode the raw ring on my side.
+
+
+-------------------------------------------------------------------------------
+ 6. WATCH IT LIVE
+-------------------------------------------------------------------------------
+
+Tail the service log:
+    Get-Content 'C:\ProgramData\ShadowStrike\Logs\PhantomHome.Service.log' -Wait -Tail 40
+
+Errors and warnings only:
+    Get-Content 'C:\ProgramData\ShadowStrike\Logs\PhantomHome.Service.log' -Wait -Tail 5 |
+      Select-String 'ERROR|WARN|FATAL|failed'
+
+Our processes, memory and CPU, refreshing:
+    while ($true) {
+      Get-Process ShadowStrikePhantom* -ErrorAction SilentlyContinue |
+        Format-Table Name, Id, @{n='CPU(s)';e={[math]::Round($_.CPU,1)}},
+                     @{n='WS(MB)';e={[math]::Round($_.WorkingSet64/1MB)}},
+                     Threads -AutoSize
+      Start-Sleep 2; Clear-Host
+    }
+
+Kernel debug output from the driver (needs DebugView from Sysinternals,
+run as admin, Capture -> Capture Kernel):
+    dbgview.exe
+
+
+-------------------------------------------------------------------------------
+ 7. WHEN IT IS FROZEN - IN ORDER
+-------------------------------------------------------------------------------
+
+1. Wait 60 seconds. The in-line scan deadline is bounded, so a stall caused by
+   a scan self-clears. If it clears, it was a stall, not a hang - tell me
+   roughly how long.
+
+2. If you can still get a shell:      fltmc unload PhantomSensor
+   That drops us out of the file path entirely. If the machine frees up, the
+   problem is on our path and that is useful evidence.
+
+3. If you cannot get a shell:         Stop-Service ShadowStrikePhantomService -Force
+   from any window that still responds.
+
+4. Only then, hard power off. Do not feel bad about it - the trace ring is
+   designed for exactly this and loses nothing.
+
+5. After the reboot: let the service come up, THEN copy the logs (section 5).
+   The trace from the session that died is recovered on that next start.
+
+
+-------------------------------------------------------------------------------
+ 8. USEFUL PATHS
+-------------------------------------------------------------------------------
+
+    C:\Program Files\ShadowStrike\               installed binaries
+    C:\ProgramData\ShadowStrike\Logs\            all logs and the trace ring
+    C:\ProgramData\ShadowStrike\Data\            signature and hash stores
+    C:\ProgramData\ShadowStrike\Quarantine\      quarantined samples
+
+    Service name : ShadowStrikePhantomService
+    Driver name  : PhantomSensor        (minifilter, altitude 385210)
+
+
+-------------------------------------------------------------------------------
+ 9. EICAR TEST FILE - confirm detection actually fires
+-------------------------------------------------------------------------------
+
+Standard harmless antivirus test string. Written in pieces so this .txt file
+does not itself trip a scanner:
+
+    $p = 'X5O!P%@AP[4\PZX54(P^)7CC)7}'
+    $s = '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+    Set-Content -Path "$env:TEMP\eicar.com" -Value ($p + $s) -NoNewline -Encoding ASCII
+
+Then check the service log for a detection. Note as of now the signature
+database ships empty, so a miss here is expected and is a known open item -
+it is not a new bug.
+
+===============================================================================
