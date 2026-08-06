@@ -36,6 +36,7 @@
  */
 
 #include "FilterConnection.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../SelfProtection/CryptoManager.hpp"
@@ -282,6 +283,8 @@ public:
         // authenticated kernel-side (exact image path + SYSTEM token).
         SHADOWSTRIKE_CONNECTION_CONTEXT connCtx{};
         connCtx.ConnectionType = registerAsPrimaryScanner ? 1u : 0u;
+        SS_DIAG("Frames", "Connect port='%ls' asPrimaryScanner=%u pid=%lu",
+                m_portName.c_str(), connCtx.ConnectionType, ::GetCurrentProcessId());
         {
             using namespace ShadowStrike::Security;
             auto& crypto = CryptoManager::Instance();
@@ -521,12 +524,26 @@ public:
         if (FAILED(hr)) {
             m_lastError.store(hr, std::memory_order_relaxed);
 
+            // Rate-limited so a desync storm cannot flood the ring, but the
+            // first occurrences and a periodic sample always land. A 297-second
+            // field trace delivered zero scan requests to user mode with no
+            // evidence of why, because this path was uninstrumented.
+            {
+                static std::atomic<std::uint64_t> s_failCount{ 0 };
+                const std::uint64_t n = s_failCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 10 || (n % 500) == 0) {
+                    SS_DIAG("Frames", "FilterGetMessage FAILED hr=0x%08X n=%llu tid=%lu",
+                            static_cast<unsigned>(hr), n, ::GetCurrentThreadId());
+                }
+            }
+
             if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
                 hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
                 return 0;
             }
 
             if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+                SS_DIAG("Frames", "port handle invalid - marking disconnected");
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_connected.store(false, std::memory_order_release);
                 // Do NOT null m_hPort — Disconnect() handles cleanup and drain.
