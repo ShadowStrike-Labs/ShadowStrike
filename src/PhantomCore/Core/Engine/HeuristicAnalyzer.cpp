@@ -1588,7 +1588,38 @@ CertificateInfo HeuristicAnalyzer::VerifySignature(const std::wstring& filePath)
         trustData.dwUnionChoice = WTD_CHOICE_FILE;
         trustData.pFile = &fileInfo;
         trustData.dwStateAction = WTD_STATEACTION_VERIFY;
-        trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_REVOCATION_CHECK_CHAIN;
+        // WTD_CACHE_ONLY_URL_RETRIEVAL is mandatory here, and its absence was a
+        // defect rather than a policy choice.
+        //
+        // This runs on the on-access scan path, where a kernel thread is parked
+        // inside FltSendMessage holding an IRP_MJ_CREATE and every other file
+        // operation on the machine queues behind the verdict. Without cache-only
+        // retrieval, WTD_REVOCATION_CHECK_CHAIN makes WinVerifyTrust fetch CRL
+        // and OCSP responses over the network, and CryptoAPI's per-URL timeouts
+        // are measured in seconds. On any host that cannot reach those endpoints
+        // - an isolated test VM, an air-gapped deployment, a machine whose
+        // egress we ourselves filter - every unseen signed binary pays that
+        // timeout with the filesystem stalled behind it. A field trace measured
+        // single on-access requests at 402 ms with the user reporting freezes of
+        // five to fifteen seconds while clicking through files.
+        //
+        // Every other trust call in the codebase already gets this right and
+        // says so: CryptoMinerDetector "Performance: skip revocation on hot
+        // path" / "Don't hit network", BootTimeAnalyzer "Skip revocation for
+        // performance", IPCManager pairing WHOLECHAIN with cache-only. This one
+        // site was the outlier.
+        //
+        // Detection is not reduced. The chain is still built and still validated
+        // for expiry, trust and tampering, and revocation is still honoured from
+        // the local CRL cache that Windows maintains. What we give up is the
+        // ability to discover a brand-new revocation during a blocking scan -
+        // which was never reliable anyway, since a revocation the cache has not
+        // seen is exactly the case that stalls, and a stalled scan fails open.
+        // Network-backed revocation belongs on the deferred worker, which has no
+        // kernel thread waiting on it.
+        trustData.dwProvFlags = WTD_SAFER_FLAG
+                              | WTD_REVOCATION_CHECK_CHAIN
+                              | WTD_CACHE_ONLY_URL_RETRIEVAL;
 
         LONG status = WinVerifyTrust(
             static_cast<HWND>(INVALID_HANDLE_VALUE), &policyGUID, &trustData);
