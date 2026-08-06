@@ -22,6 +22,7 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include "../../../PhantomCore/Diagnostics/DiagTrace.hpp"
 
 namespace ShadowStrike {
 namespace Products {
@@ -320,6 +321,11 @@ bool HomeProductOrchestrator::StartLocked() noexcept {
         bool ok = false;
         std::string errMsg;
         try {
+            // Timed individually: start-up drives roughly 125 module
+            // initialisations into a three-second window, and the machine
+            // stalls during exactly that window, so the per-module cost is
+            // the measurement that matters.
+            SS_DIAG_SCOPE("Startup", desc.name.c_str());
             ok = desc.start();
         } catch (const std::exception& e) {
             ok = false;
@@ -1006,6 +1012,11 @@ bool HomeProductOrchestrator::SetModuleMode(std::string_view name,
         bool ok = false;
         std::string errMsg;
         try {
+            // Timed individually: start-up drives roughly 125 module
+            // initialisations into a three-second window, and the machine
+            // stalls during exactly that window, so the per-module cost is
+            // the measurement that matters.
+            SS_DIAG_SCOPE("Startup", desc.name.c_str());
             ok = desc.start();
         } catch (const std::exception& e) {
             errMsg = e.what();
