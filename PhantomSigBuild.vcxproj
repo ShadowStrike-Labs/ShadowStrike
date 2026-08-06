@@ -1,0 +1,136 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PhantomSigBuild.vcxproj
+  =======================
+  Offline detection-content compiler. Build-machine tool, never shipped to an
+  endpoint.
+
+  It exists because SignatureBuilder - 9,833 lines across six translation units,
+  seven working import paths - had no caller anywhere in the tree, so no
+  signature database had ever been produced. Every deployment therefore logged
+  SignatureStore, PatternStore, HashStore and YaraRuleStore initialisation
+  failures, which read like configuration problems and were in fact an absence
+  of content.
+
+  Design points:
+    - Links PhantomCoreLib for the builder and the store, so the tool and the
+      product share one implementation. A separate compiler would drift.
+    - /SUBSYSTEM:CONSOLE, wmain, exit codes distinguishing usage from import
+      from build from verification failure, so CI can act on which stage broke.
+    - Same warning discipline as the rest of the tree: /W4 as errors.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}</ProjectGuid>
+    <RootNamespace>PhantomSigBuild</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <IntDir>$(ProjectDir)build\$(Configuration)\SigBuild\</IntDir>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <TargetName>phantom-sigbuild</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalIncludeDirectories>
+        $(ProjectDir)src;
+        $(ProjectDir)src\PhantomCore;
+        $(ProjectDir)include;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>
+        WIN32;_WINDOWS;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;
+        SHADOWSTRIKE_PRODUCT_HOME=1;
+        SHADOWSTRIKE_DIAG_TRACE=0;%(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EntryPointSymbol>wmainCRTStartup</EntryPointSymbol>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>
+        $(SolutionDir)lib\$(Configuration);
+        $(SolutionDir)vendor\openssl_lib;
+        $(SolutionDir)vendor\yara_lib;
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <AdditionalDependencies>
+        PhantomCoreLib.lib;libyara.lib;libcrypto.lib;libssl.lib;
+        advapi32.lib;kernel32.lib;user32.lib;shell32.lib;ole32.lib;oleaut32.lib;
+        crypt32.lib;wintrust.lib;version.lib;ws2_32.lib;wbemuuid.lib;
+        iphlpapi.lib;psapi.lib;shlwapi.lib;bcrypt.lib;ncrypt.lib;userenv.lib;
+        wtsapi32.lib;normaliz.lib;winhttp.lib;%(AdditionalDependencies)
+      </AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="tools\phantom-sigbuild\SigBuildMain.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="PhantomCoreLib.vcxproj">
+      <Project>{8A5C6B4D-2E1F-4A3B-9C7D-0E1F2A3B4C5D}</Project>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>
