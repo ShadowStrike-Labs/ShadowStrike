@@ -303,12 +303,49 @@ struct NetworkTrafficFilter::Impl {
                 continue;
             }
 
+            // The OVERLAPPED is mandatory: FilterPortGate::Connect passes
+            // dwOptions = 0, so FLT_PORT_FLAG_SYNC_HANDLE is not set and this
+            // handle is asynchronous. For an asynchronous handle
+            // FilterGetMessage requires lpOverlapped; passing nullptr allows the
+            // kernel to complete the operation after the call returns and write
+            // into storage the caller no longer owns. The same misuse on the
+            // primary scanner path was caught corrupting a return address in a
+            // symbolised crash dump.
+            OVERLAPPED overlapped{};
+            overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (overlapped.hEvent == nullptr) {
+                Utils::Logger::Error(
+                    "NetworkTrafficFilter: cannot create receive event: {}", ::GetLastError());
+                break;
+            }
+
             HRESULT hr = FilterGetMessage(
                 m_hPort,
                 pOsHeader,
                 static_cast<DWORD>(kBufSize),
-                nullptr   // synchronous; Stop() closes the port to unblock
+                &overlapped
             );
+
+            if (hr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+                // Stop() closes the port, which completes this wait with
+                // ERROR_OPERATION_ABORTED - handled below.
+                const DWORD waitResult = ::WaitForSingleObject(overlapped.hEvent, INFINITE);
+                if (waitResult == WAIT_OBJECT_0) {
+                    DWORD transferred = 0;
+                    if (::GetOverlappedResult(m_hPort, &overlapped, &transferred, FALSE)) {
+                        hr = S_OK;
+                    } else {
+                        hr = HRESULT_FROM_WIN32(::GetLastError());
+                    }
+                } else {
+                    hr = HRESULT_FROM_WIN32(::GetLastError());
+                    ::CancelIoEx(m_hPort, &overlapped);
+                    DWORD ignored = 0;
+                    ::GetOverlappedResult(m_hPort, &overlapped, &ignored, TRUE);
+                }
+            }
+
+            ::CloseHandle(overlapped.hEvent);
 
             if (m_stopRequested.load(std::memory_order_acquire)) break;
 

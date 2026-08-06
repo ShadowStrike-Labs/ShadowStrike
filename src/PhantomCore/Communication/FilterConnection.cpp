@@ -446,22 +446,50 @@ public:
         HRESULT hr;
         DWORD actualBytes = 0;
 
-        if (timeoutMs == 0) {
-            // Synchronous (blocking) call
-            hr = FilterGetMessage(
-                guard.get(),
-                pMessage,
-                bufferSize,
-                nullptr
-            );
-            if (SUCCEEDED(hr)) {
-                actualBytes = GetDeliveredMessageSize(buffer.data(), bufferSize);
-                if (actualBytes == 0) {
-                    hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-                }
-            }
-        } else {
-            // Asynchronous with timeout
+        // ------------------------------------------------------------------
+        // An OVERLAPPED is MANDATORY here, and omitting it was memory
+        // corruption rather than a style choice.
+        //
+        // FilterPortGate::Connect calls FilterConnectCommunicationPort with
+        // dwOptions = 0. FLT_PORT_FLAG_SYNC_HANDLE is NOT set, so the handle is
+        // opened for ASYNCHRONOUS I/O, and for an asynchronous handle the
+        // lpOverlapped parameter of FilterGetMessage is required - it is only
+        // optional on a synchronous handle.
+        //
+        // This function used to take a "synchronous" branch when timeoutMs was
+        // zero and pass nullptr. IPCManager::WorkerRoutine calls it with exactly
+        // that, so the primary scanner receive path - the one the kernel routes
+        // every scan request to - ran the illegal form on every message. The
+        // kernel then completes the operation after the call has returned and
+        // writes the delivered bytes and status into storage the caller no
+        // longer owns. That is unbounded corruption of whatever now occupies
+        // that memory.
+        //
+        // It matches every symptom on record. A symbolised dump shows the
+        // faulting thread inside this function - FilterConnection.cpp:423 via
+        // IPCManager.cpp:1694 - resuming at rip = 0x38 with rax, rbx, rdx, rsi
+        // and rbp all zero: a return address overwritten by a completion that
+        // arrived late. The same mechanism explains the frames that fail magic
+        // and version checks, the "impossible" file sizes with their four-byte
+        // offset, the AES-256-GCM authentication failures on frames that were
+        // valid when sent, and the 3,392 FilterGetMessage failures in 3.3
+        // seconds that IPCManager documents and answers with back-off. Those
+        // were treated as a framing protocol defect for a long time. They are
+        // one API misuse.
+        //
+        // Both paths now share the overlapped form. timeoutMs == 0 keeps its
+        // "block until a message arrives" meaning by waiting INFINITE; that
+        // remains interruptible because Disconnect cancels pending I/O and
+        // closes the handle, which completes the wait with
+        // ERROR_OPERATION_ABORTED - already handled below.
+        //
+        // Deliberately NOT fixed by passing FLT_PORT_FLAG_SYNC_HANDLE instead:
+        // that would change the handle semantics for every other caller of
+        // FilterPortGate::Connect, and a synchronous handle cannot be cancelled
+        // with CancelIoEx, which the timeout path depends on.
+        // ------------------------------------------------------------------
+        const DWORD waitMs = (timeoutMs == 0) ? INFINITE : timeoutMs;
+        {
             OVERLAPPED overlapped = {};
             overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -480,7 +508,7 @@ public:
             );
 
             if (hr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
-                DWORD waitResult = WaitForSingleObject(overlapped.hEvent, timeoutMs);
+                DWORD waitResult = WaitForSingleObject(overlapped.hEvent, waitMs);
 
                 if (waitResult == WAIT_OBJECT_0) {
                     DWORD bytesTransferred = 0;

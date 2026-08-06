@@ -624,13 +624,59 @@ struct FileSystemFilter::Impl {
             // iteration to be re-interpreted as a valid frame.
             std::memset(buffer.data(), 0, sizeof(FILTER_MESSAGE_HEADER) + sizeof(FilterMessageHeader));
 
-            // Get message from driver
+            // Get message from driver.
+            //
+            // The OVERLAPPED is mandatory, not optional. FilterPortGate::Connect
+            // passes dwOptions = 0, so FLT_PORT_FLAG_SYNC_HANDLE is NOT set and
+            // this handle is asynchronous; for an asynchronous handle
+            // FilterGetMessage requires lpOverlapped. Passing nullptr - which
+            // this call did, on all four reader threads, for every message - lets
+            // the kernel complete the operation after the call has returned and
+            // write the delivered bytes into storage the caller no longer owns.
+            // A symbolised crash dump caught the same misuse on the IPC worker
+            // resuming at rip = 0x38 from an overwritten return address, and it
+            // is the most likely source of the frames that fail magic, version
+            // and GCM authentication checks on this path too.
+            OVERLAPPED overlapped{};
+            overlapped.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (overlapped.hEvent == nullptr) {
+                Utils::Logger::Error(
+                    "FileSystemFilter: cannot create receive event: {}", ::GetLastError());
+                SS_DIAG("FSFilter", "MessageLoop ABORT: CreateEvent failed err=%lu",
+                        ::GetLastError());
+                break;
+            }
+
             HRESULT hr = FilterGetMessage(
                 m_hPort,
                 pMessage,
                 static_cast<DWORD>(bufferSize),
-                nullptr  // Overlapped (NULL = synchronous)
+                &overlapped
             );
+
+            if (hr == HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+                // Block until a message arrives. Stop() closes the port, which
+                // completes this wait with ERROR_OPERATION_ABORTED and is
+                // handled below, so shutdown is still prompt.
+                const DWORD waitResult = ::WaitForSingleObject(overlapped.hEvent, INFINITE);
+                if (waitResult == WAIT_OBJECT_0) {
+                    DWORD transferred = 0;
+                    if (::GetOverlappedResult(m_hPort, &overlapped, &transferred, FALSE)) {
+                        hr = S_OK;
+                    } else {
+                        hr = HRESULT_FROM_WIN32(::GetLastError());
+                    }
+                } else {
+                    hr = HRESULT_FROM_WIN32(::GetLastError());
+                    // Drain the cancellation before OVERLAPPED leaves scope,
+                    // otherwise the kernel may still write to this stack frame.
+                    ::CancelIoEx(m_hPort, &overlapped);
+                    DWORD ignored = 0;
+                    ::GetOverlappedResult(m_hPort, &overlapped, &ignored, TRUE);
+                }
+            }
+
+            ::CloseHandle(overlapped.hEvent);
 
             if (FAILED(hr)) {
                 if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
