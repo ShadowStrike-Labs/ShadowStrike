@@ -2695,6 +2695,7 @@ public:
             }
             ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
             metaCfg.processId = req.ProcessId;
+            SS_DIAG_SCOPE("OnAccess", "MetamorphicDetector::AnalyzeFile");
             auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
             if (metaResult.isMetamorphic) {
                 Utils::Logger::Warn(
@@ -2711,15 +2712,40 @@ public:
         }
 
         // Anti-Evasion: Packer Detection (packed executables are suspicious — feed into scan context)
+        //
+        // Depth is chosen by whether a kernel thread is waiting on us.
+        //
+        // This used to request PackerAnalysisDepth::Deep with the DeepScan flag
+        // unconditionally, on the in-line path, while the sensor holds an
+        // IRP_MJ_CREATE open and every other file operation on the machine queues
+        // behind it. A field trace measured a single on-access request at
+        // 4,665,512 us - 4.67 seconds - against a typical 100-300 us, which is
+        // precisely the stall the owner sees the moment a new file is touched.
+        //
+        // Commit 4ffcd2fe moved emulation, sandbox, YARA and fuzzy hashing off
+        // this path behind the deferred deep-scan worker. This call site and the
+        // metamorphic one above it were missed and kept their Deep setting.
+        //
+        // Deep analysis is not lost: QueueDeferredDeepScan re-examines every
+        // scanned file on the worker with full depth, off the kernel's thread.
+        // What changes is only WHEN the expensive work happens, never WHETHER.
+        // The quick pass still runs in-line, so entropy, section characteristics
+        // and signature matching continue to inform this verdict.
         bool fileIsPacked = false;
         double packingConfidence = 0.0;
         if (m_packerDetector) {
             ShadowStrike::AntiEvasion::PackerAnalysisConfig pdConfig;
-            pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Deep;
-            pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
+            // Standard = entropy + entry-point signature + sections + imports.
+            // All header-level work, and it keeps genuine packer detection on the
+            // in-line path. Deep adds YARA scanning and heuristics, which is the
+            // expensive tier and belongs on the deferred worker. Flags are left at
+            // the struct's designed default rather than narrowed by hand, so this
+            // change alters cost only, not which techniques are considered.
+            pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Standard;
             pdConfig.processId = req.ProcessId;
 
             ShadowStrike::AntiEvasion::PackerError pdErr{};
+            SS_DIAG_SCOPE("OnAccess", "PackerDetector::AnalyzeFile");
             auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr);
             if (pdErr.win32Code != 0) {
                 Utils::Logger::Warn(
