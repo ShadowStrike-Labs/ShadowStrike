@@ -306,6 +306,7 @@
     <ClCompile Include="src\PhantomCore\Service\BootTrace.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\Diagnostics\DiagTrace.cpp" />
     <ClCompile Include="src\PhantomCore\Service\EventPush.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

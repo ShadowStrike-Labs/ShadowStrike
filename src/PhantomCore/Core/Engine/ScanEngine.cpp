@@ -28,6 +28,7 @@
 
 #include "pch.h"
 #include "ScanEngine.hpp"
+#include "../../Diagnostics/DiagTrace.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES (The Real Deal)
@@ -1133,6 +1134,7 @@ EngineResult ScanEngine::ScanFile(
     // Declared here rather than beside its first use because the stages below
     // reach the exit path via goto, which may not jump over an initialization.
     std::optional<FileSystem::FileTypeInfo> sharedTypeInfo;
+    SS_DIAG_SCOPE("ScanEngine", "ScanFile");
     const auto resolveFileType =
         [&sharedTypeInfo, &filePath]() -> const FileSystem::FileTypeInfo& {
             if (!sharedTypeInfo.has_value()) {

@@ -39,6 +39,7 @@
 
 #include "AntivirusService.hpp"
 #include "BootTrace.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 #include "ServiceInstaller.hpp"
 #include "../Utils/Logger.hpp"
 
@@ -440,6 +441,18 @@ extern "C" int wmain(int argc, wchar_t* argv[]) {
 
     InstallProcessWideHandlers();
     ::ShadowStrikeAppendBootTrace(L"handlers-installed");
+
+    // Map the diagnostic trace ring before anything else runs, so start-up is
+    // covered too - the two hardest failures so far both happened during Start().
+    //
+    // This also recovers the previous session: if the machine was hard-reset
+    // while frozen, whatever the ring held is written to
+    // PhantomHome.Service.trace.log now, on this start, before we begin
+    // overwriting it. That is the whole point of the design - the evidence
+    // survives the event that destroyed the ability to collect it.
+    ::ShadowStrike::Diag::Initialize();
+    ::ShadowStrikeAppendBootTrace(
+        ::ShadowStrike::Diag::IsActive() ? L"diag-trace-ring-active" : L"diag-trace-ring-unavailable");
 
     InitialiseLogger();
 

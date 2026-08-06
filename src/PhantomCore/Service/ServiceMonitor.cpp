@@ -17,6 +17,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include "ServiceMonitor.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/SystemUtils.hpp"
 
@@ -428,6 +429,18 @@ namespace ShadowStrike {
                 status << "Service Hung (No Heartbeat for " << timeSinceLastHeartbeat.count() << "ms)";
                 SS_LOG_ERROR(kServiceMonitorLogCategory, L"Hang detected: no heartbeat for %lld ms",
                     static_cast<long long>(timeSinceLastHeartbeat.count()));
+
+                // Convert the in-memory trace ring to text at the one moment it
+                // is most valuable. The ring holds the last several thousand
+                // events with microsecond timings; the service log holds only
+                // what reached disk before the stall, which by definition
+                // excludes the stall itself. Dumped once per hang episode - the
+                // ring marks itself as dumped - so a persistent hang cannot turn
+                // this into its own I/O storm.
+                static std::atomic<bool> s_hangDumpDone{ false };
+                if (!s_hangDumpDone.exchange(true, std::memory_order_acq_rel)) {
+                    (void)::ShadowStrike::Diag::FlushToText(L"hang-detected");
+                }
             }
 
             newStats.isHealthy = healthy;

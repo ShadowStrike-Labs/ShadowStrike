@@ -37,6 +37,7 @@
 
 #include "pch.h"
 #include "RealTimeProtection.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 
 // ============================================================================
 // COMPONENT INCLUDES
@@ -2461,6 +2462,7 @@ public:
         m_stats.totalEvents++;
         m_stats.fileEvents++;
         m_stats.totalScans++;
+        SS_DIAG_SCOPE("OnAccess", "kernel-scan-request");
         m_performanceMetrics.kernelMessages++;
 
         if (m_state != ProtectionState::ACTIVE) {

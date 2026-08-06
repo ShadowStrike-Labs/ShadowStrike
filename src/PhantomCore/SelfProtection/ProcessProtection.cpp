@@ -47,6 +47,7 @@
 
 #include "pch.h"
 #include "ProcessProtection.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 
 // ============================================================================
 // COMMUNICATION INFRASTRUCTURE INCLUDES
@@ -2276,6 +2277,7 @@ void ProcessProtectionImpl::MonitoringThreadFunc() {
 
             // One system-wide thread snapshot serves every protected process.
             const auto threadsByProcess = SnapshotThreadsByProcess();
+            SS_DIAG("SelfProt", "reprotect: %zu process(es) in system thread snapshot", threadsByProcess.size());
             for (uint32_t pid : currentPids) {
                 const auto it = threadsByProcess.find(pid);
                 if (it == threadsByProcess.end()) {
