@@ -37,6 +37,7 @@
 #include "pch.h"
 #include "../Communication/FilterPortGate.hpp"
 #include "FileSystemFilter.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
@@ -340,26 +341,93 @@ struct FileSystemFilter::Impl {
             return true;
         }
 
+        SS_DIAG_SCOPE("FSFilter", "Start");
         Utils::Logger::Info("FileSystemFilter: Starting...");
 
         // Attempt to connect to driver
-        if (!ConnectToDriver()) {
+        const bool connected = ConnectToDriver();
+        SS_DIAG("FSFilter", "ConnectToDriver -> %s (port=%s, lastError=%lu)",
+                connected ? "ok" : "FAILED",
+                m_hPort != INVALID_HANDLE_VALUE ? "open" : "INVALID",
+                ::GetLastError());
+        if (!connected) {
             Utils::Logger::Warn("FileSystemFilter: Driver not available. Running in user-mode only.");
-            // Don't fail - we can still function without the driver for testing
+            // Deliberately non-fatal: a user-mode-only instance is valid for
+            // tests and for hosts where the sensor is not installed. What is
+            // NOT valid is pretending afterwards that we are filtering.
         }
 
         // Start message threads if connected
+        size_t spawned = 0;
         if (m_hPort != INVALID_HANDLE_VALUE) {
             m_stopMessageLoop = false;
             for (size_t i = 0; i < m_config.messageThreadCount; ++i) {
                 m_messageThreads.push_back(std::make_unique<std::thread>(
                     &Impl::MessageLoop, this));
+                ++spawned;
             }
+        }
+        SS_DIAG("FSFilter", "message reader threads spawned=%zu (configured=%zu)",
+                spawned, m_config.messageThreadCount);
+
+        // ------------------------------------------------------------------
+        // Report what is actually true.
+        //
+        // This used to SetStatus(Running) and log "Started successfully"
+        // unconditionally, even when the port was closed and therefore no
+        // reader thread existed. That is the worst possible state to be silent
+        // about: the driver gates its in-line scan wait on a client being
+        // CONNECTED, not on a client being able to ANSWER, so with the sensor
+        // loaded and no reader here every file create on the machine blocks
+        // until its deadline expires while this module reports itself healthy.
+        // A 297-second field trace showed exactly that - zero scan requests
+        // delivered to user mode for the whole session, with every subsystem
+        // claiming success.
+        //
+        // The status vocabulary for this already existed and was being thrown
+        // away: DriverNotInstalled, AccessDenied, PortBusy.
+        // ------------------------------------------------------------------
+        if (spawned == 0) {
+            const FilterStatus degraded = ClassifyConnectFailure();
+            SetStatus(degraded);
+            Utils::Logger::Error(
+                "FileSystemFilter: NOT filtering - no kernel message reader is running "
+                "(status={}). On-access scanning is inactive; if the sensor is loaded, "
+                "file operations will stall on their scan deadline.",
+                static_cast<unsigned>(degraded));
+            SS_DIAG("FSFilter", "START DEGRADED: no reader thread, status=%u",
+                    static_cast<unsigned>(degraded));
+            // Still returns true: the caller's contract is "did start complete",
+            // and the honest state is now published for the orchestrator and UI
+            // to act on rather than buried in a warning.
+            return true;
         }
 
         SetStatus(FilterStatus::Running);
-        Utils::Logger::Info("FileSystemFilter: Started successfully");
+        Utils::Logger::Info("FileSystemFilter: Started successfully ({} reader threads)", spawned);
+        SS_DIAG("FSFilter", "START OK: filtering with %zu reader thread(s)", spawned);
         return true;
+    }
+
+    /// Maps the reason the port could not be opened onto the status vocabulary
+    /// that already exists for it, so callers can distinguish "sensor absent"
+    /// from "sensor present but we were refused".
+    [[nodiscard]] FilterStatus ClassifyConnectFailure() const noexcept {
+        const DWORD err = ::GetLastError();
+        switch (err) {
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
+                return FilterStatus::DriverNotInstalled;
+            case ERROR_ACCESS_DENIED:
+            case ERROR_PRIVILEGE_NOT_HELD:
+                return FilterStatus::AccessDenied;
+            case ERROR_BUSY:
+            case ERROR_PIPE_BUSY:
+            case ERROR_TOO_MANY_OPEN_FILES:
+                return FilterStatus::PortBusy;
+            default:
+                return FilterStatus::Error;
+        }
     }
 
     void Stop() {
@@ -487,6 +555,7 @@ struct FileSystemFilter::Impl {
 
     void MessageLoop() {
         Utils::Logger::Info("FileSystemFilter: Message thread started");
+        SS_DIAG("FSFilter", "MessageLoop ENTER tid=%lu", ::GetCurrentThreadId());
 
         // Snapshot the buffer size once; ignore later UpdateConfig() changes -
         // resizing under FilterGetMessage is unsafe.
@@ -495,6 +564,7 @@ struct FileSystemFilter::Impl {
             Utils::Logger::Error(
                 "FileSystemFilter: Message buffer too small ({} bytes) - aborting message thread",
                 bufferSize);
+            SS_DIAG("FSFilter", "MessageLoop ABORT: buffer too small (%zu bytes)", bufferSize);
             return;
         }
 
