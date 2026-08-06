@@ -425,3 +425,13 @@ vendor/onnxruntime/**/*.pdb
 
 
 build/wix-intermediate/
+
+# Threat-feed and API credentials - never commit
+super_secret_text.txt
+*.credentials
+*api*key*.txt
+*apikey*
+secrets/
+.env
+.env.*
+*.pfx.txt
