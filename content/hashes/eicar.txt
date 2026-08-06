@@ -1,0 +1,22 @@
+# EICAR standard antivirus test file
+# ---------------------------------------------------------------------------
+# Format: TYPE:HASH:NAME:LEVEL
+#
+# This is the industry-standard harmless test file defined by EICAR. It is not
+# malware, contains no payload, and exists so that a scanner can be proven to
+# work end to end. It is the first entry in this database deliberately: it
+# gives us a detection we can assert on in a test without handling a real
+# sample, which means the minifilter, the frame protocol, the scan engine, the
+# hash store and the remediation path can all be verified in one pass.
+#
+# The 68-byte EICAR file:
+#   X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
+#
+# SHA-256 of exactly those 68 bytes, no trailing newline:
+SHA256:275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f:EICAR-Test-File:Low
+
+# MD5 and SHA-1 of the same file, so a scanner configured for either still
+# matches. Level stays Low: this is a test artefact, not a threat, and marking
+# it Critical would train a user to ignore Critical.
+MD5:44d88612fea8a8f36de82e1278abb02f:EICAR-Test-File:Low
+SHA1:3395856ce81f2b7382dee72602f798b642f14140:EICAR-Test-File:Low
