@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -31,6 +31,10 @@
  */
 
 #include "IpcAuthToken.hpp"
+#include <thread>
+#include <mutex>
+#include <unordered_set>
+#include "../Diagnostics/DiagTrace.hpp"
 #include "BootTrace.hpp"    // ShadowStrikeAppendBootTrace - startup hang localisation
 
 // Windows SDK — explicit inclusions after PCH
@@ -590,6 +594,70 @@ std::string IpcAuthToken::EnsureForSession(std::uint32_t sessionId)
     ::ShadowStrikeAppendBootTrace(L"token-cache-GetOrGenerate-leave");
     return result;
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// RequestProvisionAsync  (service-side, non-blocking)
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+std::mutex                        g_provisionMutex;
+std::unordered_set<std::uint32_t> g_provisionInFlight;
+
+} // namespace
+
+void IpcAuthToken::RequestProvisionAsync(std::uint32_t sessionId) noexcept {
+    // Session 0 is the non-interactive services session; 0xFFFFFFFF means "no
+    // session". Neither has a user profile to write a token into.
+    if (sessionId == 0u || sessionId == 0xFFFFFFFFu) {
+        return;
+    }
+
+    // De-duplicate. The UI retries its handshake on a timer, so without this
+    // every retry would spawn another thread and they would serialise on the
+    // token cache lock - turning a cache miss into a thread pile-up.
+    {
+        std::lock_guard<std::mutex> lock(g_provisionMutex);
+        if (!g_provisionInFlight.insert(sessionId).second) {
+            SS_DIAG("SvcAuth", "provision already in flight for session %u", sessionId);
+            return;
+        }
+    }
+
+    const auto clearInFlight = [](std::uint32_t sid) noexcept {
+        std::lock_guard<std::mutex> lock(g_provisionMutex);
+        g_provisionInFlight.erase(sid);
+    };
+
+    try {
+        std::thread([sessionId, clearInFlight]() noexcept {
+            SS_DIAG("SvcAuth", "provision thread ENTER session=%u", sessionId);
+            try {
+                const std::string issued = EnsureForSession(sessionId);
+                SS_DIAG("SvcAuth", "provision thread LEAVE session=%u result=%s",
+                        sessionId, issued.empty() ? "FAILED" : "issued");
+                if (issued.empty()) {
+                    SS_LOG_WARN(kLogCat,
+                        L"Async provisioning failed for session %u", sessionId);
+                }
+            } catch (...) {
+                SS_DIAG("SvcAuth", "provision thread EXCEPTION session=%u", sessionId);
+            }
+            clearInFlight(sessionId);
+        }).detach();
+    } catch (const std::exception& e) {
+        // Thread creation failed (resource exhaustion). Clear the guard so a
+        // later attempt is not permanently suppressed by a flag we never reset.
+        clearInFlight(sessionId);
+        SS_LOG_ERROR(kLogCat,
+            L"RequestProvisionAsync: cannot start provisioning thread for session %u: %hs",
+            sessionId, e.what());
+    } catch (...) {
+        clearInFlight(sessionId);
+        SS_LOG_ERROR(kLogCat,
+            L"RequestProvisionAsync: cannot start provisioning thread for session %u",
+            sessionId);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Verify  (service-side)
 // ─────────────────────────────────────────────────────────────────────────────

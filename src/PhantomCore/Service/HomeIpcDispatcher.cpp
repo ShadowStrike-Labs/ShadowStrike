@@ -50,6 +50,7 @@
 
 #include "pch.h"
 #include "HomeIpcDispatcher.hpp"
+#include "../Diagnostics/DiagTrace.hpp"
 #include "ServiceCommunicator.hpp"
 #include "IpcAuthToken.hpp"
 #include "EventPush.hpp"
@@ -520,27 +521,57 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         if (!token || token->empty()) { sendErr("auth_failed", "Missing token"); return; }
 
         if (!IpcAuthToken::Verify(sessionId, *token)) {
-            if (sessionId != 0u && sessionId != 0xFFFFFFFFu) {
-                const std::string issued = IpcAuthToken::EnsureForSession(sessionId);
-                if (!issued.empty() && IpcAuthToken::Verify(sessionId, *token)) {
-                    svc.MarkClientAuthenticated(clientId);
-                    SS_LOG_INFO(kLogCat,
-                        L"AuthHandshake SUCCESS after cache self-heal clientId=%llu session=%u",
-                        clientId, sessionId);
-                    svc.SendResponseEnvelope(clientId, CommandType::AuthHandshake, requestId,
-                        nlohmann::json{{"ok", true}}.dump());
-                    return;
-                }
-            }
-            SS_LOG_WARN(kLogCat, L"AuthHandshake FAILED clientId=%llu session=%u",
+            // ------------------------------------------------------------------
+            // This used to "self-heal" by calling EnsureForSession() right here,
+            // on the IPC handler thread. EnsureForSession does WTSQueryUserToken,
+            // resolves the user's profile path and then WRITES THE TOKEN FILE -
+            // all blocking, and all while holding the token cache lock.
+            //
+            // That write goes through our own minifilter. The kernel then asks
+            // user mode for a verdict on it, and the thread that must produce
+            // that verdict is this one, currently blocked inside the write. Every
+            // other process's file operations queue behind it, so the whole
+            // machine stalls until the scan deadline expires. The owner observed
+            // exactly this: the system freezes the instant the UI displays
+            // "Authenticating the service session", frees for three to five
+            // seconds when the handshake times out and the UI reports
+            // "Service connection interrupted, retrying", then freezes again on
+            // the next attempt.
+            //
+            // Commit 760a4557 created the window this runs in: provisioning was
+            // moved to a detached thread so Start() could complete, which means
+            // the service reports RUNNING before the token file exists. The UI
+            // connects into that gap, Verify misses, and the miss used to be
+            // repaired on the worst possible thread.
+            //
+            // An IPC handler must never perform file I/O. Report not-ready and
+            // let the client retry - it already does, on a timer - while the
+            // provisioning thread does the write where blocking is harmless.
+            // ------------------------------------------------------------------
+            SS_DIAG("SvcAuth", "AuthHandshake token miss clientId=%llu session=%u"
+                               " -> replying auth_not_ready (no I/O on this thread)",
+                    clientId, sessionId);
+
+            IpcAuthToken::RequestProvisionAsync(sessionId);
+
+            SS_LOG_WARN(kLogCat,
+                L"AuthHandshake not ready clientId=%llu session=%u "
+                L"(token not yet provisioned; provisioning requested, client should retry)",
                 clientId, sessionId);
-            sendErr("auth_failed", "Token mismatch");
+
+            nlohmann::json e = MakeErrorResponse("auth_not_ready",
+                "Session token is still being provisioned; retry shortly");
+            e["retryable"] = true;
+            svc.SendResponseEnvelope(clientId, CommandType::AuthHandshake, requestId,
+                e.dump());
             return;
         }
 
         svc.MarkClientAuthenticated(clientId);
         SS_LOG_INFO(kLogCat, L"AuthHandshake SUCCESS clientId=%llu session=%u",
             clientId, sessionId);
+        SS_DIAG("SvcAuth", "AuthHandshake SUCCESS clientId=%llu session=%u",
+                clientId, sessionId);
         svc.SendResponseEnvelope(clientId, CommandType::AuthHandshake, requestId,
             nlohmann::json{{"ok", true}}.dump());
     });

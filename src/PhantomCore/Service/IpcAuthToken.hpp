@@ -105,6 +105,31 @@ public:
     [[nodiscard]] static std::string EnsureForSession(std::uint32_t sessionId);
 
     /**
+     * @brief Request provisioning for a session WITHOUT blocking the caller.
+     *
+     * Exists because EnsureForSession is not safe to call from every thread.
+     * It performs WTSQueryUserToken, resolves the user's profile path and
+     * writes the token file, holding the cache lock throughout. That write
+     * passes through our own minifilter, so the kernel asks user mode for a
+     * verdict on it - and if the calling thread is one that services verdicts
+     * or IPC, it is now blocked on a reply only it could have produced. The
+     * observable result was a system-wide stall for the whole scan deadline,
+     * repeating every time the UI retried its handshake.
+     *
+     * This entry point hands the work to a detached thread where blocking is
+     * harmless, and returns immediately. Calls are de-duplicated per session:
+     * the UI retries its handshake on a timer, so an un-guarded version would
+     * spawn a thread per attempt and each would contend for the same lock.
+     *
+     * Fire-and-forget by design. Callers should report "not ready, retry" to
+     * their client rather than waiting on the result.
+     *
+     * @param sessionId  Windows logon session ID. Session 0 and 0xFFFFFFFF are
+     *                   ignored: they are non-interactive and have no profile.
+     */
+    static void RequestProvisionAsync(std::uint32_t sessionId) noexcept;
+
+    /**
      * @brief Verify a client-supplied auth token for the given session.
      *
      * Compares tokenBase64 against the cached token for sessionId using a
