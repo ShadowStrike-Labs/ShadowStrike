@@ -72,6 +72,29 @@ std::mutex YaraRuleStore::s_yaraInitMutex;
 YaraCompiler::YaraCompiler()
     : m_compiler(nullptr)
 {
+    // libyara requires yr_initialize() before any other entry point: it sets up
+    // the allocators, the module table and thread-local state that
+    // yr_compiler_create() goes on to dereference. That call used to live only
+    // in YaraRuleStore::Initialize, which made this class silently dependent on
+    // a store having been constructed first - an ordering rule that appeared
+    // nowhere in the type system and that a caller had no way to discover.
+    //
+    // SignatureBuilder::BuildYaraIndex constructs a bare compiler with no store
+    // involved, and did so for the first time when the offline content build
+    // tool was written. It crashed with an access violation inside
+    // yr_compiler_create, for exactly this reason.
+    //
+    // Initialisation is idempotent and mutex-guarded, so owning it here costs a
+    // single atomic load on every subsequent construction and removes the
+    // hidden ordering requirement entirely.
+    const StoreError yaraReady = YaraRuleStore::InitializeYara();
+    if (!yaraReady.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraCompiler",
+            L"Cannot create compiler: YARA library initialization failed (%S)",
+            yaraReady.message.c_str());
+        return;
+    }
+
     int result = yr_compiler_create(&m_compiler);
     if(result != ERROR_SUCCESS) {
         SS_LOG_ERROR(L"YaraCompiler", L"Failed to create YARA compiler instance: %d", result);
