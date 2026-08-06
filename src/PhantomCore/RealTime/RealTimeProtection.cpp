@@ -2695,6 +2695,24 @@ public:
             }
             ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
             metaCfg.processId = req.ProcessId;
+            // Bound the work, do not reduce it.
+            //
+            // This call left timeoutMs at MetamorphicConstants::DEFAULT_SCAN_TIMEOUT_MS,
+            // which is sized for an offline sweep. A field trace caught a single
+            // invocation at 5,293.97 ms - 5.3 seconds - on the on-access path,
+            // where a kernel thread is parked inside FltSendMessage holding an
+            // IRP_MJ_CREATE and every other file operation on the machine queues
+            // behind the verdict. That one call accounted for 98 percent of all
+            // scan time in the session, and it is what the owner feels when a
+            // right-click or a UI tab switch locks the desktop.
+            //
+            // Depth and flags are deliberately left untouched: this is a deadline,
+            // not a narrower analysis, so every technique still runs and simply has
+            // to fit a budget appropriate to having a kernel thread waiting.
+            // Anything that does not fit is still covered, because
+            // QueueDeferredDeepScan re-examines the file off the kernel's thread
+            // where the full default timeout applies.
+            metaCfg.timeoutMs = 50u;
             SS_DIAG_SCOPE("OnAccess", "MetamorphicDetector::AnalyzeFile");
             auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
             if (metaResult.isMetamorphic) {
@@ -2791,6 +2809,7 @@ public:
         // to catch obvious malware indicators and feed kernel callback
         {
             auto& execAnalyzer = Core::FileSystem::ExecutableAnalyzer::Instance();
+            SS_DIAG_SCOPE("OnAccess", "ExecutableAnalyzer::AnalyzeForKernel");
             auto quickInfo = execAnalyzer.AnalyzeForKernel(
                 filePath,
                 req.ProcessId,
