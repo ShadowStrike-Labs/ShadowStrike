@@ -3959,12 +3959,12 @@ void ScanEngine::OptimizeForWorkload(ScanProfile profile) {
         case ScanProfile::Full:
             m_impl->m_config.enableHeuristics = true;
             m_impl->m_config.enableBehaviorAnalysis = true;
-            m_impl->m_config.enableMachineLearning = true;
+            m_impl->m_config.enableMachineLearning = ShadowStrike::AI::kCortexEnabled;
             m_impl->m_config.archiveOptions.action = ArchiveAction::Extract;
             break;
 
         case ScanProfile::Smart:
-            m_impl->m_config.enableMachineLearning = true;
+            m_impl->m_config.enableMachineLearning = ShadowStrike::AI::kCortexEnabled;
             break;
 
         case ScanProfile::Rootkit:

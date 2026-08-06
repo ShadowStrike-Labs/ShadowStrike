@@ -157,6 +157,7 @@
 #include <chrono>
 #include <set>
 #include <algorithm>
+#include "../../AI/CortexSwitch.hpp"
 
 namespace ShadowStrike {
 namespace Core {
@@ -515,7 +516,7 @@ struct EngineConfig {
     bool enableRealTime = true;
     bool enableHeuristics = true;
     bool enableBehaviorAnalysis = true;
-    bool enableMachineLearning = true;
+    bool enableMachineLearning = ShadowStrike::AI::kCortexEnabled;
     bool enableCloudLookup = true;
     bool enableMemoryScanning = true;
     bool enableScriptAnalysis = true;
@@ -601,7 +602,7 @@ struct EngineConfig {
         config.sensitivityLevel = 3;
         config.enableHeuristics = true;
         config.enableBehaviorAnalysis = true;
-        config.enableMachineLearning = true;
+        config.enableMachineLearning = ShadowStrike::AI::kCortexEnabled;
         config.enableCloudLookup = true;
         config.archiveOptions.action = ArchiveAction::Extract;
         config.archiveOptions.maxNestingDepth = 10;

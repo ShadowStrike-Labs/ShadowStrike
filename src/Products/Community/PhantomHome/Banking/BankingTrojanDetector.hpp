@@ -154,6 +154,7 @@
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/AI/CortexSwitch.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -765,7 +766,7 @@ struct BankingTrojanDetectorConfiguration {
     bool enableHeuristics = true;
     
     /// @brief Enable machine learning
-    bool enableMachineLearning = true;
+    bool enableMachineLearning = ShadowStrike::AI::kCortexEnabled;
     
     /// @brief Enable memory scanning
     bool enableMemoryScanning = true;

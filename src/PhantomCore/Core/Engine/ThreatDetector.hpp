@@ -226,6 +226,7 @@
 #include <unordered_set>
 #include <variant>
 #include <vector>
+#include "../../AI/CortexSwitch.hpp"
 
 #ifdef _WIN32
 #  ifndef NOMINMAX
@@ -1339,7 +1340,7 @@ struct ThreatDetectorConfig {
     bool enableEmulationEngine = true;
     
     /// @brief Enable machine learning detection
-    bool enableMLDetection = true;
+    bool enableMLDetection = ShadowStrike::AI::kCortexEnabled;
     
     /// @brief Enable packer detection
     bool enablePackerDetection = true;
