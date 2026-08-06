@@ -402,6 +402,17 @@ void YaraCompiler::ClearErrors() noexcept {
     m_warnings.clear();
 }
 
+// Returns a NON-OWNING pointer. Do not call yr_rules_destroy on the result.
+//
+// We link YARA 4.5.4. From YARA 4.0 onward YR_RULES is a singleton owned by the
+// compiler: every call returns the same structure and yr_compiler_destroy
+// releases it. Destroying it here, or in a caller, frees the compiler's only
+// rule set along with the arena holding every rule identifier and namespace
+// name, leaving any other holder reading released memory.
+//
+// Consequence for callers: the YaraCompiler must outlive every pointer this
+// returns. A local compiler whose rules are stored past its scope is a
+// use-after-free.
 YR_RULES* YaraCompiler::GetRules() noexcept {
     if (!m_compiler) {
         return nullptr;
@@ -517,11 +528,33 @@ std::optional<std::vector<uint8_t>> YaraCompiler::SaveToBuffer() noexcept {
         return std::nullopt;
     }
 
-    // RAII guard for rules cleanup
-    struct RulesGuard {
-        YR_RULES* rules;
-        ~RulesGuard() { if (rules) yr_rules_destroy(rules); }
-    } rulesGuard{rules};
+    // ------------------------------------------------------------------
+    // The rules returned here are NOT ours to destroy.
+    //
+    // We link YARA 4.5.4, and from YARA 4.0 onward YR_RULES is a singleton:
+    // every call to yr_compiler_get_rules hands back the same structure, which
+    // the compiler owns and yr_compiler_destroy releases. VirusTotal's own 4.0
+    // migration notes state it directly - in 2.x and 3.x the function returned a
+    // new instance per call, in 4.0 it does not. This code was written against
+    // the older contract.
+    //
+    // There used to be an RAII guard here calling yr_rules_destroy. That freed
+    // the compiler's only rule set, so any caller still holding a pointer from
+    // GetRules() was left iterating released memory - and the rule identifiers
+    // and namespace names live inside the arena that goes with it.
+    //
+    // That was SignatureBuilder::BuildYaraIndex, which calls GetRules(), then
+    // SaveToBuffer(), then walks the rules. Under cdb the fault lands in
+    // SignatureBuilder.cpp:1706 constructing a std::string from
+    // rule->ns->name - strlen over freed memory. It reproduced on any rule file
+    // regardless of content, which fits a lifetime defect and rules out the
+    // rule text, and it was also a latent double free because
+    // yr_compiler_destroy releases the same pointer again.
+    //
+    // Nothing leaks by not destroying: ~YaraCompiler calls yr_compiler_destroy.
+    // The real constraint this creates is that the compiler must outlive every
+    // pointer handed out by GetRules().
+    // ------------------------------------------------------------------
 
     // ========================================================================
     // WRITE TO BUFFER WITH SIZE LIMIT

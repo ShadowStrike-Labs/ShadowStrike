@@ -242,6 +242,13 @@ public:
     // ========================================================================
 
     // Get compiled rules (transfers ownership)
+    /// @brief Get the compiled rules.
+    /// @return Non-owning pointer owned by this compiler, or nullptr on failure.
+    /// @warning Do NOT call yr_rules_destroy on the result. Since YARA 4.0
+    ///          YR_RULES is a singleton owned by the compiler; destroying it
+    ///          frees the arena that holds every rule identifier and namespace
+    ///          name, and yr_compiler_destroy would then release it a second
+    ///          time. This compiler must outlive the returned pointer.
     [[nodiscard]] YR_RULES* GetRules() noexcept;
 
     // Save compiled rules to file
