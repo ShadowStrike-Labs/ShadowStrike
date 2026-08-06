@@ -81,6 +81,23 @@ std::atomic<std::uint64_t> g_written{ 0 };
 std::int64_t      g_qpcFreq = 0;
 SRWLOCK           g_flushLock = SRWLOCK_INIT;   // serialises text dumps only
 
+// Mapped writes land in the page cache and are written out on the cache
+// manager's own schedule, so a hard power-off discards every dirty page. That
+// defeated the entire purpose the first time this ran in the field: the ring
+// file was the right size and the header said the session was active, yet all
+// 8 MB read back as zeroes because nothing had ever been written to disk. The
+// ring therefore needs an explicit periodic flush.
+//
+// It runs on its own thread rather than the write path: a flush is a syscall
+// and the write path must stay free of them. It flushes only the slots filled
+// since the previous pass, and does nothing at all when no record has been
+// written, so an idle service performs no I/O for tracing.
+constexpr DWORD   kFlushIntervalMs = 1000;
+
+HANDLE            g_flushThread     = nullptr;
+HANDLE            g_flushStop       = nullptr;
+std::int64_t      g_lastFlushedHead = 0;        // flush thread and Shutdown only
+
 [[nodiscard]] std::int64_t NowQpc() noexcept {
     LARGE_INTEGER li{};
     ::QueryPerformanceCounter(&li);
@@ -117,6 +134,57 @@ int FormatRecord(const Record& r, const RingHeader& hdr, char* out, size_t cap) 
         "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ  %14.3f  tid=%-6u  %-24s %s\r\n",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         sinceStartMs, r.threadId, r.category, r.message);
+}
+
+// Pushes the slots written since the last pass out to disk. Flushes the record
+// range first and the header second, so if power is lost between the two the
+// on-disk head is behind the records rather than ahead of them - a reader then
+// recovers slightly less than was written instead of reading slots that were
+// never filled.
+void FlushDirtyRange() noexcept {
+    if (g_header == nullptr || g_records == nullptr) {
+        return;
+    }
+
+    const std::int64_t head = g_header->head;
+    if (head == g_lastFlushedHead) {
+        return;                       // nothing written since last pass: no I/O
+    }
+
+    if (head - g_lastFlushedHead >= static_cast<std::int64_t>(kRecordCount)) {
+        // Wrapped entirely since the last pass, so every slot is dirty.
+        ::FlushViewOfFile(g_records, sizeof(Record) * kRecordCount);
+    } else {
+        const std::uint32_t from = static_cast<std::uint32_t>(g_lastFlushedHead % kRecordCount);
+        const std::uint32_t to   = static_cast<std::uint32_t>(head % kRecordCount);
+        if (from < to) {
+            ::FlushViewOfFile(&g_records[from], sizeof(Record) * (to - from));
+        } else {
+            // The written range crosses the end of the buffer: two pieces.
+            ::FlushViewOfFile(&g_records[from], sizeof(Record) * (kRecordCount - from));
+            if (to > 0) {
+                ::FlushViewOfFile(g_records, sizeof(Record) * to);
+            }
+        }
+    }
+
+    ::FlushViewOfFile(g_header, sizeof(RingHeader));
+    g_lastFlushedHead = head;
+}
+
+DWORD WINAPI FlushThreadProc(LPVOID) noexcept {
+    // Below normal: this thread exists to preserve evidence, never to compete
+    // with the work being traced.
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+    for (;;) {
+        const DWORD wait = ::WaitForSingleObject(g_flushStop, kFlushIntervalMs);
+        FlushDirtyRange();
+        if (wait == WAIT_OBJECT_0) {
+            break;                    // stop requested, and we just flushed
+        }
+    }
+    return 0;
 }
 
 } // namespace
@@ -205,10 +273,25 @@ void Initialize() noexcept {
     g_header->dumped               = 0;
 
     g_written.store(0, std::memory_order_relaxed);
+    g_lastFlushedHead = 0;
     g_active.store(true, std::memory_order_release);
 
-    SS_DIAG("Diag", "trace ring active: %u records, %u bytes/record, pid=%u",
-            kRecordCount, static_cast<unsigned>(sizeof(Record)), ::GetCurrentProcessId());
+    // Get the fresh header on disk immediately, so a crash seconds from now
+    // still leaves a recoverable ring rather than a zeroed one.
+    ::FlushViewOfFile(g_header, sizeof(RingHeader));
+
+    g_flushStop = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_flushStop != nullptr) {
+        g_flushThread = ::CreateThread(nullptr, 0, FlushThreadProc, nullptr, 0, nullptr);
+        if (g_flushThread == nullptr) {
+            ::CloseHandle(g_flushStop);
+            g_flushStop = nullptr;
+        }
+    }
+
+    SS_DIAG("Diag", "trace ring active: %u records, %u bytes/record, pid=%u, flush=%ums",
+            kRecordCount, static_cast<unsigned>(sizeof(Record)),
+            ::GetCurrentProcessId(), kFlushIntervalMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +425,20 @@ bool FlushToText(const wchar_t* reason) noexcept {
 // ---------------------------------------------------------------------------
 
 void Shutdown() noexcept {
+    // Stop the flusher before unmapping, or it would flush a dead view.
+    if (g_flushStop != nullptr) {
+        ::SetEvent(g_flushStop);
+    }
+    if (g_flushThread != nullptr) {
+        ::WaitForSingleObject(g_flushThread, 3000);
+        ::CloseHandle(g_flushThread);
+        g_flushThread = nullptr;
+    }
+    if (g_flushStop != nullptr) {
+        ::CloseHandle(g_flushStop);
+        g_flushStop = nullptr;
+    }
+
     if (g_active.exchange(false, std::memory_order_acq_rel)) {
         (void)FlushToText(L"clean-shutdown");
     }
