@@ -746,7 +746,11 @@ public:
     WorkerThread(WorkerThread&&) = delete;
     WorkerThread& operator=(WorkerThread&&) = delete;
     
-    void Start();
+    /// @return true if the worker started AND published its system thread id within
+    ///         the bounded wait; false means the thread is running but did not
+    ///         announce itself, so its id must not be used (see the .cpp for why
+    ///         an unbounded wait here could hang the whole service).
+    [[nodiscard]] bool Start();
     void Stop();
     void Pause();
     void Resume();

@@ -40,6 +40,7 @@
  * @copyright 2026 ShadowStrike Security Suite
  */
 
+#include <span>
 #include "pch.h"
 #include "ExecutableAnalyzer.hpp"
 
@@ -644,7 +645,7 @@ public:
 
             // Calculate hashes if requested
             if (options.calculateHashes) {
-                CalculateHashes(filePath, info);
+                CalculateHashes(fileBytes, filePath, info);
             }
 
             // Verify signature if requested (requires file path)
@@ -2648,12 +2649,31 @@ public:
         return sigInfo;
     }
 
-    void CalculateHashes(const std::wstring& filePath, ExecutableInfo& info) const {
+    // Hash the bytes the caller has ALREADY read, rather than re-reading the file.
+    //
+    // This used to take a path and call ReadAllBytes itself, while its only caller
+    // (Analyze) had just read the identical file into memory a few lines earlier.
+    // Every scanned file was therefore opened twice and read twice, into two full
+    // buffers, on the real-time on-access path.
+    //
+    // That is not only wasted I/O and memory. Each open is a separate
+    // IRP_MJ_CREATE that traverses our own minifilter, so the redundant read
+    // doubled the exposure of the scan path to anything that can block a file
+    // open - and a scan worker that blocks inside this call stops answering the
+    // kernel, which stalls file I/O machine-wide. Field evidence: a trace showing
+    // ExecutableAnalyzer::AnalyzeForKernel entered with no matching exit record,
+    // after which only the self-protection loop still ran.
+    //
+    // Taking a span makes the redundant read impossible to reintroduce: there is
+    // no path here to open. The path is retained for log messages only.
+    void CalculateHashes(std::span<const std::byte> fileBytes,
+                         const std::wstring& filePath,
+                         ExecutableInfo& info) const {
         try {
-            // Read file for hashing
-            std::vector<std::byte> fileBytes;
-            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes) || fileBytes.empty()) {
-                SS_LOG_ERROR(L"ExecutableAnalyzer", L"CalculateHashes: Failed to read file for hashing");
+            if (fileBytes.empty()) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer",
+                    L"CalculateHashes: empty buffer for '%ls' - nothing to hash",
+                    filePath.c_str());
                 return;
             }
 

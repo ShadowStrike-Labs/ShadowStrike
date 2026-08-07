@@ -930,21 +930,53 @@ WorkerThread::~WorkerThread() {
  * @note Multiple calls are idempotent.
  * @note Blocks briefly until thread initialization completes.
  */
-void WorkerThread::Start() {
+bool WorkerThread::Start() {
     // Atomic check-and-set prevents multiple starts
     if (running_.exchange(true, std::memory_order_acq_rel)) {
-        return; // Already running - idempotent
+        return true; // Already running - idempotent
     }
-    
+
     thread_ = std::thread([this]() {
         WorkerLoop();
     });
-    
-    // Wait for thread to initialize and set its system thread ID
-    // This ensures GetSystemThreadId() returns valid value after Start() returns
+
+    // Wait, BOUNDED, for the worker to publish its system thread id.
+    //
+    // This was `while (id == 0) std::this_thread::yield();` with no deadline and
+    // no way to report failure, which turned a slow thread start into a permanent
+    // hang of the caller.
+    //
+    // A newly created thread is not running our code yet: it first traverses the
+    // loader, which takes the loader lock and runs DLL_THREAD_ATTACH for every
+    // loaded module, and that can require paging module pages in from disk. When
+    // file I/O is stalled - precisely the condition this product creates if a scan
+    // worker blocks - the new thread never reaches WorkerLoop, the sentinel never
+    // changes, and the spin never ends. Field evidence: a service start reached
+    // svccomm-ThreadPoolInitialize-enter and emitted no further boot marker for the
+    // remaining life of the process, while a scan thread sat inside
+    // ExecutableAnalyzer::AnalyzeForKernel with no matching exit record.
+    //
+    // yield() also made this a busy spin, so the stall cost a fully occupied core
+    // on top of never terminating - actively starving the threads whose progress it
+    // was waiting on. Sleeping lets other runnable threads run, and the deadline
+    // turns "hung forever" into a failure the caller can act on. The thread is left
+    // running: it is a valid worker that was merely slow to announce itself, and
+    // killing it here would trade a diagnosable delay for a resource leak.
+    constexpr auto kIdPublishTimeout = std::chrono::seconds(10);
+    constexpr auto kIdPollInterval   = std::chrono::milliseconds(1);
+    const auto deadline = std::chrono::steady_clock::now() + kIdPublishTimeout;
+
     while (systemThreadId_.load(std::memory_order_acquire) == 0) {
-        std::this_thread::yield();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Do NOT report success: callers use the id to register this thread
+            // with the deadlock detector, and registering 0 would monitor a thread
+            // that does not exist while leaving this one unwatched.
+            return false;
+        }
+        std::this_thread::sleep_for(kIdPollInterval);
     }
+
+    return true;
 }
 
 /**
@@ -2059,11 +2091,26 @@ void ThreadPool::CreateWorkerThreads(size_t count) {
                 etwManager_.get()
             );
 
-            worker->Start();
+            const bool idPublished = worker->Start();
 
-            // Register for deadlock monitoring if enabled
-            if (deadlockDetector_) {
+            // Register for deadlock monitoring only when the worker actually
+            // announced itself. Start() no longer waits indefinitely for that, so
+            // the id can legitimately still be unknown here; registering 0 would
+            // monitor a nonexistent thread and leave the real one unwatched.
+            if (idPublished && deadlockDetector_) {
                 deadlockDetector_->RegisterThread(worker->GetSystemThreadId());
+            } else if (!idPublished) {
+                // Use this pool's own ETW channel - ThreadPool deliberately does not
+                // depend on the Logger, since the Logger may itself use a pool.
+                LogETWEvent(
+                    ETWEventId::ThreadPoolCreated,
+                    std::format(L"Worker {} started but did not publish its thread id within "
+                                L"the bounded wait; it remains a usable worker but is excluded "
+                                L"from deadlock monitoring. This normally means thread startup "
+                                L"is blocked in the loader, which on this product usually means "
+                                L"file I/O is stalled behind a wedged scan.", threadId),
+                    ETWLevel::Warning
+                );
             }
 
             workers_.push_back(std::move(worker));
