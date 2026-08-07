@@ -37,6 +37,7 @@
  */
 
 #include "pch.h"
+#include "../../Utils/SystemUtils.hpp"  // GetKnownFolderForAllUsersOrSelf
 #include "StartupAnalyzer.hpp"
 #include "RegistryMonitor.hpp"
 #include "PersistenceDetector.hpp"
@@ -748,11 +749,18 @@ struct StartupAnalyzer::StartupAnalyzerImpl {
 
     void EnumerateStartupFolders(std::vector<StartupItem>& items) {
         try {
-            wchar_t path[MAX_PATH];
-            if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_STARTUP, nullptr, 0, path))) {
-                EnumerateStartupFolder(items, path, StartupSource::StartupFolder_User);
+            // The per-user Startup folder is a first-class persistence location
+            // (ATT&CK T1547.001). Resolving it with a null token from a
+            // LocalSystem service yields the SYSTEM profile Startup folder, so a
+            // shortcut dropped in the real user Startup folder was never
+            // enumerated and that persistence route went undetected entirely.
+            for (const auto& userStartup :
+                 Utils::SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Startup)) {
+                EnumerateStartupFolder(items, userStartup, StartupSource::StartupFolder_User);
             }
 
+            // All-users Startup is machine-wide, so the caller identity is correct.
+            wchar_t path[MAX_PATH];
             if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_STARTUP, nullptr, 0, path))) {
                 EnumerateStartupFolder(items, path, StartupSource::StartupFolder_AllUsers);
             }

@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"  // GetKnownFolderForAllUsersOrSelf
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -293,7 +294,7 @@ public:
 
 private:
     std::vector<ExtensionInfo> DiscoverExtensions(ChromiumBrowser browser);
-    fs::path GetBrowserUserDataPath(ChromiumBrowser browser);
+    std::vector<fs::path> GetBrowserUserDataPaths(ChromiumBrowser browser);
     PermissionRisk CalculatePermissionRisk(const std::string& permission);
     ExtensionVerdict CalculateVerdict(const ExtensionScanResult& result);
     ExtensionRiskLevel CalculateRiskLevel(const ExtensionScanResult& result);
@@ -962,72 +963,77 @@ ChromeExtensionScannerImpl::CalculateRiskLevel(const ExtensionScanResult& result
 // PROFILE DISCOVERY
 // ============================================================================
 
-fs::path ChromeExtensionScannerImpl::GetBrowserUserDataPath(ChromiumBrowser browser) {
-    // SHGetFolderPathA is ANSI and the deprecated API; SHGetKnownFolderPath
-    // returns a wide path that survives non-ASCII usernames and is the modern
-    // shell-folder API.
-    auto resolveKnown = [](REFKNOWNFOLDERID id) -> fs::path {
-        PWSTR raw = nullptr;
-        if (FAILED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &raw)) || raw == nullptr) {
-            if (raw) CoTaskMemFree(raw);
-            return {};
-        }
-        fs::path p{raw};
-        CoTaskMemFree(raw);
-        return p;
-    };
+std::vector<fs::path>
+ChromeExtensionScannerImpl::GetBrowserUserDataPaths(ChromiumBrowser browser) {
+    // This runs inside a LocalSystem service, so resolving LocalAppData against
+    // the calling identity returns the SYSTEM profile - which has no browser
+    // installed. Every extension scan therefore looked in a directory that does
+    // not exist, and malicious extension detection has never run. Resolve each
+    // interactive user's real AppData instead; see SystemUtils for the contract.
+    std::vector<fs::path> results;
 
-    fs::path localAppData = resolveKnown(FOLDERID_LocalAppData);
-    if (localAppData.empty()) return {};
+    const bool wantsRoaming = (browser == ChromiumBrowser::Opera);
+    const auto bases = wantsRoaming
+        ? Utils::SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_RoamingAppData)
+        : Utils::SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_LocalAppData);
 
-    switch (browser) {
-        case ChromiumBrowser::Chrome:
-            return localAppData / L"Google" / L"Chrome" / L"User Data";
-        case ChromiumBrowser::Edge:
-            return localAppData / L"Microsoft" / L"Edge" / L"User Data";
-        case ChromiumBrowser::Brave:
-            return localAppData / L"BraveSoftware" / L"Brave-Browser" / L"User Data";
-        case ChromiumBrowser::Opera: {
-            fs::path roaming = resolveKnown(FOLDERID_RoamingAppData);
-            if (roaming.empty()) return {};
-            return roaming / L"Opera Software" / L"Opera Stable";
+    for (const auto& base : bases) {
+        const fs::path appData{base};
+        if (appData.empty()) continue;
+
+        switch (browser) {
+            case ChromiumBrowser::Chrome:
+                results.push_back(appData / L"Google" / L"Chrome" / L"User Data");
+                break;
+            case ChromiumBrowser::Edge:
+                results.push_back(appData / L"Microsoft" / L"Edge" / L"User Data");
+                break;
+            case ChromiumBrowser::Brave:
+                results.push_back(appData / L"BraveSoftware" / L"Brave-Browser" / L"User Data");
+                break;
+            case ChromiumBrowser::Opera:
+                results.push_back(appData / L"Opera Software" / L"Opera Stable");
+                break;
+            case ChromiumBrowser::Vivaldi:
+                results.push_back(appData / L"Vivaldi" / L"User Data");
+                break;
+            default:
+                break;
         }
-        case ChromiumBrowser::Vivaldi:
-            return localAppData / L"Vivaldi" / L"User Data";
-        default:
-            break;
     }
-    return {};
+
+    return results;
 }
 
 std::vector<fs::path>
 ChromeExtensionScannerImpl::GetBrowserProfiles(ChromiumBrowser browser) {
     std::vector<fs::path> profiles;
-    fs::path userData = GetBrowserUserDataPath(browser);
 
-    if (userData.empty() || !fs::exists(userData)) return profiles;
+    for (const auto& userData : GetBrowserUserDataPaths(browser)) {
+        if (userData.empty() || !fs::exists(userData)) continue;
 
-    try {
-        // Default profile
-        if (fs::exists(userData / "Default")) {
-            profiles.push_back(userData / "Default");
-        }
+        try {
+            // Default profile
+            if (fs::exists(userData / "Default")) {
+                profiles.push_back(userData / "Default");
+            }
 
-        // Numbered profiles (Profile 1, Profile 2, ...)
-        for (const auto& entry : fs::directory_iterator(userData)) {
-            if (entry.is_directory()) {
-                auto name = entry.path().filename().string();
-                if (name.find("Profile ") == 0) {
-                    profiles.push_back(entry.path());
+            // Numbered profiles (Profile 1, Profile 2, ...)
+            for (const auto& entry : fs::directory_iterator(userData)) {
+                if (entry.is_directory()) {
+                    auto name = entry.path().filename().string();
+                    if (name.find("Profile ") == 0) {
+                        profiles.push_back(entry.path());
+                    }
                 }
             }
+        } catch (const std::exception& e) {
+            Logger::Warn("ChromeExtensionScanner: error enumerating profiles for {}: {}",
+                std::string(GetChromiumBrowserName(browser)), e.what());
         }
-
-        m_stats.profilesScanned += profiles.size();
-    } catch (const std::exception& e) {
-        Logger::Warn("ChromeExtensionScanner: error enumerating profiles for {}: {}",
-            std::string(GetChromiumBrowserName(browser)), e.what());
     }
+
+    m_stats.profilesScanned += profiles.size();
 
     return profiles;
 }
@@ -1036,33 +1042,35 @@ std::vector<fs::path>
 ChromeExtensionScannerImpl::GetExtensionDirectories(
     ChromiumBrowser browser, const std::string& profileName) {
     std::vector<fs::path> dirs;
-    fs::path userData = GetBrowserUserDataPath(browser);
-    if (userData.empty()) return dirs;
 
-    fs::path extDir = userData / profileName / "Extensions";
-    if (!fs::exists(extDir)) return dirs;
+    for (const auto& userData : GetBrowserUserDataPaths(browser)) {
+        if (userData.empty()) continue;
 
-    try {
-        for (const auto& entry : fs::directory_iterator(extDir)) {
-            if (entry.is_directory()) {
-                // Each subdirectory is an extension ID; find latest version inside
-                fs::path latestVersion;
-                for (const auto& verEntry : fs::directory_iterator(entry.path())) {
-                    if (verEntry.is_directory()) {
-                        if (latestVersion.empty() ||
-                            verEntry.path().filename() > latestVersion.filename()) {
-                            latestVersion = verEntry.path();
+        fs::path extDir = userData / profileName / "Extensions";
+        if (!fs::exists(extDir)) continue;
+
+        try {
+            for (const auto& entry : fs::directory_iterator(extDir)) {
+                if (entry.is_directory()) {
+                    // Each subdirectory is an extension ID; find latest version inside
+                    fs::path latestVersion;
+                    for (const auto& verEntry : fs::directory_iterator(entry.path())) {
+                        if (verEntry.is_directory()) {
+                            if (latestVersion.empty() ||
+                                verEntry.path().filename() > latestVersion.filename()) {
+                                latestVersion = verEntry.path();
+                            }
                         }
                     }
-                }
-                if (!latestVersion.empty()) {
-                    dirs.push_back(latestVersion);
+                    if (!latestVersion.empty()) {
+                        dirs.push_back(latestVersion);
+                    }
                 }
             }
+        } catch (const std::exception& e) {
+            Logger::Warn("ChromeExtensionScanner: error enumerating extensions for {}: {}",
+                std::string(GetChromiumBrowserName(browser)), e.what());
         }
-    } catch (const std::exception& e) {
-        Logger::Warn("ChromeExtensionScanner: error listing extensions in {}: {}",
-            extDir.string(), e.what());
     }
 
     return dirs;
