@@ -128,7 +128,8 @@ bool PolicyManager::Initialize(const PolicyManagerConfiguration& config) {
         }
 
         // Launch periodic sync thread
-        if (config.enableAutoSync && config.syncIntervalSeconds > 0) {
+        if (config.enableAutoSync && config.syncIntervalSeconds > 0 &&
+        !config.managementServerUrl.empty()) {
             m_impl->m_syncThread = std::jthread([this](std::stop_token stoken) {
                 const auto interval = std::chrono::seconds(m_impl->m_config.syncIntervalSeconds);
                 while (!stoken.stop_requested() && !m_impl->m_shutdownRequested.load(std::memory_order_acquire)) {
