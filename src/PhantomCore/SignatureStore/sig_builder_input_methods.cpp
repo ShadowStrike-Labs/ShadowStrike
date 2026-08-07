@@ -699,13 +699,19 @@ namespace SignatureStore {
              // STEP 1: PRE-LOCK VALIDATION
              // ========================================================================
 
-             // Validate rule source
-            constexpr size_t MAX_RULE_SIZE = 1024 * 1024;  // 1MB
-            if (input.ruleSource.empty() || input.ruleSource.length() > MAX_RULE_SIZE) {
+             // Validate rule source. This is a rule SOURCE blob, not a single
+             // rule: ImportYaraRulesFromFile passes an entire file through here,
+             // and an aggregated pack legitimately holds thousands of rules in
+             // one source. Bounding it by the per-rule size rejected the first
+             // real rule set we were given, so the ceiling that applies is the
+             // shared source ceiling.
+            if (input.ruleSource.empty() ||
+                input.ruleSource.length() > YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"AddYaraRule: Invalid rule size %zu", input.ruleSource.length());
+                    L"AddYaraRule: Invalid rule source size %zu (max %zu)",
+                    input.ruleSource.length(), YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE);
                 return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                                  "Rule must be 1 byte - 1MB" };
+                                  "Rule source is empty or exceeds the maximum rule source size" };
             }
 
             // Validate namespace
