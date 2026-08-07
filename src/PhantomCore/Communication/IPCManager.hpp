@@ -418,6 +418,23 @@ struct RegistryOpRequest {
     }
 };
 
+// The kernel writes SHADOWSTRIKE_REGISTRY_NOTIFICATION and we read it back as
+// RegistryOpRequest, so the two layouts are one wire contract maintained in two
+// files. That equality was asserted only in the comment above, which enforces
+// nothing: adding or reordering a field on either side would silently shift every
+// subsequent offset and misparse every registry notification, and the
+// variable-length accessors above compute their offsets from this very size.
+// Pin it so a divergence is a build failure rather than a field mystery.
+static_assert(sizeof(RegistryOpRequest) == 21,
+              "RegistryOpRequest must stay byte-identical to "
+              "SHADOWSTRIKE_REGISTRY_NOTIFICATION in PhantomSensor/Shared/MessageProtocol.h "
+              "(UINT32 x2 + UINT8 + UINT16 x2 + UINT32 x2 under pack(1)). If this fires, the "
+              "kernel and user-mode views of the registry wire format have diverged.");
+static_assert(offsetof(RegistryOpRequest, keyPathLength) == 9,
+              "keyPathLength offset pins the packed layout against silent padding");
+static_assert(offsetof(RegistryOpRequest, dataSize) == 13,
+              "dataSize offset pins the packed layout against silent padding");
+
 /**
  * @brief Kernel reply — uses SHADOWSTRIKE_SCAN_VERDICT_REPLY from MessageProtocol.h
  */
@@ -919,6 +936,12 @@ private:
     // tears the channel down concurrently.
     std::shared_ptr<FilterConnection> m_primaryConnection;
     mutable std::mutex m_primaryConnMutex;
+
+    /// True once the primary connection has been observed connected at least once.
+    /// Guarded by m_primaryConnMutex on write; read unsynchronised only to decide
+    /// whether the bounded startup wait in SendToKernel applies, where a stale
+    /// false costs one short wait and a stale true costs nothing.
+    bool m_everConnected{ false };
 
     // Dedicated push connection (separate handle for user→kernel data push)
     std::unique_ptr<FilterConnection> m_pushConnection;

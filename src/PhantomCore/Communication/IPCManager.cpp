@@ -920,6 +920,52 @@ bool IPCManager::SendToKernel(
 
     auto startTime = Clock::now();
 
+    // Wait briefly for the channel, but ONLY before it has ever come up.
+    //
+    // Refusing to send is correct - we never fall back to plaintext - but simply
+    // dropping was not, because these 31 call sites carry two very different
+    // kinds of traffic. Some are one-shot events (a ransomware block request, a
+    // script block) where a loss is a missed action. Others push CONFIGURATION
+    // the kernel needs for the rest of the session: the protected registry key
+    // list (RegistryProtection), protected process and file sets
+    // (ProcessProtection, FileProtection), the self-defense config (SelfDefense),
+    // the ROP pattern database, honeypot registrations. Dropping one of those
+    // leaves the corresponding kernel-side protection permanently unconfigured,
+    // silently, for the whole session - the same silent-inertness failure mode
+    // that has already cost this project several inert detection modules.
+    //
+    // The observed drops are a startup ordering race: config pushes run before
+    // the port is established. Waiting a bounded moment resolves the race without
+    // relaxing the plaintext refusal. The wait is deliberately confined to the
+    // never-yet-connected case: once the channel has been up, a failure means a
+    // teardown or reconnect, where the reconnect path owns recovery and blocking
+    // a caller (including ransomware-response paths) would be harmful.
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        m_everConnected = m_everConnected ||
+                          (m_primaryConnection && m_primaryConnection->IsConnected());
+    }
+    if (!m_everConnected) {
+        constexpr auto kStartupChannelWait = std::chrono::milliseconds(2000);
+        constexpr auto kPollInterval       = std::chrono::milliseconds(25);
+        const auto deadline = Clock::now() + kStartupChannelWait;
+        while (Clock::now() < deadline) {
+            {
+                std::lock_guard lock(m_primaryConnMutex);
+                if (m_primaryConnection && m_primaryConnection->IsConnected()) {
+                    m_everConnected = true;
+                    break;
+                }
+            }
+            if (!m_running.load(std::memory_order_acquire)) break;
+            std::this_thread::sleep_for(kPollInterval);
+        }
+        if (m_everConnected) {
+            Utils::Logger::Info("[IPCManager] SendToKernel: waited for the encrypted channel "
+                                "at startup rather than dropping a {}-byte message", messageSize);
+        }
+    }
+
     // Route through FilterConnection for encryption
     {
         std::lock_guard lock(m_primaryConnMutex);
@@ -969,8 +1015,22 @@ bool IPCManager::SendToKernel(
         }
     }
 
-    Utils::Logger::Error("[IPCManager] SendToKernel: encrypted channel unavailable; "
-                         "refusing plaintext fallback");
+    // Still no channel. Refusing is correct - plaintext is never an option - but
+    // report enough to identify WHAT was lost. An anonymous "channel unavailable"
+    // cannot distinguish a dropped one-shot event from a dropped configuration
+    // push that leaves a kernel protection unconfigured for the session, and that
+    // distinction is the difference between a missed action and a silent gap.
+    {
+        uint32_t msgType = 0;
+        if (messageSize >= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            msgType = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(message)->MessageType;
+        }
+        Utils::Logger::Error("[IPCManager] SendToKernel: encrypted channel unavailable; "
+                             "refusing plaintext fallback - DROPPED messageType={} size={} "
+                             "everConnected={}. If this carried protection configuration, that "
+                             "configuration is now absent kernel-side until it is re-pushed.",
+                             msgType, messageSize, m_everConnected ? "yes" : "no");
+    }
     m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
@@ -2062,21 +2122,50 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                 }
                 auto* req = reinterpret_cast<RegistryOpRequest*>(pPayload);
 
-                // Validate variable-length bounds: keyPath + valueName + data must fit
+                // Validate variable-length bounds: keyPath + valueName + data must fit.
+                //
+                // These rejections are CORRECT - a length that overruns the payload must
+                // never be trusted - but they used to report no values at all, which is
+                // precisely why an observed run of them could not be explained. The
+                // producer side has been read and is self-consistent (ScanBridge.c sizes
+                // the buffer from the same clamped lengths it writes into the header, with
+                // two WCHARs of terminator slack, so its own guards cannot fail), and the
+                // layouts are now pinned by static_assert. So a rejection here means the
+                // frame did not arrive as the driver built it, and identifying that needs
+                // the actual numbers rather than an adjective.
                 uint32_t varOffset = static_cast<uint32_t>(sizeof(RegistryOpRequest));
                 uint32_t remaining = pAppHeader->DataSize - varOffset;
+                const uint32_t declaredTotal =
+                    static_cast<uint32_t>(req->keyPathLength) +
+                    static_cast<uint32_t>(req->valueNameLength) + req->dataSize;
+
                 if (req->keyPathLength > remaining) {
-                    Utils::Logger::Error("[IPCManager] RegistryNotify keyPath exceeds buffer");
+                    Utils::Logger::Error("[IPCManager] RegistryNotify keyPath exceeds buffer: "
+                                         "keyPathLength={} remaining={} DataSize={} "
+                                         "valueNameLength={} dataSize={} declaredTotal={} pid={}",
+                                         req->keyPathLength, remaining, pAppHeader->DataSize,
+                                         req->valueNameLength, req->dataSize, declaredTotal,
+                                         req->processId);
                     break;
                 }
                 remaining -= req->keyPathLength;
                 if (req->valueNameLength > remaining) {
-                    Utils::Logger::Error("[IPCManager] RegistryNotify valueName exceeds buffer");
+                    Utils::Logger::Error("[IPCManager] RegistryNotify valueName exceeds buffer: "
+                                         "valueNameLength={} remaining={} DataSize={} "
+                                         "keyPathLength={} dataSize={} declaredTotal={} pid={} op={}",
+                                         req->valueNameLength, remaining, pAppHeader->DataSize,
+                                         req->keyPathLength, req->dataSize, declaredTotal,
+                                         req->processId, static_cast<unsigned>(req->operation));
                     break;
                 }
                 remaining -= req->valueNameLength;
                 if (req->dataSize > remaining) {
-                    Utils::Logger::Error("[IPCManager] RegistryNotify data exceeds buffer");
+                    Utils::Logger::Error("[IPCManager] RegistryNotify data exceeds buffer: "
+                                         "dataSize={} remaining={} DataSize={} keyPathLength={} "
+                                         "valueNameLength={} declaredTotal={} pid={}",
+                                         req->dataSize, remaining, pAppHeader->DataSize,
+                                         req->keyPathLength, req->valueNameLength, declaredTotal,
+                                         req->processId);
                     break;
                 }
 
