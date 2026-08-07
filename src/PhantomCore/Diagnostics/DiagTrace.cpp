@@ -30,8 +30,27 @@ namespace {
 // itself and the reader can always find the next one.
 
 constexpr std::uint32_t kMagic        = 0x53534452u;  // 'SSDR'
-constexpr std::uint32_t kVersion      = 1u;
-constexpr std::uint32_t kRecordCount  = 32768u;       // ~8 MB total
+constexpr std::uint32_t kVersion      = 2u;
+// Sized against the measured field rate, not a guess.
+//
+// The 1.0.82 run sustained 428 scans/second, and each scan writes at least an
+// enter and an exit record plus whatever sub-scopes fire inside it. At 32768
+// records the ring wrapped in roughly 40 seconds, and the trace collected after
+// that run had already evicted every sub-scope - ExecutableAnalyzer,
+// MetamorphicDetector and ScanFile were all gone, leaving only the outer
+// kernel-scan-request scope. Fixing the throughput made the pipeline fast enough
+// to outrun its own instrument.
+//
+// 262144 records is 64 MB and holds roughly four to five minutes at that rate,
+// which covers a freeze episode plus the lead-up that explains it. That matters
+// specifically because a freeze cannot be diagnosed from the moment it happens -
+// the cause is in the seconds before, and a user cannot collect anything while
+// the machine is unresponsive, so the buffer has to survive until they can.
+//
+// The cost is bounded: the flusher writes only slots filled since its last pass,
+// so flush work scales with the write rate and not with ring size, and a
+// memory-mapped file only occupies pages actually touched.
+constexpr std::uint32_t kRecordCount  = 262144u;      // 64 MB total
 constexpr std::uint32_t kCategoryMax  = 24u;
 constexpr std::uint32_t kMessageMax   = 208u;   // 8+8+4+4+24+208 = 256 exactly
 
@@ -220,6 +239,10 @@ void Initialize() noexcept {
         return;                            // degrade to no-op, never fail a caller
     }
 
+    // Whether the file already existed decides whether the record area has to be
+    // cleared below. Must be read immediately: any later call clobbers it.
+    const bool ringFilePreexisted = (::GetLastError() == ERROR_ALREADY_EXISTS);
+
     LARGE_INTEGER want{};
     want.QuadPart = totalSize;
     ::SetFilePointerEx(g_file, want, nullptr, FILE_BEGIN);
@@ -261,7 +284,16 @@ void Initialize() noexcept {
     }
 
     // Start a clean session.
-    ::SecureZeroMemory(g_records, sizeof(Record) * kRecordCount);
+    //
+    // Only clear the record area when the file already existed. A file the
+    // filesystem just created is already zero-filled, so zeroing it would commit
+    // and dirty all 64 MB for nothing - forcing that much page allocation and
+    // writeback on every single service start. When the file did pre-exist the
+    // clear is mandatory, because a stale non-zero sequence field in an unwritten
+    // slot would otherwise read as a complete record from this session.
+    if (ringFilePreexisted) {
+        ::SecureZeroMemory(g_records, sizeof(Record) * kRecordCount);
+    }
     g_header->magic                = kMagic;
     g_header->version              = kVersion;
     g_header->recordCount          = kRecordCount;
@@ -292,6 +324,21 @@ void Initialize() noexcept {
     SS_DIAG("Diag", "trace ring active: %u records, %u bytes/record, pid=%u, flush=%ums",
             kRecordCount, static_cast<unsigned>(sizeof(Record)),
             ::GetCurrentProcessId(), kFlushIntervalMs);
+
+    // Say plainly what happened to the previous session's ring. Without this a
+    // discarded trace looks identical to one that was never written, which is
+    // exactly the ambiguity that wastes an investigation. A format change is the
+    // expected reason after a version bump: the record count and version are part
+    // of the recovery test, so an older ring is deliberately not reinterpreted
+    // under new layout assumptions.
+    if (ringFilePreexisted) {
+        SS_DIAG("Diag", "previous ring: %s",
+                recoverable ? "recovered to text before reset"
+                            : "present but not recoverable (format change, "
+                              "already dumped, or empty) - discarded");
+    } else {
+        SS_DIAG("Diag", "previous ring: none (file created this session)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +364,26 @@ void Write(const char* category, const char* format, ...) noexcept {
     r.qpc      = NowQpc();
     r.fileTime = NowFileTime();
     r.threadId = ::GetCurrentThreadId();
+
+    // Clear both fixed-width fields before writing them.
+    //
+    // strncpy_s and _vsnprintf_s with _TRUNCATE null-terminate but leave the
+    // rest of the buffer alone, so a short message landing in a slot that
+    // previously held a longer one left the old tail sitting after the
+    // terminator. The product's own text conversion was never affected - it
+    // formats with %s and stops at the first null - but the ring FILE contained
+    // those remnants, and any external decoder reading the field at its declared
+    // width saw two messages spliced together. One real example while diagnosing
+    // the on-access path: "< kernel-scan-request  78 us\0eFile", which parsed as
+    // a scope named "kernel-scan-request  78 us\0eFile" and produced nonsense
+    // timings in the summary.
+    //
+    // A record should contain exactly what it claims to contain. Two memsets of
+    // 24 and 208 bytes at a few thousand records per second is not measurable
+    // against the syscall-free write path this facility already has, and it
+    // removes a whole class of decoder confusion plus the stale-content leak.
+    ::memset(r.category, 0, sizeof(r.category));
+    ::memset(r.message,  0, sizeof(r.message));
 
     if (category != nullptr) {
         ::strncpy_s(r.category, sizeof(r.category), category, _TRUNCATE);
