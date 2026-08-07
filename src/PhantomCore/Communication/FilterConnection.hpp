@@ -118,7 +118,41 @@ public:
      * This is a blocking call that waits for a message from the kernel.
      * The buffer must be at least MAX_MESSAGE_SIZE bytes.
      */
-    [[nodiscard]] size_t GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs = 0);
+    /**
+     * @brief Outcome of a receive attempt on the kernel port.
+     *
+     * A frame can arrive intact at the FRAMING level and still be unusable at
+     * the PAYLOAD level, because HMAC verification or AES-GCM decryption failed.
+     * Those two outcomes must be distinguishable to the caller, and reporting
+     * only a byte count collapsed them into one.
+     *
+     * Filter Manager writes FILTER_MESSAGE_HEADER itself, in cleartext, ahead of
+     * our own encrypted payload. So on a frame whose payload we cannot decrypt,
+     * the MessageId is still valid and the kernel thread parked inside
+     * FltSendMessage can - and must - still be answered. Returning a bare 0 left
+     * that thread to wait out its entire timeout budget.
+     *
+     * That is not merely a latency cost. The driver's scan-bridge circuit
+     * breaker trips on reply-timeout RATE (SB_CIRCUIT_TIMEOUT_TRIP_COUNT within
+     * SB_CIRCUIT_TIMEOUT_WINDOW_MS) and then short-circuits the create path for
+     * SB_CIRCUIT_BREAKER_RECOVERY_MS, during which files are not scanned at all.
+     * Silently dropping undecryptable frames therefore fed a counter that can
+     * switch scanning off entirely, so answering is a detection requirement
+     * rather than an optimisation.
+     */
+    struct ReceiveResult {
+        /// Usable cleartext bytes in the buffer. Zero means DO NOT parse it.
+        size_t payloadBytes = 0;
+
+        /// Filter Manager MessageId of a frame still awaiting a reply, or zero
+        /// when nothing is owed (no frame arrived, or it was one-way).
+        uint64_t replyOwedId = 0;
+
+        [[nodiscard]] bool HasPayload() const noexcept { return payloadBytes != 0; }
+        [[nodiscard]] bool ReplyOwed()  const noexcept { return replyOwedId  != 0; }
+    };
+
+    [[nodiscard]] ReceiveResult GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs = 0);
 
     /**
      * @brief Send a reply to a kernel message

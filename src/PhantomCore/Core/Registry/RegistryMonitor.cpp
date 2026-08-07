@@ -1873,7 +1873,28 @@ private:
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     continue;
                 }
-                bytesReceived = m_connection->GetMessage(messageBuffer, 1000);
+                const auto recv = m_connection->GetMessage(messageBuffer, 1000);
+                bytesReceived = recv.payloadBytes;
+
+                // A frame we could not decrypt still has a kernel thread waiting
+                // on it, and its Filter Manager MessageId survives in cleartext.
+                // Release the waiter with a Clean verdict rather than letting it
+                // time out: the driver treats an unanswered scan as "not scanned,
+                // allowed" anyway, but each timeout also feeds the scan-bridge
+                // circuit breaker, which stops scanning altogether once it trips.
+                if (recv.ReplyOwed()) {
+                    Communication::ScanVerdictReply failOpen{};
+                    failOpen.messageId      = recv.replyOwedId;
+                    failOpen.verdict        = Communication::ScanVerdict::Clean;
+                    failOpen.threatDetected = false;
+                    auto foBuf = Communication::MessageDispatcher::SerializeVerdictReply(failOpen);
+                    if (!foBuf.empty() && m_connection) {
+                        (void)m_connection->ReplyMessage(foBuf, recv.replyOwedId);
+                    }
+                    SS_LOG_WARN(L"Registry", L"Undecryptable frame answered fail-open "
+                        L"to release kernel waiter msgId=%llu",
+                        static_cast<unsigned long long>(recv.replyOwedId));
+                }
             } catch (const std::exception& e) {
                 SS_LOG_WARN(L"Registry", L"GetMessage threw: %hs",
                     SanitizeForLog(e.what()).c_str());

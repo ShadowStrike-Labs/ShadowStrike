@@ -419,22 +419,22 @@ public:
     // Message Operations
     //=========================================================================
 
-    [[nodiscard]] size_t GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs) {
+    [[nodiscard]] FilterConnection::ReceiveResult GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs) {
         PortGuard guard(*this);
         if (!guard.valid()) {
             Utils::Logger::Warn("[FilterConnection] GetMessage: Not connected");
-            return 0;
+            return {};
         }
 
         if (buffer.empty()) {
             Utils::Logger::Error("[FilterConnection] GetMessage: Empty buffer");
-            return 0;
+            return {};
         }
 
         if (buffer.size() < sizeof(FILTER_MESSAGE_HEADER)) {
             Utils::Logger::Error("[FilterConnection] GetMessage: Buffer too small (need {})",
                                sizeof(FILTER_MESSAGE_HEADER));
-            return 0;
+            return {};
         }
 
         const DWORD bufferSize = static_cast<DWORD>(
@@ -497,7 +497,7 @@ public:
                 Utils::Logger::Error("[FilterConnection] Failed to create event: {}",
                                     ::GetLastError());
                 m_stats.errors++;
-                return 0;
+                return {};
             }
 
             hr = FilterGetMessage(
@@ -530,7 +530,7 @@ public:
                     GetOverlappedResult(guard.get(), &overlapped, &ignored, TRUE);
                     CloseHandle(overlapped.hEvent);
                     m_stats.timeouts++;
-                    return 0;
+                    return {};
                 } else {
                     hr = HRESULT_FROM_WIN32(::GetLastError());
                     // Also drain the I/O before destroying OVERLAPPED
@@ -567,7 +567,7 @@ public:
 
             if (hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
                 hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                return 0;
+                return {};
             }
 
             if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
@@ -592,27 +592,40 @@ public:
             }
 
             m_stats.errors++;
-            return 0;
+            return {};
         }
 
         if (actualBytes < sizeof(FILTER_MESSAGE_HEADER)) {
             Utils::Logger::Warn("[FilterConnection] Received malformed message");
             m_stats.errors++;
-            return 0;
+            return {};   // no valid header -> no MessageId -> nothing can be answered
         }
 
         m_stats.messagesReceived++;
         m_stats.bytesReceived += actualBytes;
 
-        // Decrypt if message has SHADOWSTRIKE_MSG_FLAG_ENCRYPTED set
+        // Capture the Filter Manager MessageId and waiter state from the CLEARTEXT
+        // header before touching the payload. fltmgr writes this header itself, so
+        // it stays valid even when our own payload fails integrity or decryption -
+        // which is what makes answering an undecryptable frame possible at all.
+        const auto* wdkHeader = reinterpret_cast<const FILTER_MESSAGE_HEADER*>(buffer.data());
+        const uint64_t wdkMessageId = wdkHeader->MessageId;
+        const bool kernelAwaitingReply = (wdkHeader->ReplyLength > 0);
+
         size_t decryptedBytes = static_cast<size_t>(actualBytes);
         if (!DecryptReceivedMessage(buffer.data(), decryptedBytes)) {
-            Utils::Logger::Warn("[FilterConnection] GetMessage: Decryption failed, dropping message");
+            // The frame is unusable, but the kernel thread must not be abandoned.
+            // Report the MessageId ONLY when Filter Manager says a waiter exists
+            // (ReplyLength > 0); replying to a one-way notification returns
+            // STATUS_FLT_NO_WAITER_FOR_REPLY and previously caused a reply/error/log
+            // storm that pegged a core.
+            Utils::Logger::Warn("[FilterConnection] GetMessage: frame failed integrity or "
+                                "decryption; answering the waiter fail-open, uncached");
             m_stats.errors++;
-            return 0;
+            return FilterConnection::ReceiveResult{ 0, kernelAwaitingReply ? wdkMessageId : 0 };
         }
 
-        return decryptedBytes;
+        return FilterConnection::ReceiveResult{ decryptedBytes, 0 };
     }
 
     [[nodiscard]] bool ReplyMessage(std::span<const uint8_t> replyBuffer,
@@ -1481,8 +1494,8 @@ void* FilterConnection::GetHandle() const noexcept {
     return m_impl ? m_impl->GetHandle() : nullptr;
 }
 
-size_t FilterConnection::GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs) {
-    if (!m_impl) return 0;
+FilterConnection::ReceiveResult FilterConnection::GetMessage(std::span<uint8_t> buffer, uint32_t timeoutMs) {
+    if (!m_impl) return {};
     return m_impl->GetMessage(buffer, timeoutMs);
 }
 

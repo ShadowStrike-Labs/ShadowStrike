@@ -1695,8 +1695,49 @@ void IPCManager::WorkerRoutine() {
         // raw path. A return of 0 means shutdown/cancel, a dropped message that
         // failed integrity/decryption, or a torn-down channel — in every case
         // we re-evaluate the loop guard (and reconnect on the next iteration).
-        const size_t received = conn->GetMessage(
+        const auto recv = conn->GetMessage(
             std::span<uint8_t>(buffer.data(), buffer.size()), 0);
+
+        // A frame that failed integrity or decryption still leaves a kernel
+        // thread parked inside FltSendMessage, and Filter Manager wrote its
+        // MessageId in cleartext ahead of our payload, so it CAN be answered.
+        // Answer it before doing anything else.
+        //
+        // Fail-open with CacheResult = 0 is the correct verdict here, and it does
+        // not weaken detection: the driver already degrades an unanswered scan to
+        // "not scanned, allowed" once the timeout expires, so the outcome for the
+        // file is identical either way. What differs is that a timeout also feeds
+        // the scan-bridge circuit breaker, which trips on reply-timeout RATE and
+        // then skips the create-path scan entirely for its recovery window. Not
+        // answering therefore risks switching scanning off wholesale, which is a
+        // far larger loss than one uncached allow. CacheResult = 0 keeps the
+        // verdict out of the kernel cache so the very next access is rescanned.
+        if (recv.ReplyOwed()) {
+            SHADOWSTRIKE_SCAN_VERDICT_REPLY failOpen = {};
+            failOpen.MessageId   = 0;   // app-level id was inside the payload we
+                                        // could not decrypt; the driver reads only
+                                        // Verdict and ThreatScore from a reply.
+            failOpen.Verdict     = static_cast<UINT8>(Verdict_Clean);
+            failOpen.ThreatScore = 0;
+            failOpen.ResultCode  = 0;
+            failOpen.CacheResult = 0;   // never cache a verdict we did not compute
+            failOpen.CacheTTL    = 0;
+
+            if (!ReplyToKernel(recv.replyOwedId, failOpen)) {
+                Utils::Logger::Debug("[IPCManager] Fail-open reply not delivered for "
+                                     "messageId {} (waiter already gone)", recv.replyOwedId);
+            }
+
+            static std::atomic<uint64_t> s_failOpenReplies{ 0 };
+            const uint64_t fo = s_failOpenReplies.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (fo == 1 || (fo % 100) == 0) {
+                Utils::Logger::Warn("[IPCManager] Answered {} undecryptable frame(s) fail-open "
+                                    "to release the kernel waiter - investigate the channel, "
+                                    "these are not expected in steady state", fo);
+            }
+        }
+
+        const size_t received = recv.payloadBytes;
         if (received == 0) {
             if (!m_running.load(std::memory_order_acquire)) {
                 Utils::Logger::Debug("[IPCManager] Worker: receive returned 0 during shutdown");
