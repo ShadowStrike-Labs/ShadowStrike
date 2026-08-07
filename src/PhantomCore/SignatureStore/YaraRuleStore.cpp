@@ -2398,7 +2398,8 @@ StoreError YaraRuleStore::AddRulesFromSource(
         SS_LOG_ERROR(L"YaraRuleStore",
             L"AddRulesFromSource: Rule source limit reached (%zu/%zu)",
             m_ruleSources.size(), YaraTitaniumLimits::MAX_RULE_SOURCES);
-        yr_rules_destroy(compiledRules);
+        // compiledRules is this compiler's singleton, not ours to release -
+        // yr_compiler_destroy handles it. Destroying it here double freed.
         return StoreError{ SignatureStoreError::TooLarge, 0,
                           "Maximum rule source count exceeded" };
     }
@@ -2596,10 +2597,15 @@ StoreError YaraRuleStore::AddRulesFromSource(
                     destroyResult);
             }
             
-            // Destroy the single-source compiled rules (we use merged instead)
-            yr_rules_destroy(compiledRules);
-            
-            m_rules = mergedRules;
+            // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
+            // the store owns what it keeps and releases the previous set only after the
+            // replacement has loaded. Direct assignment stored the LOCAL compiler's
+            // singleton, which yr_compiler_destroy frees on return - leaving m_rules
+            // dangling for every subsequent scan, and double freeing at teardown.
+            if (!AdoptRulesFromCompiler(mergeCompiler)) {
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                                   "Could not adopt merged YARA rules" };
+            }
             
             SS_LOG_INFO(L"YaraRuleStore",
                 L"AddRulesFromSource: Successfully merged %zu rule sources, added %zu new rules",
@@ -2728,13 +2734,15 @@ StoreError YaraRuleStore::AddRulesFromFile(
     // Acquire lock and update rules
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
     
-    if (m_rules) {
-        SS_LOG_WARN(L"YaraRuleStore", L"AddRulesFromFile: Replacing existing rules");
-        yr_rules_destroy(m_rules);
-        m_rules = nullptr;
+    // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
+    // the store owns what it keeps and releases the previous set only after the
+    // replacement has loaded. Direct assignment stored the LOCAL compiler's
+    // singleton, which yr_compiler_destroy frees on return - leaving m_rules
+    // dangling for every subsequent scan, and double freeing at teardown.
+    if (!AdoptRulesFromCompiler(compiler)) {
+        return StoreError{ SignatureStoreError::Unknown, 0,
+                           "Could not adopt rules from file" };
     }
-    
-    m_rules = compiledRules;
     
     // Extract metadata from loaded rules
     size_t ruleCount = 0;
@@ -2919,7 +2927,9 @@ StoreError YaraRuleStore::RemoveRule(
             }
         }
         
-        yr_rules_destroy(testRules);
+        // testRules is testCompiler's singleton, owned by the compiler and released
+        // by yr_compiler_destroy when it leaves scope. Destroying it here was a
+        // double free of the arena holding every rule identifier.
         
         // Keep sources that don't contain the target rule
         // (We can't easily modify a source to remove one rule from it,
@@ -2959,10 +2969,15 @@ StoreError YaraRuleStore::RemoveRule(
         
         YR_RULES* newRules = recompiler.GetRules();
         if (newRules) {
-            if (m_rules) {
-                yr_rules_destroy(m_rules);
+            // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
+            // the store owns what it keeps and releases the previous set only after the
+            // replacement has loaded. Direct assignment stored the LOCAL compiler's
+            // singleton, which yr_compiler_destroy frees on return - leaving m_rules
+            // dangling for every subsequent scan, and double freeing at teardown.
+            if (!AdoptRulesFromCompiler(recompiler)) {
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                                   "Could not adopt rules after rule removal" };
             }
-            m_rules = newRules;
             
             SS_LOG_INFO(L"YaraRuleStore", 
                 L"RemoveRule: Successfully removed rule %S and recompiled %zu sources", 
@@ -3048,10 +3063,15 @@ StoreError YaraRuleStore::RemoveNamespace(const std::string& namespace_) noexcep
         
         YR_RULES* newRules = recompiler.GetRules();
         if (newRules) {
-            if (m_rules) {
-                yr_rules_destroy(m_rules);
+            // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
+            // the store owns what it keeps and releases the previous set only after the
+            // replacement has loaded. Direct assignment stored the LOCAL compiler's
+            // singleton, which yr_compiler_destroy frees on return - leaving m_rules
+            // dangling for every subsequent scan, and double freeing at teardown.
+            if (!AdoptRulesFromCompiler(recompiler)) {
+                return StoreError{ SignatureStoreError::Unknown, 0,
+                                   "Could not adopt rules after namespace removal" };
             }
-            m_rules = newRules;
             
             SS_LOG_INFO(L"YaraRuleStore", 
                 L"RemoveNamespace: Successfully recompiled %zu sources after removal", 
@@ -3282,6 +3302,89 @@ StoreError YaraRuleStore::OpenMemoryMapping(const std::wstring& path, bool readO
 
 void YaraRuleStore::CloseMemoryMapping() noexcept {
     MemoryMapping::CloseView(m_mappedView);
+}
+
+// Takes ownership of a compiler's rules by round-tripping them through a
+// serialised buffer, replacing m_rules with a set this store genuinely owns.
+//
+// This exists because of a use-after-free class that ran right through this
+// file. Since YARA 4.0, yr_compiler_get_rules returns the compiler's own
+// singleton, freed by yr_compiler_destroy - so `m_rules = someCompiler.GetRules()`
+// stores a pointer owned by something else. Every site doing that used a LOCAL
+// YaraCompiler, which meant m_rules dangled the moment the function returned and
+// every subsequent scan walked released memory. It was also a double free, since
+// the store's own yr_rules_destroy would later release the same pointer.
+//
+// Serialising and reloading is the fix rather than keeping the compiler alive
+// alongside the store: a compiler cannot accept more rules once its rules have
+// been generated, so holding one forever buys nothing, and an owned rule set is
+// what every other path here already assumes it has. The round trip costs one
+// serialise plus one load, paid only when the rule set changes - adding,
+// removing, recompiling - never per scan.
+//
+// On failure m_rules is left exactly as it was, so a failed update degrades to
+// "rules unchanged" instead of "no rules at all".
+//
+// @note Caller must hold m_globalLock exclusively.
+bool YaraRuleStore::AdoptRulesFromCompiler(YaraCompiler& compiler) noexcept {
+    auto buffer = compiler.SaveToBuffer();
+    if (!buffer.has_value() || buffer->empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AdoptRulesFromCompiler: could not serialise compiled rules; "
+            L"keeping the previous rule set");
+        return false;
+    }
+
+    struct SpanReader {
+        const uint8_t* data;
+        size_t         size;
+        size_t         pos;
+    };
+
+    SpanReader reader{ buffer->data(), buffer->size(), 0u };
+
+    YR_STREAM stream{};
+    stream.user_data = &reader;
+    stream.write     = nullptr;
+    stream.read = [](void* ptr, size_t size, size_t count, void* userData) -> size_t {
+        auto* r = static_cast<SpanReader*>(userData);
+        if (r == nullptr || r->data == nullptr || ptr == nullptr ||
+            size == 0u || count == 0u) {
+            return 0u;
+        }
+        const size_t available = (r->pos < r->size) ? (r->size - r->pos) : 0u;
+        const size_t maxItems  = available / size;
+        const size_t items     = (count < maxItems) ? count : maxItems;
+        if (items == 0u) {
+            return 0u;
+        }
+        const size_t bytes = items * size;
+        std::memcpy(ptr, r->data + r->pos, bytes);
+        r->pos += bytes;
+        return items;
+    };
+
+    YR_RULES* adopted = nullptr;
+    const int loadResult = yr_rules_load_stream(&stream, &adopted);
+    if (loadResult != ERROR_SUCCESS || adopted == nullptr) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AdoptRulesFromCompiler: yr_rules_load_stream failed (error: %d); "
+            L"keeping the previous rule set", loadResult);
+        return false;
+    }
+
+    // Only now is it safe to release the old set: this one is ours, came from
+    // yr_rules_load_stream rather than from a compiler, and is independent of
+    // any compiler's lifetime.
+    if (m_rules != nullptr) {
+        yr_rules_destroy(m_rules);
+    }
+    m_rules = adopted;
+
+    const size_t indexed = RebuildRuleMetadataFromRules();
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"AdoptRulesFromCompiler: adopted %zu rule(s) with owned lifetime", indexed);
+    return true;
 }
 
 size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
@@ -4330,12 +4433,15 @@ StoreError YaraRuleStore::ImportFromYaraRulesRepo(
 
     YR_RULES* newRules = compiler.GetRules();
     if (newRules) {
-        // Destroy old rules safely
-        if (m_rules) {
-            yr_rules_destroy(m_rules);
-            m_rules = nullptr;
+        // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
+        // the store owns what it keeps and releases the previous set only after the
+        // replacement has loaded. Direct assignment stored the LOCAL compiler's
+        // singleton, which yr_compiler_destroy frees on return - leaving m_rules
+        // dangling for every subsequent scan, and double freeing at teardown.
+        if (!AdoptRulesFromCompiler(compiler)) {
+            return StoreError{ SignatureStoreError::Unknown, 0,
+                               "Could not adopt imported YARA rules" };
         }
-        m_rules = newRules;
     } else {
         SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: No rules compiled");
         return StoreError{ SignatureStoreError::Unknown, 0, "No rules compiled successfully" };
@@ -4398,10 +4504,15 @@ StoreError YaraRuleStore::Recompile() noexcept {
         return StoreError{ SignatureStoreError::Unknown, 0, "Recompilation failed at GetRules" };
     }
 
-    if (m_rules) {
-         yr_rules_destroy(m_rules);
+    // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
+    // the store owns what it keeps and releases the previous set only after the
+    // replacement has loaded. Direct assignment stored the LOCAL compiler's
+    // singleton, which yr_compiler_destroy frees on return - leaving m_rules
+    // dangling for every subsequent scan, and double freeing at teardown.
+    if (!AdoptRulesFromCompiler(compiler)) {
+        return StoreError{ SignatureStoreError::Unknown, 0,
+                           "Could not adopt recompiled YARA rules" };
     }
-    m_rules = newRules;
 
     SS_LOG_INFO(L"YaraRuleStore",
         L"Recompilation complete: %zu/%zu sources compiled",

@@ -588,8 +588,7 @@ private:
 
     [[nodiscard]] StoreError LoadRulesInternal() noexcept;
 
-    /// @brief Rebuild m_ruleMetadata by walking the rules currently in m_rules.
-    ///
+    /// @brief Rebuild m_ruleMetadata by walking the rules currently in m_rules.    ///
     /// The compiled bytecode is the authoritative source for rule identity:
     /// names, namespaces, tags and the global/private flags all come back out of
     /// it, so nothing needs to be stored alongside it to enumerate what loaded.
@@ -602,6 +601,21 @@ private:
     ///         which is a real failure for a database that claimed to have some.
     /// @note Caller must hold m_globalLock exclusively.
     size_t RebuildRuleMetadataFromRules() noexcept;
+
+    /// @brief Replace m_rules with a set this store owns, taken from a compiler.
+    ///
+    /// Since YARA 4.0 yr_compiler_get_rules returns the compiler's own singleton,
+    /// which yr_compiler_destroy frees. Assigning it straight to m_rules - which
+    /// six sites in this file used to do, every one of them from a LOCAL
+    /// YaraCompiler - leaves m_rules dangling as soon as that compiler goes out of
+    /// scope, and double frees when the store later destroys it. This serialises
+    /// the compiler's output and reloads it, so the result is independent of any
+    /// compiler's lifetime.
+    ///
+    /// @return false with m_rules left untouched if serialisation or loading
+    ///         fails, so a failed update means "unchanged" and never "empty".
+    /// @note Caller must hold m_globalLock exclusively.
+    [[nodiscard]] bool AdoptRulesFromCompiler(YaraCompiler& compiler) noexcept;
 
     [[nodiscard]] std::vector<YaraMatch> PerformScan(
         const void* buffer,
