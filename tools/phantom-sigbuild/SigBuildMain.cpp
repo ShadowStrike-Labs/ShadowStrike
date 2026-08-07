@@ -373,18 +373,23 @@ int wmain(int argc, wchar_t** argv) {
     // Build
     // ---------------------------------------------------------------------
 
+    // Build() runs the whole seven-stage pipeline - validation, deduplication,
+    // optimization, index construction, serialization, integrity check - so
+    // BuildIndices() must NOT be called again here.
+    //
+    // It was, and that was wrong in a way worth recording. Calling it after
+    // Build() re-ran index construction against a database that had already been
+    // serialized with its header written, and BuildHashIndex overwrites
+    // m_statistics.hashIndexSize with a pre-serialization estimate. The file on
+    // disk stayed correct, but the figures reported below disagreed with the
+    // header - hash index 0.00 MB against a real 28672 bytes - which is exactly
+    // the kind of misleading output that sends you looking in the wrong place.
     const StoreError built = builder.Build();
     if (!opt.quiet) {
         std::printf("\n");
     }
     if (!built.IsSuccess()) {
         Fail("build failed: %s", Describe(built).c_str());
-        return 3;
-    }
-
-    const StoreError indexed = builder.BuildIndices();
-    if (!indexed.IsSuccess()) {
-        Fail("index build failed: %s", Describe(indexed).c_str());
         return 3;
     }
 
