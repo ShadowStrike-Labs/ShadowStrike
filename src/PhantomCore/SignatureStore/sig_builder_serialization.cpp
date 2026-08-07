@@ -426,17 +426,109 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // PREPARE HASH DATA FOR SERIALIZATION
+            // LAY OUT THE HASH INDEX THE WAY THE RUNTIME READS IT
             // ========================================================================
-            std::vector<uint64_t> hashOffsets;
-            hashOffsets.reserve(m_pendingHashes.size());
+            // The previous layout could never be opened by HashStore, and the two
+            // halves disagreed on structure rather than on a size or an offset.
+            //
+            // HashStore::InitializeBuckets partitions the hash index into
+            // NUM_HASH_TYPES equal buckets - seven, MD5 through TLSH - and gives
+            // each one its own B+tree:
+            //
+            //     bucketSize   = header->hashIndexSize / 7
+            //     bucket[i] at = header->hashIndexOffset + i * bucketSize
+            //
+            // That is a deliberate design and a good one: a SHA-256 lookup then
+            // searches only SHA-256 keys, with no type comparison per node and a
+            // smaller tree to walk. This writer instead emitted ONE tree for all
+            // types, and placed the hash payload at the very start of the region -
+            // exactly where the reader expects bucket 0's root node. Every bucket
+            // therefore failed to initialise and HashStore returned
+            // "No buckets initialized", which surfaced as hashStore=FAILED even
+            // though the header, magic, offsets and totalHashes were all correct.
+            //
+            // It also allocated one page for the whole index, while the reader
+            // needs at least sizeof(BPlusTreeNode) per bucket - roughly 2 KB each
+            // given ORDER 128, so about 14 KB minimum before any hash is stored.
+            //
+            // Fixed on the writer's side because the reader's per-type design is
+            // the one the runtime is built around (HashStore keeps m_buckets keyed
+            // by HashType) and is the better structure. No compatibility concern:
+            // no signatures.sdb has ever existed in the field.
+            //
+            // Layout now, all page aligned:
+            //
+            //     hashIndexOffset + 0*bucketSize : bucket 0  (MD5)     leaf chain
+            //     ...
+            //     hashIndexOffset + 6*bucketSize : bucket 6  (TLSH)    leaf chain
+            //     hashIndexOffset + 7*bucketSize : hash payload (HashValue + name)
+            //
+            // Payload sits after the buckets because leaf children hold absolute
+            // file offsets, so the payload can live anywhere outside the region the
+            // reader partitions. Buckets are written even for types with no hashes:
+            // an empty leaf with keyCount 0 initialises cleanly and reports no
+            // matches, whereas a missing bucket would fail the whole store.
+            // ========================================================================
+            constexpr uint8_t kNumHashTypes = static_cast<uint8_t>(HashType::TLSH) + 1;
 
-            uint64_t currentOffset = m_currentOffset;
+            // Group by type, preserving a sorted-by-fast-hash order within each type
+            // so each bucket's leaf chain is ordered the way lookups expect.
+            std::array<std::vector<size_t>, kNumHashTypes> byType{};
+            for (size_t i = 0; i < m_pendingHashes.size(); ++i) {
+                const auto rawType = static_cast<uint8_t>(m_pendingHashes[i].hash.type);
+                if (rawType >= kNumHashTypes) {
+                    SS_LOG_WARN(L"SignatureBuilder",
+                        L"SerializeHashes: hash %zu has unsupported type %u, skipping",
+                        i, static_cast<unsigned>(rawType));
+                    continue;
+                }
+                byType[rawType].push_back(i);
+            }
 
-            // Step 1: Write hash entries sequentially
-            for (const auto& hashInput : m_pendingHashes) {
-                // Write hash value
-                if (!m_outputBase || currentOffset + sizeof(HashValue) > m_outputSize) {
+            for (auto& group : byType) {
+                std::sort(group.begin(), group.end(),
+                    [this](size_t a, size_t b) {
+                        return m_pendingHashes[a].hash.FastHash() <
+                               m_pendingHashes[b].hash.FastHash();
+                    });
+            }
+
+            // A uniform bucket must hold the busiest type's leaf chain, because the
+            // reader derives one bucketSize for all of them.
+            const size_t leafCapacity = BPlusTreeNode::MAX_KEYS;
+            size_t maxLeavesPerType = 1;   // at least one node, even when empty
+            for (const auto& group : byType) {
+                if (!group.empty()) {
+                    const size_t leaves = (group.size() + leafCapacity - 1) / leafCapacity;
+                    if (leaves > maxLeavesPerType) {
+                        maxLeavesPerType = leaves;
+                    }
+                }
+            }
+
+            const uint64_t bucketSize =
+                Format::AlignToPage(maxLeavesPerType * sizeof(BPlusTreeNode));
+            const uint64_t indexRegionSize = bucketSize * kNumHashTypes;
+            const uint64_t indexRegionStart = m_currentOffset;
+            const uint64_t payloadStart = Format::AlignToPage(indexRegionStart + indexRegionSize);
+
+            if (payloadStart <= indexRegionStart || payloadStart > m_outputSize) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"SerializeHashes: hash index region does not fit (start=%llu, size=%llu, output=%llu)",
+                    indexRegionStart, indexRegionSize, m_outputSize);
+                return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small for hash index" };
+            }
+
+            // ------------------------------------------------------------------
+            // Write the hash payload, recording each entry's absolute offset.
+            // ------------------------------------------------------------------
+            std::vector<uint64_t> hashOffsets(m_pendingHashes.size(), 0ull);
+            uint64_t currentOffset = payloadStart;
+
+            for (size_t i = 0; i < m_pendingHashes.size(); ++i) {
+                const auto& hashInput = m_pendingHashes[i];
+
+                if (currentOffset + sizeof(HashValue) > m_outputSize) {
                     SS_LOG_ERROR(L"SignatureBuilder", L"SerializeHashes: Insufficient space for hash");
                     return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
                 }
@@ -444,14 +536,12 @@ namespace SignatureStore {
                 HashValue* hashPtr = reinterpret_cast<HashValue*>(
                     static_cast<uint8_t*>(m_outputBase) + currentOffset
                     );
-
                 std::memcpy(hashPtr, &hashInput.hash, sizeof(HashValue));
 
-                // Write name string (null-terminated)
-                uint64_t nameOffset = currentOffset + sizeof(HashValue);
-                std::string nameStr = hashInput.name + "\0";
+                const uint64_t nameOffset = currentOffset + sizeof(HashValue);
+                const size_t nameBytes = hashInput.name.size() + 1;   // include the terminator
 
-                if (nameOffset + nameStr.length() > m_outputSize) {
+                if (nameOffset + nameBytes > m_outputSize) {
                     SS_LOG_ERROR(L"SignatureBuilder", L"SerializeHashes: Insufficient space for name");
                     return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
                 }
@@ -459,91 +549,76 @@ namespace SignatureStore {
                 char* namePtr = reinterpret_cast<char*>(
                     static_cast<uint8_t*>(m_outputBase) + nameOffset
                     );
-                std::memcpy(namePtr, nameStr.c_str(), nameStr.length());
+                std::memcpy(namePtr, hashInput.name.c_str(), nameBytes);
 
-                // Track offset for index
-                hashOffsets.push_back(currentOffset);
-
-                // Advance offset (hash + name + alignment)
-                currentOffset = AlignToCacheLine64(
-                    nameOffset + nameStr.length()
-                );
+                hashOffsets[i] = currentOffset;
+                currentOffset = AlignToCacheLine64(nameOffset + nameBytes);
             }
 
-            // ========================================================================
-            // BUILD B+TREE LEAF CHAIN INDEX FOR HASHES
-            // ========================================================================
-            // Sort by fast-hash for optimal tree layout
-            std::vector<std::pair<uint64_t, uint64_t>> sortedHashes;
-            sortedHashes.reserve(m_pendingHashes.size());
+            // ------------------------------------------------------------------
+            // Write one leaf chain per hash type into its own bucket.
+            // ------------------------------------------------------------------
+            size_t totalIndexed = 0;
 
-            for (size_t i = 0; i < m_pendingHashes.size(); ++i) {
-                sortedHashes.emplace_back(
-                    m_pendingHashes[i].hash.FastHash(),
-                    hashOffsets[i]
-                );
-            }
+            for (uint8_t t = 0; t < kNumHashTypes; ++t) {
+                const uint64_t bucketOffset = indexRegionStart + (static_cast<uint64_t>(t) * bucketSize);
+                const auto& group = byType[t];
 
-            std::sort(sortedHashes.begin(), sortedHashes.end());
+                const size_t leaves = group.empty()
+                    ? 1u
+                    : (group.size() + leafCapacity - 1) / leafCapacity;
 
-            // Build a chain of leaf nodes covering ALL entries (not just MAX_KEYS).
-            // Entries beyond MAX_KEYS are placed into additional leaf nodes linked
-            // via nextLeaf/prevLeaf forming a sorted linked list.
-            uint64_t treeIndexOffset = currentOffset;
-            const size_t totalEntries = sortedHashes.size();
-            const size_t leafCapacity = BPlusTreeNode::MAX_KEYS;
-            const size_t leafCount = (totalEntries + leafCapacity - 1) / leafCapacity;
-
-            // Validate space for all leaf nodes
-            {
-                uint64_t requiredTreeBytes = leafCount * sizeof(BPlusTreeNode);
-                if (treeIndexOffset + requiredTreeBytes > m_outputSize) {
+                if (bucketOffset + (leaves * sizeof(BPlusTreeNode)) > m_outputSize) {
                     SS_LOG_ERROR(L"SignatureBuilder",
-                        L"SerializeHashes: Insufficient space for B+Tree (%zu leaves)",
-                        leafCount);
+                        L"SerializeHashes: bucket %u exceeds output (offset=%llu, leaves=%zu)",
+                        static_cast<unsigned>(t), bucketOffset, leaves);
                     return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small for hash index" };
                 }
+
+                size_t entryIdx = 0;
+                uint64_t prevLeafOffset = 0;
+
+                for (size_t leafIdx = 0; leafIdx < leaves; ++leafIdx) {
+                    const uint64_t leafOffset = bucketOffset + (leafIdx * sizeof(BPlusTreeNode));
+
+                    BPlusTreeNode* leaf = reinterpret_cast<BPlusTreeNode*>(
+                        static_cast<uint8_t*>(m_outputBase) + leafOffset
+                        );
+
+                    std::memset(leaf, 0, sizeof(BPlusTreeNode));
+                    leaf->isLeaf = true;
+
+                    const uint32_t keysInLeaf = group.empty()
+                        ? 0u
+                        : static_cast<uint32_t>(std::min(leafCapacity, group.size() - entryIdx));
+                    leaf->keyCount = keysInLeaf;
+
+                    for (uint32_t k = 0; k < keysInLeaf; ++k) {
+                        const size_t src = group[entryIdx + k];
+                        leaf->keys[k]     = m_pendingHashes[src].hash.FastHash();
+                        leaf->children[k] = hashOffsets[src];
+                    }
+
+                    leaf->prevLeaf = prevLeafOffset;
+                    leaf->nextLeaf = (leafIdx + 1 < leaves)
+                        ? bucketOffset + ((leafIdx + 1) * sizeof(BPlusTreeNode))
+                        : 0ull;
+
+                    prevLeafOffset = leafOffset;
+                    entryIdx += keysInLeaf;
+                    totalIndexed += keysInLeaf;
+                }
             }
 
-            uint64_t prevLeafOffset = 0;
-            size_t entryIdx = 0;
-
-            for (size_t leafIdx = 0; leafIdx < leafCount; ++leafIdx) {
-                uint64_t leafOffset = treeIndexOffset + (leafIdx * sizeof(BPlusTreeNode));
-
-                BPlusTreeNode* leaf = reinterpret_cast<BPlusTreeNode*>(
-                    static_cast<uint8_t*>(m_outputBase) + leafOffset
-                );
-
-                std::memset(leaf, 0, sizeof(BPlusTreeNode));
-                leaf->isLeaf = true;
-
-                uint32_t keysInLeaf = static_cast<uint32_t>(
-                    std::min(leafCapacity, totalEntries - entryIdx));
-                leaf->keyCount = keysInLeaf;
-
-                for (uint32_t k = 0; k < keysInLeaf; ++k) {
-                    leaf->keys[k] = sortedHashes[entryIdx + k].first;
-                    leaf->children[k] = sortedHashes[entryIdx + k].second;
-                }
-
-                // Wire linked list
-                leaf->prevLeaf = prevLeafOffset;
-                if (leafIdx + 1 < leafCount) {
-                    leaf->nextLeaf = treeIndexOffset + ((leafIdx + 1) * sizeof(BPlusTreeNode));
-                } else {
-                    leaf->nextLeaf = 0;
-                }
-
-                // Back-patch previous leaf's nextLeaf (already done above via formula)
-                prevLeafOffset = leafOffset;
-                entryIdx += keysInLeaf;
-            }
-
-            currentOffset = Format::AlignToPage(treeIndexOffset + (leafCount * sizeof(BPlusTreeNode)));
-
-            m_statistics.hashIndexSize = currentOffset - m_currentOffset;
+            // The reader computes bucketSize as hashIndexSize / kNumHashTypes, so
+            // this must be an exact multiple or every bucket lands misaligned.
+            m_statistics.hashIndexSize = indexRegionSize;
             m_statistics.optimizedSignatures += m_pendingHashes.size();
+
+            SS_LOG_INFO(L"SignatureBuilder",
+                L"SerializeHashes: %zu hash(es) indexed across %u type buckets "
+                L"(bucketSize=%llu, indexSize=%llu)",
+                totalIndexed, static_cast<unsigned>(kNumHashTypes), bucketSize, indexRegionSize);
 
             // ========================================================================
             // PERFORMANCE METRICS
