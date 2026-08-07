@@ -40,9 +40,10 @@
  * @copyright 2026 ShadowStrike Security Suite
  */
 
-#include <span>
 #include "pch.h"
 #include "ExecutableAnalyzer.hpp"
+#include "../../Diagnostics/DiagTrace.hpp"   // SS_DIAG / SS_DIAG_SCOPE
+#include <span>
 
 // Infrastructure includes
 #include "../../Utils/Logger.hpp"
@@ -591,6 +592,7 @@ public:
             }
 
             // Check file exists using real FileUtils API
+            SS_DIAG("OnAccess", "Analyze.Exists ENTER");
             if (!Utils::FileUtils::Exists(filePath)) {
                 SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File not found: %hs",
                     SanitizeNarrowForLog(Utils::StringUtils::ToNarrow(filePath)).c_str());
@@ -599,6 +601,7 @@ public:
             }
 
             // Get file size via Stat
+            SS_DIAG("OnAccess", "Analyze.Stat ENTER");
             Utils::FileUtils::FileStat fileStat;
             if (!Utils::FileUtils::Stat(filePath, fileStat)) {
                 SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to stat file");
@@ -620,6 +623,7 @@ public:
             }
 
             // Read file into memory for analysis
+            SS_DIAG("OnAccess", "Analyze.ReadAllBytes ENTER size=%llu", (unsigned long long)info.fileSize);
             std::vector<std::byte> fileBytes;
             Utils::FileUtils::Error fileErr;
             if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes, &fileErr)) {
@@ -641,15 +645,19 @@ public:
             );
 
             // Analyze the buffer
+            { SS_DIAG_SCOPE("OnAccess", "Analyze.ParseBuffer");
             info = AnalyzeBufferImpl(fileData, options);
+            }
 
             // Calculate hashes if requested
             if (options.calculateHashes) {
+                SS_DIAG_SCOPE("OnAccess", "Analyze.CalculateHashes");
                 CalculateHashes(fileBytes, filePath, info);
             }
 
             // Verify signature if requested (requires file path)
             if (options.parseSignature) {
+                SS_DIAG_SCOPE("OnAccess", "Analyze.VerifySignature");
                 info.signature = VerifySignatureImpl(filePath);
                 if (info.signature.isSigned) {
                     m_stats.signedFiles.fetch_add(1, std::memory_order_relaxed);
@@ -658,6 +666,7 @@ public:
 
             // Get version info
             if (options.parseResources) {
+                SS_DIAG_SCOPE("OnAccess", "Analyze.GetVersionInfo");
                 info.versionInfo = GetVersionInfoImpl(filePath);
             }
 

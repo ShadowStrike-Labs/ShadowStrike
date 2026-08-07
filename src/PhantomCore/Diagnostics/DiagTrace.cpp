@@ -111,7 +111,13 @@ SRWLOCK           g_flushLock = SRWLOCK_INIT;   // serialises text dumps only
 // and the write path must stay free of them. It flushes only the slots filled
 // since the previous pass, and does nothing at all when no record has been
 // written, so an idle service performs no I/O for tracing.
-constexpr DWORD   kFlushIntervalMs = 1000;
+// Flush cadence. 1000 ms meant a freeze took the last full second of records with
+// it - the most important second there is, since it contains whatever was executing
+// when everything stopped. 200 ms bounds that loss to a fifth of a second. The
+// flusher writes only newly-filled slots and performs no I/O when nothing was
+// written, so a shorter period costs five cheap timer wakeups per second rather
+// than five times the work.
+constexpr DWORD   kFlushIntervalMs = 200;
 
 HANDLE            g_flushThread     = nullptr;
 HANDLE            g_flushStop       = nullptr;
@@ -194,7 +200,21 @@ void FlushDirtyRange() noexcept {
 DWORD WINAPI FlushThreadProc(LPVOID) noexcept {
     // Below normal: this thread exists to preserve evidence, never to compete
     // with the work being traced.
-    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // Run ABOVE normal, not below.
+    //
+    // BELOW_NORMAL was chosen so tracing never competed with detection work, which
+    // is the right instinct for steady state and exactly wrong for the incident
+    // this ring exists to capture. A freeze in this product means threads are
+    // spinning or blocked at normal priority, and a below-normal flusher is the
+    // first thing the scheduler starves - so the trace stops advancing precisely
+    // when it becomes valuable. Field evidence: a 1.0.83 freeze flushed its last
+    // record at 21:39:00 while the main log kept writing until 21:41:03, leaving
+    // the final two minutes before the freeze permanently unrecorded.
+    //
+    // The cost is bounded and small: this thread wakes on a timer, copies only
+    // newly-filled slots, and does no work at all when nothing was written. Paying
+    // that at above-normal priority is cheaper than losing the evidence.
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     for (;;) {
         const DWORD wait = ::WaitForSingleObject(g_flushStop, kFlushIntervalMs);
