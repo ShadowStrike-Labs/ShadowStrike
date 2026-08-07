@@ -1588,6 +1588,10 @@ void IPCManager::WorkerRoutine() {
     // message resets it. See the received==0 handling below.
     uint32_t badReceiveStreak = 0;
     constexpr uint32_t kBadReceiveResyncThreshold = 16;
+    // Applied only once a streak proves the condition is sustained. Modest by
+    // design: its whole job is to stop a core spinning, and anything longer
+    // starves the reply path that kernel threads are waiting on.
+    constexpr uint32_t kSustainedDesyncBackoffMs  = 10;
 
     while (m_running.load(std::memory_order_acquire)) {
         // Snapshot the encrypted primary-scanner connection. The kernel routes
@@ -1707,25 +1711,63 @@ void IPCManager::WorkerRoutine() {
             }
             // Connected, but the delivered frame was UNUSABLE (integrity /
             // decryption / two-header framing failure -> GetMessage returned 0).
-            // A *burst* of these means the encrypted stream has desynchronized.
-            // With no back-off the worker spun at ~1000/s: field logs showed
-            // 3392 FilterGetMessage failures in 3.3s, pegging a core, flooding
-            // the log, and immediately preceding a process death. Escalating
-            // back-off bounds it -- a rare transient bad frame costs a couple of
-            // ms, a sustained desync is capped at ~20/s instead of ~1000/s. A
-            // healthy message resets the streak. (The malformed-frame root cause
-            // is kernel-side -- driver frame framing / GCM state -- and is
-            // tracked separately for a kernel-validated fix.)
+            //
+            // WHAT THIS USED TO SAY, AND WHY IT WAS WRONG
+            //
+            // This block previously attributed the failures to "a kernel-side
+            // frame framing/GCM issue" and deferred the real fix, applying
+            // escalating back-off from the very first bad frame. The attribution
+            // was incorrect and it cost weeks of investigation aimed at the
+            // driver. The cause was in user mode, three layers above this line:
+            // FilterGetMessage was being called without the mandatory OVERLAPPED
+            // on an asynchronous port handle, so the kernel completed the
+            // operation after the call returned and wrote the delivered bytes
+            // into storage the caller no longer owned. The frames were intact
+            // when the driver sent them; we corrupted them on arrival. The field
+            // evidence quoted here - 3392 FilterGetMessage failures in 3.3
+            // seconds, pegging a core, immediately preceding a process death -
+            // was that defect, not a protocol defect.
+            //
+            // WHY A STREAK GUARD STILL EARNS ITS PLACE
+            //
+            // Not as a stand-in for a fix, but because busy-waiting on a channel
+            // that reports connected while delivering nothing usable is a hazard
+            // regardless of what causes it. Keeping a bound here is cheap
+            // insurance against a spin; keeping a *diagnosis* here was the
+            // mistake.
+            //
+            // THE COST MODEL IS NOW INVERTED, DELIBERATELY
+            //
+            // Sleeping from the first bad frame made sense when failures were
+            // continuous. After the fix they are rare - 4 in 81 seconds of
+            // sustained load, about 0.01% of traffic - and the next frame is
+            // almost certainly fine. Sleeping on a one-off therefore delays
+            // legitimate scan traffic for nothing, and the old 50 ms ceiling
+            // starved the reply path, which made the freeze it was meant to
+            // mitigate worse. So: no delay at all until a streak proves the
+            // condition is sustained rather than transient, then a bounded sleep
+            // purely to stop the spin.
+            //
+            // The residual bad frames are NOT explained by the fix above and are
+            // tracked separately. This guard does not pretend to explain them.
             ++badReceiveStreak;
+            if (badReceiveStreak < kBadReceiveResyncThreshold) {
+                // Transient: retry immediately, cost nothing.
+                continue;
+            }
+
             if (badReceiveStreak == kBadReceiveResyncThreshold) {
                 Utils::Logger::Warn(
                     "[IPCManager] {} consecutive unusable receives on a connected "
-                    "channel (encrypted-stream desync?); backing off. Likely a "
-                    "kernel-side frame framing/GCM issue.", badReceiveStreak);
+                    "channel - sustained condition, throttling to avoid a spin. "
+                    "Individual frame failures are counted separately.",
+                    badReceiveStreak);
                 m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
             }
-            const uint32_t backoffMs = (std::min)(badReceiveStreak * 2u, 50u);
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+
+            // Sustained only. Fixed and modest: enough to stop a core spinning,
+            // short enough that the reply path is not starved.
+            std::this_thread::sleep_for(std::chrono::milliseconds(kSustainedDesyncBackoffMs));
             continue;
         }
         badReceiveStreak = 0;  // healthy frame -> reset the bad-receive streak
