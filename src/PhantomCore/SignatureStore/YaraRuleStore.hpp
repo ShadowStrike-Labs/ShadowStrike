@@ -90,7 +90,12 @@ namespace YaraTitaniumLimits {
     // Buffer size limits
     constexpr size_t MAX_SCAN_BUFFER_SIZE = 500 * 1024 * 1024;      // 500MB max scan buffer
     constexpr size_t MAX_FILE_SIZE = 100 * 1024 * 1024;             // 100MB max file
-    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024;       // 10MB max rule source
+    // Bounds compile-time memory against a hostile rule file. Sized against real
+    // aggregated community rule sets rather than a single hand-written file:
+    // Yara-Forge's full pack is 18.4 MB across 11,716 rules and grows over time,
+    // so a 10 MB ceiling rejected legitimate content outright. 64 MB keeps ~3.5x
+    // headroom while staying well under MAX_COMPILED_RULES_SIZE.
+    constexpr size_t MAX_RULE_SOURCE_SIZE = 64 * 1024 * 1024;       // 64MB max rule source
     constexpr size_t MAX_COMPILED_RULES_SIZE = 500 * 1024 * 1024;   // 500MB max compiled rules
     
     // Stream scanner limits

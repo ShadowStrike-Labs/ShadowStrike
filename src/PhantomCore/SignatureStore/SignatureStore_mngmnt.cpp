@@ -36,7 +36,7 @@ namespace ShadowStrike {
             constexpr size_t MNG_MAX_NAMESPACE_LENGTH = 256;
             constexpr size_t MNG_MAX_RULE_NAME_LENGTH = 256;
             constexpr size_t MNG_MAX_PATTERN_LENGTH   = 64ull * 1024;            // 64KB
-            constexpr size_t MNG_MAX_RULE_LENGTH      = 10ull * 1024 * 1024;     // 10MB
+            constexpr size_t MNG_MAX_RULE_LENGTH      = YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE;  // shared ceiling
             constexpr size_t MNG_MAX_PATH_LENGTH      = 32767;                   // \\?\ ext path
             constexpr uint32_t MNG_MIN_HASH_LEN       = 1;
             constexpr uint32_t MNG_MAX_HASH_LEN       = 64;

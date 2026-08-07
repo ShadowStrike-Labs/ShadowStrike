@@ -202,11 +202,10 @@ StoreError YaraCompiler::AddFile(
         }
         
         // VALIDATION 6: File size limit (DoS protection - 10MB max per rule file)
-        constexpr std::streamsize MAX_RULE_FILE_SIZE = 10 * 1024 * 1024;
-        if (fileSize > MAX_RULE_FILE_SIZE) {
+        if (fileSize > YaraTitaniumLimits::MAX_FILE_SIZE) {
             SS_LOG_ERROR(L"YaraCompiler", L"File too large: %s (%lld bytes)",
                 filePath.c_str(), static_cast<long long>(fileSize));
-            return StoreError{SignatureStoreError::TooLarge, 0, "Rule file exceeds 10MB limit"};
+            return StoreError{SignatureStoreError::TooLarge, 0, "Rule file exceeds the maximum rule file size"};
         }
         
         // Pre-allocate string to avoid reallocations
@@ -263,11 +262,10 @@ StoreError YaraCompiler::AddString(
     }
     
     // VALIDATION 3: Source size limit (DoS protection - 10MB max)
-    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024;
-    if (ruleSource.length() > MAX_RULE_SOURCE_SIZE) {
+    if (ruleSource.length() > YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE) {
         SS_LOG_ERROR(L"YaraCompiler", L"AddString: Rule source too large (%zu > %zu)",
-            ruleSource.length(), MAX_RULE_SOURCE_SIZE);
-        return StoreError{SignatureStoreError::TooLarge, 0, "Rule source exceeds 10MB limit"};
+            ruleSource.length(), YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE);
+        return StoreError{SignatureStoreError::TooLarge, 0, "Rule source exceeds the maximum rule source size"};
     }
     
     // VALIDATION 4: Namespace validation (can be empty for default namespace)
@@ -2291,12 +2289,11 @@ StoreError YaraRuleStore::AddRulesFromSource(
         return StoreError{ SignatureStoreError::InvalidSignature, 0, "Rule source cannot be empty" };
     }
 
-    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024; // 10MB limit
-    if (ruleSource.length() > MAX_RULE_SOURCE_SIZE) {
+    if (ruleSource.length() > YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE) {
         SS_LOG_ERROR(L"YaraRuleStore",
             L"AddRulesFromSource: Rule source too large (%zu > %zu bytes)",
-            ruleSource.length(), MAX_RULE_SOURCE_SIZE);
-        return StoreError{ SignatureStoreError::TooLarge, 0, "Rule source exceeds 10MB limit" };
+            ruleSource.length(), YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE);
+        return StoreError{ SignatureStoreError::TooLarge, 0, "Rule source exceeds the maximum rule source size" };
     }
 
     if (namespace_.empty() || namespace_.length() > 128) {
@@ -4637,9 +4634,8 @@ bool ValidateRuleSyntax(
     }
     
     // Size limit (10MB max)
-    constexpr size_t MAX_RULE_SOURCE_SIZE = 10 * 1024 * 1024;
-    if (ruleSource.length() > MAX_RULE_SOURCE_SIZE) {
-        errors.push_back("Rule source exceeds 10MB limit");
+    if (ruleSource.length() > YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE) {
+        errors.push_back("Rule source exceeds the maximum rule source size");
         return false;
     }
     
