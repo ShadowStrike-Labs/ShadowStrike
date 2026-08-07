@@ -588,6 +588,21 @@ private:
 
     [[nodiscard]] StoreError LoadRulesInternal() noexcept;
 
+    /// @brief Rebuild m_ruleMetadata by walking the rules currently in m_rules.
+    ///
+    /// The compiled bytecode is the authoritative source for rule identity:
+    /// names, namespaces, tags and the global/private flags all come back out of
+    /// it, so nothing needs to be stored alongside it to enumerate what loaded.
+    /// Both load paths - from the combined database and from a standalone
+    /// compiled file - use this, so the two cannot drift apart. An earlier copy
+    /// of this loop in SignatureBuilder did drift, and dereferenced
+    /// rule->ns->name without the null check this one has.
+    ///
+    /// @return the number of rules indexed. Zero means m_rules held no rules,
+    ///         which is a real failure for a database that claimed to have some.
+    /// @note Caller must hold m_globalLock exclusively.
+    size_t RebuildRuleMetadataFromRules() noexcept;
+
     [[nodiscard]] std::vector<YaraMatch> PerformScan(
         const void* buffer,
         size_t size,

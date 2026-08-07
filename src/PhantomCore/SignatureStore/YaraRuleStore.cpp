@@ -1304,39 +1304,11 @@ StoreError YaraRuleStore::LoadCompiledRules(const std::wstring& compiledRulePath
     // ========================================================================
     // EXTRACT RULE METADATA FROM LOADED RULES
     // ========================================================================
-    m_ruleMetadata.clear();
-    size_t ruleCount = 0;
-    
-    YR_RULE* rule = nullptr;
-    yr_rules_foreach(m_rules, rule) {
-        if (!rule || !rule->identifier) {
-            continue;
-        }
-
-        std::string ruleName = rule->identifier;
-        std::string ruleNamespace = rule->ns && rule->ns->name ? rule->ns->name : "default";
-        std::string fullName = ruleNamespace + "::" + ruleName;
-
-        YaraRuleMetadata metadata{};
-        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
-        metadata.ruleName = ruleName;
-        metadata.namespace_ = ruleNamespace;
-        metadata.threatLevel = ThreatLevel::Medium;
-        metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
-        metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
-        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
-
-        // Extract tags
-        const char* tag = nullptr;
-        yr_rule_tags_foreach(rule, tag) {
-            if (tag && std::strlen(tag) > 0 && std::strlen(tag) <= 64) {
-                metadata.tags.emplace_back(tag);
-            }
-        }
-
-        m_ruleMetadata[fullName] = std::move(metadata);
-        ruleCount++;
-    }
+    // Shared with LoadRulesInternal. This loop used to be duplicated here, and
+    // a third copy in SignatureBuilder::BuildYaraIndex had already drifted - it
+    // dereferenced rule->ns->name without a null check and crashed on freed
+    // arena memory. One implementation, one place to fix.
+    const size_t ruleCount = RebuildRuleMetadataFromRules();
 
     SS_LOG_INFO(L"YaraRuleStore", L"LoadCompiledRules: Loaded %zu rules from %s", 
         ruleCount, compiledRulePath.c_str());
@@ -3312,6 +3284,57 @@ void YaraRuleStore::CloseMemoryMapping() noexcept {
     MemoryMapping::CloseView(m_mappedView);
 }
 
+size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
+    m_ruleMetadata.clear();
+
+    if (m_rules == nullptr) {
+        return 0u;
+    }
+
+    size_t ruleCount = 0;
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+
+    YR_RULE* rule = nullptr;
+    yr_rules_foreach(m_rules, rule) {
+        if (rule == nullptr || rule->identifier == nullptr) {
+            continue;
+        }
+
+        std::string ruleName = rule->identifier;
+        std::string ruleNamespace =
+            (rule->ns != nullptr && rule->ns->name != nullptr) ? rule->ns->name : "default";
+        std::string fullName = ruleNamespace + "::" + ruleName;
+
+        YaraRuleMetadata metadata{};
+        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
+        metadata.ruleName = ruleName;
+        metadata.namespace_ = ruleNamespace;
+        // Severity is not encoded in the bytecode. The database's YaraRuleEntry
+        // records carry a real threatLevel and enriching from them is tracked
+        // separately; until that lands every rule reports Medium, which is
+        // deliberately neutral rather than silently severe.
+        metadata.threatLevel = ThreatLevel::Medium;
+        metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
+        metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
+        metadata.lastModified = now;
+
+        const char* tag = nullptr;
+        yr_rule_tags_foreach(rule, tag) {
+            if (tag != nullptr) {
+                const size_t tagLen = std::strlen(tag);
+                if (tagLen > 0 && tagLen <= 64) {
+                    metadata.tags.emplace_back(tag);
+                }
+            }
+        }
+
+        m_ruleMetadata[fullName] = std::move(metadata);
+        ++ruleCount;
+    }
+
+    return ruleCount;
+}
+
 StoreError YaraRuleStore::LoadRulesInternal() noexcept {
     SS_LOG_INFO(L"YaraRuleStore", L"LoadRulesInternal: Starting rule loading from mapped database");
 
@@ -3366,6 +3389,100 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
     }
 
     SS_LOG_DEBUG(L"YaraRuleStore", L"LoadRulesInternal: Read YARA section - %llu bytes", yaraData.size());
+
+    // ========================================================================
+    // LOAD THE COMPILED BYTECODE INTO YARA
+    // ========================================================================
+    // This step did not exist, and its absence is why YARA matching never
+    // worked from the combined database. The function mapped the file, read the
+    // section bounds, took the span, logged its size - and then went straight on
+    // to the metadata section without ever handing the bytecode to YARA.
+    // m_rules stayed null, Initialize still returned Success, and GetStatus
+    // reported yaraStoreReady = true. A store that loads no rules and calls
+    // itself ready is worse than one that fails, because nothing looks wrong.
+    //
+    // The only loader in this file was LoadCompiledRules, which takes a file
+    // path, and it has zero callers anywhere in the tree - so the one load path
+    // that existed was unreachable code.
+    //
+    // Loaded through a YR_STREAM over the mapped span rather than by path.
+    // The comment at the bottom of this file - "YARA yr_rules_load() expects
+    // file path, not memory buffer" - is true of yr_rules_load and led to a
+    // temp-file write-then-load dance elsewhere in this file. But
+    // yr_rules_load_stream takes a caller-supplied reader, so no temp file is
+    // needed: we read straight out of the mapping. That avoids writing rule
+    // bytecode to disk on every start, avoids the window where it sits there
+    // readable, and keeps the memory-mapped design intact.
+    {
+        struct SpanReader {
+            const uint8_t* data;
+            size_t         size;
+            size_t         pos;
+        };
+
+        SpanReader reader{ yaraData.data(), yaraData.size(), 0u };
+
+        YR_STREAM stream{};
+        stream.user_data = &reader;
+        stream.write     = nullptr;   // read-only stream
+        // Capture-free lambda so it converts to YR_STREAM_READ_FUNC.
+        // Follows fread semantics: returns the number of ITEMS read, not bytes.
+        stream.read = [](void* ptr, size_t size, size_t count, void* userData) -> size_t {
+            auto* r = static_cast<SpanReader*>(userData);
+            if (r == nullptr || r->data == nullptr || ptr == nullptr ||
+                size == 0u || count == 0u) {
+                return 0u;
+            }
+            // Clamp against what remains before multiplying, so the byte count
+            // can never overflow regardless of what YARA asks for.
+            const size_t available = (r->pos < r->size) ? (r->size - r->pos) : 0u;
+            const size_t maxItems  = available / size;
+            const size_t items     = (count < maxItems) ? count : maxItems;
+            if (items == 0u) {
+                return 0u;
+            }
+            const size_t bytes = items * size;
+            std::memcpy(ptr, r->data + r->pos, bytes);
+            r->pos += bytes;
+            return items;
+        };
+
+        // Release rules from any previous load before replacing them. Destroying
+        // is correct here and only here: yr_rules_load_stream allocates a rule
+        // set we own, unlike yr_compiler_get_rules which returns the compiler's
+        // singleton (see the contract on YaraCompiler::GetRules).
+        if (m_rules != nullptr) {
+            yr_rules_destroy(m_rules);
+            m_rules = nullptr;
+        }
+
+        const int loadResult = yr_rules_load_stream(&stream, &m_rules);
+        if (loadResult != ERROR_SUCCESS || m_rules == nullptr) {
+            m_rules = nullptr;
+            SS_LOG_ERROR(L"YaraRuleStore",
+                L"LoadRulesInternal: yr_rules_load_stream failed (error: %d, section: %llu bytes)",
+                loadResult, yaraData.size());
+            return StoreError{ SignatureStoreError::InvalidFormat,
+                               static_cast<DWORD>(loadResult),
+                               "Cannot load compiled YARA rules from database" };
+        }
+
+        // Rebuild the rule index from what actually loaded. Reporting readiness
+        // without knowing how many rules are live is the failure this replaces.
+        const size_t indexed = RebuildRuleMetadataFromRules();
+        if (indexed == 0u) {
+            yr_rules_destroy(m_rules);
+            m_rules = nullptr;
+            SS_LOG_ERROR(L"YaraRuleStore",
+                L"LoadRulesInternal: bytecode loaded but contains no rules - "
+                L"refusing to report ready with an empty rule set");
+            return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                               "YARA section contains no rules" };
+        }
+
+        SS_LOG_INFO(L"YaraRuleStore",
+            L"LoadRulesInternal: loaded %zu YARA rule(s) from the database", indexed);
+    }
 
     // ========================================================================
     // LOAD METADATA SECTION
