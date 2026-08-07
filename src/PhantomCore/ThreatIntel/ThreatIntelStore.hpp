@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -1069,6 +1069,15 @@ public:
      * @return Number of feeds registered.
      */
     [[nodiscard]] uint32_t RegisterDefaultFeeds() noexcept;
+
+    /**
+     * @brief Registers feeds that require an API key, when one is configured
+     * @return Number of credentialed feeds registered
+     * @note Public feeds carry URLs and IPs but no file hashes; MalwareBazaar is
+     *       the hash source and needs a key, so skipping this leaves hash
+     *       reputation with no data while nothing reports an error.
+     */
+    uint32_t RegisterCredentialedFeeds() noexcept;
     
     // =========================================================================
     // IOC Lookups

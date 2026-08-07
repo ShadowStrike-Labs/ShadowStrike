@@ -1225,8 +1225,15 @@ bool ZeroHourProtection::CheckForSignatureUpdates(bool force) {
             for (const auto& fs : feedStatuses) {
                 if (!fs.enabled || fs.isUpdating) continue;
 
-                // If a feed has a next-update time in the past, it's overdue
-                if (fs.nextUpdateTime <= now && fs.lastSuccessTime != fs.lastUpdateTime) {
+                // A feed is due when its next scheduled sync has passed. The
+                // previous condition also required lastSuccessTime != lastUpdateTime,
+                // which deadlocked every feed: both default to the epoch until a
+                // sync happens, so a newly registered feed was never equal-enough
+                // to be considered overdue, could therefore never sync, and could
+                // therefore never record a success to break the tie. isUpdating
+                // above already prevents a double trigger, so the extra clause
+                // bought nothing and cost every feed its first fetch.
+                if (fs.nextUpdateTime <= now) {
                     if (tiStore->UpdateFeed(fs.feedId)) {
                         ++feedsWithUpdates;
                         SS_LOG_INFO(L"ZeroHourProtection",

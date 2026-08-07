@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -56,6 +56,7 @@
 #include "ThreatIntelImporter.hpp"
 #include "ThreatIntelExporter.hpp"
 #include "ThreatIntelFeedManager.hpp"
+#include "FeedCredentials.hpp"
 #include "ReputationCache.hpp"
 #include"nlohmann/json.hpp"
 
@@ -987,10 +988,67 @@ uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
             "and hash/URL/IP lookups will not match anything");
     } else {
         Utils::Logger::Info(
-            "[ThreatIntel] {} public feeds registered (no API key required). "
-            "Credentialed sources such as VirusTotal and OTX can be added via "
-            "AddFeed() once a key is configured.",
+            "[ThreatIntel] {} public feeds registered (no API key required)",
             registered);
+    }
+
+    registered += RegisterCredentialedFeeds();
+    return registered;
+}
+
+uint32_t ThreatIntelStore::RegisterCredentialedFeeds() noexcept {
+    // The public feeds above supply URLs and IP addresses. They do NOT supply
+    // file hashes, which is the single most useful indicator type for an endpoint
+    // scanner - MalwareBazaar is the hash source, and its API requires a key.
+    // Registering only the key-free feeds therefore leaves hash reputation with
+    // no data at all, which is easy to miss because nothing errors.
+    if (!IsInitialized() || !m_impl->feedManager) {
+        return 0;
+    }
+
+    const auto creds = ThreatIntel::FeedCredentials::Load();
+    creds.LogSummary();
+
+    uint32_t registered = 0;
+
+    const auto add = [&](const char* what, const ThreatFeedConfig& cfg) {
+        if (m_impl->feedManager->AddFeed(cfg)) {
+            ++registered;
+            Utils::Logger::Info("[ThreatIntel] Registered credentialed feed '{}'", what);
+        } else {
+            // AddFeed refuses an ApiKey config with an empty key, so this path is
+            // reachable and worth reporting rather than swallowing.
+            Utils::Logger::Warn(
+                "[ThreatIntel] Could not register credentialed feed '{}'", what);
+        }
+    };
+
+    // abuse.ch issues ONE Auth-Key that covers MalwareBazaar and ThreatFox.
+    if (const auto abuseKey = creds.Get(ThreatIntel::FeedCredentialKeys::AbuseChAuthKey)) {
+        add("malwarebazaar", ThreatFeedConfig::CreateMalwareBazaar(*abuseKey));
+        add("threatfox", ThreatFeedConfig::CreateThreatFox(*abuseKey));
+    } else {
+        Utils::Logger::Warn(
+            "[ThreatIntel] No {} configured - MalwareBazaar and ThreatFox stay "
+            "disabled, so FILE HASH indicators have no feed source. Public URL and "
+            "IP feeds are unaffected. A free key is available from "
+            "https://auth.abuse.ch/ for non-commercial use.",
+            ThreatIntel::FeedCredentialKeys::AbuseChAuthKey);
+    }
+
+    if (const auto otxKey = creds.Get(ThreatIntel::FeedCredentialKeys::OtxApiKey)) {
+        add("alienvault-otx", ThreatFeedConfig::CreateAlienVaultOTX(*otxKey));
+    } else {
+        Utils::Logger::Info(
+            "[ThreatIntel] No {} configured - AlienVault OTX stays disabled",
+            ThreatIntel::FeedCredentialKeys::OtxApiKey);
+    }
+
+    if (const auto vtKey = creds.Get(ThreatIntel::FeedCredentialKeys::VirusTotalApiKey)) {
+        add("virustotal", ThreatFeedConfig::CreateVirusTotal(*vtKey));
+    }
+    if (const auto ipdbKey = creds.Get(ThreatIntel::FeedCredentialKeys::AbuseIpdbApiKey)) {
+        add("abuseipdb", ThreatFeedConfig::CreateAbuseIPDB(*ipdbKey));
     }
 
     return registered;
@@ -2029,27 +2087,11 @@ size_t ThreatIntelStore::UpdateAllFeeds() noexcept {
         {
             std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
             
-            // Get feed IDs from feed manager's internal map
-            // Since direct access isn't available, we use configured feed sources
-            static const std::vector<std::string> knownFeedSources = {
-                "virustotal",
-                "alienvault_otx",
-                "abuseipdb",
-                "urlhaus",
-                "malwarebazaar",
-                "threatfox",
-                "feodotracker",
-                "misp"
-            };
-            
-            // Check which feeds are registered
-            for (const auto& feedId : knownFeedSources) {
-                // Feed manager will return status for valid feeds
-                auto status = m_impl->feedManager->GetFeedStatus(feedId);
-                if (status != FeedSyncStatus::Unknown) {
-                    feedIds.push_back(feedId);
-                }
-            }
+            // The registry knows exactly which feeds exist. An earlier version
+            // walked a hardcoded id list because "direct access isn't available";
+            // GetFeedIds() provides it, and the hardcoded list had already drifted
+            // out of step with the ids actually registered.
+            feedIds = m_impl->feedManager->GetFeedIds();
         }
         
         if (feedIds.empty()) {
@@ -2218,6 +2260,12 @@ std::optional<FeedStatus> ThreatIntelStore::GetFeedStatus(const std::string& fee
             status.errorCount = static_cast<size_t>(feedStats->totalFailedSyncs.load(std::memory_order_relaxed));
             
             // Convert timestamps
+            uint64_t lastAttempt = feedStats->lastSyncAttempt.load(std::memory_order_relaxed);
+            if (lastAttempt > 0) {
+                status.lastUpdateTime = std::chrono::system_clock::from_time_t(
+                    static_cast<std::time_t>(lastAttempt));
+            }
+
             uint64_t lastSuccess = feedStats->lastSuccessfulSync.load(std::memory_order_relaxed);
             if (lastSuccess > 0) {
                 status.lastSuccessTime = std::chrono::system_clock::from_time_t(
@@ -2268,24 +2316,16 @@ std::vector<FeedStatus> ThreatIntelStore::GetAllFeedStatuses() const noexcept {
     std::vector<FeedStatus> statuses;
     
     try {
-        // Known feed source identifiers that might be registered
-        static const std::vector<std::string> knownFeedSources = {
-            "virustotal",
-            "alienvault_otx",
-            "abuseipdb",
-            "urlhaus",
-            "malwarebazaar",
-            "threatfox",
-            "feodotracker",
-            "misp",
-            "crowdstrike",
-            "recordedfuture",
-            "mandiant"
-        };
-        
-        statuses.reserve(knownFeedSources.size());
-        
-        for (const auto& feedId : knownFeedSources) {
+        // Ask the feed manager which feeds are actually registered. This used to
+        // walk a hardcoded list of "known" identifiers, which silently omitted any
+        // feed whose id did not appear in it verbatim - "alienvault-otx" was listed
+        // as "alienvault_otx" and "etopen-compromised-ips" was absent entirely, so
+        // both were invisible to every caller that enumerates statuses, including
+        // the sync scheduler. The registry is the only correct source for this.
+        const auto feedIds = m_impl->feedManager->GetFeedIds();
+        statuses.reserve(feedIds.size());
+
+        for (const auto& feedId : feedIds) {
             // Check if feed is registered by getting its status
             auto status = GetFeedStatus(feedId);
             if (status.has_value()) {

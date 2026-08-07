@@ -675,7 +675,7 @@ ThreatFeedConfig ThreatFeedConfig::CreateURLhaus() {
     return config;
 }
 
-ThreatFeedConfig ThreatFeedConfig::CreateMalwareBazaar() {
+ThreatFeedConfig ThreatFeedConfig::CreateMalwareBazaar(const std::string& authKey) {
     ThreatFeedConfig config = CreateDefault(ThreatIntelSource::MalwareBazaar);
     
     config.feedId = "malwarebazaar";
@@ -690,7 +690,22 @@ ThreatFeedConfig ThreatFeedConfig::CreateMalwareBazaar() {
     config.endpoint.requestBody = "query=get_recent&selector=100";
     config.endpoint.contentType = "application/x-www-form-urlencoded";
     
-    config.auth.method = AuthMethod::None;
+    // abuse.ch made authentication mandatory on their API endpoints. Verified
+    // against the live service: POST /api/v1/ without a key returns 401, with
+    // Auth-Key it returns 200. Their static download endpoints are still open,
+    // which is why URLhaus needs no key - the distinction is the endpoint, not
+    // the publisher. Leaving this as None made the only file-hash feed we have
+    // fail every single sync.
+    if (!authKey.empty()) {
+        config.auth.method = AuthMethod::ApiKey;
+        config.auth.apiKey = authKey;
+        config.auth.apiKeyHeader = "Auth-Key";
+    } else {
+        // AddFeed rejects an ApiKey config carrying no key, so declaring None
+        // here keeps the failure at registration where it gets reported, rather
+        // than yielding a feed that 401s forever.
+        config.auth.method = AuthMethod::None;
+    }
     
     config.rateLimit.requestsPerMinute = 10;
     
@@ -728,7 +743,7 @@ ThreatFeedConfig ThreatFeedConfig::CreateThreatFox(const std::string& apiKey) {
     if (!apiKey.empty()) {
         config.auth.method = AuthMethod::ApiKey;
         config.auth.apiKey = apiKey;
-        config.auth.apiKeyHeader = "API-KEY";
+        config.auth.apiKeyHeader = "Auth-Key";  // abuse.ch unified header; API-KEY now 401s
     } else {
         config.auth.method = AuthMethod::None;
     }

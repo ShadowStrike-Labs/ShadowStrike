@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -543,7 +543,7 @@ struct ThreatFeedConfig {
     [[nodiscard]] static ThreatFeedConfig CreateURLhaus();
     
     /// @brief Create MalwareBazaar feed config
-    [[nodiscard]] static ThreatFeedConfig CreateMalwareBazaar();
+    [[nodiscard]] static ThreatFeedConfig CreateMalwareBazaar(const std::string& authKey = "");
     
     /// @brief Create ThreatFox feed config
     [[nodiscard]] static ThreatFeedConfig CreateThreatFox(const std::string& apiKey = "");

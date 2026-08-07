@@ -355,6 +355,7 @@
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelIOCManager.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelLookup.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelStore.cpp" />
+    <ClCompile Include="src\PhantomCore\ThreatIntel\FeedCredentials.cpp" />
     <ClCompile Include="src\PhantomCore\Update\DeltaUpdater.cpp" />
     <ClCompile Include="src\PhantomCore\Update\ProgramUpdater.cpp" />
     <ClCompile Include="src\PhantomCore\Update\RollbackManager.cpp" />
