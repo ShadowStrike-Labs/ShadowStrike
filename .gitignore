@@ -435,3 +435,7 @@ secrets/
 .env
 .env.*
 *.pfx.txt
+
+# Aggregated third-party YARA packages: fetched at build time, not redistributed.
+# See content/README.md - some upstream sections carry no licence grant.
+content/yara/yara_forge_rules_*.yar

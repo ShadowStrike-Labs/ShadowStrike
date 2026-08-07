@@ -25,6 +25,8 @@
 
 #include "../../src/PhantomCore/SignatureStore/SignatureBuilder.hpp"
 #include "../../src/PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "../../src/PhantomCore/SignatureStore/YaraRuleStore.hpp"   // YaraUtils::ValidateRuleSyntax
+#include "RuleLicenseFilter.hpp"
 
 #include <windows.h>
 
@@ -33,6 +35,8 @@
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -126,6 +130,7 @@ struct Options {
     std::uint64_t             sizeMb{ 64 };
     bool                      overwrite{ false };
     bool                      verify{ true };
+    std::wstring              attribution;   // empty => beside the output database
     bool                      quiet{ false };
 };
 
@@ -163,6 +168,129 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
     collect(root / "hashes",   opt.hashCsvFiles, { L".csv" });
     collect(root / "patterns", opt.patternFiles, { L".txt", L".patterns" });
     collect(root / "yara",     opt.yaraFiles,    { L".yar", L".yara" });
+}
+
+// Which YARA modules the libyara we link can actually compile. Probed rather
+// than hardcoded, so this self-corrects when the vendored library changes
+// instead of drifting into a lie. See vendor/yara_lib/README.md.
+[[nodiscard]] std::set<std::string> ProbeAvailableModules(
+    const std::vector<std::string>& candidates) {
+    std::set<std::string> available;
+    for (const auto& m : candidates) {
+        const std::string probe = "import \"" + m + "\"\nrule probe { condition: false }\n";
+        std::vector<std::string> errors;
+        if (ShadowStrike::SignatureStore::YaraUtils::ValidateRuleSyntax(probe, errors)) {
+            available.insert(m);
+        }
+    }
+    return available;
+}
+
+// Imports one YARA source, withholding anything we may not redistribute and
+// anything this build cannot compile. Both are reported: content that vanishes
+// quietly is indistinguishable from content that was never there, which is the
+// failure mode this whole tool exists to avoid.
+[[nodiscard]] bool ImportYaraWithLicenseFilter(SignatureBuilder& builder,
+                                              const std::wstring& path,
+                                              const Options& opt) {
+    std::string source;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            Fail("yara: cannot open '%ls'", path.c_str());
+            return false;
+        }
+        in.seekg(0, std::ios::end);
+        const std::streamoff size = in.tellg();
+        if (size <= 0) {
+            Fail("yara: '%ls' is empty", path.c_str());
+            return false;
+        }
+        in.seekg(0, std::ios::beg);
+        source.resize(static_cast<std::size_t>(size));
+        in.read(source.data(), size);
+        source.resize(static_cast<std::size_t>(in.gcount()));
+    }
+
+    const auto imported = ShadowStrike::SigBuild::ExtractImportedModules(source);
+    const auto available = ProbeAvailableModules(imported);
+    const auto report = ShadowStrike::SigBuild::FilterRuleSource(source, available);
+
+    if (!report.isAggregatedPackage) {
+        // A hand-written file is the author's own content; import it unchanged.
+        const StoreError e = builder.ImportYaraRulesFromFile(path, opt.yaraNamespace);
+        if (!e.IsSuccess()) {
+            Fail("yara failed for '%ls': %s", path.c_str(), Describe(e).c_str());
+            return false;
+        }
+        Info("  imported   : %-11s %ls", "yara", path.c_str());
+        return true;
+    }
+
+    Info("  yara pack  : %ls", path.c_str());
+    Info("    sources  : %zu upstream repositories", report.sections.size());
+
+    for (const auto& s : report.sections) {
+        if (!s.permitted) {
+            Info("    WITHHELD  : %-22s %5zu rules  (%s)",
+                 s.repository.c_str(), s.ruleCount, s.reason.c_str());
+        } else if (s.rulesDropped > 0) {
+            Info("    included  : %-22s %5zu rules  [%s]  (-%zu need a missing module)",
+                 s.repository.c_str(), s.ruleCount - s.rulesDropped,
+                 s.license.c_str(), s.rulesDropped);
+        }
+    }
+    if (!report.importsRemoved.empty()) {
+        std::string joined;
+        for (const auto& m : report.importsRemoved) {
+            joined += (joined.empty() ? "" : ", ") + m;
+        }
+        Info("    no module : %s  (this libyara build lacks it)", joined.c_str());
+    }
+    Info("    rules     : %zu of %zu kept, %zu unlicensed, %zu missing-module",
+         report.rulesKept, report.rulesTotal,
+         report.rulesDroppedNoLicense, report.rulesDroppedModule);
+
+    if (report.rulesKept == 0) {
+        Fail("yara: every rule in '%ls' was withheld - refusing to build an empty rule set",
+             path.c_str());
+        return false;
+    }
+
+    ShadowStrike::SignatureStore::YaraRuleInput input;
+    input.ruleSource = report.source;
+    input.namespace_ = opt.yaraNamespace;
+    input.source = Narrow(path);
+
+    const StoreError e = builder.AddYaraRule(input);
+    if (!e.IsSuccess()) {
+        Fail("yara failed for '%ls': %s", path.c_str(), Describe(e).c_str());
+        return false;
+    }
+
+    // Attribution is a redistribution condition of DRL and CC BY-SA, so write it
+    // beside the database that carries the rules rather than leaving it to a
+    // human to remember.
+    const fs::path manifest = opt.attribution.empty()
+        ? (fs::path(opt.output).parent_path() / L"THIRD-PARTY-RULES.md")
+        : fs::path(opt.attribution);
+    std::error_code ec;
+    if (!manifest.parent_path().empty()) {
+        fs::create_directories(manifest.parent_path(), ec);
+    }
+    std::ofstream out(manifest, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        Fail("yara: cannot write the attribution manifest to '%ls'", manifest.c_str());
+        return false;
+    }
+    const std::string md = ShadowStrike::SigBuild::BuildAttributionManifest(report);
+    out.write(md.data(), static_cast<std::streamsize>(md.size()));
+    if (!out) {
+        Fail("yara: failed writing the attribution manifest");
+        return false;
+    }
+    Info("    attribution: %ls", manifest.c_str());
+    return true;
 }
 
 [[nodiscard]] bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
@@ -204,6 +332,9 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
         } else if (a == L"--namespace") {
             if (!needValue(i)) { return false; }
             opt.yaraNamespace = Narrow(argv[++i]);
+        } else if (a == L"--attribution") {
+            if (!needValue(i)) { return false; }
+            opt.attribution = argv[++i];
         } else if (a == L"--size-mb") {
             if (!needValue(i)) { return false; }
             opt.sizeMb = std::wcstoull(argv[++i], nullptr, 10);
@@ -349,7 +480,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!importStep("patterns", f, builder.ImportPatternsFromFile(f))) { return 2; }
     }
     for (const auto& f : opt.yaraFiles) {
-        if (!importStep("yara", f, builder.ImportYaraRulesFromFile(f, opt.yaraNamespace))) { return 2; }
+        if (!ImportYaraWithLicenseFilter(builder, f, opt)) { return 2; }
     }
     for (const auto& d : opt.yaraDirs) {
         if (!importStep("yara-dir", d, builder.ImportYaraRulesFromDirectory(d, opt.yaraNamespace))) { return 2; }
