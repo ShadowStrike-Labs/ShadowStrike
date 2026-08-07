@@ -52,6 +52,7 @@
  */
 
 #include "pch.h"
+#include "../Utils/SystemUtils.hpp"  // GetKnownFolderForAllUsersOrSelf
 #include "EnvironmentEvasionDetector.hpp"
 
  // ============================================================================
@@ -1730,18 +1731,30 @@ namespace ShadowStrike::AntiEvasion {
         try {
             info = UserActivityInfo{};
 
-            // Expand environment variables
-            auto expandPath = [](const wchar_t* path) -> std::wstring {
-                wchar_t expanded[MAX_PATH];
-                ExpandEnvironmentStringsW(path, expanded, MAX_PATH);
-                return expanded;
+            // These counts decide whether the machine looks "lived-in", and four
+            // separate sandbox detections fire when they come back empty. The
+            // service runs as LocalSystem, so expanding %USERPROFILE% resolved
+            // the SYSTEM profile - whose Desktop, Documents, Downloads and Recent
+            // are empty on every machine, sandbox or not. Every real endpoint
+            // therefore reported four "sandbox indicator" detections permanently.
+            //
+            // Count across each interactive user's real folders instead. Lived-in
+            // is a machine-level property, so activity from any logged-on user
+            // counts toward it.
+            const auto sumOverUsers = [this](REFKNOWNFOLDERID folderId) -> uint32_t {
+                uint64_t total = 0;
+                for (const auto& dir :
+                     Utils::SystemUtils::GetKnownFolderForAllUsersOrSelf(folderId)) {
+                    total += CountFilesInDirectory(dir, nullptr);
+                }
+                return static_cast<uint32_t>(
+                    (total > UINT32_MAX) ? UINT32_MAX : total);
                 };
 
-            // Count files in various user directories
-            info.desktopItemsCount = CountFilesInDirectory(expandPath(L"%USERPROFILE%\\Desktop"), nullptr);
-            info.documentsCount = CountFilesInDirectory(expandPath(L"%USERPROFILE%\\Documents"), nullptr);
-            info.downloadsCount = CountFilesInDirectory(expandPath(L"%USERPROFILE%\\Downloads"), nullptr);
-            info.recentDocumentsCount = CountFilesInDirectory(expandPath(L"%APPDATA%\\Microsoft\\Windows\\Recent"), nullptr);
+            info.desktopItemsCount     = sumOverUsers(FOLDERID_Desktop);
+            info.documentsCount        = sumOverUsers(FOLDERID_Documents);
+            info.downloadsCount        = sumOverUsers(FOLDERID_Downloads);
+            info.recentDocumentsCount  = sumOverUsers(FOLDERID_Recent);
 
             // Check if system appears "lived-in"
             info.isLivedInSystem = (
