@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"  // GetKnownFolderForAllUsersOrSelf
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -1196,26 +1197,27 @@ public:
     std::vector<fs::path> GetFirefoxProfiles() {
         std::vector<fs::path> profiles;
 
-        for (const auto& basePathStr : FirefoxAddonConstants::FIREFOX_PROFILE_PATHS) {
-            // The literal `basePathStr` is pure ASCII (see FIREFOX_PROFILE_PATHS
-            // in the header), so a direct char->wchar copy is loss-free.
-            // ExpandEnvironmentStringsW is required because %USERPROFILE% can
-            // resolve to a path containing non-ASCII characters on locale-aware
-            // installations; the ANSI variant silently corrupts those.
-            std::wstring envPath = L"%USERPROFILE%";
-            for (const char* p = basePathStr; *p; ++p) {
-                envPath.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
-            }
+        // %USERPROFILE% expands against the CALLING identity, and this runs in a
+        // LocalSystem service, so it resolved to
+        // C:\Windows\system32\config\systemprofile - which has no Firefox. The
+        // fs::exists check below then skipped every candidate, so addon scanning
+        // never examined a single profile. Resolve each interactive user's real
+        // profile root instead; the resolved path is already wide, so the
+        // non-ASCII concern the ANSI expansion had does not arise.
+        const auto userRoots =
+            Utils::SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Profile);
 
-            wchar_t expandedPath[MAX_PATH]{};
-            DWORD expandedLen = ExpandEnvironmentStringsW(
-                envPath.c_str(), expandedPath, MAX_PATH);
-            if (expandedLen == 0 || expandedLen > MAX_PATH) {
-                continue;
-            }
+        for (const auto& userRoot : userRoots) {
+            for (const auto& basePathStr : FirefoxAddonConstants::FIREFOX_PROFILE_PATHS) {
+                // The literal `basePathStr` is pure ASCII (see FIREFOX_PROFILE_PATHS
+                // in the header), so a direct char->wchar copy is loss-free.
+                std::wstring suffix;
+                for (const char* p = basePathStr; *p; ++p) {
+                    suffix.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
+                }
 
-            fs::path basePath(expandedPath);
-            if (!fs::exists(basePath)) continue;
+                fs::path basePath = fs::path(userRoot) / fs::path(suffix).relative_path();
+                if (!fs::exists(basePath)) continue;
 
             // Parse profiles.ini
             fs::path profilesIni = basePath.parent_path() / "profiles.ini";
@@ -1255,6 +1257,7 @@ public:
                     }
                 }
             } catch (...) {}
+            }
         }
 
         return profiles;
