@@ -390,7 +390,6 @@ struct BehaviorBlockerConfig {
     uint32_t regexMaxInputLength{32768};      ///< Cap input length to prevent ReDoS
     uint32_t behaviorChainTimeoutSec{300};    ///< Chain window before auto-expiry (5 min)
     float escalationThreshold{0.7f};          ///< Chain score threshold for auto-escalation
-    std::filesystem::path rulesDirectory;     ///< Path to external rule definition files
 
     /// @brief Create a config suitable for development and testing.
     [[nodiscard]] static BehaviorBlockerConfig CreateDefault();

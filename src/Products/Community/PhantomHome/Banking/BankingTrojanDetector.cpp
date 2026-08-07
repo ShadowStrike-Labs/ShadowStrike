@@ -531,18 +531,6 @@ public:
 
             m_config = config;
 
-            // Validate YARA rules path if provided
-            if (!config.yaraRulesPath.empty()) {
-                const std::filesystem::path yaraPath(config.yaraRulesPath);
-                if (!std::filesystem::exists(yaraPath) || !std::filesystem::is_regular_file(yaraPath)) {
-                    SS_LOG_ERROR(LOG_CATEGORY, L"YARA rules file not found or not a regular file: %ls",
-                                 config.yaraRulesPath.c_str());
-                    m_status.store(ModuleStatus::Error, std::memory_order_release);
-                    return false;
-                }
-                SS_LOG_INFO(LOG_CATEGORY, L"YARA rules path validated: %ls", config.yaraRulesPath.c_str());
-            }
-
             // Load whitelist
             m_whitelist.clear();
             for (const auto& proc : config.whitelistedProcesses) {

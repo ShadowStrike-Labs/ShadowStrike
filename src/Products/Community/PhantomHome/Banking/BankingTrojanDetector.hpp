@@ -804,9 +804,6 @@ struct BankingTrojanDetectorConfiguration {
     /// @brief Whitelisted processes
     std::vector<std::wstring> whitelistedProcesses;
     
-    /// @brief YARA rules path
-    std::wstring yaraRulesPath;
-    
     /// @brief Verbose logging
     bool verboseLogging = false;
     
