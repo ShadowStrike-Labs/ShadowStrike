@@ -40,6 +40,13 @@
 #include <intrin.h>
 #include <VersionHelpers.h>
 #include <winternl.h>
+#include <algorithm>
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <wtsapi32.h>
+#pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -1363,6 +1370,81 @@ namespace SystemUtils {
         (void)bootTimeUtc;
         return false;
 #endif
+    }
+
+    std::vector<std::wstring> GetKnownFolderForAllUsers(REFKNOWNFOLDERID folderId) {
+        std::vector<std::wstring> resolved;
+
+#ifdef _WIN32
+        PWTS_SESSION_INFOW sessions = nullptr;
+        DWORD sessionCount = 0;
+        if (!::WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount)) {
+            return resolved;
+        }
+
+        for (DWORD i = 0; i < sessionCount; ++i) {
+            // Disconnected sessions are included deliberately: a locked or
+            // switched-away desktop still has a live profile, and a browser can
+            // still be completing a download or ransomware encrypting files
+            // there. Other states (listening, idle, initialising) have no
+            // interactive user, so WTSQueryUserToken would fail anyway.
+            if (sessions[i].State != WTSActive && sessions[i].State != WTSDisconnected) {
+                continue;
+            }
+
+            HANDLE userToken = nullptr;
+            if (!::WTSQueryUserToken(sessions[i].SessionId, &userToken)) {
+                // No interactive user in this session. Expected for the console
+                // session before logon and for the services session.
+                continue;
+            }
+
+            PWSTR sessionPath = nullptr;
+            const HRESULT hr = ::SHGetKnownFolderPath(folderId, 0, userToken, &sessionPath);
+            if (SUCCEEDED(hr) && sessionPath != nullptr) {
+                std::wstring candidate(sessionPath);
+
+                // Several sessions can map to one profile; returning it twice
+                // would make callers scan or seed the same directory twice.
+                if (std::find(resolved.begin(), resolved.end(), candidate) == resolved.end()) {
+                    resolved.emplace_back(std::move(candidate));
+                }
+            }
+            if (sessionPath != nullptr) {
+                ::CoTaskMemFree(sessionPath);
+            }
+
+            ::CloseHandle(userToken);
+        }
+
+        ::WTSFreeMemory(sessions);
+#else
+        (void)folderId;
+#endif
+
+        return resolved;
+    }
+
+    std::vector<std::wstring> GetKnownFolderForAllUsersOrSelf(REFKNOWNFOLDERID folderId) {
+        std::vector<std::wstring> resolved = GetKnownFolderForAllUsers(folderId);
+        if (!resolved.empty()) {
+            return resolved;
+        }
+
+#ifdef _WIN32
+        // No interactive user - headless or pre-logon. Fall back to the calling
+        // identity so behaviour is never worse than a plain null-token call.
+        PWSTR path = nullptr;
+        const HRESULT hr = ::SHGetKnownFolderPath(folderId, 0, nullptr, &path);
+        if (SUCCEEDED(hr) && path != nullptr) {
+            resolved.emplace_back(path);
+        }
+        if (path != nullptr) {
+            ::CoTaskMemFree(path);
+        }
+#endif
+
+        return resolved;
     }
 
 } // namespace SystemUtils

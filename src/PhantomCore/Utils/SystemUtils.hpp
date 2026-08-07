@@ -40,6 +40,7 @@
 #include <vector>
 #include <array>
 #include <optional>
+#include <shlobj.h>        // REFKNOWNFOLDERID for the per-user folder resolvers
 #include <cstdint>
 
 #ifdef _WIN32
@@ -379,6 +380,44 @@ namespace SystemUtils {
      * @note Calculated from current time minus uptime; may have minor drift
      */
     [[nodiscard]] bool QueryBootTime(FILETIME& bootTimeUtc) noexcept;
+
+    //=============================================================================
+    // Interactive User Profile Resolution
+    //=============================================================================
+
+    /**
+     * @brief Resolves a known folder for every interactive user on the machine
+     *
+     * The service runs as LocalSystem. SHGetKnownFolderPath with a null token
+     * resolves against the *caller's* profile, which for LocalSystem is
+     * C:\Windows\system32\config\systemprofile - not the logged-on user. Any
+     * module that scans, monitors or seeds a per-user directory therefore looks
+     * at a profile no real user and no malware ever touches.
+     *
+     * This enumerates interactive sessions and resolves the folder against each
+     * session's user token, so callers cover every logged-on user rather than
+     * just the console one.
+     *
+     * @param folderId KNOWNFOLDERID to resolve (e.g. FOLDERID_Downloads)
+     * @return One absolute path per distinct user profile; empty if none resolved
+     * @note Several sessions can map to one profile, so results are deduplicated
+     * @note Requires SeTcbPrivilege for WTSQueryUserToken, which LocalSystem has
+     */
+    [[nodiscard]] std::vector<std::wstring> GetKnownFolderForAllUsers(
+        REFKNOWNFOLDERID folderId);
+
+    /**
+     * @brief Resolves a known folder for all interactive users, else the caller
+     *
+     * Identical to GetKnownFolderForAllUsers but falls back to the calling
+     * identity when no interactive user can be resolved - a headless or
+     * pre-logon machine - so behaviour is never worse than a null-token call.
+     *
+     * @param folderId KNOWNFOLDERID to resolve
+     * @return One absolute path per profile, or the caller's own as a last resort
+     */
+    [[nodiscard]] std::vector<std::wstring> GetKnownFolderForAllUsersOrSelf(
+        REFKNOWNFOLDERID folderId);
 
 } // namespace SystemUtils
 } // namespace Utils

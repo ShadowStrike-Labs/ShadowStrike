@@ -70,6 +70,8 @@
 #ifdef _WIN32
 #include <shlobj.h>
 #include <knownfolders.h>
+#include <wtsapi32.h>       // WTSEnumerateSessionsW / WTSQueryUserToken
+#pragma comment(lib, "wtsapi32.lib")
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #endif
@@ -115,45 +117,38 @@ namespace {
     }
 
     /**
-     * @brief Get standard location path via SHGetKnownFolderPath.
+     * @brief Get every base directory to seed for a location type.
+     *
+     * Per-user types resolve to one directory per logged-on user. The service
+     * runs as LocalSystem, so resolving these against the caller would place
+     * every canary in C:\Windows\system32\config\systemprofile - a profile
+     * ransomware never touches, which left the whole tripwire layer inert.
+     * SystemUtils performs the session-token resolution; see the contract there.
      */
-    [[nodiscard]] std::wstring GetLocationPath(LocationType type) {
+    [[nodiscard]] std::vector<std::wstring> GetLocationPaths(LocationType type) {
 #ifdef _WIN32
-        PWSTR path = nullptr;
-        HRESULT hr = E_FAIL;
-
         switch (type) {
             case LocationType::UserDocuments:
-                hr = SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &path);
-                break;
+                return SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Documents);
             case LocationType::UserDesktop:
-                hr = SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &path);
-                break;
+                return SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Desktop);
             case LocationType::UserPictures:
-                hr = SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &path);
-                break;
+                return SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Pictures);
             case LocationType::UserDownloads:
-                hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &path);
-                break;
+                return SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Downloads);
             case LocationType::RootDrive: {
+                // Machine-wide, so the calling identity resolves it correctly.
                 wchar_t sysPath[MAX_PATH]{};
                 if (GetSystemDirectoryW(sysPath, MAX_PATH)) {
-                    return std::wstring(sysPath).substr(0, 3);
+                    return { std::wstring(sysPath).substr(0, 3) };
                 }
-                return L"C:\\";
+                return { L"C:\\" };
             }
             default:
                 break;
         }
-
-        if (SUCCEEDED(hr) && path) {
-            std::wstring result(path);
-            CoTaskMemFree(path);
-            return result;
-        }
-        if (path) CoTaskMemFree(path);
 #endif
-        return L"";
+        return {};
     }
 
     /**
@@ -390,40 +385,46 @@ bool HoneypotManagerImpl::DeployTraps() {
 }
 
 bool HoneypotManagerImpl::DeployToLocation(const DeploymentLocation& location) {
-    std::wstring basePath;
+    // A per-user location type resolves to one directory per logged-on user, so
+    // this is a list rather than a single path. An explicitly configured path is
+    // taken verbatim and is not expanded per user.
+    std::vector<std::wstring> basePaths;
     if (location.path.empty()) {
-        basePath = GetLocationPath(location.type);
+        basePaths = GetLocationPaths(location.type);
     } else {
-        basePath = location.path;
+        basePaths.emplace_back(location.path);
     }
 
-    if (basePath.empty()) {
-        SS_LOG_WARN(kLogCategory, L"Empty location path for type %d",
+    if (basePaths.empty()) {
+        SS_LOG_WARN(kLogCategory, L"No location path resolved for type %d",
                     static_cast<int>(location.type));
         return false;
     }
 
-    std::error_code fsec;
-    if (!fs::exists(basePath, fsec)) {
-        SS_LOG_WARN(kLogCategory, L"Location path does not exist: %ls", basePath.c_str());
-        return false;
-    }
-
-    const size_t trapsToDeploy = location.maxHoneypots;
     std::vector<HoneypotTemplate> availableTemplates = GetTemplates();
     if (availableTemplates.empty()) return false;
 
     size_t successCount = 0;
-    for (size_t i = 0; i < trapsToDeploy; ++i) {
-        if (GetHoneypotCount() >= m_config.maxTotalHoneypots) {
-            SS_LOG_INFO(kLogCategory, L"Global honeypot limit (%zu) reached",
-                        m_config.maxTotalHoneypots);
-            break;
+    for (const auto& basePath : basePaths) {
+        std::error_code fsec;
+        if (!fs::exists(basePath, fsec)) {
+            // A user profile may legitimately lack a given folder.
+            SS_LOG_WARN(kLogCategory, L"Location path does not exist: %ls", basePath.c_str());
+            continue;
         }
 
-        const auto& tmpl = availableTemplates[SecureRandomIndex(availableTemplates.size())];
-        if (DeployHoneypot(basePath, tmpl)) {
-            successCount++;
+        const size_t trapsToDeploy = location.maxHoneypots;
+        for (size_t i = 0; i < trapsToDeploy; ++i) {
+            if (GetHoneypotCount() >= m_config.maxTotalHoneypots) {
+                SS_LOG_INFO(kLogCategory, L"Global honeypot limit (%zu) reached",
+                            m_config.maxTotalHoneypots);
+                return successCount > 0;
+            }
+
+            const auto& tmpl = availableTemplates[SecureRandomIndex(availableTemplates.size())];
+            if (DeployHoneypot(basePath, tmpl)) {
+                successCount++;
+            }
         }
     }
 
