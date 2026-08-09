@@ -538,7 +538,27 @@ struct HoneypotManagerConfiguration {
     bool hideFiles = true;
     
     /// @brief Make files system files
-    bool makeSystemFiles = false;
+    // Decoys carry FILE_ATTRIBUTE_SYSTEM in addition to HIDDEN.
+    //
+    // HIDDEN alone is not enough in practice. Anyone who has enabled "Show
+    // hidden files" - which is most technical users and every developer - sees
+    // a handful of documents they did not create appear in Documents, Pictures
+    // and on the Desktop, and the only reasonable conclusion is that the
+    // machine is infected. That happened to this project's own author on a test
+    // VM, which is as clear a signal as we are going to get: if the person who
+    // wrote the tripwire reads it as an infection, a customer certainly will.
+    //
+    // Explorer hides HIDDEN+SYSTEM behind a second, separate setting ("Hide
+    // protected operating system files") that is enabled by default and that
+    // almost nobody turns off, so the pair is invisible to essentially everyone
+    // who is not deliberately looking.
+    //
+    // This costs no detection. Ransomware enumerates targets with
+    // FindFirstFile/FindNextFile or the equivalent, which return hidden and
+    // system entries without any special flag, so a decoy remains exactly as
+    // discoverable to an encryptor as it was before. Teardown already strips
+    // both attributes together, so the change stays symmetric.
+    bool makeSystemFiles = true;
     
     /// @brief Kill process on access
     bool killOnAccess = true;
