@@ -2481,9 +2481,11 @@ public:
         // packer, ExecutableAnalyzer, ScanEngine — cannot open. Resolve it to a
         // DOS path once, here at the boundary; without this each scan fails
         // "file not found" and the product never actually inspects anything.
+        SS_DIAG("OnAccess", "step.DevicePathToDosPath");
         filePath = Utils::FileUtils::DevicePathToDosPath(filePath);
 
         // 1. Check Exclusions
+        SS_DIAG("OnAccess", "step.IsExcluded");
         if (IsExcluded(filePath, req.ProcessId)) {
             m_stats.excludedByPath++;
             return Communication::KernelVerdict::Allow;
@@ -2512,6 +2514,7 @@ public:
             if (!mutating) {
                 uint64_t mtime = 0;
                 WIN32_FILE_ATTRIBUTE_DATA fad{};
+                SS_DIAG("OnAccess", "step.GetFileAttributesExW");
                 if (GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &fad)) {
                     mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
                           |  static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
@@ -2519,6 +2522,7 @@ public:
                 fileIdentityKey = ToLowerW(filePath) + L"|" +
                     std::to_wstring(static_cast<unsigned long long>(req.FileSize)) + L"|" +
                     std::to_wstring(static_cast<unsigned long long>(mtime));
+                SS_DIAG("OnAccess", "step.CheckFileVerdictCache");
                 if (auto cached = CheckFileVerdictCache(fileIdentityKey)) {
                     m_stats.cleanFiles++;
                     return *cached;
@@ -2542,6 +2546,7 @@ public:
                 // writes/creates always fall through to full analysis; and
                 // (d) LOLBin *abuse* of a signed binary is detected by the
                 // process/behavioral monitors, not by scanning the clean file.
+                SS_DIAG("OnAccess", "step.IsMicrosoftSigned(WinVerifyTrust)");
                 if (Security::DigitalSignatureValidator::Instance()
                         .IsMicrosoftSigned(filePath)) {
                     UpdateFileVerdictCache(fileIdentityKey,
@@ -2553,6 +2558,7 @@ public:
         }
 
         // 1.5. CPU-based scan throttling — defer low-priority scans under heavy load
+        SS_DIAG("OnAccess", "step.CPUMonitor.IsSystemUnderLoad");
         if (m_config.throttleOnHighCPU && Performance::CPUMonitor::HasInstance()) {
             if (Performance::CPUMonitor::Instance().IsSystemUnderLoad(90.0)) {
                 // Under extreme load, only allow high-priority scans (Priority > 0).
@@ -2583,8 +2589,10 @@ public:
             switch (accessType) {
                 case static_cast<uint8_t>(ShadowStrikeAccessWrite):
                 case static_cast<uint8_t>(ShadowStrikeAccessCreate):
+                    SS_DIAG("OnAccess", "step.DispatchFileWrite(ransomware)");
                     Ransomware::Wiring::DispatchFileWrite(
                         req.ProcessId, filePath, std::wstring{});
+                    SS_DIAG("OnAccess", "step.DispatchFileScan(scripts)");
                     if (Scripts::Wiring::DispatchFileScan(req.ProcessId, filePath)) {
                         Utils::Logger::Warn(
                             "RealTimeProtection: Script scanner blocked malicious file: {}",
@@ -2596,10 +2604,12 @@ public:
                 case static_cast<uint8_t>(ShadowStrikeAccessRename):
                     // Rename carries only the new path at this layer; LockyDetector
                     // still scores on the new extension alone.
+                    SS_DIAG("OnAccess", "step.DispatchFileRename");
                     Ransomware::Wiring::DispatchFileRename(
                         req.ProcessId, std::wstring{}, filePath);
                     break;
                 case static_cast<uint8_t>(ShadowStrikeAccessDelete):
+                    SS_DIAG("OnAccess", "step.DispatchFileDelete");
                     Ransomware::Wiring::DispatchFileDelete(req.ProcessId, filePath);
                     break;
                 default:
@@ -2676,6 +2686,7 @@ public:
         // ALREADY run, so file-operation patterns are still scored; and (c) a
         // later create/write on the path re-triggers a scan with real content.
         {
+        SS_DIAG("OnAccess", "step.GetFileAttributesW");
             const DWORD attrs = ::GetFileAttributesW(filePath.c_str());
             if (attrs == INVALID_FILE_ATTRIBUTES) {
                 // Absent / unresolvable path -- nothing to inspect.
