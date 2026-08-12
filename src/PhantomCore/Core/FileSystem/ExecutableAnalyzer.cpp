@@ -2621,7 +2621,52 @@ public:
             trustData.dwUnionChoice = WTD_CHOICE_FILE;
             trustData.pFile = &fileInfo;
             trustData.dwStateAction = WTD_STATEACTION_VERIFY;
-            trustData.dwProvFlags = WTD_SAFER_FLAG;
+
+            // WTD_CACHE_ONLY_URL_RETRIEVAL is not optional here: without it this
+            // call reaches the network, and this call sits on the synchronous
+            // on-access path with a kernel file operation held open behind it.
+            //
+            // Field evidence, 2026-08-12 trace ring. Two scan workers entered
+            // this function and returned 180.1 and 180.3 seconds later, within
+            // four milliseconds of each other:
+            //     17:58:25.671 t5004 > Analyze.VerifySignature
+            //     18:01:25.784 t5004 < Analyze.VerifySignature  180112924 us
+            //     17:58:25.493 t3416 > Analyze.VerifySignature
+            //     18:01:25.788 t3416 < Analyze.VerifySignature  180293822 us
+            // Three minutes on the nose, on two independent threads releasing
+            // simultaneously, is a network retrieval timing out with both callers
+            // queued behind the same cryptnet fetch. The pool has two workers, so
+            // that was three minutes of zero scan capacity: every file operation
+            // on the machine waited out a driver timeout and the desktop never
+            // finished composing. That is the gray-screen lockdown.
+            //
+            // WTD_REVOKE_NONE above was not sufficient, which is the subtle part.
+            // It suppresses CRL and OCSP revocation checking, but chain building
+            // still resolves missing intermediate CA certificates through the
+            // Authority Information Access extension, and that retrieval goes to
+            // the network regardless of the revocation setting. Only the
+            // cache-only flag suppresses URL retrieval as a whole.
+            //
+            // This costs no detection. Revocation was already disabled on this
+            // path, so nothing is lost there. The flag only changes where
+            // intermediate certificates come from - local store and cache rather
+            // than the network - while the signature cryptography is verified
+            // identically either way. When an intermediate genuinely is not
+            // available locally the chain is reported incomplete, we treat the
+            // file as unverified, and it receives MORE analysis rather than less,
+            // so the failure direction is the safe one. And measured against what
+            // actually happens today the change can only improve coverage: a check
+            // that stalls both scan workers for three minutes leaves the whole
+            // machine unscanned while the driver fails open.
+            //
+            // DigitalSignatureValidator already does exactly this on the same hot
+            // path (WTD_REVOKE_NONE plus WTD_CACHE_ONLY_URL_RETRIEVAL) and the same
+            // trace shows it completing 528 times with a 7 ms worst case. This
+            // brings the second path in line with the one already proven in the
+            // field. Full revocation checking with network access belongs in the
+            // asynchronous deep-scan stage and in the update and certificate
+            // pinning paths, where a slow fetch delays only itself.
+            trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
 
             LONG result = WinVerifyTrust(nullptr, &policyGUID, &trustData);
 

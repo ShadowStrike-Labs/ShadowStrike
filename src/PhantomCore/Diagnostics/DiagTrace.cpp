@@ -198,8 +198,6 @@ void FlushDirtyRange() noexcept {
 }
 
 DWORD WINAPI FlushThreadProc(LPVOID) noexcept {
-    // Below normal: this thread exists to preserve evidence, never to compete
-    // with the work being traced.
     // Run ABOVE normal, not below.
     //
     // BELOW_NORMAL was chosen so tracing never competed with detection work, which
