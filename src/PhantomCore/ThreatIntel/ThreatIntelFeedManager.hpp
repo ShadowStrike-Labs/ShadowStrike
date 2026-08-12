@@ -530,9 +530,6 @@ struct ThreatFeedConfig {
     /// @brief Create default config for known source
     [[nodiscard]] static ThreatFeedConfig CreateDefault(ThreatIntelSource source);
     
-    /// @brief Create VirusTotal feed config
-    [[nodiscard]] static ThreatFeedConfig CreateVirusTotal(const std::string& apiKey);
-    
     /// @brief Create AlienVault OTX feed config
     [[nodiscard]] static ThreatFeedConfig CreateAlienVaultOTX(const std::string& apiKey);
     
@@ -1264,7 +1261,7 @@ public:
  * manager.Initialize(config);
  * 
  * // Add feeds
- * manager.AddFeed(ThreatFeedConfig::CreateVirusTotal("your-api-key"));
+ * manager.AddFeed(ThreatFeedConfig::CreateAlienVaultOTX("your-otx-key"));
  * manager.AddFeed(ThreatFeedConfig::CreateURLhaus());
  * 
  * // Set event callback

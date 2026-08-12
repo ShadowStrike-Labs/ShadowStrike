@@ -1044,9 +1044,31 @@ uint32_t ThreatIntelStore::RegisterCredentialedFeeds() noexcept {
             ThreatIntel::FeedCredentialKeys::OtxApiKey);
     }
 
-    if (const auto vtKey = creds.Get(ThreatIntel::FeedCredentialKeys::VirusTotalApiKey)) {
-        add("virustotal", ThreatFeedConfig::CreateVirusTotal(*vtKey));
+    // VirusTotal is deliberately NOT registered, even when a key is present.
+    //
+    // Their Terms of Service disqualify this product on three independent counts:
+    // the API "must not be used in commercial products or services", it "can not
+    // be used as a substitute for antivirus products", and it "can not be
+    // integrated in any project that may harm the antivirus industry directly or
+    // indirectly". ShadowStrike Phantom is a commercial-licensable antivirus
+    // product in the antivirus industry, so there is no configuration in which
+    // this feed is permissible - it is not a matter of attribution or of a paid
+    // tier, and no warning text would make it compliant.
+    //
+    // The key is reported rather than silently ignored. A user who took the
+    // trouble to configure one is entitled to know the omission is deliberate and
+    // not a bug, otherwise they will reasonably conclude the feed subsystem is
+    // broken and go looking for a defect that does not exist.
+    if (creds.Get(ThreatIntel::FeedCredentialKeys::VirusTotalApiKey)) {
+        Utils::Logger::Warn(
+            "[ThreatIntel] {} is configured but VirusTotal is intentionally not "
+            "used. Their terms forbid use in commercial products, use as an "
+            "antivirus substitute, and integration into anything affecting the "
+            "antivirus industry - this product is all three. Remove the key to "
+            "silence this warning; hash reputation is served by MalwareBazaar.",
+            ThreatIntel::FeedCredentialKeys::VirusTotalApiKey);
     }
+
     if (const auto ipdbKey = creds.Get(ThreatIntel::FeedCredentialKeys::AbuseIpdbApiKey)) {
         add("abuseipdb", ThreatFeedConfig::CreateAbuseIPDB(*ipdbKey));
     }

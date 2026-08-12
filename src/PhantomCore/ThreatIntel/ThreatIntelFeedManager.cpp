@@ -550,35 +550,19 @@ ThreatFeedConfig ThreatFeedConfig::CreateDefault(ThreatIntelSource source) {
     return config;
 }
 
-ThreatFeedConfig ThreatFeedConfig::CreateVirusTotal(const std::string& apiKey) {
-    ThreatFeedConfig config = CreateDefault(ThreatIntelSource::VirusTotal);
-    
-    config.feedId = "virustotal";
-    config.name = "VirusTotal";
-    config.description = "VirusTotal threat intelligence feed";
-    config.protocol = FeedProtocol::REST_API;
-    
-    config.endpoint.baseUrl = "https://www.virustotal.com";
-    config.endpoint.path = "/api/v3/intelligence/search";
-    config.endpoint.method = "GET";
-    
-    config.auth.method = AuthMethod::ApiKey;
-    config.auth.apiKey = apiKey;
-    config.auth.apiKeyHeader = "x-apikey";
-    
-    // Rate limits for free tier
-    config.rateLimit.requestsPerMinute = 4;
-    config.rateLimit.requestsPerDay = 500;
-    config.rateLimit.minIntervalMs = 15000;
-    
-    config.parser.iocPath = "$.data";
-    config.parser.valuePath = "$.id";
-    config.parser.typePath = "$.type";
-    
-    config.syncIntervalSeconds = 3600;  // 1 hour
-    
-    return config;
-}
+// ThreatFeedConfig::CreateVirusTotal was removed deliberately, not overlooked.
+//
+// VirusTotal's Terms of Service disqualify this product on three independent
+// counts: the API must not be used in commercial products or services, cannot be
+// used as a substitute for antivirus products, and cannot be integrated into any
+// project that may harm the antivirus industry directly or indirectly. This is a
+// commercial-licensable antivirus product in the antivirus industry, so no
+// configuration of this feed is permissible and a factory that produces a usable
+// config is a liability waiting for a caller. RegisterCredentialedFeeds reports a
+// configured VIRUSTOTAL_API_KEY as intentionally unused rather than acting on it.
+//
+// If a future non-commercial build ever needs this, reintroduce it behind a build
+// flag that also removes the commercial licence grant - do not simply restore it.
 
 ThreatFeedConfig ThreatFeedConfig::CreateAlienVaultOTX(const std::string& apiKey) {
     ThreatFeedConfig config = CreateDefault(ThreatIntelSource::AlienVaultOTX);

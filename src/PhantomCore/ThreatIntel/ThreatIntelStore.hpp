@@ -580,21 +580,11 @@ struct FeedConfiguration {
     bool verifySignature = false;
     std::string signatureKeyPath;
     
-    /**
-     * @brief Create VirusTotal feed configuration
-     */
-    [[nodiscard]] static FeedConfiguration CreateVirusTotal(const std::string& apiKey) {
-        FeedConfiguration config;
-        config.feedId = "virustotal";
-        config.name = "VirusTotal";
-        config.description = "VirusTotal threat intelligence feed";
-        config.type = FeedType::JSON;
-        config.url = "https://www.virustotal.com/api/v3/intelligence/feeds";
-        config.authType = FeedAuthType::APIKey;
-        config.apiKey = apiKey;
-        config.priority = 90;
-        return config;
-    }
+    // FeedConfiguration::CreateVirusTotal was removed deliberately. VirusTotal's
+    // terms forbid use in commercial products or services, use as a substitute for
+    // antivirus products, and integration into any project that may harm the
+    // antivirus industry - this product is all three, so there is no permissible
+    // configuration. See the matching note in ThreatIntelFeedManager.cpp.
     
     /**
      * @brief Create AlienVault OTX feed configuration
@@ -985,7 +975,7 @@ using StoreEventCallback = std::function<void(const StoreEvent&)>;
  * auto store = std::make_unique<ThreatIntelStore>();
  * if (store->Initialize(config)) {
  *     // Add feed
- *     store->AddFeed(FeedConfig::CreateVirusTotal(apiKey));
+ *     store->AddFeed(FeedConfig::CreateAlienVaultOTX(otxKey));
  *     store->StartFeedUpdates();
  *     
  *     // Lookup hash
