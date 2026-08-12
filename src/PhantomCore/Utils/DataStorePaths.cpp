@@ -14,6 +14,8 @@
 #include <aclapi.h>   // SetEntriesInAclW, SetNamedSecurityInfoW
 #include <sddl.h>
 
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 
 namespace ShadowStrike::Utils::DataStorePaths {
@@ -212,5 +214,190 @@ std::wstring SignatureDatabase()      { return GetDataDirectory() + L"\\signatur
 std::wstring WhitelistDatabase()      { return GetDataDirectory() + L"\\whitelist.wdb"; }
 std::wstring ThreatIntelDatabase()    { return GetDataDirectory() + L"\\threatintel.tidb"; }
 std::wstring HashReputationDatabase() { return GetDataDirectory() + L"\\hashes.hdb"; }
+
+namespace {
+
+// Signature database header, as written by phantom-sigbuild. Only the two fields
+// needed to decide whether a copy is worthwhile are named here; the full layout
+// belongs to SignatureStore and is deliberately not duplicated.
+constexpr std::uint32_t kSignatureDbMagic       = 0x53535344u;  // 'SSSD'
+constexpr std::size_t   kOffsetMagic            = 0;
+constexpr std::size_t   kOffsetLastUpdateTime   = 32;           // Unix milliseconds
+constexpr std::size_t   kHeaderProbeBytes       = 48;
+
+struct DbStamp {
+    bool          valid = false;
+    std::uint64_t lastUpdateTime = 0;
+};
+
+// Reads and validates just enough of a candidate database to compare versions.
+// A file that fails this is treated as absent rather than as empty or as zero,
+// so a truncated download or a half-written copy can never be judged "older" and
+// silently overwrite something good, nor be judged "newer" and replace it.
+[[nodiscard]] DbStamp ReadDbStamp(const std::wstring& path) noexcept {
+    DbStamp stamp;
+
+    const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     nullptr, OPEN_EXISTING,
+                                     FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return stamp;
+    }
+
+    unsigned char header[kHeaderProbeBytes]{};
+    DWORD read = 0;
+    const BOOL ok = ::ReadFile(file, header, static_cast<DWORD>(sizeof(header)), &read, nullptr);
+    ::CloseHandle(file);
+
+    if (!ok || read != sizeof(header)) {
+        return stamp;
+    }
+
+    std::uint32_t magic = 0;
+    std::memcpy(&magic, header + kOffsetMagic, sizeof(magic));
+    if (magic != kSignatureDbMagic) {
+        return stamp;
+    }
+
+    std::memcpy(&stamp.lastUpdateTime, header + kOffsetLastUpdateTime, sizeof(stamp.lastUpdateTime));
+    stamp.valid = true;
+    return stamp;
+}
+
+[[nodiscard]] std::wstring ModuleDirectory() noexcept {
+    // GetModuleFileNameW(nullptr) is the executable, which for the service is
+    // <install dir>\ShadowStrikePhantomService.exe. Resolving relative to the
+    // module rather than the working directory matters because a service starts
+    // with the working directory set to System32.
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD len = ::GetModuleFileNameW(nullptr, buffer.data(),
+                                              static_cast<DWORD>(buffer.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buffer.size()) {
+            buffer.resize(len);
+            break;
+        }
+        if (buffer.size() >= 32768) {   // NT path ceiling; give up rather than spin
+            return {};
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+
+    const std::size_t slash = buffer.find_last_of(L'\\');
+    return (slash == std::wstring::npos) ? std::wstring{} : buffer.substr(0, slash);
+}
+
+}  // namespace
+
+std::wstring GetShippedContentDirectory() {
+    const std::wstring dir = ModuleDirectory();
+    return dir.empty() ? std::wstring{} : (dir + L"\\content");
+}
+
+bool SeedSignatureDatabaseFromBaseline() noexcept {
+    const std::wstring working = SignatureDatabase();
+    const std::wstring contentDir = GetShippedContentDirectory();
+
+    const DbStamp workingStamp = ReadDbStamp(working);
+
+    if (contentDir.empty()) {
+        SS_LOG_WARN(kLogCat,
+            L"Could not resolve this module's directory, so the shipped detection "
+            L"content could not be located. Working database %ls",
+            workingStamp.valid ? L"is present and will be used as-is."
+                               : L"is ALSO absent - the engine will start with no signatures.");
+        return workingStamp.valid;
+    }
+
+    const std::wstring baseline = contentDir + L"\\signatures.sdb";
+    const DbStamp baselineStamp = ReadDbStamp(baseline);
+
+    if (!baselineStamp.valid) {
+        // Distinguish "not shipped" from "shipped but unusable": the first is a
+        // packaging gap, the second is corruption, and they need different fixes.
+        const DWORD attrs = ::GetFileAttributesW(baseline.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            SS_LOG_WARN(kLogCat,
+                L"No shipped detection content at '%ls'. This installation cannot "
+                L"seed a signature database, so unless one is already present the "
+                L"engine will run with no signatures, no patterns and no YARA rules.",
+                baseline.c_str());
+        } else {
+            SS_LOG_ERROR(kLogCat,
+                L"Shipped detection content at '%ls' is present but is not a valid "
+                L"signature database (bad magic or truncated). Refusing to use it; "
+                L"any existing working database is left untouched.",
+                baseline.c_str());
+        }
+        return workingStamp.valid;
+    }
+
+    if (workingStamp.valid && workingStamp.lastUpdateTime >= baselineStamp.lastUpdateTime) {
+        // Never roll back content that runtime updates have moved forward.
+        return true;
+    }
+
+    if (!EnsureDataDirectory()) {
+        SS_LOG_ERROR(kLogCat,
+            L"Cannot prepare the data directory, so the shipped signature database "
+            L"could not be installed. The engine will start with no signatures.");
+        return false;
+    }
+
+    // Copy to a sibling temporary first, then swap. A direct CopyFileW onto the
+    // live path would leave a half-written database behind if the machine lost
+    // power or the copy failed, and that file would then look like a real
+    // database to the next start - the failure mode this whole function exists to
+    // avoid. MOVEFILE_REPLACE_EXISTING on the same volume is atomic.
+    const std::wstring staging = working + L".incoming";
+    ::DeleteFileW(staging.c_str());
+
+    if (!::CopyFileW(baseline.c_str(), staging.c_str(), FALSE)) {
+        SS_LOG_ERROR(kLogCat,
+            L"Copying the shipped signature database to '%ls' failed (win32=%lu). "
+            L"Existing content, if any, is unchanged.",
+            staging.c_str(), ::GetLastError());
+        ::DeleteFileW(staging.c_str());
+        return workingStamp.valid;
+    }
+
+    // Re-validate the copy rather than the source. A short read or a full disk
+    // produces a file that passes CopyFileW's return but is not a database.
+    if (!ReadDbStamp(staging).valid) {
+        SS_LOG_ERROR(kLogCat,
+            L"The copied signature database at '%ls' did not validate, so it was "
+            L"discarded. Existing content, if any, is unchanged.", staging.c_str());
+        ::DeleteFileW(staging.c_str());
+        return workingStamp.valid;
+    }
+
+    if (!::MoveFileExW(staging.c_str(), working.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        SS_LOG_ERROR(kLogCat,
+            L"Could not swap the new signature database into place at '%ls' "
+            L"(win32=%lu). Existing content, if any, is unchanged.",
+            working.c_str(), ::GetLastError());
+        ::DeleteFileW(staging.c_str());
+        return workingStamp.valid;
+    }
+
+    if (workingStamp.valid) {
+        SS_LOG_INFO(kLogCat,
+            L"Refreshed the signature database from shipped content: "
+            L"stamp %llu -> %llu (%ls)",
+            static_cast<unsigned long long>(workingStamp.lastUpdateTime),
+            static_cast<unsigned long long>(baselineStamp.lastUpdateTime),
+            working.c_str());
+    } else {
+        SS_LOG_INFO(kLogCat,
+            L"Installed the shipped signature database (stamp %llu) to '%ls'",
+            static_cast<unsigned long long>(baselineStamp.lastUpdateTime),
+            working.c_str());
+    }
+    return true;
+}
 
 }  // namespace ShadowStrike::Utils::DataStorePaths

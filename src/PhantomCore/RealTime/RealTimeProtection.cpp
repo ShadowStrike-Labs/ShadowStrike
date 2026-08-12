@@ -38,6 +38,7 @@
 #include "pch.h"
 #include "RealTimeProtection.hpp"
 #include "../Diagnostics/DiagTrace.hpp"
+#include "../Utils/DataStorePaths.hpp"   // SeedSignatureDatabaseFromBaseline
 
 // ============================================================================
 // COMPONENT INCLUDES
@@ -662,6 +663,27 @@ public:
                 Utils::Logger::Warn(
                     "RealTimeProtection: CacheManager init failed ({}), continuing without verdict cache",
                     ex.what());
+            }
+
+            // 1.9  Install or refresh the signature database from shipped content.
+            //
+            // This has to happen before InitializeScanEngine, because that is what
+            // opens the database, and on a fresh install there is nothing to open:
+            // the installer ships an immutable baseline under <install dir>\content
+            // and deliberately does not write into the data directory, since that
+            // file is runtime state the updater replaces in place. Without this
+            // step the field symptom is a service that starts, logs healthily and
+            // matches nothing, with the only clue an ERROR from SignatureStore.
+            //
+            // A failure here is not fatal to startup. The engine still runs its
+            // behavioural, heuristic and emulation layers, and a loud log line is
+            // more useful than a refusal to start, so the failure is reported and
+            // scanning continues degraded rather than absent.
+            if (!Utils::DataStorePaths::SeedSignatureDatabaseFromBaseline()) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: no usable signature database is present. "
+                    "Hash, pattern and YARA matching will be unavailable this session; "
+                    "behavioural and heuristic detection are unaffected.");
             }
 
             // 2. Initialize Scan Engine

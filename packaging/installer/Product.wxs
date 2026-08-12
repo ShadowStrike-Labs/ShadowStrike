@@ -202,6 +202,14 @@
       <!-- ProgramData directories with correct ACLs. -->
       <ComponentRef Id="CmpProgramDataLogs"/>
       <ComponentRef Id="CmpProgramDataQuarantine"/>
+      <!--
+        Data directory (tighter ACL: SYSTEM + Administrators only) and the
+        shipped detection content baseline. Without these the product installs
+        with no signatures, no patterns and no YARA rules, so it starts,
+        reports healthy and detects nothing - see ContentComponent.wxs.
+      -->
+      <ComponentRef Id="CmpProgramDataData"/>
+      <ComponentRef Id="CmpDetectionContent"/>
 
       <!-- Qt 6 runtime DLLs and plugins (auto-harvested from windeployqt staging). -->
       <ComponentGroupRef Id="QtRuntimeComponents"/>

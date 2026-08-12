@@ -64,7 +64,7 @@ $ResultsDir  = Join-Path $AutoDir  'results'
 $MSBuild     = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 $MsiOut      = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.msi'
 $BundleOut   = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.exe'
-$ProductVersion = '1.0.82'
+$ProductVersion = '1.0.89'
 $SigningDir  = Join-Path $RepoRoot 'packaging\signing'
 $DevPfxPath  = Join-Path $SigningDir 'ShadowStrike-Dev.pfx'
 $DevCerPath  = Join-Path $SigningDir 'ShadowStrike-Dev.cer'
@@ -447,6 +447,103 @@ if (-not $SkipBuild) {
     }
 }
 
+# ── DETECTION CONTENT ────────────────────────────────────────────────────────
+# Stage signatures.sdb and its attribution manifest for CmpDetectionContent.
+#
+# This runs for both the build and -SkipBuild paths, because the MSI needs the
+# payload either way, and it DIES rather than continuing when the database is
+# unavailable. That is deliberate: an MSI that packages fine while shipping no
+# signatures, no patterns and no YARA rules produces an installation that starts,
+# logs healthily and detects nothing. Every hard-won defect in this project has
+# been of that shape, so the build refuses to produce one.
+#
+# The database is rebuilt only when it is missing or older than the newest rule
+# source, so a normal deploy pays nothing and a content change is never missed.
+function Sync-DetectionContentStaging {
+    $stagingContentDir = Join-Path $StagingDir 'Content'
+    New-Item -ItemType Directory -Force -Path $stagingContentDir | Out-Null
+
+    $contentSrcDir = Join-Path $RepoRoot 'content'
+    $sigBuild      = Join-Path $BinDir 'phantom-sigbuild.exe'
+    $prebuiltDb    = Join-Path $PSScriptRoot 'signatures.sdb'
+    $prebuiltDoc   = Join-Path $PSScriptRoot 'THIRD-PARTY-RULES.md'
+
+    # Newest rule/hash/pattern source, if any content is checked out at all.
+    $newestInput = $null
+    if (Test-Path $contentSrcDir) {
+        $newestInput = Get-ChildItem $contentSrcDir -Recurse -File -ErrorAction SilentlyContinue |
+                       Sort-Object LastWriteTimeUtc -Descending |
+                       Select-Object -First 1
+    }
+
+    $needsBuild = $false
+    if ((Test-Path $sigBuild) -and $newestInput) {
+        if (-not (Test-Path $prebuiltDb)) {
+            $needsBuild = $true
+            Log "Detection content: no prebuilt database, building from $contentSrcDir"
+        } elseif ((Get-Item $prebuiltDb).LastWriteTimeUtc -lt $newestInput.LastWriteTimeUtc) {
+            $needsBuild = $true
+            Log "Detection content: $($newestInput.Name) is newer than signatures.sdb, rebuilding"
+        }
+    }
+
+    if ($needsBuild) {
+        & $sigBuild --out $prebuiltDb --content $contentSrcDir --overwrite 2>&1 |
+            ForEach-Object { Log "  sigbuild: $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Die "phantom-sigbuild failed with exit code $LASTEXITCODE - refusing to ship an MSI with stale or absent detection content."
+        }
+    }
+
+    if (-not (Test-Path $prebuiltDb)) {
+        Die @"
+No detection database available, so the MSI would ship with zero signatures.
+
+Build one before deploying:
+  bin\Release\phantom-sigbuild.exe --out tools\vm-harness\signatures.sdb --content content --overwrite
+
+The YARA rule pack is gitignored because roughly 640 of its rules carry no
+redistribution grant; fetch it from https://github.com/YARAHQ/yara-forge/releases
+into content\yara\ first. See content\README.md.
+"@
+    }
+
+    Copy-Item $prebuiltDb (Join-Path $stagingContentDir 'signatures.sdb') -Force
+
+    # Attribution is a redistribution CONDITION of DRL 1.1 and CC BY-SA 4.0, so a
+    # database without its manifest is not shippable. phantom-sigbuild writes the
+    # manifest beside its output; if it is not there the database was produced by
+    # something other than the licence-filtering path and must not be shipped.
+    if (-not (Test-Path $prebuiltDoc)) {
+        Die @"
+signatures.sdb is present but THIRD-PARTY-RULES.md is not, next to:
+  $prebuiltDb
+
+Attribution is a condition of the licences the bundled rules are distributed
+under, not a courtesy, so shipping the database without it would breach them.
+Rebuild with phantom-sigbuild, which generates the manifest alongside the output.
+"@
+    }
+    Copy-Item $prebuiltDoc (Join-Path $stagingContentDir 'THIRD-PARTY-RULES.md') -Force
+
+    # Report what is actually going into the MSI, decoded from the database header
+    # rather than taken on trust: magic 'SSSD' at 0, rule/hash counts at 144/128.
+    $bytes = New-Object byte[] 160
+    $fs = [IO.File]::OpenRead((Join-Path $stagingContentDir 'signatures.sdb'))
+    try { $null = $fs.Read($bytes, 0, 160) } finally { $fs.Close() }
+    $magic = [BitConverter]::ToUInt32($bytes, 0)
+    if ($magic -ne 0x53535344) {
+        Die ("Staged signatures.sdb has magic 0x{0:X8}, expected 0x53535344 ('SSSD') - the file is not a signature database." -f $magic)
+    }
+    Log ("Staged detection content: {0:N0} bytes, {1:N0} hash(es), format {2}.{3}" -f `
+        (Get-Item (Join-Path $stagingContentDir 'signatures.sdb')).Length, `
+        [BitConverter]::ToUInt64($bytes, 128), `
+        [BitConverter]::ToUInt16($bytes, 4), `
+        [BitConverter]::ToUInt16($bytes, 6))
+}
+
+Sync-DetectionContentStaging
+
 # ── PACKAGE ──────────────────────────────────────────────────────────────────
 Log "Building MSI..."
 New-Item -ItemType Directory -Force -Path $MsiObjDir | Out-Null
@@ -460,6 +557,7 @@ wix build -arch x64 `
     -ext WixToolset.UI.wixext `
     (Join-Path $PackageDir 'Product.wxs') `
     (Join-Path $PackageDir 'Components.wxs') `
+    (Join-Path $PackageDir 'ContentComponent.wxs') `
     (Join-Path $PackageDir 'DriverComponent.wxs') `
     (Join-Path $PackageDir 'DriverInstallCA.wxs') `
     (Join-Path $BuildDir   'QtHarvest.wxs') `
