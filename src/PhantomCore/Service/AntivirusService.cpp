@@ -41,6 +41,7 @@
 #include "../Utils/ThreadPool.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#include "../Utils/DataStorePaths.hpp"   // SeedSignatureDatabaseFromBaseline
 #include "ServiceMonitor.hpp"
 
 // ============================================================================
@@ -243,6 +244,38 @@ public:
                 // Non-fatal: modules will use hardcoded defaults
             }
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ConfigManager-leave");
+
+            // 2b. Install the shipped detection content before ANY module opens it.
+            //
+            // This has to happen here, not later, because module initialization is
+            // what opens the database and the first module to do so wins or loses
+            // permanently. Field evidence from 1.0.89: AmsiProvider initialized
+            // first, opened C:\ProgramData\ShadowStrike\Data\signatures.sdb, got
+            // WinError 2 because nothing had put a file there yet, and logged
+            // "Initialize failed: No components could be initialized". The seeding
+            // then ran from RealTimeProtection a few hundred log lines later and
+            // every subsequent open succeeded with 11,053 YARA rules. So the
+            // database was fine and the product was working - except that AMSI
+            // script scanning spent the entire life of the process with a dead
+            // signature store, silently, while reporting itself as started.
+            //
+            // A module that initializes successfully against nothing is worse than
+            // one that fails loudly, because nothing ever revisits it. Seeding
+            // before the first consumer removes the ordering dependency instead of
+            // reordering the modules, which would only move the problem to whoever
+            // ends up first next time.
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-SeedContent-enter");
+            if (!Utils::DataStorePaths::SeedSignatureDatabaseFromBaseline()) {
+                // Non-fatal by design. A missing or unreadable baseline must not
+                // stop the service: an existing working database is left untouched
+                // by every failure path, and a first install with no content still
+                // has behavioural and heuristic detection. The condition is logged
+                // by the callee with the reason.
+                SS_LOG_WARN(LOG_CATEGORY,
+                            L"Shipped detection content could not be installed; "
+                            L"continuing with whatever database is already present");
+            }
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-SeedContent-leave");
 
             // 3. Initialize Infrastructure
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreadPool-enter");
