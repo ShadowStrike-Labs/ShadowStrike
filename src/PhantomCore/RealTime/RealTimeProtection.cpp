@@ -601,66 +601,8 @@ public:
                     }
                 };
 
-            // Warm the Authenticode / catalog stack BEFORE the filter starts
-            // intercepting, because the first verification cannot safely happen
-            // once we are on the file path.
-            //
-            // Field evidence, 2026-08-12. The filter went live at 18:30:56.949 and
-            // the first scan request arrived 500 ms later. Both scan workers then
-            // entered WinVerifyTrust and never came out:
-            //     18:30:57.446 t5928  step.IsMicrosoftSigned(WinVerifyTrust)
-            //     18:30:59.548 t12284 > Analyze.VerifySignature
-            // In the previous run the same pair released simultaneously after
-            // exactly 180 seconds, which is a remote call timing out, not local
-            // work. Note that one of those two paths already passed
-            // WTD_CACHE_ONLY_URL_RETRIEVAL, so this is not CRL or AIA retrieval.
-            //
-            // The mechanism is a cross-process cycle. A cold WinVerifyTrust loads
-            // wintrust.dll and crypt32.dll and acquires a catalog admin context,
-            // and catalog work is serviced by CryptSvc over RPC. CryptSvc then
-            // performs its own file I/O, our minifilter intercepts it, and the
-            // resulting scan request queues behind the very workers that are
-            // waiting on CryptSvc. The driver's scanner exemption cannot help:
-            // ShadowStrikeIsScannerProcess matches only PIDs in
-            // g_AcceptedPrimaryScannerProcessIds, which holds our own process,
-            // not the system services we synchronously depend on.
-            //
-            // Verifying one known system binary here breaks the cycle at the only
-            // point where it is free to break: the modules are loaded, the CryptSvc
-            // binding is established and the catalog context is cached while our
-            // filter is still not intercepting anything, so CryptSvc's file I/O
-            // completes unimpeded. This is ordering, not suppression - a component
-            // must have its dependencies ready before it accepts work - and it
-            // changes no verdict, since the result is discarded.
-            //
-            // Being honest about the limit: this removes the cold-start deadlock we
-            // have actually measured, but it does not make the synchronous path
-            // structurally safe. A later catalog miss can still reach CryptSvc. The
-            // guaranteed fix is to stop asking another process for a verdict while
-            // holding a kernel file operation, by resolving the signing level in
-            // the kernel via SeGetCachedSigningLevel and treating user-mode
-            // Authenticode as an asynchronous deep-stage concern only.
-            try {
-                SS_DIAG_SCOPE("Startup", "CryptoStackWarmup");
-                const wchar_t* const kWarmupTargets[] = {
-                    L"C:\\Windows\\System32\\ntdll.dll",
-                    L"C:\\Windows\\System32\\kernel32.dll"
-                };
-                for (const wchar_t* target : kWarmupTargets) {
-                    (void)Security::DigitalSignatureValidator::Instance()
-                              .IsMicrosoftSigned(target);
-                }
-                Utils::Logger::Info(
-                    "RealTimeProtection: Authenticode and catalog stack warmed "
-                    "before on-access filtering began");
-            } catch (...) {
-                // A warm-up failure is not a startup failure. If verification is
-                // broken here it will also be broken later, and the scan path
-                // already treats an unverified file as needing more analysis.
-                Utils::Logger::Warn(
-                    "RealTimeProtection: Authenticode warm-up did not complete; "
-                    "the first on-access signature check may be slow");
-            }
+            // Dependencies before work: see WarmAuthenticodeStack.
+            WarmAuthenticodeStack();
 
             startFocusedComponent(
                 ComponentType::FILE_SYSTEM_FILTER,
@@ -1564,8 +1506,72 @@ public:
         Utils::Logger::Info("RealTimeProtection: Anti-Evasion detectors shut down");
     }
 
+    // Loads and primes the Authenticode / catalog stack before anything can be
+    // blocked by us. This must run before the on-access filter starts
+    // intercepting, and it is deliberately called from both the focused and the
+    // full build paths, because placing it on only one of them is exactly the
+    // mistake that made the previous attempt a no-op.
+    //
+    // Field evidence, 2026-08-12. The filter went live at 18:58:53.410 and a scan
+    // worker entered WinVerifyTrust 2.4 seconds later and never came out:
+    //     18:58:55.801 t3720 step.IsMicrosoftSigned(WinVerifyTrust)
+    // In an earlier run the same call, on two workers, released simultaneously
+    // after exactly 180.1 and 180.3 seconds. Simultaneous release on independent
+    // threads after a round three minutes is a remote call timing out, not local
+    // work. Note this reproduces on a path that already passes
+    // WTD_CACHE_ONLY_URL_RETRIEVAL, so it is not CRL or AIA retrieval.
+    //
+    // The mechanism is a cross-process cycle. A cold WinVerifyTrust loads
+    // wintrust.dll and crypt32.dll and acquires a catalog admin context, and
+    // catalog work is serviced by CryptSvc over RPC. CryptSvc then performs its
+    // own file I/O, our minifilter intercepts it, and the resulting scan request
+    // queues behind the very workers waiting on CryptSvc. The driver's scanner
+    // exemption cannot break this: ShadowStrikeIsScannerProcess matches only PIDs
+    // in g_AcceptedPrimaryScannerProcessIds, which holds our own process, not the
+    // system services we synchronously depend on.
+    //
+    // Verifying two known system binaries here breaks the cycle at the only point
+    // where breaking it is free: the modules load, the CryptSvc binding is
+    // established and the catalog context is cached while our filter is not yet
+    // intercepting, so CryptSvc file I/O completes unimpeded. This is ordering,
+    // not suppression, and it changes no verdict because the result is discarded.
+    //
+    // The limit, stated plainly: this removes the cold-start deadlock that has now
+    // been measured four times, but it does not make the synchronous path
+    // structurally safe, because a later catalog miss can still reach CryptSvc.
+    // The guaranteed fix is to stop asking another process for a verdict while
+    // holding a kernel file operation - resolve the signing level in the kernel
+    // with SeGetCachedSigningLevel and treat user-mode Authenticode as an
+    // asynchronous deep-stage concern only.
+    void WarmAuthenticodeStack() noexcept {
+        try {
+            SS_DIAG_SCOPE("Startup", "CryptoStackWarmup");
+            static constexpr const wchar_t* kWarmupTargets[] = {
+                L"C:\\Windows\\System32\\ntdll.dll",
+                L"C:\\Windows\\System32\\kernel32.dll"
+            };
+            for (const wchar_t* target : kWarmupTargets) {
+                (void)Security::DigitalSignatureValidator::Instance()
+                          .IsMicrosoftSigned(target);
+            }
+            Utils::Logger::Info(
+                "RealTimeProtection: Authenticode and catalog stack warmed before "
+                "on-access filtering began");
+        } catch (...) {
+            // A warm-up failure is not a startup failure. If verification is
+            // broken here it will be broken later too, and the scan path already
+            // treats an unverified file as needing more analysis, not less.
+            Utils::Logger::Warn(
+                "RealTimeProtection: Authenticode warm-up did not complete; the "
+                "first on-access signature check may be slow");
+        }
+    }
+
     void StartComponents() {
         Utils::Logger::Info("RealTimeProtection: Starting protection components...");
+
+        // Must precede FileSystemFilter::Start - see WarmAuthenticodeStack for why.
+        WarmAuthenticodeStack();
 
         // FileSystemFilter
         try {
