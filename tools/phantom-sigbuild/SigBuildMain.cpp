@@ -26,10 +26,13 @@
 #include "../../src/PhantomCore/SignatureStore/SignatureBuilder.hpp"
 #include "../../src/PhantomCore/SignatureStore/SignatureStore.hpp"
 #include "../../src/PhantomCore/SignatureStore/YaraRuleStore.hpp"   // YaraUtils::ValidateRuleSyntax
+#include "../../src/PhantomCore/Whitelist/WhiteListStore.hpp"   // whitelist.wdb output
 #include "RuleLicenseFilter.hpp"
 
 #include <windows.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cwchar>
@@ -81,6 +84,23 @@ void Fail(const char* fmt, ...) noexcept {
     return out;
 }
 
+// Mirror of Narrow. Content files are UTF-8 on disk, and a description that came
+// from one has to be widened before it can go into the store's wide-string API.
+[[nodiscard]] std::wstring Widen(const std::string& s) {
+    if (s.empty()) {
+        return {};
+    }
+    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()),
+                                        nullptr, 0);
+    if (n <= 0) {
+        return {};
+    }
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()),
+                          out.data(), n);
+    return out;
+}
+
 // Renders a StoreError so a failure names itself instead of returning a number.
 [[nodiscard]] std::string Describe(const StoreError& e) {
     std::string s = "code=" + std::to_string(static_cast<int>(e.code));
@@ -106,7 +126,21 @@ void Usage() {
         "  --patterns <file>    byte or string patterns, one per line\n"
         "  --yara <file>        a single YARA rule file\n"
         "  --yara-dir <dir>     a directory of YARA rules, searched recursively\n"
-        "  --content <dir>      convention: <dir>/hashes, <dir>/patterns, <dir>/yara\n"
+        "  --content <dir>      convention: <dir>/hashes, <dir>/patterns,\n"
+        "                       <dir>/yara, <dir>/whitelist\n"
+        "\n"
+        "Whitelist (a SEPARATE database with the OPPOSITE meaning):\n"
+        "  --whitelist <file>   known-good hashes as TYPE:HASH[:DESCRIPTION]\n"
+        "  --whitelist-out <f>  write whitelist.wdb here (required with the above)\n"
+        "\n"
+        "  Entries under --hashes are DETECTIONS: each carries a threat level and\n"
+        "  matching one convicts a file. Entries under --whitelist are ALLOW\n"
+        "  decisions that let a file skip deeper analysis. Placing a known-good\n"
+        "  corpus in --hashes would report all of Windows as malware; placing a\n"
+        "  malware corpus in --whitelist would make it invisible. The two formats\n"
+        "  differ so that a misplaced file is rejected instead of inverting the\n"
+        "  product's behaviour - whitelist lines carry no threat level, and one\n"
+        "  that does is a hard error.\n"
         "\n"
         "Options:\n"
         "  --overwrite          replace an existing database\n"
@@ -116,7 +150,7 @@ void Usage() {
         "  --quiet              suppress per-stage progress\n"
         "\n"
         "Exit codes: 0 success, 1 usage, 2 import failed, 3 build failed,\n"
-        "            4 output did not verify\n");
+        "            4 output did not verify, 5 whitelist build failed\n");
 }
 
 struct Options {
@@ -126,6 +160,8 @@ struct Options {
     std::vector<std::wstring> patternFiles;
     std::vector<std::wstring> yaraFiles;
     std::vector<std::wstring> yaraDirs;
+    std::wstring              whitelistOutput;   // empty => no whitelist is built
+    std::vector<std::wstring> whitelistFiles;
     std::string               yaraNamespace{ "default" };
     std::uint64_t             sizeMb{ 64 };
     bool                      overwrite{ false };
@@ -136,6 +172,17 @@ struct Options {
 
 // Expands --content into the individual input lists. Kept a convention rather
 // than a manifest format so the content tree is self-describing on disk.
+//
+// NOTE ON hashes/ VERSUS whitelist/: these two directories have OPPOSITE
+// meanings and must never be conflated. Everything under hashes/ becomes a
+// DETECTION - each entry carries a threat level and matching it convicts a
+// file. Everything under whitelist/ becomes an ALLOW decision that causes a
+// file to skip deeper analysis. Putting a known-good corpus such as the NIST
+// NSRL under hashes/ would make the product report all of Windows as malware;
+// putting a malware corpus under whitelist/ would make that malware invisible.
+// Both are catastrophic and neither is obvious from a directory listing, which
+// is why the two use different line formats and why ParseWhitelistLine rejects
+// anything carrying a threat level.
 void ExpandContentDirectory(const fs::path& root, Options& opt) {
     const auto collect = [](const fs::path& dir,
                             std::vector<std::wstring>& into,
@@ -164,10 +211,11 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
         }
     };
 
-    collect(root / "hashes",   opt.hashFiles,    { L".txt", L".hashes" });
-    collect(root / "hashes",   opt.hashCsvFiles, { L".csv" });
-    collect(root / "patterns", opt.patternFiles, { L".txt", L".patterns" });
-    collect(root / "yara",     opt.yaraFiles,    { L".yar", L".yara" });
+    collect(root / "hashes",    opt.hashFiles,      { L".txt", L".hashes" });
+    collect(root / "hashes",    opt.hashCsvFiles,   { L".csv" });
+    collect(root / "patterns",  opt.patternFiles,   { L".txt", L".patterns" });
+    collect(root / "yara",      opt.yaraFiles,      { L".yar", L".yara" });
+    collect(root / "whitelist", opt.whitelistFiles, { L".txt", L".whitelist" });
 }
 
 // Which YARA modules the libyara we link can actually compile. Probed rather
@@ -329,6 +377,12 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
         } else if (a == L"--content") {
             if (!needValue(i)) { return false; }
             ExpandContentDirectory(fs::path(argv[++i]), opt);
+        } else if (a == L"--whitelist") {
+            if (!needValue(i)) { return false; }
+            opt.whitelistFiles.emplace_back(argv[++i]);
+        } else if (a == L"--whitelist-out") {
+            if (!needValue(i)) { return false; }
+            opt.whitelistOutput = argv[++i];
         } else if (a == L"--namespace") {
             if (!needValue(i)) { return false; }
             opt.yaraNamespace = Narrow(argv[++i]);
@@ -367,7 +421,325 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
              "the failure this tool exists to prevent.");
         return false;
     }
+
+    // Whitelist inputs and a whitelist output are meaningless apart, and either
+    // one alone is a mistake worth stopping for rather than guessing around.
+    if (!opt.whitelistFiles.empty() && opt.whitelistOutput.empty()) {
+        Fail("%zu whitelist input file(s) were found but --whitelist-out was not "
+             "given, so they would be silently discarded. Known-good content that "
+             "is dropped without a word is how a whitelist ends up trusting "
+             "nothing while appearing to be configured.",
+             opt.whitelistFiles.size());
+        return false;
+    }
+    if (!opt.whitelistOutput.empty() && opt.whitelistFiles.empty()) {
+        Fail("--whitelist-out was given but no whitelist input was found. Writing "
+             "an empty whitelist would produce a database that grants no trust "
+             "while looking present, so nothing is written. Add entries under "
+             "<content>/whitelist or pass --whitelist <file>.");
+        return false;
+    }
+    if (!opt.whitelistOutput.empty() && opt.whitelistOutput == opt.output) {
+        Fail("--whitelist-out and --out are the same path. These are two different "
+             "databases with opposite meanings and cannot share a file.");
+        return false;
+    }
     return true;
+}
+
+// ============================================================================
+// WHITELIST DATABASE
+//
+// The whitelist is a separate database (whitelist.wdb) with the opposite meaning
+// to the signature database: an entry here is an ALLOW decision that lets a file
+// skip deeper analysis. It gets its own output path rather than a section inside
+// signatures.sdb because the runtime opens them as two stores with two different
+// trust postures - WhitelistStore is refused entirely unless the data directory
+// is write-restricted, precisely because an attacker who can add an entry becomes
+// invisible.
+//
+// LINE FORMAT, deliberately different from the malware hash format:
+//     TYPE:HASH[:DESCRIPTION]
+//   TYPE        MD5 | SHA1 | SHA256 | SHA512
+//   HASH        hex, length must match the algorithm
+//   DESCRIPTION optional free text for the audit trail
+//   '#' starts a comment; blank lines are ignored.
+//
+// The malware format is TYPE:HASH:NAME:LEVEL, where LEVEL is a threat level. A
+// whitelist entry has no threat level because it is not a threat, and that
+// difference is load-bearing: it is what lets a file dropped into the wrong
+// directory be detected instead of silently inverting the product's behaviour.
+// ============================================================================
+
+// Maps a hash type keyword to its algorithm and expected hex length. Returning
+// the length matters: a SHA1 value pasted under an MD5 label would otherwise be
+// truncated into a hash that matches nothing, which is a silent whitelist miss.
+[[nodiscard]] bool ResolveWhitelistHashType(const std::string& keyword,
+                                           ShadowStrike::Whitelist::HashAlgorithm& algo,
+                                           std::size_t& hexLength) {
+    using ShadowStrike::Whitelist::HashAlgorithm;
+    if (keyword == "MD5")    { algo = HashAlgorithm::MD5;    hexLength = 32;  return true; }
+    if (keyword == "SHA1")   { algo = HashAlgorithm::SHA1;   hexLength = 40;  return true; }
+    if (keyword == "SHA256") { algo = HashAlgorithm::SHA256; hexLength = 64;  return true; }
+    if (keyword == "SHA512") { algo = HashAlgorithm::SHA512; hexLength = 128; return true; }
+    return false;
+}
+
+[[nodiscard]] bool LooksLikeThreatLevel(const std::string& field) {
+    return field == "Info" || field == "Low" || field == "Medium" ||
+           field == "High" || field == "Critical";
+}
+
+struct WhitelistLine {
+    ShadowStrike::Whitelist::HashAlgorithm algorithm{};
+    std::string                            hash;
+    std::wstring                           description;
+};
+
+// Parses one line. `error` is set with something a human can act on, because a
+// content file that is quietly half-ignored is the failure mode this tool exists
+// to prevent.
+[[nodiscard]] bool ParseWhitelistLine(const std::string& raw,
+                                      WhitelistLine& out,
+                                      std::string& error) {
+    std::string line = raw;
+    if (const auto hash = line.find('#'); hash != std::string::npos) {
+        line.erase(hash);
+    }
+    // Trim
+    const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+    line.erase(line.begin(), std::find_if(line.begin(), line.end(), notSpace));
+    line.erase(std::find_if(line.rbegin(), line.rend(), notSpace).base(), line.end());
+    if (line.empty()) {
+        return false;   // blank or comment-only: not an error, just nothing
+    }
+
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t colon = line.find(':', start);
+        if (colon == std::string::npos) {
+            fields.push_back(line.substr(start));
+            break;
+        }
+        fields.push_back(line.substr(start, colon - start));
+        start = colon + 1;
+    }
+
+    if (fields.size() < 2) {
+        error = "expected TYPE:HASH[:DESCRIPTION]";
+        return false;
+    }
+
+    // THE GUARD. A four-field line whose last field is a threat level is a
+    // malware hash entry, which means a detection corpus has been placed in the
+    // whitelist tree. Accepting it would make every listed sample invisible to
+    // the engine - the single worst outcome this tool can produce - so it is a
+    // hard error naming the likely mistake rather than a warning.
+    if (fields.size() >= 4 && LooksLikeThreatLevel(fields.back())) {
+        error = "line carries a threat level ('" + fields.back() +
+                "'), so this is malware hash content in TYPE:HASH:NAME:LEVEL form. "
+                "It belongs under content/hashes, not content/whitelist - "
+                "whitelisting it would make those samples invisible to the engine";
+        return false;
+    }
+
+    std::string type = fields[0];
+    for (auto& c : type) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    std::size_t expectedHexLength = 0;
+    if (!ResolveWhitelistHashType(type, out.algorithm, expectedHexLength)) {
+        error = "unknown hash type '" + fields[0] + "' (expected MD5, SHA1, SHA256 or SHA512)";
+        return false;
+    }
+
+    out.hash = fields[1];
+    if (out.hash.size() != expectedHexLength) {
+        error = type + " requires " + std::to_string(expectedHexLength) +
+                " hex characters but this value has " + std::to_string(out.hash.size()) +
+                " - a mismatched label would store a hash that can never match";
+        return false;
+    }
+    for (char c : out.hash) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            error = "hash contains a non-hexadecimal character";
+            return false;
+        }
+    }
+
+    if (fields.size() >= 3 && !fields[2].empty()) {
+        out.description = Widen(fields[2]);
+    }
+    return true;
+}
+
+// Builds whitelist.wdb from the collected inputs and proves it reopens.
+//
+// Reason is SystemFile for every entry: this path exists to ingest known-good
+// operating-system and vendor corpora (the NIST NSRL being the motivating case,
+// as it is public domain and carries no commercial restriction). A per-line
+// reason override is deliberately not offered yet - there is no caller for it,
+// and inventing one now would be a configuration surface with no consumer.
+[[nodiscard]] bool BuildWhitelistDatabaseInner(const Options& opt) {
+    namespace WL = ShadowStrike::Whitelist;
+
+    std::error_code ec;
+    if (fs::exists(opt.whitelistOutput, ec)) {
+        if (!opt.overwrite) {
+            Fail("whitelist output '%ls' already exists (use --overwrite)",
+                 opt.whitelistOutput.c_str());
+            return false;
+        }
+        fs::remove(opt.whitelistOutput, ec);
+        if (ec) {
+            Fail("cannot replace existing whitelist '%ls'", opt.whitelistOutput.c_str());
+            return false;
+        }
+    }
+
+    WL::WhitelistStore store;
+    const auto created = store.Create(opt.whitelistOutput);
+    if (!created.IsSuccess()) {
+        Fail("cannot create whitelist database '%ls': %s",
+             opt.whitelistOutput.c_str(), created.message.c_str());
+        return false;
+    }
+
+    std::uint64_t added = 0;
+    std::uint64_t rejected = 0;
+    std::uint64_t duplicates = 0;
+
+    for (const auto& file : opt.whitelistFiles) {
+        std::ifstream in(file);
+        if (!in) {
+            Fail("whitelist: cannot open '%ls'", file.c_str());
+            return false;
+        }
+        Info("  whitelist  : reading %ls", file.c_str());
+
+        std::string raw;
+        std::uint64_t lineNo = 0;
+        while (std::getline(in, raw)) {
+            ++lineNo;
+            WhitelistLine parsed;
+            std::string error;
+            if (!ParseWhitelistLine(raw, parsed, error)) {
+                if (!error.empty()) {
+                    Fail("whitelist: %ls line %llu: %s",
+                         file.c_str(), static_cast<unsigned long long>(lineNo), error.c_str());
+                    ++rejected;
+                }
+                continue;
+            }
+
+            const auto res = store.AddHash(parsed.hash, parsed.algorithm,
+                                           WL::WhitelistReason::SystemFile,
+                                           parsed.description);
+            if (res.IsSuccess()) {
+                ++added;
+            } else if (res.code == WL::WhitelistStoreError::DuplicateEntry) {
+                ++duplicates;
+            } else {
+                Fail("whitelist: %ls line %llu: %s",
+                     file.c_str(), static_cast<unsigned long long>(lineNo), res.message.c_str());
+                ++rejected;
+            }
+        }
+    }
+
+    // A rejected line means content the operator believes is protecting them is
+    // not in the database. Shipping that silently is how a whitelist ends up
+    // trusting less than its author thinks, so the build fails.
+    if (rejected > 0) {
+        Fail("whitelist: %llu line(s) were rejected - refusing to write a database "
+             "that silently omits content", static_cast<unsigned long long>(rejected));
+        return false;
+    }
+
+    if (added == 0) {
+        Fail("whitelist: no entries were accepted, so the database would grant "
+             "nothing while appearing to exist - exactly the inert-module failure "
+             "this tool refuses to produce");
+        return false;
+    }
+
+    const auto indexed = store.RebuildIndices();
+    if (!indexed.IsSuccess()) {
+        Fail("whitelist: index rebuild failed: %s", indexed.message.c_str());
+        return false;
+    }
+
+    const auto saved = store.Save();
+    if (!saved.IsSuccess()) {
+        Fail("whitelist: save failed: %s", saved.message.c_str());
+        return false;
+    }
+    store.Close();
+
+    Info("  whitelist  : %llu entr%s added, %llu duplicate(s) collapsed",
+         static_cast<unsigned long long>(added), added == 1 ? "y" : "ies",
+         static_cast<unsigned long long>(duplicates));
+
+    if (!opt.verify) {
+        return true;
+    }
+
+    // Reopen read-only through the same store the service uses. A whitelist that
+    // writes but does not load is worse than none, because the engine would then
+    // treat trust lookups as unavailable and silently fall back to full analysis.
+    WL::WhitelistStore reopened;
+    const auto loaded = reopened.Load(opt.whitelistOutput, /*readOnly=*/true);
+    if (!loaded.IsSuccess()) {
+        Fail("whitelist verification failed - the runtime store cannot open the "
+             "database we just wrote: %s", loaded.message.c_str());
+        return false;
+    }
+    const std::uint64_t reopenedCount = reopened.GetEntryCount();
+    reopened.Close();
+
+    if (reopenedCount != added) {
+        Fail("whitelist verification failed - wrote %llu entries but the reopened "
+             "database reports %llu",
+             static_cast<unsigned long long>(added),
+             static_cast<unsigned long long>(reopenedCount));
+        return false;
+    }
+    Info("  verified   : whitelist reopened with %llu entr%s",
+         static_cast<unsigned long long>(reopenedCount),
+         reopenedCount == 1 ? "y" : "ies");
+    return true;
+}
+
+// A failed whitelist build must leave nothing behind.
+//
+// WhitelistStore::Create allocates the database file up front, so every failure
+// after that point - a rejected line, a failed index rebuild, a save error - was
+// leaving a partially populated database on disk. That file is worse than no file
+// at all: the next build would refuse to overwrite it without --overwrite, and
+// anything that went looking for whitelist.wdb would find a store holding some
+// unknown subset of the intended entries and treat it as authoritative. A
+// whitelist that grants trust for reasons nobody can reconstruct is precisely the
+// thing the store's own hardening checks exist to prevent.
+//
+// The inner function owns the store, so by the time it returns the mapping is
+// released and the file can be removed.
+[[nodiscard]] bool BuildWhitelistDatabase(const Options& opt) {
+    if (BuildWhitelistDatabaseInner(opt)) {
+        return true;
+    }
+
+    std::error_code ec;
+    if (fs::remove(opt.whitelistOutput, ec)) {
+        Info("  whitelist  : discarded the partial database at %ls",
+             opt.whitelistOutput.c_str());
+    } else if (fs::exists(opt.whitelistOutput, ec)) {
+        Fail("whitelist: a partial database remains at '%ls' and could not be "
+             "removed - delete it before relying on this build",
+             opt.whitelistOutput.c_str());
+    }
+    return false;
 }
 
 // Reopens the finished database through the same store the service uses. This
@@ -551,6 +923,18 @@ int wmain(int argc, wchar_t** argv) {
                       pendingPatterns > 0,
                       pendingYara     > 0)) {
         return 4;
+    }
+
+    // ---------------------------------------------------------------------
+    // Whitelist database
+    //
+    // Built after the signature database has verified, so a failure here cannot
+    // be confused with a failure there. It is a separate output because it is a
+    // separate store with the opposite meaning, and because the runtime applies
+    // a different trust posture to it.
+    // ---------------------------------------------------------------------
+    if (!opt.whitelistOutput.empty() && !BuildWhitelistDatabase(opt)) {
+        return 5;
     }
 
     Info("  OK");
