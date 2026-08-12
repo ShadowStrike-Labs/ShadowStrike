@@ -109,17 +109,50 @@ namespace ShadowStrike {
                 return err;
             }
 
-            // Create Bloom filter with proper exception handling
-            try {
-                m_bloomFilter = std::make_unique<BloomFilter>(100000, 0.01); // 100K hashes, 1% FPR
-            }
-            catch (const std::bad_alloc& ex) {
-                SS_LOG_ERROR(L"HashBucket",
-                    L"Failed to allocate bloom filter: %S", ex.what());
-                return StoreError{ SignatureStoreError::Unknown, 0, "Bloom filter allocation failed" };
-            }
+            // NO Bloom filter is created on this path, and that is the fix for a
+            // total failure of hash detection.
+            //
+            // This function opens an EXISTING database. It used to do:
+            //     m_bloomFilter = std::make_unique<BloomFilter>(100000, 0.01);
+            // which creates an empty filter and never puts the database's contents
+            // into it. Nothing writes a filter into the file either - there is not
+            // one Bloom reference anywhere in the builder - so there was nothing to
+            // load even if this had tried.
+            //
+            // Lookup() then asks that filter first:
+            //     if (m_bloomFilter && !m_bloomFilter->MightContain(fastHash))
+            //         return std::nullopt;                // "definitely not present"
+            // An empty filter answers "not present" to every possible query, so
+            // every hash lookup returned nothing before the B+Tree was ever
+            // consulted. Hash detection did not work for any number of hashes.
+            //
+            // It was invisible because of what the failure looks like: a lookup that
+            // finds nothing is indistinguishable from a genuinely clean file, so it
+            // produces no error, no warning and no log line. It was found by making
+            // phantom-sigbuild reopen its own output and look up every hash it had
+            // just imported - the real EICAR content reported "0 of 3 hash(es)
+            // found by lookup".
+            //
+            // A Bloom filter is a performance optimisation whose one hard
+            // requirement is that it must never produce a false negative. A filter
+            // that is not built from the data it guards produces nothing but false
+            // negatives. Leaving it absent means Lookup() skips the fast path and
+            // consults the B+Tree, which is the authoritative answer: correct, and
+            // slower by one tree descent. That is the right direction to fail in.
+            //
+            // The filter should come back, but only once it can be correct: either
+            // populated from a complete walk of the index on load, or serialised
+            // into the database by the builder and validated on open. Both depend on
+            // the index being fully walkable, which it is not yet - the builder
+            // currently writes a flat chain of leaf nodes with no internal nodes, so
+            // a root-to-leaf descent reaches only the first leaf. Restoring the
+            // filter before that is fixed would just re-hide the problem.
+            m_bloomFilter.reset();
 
-            SS_LOG_INFO(L"HashBucket", L"Initialized bucket for %S",
+            SS_LOG_INFO(L"HashBucket",
+                L"Initialized bucket for %S (exact B+Tree lookups; no Bloom "
+                L"pre-filter, because a filter that is not populated from the "
+                L"database can only produce false negatives)",
                 Format::HashTypeToString(m_type));
 
             return StoreError{ SignatureStoreError::Success };
