@@ -26,6 +26,7 @@
 #include "../../src/PhantomCore/SignatureStore/SignatureBuilder.hpp"
 #include "../../src/PhantomCore/SignatureStore/SignatureStore.hpp"
 #include "../../src/PhantomCore/SignatureStore/YaraRuleStore.hpp"   // YaraUtils::ValidateRuleSyntax
+#include "../../src/PhantomCore/HashStore/HashStore.hpp"        // lookup verification
 #include "../../src/PhantomCore/Whitelist/WhiteListStore.hpp"   // whitelist.wdb output
 #include "RuleLicenseFilter.hpp"
 
@@ -150,7 +151,8 @@ void Usage() {
         "  --quiet              suppress per-stage progress\n"
         "\n"
         "Exit codes: 0 success, 1 usage, 2 import failed, 3 build failed,\n"
-        "            4 output did not verify, 5 whitelist build failed\n");
+        "            4 output did not verify, 5 whitelist build failed,\n"
+        "            6 built hashes cannot be found by lookup\n");
 }
 
 struct Options {
@@ -742,6 +744,156 @@ struct WhitelistLine {
     return false;
 }
 
+// A hash we handed to the builder, remembered so the finished database can be
+// asked for it again.
+//
+// This is parsed INDEPENDENTLY of the importer, and that is deliberate. Verifying
+// with the same code that produced the data proves only that the code agrees with
+// itself. If the importer mis-parses a line - wrong type, truncated digest - an
+// independent reading of the same file is what exposes it, because the lookup will
+// ask for something different from what was stored.
+struct HashLine {
+    std::string                          hash;
+    ShadowStrike::SignatureStore::HashType type{};
+    std::string                          name;
+};
+
+[[nodiscard]] bool ResolveMalwareHashType(const std::string& keyword,
+                                          ShadowStrike::SignatureStore::HashType& outType,
+                                          size_t& outHexLength) {
+    using HT = ShadowStrike::SignatureStore::HashType;
+    std::string k;
+    k.reserve(keyword.size());
+    for (const char c : keyword) {
+        k.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    if (k == "MD5")    { outType = HT::MD5;    outHexLength = 32;  return true; }
+    if (k == "SHA1")   { outType = HT::SHA1;   outHexLength = 40;  return true; }
+    if (k == "SHA256") { outType = HT::SHA256; outHexLength = 64;  return true; }
+    if (k == "SHA512") { outType = HT::SHA512; outHexLength = 128; return true; }
+    return false;
+}
+
+// Best-effort collection for verification only. Lines this cannot understand are
+// skipped rather than rejected: the importer is the authority on what is valid
+// input, and duplicating its error handling here would produce two sources of
+// truth about acceptance. What this must never do is claim a line was verified
+// when it was not, which is why only fully understood lines are returned.
+void CollectHashLinesForVerification(const std::vector<std::wstring>& files,
+                                     std::vector<HashLine>& out) {
+    for (const auto& file : files) {
+        const fs::path filePath{ file };
+        std::ifstream in(filePath);
+        if (!in) {
+            continue;
+        }
+        std::string raw;
+        while (std::getline(in, raw)) {
+            if (!raw.empty() && raw.back() == '\r') {
+                raw.pop_back();
+            }
+            const size_t begin = raw.find_first_not_of(" \t");
+            if (begin == std::string::npos || raw[begin] == '#') {
+                continue;
+            }
+
+            std::vector<std::string> fields;
+            size_t start = begin;
+            for (;;) {
+                const size_t colon = raw.find(':', start);
+                if (colon == std::string::npos) {
+                    fields.emplace_back(raw.substr(start));
+                    break;
+                }
+                fields.emplace_back(raw.substr(start, colon - start));
+                start = colon + 1;
+            }
+            if (fields.size() < 2) {
+                continue;
+            }
+
+            HashLine line;
+            size_t expectedHexLength = 0;
+            if (!ResolveMalwareHashType(fields[0], line.type, expectedHexLength)) {
+                continue;
+            }
+            line.hash = fields[1];
+            if (line.hash.size() != expectedHexLength) {
+                continue;
+            }
+            line.name = (fields.size() >= 3) ? fields[2] : std::string("<unnamed>");
+            out.push_back(std::move(line));
+        }
+    }
+}
+
+// Looks up every hash we just imported, through the same store the service uses.
+//
+// The existing checks above assert that the stores OPEN. That is necessary and it
+// caught a real defect, but it is not sufficient: a store can open, report itself
+// ready, and still fail to find entries it contains. That failure mode is silent
+// by construction - a lookup that finds nothing is indistinguishable from a clean
+// file - so it cannot be caught by observation in the field. It has to be caught
+// here, by asking the finished database for the very entries we put in it.
+//
+// This is the check that would have caught the leaf-chain defect: the builder
+// wrote ceil(N/127) leaf nodes per hash type but no internal nodes, so the
+// reader's root-to-leaf descent could only ever reach the first leaf, and every
+// hash past the 127th in a type was unreachable while the Bloom filter still
+// claimed it might be present. Three EICAR hashes fit in one leaf, which is the
+// only reason the product appeared to work.
+[[nodiscard]] bool VerifyHashLookups(const std::wstring& path,
+                                     const std::vector<HashLine>& expected) {
+    if (expected.empty()) {
+        return true;
+    }
+
+    ShadowStrike::HashStore::HashStore hashes;
+    const StoreError opened = hashes.Initialize(path, /*readOnly=*/true);
+    if (!opened.IsSuccess()) {
+        Fail("lookup verification failed - cannot reopen the hash store: %s",
+             Describe(opened).c_str());
+        return false;
+    }
+
+    size_t found   = 0;
+    size_t missing = 0;
+    std::string firstMissingReport;
+
+    for (const auto& line : expected) {
+        const auto hit = hashes.LookupHashString(line.hash, line.type);
+        if (hit.has_value()) {
+            ++found;
+            continue;
+        }
+        ++missing;
+        if (missing <= 5) {
+            if (!firstMissingReport.empty()) {
+                firstMissingReport += "\n           ";
+            }
+            firstMissingReport += line.hash + " (" + line.name + ")";
+        }
+    }
+
+    hashes.Close();
+
+    Info("  verified   : %zu of %zu hash(es) found by lookup",
+         found, expected.size());
+
+    if (missing != 0) {
+        Fail("%zu of %zu imported hash(es) cannot be found in the database that "
+             "was just built. A database that stores a hash but cannot retrieve "
+             "it is worse than an empty one: the entry looks present to anyone "
+             "inspecting the build, while at runtime the file it should convict "
+             "is reported clean and nothing is logged. First unreachable "
+             "entries:\n           %s",
+             missing, expected.size(), firstMissingReport.c_str());
+        return false;
+    }
+
+    return true;
+}
+
 // Reopens the finished database through the same store the service uses. This
 // is the whole point: a database that compiles but does not load is worthless,
 // and that is precisely the state the product shipped in. The field log's
@@ -923,6 +1075,20 @@ int wmain(int argc, wchar_t** argv) {
                       pendingPatterns > 0,
                       pendingYara     > 0)) {
         return 4;
+    }
+
+    // Asking the finished database for the entries we put in it. Opening cleanly
+    // is not the same as answering correctly, and the difference is invisible at
+    // runtime because a lookup that finds nothing looks exactly like a clean file.
+    if (opt.verify && pendingHashes > 0) {
+        std::vector<HashLine> importedHashes;
+        CollectHashLinesForVerification(opt.hashFiles, importedHashes);
+        if (importedHashes.empty()) {
+            Info("  note       : no hash lines could be re-read for lookup "
+                 "verification (CSV-only input); lookups were not checked");
+        } else if (!VerifyHashLookups(opt.output, importedHashes)) {
+            return 6;
+        }
     }
 
     // ---------------------------------------------------------------------
