@@ -826,8 +826,16 @@ StoreError PatternStore::Initialize(
     // Build Aho-Corasick automaton
     err = BuildAutomaton();
     if (!err.IsSuccess()) {
-        SS_LOG_WARN(L"PatternStore", L"Initialize: Failed to build automaton (non-fatal)");
-        // Don't fail - automaton can be rebuilt later
+        // An empty pattern set no longer reaches here - BuildAutomaton reports that
+        // as a success with an explanatory line - so this genuinely means a rebuild
+        // failed while patterns were present, and pattern matching is running with
+        // whatever automaton preceded it.
+        SS_LOG_WARN(L"PatternStore",
+            L"Initialize: the pattern automaton could not be built even though "
+            L"patterns are present; pattern matching may be incomplete until a "
+            L"rebuild succeeds");
+        // Don't fail - the store still serves its other functions and the automaton
+        // can be rebuilt later.
     }
 
     m_initialized.store(true, std::memory_order_release);
@@ -2399,9 +2407,39 @@ StoreError PatternStore::BuildAutomaton() noexcept {
         }
     }
 
+    // Nothing to compile is not a failure.
+    //
+    // AhoCorasickAutomaton::Compile() returns false for an empty automaton, so with
+    // no patterns loaded this reported "BuildAutomaton: Compilation failed" as an
+    // ERROR and the caller followed it with "Failed to build automaton" on every
+    // single service start. There is no pattern content shipped yet, so that pair of
+    // lines was pure noise - and noise on an error channel is not harmless: it
+    // trains whoever reads the log to skip exactly the line that will matter when
+    // the automaton genuinely fails to build.
+    //
+    // The two states are now distinguished. An empty pattern set is reported plainly
+    // and succeeds, with the automaton released so that it reflects reality: no
+    // patterns means no pattern matches, and ScanWithAutomaton already returns an
+    // empty result set when no automaton is present. Releasing it also matters for
+    // correctness in the other direction - if patterns were removed, keeping the
+    // previous automaton would go on matching content the store no longer holds.
+    if (addedCount == 0) {
+        m_automaton.reset();
+        m_hitCounters.clear();
+        SS_LOG_INFO(L"PatternStore",
+            L"BuildAutomaton: no exact patterns are loaded, so there is nothing to "
+            L"compile; pattern scanning will report no matches until pattern content "
+            L"is added to the database");
+        return StoreError{ SignatureStoreError::Success };
+    }
+
     // Compile the automaton
     if (!newAutomaton->Compile()) {
-        SS_LOG_ERROR(L"PatternStore", L"BuildAutomaton: Compilation failed");
+        SS_LOG_ERROR(L"PatternStore",
+            L"BuildAutomaton: compilation failed with %zu pattern(s) present - the "
+            L"previous automaton is kept, so pattern coverage is whatever it was "
+            L"before this rebuild",
+            addedCount);
         // Keep old automaton if compilation fails (better than nothing)
         return StoreError{ SignatureStoreError::Unknown, 0, "Automaton compilation failed" };
     }
