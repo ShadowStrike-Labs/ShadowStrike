@@ -1034,6 +1034,20 @@ namespace ShadowStrike {
                 case RevocationMode::OfflineAllowed:
                     flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN;
                     flags |= CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY;
+                    // CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY alone does not make
+                    // this offline, which is the trap. It restricts REVOCATION
+                    // lookups to the cache, but the chain engine will still resolve
+                    // missing issuer certificates through the Authority Information
+                    // Access extension over the network, so a mode named
+                    // "OfflineAllowed" was still capable of a multi-minute network
+                    // stall. CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL suppresses URL
+                    // retrieval as a whole and is what makes the name true.
+                    //
+                    // Revocation checking is NOT being disabled here: the chain
+                    // flag stays, so a certificate whose revocation is already
+                    // known locally is still rejected. The only change is that we
+                    // no longer block a caller while fetching over the network.
+                    flags |= CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
                     break;
                 case RevocationMode::Disabled:
                     // Explicitly skip revocation; treat as success but log via err if provided for auditing
@@ -1085,9 +1099,19 @@ namespace ShadowStrike {
                 case RevocationMode::OfflineAllowed:
                     flags |= CERT_CHAIN_REVOCATION_CHECK_CHAIN;
                     flags |= CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY;
+                    // See CheckRevocationOnline above: the cache-only REVOCATION
+                    // flag does not prevent issuer retrieval over the network, and
+                    // this function is the one that builds the chain, so it is the
+                    // one that performs that retrieval. Without this the mode does
+                    // not mean what it is called.
+                    flags |= CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
                     break;
                 case RevocationMode::Disabled:
-                    // No revocation flags
+                    // No revocation flags. Revocation being switched off is not a
+                    // licence to go to the network for issuers either - a caller
+                    // that asked for no revocation work certainly did not ask to
+                    // wait on a remote fetch.
+                    flags |= CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
                     break;
                 }
 

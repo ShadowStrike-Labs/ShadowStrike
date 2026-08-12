@@ -131,9 +131,14 @@ namespace ShadowStrike {
 			 * @brief Certificate revocation checking mode.
 			 */
 			enum class RevocationMode {
-				OnlineOnly,      ///< Require online OCSP/CRL check (strictest)
-				OfflineAllowed,  ///< Allow cached CRL if online check fails
-				Disabled         ///< Skip revocation checking (not recommended)
+				OnlineOnly,      ///< Authoritative OCSP/CRL over the NETWORK. Strictest,
+				                 ///< and the only mode that can block the caller for as
+				                 ///< long as the remote fetch takes. Never use it on a
+				                 ///< path that holds a kernel file operation open.
+				OfflineAllowed,  ///< Revocation checked against the local cache only.
+				                 ///< Never touches the network, including for issuer
+				                 ///< certificate retrieval. This is the default.
+				Disabled         ///< Skip revocation checking entirely (not recommended)
 			};
 
 
@@ -381,7 +386,27 @@ namespace ShadowStrike {
                 [[nodiscard]] bool IsTimeValidWithGrace(const FILETIME& signTime) const noexcept;
 
 				// --- Configuration State ---
-                RevocationMode revocationMode_{ RevocationMode::OnlineOnly };
+
+                // The default is deliberately the mode that cannot stall a caller.
+                //
+                // This used to default to OnlineOnly, and six modules constructed a
+                // verifier without ever calling SetRevocationMode: PackerDetector,
+                // StartupAnalyzer, PersistenceDetector, FileProtection,
+                // FileIntegrityMonitor and ProgramUpdater. Five of those run on or
+                // near the synchronous on-access scan path, where a network
+                // revocation fetch blocks a scan worker while a kernel file
+                // operation waits behind it - measured at up to three minutes in
+                // the field, which starves the whole machine of scan capacity.
+                // Inheriting that silently, from a default nobody chose, is how a
+                // detail like this stays invisible for months.
+                //
+                // OfflineAllowed still checks revocation; it checks it against the
+                // local cache instead of the network, so a certificate already
+                // known to be revoked is still rejected. Callers that genuinely
+                // need an authoritative online answer - update and installer
+                // verification, where a slow fetch delays only the update - must now
+                // say so explicitly, and the places that do are easy to audit.
+                RevocationMode revocationMode_{ RevocationMode::OfflineAllowed };
                 uint32_t tsGraceSeconds_{ 300 };        ///< Timestamp grace (5 min default)
                 bool allowCatalogFallback_{ true };     ///< Allow catalog when no embedded sig
                 bool allowMultipleSignatures_{ false }; ///< Verify all nested signatures

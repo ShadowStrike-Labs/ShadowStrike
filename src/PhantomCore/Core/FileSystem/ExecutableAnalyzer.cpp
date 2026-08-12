@@ -2668,7 +2668,17 @@ public:
             // pinning paths, where a slow fetch delays only itself.
             trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
 
-            LONG result = WinVerifyTrust(nullptr, &policyGUID, &trustData);
+            LONG result = ERROR_SUCCESS;
+            {
+                // These two scopes exist because a single Analyze.VerifySignature
+                // scope could not tell us which half was blocking. In 1.0.89 the
+                // trust call was already cache-only and fast while the certificate
+                // detail extraction below was the part that never returned, and
+                // that was only deducible by comparing against a different code
+                // path. The next trace should not need deduction.
+                SS_DIAG_SCOPE("OnAccess", "Analyze.WinVerifyTrust");
+                result = WinVerifyTrust(nullptr, &policyGUID, &trustData);
+            }
 
             if (result == ERROR_SUCCESS) {
                 sigInfo.isSigned = true;
@@ -2693,6 +2703,7 @@ public:
 
             // Get detailed certificate info if signed
             if (sigInfo.isSigned) {
+                SS_DIAG_SCOPE("OnAccess", "Analyze.ExtractCertDetails");
                 ExtractCertificateDetailsImpl(filePath, sigInfo);
             }
 
@@ -3637,9 +3648,61 @@ public:
                         chainPara.cbSize = sizeof(chainPara);
                         PCCERT_CHAIN_CONTEXT pChainCtx = nullptr;
 
+                        // CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL is required here for
+                        // the same reason WTD_CACHE_ONLY_URL_RETRIEVAL is required
+                        // in VerifySignatureImpl above, and its absence is why
+                        // fixing that one alone did not cure the freeze.
+                        //
+                        // This function is called from VerifySignatureImpl the
+                        // moment WinVerifyTrust reports the file is signed, so it
+                        // sits on the synchronous on-access path with a kernel file
+                        // operation held open behind it. With dwFlags = 0 the chain
+                        // engine resolves missing issuers through the Authority
+                        // Information Access extension over the NETWORK, so the
+                        // expensive retrieval that was just suppressed one call
+                        // earlier was immediately performed again here.
+                        //
+                        // Field evidence, 1.0.89 trace ring, 2026-08-13. In the
+                        // same run, on the same threads:
+                        //   step.IsMicrosoftSigned(WinVerifyTrust)  completed
+                        //     dozens of times, 7-43 ms - it calls WinVerifyTrust
+                        //     and nothing else, and that call is cache-only.
+                        //   Analyze.VerifySignature  entered at 00:21:29.532 on
+                        //     t9652 and 00:21:31.041 on t10216 and NEVER returned.
+                        // The distinguishing factor between the two is precisely
+                        // this function: only the second path builds a chain.
+                        // t10216 was still completing its own WinVerifyTrust calls
+                        // at 00:21:30.9 while t9652 was already stuck in here, so
+                        // WinVerifyTrust itself was healthy and the block is in the
+                        // chain builder. The service log agrees exactly - scans=32,
+                        // clean=30, and the two missing completions are these two
+                        // threads. Two workers stuck means zero scan capacity,
+                        // which is the machine-wide lag.
+                        //
+                        // No detection is lost. Revocation is not requested here
+                        // and is not being disabled. The flag changes only where
+                        // issuer certificates may come from: the local stores and
+                        // the caches the startup warm-up populates, rather than the
+                        // network. When an issuer genuinely is not available
+                        // locally the chain comes back partial, TrustStatus is not
+                        // CERT_TRUST_NO_ERROR, and isTrusted is therefore false -
+                        // so the file is treated as less trusted and receives more
+                        // analysis, never less. The authoritative signature verdict
+                        // was already established by WinVerifyTrust before we got
+                        // here; this call exists to name the chain elements.
+                        //
+                        // Deliberately NOT applied blanket-wide. Chain building
+                        // that legitimately needs the network - TLS validation in
+                        // NetworkSecurity_SSL_TLS, certificate pinning in the
+                        // banking module, and the update trust path - must keep
+                        // reaching it, because there a slow fetch delays only the
+                        // operation that asked for it. The rule is not "never use
+                        // the network", it is "never use the network while holding
+                        // a kernel file operation open".
                         if (CertGetCertificateChain(
                                 nullptr, pCertCtx, nullptr, hStore,
-                                &chainPara, 0, nullptr, &pChainCtx))
+                                &chainPara, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL,
+                                nullptr, &pChainCtx))
                         {
                             if (pChainCtx->cChain > 0) {
                                 const auto* chain = pChainCtx->rgpChain[0];

@@ -2523,6 +2523,15 @@ bool VerifyCodeSignature(const fs::path& filePath)
 
     // Fallback: use PE signature verifier directly.
     Utils::pe_sig_utils::PEFileSignatureVerifier verifier;
+
+    // Stated explicitly rather than inherited. The verifier now defaults to
+    // cache-only revocation so that the on-access scan path cannot be stalled by
+    // a network fetch, but this is the opposite situation: we are about to decide
+    // whether to trust and run an update binary, an authoritative revocation
+    // answer is exactly what that decision needs, and a slow fetch here delays
+    // only the update rather than every file operation on the machine.
+    verifier.SetRevocationMode(Utils::pe_sig_utils::RevocationMode::OnlineOnly);
+
     Utils::pe_sig_utils::SignatureInfo info;
     Utils::pe_sig_utils::Error peErr;
 
