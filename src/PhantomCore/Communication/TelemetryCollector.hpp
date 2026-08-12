@@ -168,7 +168,19 @@ namespace TelemetryConstants {
     inline constexpr uint32_t MAX_RETRY_ATTEMPTS = 5;
     
     /// @brief Telemetry endpoint
-    inline constexpr const char* TELEMETRY_ENDPOINT = "https://telemetry.shadowstrike.io/v3/collect";
+    // NOTE: .invalid is reserved by RFC 2606 and can never be registered by
+    // anyone. That is the point. This default previously named a shadowstrike.io
+    // host, and nobody owns shadowstrike.io - so any party who registered it would
+    // have become the endpoint every deployed copy contacts by default. For a
+    // telemetry sink that means an unowned third party receiving whatever this
+    // product reports about a customer machine, which is the privacy inverse of
+    // what the project promises.
+    //
+    // Pointing it at shadowstrike.dev instead would look fixed while moving the
+    // problem, because that subdomain does not exist either. A reserved name cannot
+    // be hijacked and fails DNS immediately and visibly, so an unconfigured
+    // installation sends nothing rather than sending it to a stranger.
+    inline constexpr const char* TELEMETRY_ENDPOINT = "https://telemetry.shadowstrike.invalid/v3/collect";
 
 }  // namespace TelemetryConstants
 

@@ -25,7 +25,7 @@
  *
  * Decouples update logic from delivery mechanism. Implementations:
  *   - LocalFolderTransport: Reads packages from local/network staging directory
- *   - (Future) HttpTransport: Downloads from update.shadowstrike.io CDN
+ *   - (Future) HttpTransport: Downloads from update.shadowstrike.invalid CDN
  *   - (Future) P2PTransport: Peer-to-peer mesh for enterprise LAN distribution
  *
  * DESIGN PRINCIPLES:

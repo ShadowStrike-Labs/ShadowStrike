@@ -145,7 +145,20 @@ namespace SigUpdateConstants {
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     /// @brief Signature server URL
-    inline constexpr const char* SIGNATURE_SERVER_URL = "https://signatures.shadowstrike.io/v3";
+    // NOTE: .invalid is reserved by RFC 2606 and can never be registered by
+    // anyone. That is the point. This default previously named a shadowstrike.io
+    // host, and nobody owns shadowstrike.io - so any party who registered it would
+    // have become the endpoint every deployed copy contacts by default. With update
+    // signing not yet in place that is arbitrary code delivery, which makes an
+    // unowned default the most serious kind of supply-chain defect: one that ships.
+    //
+    // Pointing it at shadowstrike.dev instead would look fixed while moving the
+    // problem, because those subdomains do not exist yet either. A reserved name
+    // cannot be hijacked and fails DNS immediately and visibly, so an unconfigured
+    // installation is inert rather than quietly trusting a stranger. Replace this
+    // with a real host only once the endpoint exists AND update signatures are
+    // verified against a pinned trust anchor.
+    inline constexpr const char* SIGNATURE_SERVER_URL = "https://signatures.shadowstrike.invalid/v3";
     
     /// @brief Default update interval (minutes)
     inline constexpr uint32_t DEFAULT_UPDATE_INTERVAL_MINUTES = 60;
