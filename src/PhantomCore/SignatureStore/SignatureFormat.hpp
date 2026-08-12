@@ -188,7 +188,9 @@ struct alignas(8) PatternEntry {
 
     // Statistics for optimization
     uint32_t hitCount;                                    // Detection count (heatmap)
-    uint32_t lastUpdateTime;                              // Unix timestamp
+    uint32_t lastUpdateTime;                              // Unix time in SECONDS (32-bit
+                                                          // cannot hold milliseconds; the
+                                                          // 64-bit header fields do use ms)
 };
 #pragma pack(pop)
 
@@ -275,8 +277,8 @@ struct alignas(8) SignatureDatabaseHeader {
     
     // Database identification
     std::array<uint8_t, 16> databaseUuid;                // UUID for database tracking
-    uint64_t creationTime;                                // Unix timestamp
-    uint64_t lastUpdateTime;                              // Unix timestamp
+    uint64_t creationTime;                                // Unix time in MILLISECONDS
+    uint64_t lastUpdateTime;                              // Unix time in MILLISECONDS
     uint64_t buildNumber;                                 // Incremental build ID
     
     // Section offsets (all 4KB aligned)

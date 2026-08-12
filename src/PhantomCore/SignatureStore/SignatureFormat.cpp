@@ -366,15 +366,40 @@ namespace Format {
             }
         }
 
-        // Reasonable timestamp range: 2020-2100 (in seconds since epoch)
-        constexpr uint64_t MIN_TIMESTAMP = 1577836800ULL;  // 2020-01-01
-        constexpr uint64_t MAX_TIMESTAMP = 4102444800ULL;  // 2100-01-01
+        // Reasonable timestamp range, in MILLISECONDS since the Unix epoch.
+        //
+        // This used to compare against second-granularity bounds while every
+        // producer writes milliseconds, so it warned "Creation timestamp
+        // 1786117931546 outside expected range [2020-2100]" on every header
+        // validation - eight or more times per service start in the field. A range
+        // check that rejects every valid value validates nothing: it cannot
+        // distinguish a genuinely corrupt timestamp from the normal case, and it
+        // trains whoever reads the log to skip the line.
+        //
+        // Milliseconds is the unit because that is what SignatureBuilder has always
+        // written (GetCurrentTimestamp returns duration_cast<milliseconds>) and what
+        // DataStorePaths compares when deciding whether shipped content is newer
+        // than the working copy. The field is uint64, so milliseconds overflow no
+        // sooner than the year 292 million.
+        constexpr uint64_t MIN_TIMESTAMP_MS = 1577836800000ULL;  // 2020-01-01T00:00:00Z
+        constexpr uint64_t MAX_TIMESTAMP_MS = 4102444800000ULL;  // 2100-01-01T00:00:00Z
 
         if (header->creationTime > 0 &&
-            (header->creationTime < MIN_TIMESTAMP || header->creationTime > MAX_TIMESTAMP)) {
+            (header->creationTime < MIN_TIMESTAMP_MS || header->creationTime > MAX_TIMESTAMP_MS)) {
             SS_LOG_WARN(L"SignatureStore",
-                L"Creation timestamp %llu outside expected range [2020-2100]",
+                L"Creation timestamp %llu ms is outside the expected range "
+                L"[2020-2100]; the header may be corrupt or written with the wrong "
+                L"unit (this field is milliseconds, not seconds)",
                 header->creationTime);
+        }
+
+        if (header->lastUpdateTime > 0 &&
+            (header->lastUpdateTime < MIN_TIMESTAMP_MS || header->lastUpdateTime > MAX_TIMESTAMP_MS)) {
+            SS_LOG_WARN(L"SignatureStore",
+                L"Last-update timestamp %llu ms is outside the expected range "
+                L"[2020-2100]; the header may be corrupt or written with the wrong "
+                L"unit (this field is milliseconds, not seconds)",
+                header->lastUpdateTime);
         }
 
         SS_LOG_DEBUG(L"SignatureStore", L"Header validation passed");

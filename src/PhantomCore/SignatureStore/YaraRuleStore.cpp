@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include"pch.h"
+#include <chrono>   // millisecond header timestamps
 #ifdef SHADOWSTRIKE_HAS_YARA  // Entire TU requires libyara SDK
 /*
  * ============================================================================
@@ -1179,8 +1180,21 @@ StoreError YaraRuleStore::CreateNew(
     header.magic = SIGNATURE_DB_MAGIC;
     header.versionMajor = SIGNATURE_DB_VERSION_MAJOR;
     header.versionMinor = SIGNATURE_DB_VERSION_MINOR;
-    header.creationTime = static_cast<uint64_t>(std::time(nullptr));
-    header.lastUpdateTime = header.creationTime;
+    // Milliseconds, matching SignatureBuilder and the documented unit on the field.
+    //
+    // This wrote std::time(nullptr) - seconds - into the same SignatureDatabaseHeader
+    // that SignatureBuilder fills with milliseconds. Two producers of one field in
+    // two different units is the actual defect behind the "Creation timestamp
+    // outside expected range" warnings, and it had a second consequence: the content
+    // seeding in DataStorePaths decides whether to install shipped content by
+    // comparing lastUpdateTime, so a seconds-valued header looks roughly fifty years
+    // older than any millisecond-valued baseline and would lose that comparison every
+    // time regardless of which database was actually newer.
+    const auto nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    header.creationTime = nowMs;
+    header.lastUpdateTime = nowMs;
     header.buildNumber = 1;
     header.totalHashes = 0;
     header.totalPatterns = 0;
