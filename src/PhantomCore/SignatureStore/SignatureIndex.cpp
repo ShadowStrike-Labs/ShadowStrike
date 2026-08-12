@@ -189,37 +189,53 @@ StoreError SignatureIndex::Initialize(
         m_perfFrequency.QuadPart = 1000000; // Fallback to microseconds
     }
 
-    // Support both persisted-root-offset layouts and raw node-at-offset-zero
-    // layouts produced by CreateNew().
-    uint64_t resolvedRootOffset = 0;
-    if (indexSize >= sizeof(uint32_t)) {
-        const uint32_t* rootPtr = view.GetAt<uint32_t>(indexOffset);
-        if (rootPtr) {
-            const uint64_t rootVal = *rootPtr;
-            const bool aligned = (rootVal % alignof(BPlusTreeNode)) == 0;
-            const bool inBounds = rootVal < indexSize &&
-                                  rootVal + sizeof(BPlusTreeNode) <= indexSize;
+    // The root node is at offset 0 of the index section. That is the format
+    // contract, and it is now stated rather than inferred.
+    //
+    // This used to read the first four bytes of the section as a "persisted root
+    // offset", validate them, and fall back to 0 when they failed. No code has ever
+    // written a root offset there. What it actually read was the root node's own
+    // first four bytes - isLeaf followed by three of its reserved padding bytes - so
+    // for a leaf root it obtained 1, failed the 8-byte alignment test, warned
+    // "Root offset 0x1 is invalid for section size 0x1000" on every open, and fell
+    // back to 0. The fallback happened to be right, which is the only reason hash
+    // lookups resolved to a real node at all.
+    //
+    // Reading a value nobody writes is worse than not reading it. Had an internal
+    // root ever occupied offset 0, isLeaf would be false, those bytes would read as
+    // 0, and the "rootVal != 0" guard would have suppressed even the warning - a
+    // silent misresolution with no trace. The builder now places the root at index 0
+    // unconditionally (see the layout comment in sig_builder_serialization.cpp) and
+    // CreateNew does the same for an empty index, so offset 0 is authoritative for
+    // every database this product produces.
+    const uint64_t resolvedRootOffset = 0;
 
-            if (aligned && inBounds) {
-                const auto* candidateRoot = reinterpret_cast<const BPlusTreeNode*>(
-                    static_cast<const uint8_t*>(m_baseAddress) + rootVal);
-
-                if (candidateRoot->keyCount <= BPlusTreeNode::MAX_KEYS) {
-                    resolvedRootOffset = rootVal;
-                    SS_LOG_DEBUG(L"SignatureIndex",
-                        L"Initialize: Using persisted root offset 0x%llX", resolvedRootOffset);
-                } else {
-                    SS_LOG_WARN(L"SignatureIndex",
-                        L"Initialize: Root candidate at 0x%llX has invalid keyCount %u; "
-                        L"falling back to offset 0",
-                        rootVal, candidateRoot->keyCount);
-                }
-            } else if (rootVal != 0) {
-                SS_LOG_WARN(L"SignatureIndex",
-                    L"Initialize: Root offset 0x%llX is invalid for section size 0x%llX; "
-                    L"falling back to offset 0",
-                    rootVal, indexSize);
-            }
+    // Validate the node that is actually there. A corrupt or truncated section must
+    // be refused at open, because the alternative is a store that reports itself
+    // ready and then answers every lookup with "not found" - indistinguishable from
+    // a clean machine.
+    {
+        const auto* root = view.GetAt<BPlusTreeNode>(indexOffset);
+        if (!root) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"Initialize: cannot map the root node at section offset 0");
+            return StoreError{SignatureStoreError::InvalidFormat, 0,
+                              "Root node not mappable"};
+        }
+        if (root->keyCount > BPlusTreeNode::MAX_KEYS) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"Initialize: root keyCount %u exceeds maximum %zu - the index "
+                L"section is corrupt and every lookup would silently miss",
+                root->keyCount, static_cast<size_t>(BPlusTreeNode::MAX_KEYS));
+            return StoreError{SignatureStoreError::IndexCorrupted, 0,
+                              "Root node keyCount out of range"};
+        }
+        if (!root->isLeaf && root->keyCount == 0) {
+            SS_LOG_ERROR(L"SignatureIndex",
+                L"Initialize: root is an internal node with zero keys, so nothing "
+                L"below it is reachable");
+            return StoreError{SignatureStoreError::IndexCorrupted, 0,
+                              "Internal root has no keys"};
         }
     }
 

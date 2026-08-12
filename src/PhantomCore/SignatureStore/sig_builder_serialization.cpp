@@ -493,21 +493,63 @@ namespace SignatureStore {
                     });
             }
 
-            // A uniform bucket must hold the busiest type's leaf chain, because the
-            // reader derives one bucketSize for all of them.
-            const size_t leafCapacity = BPlusTreeNode::MAX_KEYS;
+            // Sizing must budget the WHOLE tree, not just its leaves.
+            //
+            // This previously counted leaves only, because only leaves were ever
+            // written. That produced a structure the reader cannot navigate: it
+            // wrote ceil(N/127) leaf nodes chained by nextLeaf with no internal
+            // nodes and no root, while SignatureIndex::FindLeaf descends with
+            // "while (node && !node->isLeaf)". A leaf at the section's root offset
+            // ends that loop immediately, so every point lookup returned the FIRST
+            // leaf regardless of the key sought, and only the first 127 entries per
+            // hash type were reachable. Measured before this change with a synthetic
+            // 500-hash corpus: exactly 127 of 500 found, 127 being MAX_KEYS.
+            //
+            // Nothing reported it because a hash lookup that finds nothing is
+            // indistinguishable from a clean file. The builder now verifies its own
+            // output by looking up every hash it imported, which is what turned this
+            // from invisible into a build failure.
+            const size_t leafCapacity  = BPlusTreeNode::MAX_KEYS;
+            const size_t childCapacity = BPlusTreeNode::MAX_CHILDREN;
+
+            // Total nodes for a tree over `leaves` leaf nodes: the leaves, plus one
+            // internal level per reduction by childCapacity, until a single node
+            // remains. That last node is the root. A single leaf IS the root, so it
+            // needs no internal level at all.
+            const auto totalNodesForLeaves = [childCapacity](size_t leaves) -> size_t {
+                if (leaves <= 1) {
+                    return 1;
+                }
+                size_t nodes = leaves;
+                size_t level = leaves;
+                while (level > 1) {
+                    level = (level + childCapacity - 1) / childCapacity;
+                    nodes += level;
+                }
+                return nodes;
+            };
+
             size_t maxLeavesPerType = 1;   // at least one node, even when empty
+            size_t maxNodesPerType  = 1;
             for (const auto& group : byType) {
-                if (!group.empty()) {
-                    const size_t leaves = (group.size() + leafCapacity - 1) / leafCapacity;
-                    if (leaves > maxLeavesPerType) {
-                        maxLeavesPerType = leaves;
-                    }
+                const size_t leaves = group.empty()
+                    ? 1u
+                    : (group.size() + leafCapacity - 1) / leafCapacity;
+                if (leaves > maxLeavesPerType) {
+                    maxLeavesPerType = leaves;
+                }
+                const size_t nodes = totalNodesForLeaves(leaves);
+                if (nodes > maxNodesPerType) {
+                    maxNodesPerType = nodes;
                 }
             }
+            (void)maxLeavesPerType;   // retained for the log line below
 
+            // A uniform bucket must hold the busiest type's entire tree, because the
+            // reader derives one bucketSize for all of them from
+            // hashIndexSize / kNumHashTypes.
             const uint64_t bucketSize =
-                Format::AlignToPage(maxLeavesPerType * sizeof(BPlusTreeNode));
+                Format::AlignToPage(maxNodesPerType * sizeof(BPlusTreeNode));
             const uint64_t indexRegionSize = bucketSize * kNumHashTypes;
             const uint64_t indexRegionStart = m_currentOffset;
             const uint64_t payloadStart = Format::AlignToPage(indexRegionStart + indexRegionSize);
@@ -556,9 +598,41 @@ namespace SignatureStore {
             }
 
             // ------------------------------------------------------------------
-            // Write one leaf chain per hash type into its own bucket.
+            // Write one B+Tree per hash type into its own bucket.
+            //
+            // Node placement inside a bucket:
+            //
+            //     index 0            the ROOT, always
+            //     index 1 .. L       the L leaves, in ascending key order
+            //     index L+1 ...      intermediate internal levels, bottom-up
+            //
+            // The root lives at section offset 0 because that is the one location
+            // the reader can find without being told: SignatureIndex resolves its
+            // root there, so no format change, no section header and no version bump
+            // are needed. When a tree is a single leaf, that leaf IS the root and
+            // occupies index 0 alone.
+            //
+            // Separator convention, which must match the reader exactly or lookups
+            // silently go to the wrong subtree. SignatureIndex::FindLeaf does:
+            //
+            //     pos = lower_bound(keys, keyCount, target)
+            //     if (pos < keyCount && target >= keys[pos]) pos++
+            //     next = children[pos]
+            //
+            // so children[j] covers [keys[j-1], keys[j]) and a key equal to keys[j]
+            // descends right into children[j+1]. Therefore keys[j] must be the
+            // MINIMUM key present in the subtree under children[j+1] - the separator
+            // is the first key of the right child, not the last key of the left.
             // ------------------------------------------------------------------
             size_t totalIndexed = 0;
+
+            // One entry per node written at the level currently being reduced.
+            struct LevelNode {
+                uint64_t offset;   // absolute file offset of the node
+                uint64_t minKey;   // smallest key anywhere beneath it
+            };
+            std::vector<LevelNode> level;
+            std::vector<LevelNode> nextLevel;
 
             for (uint8_t t = 0; t < kNumHashTypes; ++t) {
                 const uint64_t bucketOffset = indexRegionStart + (static_cast<uint64_t>(t) * bucketSize);
@@ -567,23 +641,57 @@ namespace SignatureStore {
                 const size_t leaves = group.empty()
                     ? 1u
                     : (group.size() + leafCapacity - 1) / leafCapacity;
+                const size_t nodesNeeded = totalNodesForLeaves(leaves);
 
-                if (bucketOffset + (leaves * sizeof(BPlusTreeNode)) > m_outputSize) {
+                if (nodesNeeded * sizeof(BPlusTreeNode) > bucketSize ||
+                    bucketOffset + (nodesNeeded * sizeof(BPlusTreeNode)) > m_outputSize) {
                     SS_LOG_ERROR(L"SignatureBuilder",
-                        L"SerializeHashes: bucket %u exceeds output (offset=%llu, leaves=%zu)",
-                        static_cast<unsigned>(t), bucketOffset, leaves);
+                        L"SerializeHashes: bucket %u exceeds its space (offset=%llu, nodes=%zu, bucketSize=%llu)",
+                        static_cast<unsigned>(t), bucketOffset, nodesNeeded, bucketSize);
                     return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small for hash index" };
                 }
 
+                const auto nodeAt = [this, bucketOffset](size_t index) -> BPlusTreeNode* {
+                    return reinterpret_cast<BPlusTreeNode*>(
+                        static_cast<uint8_t*>(m_outputBase) + bucketOffset +
+                        (static_cast<uint64_t>(index) * sizeof(BPlusTreeNode)));
+                };
+
+                // Node offsets stored INSIDE nodes are SECTION-RELATIVE, not absolute
+                // file offsets. SignatureIndex sets m_baseAddress to
+                // view.baseAddress + indexOffset and GetNode requires
+                // nodeOffset < m_indexSize, where m_indexSize is this bucket's size,
+                // then addresses the node as m_baseAddress + nodeOffset.
+                //
+                // Writing absolute offsets here is precisely how the first attempt at
+                // this fix failed: every internal child offset exceeded m_indexSize,
+                // GetNode refused it, FindLeaf returned null and lookups went from
+                // 127-of-500 to 0-of-500. Single-leaf trees still worked, which is
+                // the tell - they never descend.
+                //
+                // Note the deliberate asymmetry: a LEAF's children[] hold ABSOLUTE
+                // file offsets to hash payload records, because leaves are terminal
+                // and those values are returned to the caller rather than followed as
+                // nodes. Only internal children, prevLeaf, nextLeaf and parentOffset
+                // are section-relative node offsets.
+                const auto offsetAt = [](size_t index) -> uint64_t {
+                    return static_cast<uint64_t>(index) * sizeof(BPlusTreeNode);
+                };
+
+                // --------------------------------------------------------------
+                // Leaf level. A single leaf is the root and goes to index 0;
+                // otherwise leaves occupy 1..L and index 0 is reserved for the root.
+                // --------------------------------------------------------------
+                const size_t firstLeafIndex = (leaves == 1) ? 0u : 1u;
+
+                level.clear();
+                level.reserve(leaves);
+
                 size_t entryIdx = 0;
-                uint64_t prevLeafOffset = 0;
-
                 for (size_t leafIdx = 0; leafIdx < leaves; ++leafIdx) {
-                    const uint64_t leafOffset = bucketOffset + (leafIdx * sizeof(BPlusTreeNode));
-
-                    BPlusTreeNode* leaf = reinterpret_cast<BPlusTreeNode*>(
-                        static_cast<uint8_t*>(m_outputBase) + leafOffset
-                        );
+                    const size_t   slot       = firstLeafIndex + leafIdx;
+                    const uint64_t leafOffset = offsetAt(slot);
+                    BPlusTreeNode* leaf       = nodeAt(slot);
 
                     std::memset(leaf, 0, sizeof(BPlusTreeNode));
                     leaf->isLeaf = true;
@@ -599,14 +707,99 @@ namespace SignatureStore {
                         leaf->children[k] = hashOffsets[src];
                     }
 
-                    leaf->prevLeaf = prevLeafOffset;
-                    leaf->nextLeaf = (leafIdx + 1 < leaves)
-                        ? bucketOffset + ((leafIdx + 1) * sizeof(BPlusTreeNode))
-                        : 0ull;
+                    // Sequential-scan chain. Still maintained: ForEach and range
+                    // queries walk it, and it is how a full enumeration reaches
+                    // every entry independently of the descent path.
+                    leaf->prevLeaf = (leafIdx > 0) ? offsetAt(slot - 1) : 0ull;
+                    leaf->nextLeaf = (leafIdx + 1 < leaves) ? offsetAt(slot + 1) : 0ull;
 
-                    prevLeafOffset = leafOffset;
-                    entryIdx += keysInLeaf;
+                    level.push_back(LevelNode{
+                        leafOffset,
+                        (keysInLeaf > 0) ? leaf->keys[0] : 0ull
+                    });
+
+                    entryIdx     += keysInLeaf;
                     totalIndexed += keysInLeaf;
+                }
+
+                // --------------------------------------------------------------
+                // Internal levels, built bottom-up until one node remains. That
+                // final node is the root and is written to index 0.
+                // --------------------------------------------------------------
+                size_t nextFreeSlot = (leaves == 1) ? 1u : (1u + leaves);
+
+                while (level.size() > 1) {
+                    const size_t parentCount =
+                        (level.size() + childCapacity - 1) / childCapacity;
+
+                    nextLevel.clear();
+                    nextLevel.reserve(parentCount);
+
+                    for (size_t p = 0; p < parentCount; ++p) {
+                        const size_t firstChild = p * childCapacity;
+                        const size_t childCount =
+                            std::min(childCapacity, level.size() - firstChild);
+
+                        // The single node of the topmost level is the root.
+                        const bool isRoot = (parentCount == 1);
+                        const size_t slot = isRoot ? 0u : nextFreeSlot++;
+
+                        if (!isRoot && slot * sizeof(BPlusTreeNode) >= bucketSize) {
+                            SS_LOG_ERROR(L"SignatureBuilder",
+                                L"SerializeHashes: bucket %u internal node slot %zu exceeds bucket size %llu",
+                                static_cast<unsigned>(t), slot, bucketSize);
+                            return StoreError{ SignatureStoreError::TooLarge, 0,
+                                "Database too small for hash index internal nodes" };
+                        }
+
+                        BPlusTreeNode* parent = nodeAt(slot);
+                        std::memset(parent, 0, sizeof(BPlusTreeNode));
+                        parent->isLeaf   = false;
+                        parent->keyCount = static_cast<uint32_t>(childCount - 1);
+
+                        for (size_t c = 0; c < childCount; ++c) {
+                            parent->children[c] = level[firstChild + c].offset;
+                            if (c > 0) {
+                                // Separator is the first key of the right child.
+                                parent->keys[c - 1] = level[firstChild + c].minKey;
+                            }
+                        }
+
+                        nextLevel.push_back(LevelNode{
+                            offsetAt(slot),
+                            level[firstChild].minKey
+                        });
+                    }
+
+                    level.swap(nextLevel);
+                }
+
+                // Record each child's parent so maintenance paths that walk upward
+                // have a truthful pointer rather than an implied zero. Offsets here
+                // are section-relative, matching the children[] they mirror.
+                if (leaves > 1) {
+                    const auto linkChildren = [&](size_t parentSlot) {
+                        BPlusTreeNode* node = nodeAt(parentSlot);
+                        if (node->isLeaf) {
+                            return;
+                        }
+                        const uint32_t childTotal = node->keyCount + 1u;
+                        for (uint32_t c = 0; c < childTotal && c < BPlusTreeNode::MAX_CHILDREN; ++c) {
+                            const uint64_t childOffset = node->children[c];
+                            if (childOffset % sizeof(BPlusTreeNode) != 0 ||
+                                childOffset + sizeof(BPlusTreeNode) > bucketSize) {
+                                continue;
+                            }
+                            const size_t childSlot =
+                                static_cast<size_t>(childOffset / sizeof(BPlusTreeNode));
+                            nodeAt(childSlot)->parentOffset = offsetAt(parentSlot);
+                        }
+                    };
+
+                    linkChildren(0);                                  // the root
+                    for (size_t slot = 1; slot < nextFreeSlot; ++slot) {
+                        linkChildren(slot);                           // intermediate levels
+                    }
                 }
             }
 
