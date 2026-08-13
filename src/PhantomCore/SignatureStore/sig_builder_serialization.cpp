@@ -871,8 +871,16 @@ namespace SignatureStore {
             SS_LOG_INFO(L"SignatureBuilder",
                 L"SerializePatterns: Processing %zu patterns", m_pendingPatterns.size());
 
-            // Record section start for header back-fill
-            m_sectionOffsets.patternStart = m_currentOffset;
+            // NOTE: the pattern section start is NOT recorded here. It is
+            // recorded at the trie offset below, once alignment is applied.
+            // Recording m_currentOffset at this point published a section start
+            // that was (a) not page aligned, because it is wherever the hash
+            // payload pool happened to end, and (b) inconsistent with
+            // patternIndexSize, which is measured from the ALIGNED trie offset.
+            // ValidateHeader::checkPageAlignment then rejected the whole database
+            // on open, so every store failed and the product reported "No
+            // components could be initialized" - for a database that had just
+            // been written and checksummed successfully.
 
             // ========================================================================
             // STEP 2: PRE-COMPILE ALL PATTERNS (SINGLE PASS - MAJOR OPTIMIZATION)
@@ -1092,6 +1100,12 @@ namespace SignatureStore {
             // ========================================================================
             uint64_t trieOffset = Format::AlignToPage(currentOffset);
             currentOffset = trieOffset;
+
+            // Record the section start HERE, at the aligned offset where the
+            // pattern data actually begins. This is also the base that
+            // patternIndexSize is measured from a few lines below, so offset and
+            // size now describe the same span - they did not before.
+            m_sectionOffsets.patternStart = trieOffset;
 
             StoreError trieErr = SerializeAhoCorasickToDisk(currentOffset);
             if (!trieErr.IsSuccess()) {
@@ -1424,7 +1438,14 @@ namespace SignatureStore {
             serialQueue.push(0); // Start at root
             nodeIdToDiskOffset[0] = nodeOffset;
 
-            header->rootNodeOffset = nodeOffset;
+            // Section-RELATIVE, not absolute. PatternIndex resolves this as
+            // view.GetAt<TrieNodeBinary>(indexOffset + rootNodeOffset) and
+            // validates it against indexSize, so an absolute file offset both
+            // fails the bounds check and, if it passed, would resolve to the
+            // wrong address. This is the same asymmetry that made the hash
+            // B+tree unreadable: offsets stored INSIDE a section are relative to
+            // that section, and only the header's section offsets are absolute.
+            header->rootNodeOffset = nodeOffset - headerOffset;
 
             while (!serialQueue.empty()) {
                 uint64_t nodeId = serialQueue.front();
@@ -1476,7 +1497,12 @@ namespace SignatureStore {
             // STEP 7: BUILD OUTPUT PATTERN ID POOL
             // ========================================================================
             uint64_t poolOffset = currentOffset;
-            header->outputPoolOffset = poolOffset;
+            // Absolute start kept separately: poolOffset is passed by reference
+            // and BuildOutputPool advances it, so the size below must be measured
+            // against a saved copy rather than against the header field, which is
+            // now section-relative.
+            const uint64_t poolStartAbsolute = poolOffset;
+            header->outputPoolOffset = poolStartAbsolute - headerOffset;
 
             StoreError poolErr = BuildOutputPool(poolOffset);
             if (!poolErr.IsSuccess()) {
@@ -1485,7 +1511,7 @@ namespace SignatureStore {
                 return poolErr;
             }
 
-            header->outputPoolSize = poolOffset - header->outputPoolOffset;
+            header->outputPoolSize = poolOffset - poolStartAbsolute;
             currentOffset = poolOffset;
 
             // ========================================================================

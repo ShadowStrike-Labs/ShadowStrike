@@ -152,7 +152,8 @@ void Usage() {
         "\n"
         "Exit codes: 0 success, 1 usage, 2 import failed, 3 build failed,\n"
         "            4 output did not verify, 5 whitelist build failed,\n"
-        "            6 built hashes cannot be found by lookup\n");
+        "            6 built hashes cannot be found by lookup\n"
+        "            7 built patterns do not match content containing them\n");
 }
 
 struct Options {
@@ -827,8 +828,85 @@ void CollectHashLinesForVerification(const std::vector<std::wstring>& files,
     }
 }
 
-// Looks up every hash we just imported, through the same store the service uses.
-//
+// Independently re-read pattern lines and decode the hex to raw bytes, for the
+// same reason the hash collector exists: re-reading with the importer's own code
+// would only prove the code agrees with itself. Decoding here means the scan asks
+// for the bytes the FILE describes, so a mis-parse in the importer shows up as a
+// pattern that will not match.
+struct PatternLine {
+    std::vector<uint8_t> bytes;
+    std::string          name;
+};
+
+// Only fully understood lines are returned. Wildcards and byte ranges are skipped
+// rather than guessed at: '??' has no single byte to place in a test buffer, so a
+// pattern containing one cannot be verified this way and must not be counted as
+// verified. That is a gap in coverage, and it is a smaller lie than a pass.
+void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
+                                        std::vector<PatternLine>& out,
+                                        size_t& outSkipped) {
+    outSkipped = 0;
+    for (const auto& file : files) {
+        const fs::path filePath{ file };
+        std::ifstream in(filePath);
+        if (!in) {
+            continue;
+        }
+        std::string raw;
+        while (std::getline(in, raw)) {
+            if (!raw.empty() && raw.back() == '\r') {
+                raw.pop_back();
+            }
+            const size_t begin = raw.find_first_not_of(" \t");
+            if (begin == std::string::npos || raw[begin] == '#') {
+                continue;
+            }
+            const size_t firstColon = raw.find(':', begin);
+            if (firstColon == std::string::npos) {
+                continue;
+            }
+            const size_t secondColon = raw.find(':', firstColon + 1);
+            if (secondColon == std::string::npos) {
+                continue;
+            }
+
+            const std::string patternText = raw.substr(begin, firstColon - begin);
+            if (patternText.find('?') != std::string::npos ||
+                patternText.find('[') != std::string::npos) {
+                ++outSkipped;
+                continue;
+            }
+
+            PatternLine line;
+            line.name = raw.substr(firstColon + 1, secondColon - firstColon - 1);
+
+            bool ok = true;
+            std::string nibble;
+            for (const char c : patternText) {
+                if (c == ' ' || c == '\t') {
+                    continue;
+                }
+                if (std::isxdigit(static_cast<unsigned char>(c)) == 0) {
+                    ok = false;
+                    break;
+                }
+                nibble.push_back(c);
+                if (nibble.size() == 2) {
+                    line.bytes.push_back(static_cast<uint8_t>(
+                        std::stoul(nibble, nullptr, 16)));
+                    nibble.clear();
+                }
+            }
+            if (!ok || !nibble.empty() || line.bytes.empty()) {
+                ++outSkipped;
+                continue;
+            }
+            out.push_back(std::move(line));
+        }
+    }
+}
+
+// Looks up every hash we just imported, through the same store the service uses.//
 // The existing checks above assert that the stores OPEN. That is necessary and it
 // caught a real defect, but it is not sufficient: a store can open, report itself
 // ready, and still fail to find entries it contains. That failure mode is silent
@@ -888,6 +966,74 @@ void CollectHashLinesForVerification(const std::vector<std::wstring>& files,
              "is reported clean and nothing is logged. First unreachable "
              "entries:\n           %s",
              missing, expected.size(), firstMissingReport.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+// Scans a buffer that contains each imported pattern and asserts the store
+// reports it. This is the pattern-side equivalent of VerifyHashLookups, and it
+// exists for the same reason: the pattern trie is written by one body of code and
+// walked by another, the two disagreed about whether offsets stored inside the
+// section are absolute or section-relative, and nothing anywhere noticed because
+// no pattern content had ever been built. A store that opens cleanly and matches
+// nothing is indistinguishable at runtime from a clean machine.
+[[nodiscard]] bool VerifyPatternScan(const std::wstring& path,
+                                     const std::vector<PatternLine>& expected) {
+    if (expected.empty()) {
+        return true;
+    }
+
+    ShadowStrike::SignatureStore::SignatureStore store;
+    const StoreError opened = store.Initialize(path, /*readOnly=*/true);
+    if (!opened.IsSuccess()) {
+        Fail("pattern scan verification failed - cannot reopen the store: %s",
+             Describe(opened).c_str());
+        return false;
+    }
+
+    ShadowStrike::SignatureStore::ScanOptions opts{};
+    opts.enableHashLookup  = false;
+    opts.enablePatternScan = true;
+    opts.enableYaraScan    = false;
+    opts.stopOnFirstMatch  = false;
+
+    size_t matched = 0;
+    std::string firstMissReport;
+
+    for (const auto& line : expected) {
+        // The pattern bytes surrounded by filler, so the match is proven to work
+        // at a non-zero offset rather than only when the pattern is the entire
+        // buffer. A trie that only matches at offset 0 is a substring search that
+        // happens to pass a test written the easy way.
+        std::vector<uint8_t> buffer;
+        buffer.reserve(line.bytes.size() + 128);
+        buffer.insert(buffer.end(), 64, 0x41);
+        buffer.insert(buffer.end(), line.bytes.begin(), line.bytes.end());
+        buffer.insert(buffer.end(), 64, 0x42);
+
+        const auto result = store.ScanBuffer(buffer, opts);
+        if (!result.patternMatches.empty()) {
+            ++matched;
+            continue;
+        }
+        if (firstMissReport.empty()) {
+            firstMissReport = line.name;
+        }
+    }
+
+    store.Close();
+
+    Info("  verified   : %zu of %zu pattern(s) matched by scan",
+         matched, expected.size());
+
+    if (matched != expected.size()) {
+        Fail("%zu of %zu imported pattern(s) do not match content that contains "
+             "them. The pattern is in the database and the store opened without "
+             "complaint, so from outside this looks like working detection - it "
+             "simply never fires. First unmatched: %s",
+             expected.size() - matched, expected.size(), firstMissReport.c_str());
         return false;
     }
 
@@ -1088,6 +1234,26 @@ int wmain(int argc, wchar_t** argv) {
                  "verification (CSV-only input); lookups were not checked");
         } else if (!VerifyHashLookups(opt.output, importedHashes)) {
             return 6;
+        }
+    }
+
+    // Same question asked of the pattern side: the store opening is not the same
+    // as the store matching, and a pattern that never fires is invisible.
+    if (opt.verify && pendingPatterns > 0) {
+        std::vector<PatternLine> importedPatterns;
+        size_t skippedPatterns = 0;
+        CollectPatternLinesForVerification(opt.patternFiles, importedPatterns,
+                                          skippedPatterns);
+        if (skippedPatterns != 0) {
+            Info("  note       : %zu pattern(s) use wildcards or byte ranges and "
+                 "were not scan-verified (no single byte sequence to test)",
+                 skippedPatterns);
+        }
+        if (importedPatterns.empty()) {
+            Info("  note       : no literal pattern lines could be re-read for "
+                 "scan verification; pattern matching was not checked");
+        } else if (!VerifyPatternScan(opt.output, importedPatterns)) {
+            return 7;
         }
     }
 
