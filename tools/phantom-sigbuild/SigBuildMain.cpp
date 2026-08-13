@@ -838,14 +838,28 @@ struct PatternLine {
     std::string          name;
 };
 
-// Only fully understood lines are returned. Wildcards and byte ranges are skipped
-// rather than guessed at: '??' has no single byte to place in a test buffer, so a
-// pattern containing one cannot be verified this way and must not be counted as
-// verified. That is a gap in coverage, and it is a smaller lie than a pass.
+// Collects the literal pattern lines, and REPORTS any pattern this build cannot
+// match so the caller can refuse it.
+//
+// Wildcards ('??'), byte ranges ('[01-FF]') and variable gaps ('{0-16}') are not
+// merely unverifiable here - nothing in the product matches them at all.
+// PatternStore::BuildAutomaton adds only PatternMode::Exact, ScanWithSIMD skips
+// every other mode, and BoyerMooreMatcher - the one matcher that accepts a mask -
+// is never instantiated anywhere in the product. So such a pattern is compiled,
+// written to the database, counted in the statistics, and can never fire.
+//
+// Measured before this refusal existed: "48 8B ?? C3" and "48 8B [01-FF] C3" both
+// built at exit 0 and shipped, while "48 8B {0-16} C3" failed with a message about
+// the HASH line format - a rejection whose stated reason pointed at the wrong file
+// type entirely. Two silent holes and one misleading error.
+//
+// Refusing is the honest outcome: an author gets a build error naming the exact
+// construct instead of a database that reports a pattern it will never match. The
+// refusal must be lifted in the SAME change that wires a wildcard-capable matcher
+// into the scan path, never before.
 void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
                                         std::vector<PatternLine>& out,
-                                        size_t& outSkipped) {
-    outSkipped = 0;
+                                        std::vector<std::string>& outUnmatchable) {
     for (const auto& file : files) {
         const fs::path filePath{ file };
         std::ifstream in(filePath);
@@ -871,14 +885,21 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
             }
 
             const std::string patternText = raw.substr(begin, firstColon - begin);
-            if (patternText.find('?') != std::string::npos ||
-                patternText.find('[') != std::string::npos) {
-                ++outSkipped;
+            const std::string patternName =
+                raw.substr(firstColon + 1, secondColon - firstColon - 1);
+
+            const char* construct = nullptr;
+            if (patternText.find('?') != std::string::npos)      construct = "'??' wildcard";
+            else if (patternText.find('{') != std::string::npos) construct = "'{n-m}' variable gap";
+            else if (patternText.find('[') != std::string::npos) construct = "'[a-b]' byte range";
+
+            if (construct != nullptr) {
+                outUnmatchable.push_back(patternName + " uses a " + construct);
                 continue;
             }
 
             PatternLine line;
-            line.name = raw.substr(firstColon + 1, secondColon - firstColon - 1);
+            line.name = patternName;
 
             bool ok = true;
             std::string nibble;
@@ -898,7 +919,8 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
                 }
             }
             if (!ok || !nibble.empty() || line.bytes.empty()) {
-                ++outSkipped;
+                outUnmatchable.push_back(
+                    patternName + " is not a whole sequence of hex byte pairs");
                 continue;
             }
             out.push_back(std::move(line));
@@ -1213,6 +1235,38 @@ int wmain(int argc, wchar_t** argv) {
     builder.SetConfiguration(cfg);
 
     // ---------------------------------------------------------------------
+    // Refuse patterns this build cannot match, BEFORE importing anything.
+    //
+    // Placed here rather than at the verification stage because the import
+    // silently drops a line whose syntax the builder's validator rejects, and the
+    // build then fails with "nothing is pending - the input files parsed to zero
+    // signatures. Check the expected formats: hashes are TYPE:HASH:NAME:LEVEL" -
+    // a message that names the HASH format for what is actually a rejected
+    // character in a PATTERN. Measured: that is exactly what "48 8B {0-16} C3"
+    // produced. Checking first means the reason reported is the real one.
+    // ---------------------------------------------------------------------
+
+    if (!opt.patternFiles.empty()) {
+        std::vector<PatternLine> matchable;
+        std::vector<std::string> unmatchable;
+        CollectPatternLinesForVerification(opt.patternFiles, matchable, unmatchable);
+
+        if (!unmatchable.empty()) {
+            Fail("%zu pattern(s) cannot be matched by this build and were refused. "
+                 "Nothing in the product matches wildcards, byte ranges or variable "
+                 "gaps: the automaton takes exact patterns only, the SIMD path skips "
+                 "every other mode, and no masked matcher is wired into the scan "
+                 "path. A pattern like that would be stored, counted, and never "
+                 "fire. Use exact hex byte sequences.",
+                 unmatchable.size());
+            for (const auto& why : unmatchable) {
+                Fail("  refused    : %s", why.c_str());
+            }
+            return 7;
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Import. Every failure is fatal: a partial content set that silently
     // drops half its input is worse than no content, because it looks fine.
     // ---------------------------------------------------------------------
@@ -1328,14 +1382,20 @@ int wmain(int argc, wchar_t** argv) {
     // as the store matching, and a pattern that never fires is invisible.
     if (opt.verify && pendingPatterns > 0) {
         std::vector<PatternLine> importedPatterns;
-        size_t skippedPatterns = 0;
+        std::vector<std::string> unmatchablePatterns;
         CollectPatternLinesForVerification(opt.patternFiles, importedPatterns,
-                                          skippedPatterns);
-        if (skippedPatterns != 0) {
-            Info("  note       : %zu pattern(s) use wildcards or byte ranges and "
-                 "were not scan-verified (no single byte sequence to test)",
-                 skippedPatterns);
+                                          unmatchablePatterns);
+
+        // Cannot happen: unmatchable patterns are refused before the import above.
+        // Reported rather than ignored because if it ever does, the two checks have
+        // drifted apart and a pattern that cannot fire is about to be shipped.
+        if (!unmatchablePatterns.empty()) {
+            Fail("internal inconsistency: %zu unmatchable pattern(s) reached "
+                 "verification after being refused before import",
+                 unmatchablePatterns.size());
+            return 7;
         }
+
         if (importedPatterns.empty()) {
             Info("  note       : no literal pattern lines could be re-read for "
                  "scan verification; pattern matching was not checked");
