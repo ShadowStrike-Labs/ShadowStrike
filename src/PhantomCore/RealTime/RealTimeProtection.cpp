@@ -1687,6 +1687,11 @@ public:
         // Must precede FileSystemFilter::Start - see WarmAuthenticodeStack for why.
         WarmAuthenticodeStack();
 
+        // Also must precede FileSystemFilter::Start: once the filter is running the
+        // kernel can deliver a scan request immediately, and an exclusion registered
+        // after that point is not an exclusion for whatever arrived first.
+        RegisterOwnDataFileExclusions();
+
         // FileSystemFilter
         try {
             auto& fsf = FileSystemFilter::Instance();
@@ -5149,6 +5154,55 @@ public:
         Utils::Logger::Info("RealTimeProtection: Added path exclusion: {}",
             Utils::StringUtils::ToNarrow(path));
         return true;
+    }
+
+    // Exclude our own detection databases from the on-access path.
+    //
+    // Until this existed there were NO exclusions at runtime at all: nothing
+    // anywhere called AddPathExclusion, so m_excludedPaths was empty for the whole
+    // process lifetime and the loop in IsExcluded iterated nothing on every single
+    // file operation. The check at the top of OnKernelFileScan looked like a
+    // working exclusion tier and could not exclude anything.
+    //
+    // What that cost: our own signature database contains malware indicators
+    // verbatim - compiled YARA rules embed thousands of literal malware strings and
+    // the pattern section stores raw byte sequences - so any scan of it finds our
+    // own detection content and reports it as a threat, which can quarantine the
+    // database and take every form of detection with it.
+    //
+    // Our own accesses mostly do not reach here: the driver exempts the scanner
+    // process at create time (PreCreate.c, ShadowStrikeIsScannerProcess). This
+    // matters for the cases that are NOT us - a backup agent, an administrator, the
+    // UI, or an indexer opening the database - where the request does arrive and
+    // the file is 64 MB, gets deferred by the size gate, and is then fully analysed
+    // by the deferred stage.
+    //
+    // Placement is deliberate: this is the FIRST check in the handler, before the
+    // identity cache, before hashing and before every analyzer, so an excluded file
+    // costs a string comparison rather than a pipeline.
+    void RegisterOwnDataFileExclusions() {
+        size_t registered = 0;
+        for (const auto& ownFile : Utils::DataStorePaths::GetOwnedDataFiles()) {
+            if (ownFile.empty()) {
+                continue;
+            }
+            // Exact paths, deliberately with no trailing wildcard. PathMatchesWildcard
+            // treats a pattern ending in '*' as a prefix match, which would turn any
+            // of these into a directory exclusion - a location an attacker could drop
+            // a payload into and have it never examined. Anything else in the data
+            // directory is still scanned normally.
+            {
+                std::unique_lock lock(m_exclusionMutex);
+                m_excludedPaths.push_back(ownFile);
+            }
+            ++registered;
+        }
+
+        Utils::Logger::Info(
+            "RealTimeProtection: registered {} own data file(s) as exact-path "
+            "on-access exclusions (databases only; log and quarantine directories "
+            "are deliberately NOT excluded)",
+            registered);
     }
 
     bool RemovePathExclusion(const std::wstring& path) {

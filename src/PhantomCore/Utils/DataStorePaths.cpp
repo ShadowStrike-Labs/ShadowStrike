@@ -215,6 +215,25 @@ std::wstring WhitelistDatabase()      { return GetDataDirectory() + L"\\whitelis
 std::wstring ThreatIntelDatabase()    { return GetDataDirectory() + L"\\threatintel.tidb"; }
 std::wstring HashReputationDatabase() { return GetDataDirectory() + L"\\hashes.hdb"; }
 
+std::vector<std::wstring> GetOwnedDataFiles() {
+    std::vector<std::wstring> files;
+    files.reserve(5);
+
+    files.push_back(SignatureDatabase());
+    files.push_back(WhitelistDatabase());
+    files.push_back(ThreatIntelDatabase());
+    files.push_back(HashReputationDatabase());
+
+    // The installer's read-only baseline copy. Same content as the working
+    // database and the same size, so it carries the same self-match problem.
+    const std::wstring shipped = GetShippedContentDirectory();
+    if (!shipped.empty()) {
+        files.push_back(shipped + L"\\signatures.sdb");
+    }
+
+    return files;
+}
+
 namespace {
 
 // Signature database header, as written by phantom-sigbuild. Only the two fields

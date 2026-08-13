@@ -26,6 +26,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace ShadowStrike::Utils::DataStorePaths {
 
@@ -92,5 +93,35 @@ namespace ShadowStrike::Utils::DataStorePaths {
 
 /// @brief Hash-reputation store database (bloom-filtered known-bad hashes).
 [[nodiscard]] std::wstring HashReputationDatabase();
+
+/// @brief Absolute paths of the files this product owns as DATA, not as content.
+///
+/// These are the detection databases: the working stores in the data directory
+/// plus the installer's read-only baseline copy. They must not be scanned as if
+/// they were user content, because they legitimately contain malware indicators
+/// verbatim - compiled YARA rules embed thousands of literal malware strings, and
+/// the pattern section stores raw byte sequences such as the EICAR test string.
+/// Scanning them finds our own detection content and reports it as a threat,
+/// which at worst quarantines the database and takes all detection with it.
+///
+/// EXACT FILE PATHS, DELIBERATELY NOT DIRECTORIES. A directory exclusion would
+/// create a location an attacker can drop a payload into and have it never
+/// examined, which is a far worse trade than the cost it saves. Anything else
+/// appearing in the data directory is still scanned normally, and the data
+/// directory's DACL already restricts writes to SYSTEM and Administrators, so
+/// these names cannot be squatted without the privilege to disable the product
+/// outright.
+///
+/// Deliberately NOT included:
+///  - the log directory. Our own writes never generate a scan: the driver exempts
+///    the scanner process at create (PreCreate.c, ShadowStrikeIsScannerProcess)
+///    and the write path posts no user-mode request. Another process reading our
+///    logs SHOULD be scanned, and a wildcard over that directory would be a drop
+///    zone since it is deliberately more permissive than the data directory.
+///  - the quarantine vault. Its contents are AES-256-GCM encrypted, so no
+///    pattern, rule or hash can match them and scanning costs a read that finds
+///    nothing. Excluding the one directory that holds real malware would be the
+///    worst possible exclusion in this product.
+[[nodiscard]] std::vector<std::wstring> GetOwnedDataFiles();
 
 }  // namespace ShadowStrike::Utils::DataStorePaths

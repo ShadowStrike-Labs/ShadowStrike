@@ -66,7 +66,15 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <!-- Must match PhantomCoreLib (stdcpp23). At stdcpp20 this project could not
+           include Utils/Logger.hpp at all: it uses std::format_string, which MSVC
+           only exposes in C++23 mode, so every header chain reaching the logger
+           failed with "'format_string': is not a member of 'std'". Since almost
+           every module logs, that made most of the codebase unincludable from a
+           test - a plausible reason this project compiled 2 of the 207 test files
+           present in tests\. A test project on an older standard than the code it
+           tests cannot test that code. -->
+      <LanguageStandard>stdcpp23</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
       <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
       <ExceptionHandling>Sync</ExceptionHandling>
@@ -102,11 +110,16 @@
         $(SolutionDir)vendor\gtest_framework;
         $(SolutionDir)vendor\openssl_lib;
         $(SolutionDir)vendor\yara_lib;
+        $(SolutionDir)vendor\onnxruntime\lib;
         %(AdditionalLibraryDirectories)
       </AdditionalLibraryDirectories>
+      <!-- PhantomCoreLib is built with SHADOWSTRIKE_HAS_ONNXRUNTIME=1, so any test
+           that reaches ScanEngine pulls in the Cortex inference objects and needs
+           OrtGetApiBase resolved. Matches the service's link inputs. -->
       <AdditionalDependencies>
         PhantomCoreLib.lib;gtest.lib;gmock.lib;
         libyara.lib;libcrypto.lib;libssl.lib;
+        onnxruntime.lib;
         advapi32.lib;kernel32.lib;user32.lib;shell32.lib;ole32.lib;oleaut32.lib;
         crypt32.lib;wintrust.lib;version.lib;ws2_32.lib;wbemuuid.lib;
         iphlpapi.lib;psapi.lib;shlwapi.lib;bcrypt.lib;ncrypt.lib;userenv.lib;
@@ -140,6 +153,13 @@
          task 22 - why kernel frames fail validation - is the last unknown in
          the freeze chain, and this is the code that would prove it. -->
     <ClCompile Include="tests\integration\communication_pipeline\CommunicationPipeline_Integration_Tests.cpp" />
+
+    <!-- Enabled suite 2: self-exclusion. Asserts that the engine has ACTUALLY
+         registered its own data files as exclusions, not merely that the list
+         would be correct if anyone populated it. Four exclusion mechanisms
+         existed in this product with zero production callers between them, so
+         the wiring is the part worth testing. -->
+    <ClCompile Include="tests\unit\self_exclusion\SelfExclusion_Tests.cpp" />
   </ItemGroup>
 
   <ItemGroup>

@@ -441,6 +441,48 @@ public:
                     Utils::DataStorePaths::GetDataDirectory().c_str());
             }
 
+            // Do not scan our own detection databases.
+            //
+            // They legitimately contain malware indicators verbatim - compiled YARA
+            // rules embed thousands of literal malware strings and the pattern
+            // section stores raw byte sequences - so scanning them finds our own
+            // content and reports it as a threat. The failure mode is not a
+            // cosmetic false positive: a detection on signatures.sdb can quarantine
+            // the database and take every form of detection with it.
+            //
+            // Registered HERE, in the engine's own initialisation, rather than at
+            // each call site. There were already four separate exclusion mechanisms
+            // in this product (this one, RealTimeProtection's, FileSystemFilter's
+            // and its driver sync, and ProfileManager's config lists) and NONE of
+            // them had a single production caller - ScanEngine's list was populated
+            // only by its own self-test, with a fake path. Anything that depends on
+            // a caller remembering to register has already been demonstrated not to
+            // happen.
+            //
+            // Exact file paths only. See DataStorePaths::GetOwnedDataFiles for why
+            // this is not a directory exclusion and why the log directory and the
+            // quarantine vault are deliberately not in the list.
+            {
+                size_t registered = 0;
+                for (const auto& ownFile : Utils::DataStorePaths::GetOwnedDataFiles()) {
+                    if (ownFile.empty()) continue;
+
+                    ExclusionRule rule{};
+                    rule.type = ExclusionRule::Type::Path;   // exact match, not a prefix
+                    rule.pattern = ownFile;
+                    rule.enabled = true;
+                    rule.caseSensitive = false;
+                    rule.description = "ShadowStrike detection database (own data file)";
+
+                    std::unique_lock lock(m_exclusionMutex);
+                    m_exclusions.push_back(std::move(rule));
+                    ++registered;
+                }
+                SS_LOG_INFO(L"ScanEngine",
+                    L"Registered %zu own data file(s) as exact-path scan exclusions",
+                    registered);
+            }
+
             // Initialize SignatureStore (YARA + Patterns + Hashes)
             if (!m_config.signatureDbPath.empty()) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing SignatureStore at %hs",
