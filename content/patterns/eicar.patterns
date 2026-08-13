@@ -1,0 +1,60 @@
+# EICAR standard antivirus test file - byte pattern
+# ---------------------------------------------------------------------------
+# Format: PATTERN:NAME:LEVEL
+#
+# PATTERN is hex bytes separated by spaces. The syntax also accepts '?' for a
+# wildcard nibble and '[' ']' ranges, but NOT those here - see the note at the
+# bottom on why this entry is deliberately an exact byte sequence.
+#
+# LEVEL is one of Info, Low, Medium, High, Critical (or their numeric values
+# 0, 25, 50, 75, 100). Names and numbers are equivalent; the name is used here
+# to match content/hashes, because two content files disagreeing about how to
+# write "Low" is how a severity gets silently downgraded.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS IS FOR
+#
+# content/hashes already carries the EICAR file's MD5, SHA-1 and SHA-256, so
+# dropping the file on disk is detected by hash. This entry detects the same
+# thing by CONTENT, which is a different capability and worth having on its own:
+# a hash matches one exact file, while the pattern matches the EICAR string
+# wherever it appears - inside an archive being written, in a larger file, in a
+# script, in a buffer handed to AMSI. It also means the pattern store has a
+# detection that can be asserted end to end, which is what proves the store is
+# actually loaded and matching rather than merely reporting itself ready.
+#
+# ---------------------------------------------------------------------------
+# THE BYTES, AND HOW THEY WERE VERIFIED
+#
+# The 68-byte EICAR file, with no trailing newline:
+#   X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
+#
+# Hand-encoded hex is exactly where a silent error hides - a single wrong nibble
+# produces a pattern that is syntactically perfect and matches nothing, which is
+# indistinguishable from working detection. So the hex below was not typed: it
+# was generated from the ASCII string, then reconstructed back from the hex and
+# hashed, and the digests compared against the entries already in
+# content/hashes/eicar.txt:
+#
+#   length   68 bytes
+#   SHA-256  275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+#   MD5      44d88612fea8a8f36de82e1278abb02f
+#
+# Both matched. phantom-sigbuild additionally proves the built pattern is
+# matchable: it surrounds the pattern with filler bytes and requires a match at
+# a non-zero offset, and refuses to produce a database if the scan finds nothing
+# (exit code 7). A pattern that builds but cannot match is the failure this
+# whole subsystem was in before, and it is now a hard build error.
+#
+# ---------------------------------------------------------------------------
+# WHY Low, AND WHY NOT A WILDCARD
+#
+# Low, for the same reason content/hashes uses Low: this is a test artefact, not
+# a threat. Marking it Critical would train a user to ignore Critical.
+#
+# Exact bytes, no wildcards, because nothing in this build matches a wildcard or
+# masked pattern - the automaton takes only exact patterns and the SIMD path
+# skips everything else. A wildcard entry here would be accepted, stored,
+# counted in the statistics, and never matched.
+#
+58 35 4F 21 50 25 40 41 50 5B 34 5C 50 5A 58 35 34 28 50 5E 29 37 43 43 29 37 7D 24 45 49 43 41 52 2D 53 54 41 4E 44 41 52 44 2D 41 4E 54 49 56 49 52 55 53 2D 54 45 53 54 2D 46 49 4C 45 21 24 48 2B 48 2A:EICAR-Test-Pattern:Low

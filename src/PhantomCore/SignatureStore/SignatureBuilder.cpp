@@ -2020,9 +2020,48 @@ std::optional<PatternSignatureInput> ParsePatternLine(const std::string& line) n
     PatternSignatureInput input{};
     input.patternString = line.substr(0, pos1);
     input.name = line.substr(pos1 + 1, pos2 - pos1 - 1);
-    
-    int levelInt = std::atoi(line.substr(pos2 + 1).c_str());
-    input.threatLevel = static_cast<ThreatLevel>(std::clamp(levelInt, 0, 100));
+
+    // THREAT LEVEL: exactly one of the five defined severities, given either as
+    // its numeric value or by name. Anything else is a REJECTED LINE, not a
+    // best-effort guess.
+    //
+    // This used to be `atoi` followed by `clamp(levelInt, 0, 100)`, which had two
+    // silent failure modes. atoi("Low") returns 0, so writing the level by name -
+    // exactly as the hash content format requires - produced ThreatLevel::Info: a
+    // severity downgrade to the lowest possible value, with no warning, on a line
+    // that looked correct. And clamping to 0..100 accepted values like 37, which
+    // then cast to a ThreatLevel enumerator that does not exist, so the database
+    // carried a threat level no consumer could interpret.
+    //
+    // Names are accepted because the hash content format uses them, and two
+    // content files under the same content/ tree disagreeing about how to write
+    // "Low" is how the mistake above gets made.
+    {
+        std::string levelText = line.substr(pos2 + 1);
+        // Trim surrounding whitespace and any trailing comment.
+        if (const auto hash = levelText.find('#'); hash != std::string::npos) {
+            levelText.erase(hash);
+        }
+        const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+        levelText.erase(levelText.begin(),
+            std::find_if(levelText.begin(), levelText.end(), notSpace));
+        levelText.erase(std::find_if(levelText.rbegin(), levelText.rend(), notSpace).base(),
+            levelText.end());
+
+        if (levelText.empty()) return std::nullopt;
+
+        std::string lowered = levelText;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        if (lowered == "0"   || lowered == "info")     input.threatLevel = ThreatLevel::Info;
+        else if (lowered == "25"  || lowered == "low")      input.threatLevel = ThreatLevel::Low;
+        else if (lowered == "50"  || lowered == "medium")   input.threatLevel = ThreatLevel::Medium;
+        else if (lowered == "75"  || lowered == "high")     input.threatLevel = ThreatLevel::High;
+        else if (lowered == "100" || lowered == "critical") input.threatLevel = ThreatLevel::Critical;
+        else return std::nullopt;
+    }
+
     input.source = "file";
 
     return input;
