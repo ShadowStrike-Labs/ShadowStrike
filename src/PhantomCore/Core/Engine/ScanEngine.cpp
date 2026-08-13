@@ -380,12 +380,44 @@ public:
             m_config = config;
 
             // Initialize thread pool with a bounded, explicit configuration.
-            const size_t desiredThreadCount = std::max<size_t>(
-                ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
+            //
+            // SIZING RATIONALE, from measured field behaviour rather than taste.
+            //
+            // This pool serves the on-access path: the kernel's reader threads
+            // hand every scan request to it, so its width is the number of file
+            // operations this machine can decide concurrently. Deriving that
+            // purely from hardware_concurrency() treats scanning as CPU-bound
+            // work, and it is not - a scan reads the file, and a thread blocked
+            // in a read holds a slot while consuming no CPU at all.
+            //
+            // The number that matters is therefore not throughput. Steady-state
+            // scans were measured at 138-238 us each, and the observed peak drain
+            // was around 400 per second, so throughput was never thread-limited.
+            // What matters is what happens to the LAST slot. On a 2-vCPU machine
+            // this produced a pool of exactly 2, and the 1.0.91 field trace shows
+            // what that costs: two requests stalled, capacity reached zero, and
+            // every file operation on the machine then waited out a driver
+            // timeout - a full-system freeze caused by two files.
+            //
+            // So the floor exists to keep a small machine from being two slow
+            // operations away from no file-scanning capacity at all. It is not a
+            // cap on cost: max stays at cores on any machine with 4 or more, so
+            // larger hosts are not oversubscribed, and an explicit scanThreads
+            // setting still wins outright.
+            //
+            // STATED PLAINLY: this is headroom, not a fix. No pool width makes a
+            // slow stage acceptable - N slow operations always consume N slots.
+            // The actual fix is bounding per-stage time on this path; the
+            // remaining measured offender is MetamorphicDetector at 10.9 s.
+            constexpr size_t kMinConcurrentScans = 4;
+            constexpr size_t kMaxAutoScanThreads = 16;
+            const size_t hwThreads =
+                static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency()));
+            const size_t desiredThreadCount =
                 config.scanThreads > 0
-                    ? static_cast<size_t>(config.scanThreads)
-                    : static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency()))
-            );
+                    ? std::max<size_t>(ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
+                                       static_cast<size_t>(config.scanThreads))
+                    : std::clamp(hwThreads, kMinConcurrentScans, kMaxAutoScanThreads);
 
             ThreadPoolConfig threadPoolConfig;
             threadPoolConfig.minThreads = desiredThreadCount;
@@ -393,7 +425,11 @@ public:
             threadPoolConfig.threadNamePrefix = L"ShadowStrike-Scan";
 
             m_threadPool = std::make_shared<ThreadPool>(threadPoolConfig);
-            SS_LOG_INFO(L"ScanEngine", L"Thread pool initialized with %zu threads", desiredThreadCount);
+            SS_LOG_INFO(L"ScanEngine",
+                        L"Thread pool initialized with %zu threads "
+                        L"(logical processors=%zu, configured scanThreads=%u)",
+                        desiredThreadCount, hwThreads,
+                        static_cast<unsigned>(config.scanThreads));
 
             // The detection stores live in one hardened directory. Create it
             // before opening anything so first run works without the installer
