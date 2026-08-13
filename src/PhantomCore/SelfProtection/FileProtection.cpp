@@ -48,6 +48,7 @@
 
 #include "pch.h"
 #include "FileProtection.hpp"
+#include "SelfDefense.hpp"   // SelfDefenseConstants::CRITICAL_INSTALLED_FILES
 #include "../Utils/PE_sig_verf.hpp"
 #include "../Communication/IPCManager.hpp"
 #include <bcrypt.h>
@@ -1055,14 +1056,17 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
         }
     }
 
-    // Protect critical files
-    std::vector<std::wstring> criticalFiles = {
-        m_installationPath + L"\\ShadowStrike.exe",
-        m_installationPath + L"\\ShadowStrikePhantomService.exe",
-        m_installationPath + L"\\ShadowStrikeDriver.sys",
-        m_installationPath + L"\\signatures.db",
-        m_installationPath + L"\\config.xml"
-    };
+    // Protect critical files. Shared with TamperProtection through
+    // SelfDefenseConstants, because the two hand-written copies had drifted: of the
+    // five names previously listed here, only ShadowStrikePhantomService.exe is a file
+    // the installer ships. ShadowStrikeDriver.sys, signatures.db, config.xml and
+    // ShadowStrike.exe do not exist under those names, so this protected one file out
+    // of five while reporting success.
+    std::vector<std::wstring> criticalFiles;
+    criticalFiles.reserve(SelfDefenseConstants::CRITICAL_INSTALLED_FILES.size());
+    for (const auto& rel : SelfDefenseConstants::CRITICAL_INSTALLED_FILES) {
+        criticalFiles.emplace_back(m_installationPath + L"\\" + std::wstring(rel));
+    }
 
     for (const auto& file : criticalFiles) {
         Utils::FileUtils::Error fileErr;
@@ -2173,19 +2177,34 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
     }
 
     // Test 4: Test hash computation
-    Hash256 testHash = ComputeFileHash(m_installationPath + L"\\ShadowStrike.exe");
-    bool hashValid = false;
-    for (const auto& byte : testHash) {
-        if (byte != 0) {
-            hashValid = true;
-            break;
+    //
+    // Hash the running module, which is guaranteed to exist. This used to hash
+    // m_installationPath + "\\ShadowStrike.exe" - a file this product does not
+    // install - and then suppressed the failure with an Exists() check, so the test
+    // passed without ever computing a hash. A self-test that cannot fail is worse
+    // than no self-test, because it reports coverage that is not there.
+    WCHAR selfTestModule[MAX_PATH] = {};
+    if (::GetModuleFileNameW(nullptr, selfTestModule, MAX_PATH) == 0) {
+        SS_LOG_WARN(L"FileProtection",
+                    L"Self-test: cannot determine the running module path, so hash "
+                    L"computation was not exercised");
+    } else {
+        const std::wstring selfPath(selfTestModule);
+        Hash256 testHash = ComputeFileHash(selfPath);
+        bool hashValid = false;
+        for (const auto& byte : testHash) {
+            if (byte != 0) {
+                hashValid = true;
+                break;
+            }
         }
-    }
-    // Skip if file doesn't exist
-    Utils::FileUtils::Error fileErr;
-    if (Utils::FileUtils::Exists(m_installationPath + L"\\ShadowStrike.exe", &fileErr) &&
-        !hashValid) {
-        SS_LOG_WARN(L"FileProtection", L"Self-test: Hash computation returned empty");
+        if (!hashValid) {
+            SS_LOG_ERROR(L"FileProtection",
+                         L"Self-test: hash computation returned all zeroes for %ls, "
+                         L"which exists - file integrity hashing is not working",
+                         selfPath.c_str());
+            allPassed = false;
+        }
     }
 
     // Test 5: Test whitelist operations

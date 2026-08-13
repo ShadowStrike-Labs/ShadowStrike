@@ -1029,13 +1029,16 @@ public:
 
         SS_LOG_INFO(LOG_CATEGORY, L"Protecting installation: %ls", installDir.c_str());
 
-        // Protect critical files
-        std::vector<std::wstring> criticalFiles = {
-            L"ShadowStrike.exe",
-            L"ShadowStrikePhantomService.exe",
-            L"SSEngine.dll",
-            L"SSDriver.sys"
-        };
+        // Protect critical files. Names come from SelfDefenseConstants so this list
+        // and FileProtection's cannot disagree, and so that neither can drift from
+        // what the installer actually ships - which is what happened before: three of
+        // the four names here referred to files that have never existed, and the
+        // exists() check below meant that failed silently.
+        std::vector<std::wstring> criticalFiles;
+        criticalFiles.reserve(SelfDefenseConstants::CRITICAL_INSTALLED_FILES.size());
+        for (const auto& rel : SelfDefenseConstants::CRITICAL_INSTALLED_FILES) {
+            criticalFiles.emplace_back(rel);
+        }
 
         for (const auto& file : criticalFiles) {
             auto fullPath = installDir / file;

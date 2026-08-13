@@ -714,13 +714,22 @@ private:
     // Internal auth token
     std::string m_internalAuthToken;
 
-    // ShadowStrike component names
-    static constexpr std::array<std::wstring_view, 5> SHADOWSTRIKE_COMPONENTS = {
-        L"ShadowStrike.exe",
-        L"ShadowStrikeSvc.exe",
-        L"PhantomSensor.sys",
-        L"SSAgent.exe",
-        L"SSUpdater.exe"
+    // ShadowStrike component executables, as the installer actually ships them.
+    //
+    // This list previously read ShadowStrike.exe, ShadowStrikeSvc.exe,
+    // PhantomSensor.sys, SSAgent.exe and SSUpdater.exe. Four of those five names are
+    // not installed by this product and never have been, so a list meant to recognise
+    // our own components matched almost nothing - and the one entry that was correct,
+    // PhantomSensor.sys, is a kernel driver rather than a process, so it can never
+    // appear as a process image name here either.
+    //
+    // Verified against the MSI File table: the processes this product runs are the
+    // service, the tray, the UI and the driver-resume helper.
+    static constexpr std::array<std::wstring_view, 4> SHADOWSTRIKE_COMPONENTS = {
+        L"ShadowStrikePhantomService.exe",
+        L"ShadowStrikePhantomTray.exe",
+        L"ShadowStrikePhantomUI.exe",
+        L"ShadowStrikeDriverResume.exe"
     };
 };
 

@@ -254,6 +254,44 @@ namespace SelfDefenseConstants {
     
     /// @brief Maximum service restart attempts
     inline constexpr uint32_t MAX_SERVICE_RESTART_ATTEMPTS = 5;
+
+    // ========================================================================
+    // CRITICAL INSTALLED FILES
+    // ========================================================================
+
+    /// @brief Files under the install directory whose integrity must be protected,
+    ///        as paths relative to that directory.
+    ///
+    /// This list is shared rather than written out per module, because the two copies
+    /// that existed before had drifted so far from what the installer ships that they
+    /// protected almost nothing. TamperProtection guarded ShadowStrike.exe,
+    /// SSEngine.dll and SSDriver.sys; FileProtection guarded ShadowStrike.exe,
+    /// ShadowStrikeDriver.sys, signatures.db and config.xml. Of those, the only name
+    /// the MSI actually installs is ShadowStrikePhantomService.exe. Every other entry
+    /// referred to a file that has never existed under that name.
+    ///
+    /// It went unnoticed because both call sites skip entries that are not present on
+    /// disk, so a list of names that do not exist produces no error and no warning -
+    /// it simply protects nothing while reporting success.
+    ///
+    /// What was therefore left unprotected includes PhantomSensor.sys, the kernel
+    /// driver itself, plus the tray, the UI, the driver-resume helper and the shipped
+    /// signature database. Verified against the MSI File table and the extracted
+    /// staging layout: the driver sits under Drivers\ and the detection content under
+    /// content\.
+    ///
+    /// If a binary is added to the installer it must be added here too; the MSI File
+    /// table is the authority.
+    inline constexpr std::array<std::wstring_view, 8> CRITICAL_INSTALLED_FILES = {
+        L"ShadowStrikePhantomService.exe",
+        L"ShadowStrikePhantomTray.exe",
+        L"ShadowStrikePhantomUI.exe",
+        L"ShadowStrikeDriverResume.exe",
+        L"Drivers\\PhantomSensor.sys",
+        L"Drivers\\PhantomSensor.cat",
+        L"Drivers\\PhantomSensor.inf",
+        L"content\\signatures.sdb"
+    };
     
     /// @brief Service restart delay (milliseconds)
     inline constexpr uint32_t SERVICE_RESTART_DELAY_MS = 5000;
