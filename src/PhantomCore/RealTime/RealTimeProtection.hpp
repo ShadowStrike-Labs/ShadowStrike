@@ -905,6 +905,15 @@ struct alignas(64) RTPStatistics {
     ///        of how much analysis moved off the blocking path rather than a
     ///        measure of how often the path ran late.
     std::atomic<uint64_t> scansDeferred{ 0 };
+
+    /// @brief Microsoft-signature trust verdicts established off the kernel-reply
+    ///        path and published to the file verdict cache.
+    ///        This is the evidence that the trust fast path is actually warming.
+    ///        If it stays at zero while scans climb, the tier is inert and every
+    ///        file is taking the full pipeline on every access - which would look
+    ///        identical to a working product from the outside, only slower, so it
+    ///        needs its own number rather than being inferred from CPU use.
+    std::atomic<uint64_t> signatureVerdictsCached{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
     std::atomic<uint64_t> excludedByProcess{ 0 };
     std::atomic<uint64_t> excludedByHash{ 0 };

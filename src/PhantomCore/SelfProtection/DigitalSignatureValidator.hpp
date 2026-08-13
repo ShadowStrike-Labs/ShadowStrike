@@ -926,6 +926,29 @@ public:
      * @brief Check if file is signed by Microsoft
      */
     [[nodiscard]] bool IsMicrosoftSigned(std::wstring_view filePath);
+
+    /**
+     * @brief Answer "is this Microsoft-signed?" only if the answer is already
+     *        known, without performing any verification.
+     *
+     * IsMicrosoftSigned reaches WinVerifyTrust, which is an RPC into CryptSvc,
+     * which reads the catalog store. A thread that is holding a kernel file
+     * operation open must never make that call: our own minifilter intercepts
+     * CryptSvc's reads and posts them back to this service, so the caller ends
+     * up waiting on a process that is waiting on the caller. The field trace
+     * measured that cycle at 180 seconds on every scan worker at once.
+     *
+     * This accessor exists so such a caller can still benefit from a verdict
+     * that has already been established, while the verification itself happens
+     * on a thread that holds nothing. It consults the validation cache only.
+     *
+     * @return nullopt when no usable cached verdict exists - meaning "not
+     *         determined", NOT "not Microsoft-signed". The distinction is
+     *         load-bearing: treating an absent verdict as a negative would be
+     *         asserting a fact nobody established.
+     */
+    [[nodiscard]] std::optional<bool> TryGetCachedMicrosoftSigned(
+        std::wstring_view filePath) const;
     
     /**
      * @brief Check if driver is WHQL signed

@@ -822,6 +822,21 @@ public:
         return result.isValid && result.isMicrosoftSigned;
     }
 
+    // Cache-only counterpart of IsMicrosoftSigned. Deliberately does NOT call
+    // VerifyFile: the whole point is that no cross-process call happens here.
+    // getCachedResult already revalidates the file's last-write time and honours
+    // the cache duration, so a hit cannot describe content that has since
+    // changed. An absent entry returns nullopt, which the caller must read as
+    // "not determined" rather than "unsigned".
+    [[nodiscard]] std::optional<bool> TryGetCachedMicrosoftSigned(
+        const std::wstring& filePath) const noexcept {
+        auto cached = getCachedResult(filePath);
+        if (!cached.has_value()) {
+            return std::nullopt;
+        }
+        return cached->isValid && cached->isMicrosoftSigned;
+    }
+
     [[nodiscard]] bool IsWHQLSigned(std::wstring_view filePath) noexcept {
         auto result = VerifyFile(std::wstring(filePath));
         return result.isValid && result.isWHQL;
@@ -2559,6 +2574,11 @@ bool DigitalSignatureValidator::IsSigned(std::wstring_view filePath) {
 
 bool DigitalSignatureValidator::IsMicrosoftSigned(std::wstring_view filePath) {
     return m_impl->IsMicrosoftSigned(filePath);
+}
+
+std::optional<bool> DigitalSignatureValidator::TryGetCachedMicrosoftSigned(
+    std::wstring_view filePath) const {
+    return m_impl->TryGetCachedMicrosoftSigned(std::wstring(filePath));
 }
 
 bool DigitalSignatureValidator::IsWHQLSigned(std::wstring_view filePath) {

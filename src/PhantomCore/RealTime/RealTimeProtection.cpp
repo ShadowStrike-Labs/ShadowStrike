@@ -388,6 +388,26 @@ public:
     std::atomic<bool>                             m_deferredStop{ false };
     std::unique_ptr<std::thread>                  m_deferredScanThread;
 
+    // Files whose Microsoft-signature trust verdict is not yet known.
+    //
+    // Kept separate from m_deferredQueue on purpose. That queue runs the full
+    // deep scan; this one only establishes a trust verdict, which is far cheaper
+    // and far more common - every OS binary on the machine passes through it once.
+    // Sharing one bounded queue would let a burst of trust look-ups evict real
+    // deep scans, and a slow deep scan delay every trust verdict, so the two
+    // would degrade each other precisely when the machine is busiest.
+    //
+    // The pair is (path, file identity key). The key is CAPTURED AT ENQUEUE and
+    // never recomputed by the worker: it binds the verdict to the content that
+    // was actually observed, so if the file changes in between, the entry we
+    // publish is keyed to content that no longer exists and can never be served.
+    std::deque<std::pair<std::wstring, std::wstring>> m_sigDetermQueue;
+    std::unordered_set<std::wstring>                 m_sigDetermSeen;
+    std::mutex                                       m_sigDetermMutex;
+    std::condition_variable                          m_sigDetermCv;
+    std::atomic<bool>                                m_sigDetermStop{ false };
+    std::unique_ptr<std::thread>                     m_sigDetermThread;
+
     // Synchronization
     mutable std::shared_mutex m_configMutex;
     mutable std::shared_mutex m_exclusionMutex;
@@ -843,6 +863,14 @@ public:
             m_deferredScanThread = std::make_unique<std::thread>(
                 &RealTimeProtectionImpl::DeferredDeepScanLoop, this);
 
+            // Establishes Microsoft-signature trust verdicts off the kernel-reply
+            // path. Must exist before the filter starts accepting scan requests,
+            // or the first wave of requests has nowhere to send its trust
+            // look-ups and the fast path never warms.
+            m_sigDetermStop.store(false, std::memory_order_release);
+            m_sigDetermThread = std::make_unique<std::thread>(
+                &RealTimeProtectionImpl::SignatureDeterminationLoop, this);
+
             // 7. Update protection status
             m_protectionStatus.isProtected = true;
             m_protectionStatus.lastUpdate = Now();
@@ -998,6 +1026,19 @@ public:
             m_deferredScanThread->join();
         }
         m_deferredScanThread.reset();
+
+        // Signature determination worker. Joined here for the same reason as the
+        // deep-scan worker, and with the same explicit wake so shutdown is not
+        // held up by its one-second wait. It may be parked inside WinVerifyTrust,
+        // which is exactly why it exists; that call is bounded by the CryptSvc RPC
+        // timeout and no scan worker is waiting on it, so the join cannot deadlock
+        // shutdown the way the original in-line call could stall a file operation.
+        m_sigDetermStop.store(true, std::memory_order_release);
+        m_sigDetermCv.notify_all();
+        if (m_sigDetermThread && m_sigDetermThread->joinable()) {
+            m_sigDetermThread->join();
+        }
+        m_sigDetermThread.reset();
 
         // Deferred self-protection baseline (installation integrity + APT sweep).
         // Joined here, BEFORE the detection components/kernel channel are torn down,
@@ -2432,6 +2473,158 @@ public:
     // catch something, never whether we catch it.
     // =========================================================================
 
+    // Ask for a Microsoft-signature trust verdict on a thread that is not
+    // holding a kernel file operation open. Never blocks the caller.
+    //
+    // identityKey may be EMPTY. A non-empty key means "also publish an Allow to
+    // the on-access file verdict cache under this exact identity once trust is
+    // established"; an empty key means "just establish the verdict", which is all
+    // the image-load and process-notify paths need, because they consult the
+    // validator's own cache rather than the file verdict cache. Publishing under
+    // a key nobody queries would be dead work dressed up as an optimisation.
+    void QueueSignatureDetermination(const std::wstring& filePath,
+                                     const std::wstring& identityKey) {
+        // Dedup on the identity key when there is one, otherwise on the path.
+        // Using the key unconditionally would collapse every keyless request into
+        // a single queue slot and starve all but one of them.
+        const std::wstring& dedupKey = identityKey.empty() ? filePath : identityKey;
+        // Smaller than the deep-scan queue on purpose. Each entry is only worth
+        // anything until the file is next accessed, and a first access that finds
+        // no verdict simply re-queues it, so a deep backlog buys nothing while a
+        // shallow one bounds both memory and how stale the queue can get.
+        constexpr size_t kMaxSigDetermQueue = 1024;
+        {
+            std::lock_guard<std::mutex> lock(m_sigDetermMutex);
+            // De-duplicate on the identity key, not the path: one file being
+            // opened repeatedly must collapse to one determination, but a file
+            // that has genuinely changed is different content and needs its own.
+            if (m_sigDetermSeen.count(dedupKey) != 0) {
+                return;
+            }
+            if (m_sigDetermQueue.size() >= kMaxSigDetermQueue) {
+                // Drop the OLDEST, and say so. The oldest request is the least
+                // valuable: either the file was accessed again already and
+                // re-queued, or it has not been touched since and is not urgent.
+                // Silence here would look exactly like a working fast path that
+                // simply never warms up, which is the failure mode this codebase
+                // produces most often.
+                Utils::Logger::Warn(
+                    "RealTimeProtection: signature determination queue full ({}); "
+                    "dropping oldest - the trust fast path will warm more slowly",
+                    kMaxSigDetermQueue);
+                const auto& front = m_sigDetermQueue.front();
+                m_sigDetermSeen.erase(front.second.empty() ? front.first
+                                                           : front.second);
+                m_sigDetermQueue.pop_front();
+            }
+            m_sigDetermQueue.emplace_back(filePath, identityKey);
+            m_sigDetermSeen.insert(dedupKey);
+        }
+        m_sigDetermCv.notify_one();
+    }
+
+    // Establishes Microsoft-signature trust verdicts off the kernel-reply path.
+    //
+    // This thread is allowed to do what no scan worker may: call into another
+    // process and wait. It holds no kernel file operation, so if CryptSvc's own
+    // file I/O is intercepted by our minifilter, the scan workers are still free
+    // to service it and the cycle that wedged 1.0.91 cannot form.
+    void SignatureDeterminationLoop() {
+        ::SetThreadDescription(::GetCurrentThread(), L"SS-SignatureDetermination");
+        // Same reasoning as the deferred deep-scan stage: this exists to keep the
+        // verdict path fast, so it must never compete with it.
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+        while (!m_sigDetermStop.load(std::memory_order_acquire)) {
+            std::pair<std::wstring, std::wstring> item;
+            {
+                std::unique_lock<std::mutex> lock(m_sigDetermMutex);
+                m_sigDetermCv.wait_for(lock, std::chrono::milliseconds(1000), [this] {
+                    return m_sigDetermStop.load(std::memory_order_acquire) ||
+                           !m_sigDetermQueue.empty();
+                });
+                if (m_sigDetermStop.load(std::memory_order_acquire)) break;
+                if (m_sigDetermQueue.empty()) continue;
+                item = std::move(m_sigDetermQueue.front());
+                m_sigDetermQueue.pop_front();
+                m_sigDetermSeen.erase(item.second.empty() ? item.first
+                                                          : item.second);
+            }
+            const std::wstring& filePath    = item.first;
+            const std::wstring& identityKey = item.second;
+
+            SS_DIAG_SCOPE("SigDeterm", "determine-microsoft-trust");
+
+            bool trusted = false;
+            try {
+                // The blocking call, on the one thread where blocking is safe.
+                // Full strength deliberately: whole-chain revocation against the
+                // local CRL cache stays enabled here, which is stronger than
+                // anything that could be justified in line, because a slow answer
+                // on this thread delays a cache warm-up rather than every file
+                // operation on the machine.
+                trusted = Security::DigitalSignatureValidator::Instance()
+                              .IsMicrosoftSigned(filePath);
+            } catch (const std::exception& e) {
+                Utils::Logger::Warn(
+                    "RealTimeProtection: signature determination failed for {}: {}",
+                    Utils::StringUtils::ToNarrow(filePath), e.what());
+                continue;
+            }
+
+            if (!trusted) {
+                // Nothing to publish. Only trust is cacheable here; an absent
+                // entry correctly means "not determined to be trusted" and leaves
+                // the file taking the full pipeline on every access.
+                continue;
+            }
+
+            // The verdict now lives in the validator's own cache, which is what
+            // every TryGetCachedMicrosoftSigned caller reads, so callers that
+            // supplied no identity key are already served and are done here.
+            if (identityKey.empty()) {
+                m_stats.signatureVerdictsCached++;
+                continue;
+            }
+
+            // Publish only if the file is STILL the content we were asked about.
+            //
+            // Without this check, deferring the verification would open a window
+            // that the synchronous version did not have: an attacker could let us
+            // verify trusted content, then restore untrusted content with the same
+            // size and a restored last-write time, and the verdict cached under
+            // the original identity would serve it. Re-reading identity here binds
+            // the published verdict to content that was still present after the
+            // verdict was reached.
+            //
+            // Stated honestly: last-write time is attacker-settable, so this is a
+            // narrowing of the window, not a cryptographic guarantee - the same
+            // limitation the identity-keyed verdict cache already has. It closes
+            // the window this change would otherwise add.
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (!GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &fad)) {
+                continue;
+            }
+            const uint64_t mtime =
+                (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+                 static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
+            const uint64_t size =
+                (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) |
+                 static_cast<uint64_t>(fad.nFileSizeLow);
+            const std::wstring currentKey =
+                ToLowerW(filePath) + L"|" +
+                std::to_wstring(static_cast<unsigned long long>(size)) + L"|" +
+                std::to_wstring(static_cast<unsigned long long>(mtime));
+
+            if (currentKey != identityKey) {
+                continue;  // Changed under us; the verdict describes gone content.
+            }
+
+            UpdateFileVerdictCache(identityKey, Communication::KernelVerdict::Allow);
+            m_stats.signatureVerdictsCached++;
+        }
+    }
+
     void QueueDeferredDeepScan(const std::wstring& filePath, uint32_t processId) {
         constexpr size_t kMaxDeferredQueue = 4096;
         {
@@ -2617,7 +2810,7 @@ public:
                     return *cached;
                 }
 
-                // TIER 1: MICROSOFT-SIGNATURE TRUST
+                // TIER 1: MICROSOFT-SIGNATURE TRUST (cache-only in line)
                 // A WinVerifyTrust-validated Microsoft Authenticode signature
                 // means this is trusted operating-system code. Trust it and skip
                 // the entire heavy pipeline below (metamorphic + deep packer +
@@ -2627,22 +2820,57 @@ public:
                 // every process -- was the dominant real-time CPU cost.
                 //
                 // This does NOT weaken detection: (a) malware cannot forge a
-                // valid Microsoft signature (IsMicrosoftSigned == WinVerifyTrust
-                // validated the chain AND publisher, it is not a name check);
-                // (b) any tampering both breaks the signature AND changes
-                // size/mtime, so a modified file misses the cache and gets a
-                // full re-scan; (c) only NON-mutating access reaches here, so
-                // writes/creates always fall through to full analysis; and
+                // valid Microsoft signature (the verdict comes from
+                // WinVerifyTrust having validated the chain AND publisher, it is
+                // not a name check); (b) any tampering both breaks the signature
+                // AND changes size/mtime, so a modified file misses the cache and
+                // gets a full re-scan; (c) only NON-mutating access reaches here,
+                // so writes/creates always fall through to full analysis; and
                 // (d) LOLBin *abuse* of a signed binary is detected by the
                 // process/behavioral monitors, not by scanning the clean file.
-                SS_DIAG("OnAccess", "step.IsMicrosoftSigned(WinVerifyTrust)");
-                if (Security::DigitalSignatureValidator::Instance()
-                        .IsMicrosoftSigned(filePath)) {
+                //
+                // WHY THIS IS A CACHE-ONLY QUERY AND NOT A VERIFICATION.
+                // IsMicrosoftSigned reaches WinVerifyTrust, which does not do its
+                // own work: it RPCs into CryptSvc, which reads the catalog store
+                // under CatRoot. Our own minifilter intercepts those reads and
+                // posts them back to this service. A scan worker that calls it is
+                // therefore waiting on a process that is waiting on that same
+                // worker, and with a small worker pool that is zero scan capacity
+                // until something times out. The 1.0.91 field trace measured
+                // exactly that: 180.13 seconds on both workers, released 2 ms
+                // apart, which is one shared resource timing out rather than any
+                // per-thread work. Cache-only URL flags do not prevent it - and
+                // this call already sets them - because the block is not our
+                // process reaching the network, it is another process's file I/O
+                // being blocked by us.
+                //
+                // So the verdict is consumed here but never produced here.
+                // Production happens on the signature-determination thread,
+                // which holds no kernel operation and can safely block.
+                SS_DIAG("OnAccess", "step.TryGetCachedMicrosoftSigned");
+                const std::optional<bool> msTrust =
+                    Security::DigitalSignatureValidator::Instance()
+                        .TryGetCachedMicrosoftSigned(filePath);
+
+                if (msTrust.has_value() && *msTrust) {
                     UpdateFileVerdictCache(fileIdentityKey,
                                            Communication::KernelVerdict::Allow);
                     m_stats.cleanFiles++;
                     return Communication::KernelVerdict::Allow;
                 }
+
+                if (!msTrust.has_value()) {
+                    // Not determined - which is not the same as unsigned, and is
+                    // deliberately not treated as one. Ask for the verdict off
+                    // this thread so the next access to this exact file content
+                    // can take the fast path, then fall through to the full local
+                    // pipeline, which decides this access on its own evidence.
+                    QueueSignatureDetermination(filePath, fileIdentityKey);
+                }
+                // A determined non-Microsoft verdict (*msTrust == false) falls
+                // through as well, exactly as before: this tier only ever grants
+                // a fast path, it never blocks or reports a threat, so there is
+                // nothing to re-ask and nothing to defer.
             }
         }
 
@@ -3567,7 +3795,25 @@ public:
                 // image fails the catalog/Authenticode check) and LOLBin abuse of
                 // a signed binary is caught by the process/behavioral monitors
                 // above, not by scanning the clean image.
-                if (!Security::DigitalSignatureValidator::Instance().IsMicrosoftSigned(imagePath)) {
+                //
+                // Queried CACHE-ONLY, for the reason documented at the on-access
+                // TIER 1: establishing this verdict calls WinVerifyTrust, which
+                // RPCs into CryptSvc, whose catalog reads this product's own
+                // minifilter intercepts. This handler owes the kernel a verdict,
+                // so blocking here risks the same circular wait that wedged
+                // 1.0.91 for 180 seconds - on the process-creation path, where a
+                // stall blocks every process launch on the machine.
+                //
+                // NOT-DETERMINED FALLS THROUGH TO THE SCAN, which is the safe
+                // direction: this tier only ever SKIPS work, so an unknown verdict
+                // costs a scan that would have happened anyway and can never let
+                // an unexamined binary through.
+                const auto msTrust = Security::DigitalSignatureValidator::Instance()
+                                         .TryGetCachedMicrosoftSigned(imagePath);
+                if (!msTrust.has_value()) {
+                    QueueSignatureDetermination(imagePath, std::wstring());
+                }
+                if (!(msTrust.has_value() && *msTrust)) {
                     Core::Engine::ScanContext context;
                     context.type = Core::Engine::ScanType::RealTime;
                     context.priority = Core::Engine::ScanPriority::Critical;
@@ -3874,7 +4120,20 @@ public:
         // the heavy ScanEngine pipeline.
         if (m_config.scanOnExecute) {
             try {
-                if (!Security::DigitalSignatureValidator::Instance().IsMicrosoftSigned(imagePath)) {
+                // Cache-only, and not-determined falls through to the scan. Same
+                // reasoning as the on-access TIER 1 and the process-notify path:
+                // establishing this verdict reaches WinVerifyTrust, which RPCs
+                // into CryptSvc, whose catalog reads our own minifilter
+                // intercepts, and this handler owes the kernel a verdict. This
+                // path is the most exposed of the three - it fires for every
+                // module load in every process, so a stall here freezes far more
+                // than file access does.
+                const auto msTrust = Security::DigitalSignatureValidator::Instance()
+                                         .TryGetCachedMicrosoftSigned(imagePath);
+                if (!msTrust.has_value()) {
+                    QueueSignatureDetermination(imagePath, std::wstring());
+                }
+                if (!(msTrust.has_value() && *msTrust)) {
                     Core::Engine::ScanContext context;
                     context.type = Core::Engine::ScanType::RealTime;
                     context.priority = Core::Engine::ScanPriority::High;
