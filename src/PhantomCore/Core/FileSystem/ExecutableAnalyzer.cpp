@@ -467,6 +467,17 @@ AnalysisOptions AnalysisOptions::CreateFull() noexcept {
     opts.calculateHashes = true;
     opts.calculateEntropy = true;
     opts.extractStrings = false;
+
+    // The full profile is the one that actually determines signature verdicts.
+    //
+    // ScanEngine selects between this and CreateQuick() on context.deepScan, so
+    // this profile runs on the deferred deep-scan worker rather than on a thread
+    // the kernel is waiting on. That is the only place it is safe to make the
+    // CryptSvc round trip, and it is also the place that must make it: with this
+    // false everywhere, no verdict would ever be determined and the cache the
+    // on-access path reads would stay permanently empty.
+    opts.allowBlockingSignatureVerification = true;
+
     return opts;
 }
 
@@ -658,7 +669,39 @@ public:
             // Verify signature if requested (requires file path)
             if (options.parseSignature) {
                 SS_DIAG_SCOPE("OnAccess", "Analyze.VerifySignature");
-                info.signature = VerifySignatureImpl(filePath);
+
+                // Three outcomes, and the third is the point of this structure.
+                //
+                // A determined verdict already in cache is free, so the common case
+                // costs a map lookup plus a directory-entry read.
+                //
+                // A caller that has explicitly accepted the risk of blocking gets
+                // the real verification and its result is cached for everyone else.
+                //
+                // Otherwise the status stays Unknown and we do NOT call
+                // WinVerifyTrust. That call makes an RPC into CryptSvc, whose own
+                // file I/O our minifilter intercepts and hands back to this
+                // service; a scan worker blocked here is waiting on a process that
+                // is waiting on the worker, and the field trace measured the
+                // resulting stall at 180.13 seconds on both workers at once.
+                //
+                // Unknown is not a downgrade of the verdict. CalculateRiskScoreImpl
+                // scores NotSigned, Invalid and Revoked and has no branch for
+                // Unknown, so an unexamined file is neither penalised (no fabricated
+                // evidence, no false positive) nor trusted (no fast path granted).
+                // It simply receives the full local pipeline - hashes, patterns,
+                // YARA, heuristics - none of which leave this process. The signature
+                // verdict still gets determined, in the deferred stage, and lands
+                // here for every subsequent access.
+                if (TryGetCachedSignature(filePath, info.signature)) {
+                    // Served from a verdict we previously determined.
+                } else if (options.allowBlockingSignatureVerification) {
+                    info.signature = VerifySignatureImpl(filePath);
+                    StoreCachedSignature(filePath, info.signature);
+                } else {
+                    info.signature = SignatureInfo{};  // status == Unknown
+                }
+
                 if (info.signature.isSigned) {
                     m_stats.signedFiles.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -940,7 +983,16 @@ public:
     }
 
     SignatureInfo VerifySignature(const std::wstring& filePath) const {
-        return VerifySignatureImpl(filePath);
+        // An explicit call to this API is a caller asking for the real answer and
+        // accepting the cost, so it always verifies rather than consulting the
+        // cache. It does record the result, because the work has been done either
+        // way and the on-access path is the one that cannot afford to repeat it.
+        //
+        // Callers must be off the kernel-reply path: this blocks on an RPC into
+        // CryptSvc. See AnalysisOptions::allowBlockingSignatureVerification.
+        SignatureInfo info = VerifySignatureImpl(filePath);
+        StoreCachedSignature(filePath, info);
+        return info;
     }
 
     // ========================================================================
@@ -2449,6 +2501,19 @@ public:
             // Suspicious imports (+2 each, max 10)
             score += std::min(info.suspiciousImports * 2, 10u);
 
+            // Signature-derived penalties.
+            //
+            // Every branch here requires a POSITIVELY DETERMINED bad state. There is
+            // deliberately no branch for SignatureStatus::Unknown, and none should be
+            // added: Unknown means verification has not run yet, so charging for it
+            // would invent evidence against every file whose verdict is still
+            // pending and push ordinary executables toward the rapid-block
+            // threshold. Absence of a verdict must cost nothing and grant nothing.
+            //
+            // Note also that a valid signature earns no discount here. Signature
+            // state only ever adds risk in this function, so deferring verification
+            // cannot make a file look safer than it is.
+
             // No signature (+10)
             if (info.signature.status == SignatureStatus::NotSigned && !info.isDLL) {
                 score += 10;
@@ -2599,6 +2664,115 @@ public:
         }
 
         return versionInfo;
+    }
+
+    // ========================================================================
+    // SIGNATURE VERDICT CACHE
+    //
+    // Authenticode verification is the one step in this analyzer that leaves the
+    // process, so it is the one step that can be blocked by something we are
+    // ourselves blocking. Everything here exists to make the synchronous path able
+    // to answer "what is this file's signature status" without making that call.
+    //
+    // The cache is keyed on the path but VALIDATED on size and last-write time, so
+    // replacing a trusted binary with a malicious one of a different size or
+    // timestamp invalidates the entry rather than inheriting its verdict. That
+    // check matters more than the speed: a path-only cache would be a trust
+    // primitive an attacker could poison by overwriting a file we had already
+    // blessed.
+    // ========================================================================
+
+    struct SignatureCacheEntry {
+        SignatureInfo info;
+        uint64_t fileSize{ 0 };
+        int64_t lastWriteTime{ 0 };
+    };
+
+    mutable std::shared_mutex m_sigCacheMutex;
+    mutable std::unordered_map<std::wstring, SignatureCacheEntry> m_sigCache;
+
+    /// Maximum cached verdicts. Bounded because this is fed by on-access traffic,
+    /// which is unbounded by nature.
+    static constexpr size_t kSignatureCacheCapacity = 8192;
+
+    /// Read the identity a cache entry is validated against.
+    ///
+    /// GetFileAttributesExW reads the directory entry without opening the file, so
+    /// it costs no handle and does not re-enter our own minifilter. Anything that
+    /// needs a handle would defeat the purpose of this cache.
+    static bool ReadFileIdentity(const std::wstring& filePath,
+                                 uint64_t& sizeOut,
+                                 int64_t& writeTimeOut) noexcept {
+        WIN32_FILE_ATTRIBUTE_DATA attr{};
+        if (::GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &attr) == FALSE) {
+            return false;
+        }
+        sizeOut = (static_cast<uint64_t>(attr.nFileSizeHigh) << 32) |
+                  static_cast<uint64_t>(attr.nFileSizeLow);
+        writeTimeOut = (static_cast<int64_t>(attr.ftLastWriteTime.dwHighDateTime) << 32) |
+                       static_cast<int64_t>(attr.ftLastWriteTime.dwLowDateTime);
+        return true;
+    }
+
+    /// Serve a previously determined verdict, or report that we have none.
+    ///
+    /// Returns false rather than a default-constructed SignatureInfo on a miss, so
+    /// a caller cannot mistake "no entry" for "verified as unsigned".
+    bool TryGetCachedSignature(const std::wstring& filePath, SignatureInfo& out) const {
+        uint64_t size = 0;
+        int64_t writeTime = 0;
+        if (!ReadFileIdentity(filePath, size, writeTime)) {
+            return false;
+        }
+
+        std::shared_lock lock(m_sigCacheMutex);
+        const auto it = m_sigCache.find(filePath);
+        if (it == m_sigCache.end()) {
+            return false;
+        }
+        if (it->second.fileSize != size || it->second.lastWriteTime != writeTime) {
+            // The file changed under a verdict we had already reached. The entry
+            // describes a file that no longer exists at this path; treat it as
+            // absent rather than stale-but-usable.
+            return false;
+        }
+        out = it->second.info;
+        return true;
+    }
+
+    /// Record a verdict that was actually determined.
+    ///
+    /// Refuses to store Unknown: caching "we did not look" would turn one skipped
+    /// verification into a permanent one, and every later access would find an
+    /// entry and stop asking.
+    void StoreCachedSignature(const std::wstring& filePath, const SignatureInfo& info) const {
+        if (info.status == SignatureStatus::Unknown) {
+            return;
+        }
+
+        uint64_t size = 0;
+        int64_t writeTime = 0;
+        if (!ReadFileIdentity(filePath, size, writeTime)) {
+            return;
+        }
+
+        std::unique_lock lock(m_sigCacheMutex);
+        if (m_sigCache.size() >= kSignatureCacheCapacity &&
+            m_sigCache.find(filePath) == m_sigCache.end()) {
+            // Bounded, and cleared wholesale rather than evicting one entry.
+            // Signature verdicts are cheap to re-derive off the synchronous path,
+            // so the simple bound is preferable to carrying LRU bookkeeping on a
+            // hot path; correctness never depends on a hit.
+            m_sigCache.clear();
+            SS_LOG_DEBUG(L"ExecutableAnalyzer",
+                L"Signature verdict cache reached %zu entries and was cleared",
+                kSignatureCacheCapacity);
+        }
+        SignatureCacheEntry entry;
+        entry.info = info;
+        entry.fileSize = size;
+        entry.lastWriteTime = writeTime;
+        m_sigCache[filePath] = std::move(entry);
     }
 
     SignatureInfo VerifySignatureImpl(const std::wstring& filePath) const {

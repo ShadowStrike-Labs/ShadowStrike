@@ -277,7 +277,23 @@ enum class SignatureStatus : uint8_t {
     UntrustedRoot = 5,
     TimestampInvalid = 6,
     CatalogSigned = 7,
-    HashMismatch = 8
+    HashMismatch = 8,
+
+    /// Verification has not been performed, so nothing is known about this
+    /// file's signature.
+    ///
+    /// This is deliberately distinct from NotSigned. NotSigned is a positive
+    /// finding - we looked, and there is no signature. Unknown means we have not
+    /// looked yet, which happens whenever a caller declines the blocking
+    /// verification path (see AnalysisOptions::allowBlockingSignatureVerification).
+    ///
+    /// Keeping the two apart is load-bearing rather than pedantic. Unknown must
+    /// never grant trust and must never be scored as a penalty; a status that
+    /// conflated "no signature" with "not examined" would both fabricate evidence
+    /// against every unexamined file and let an absent verdict masquerade as a
+    /// determined one. Appended at the end so the existing wire values are
+    /// unchanged for anything that has already persisted them.
+    Unknown = 9
 };
 
 /**
@@ -540,7 +556,15 @@ struct alignas(64) RichHeader {
  * @brief Code signing information.
  */
 struct alignas(128) SignatureInfo {
-    SignatureStatus status{ SignatureStatus::NotSigned };
+    /// Defaults to Unknown, not NotSigned.
+    ///
+    /// A default-constructed SignatureInfo has not been through verification, so
+    /// the only honest value is "not determined". This used to default to
+    /// NotSigned, which meant every code path that built one without verifying -
+    /// including any path that skips verification for cost reasons - asserted that
+    /// the file carried no signature. That is evidence nobody gathered, and
+    /// CalculateRiskScoreImpl charges +10 for it.
+    SignatureStatus status{ SignatureStatus::Unknown };
 
     bool isSigned{ false };
     bool isValid{ false };
@@ -735,6 +759,28 @@ struct alignas(32) AnalysisOptions {
     bool parseRichHeader{ true };
     bool parseSignature{ true };
     bool parseDotNet{ true };
+
+    /// Permit signature verification to block on a call that leaves this process.
+    ///
+    /// Authenticode verification is not local work. WinVerifyTrust makes an RPC
+    /// into CryptSvc, which reads the catalog store under System32\CatRoot. Our own
+    /// minifilter intercepts that read and posts a scan request back to this
+    /// service, so a scan worker that blocks inside WinVerifyTrust is waiting on a
+    /// process that is waiting on the worker. The cycle only breaks when the RPC
+    /// times out, which the field traces measured at 180.13 seconds on both scan
+    /// workers simultaneously - three minutes of zero scan capacity, during which
+    /// every file operation on the machine stalls behind a driver timeout.
+    ///
+    /// Therefore the default is false, and it is false rather than true on purpose:
+    /// a caller has to say out loud that it is willing to block, which means a new
+    /// call site cannot inherit the dangerous behaviour by omission. When this is
+    /// false, parseSignature still decides whether a signature verdict is wanted;
+    /// the verdict is then served from cache if present, and otherwise left Unknown
+    /// while an asynchronous verification is queued to populate the cache.
+    ///
+    /// Set this only on paths that are not holding a kernel file operation open -
+    /// the deferred deep-scan stage, scheduled scans, update verification.
+    bool allowBlockingSignatureVerification{ false };
 
     bool detectPackers{ true };
     bool detectAnomalies{ true };
