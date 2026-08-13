@@ -4057,12 +4057,56 @@ public:
         if (m_packerDetector) {
             try {
                 ShadowStrike::AntiEvasion::PackerAnalysisConfig pdConfig;
-                pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Deep;
-                pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
+                // This handler owes the kernel a verdict and fires for EVERY module
+                // load in EVERY process, which makes it the most cost-sensitive path
+                // in the product. It ran PackerAnalysisFlags::DeepScan in line, and
+                // DeepScan is StandardScan | EnableYARAScanning |
+                // EnableResourceAnalysis | EnableHeuristicAnalysis - so every DLL
+                // load paid a full YARA pass over 11,053 rules. StandardScan also
+                // carries EnableSignatureVerification, which reaches WinVerifyTrust
+                // and so RPCs into CryptSvc, whose catalog reads our own minifilter
+                // intercepts and posts back to this service: the same circular wait
+                // the field trace measured at 180 seconds, on our busiest path.
+                //
+                // The deep tier is not dropped, it moves. QueueDeferredDeepScan below
+                // runs the full profile, YARA included, off the kernel's thread.
+                pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Standard;
+                pdConfig.flags = static_cast<ShadowStrike::AntiEvasion::PackerAnalysisFlags>(
+                    static_cast<uint32_t>(ShadowStrike::AntiEvasion::PackerAnalysisFlags::StandardScan) &
+                    ~static_cast<uint32_t>(
+                        ShadowStrike::AntiEvasion::PackerAnalysisFlags::EnableSignatureVerification));
+                pdConfig.timeoutMs = 50u;
+                pdConfig.maxFileSize = 32ull * 1024ull * 1024ull;
                 pdConfig.processId = req.processId;
 
                 ShadowStrike::AntiEvasion::PackerError pdErr{};
                 auto packResult = m_packerDetector->AnalyzeFile(imagePath, pdConfig, &pdErr);
+                if (!packResult.analysisComplete || packResult.analysisTruncated ||
+                    packResult.isPacked) {
+                    // Not cleared, merely not fully examined - or examined and found
+                    // packed. Either way the deep tier this path no longer runs in
+                    // line (YARA, resources, heuristics) must still run, so re-queue
+                    // it off the kernel's thread at full depth.
+                    //
+                    // Deliberately NOT unconditional. Queuing every module load would
+                    // put hundreds of entries per process launch into a 4096-deep
+                    // queue served by one worker doing full deep scans, so the queue
+                    // would stop draining and the deferrals that matter would be
+                    // evicted by the ones that do not - the same degrade-each-other
+                    // problem that keeps the signature-determination queue separate.
+                    //
+                    // ASSUMPTION, recorded rather than hidden: a module that
+                    // completes Standard analysis cleanly is not additionally
+                    // deferred, on the basis that mapping the DLL also opens the file
+                    // and so its content is scanned by the on-access path, which runs
+                    // the signature store including YARA. That is consistent with the
+                    // driver sending both an image-load and a file event, but it is
+                    // not something this change verified end to end - it should be
+                    // confirmed against the sensor's image-load and create paths
+                    // before being relied on as a coverage guarantee.
+                    m_stats.packerDeferred++;
+                    QueueDeferredDeepScan(imagePath, req.processId);
+                }
                 if (pdErr.win32Code != 0) {
                     Utils::Logger::Warn(
                         "RealTimeProtection: PackerDetector analysis failed for DLL {} in PID {}  -  error={} {}",
