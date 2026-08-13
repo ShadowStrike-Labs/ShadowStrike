@@ -2856,11 +2856,40 @@ public:
             // Standard = entropy + entry-point signature + sections + imports.
             // All header-level work, and it keeps genuine packer detection on the
             // in-line path. Deep adds YARA scanning and heuristics, which is the
-            // expensive tier and belongs on the deferred worker. Flags are left at
-            // the struct's designed default rather than narrowed by hand, so this
-            // change alters cost only, not which techniques are considered.
+            // expensive tier and belongs on the deferred worker.
             pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Standard;
             pdConfig.processId = req.ProcessId;
+
+            // Signature verification is removed from the in-line flags, and this is
+            // the one narrowing that is not about cost.
+            //
+            // PackerAnalysisFlags::Default is StandardScan, which includes
+            // EnableSignatureVerification, so a default-constructed config makes
+            // PackerDetector call VerifyPESignature here. That reaches
+            // WinVerifyTrust, which is an RPC into CryptSvc, whose catalog reads our
+            // own minifilter intercepts and hands back to this service - so a scan
+            // worker blocked in it is waiting on a process waiting on the worker.
+            // The field trace measured that cycle at 180.13 seconds on both workers
+            // at once, and the cache-only trust flags this path already sets do not
+            // prevent it, because the block is not our process reaching the network.
+            //
+            // This is the same defect the ExecutableAnalyzer fix addressed, in a
+            // second module on the same path; it was missed the first time because
+            // the trace named whichever call happened to block first. The rule is
+            // that no thread holding a kernel file operation open may make a
+            // synchronous call that leaves this process, and it has to be applied to
+            // the behaviour rather than to one API.
+            //
+            // No packer technique is lost. Entropy, entry-point signatures, section
+            // and import analysis all stay in line and are what actually decide
+            // isPacked. The signature verdict is used to temper the confidence of a
+            // packing call, so dropping it in line can only make this stage more
+            // willing to flag, never less - and the deferred stage runs the full
+            // profile, signature included, a moment later.
+            pdConfig.flags = static_cast<ShadowStrike::AntiEvasion::PackerAnalysisFlags>(
+                static_cast<uint32_t>(ShadowStrike::AntiEvasion::PackerAnalysisFlags::Default) &
+                ~static_cast<uint32_t>(
+                    ShadowStrike::AntiEvasion::PackerAnalysisFlags::EnableSignatureVerification));
 
             ShadowStrike::AntiEvasion::PackerError pdErr{};
             SS_DIAG_SCOPE("OnAccess", "PackerDetector::AnalyzeFile");
