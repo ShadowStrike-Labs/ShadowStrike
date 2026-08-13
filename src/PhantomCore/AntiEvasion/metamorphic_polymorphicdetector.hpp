@@ -1628,6 +1628,20 @@ namespace ShadowStrike {
             /// @brief From cache
             bool fromCache = false;
 
+            /// @brief True when the analysis stopped early because it ran out of
+            ///        the time budget in MetamorphicAnalysisConfig::timeoutMs.
+            ///
+            /// A truncated result is INCOMPLETE, not negative. Techniques that had
+            /// not run yet did not report absence of evidence - they never looked.
+            /// Callers must therefore never read !isMetamorphic on a truncated
+            /// result as "this file is clean"; on a latency-sensitive path the
+            /// correct response is to re-examine the file somewhere the full
+            /// budget applies. This field exists because the alternative - a
+            /// deadline that quietly returns a partial verdict - is indis-
+            /// tinguishable from a completed clean analysis, which is precisely
+            /// the failure mode that let earlier defects in this codebase survive.
+            bool analysisTruncated = false;
+
             // ========================================================================
             // FUZZY HASHING RESULTS
             // ========================================================================
@@ -1700,6 +1714,7 @@ namespace ShadowStrike {
                 errors.clear();
                 analysisComplete = false;
                 fromCache = false;
+                analysisTruncated = false;
                 fuzzyHash.clear();
                 tlshHash.clear();
                 ngramProfile.clear();

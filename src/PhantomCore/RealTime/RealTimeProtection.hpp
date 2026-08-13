@@ -914,6 +914,14 @@ struct alignas(64) RTPStatistics {
     ///        identical to a working product from the outside, only slower, so it
     ///        needs its own number rather than being inferred from CPU use.
     std::atomic<uint64_t> signatureVerdictsCached{ 0 };
+
+    /// @brief On-access metamorphic analyses that hit their time budget and were
+    ///        therefore requeued for a full off-path examination.
+    ///        Worth its own number: if this climbs steadily the in-line budget is
+    ///        too tight for real files and the deferred queue is carrying the
+    ///        actual detection work, which is a very different operating regime
+    ///        from the budget rarely being reached.
+    std::atomic<uint64_t> metamorphicTruncated{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
     std::atomic<uint64_t> excludedByProcess{ 0 };
     std::atomic<uint64_t> excludedByHash{ 0 };

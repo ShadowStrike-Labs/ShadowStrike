@@ -1778,11 +1778,27 @@ MetamorphicResult MetamorphicDetector::AnalyzeFile(
         }
     }
 
-    if (config.enableCaching) {
+    // A truncated analysis must never be cached.
+    //
+    // The cache is keyed by file and answers later queries without re-analysing,
+    // so storing a partial verdict converts one exhausted budget into a permanent
+    // one: every subsequent look-up would be served the incomplete answer, and the
+    // techniques that never ran would never run for that file again. That is the
+    // same defect as a bloom filter built from nothing answering "not present" -
+    // a durable negative derived from work that was not performed.
+    if (config.enableCaching && !result.analysisTruncated) {
         m_impl->UpdateCache(filePath, result);
     }
 
-    result.analysisComplete = true;
+    // Report what actually happened. This was set unconditionally, which meant a
+    // run that stopped early still described itself as complete.
+    result.analysisComplete = !result.analysisTruncated;
+
+    if (result.analysisTruncated) {
+        SS_LOG_DEBUG(L"MetamorphicDetector",
+                     L"Analysis truncated at %u ms budget: %ls (score=%.1f so far)",
+                     config.timeoutMs, filePath.c_str(), result.mutationScore);
+    }
 
     SS_LOG_DEBUG(L"MetamorphicDetector", L"Analysis complete: %ls, score=%.1f, techniques=%u",
                  filePath.c_str(), result.mutationScore, result.totalDetections);
@@ -1844,6 +1860,52 @@ void MetamorphicDetector::AnalyzeFileInternal(
     MetamorphicResult& result) noexcept
 {
     result.bytesAnalyzed = size;
+
+    // ENFORCE THE TIME BUDGET THIS CONFIG HAS ALWAYS ADVERTISED.
+    //
+    // MetamorphicAnalysisConfig::timeoutMs has existed, been documented, and been
+    // set by callers since this module was written, and nothing ever read it:
+    // before this change the string "timeoutMs" did not appear anywhere in this
+    // 5,200-line implementation, nor did steady_clock, so no deadline of any kind
+    // could be enforced. The on-access path set it to 50 ms specifically to bound
+    // this call, and a field trace then measured a single invocation at
+    // 10,974,722 us - 10.97 seconds, some 219 times the budget it had asked for -
+    // while a kernel thread sat inside FltSendMessage holding an IRP_MJ_CREATE
+    // and every other file operation on the machine queued behind that verdict.
+    // A knob wired to nothing is worse than no knob: it makes the call site look
+    // bounded, so nobody looks again.
+    //
+    // The budget is deliberately a DEADLINE, not a narrowing of analysis. No
+    // technique is removed and no threshold is relaxed; the stages simply have to
+    // fit the time appropriate to having a kernel thread waiting, and whatever
+    // does not fit is reported as truncated so the caller can re-examine the file
+    // where the full budget applies. Coverage moves in TIME, it is not lost.
+    //
+    // timeoutMs == 0 means no limit, which is what an offline sweep wants.
+    // Honest caveat: this clock starts here, so it does not include the file
+    // mapping performed by the caller. Mapping is a view creation rather than a
+    // read, so that is a small omission, but it is an omission.
+    const auto analysisStart = std::chrono::steady_clock::now();
+    const bool hasDeadline = (config.timeoutMs > 0);
+    const auto deadline =
+        analysisStart + std::chrono::milliseconds(config.timeoutMs);
+
+    const auto outOfTime = [&](const wchar_t* stage) -> bool {
+        if (!hasDeadline) {
+            return false;
+        }
+        if (std::chrono::steady_clock::now() < deadline) {
+            return false;
+        }
+        result.analysisTruncated = true;
+        result.errors.push_back({
+            static_cast<uint32_t>(ERROR_TIMEOUT),
+            std::wstring(L"Analysis budget of ") +
+                std::to_wstring(config.timeoutMs) +
+                L" ms exhausted; remaining techniques did not run",
+            stage });
+        return true;
+    };
 
     PEParser::PEParser parser;
     PEParser::PEInfo peInfo;
@@ -1963,7 +2025,8 @@ void MetamorphicDetector::AnalyzeFileInternal(
                     }
                 }
 
-                m_impl->DetectSelfModifyingImports(peInfo, imports, result.detectedTechniques);
+                if (outOfTime(L"DetectSelfModifyingImports")) { return; }
+            m_impl->DetectSelfModifyingImports(peInfo, imports, result.detectedTechniques);
             }
 
             PEParser::TLSInfo tlsInfo;
@@ -2008,6 +2071,7 @@ void MetamorphicDetector::AnalyzeFileInternal(
             epOffset = static_cast<uint32_t>(*epFileOffset);
         }
 
+        if (outOfTime(L"DetectPacker")) { return; }
         auto packer = m_impl->DetectPacker(buffer, size, epOffset);
         if (packer) {
             result.peAnalysis.packerName = *packer;
@@ -2056,9 +2120,12 @@ void MetamorphicDetector::AnalyzeFileInternal(
         }
 
         std::vector<Impl::DisassembledInstruction> instructions;
+        if (outOfTime(L"DisassembleBuffer")) { return; }
         if (m_impl->DisassembleBuffer(codeBuffer, codeSize, baseAddress, is64Bit, instructions,
                                        config.maxInstructions)) {
             result.instructionsAnalyzed = instructions.size();
+
+            if (outOfTime(L"post-disassembly")) { return; }
 
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanMetamorphic)) {
                 m_impl->DetectInstructionSubstitution(instructions, result.detectedTechniques);
@@ -2089,14 +2156,17 @@ void MetamorphicDetector::AnalyzeFileInternal(
                 }
             }
 
+            if (outOfTime(L"ScanObfuscation")) { return; }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanObfuscation)) {
                 m_impl->DetectAPIHashing(instructions, result.detectedTechniques);
             }
 
+            if (outOfTime(L"ScanVMProtection")) { return; }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanVMProtection)) {
                 m_impl->DetectVMProtection(codeBuffer, codeSize, instructions, result.detectedTechniques);
             }
 
+            if (outOfTime(L"EnableCFGAnalysis")) { return; }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::EnableCFGAnalysis)) {
                 m_impl->AnalyzeCFG(codeBuffer, codeSize, baseAddress, is64Bit, result.cfgAnalysis);
 

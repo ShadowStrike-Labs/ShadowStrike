@@ -3041,8 +3041,40 @@ public:
             // QueueDeferredDeepScan re-examines the file off the kernel's thread
             // where the full default timeout applies.
             metaCfg.timeoutMs = 50u;
+
+            // BOUND THE DISASSEMBLY, WHICH IS WHAT ACTUALLY COST THE 10.9 SECONDS.
+            //
+            // The deadline above is necessary but was not sufficient on its own,
+            // and it is worth being precise about why. MetamorphicAnalysisConfig
+            // defaults maxInstructions to MetamorphicConstants::MAX_INSTRUCTIONS,
+            // which is 10,000,000, and this call never overrode it. The budget can
+            // only be tested between stages, so a single DisassembleBuffer asked to
+            // decode ten million instructions overruns it by any margin it likes -
+            // which is exactly what the field trace caught. The same limit also
+            // drives a speculative reserve of min(size/4, limit) entries, so an
+            // unbounded instruction count is a memory spike as well as a stall.
+            //
+            // 64K instructions is a bound on WORK, not a reduction in technique.
+            // Every detector still runs, over the region where the evidence they
+            // look for actually lives: entry-point decryption stubs, GetPC
+            // sequences, substitution and dead-code patterns and API hashing all
+            // appear in the first few thousand instructions of a mutated sample,
+            // because that is the unpacking preamble. What a deeper decode adds is
+            // coverage of the body, and the body is covered by the deferred stage
+            // below, which runs with the full default limit and no deadline.
+            metaCfg.maxInstructions = 64u * 1024u;
+
             SS_DIAG_SCOPE("OnAccess", "MetamorphicDetector::AnalyzeFile");
             auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
+            if (metaResult.analysisTruncated) {
+                // The budget stopped this analysis before every technique ran, so
+                // this file has NOT been cleared - it has been partially examined.
+                // Re-examine it off the kernel's thread, where the full limits
+                // apply. Without this the deadline would silently trade detection
+                // for latency, which is the one trade this project does not make.
+                m_stats.metamorphicTruncated++;
+                QueueDeferredDeepScan(filePath, req.ProcessId);
+            }
             if (metaResult.isMetamorphic) {
                 Utils::Logger::Warn(
                     "RealTimeProtection: Blocked metamorphic threat: {} "
