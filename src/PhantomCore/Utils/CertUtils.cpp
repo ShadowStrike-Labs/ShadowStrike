@@ -2388,7 +2388,19 @@ bool Certificate::VerifyAgainstCA(const Certificate& caCert, Error* err) const n
         nullptr,    // Current time
         nullptr,    // Additional store (not needed, using engine)
         &chainPara,
-        0,          // No revocation checking for simple CA verification
+        // dwFlags = 0 does NOT mean "local only", which is what the previous
+        // comment here assumed. It means no revocation checking - and the chain
+        // engine is then still free to resolve missing intermediate issuers over
+        // the network through the Authority Information Access extension. That is
+        // the same misreading as WTD_REVOKE_NONE, and it is what made
+        // CertGetCertificateChain(dwFlags=0) stall the on-access path for minutes
+        // before commit 4f3cd0d2.
+        //
+        // Revocation is still not checked here - this is a simple CA verification
+        // and that was deliberate - so nothing about the trust decision changes.
+        // The only change is that an unavailable issuer now fails locally and
+        // immediately instead of after a network timeout.
+        CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL,
         nullptr,    // Reserved
         &chainCtx
     );

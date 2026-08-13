@@ -1868,13 +1868,49 @@ public:
             chainPara.cbSize = sizeof(chainPara);
 
             CertChainPtr chainCtx;
+
+            // Revocation checking stays on, but WHERE the revocation data may come
+            // from is now the caller's decision instead of always being "wherever,
+            // including the network".
+            //
+            // CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT on its own permits the
+            // chain engine to fetch CRL/OCSP responses AND missing intermediates
+            // over the network, synchronously, once per certificate. This function
+            // is reached from CertificateValidator::OnKernelImageLoad and
+            // ::OnKernelProcessCreate, both of which are called from
+            // RealTimeProtection's kernel handlers and whose own comments say they
+            // must decide "before returning to kernel" - so a fetch here is a
+            // network round trip taken while the kernel waits on a process creation
+            // or a module load.
+            //
+            // Cache-only is therefore the default and an online check must be asked
+            // for explicitly via CertificateValidationFlags::OnlineCheck.
+            // OfflineOnly forces cache-only even if OnlineCheck is also present, so
+            // a caller that must never block can say so unambiguously.
+            //
+            // NO DETECTION IS LOST FOR THE COMMON CASE: revocation is still checked,
+            // against the local CRL cache, so a certificate already known to be
+            // revoked is still reported Revoked and still blocked. What cache-only
+            // gives up is discovering a revocation this machine has never fetched,
+            // at that instant. For a path that owes the kernel an answer that is the
+            // correct trade; a caller needing authority can request OnlineCheck.
+            DWORD chainFlags = CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+            const bool wantsOnline =
+                (options.flags & CertificateValidationFlags::OnlineCheck) !=
+                    CertificateValidationFlags::None &&
+                (options.flags & CertificateValidationFlags::OfflineOnly) ==
+                    CertificateValidationFlags::None;
+            if (!wantsOnline) {
+                chainFlags |= CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
+            }
+
             if (!CertGetCertificateChain(
                     nullptr,
                     certCtx.Get(),
                     nullptr,
                     nullptr,
                     &chainPara,
-                    CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+                    chainFlags,
                     nullptr,
                     chainCtx.AddressOf())) {
 
@@ -3415,8 +3451,18 @@ void CertificateValidator::OnKernelImageLoad(
 
         // Use CacheResult flag so repeat loads resolve from in-memory cache.
         // VerifyFile reads the Authenticode signature and checks the cache internally.
+        //
+        // OfflineOnly is stated EXPLICITLY rather than relied upon from the default.
+        // This function is called from RealTimeProtection::OnKernelImageLoad and, as
+        // the block below says, has to decide before the kernel is released. A
+        // synchronous CRL or OCSP fetch here would be a network round trip taken on
+        // every module load in every process. Saying it here means a future change
+        // to the ValidationOptions default cannot quietly reintroduce that.
+        // Revocation is still evaluated against the local CRL cache, so the Revoked
+        // verdict this function acts on is still reached for anything already known.
         ValidationOptions opts;
-        opts.flags = opts.flags | CertificateValidationFlags::CacheResult;
+        opts.flags = opts.flags | CertificateValidationFlags::CacheResult
+                                | CertificateValidationFlags::OfflineOnly;
         auto details = m_impl->VerifyFile(path, opts);
 
         // For revoked / untrusted certs, block synchronously BEFORE returning to kernel
@@ -3477,8 +3523,14 @@ void CertificateValidator::OnKernelProcessCreate(
         std::wstring path(imagePath);
         if (path.empty()) return;
 
+        // OfflineOnly stated explicitly for the same reason as OnKernelImageLoad:
+        // this runs from RealTimeProtection::OnKernelProcessNotify and blocks
+        // synchronously below, so it must never take a network round trip while the
+        // kernel is waiting on a process creation. Local CRL cache still applies, so
+        // an already-known-revoked certificate is still caught and still blocked.
         ValidationOptions opts;
-        opts.flags = opts.flags | CertificateValidationFlags::CacheResult;
+        opts.flags = opts.flags | CertificateValidationFlags::CacheResult
+                                | CertificateValidationFlags::OfflineOnly;
         auto details = m_impl->VerifyFile(path, opts);
 
         // Synchronous block for revoked certs — must happen before kernel returns

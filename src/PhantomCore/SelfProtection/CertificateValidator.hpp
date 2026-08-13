@@ -686,7 +686,22 @@ struct CertificateInfo {
  */
 struct ValidationOptions {
     /// @brief Validation flags
-    CertificateValidationFlags flags = CertificateValidationFlags::Strict;
+    /// @brief Validation flags.
+    ///
+    /// Defaults to CacheResult rather than Strict, and the difference is
+    /// load-bearing: Strict is CacheResult | OnlineCheck, so the previous default
+    /// meant every caller who did not think about it requested a synchronous
+    /// network revocation check. Two of those callers - OnKernelImageLoad and
+    /// OnKernelProcessCreate - run from RealTimeProtection's kernel handlers and
+    /// must answer before the kernel is released, so the default was buying a
+    /// network round trip on process creation and module load.
+    ///
+    /// Revocation is still checked against the local CRL cache by default, so an
+    /// already-known-revoked certificate is still caught. A caller that genuinely
+    /// needs an authoritative answer - update verification, certificate pinning -
+    /// now has to say so by passing OnlineCheck or Strict, which is the right way
+    /// round: the expensive, blocking behaviour should be requested, not inherited.
+    CertificateValidationFlags flags = CertificateValidationFlags::CacheResult;
     
     /// @brief Expected hostname (for SSL validation)
     std::string expectedHostname;
@@ -796,8 +811,18 @@ struct CertificateValidatorConfiguration {
     /// @brief CRL cache duration (seconds)
     uint32_t crlCacheDurationSecs = CertificateConstants::CRL_CACHE_DURATION_SECS;
     
-    /// @brief Default validation flags
-    CertificateValidationFlags defaultFlags = CertificateValidationFlags::Strict;
+    /// @brief Default validation flags.
+    ///
+    /// Kept in step with ValidationOptions::flags deliberately. Today only the
+    /// IgnoreRevocation bit of this field is ever consulted, but it is named as a
+    /// default and sits one line away from being assigned straight into
+    /// options.flags - which is exactly what DigitalSignatureValidator does with
+    /// its equivalent. Leaving this at Strict while the real default is CacheResult
+    /// would mean that one plausible line silently restores synchronous network
+    /// revocation checks on the kernel process-create and image-load paths.
+    /// Changing this to Strict is therefore a decision about blocking behaviour,
+    /// not a tightening of validation.
+    CertificateValidationFlags defaultFlags = CertificateValidationFlags::CacheResult;
     
     /// @brief Allow weak algorithms
     bool allowWeakAlgorithms = false;
