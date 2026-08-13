@@ -1040,6 +1040,91 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
     return true;
 }
 
+// Reports the threat level the runtime will actually assign to each compiled
+// rule, and fails the build if every rule reports the same default.
+//
+// This exists because the severity was measured to be a lie. YaraRuleStore
+// assigned ThreatLevel::Medium to every rule and only overrode it from a
+// `severity` STRING meta - which 70 of the 11,716 shipped rules carry - while
+// ALL of them carry `score = <integer>`. So 99.4% of rules reported a blanket
+// default that looked like a real severity.
+//
+// It also settles a question the source could not: a comment in the rebuild path
+// claimed severity is not encoded in the compiled bytecode. If that were true of
+// the load path, reading metadata back from a saved rule set would find nothing
+// and every rule would still be Medium - the fix would be a silent no-op. This
+// check measures it on the real database instead of trusting either claim.
+//
+// The failure condition is deliberately narrow: a single level for EVERY rule.
+// That is the signature of metadata not being read at all. Any genuine spread,
+// even a skewed one, passes - the point is to catch the mechanism breaking, not
+// to enforce a distribution.
+[[nodiscard]] bool ReportYaraSeverityDistribution(const std::wstring& path,
+                                                  uint64_t expectedRules) {
+    using ShadowStrike::SignatureStore::ThreatLevel;
+
+    ShadowStrike::SignatureStore::YaraRuleStore yara;
+    const StoreError opened = yara.Initialize(path, /*readOnly=*/true);
+    if (!opened.IsSuccess()) {
+        Fail("could not reopen the YARA store to measure rule severities: %s",
+             Describe(opened).c_str());
+        return false;
+    }
+
+    const auto rules = yara.ListRules();
+    if (rules.empty()) {
+        Fail("the YARA store lists no rule metadata, so no rule can carry a "
+             "severity - every detection would report the same default level");
+        return false;
+    }
+
+    size_t info = 0, low = 0, medium = 0, high = 0, critical = 0;
+    size_t withAuthor = 0, withDescription = 0, withTags = 0;
+    for (const auto& r : rules) {
+        switch (r.threatLevel) {
+            case ThreatLevel::Info:     ++info; break;
+            case ThreatLevel::Low:      ++low; break;
+            case ThreatLevel::Medium:   ++medium; break;
+            case ThreatLevel::High:     ++high; break;
+            case ThreatLevel::Critical: ++critical; break;
+            default:                    ++medium; break;
+        }
+        if (!r.author.empty())      ++withAuthor;
+        if (!r.description.empty()) ++withDescription;
+        if (!r.tags.empty())        ++withTags;
+    }
+
+    Info("  yara levels: info=%zu low=%zu medium=%zu high=%zu critical=%zu",
+         info, low, medium, high, critical);
+
+    // Distinguishes "metadata is absent from the compiled rules" from "metadata is
+    // present but the severity keys did not match". Author, description and tags
+    // come from the same iteration as the severity, so if those are empty too then
+    // nothing is reaching the parser and no key change could ever help.
+    Info("  yara meta  : author=%zu description=%zu tags=%zu (of %zu rules)",
+         withAuthor, withDescription, withTags, rules.size());
+
+    if (rules.size() != static_cast<size_t>(expectedRules)) {
+        Info("  note       : %zu rule(s) carry metadata out of %llu compiled",
+             rules.size(), expectedRules);
+    }
+
+    size_t populatedBands = 0;
+    for (size_t n : { info, low, medium, high, critical }) {
+        if (n > 0) ++populatedBands;
+    }
+
+    if (populatedBands <= 1 && rules.size() > 1) {
+        Fail("all %zu rules report the same threat level - rule metadata is not "
+             "reaching the level parser, so every YARA detection would carry a "
+             "default severity rather than its own",
+             rules.size());
+        return false;
+    }
+
+    return true;
+}
+
 // Reopens the finished database through the same store the service uses. This
 // is the whole point: a database that compiles but does not load is worthless,
 // and that is precisely the state the product shipped in. The field log's
@@ -1085,6 +1170,8 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
              yaraStats.totalRules, yaraStats.totalNamespaces);
         if (yaraStats.totalRules == 0) {
             Fail("the YARA store opened but reports zero compiled rules");
+            ok = false;
+        } else if (!ReportYaraSeverityDistribution(path, yaraStats.totalRules)) {
             ok = false;
         }
     }

@@ -3406,6 +3406,7 @@ size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
     }
 
     size_t ruleCount = 0;
+    size_t rulesWithReadableMetadata = 0;
     const auto now = static_cast<uint64_t>(std::time(nullptr));
 
     YR_RULE* rule = nullptr;
@@ -3423,10 +3424,10 @@ size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
         metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
         metadata.ruleName = ruleName;
         metadata.namespace_ = ruleNamespace;
-        // Severity is not encoded in the bytecode. The database's YaraRuleEntry
-        // records carry a real threatLevel and enriching from them is tracked
-        // separately; until that lands every rule reports Medium, which is
-        // deliberately neutral rather than silently severe.
+        // Neutral default. Overridden below from the rule's own metadata when the
+        // rule states anything usable - deliberately Medium rather than something
+        // severe, because a placeholder that convicts is worse than one that does
+        // not.
         metadata.threatLevel = ThreatLevel::Medium;
         metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
         metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
@@ -3442,9 +3443,59 @@ size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
             }
         }
 
+        // Rule metadata: author, description, reference, and anything that could
+        // carry a severity.
+        //
+        // THIS PARSING LIVES HERE AND ONLY HERE. LoadRulesInternal used to keep its
+        // own copy of this loop, and the two had diverged: this one read tags and
+        // nothing else, while that one read author, description and a `severity`
+        // string. Which of the two ran therefore decided whether a rule had an
+        // author or a severity at all - and both are reached from a plain
+        // Initialize depending on how the rules got there. One implementation
+        // cannot disagree with itself.
+        std::map<std::string, std::string> severityMetadata;
+
+        YR_META* meta = nullptr;
+        yr_rule_metas_foreach(rule, meta) {
+            if (meta == nullptr || meta->identifier == nullptr) {
+                continue;
+            }
+
+            const std::string metaKey = meta->identifier;
+
+            if (meta->type == META_TYPE_STRING && meta->string != nullptr) {
+                if (metaKey == "author") {
+                    metadata.author = meta->string;
+                } else if (metaKey == "description") {
+                    metadata.description = meta->string;
+                } else if (metaKey == "reference") {
+                    metadata.reference = meta->string;
+                }
+                severityMetadata[metaKey] = meta->string;
+            } else if (meta->type == META_TYPE_INTEGER) {
+                // Integer metas were previously not read at all, which is how
+                // `score = <integer>` - present on every rule in the shipped
+                // ruleset - never reached the level parser.
+                severityMetadata[metaKey] = std::to_string(meta->integer);
+            }
+        }
+
+        if (!severityMetadata.empty()) {
+            metadata.threatLevel = YaraUtils::ParseThreatLevel(severityMetadata);
+            ++rulesWithReadableMetadata;
+        }
+
         m_ruleMetadata[fullName] = std::move(metadata);
         ++ruleCount;
     }
+
+    // Reported because a severity nobody can read is worse than no severity: every
+    // rule then carries the Medium default and looks like a real judgement. 0 of N
+    // here means no rule's own severity reached the level parser.
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"RebuildRuleMetadataFromRules: indexed %zu rule(s), %zu carried readable "
+        L"metadata usable for severity",
+        ruleCount, rulesWithReadableMetadata);
 
     return ruleCount;
 }
@@ -3892,68 +3943,13 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
     // ========================================================================
     // POPULATE RULE METADATA FROM COMPILED RULES
     // ========================================================================
-    size_t ruleCount = 0;
-    YR_RULE* rule = nullptr;
-    yr_rules_foreach(m_rules, rule) {
-        if (!rule || !rule->identifier) {
-            SS_LOG_WARN(L"YaraRuleStore", L"LoadRulesInternal: Encountered rule with null identifier");
-            continue;
-        }
-
-        std::string ruleName = rule->identifier;
-        std::string ruleNamespace = rule->ns ? rule->ns->name : "default";
-        std::string fullName = ruleNamespace + "::" + ruleName;
-
-        // Create metadata entry
-        YaraRuleMetadata metadata{};
-        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
-        metadata.ruleName = ruleName;
-        metadata.namespace_ = ruleNamespace;
-        metadata.threatLevel = ThreatLevel::Medium;  // Default, can be overridden by database metadata
-        metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
-        metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
-        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
-        metadata.hitCount = 0;
-        metadata.averageMatchTimeMicroseconds = 0;
-
-        // Extract tags
-        const char* tag = nullptr;
-        yr_rule_tags_foreach(rule, tag) {
-            if (tag) {
-                metadata.tags.emplace_back(tag);
-            }
-        }
-
-        // Extract metadata (author, description, reference)
-        YR_META* meta = nullptr;
-        yr_rule_metas_foreach(rule, meta) {
-            if (!meta || !meta->identifier) continue;
-
-            std::string metaKey = meta->identifier;
-
-            if (metaKey == "author" && meta->type == META_TYPE_STRING && meta->string) {
-                metadata.author = meta->string;
-            }
-            else if (metaKey == "description" && meta->type == META_TYPE_STRING && meta->string) {
-                metadata.description = meta->string;
-            }
-            else if (metaKey == "reference" && meta->type == META_TYPE_STRING && meta->string) {
-                metadata.reference = meta->string;
-            }
-            else if (metaKey == "severity" && meta->type == META_TYPE_STRING && meta->string) {
-                // Parse threat level from metadata
-                metadata.threatLevel = YaraUtils::ParseThreatLevel(
-                    std::map<std::string, std::string>{{"severity", meta->string}}
-                );
-            }
-        }
-
-        // Store in cache
-        m_ruleMetadata[fullName] = std::move(metadata);
-        ruleCount++;
-    }
-
-    SS_LOG_INFO(L"YaraRuleStore", L"LoadRulesInternal: Loaded metadata for %zu rules", ruleCount);
+    // One implementation, shared with LoadCompiledRules and
+    // AdoptRulesFromCompiler. This function used to keep its own copy of the
+    // indexing loop and the two had drifted apart: the shared one read tags only,
+    // this one read author, description and a `severity` string. Which of them ran
+    // therefore decided whether a rule had an author or a severity at all, and both
+    // are reachable from a plain Initialize depending on how the rules arrived.
+    const size_t ruleCount = RebuildRuleMetadataFromRules();
 
     // ========================================================================
     // LOAD STATISTICS FROM HEADER
@@ -4819,7 +4815,11 @@ std::vector<std::string> ExtractTags(const std::string& ruleSource) noexcept {
 }
 
 ThreatLevel ParseThreatLevel(const std::map<std::string, std::string>& metadata) noexcept {
-    // Look for severity or threat_level keys (case-insensitive comparison would be better)
+    // ------------------------------------------------------------------------
+    // 1. AN EXPLICIT SEVERITY WINS.
+    // ------------------------------------------------------------------------
+    // A word or small ordinal written by a rule author is a human judgement and
+    // takes precedence over the generated confidence score handled below.
     auto it = metadata.find("severity");
     if (it == metadata.end()) {
         it = metadata.find("threat_level");
@@ -4851,11 +4851,58 @@ ThreatLevel ParseThreatLevel(const std::map<std::string, std::string>& metadata)
             return ThreatLevel::Low;
         }
         if (value == "info" || value == "informational" || value == "0") {
-            return ThreatLevel::Low;
+            // Info, not Low. This returned Low, which silently promoted a rule its
+            // own author called informational into a conviction - Low and above map
+            // to ScanVerdict::Infected while Info maps to Suspicious.
+            return ThreatLevel::Info;
         }
     }
 
-    return ThreatLevel::Medium; // Default
+    // ------------------------------------------------------------------------
+    // 2. NO EXPLICIT SEVERITY: USE THE CONFIDENCE SCORE IF THERE IS ONE.
+    // ------------------------------------------------------------------------
+    // MEASURED against the shipped ruleset, and this is why it is worth reading:
+    // ALL 11,716 rules carry `score = <integer>` (the YARA Forge convention) while
+    // only 70 carry a `severity` word. Without this branch, 11,646 of them fall
+    // through to the Medium default below - so the product had a real, per-rule
+    // severity signal for 100% of its rules and reported a blanket Medium for
+    // 99.4% of them.
+    //
+    // Honouring it changes the reported severity to (measured on that ruleset):
+    //   652 Low, 1348 Medium, 9706 High, 10 Critical
+    //
+    // THE TWO SCALES MUST NOT BE CONFUSED, which is why this is a separate branch
+    // rather than another numeric case above. `severity = 5` means Critical on a
+    // 0-5 ordinal; `score = 5` on the 0-100 scale would be almost nothing. Feeding
+    // score into the ordinal branch would read 40 and 75 as unknown values and fall
+    // back to Medium, or worse, silently invert the meaning.
+    //
+    // NO RULE CAN BE FILTERED OUT BY THIS: verified that minThreatLevel defaults to
+    // ThreatLevel::Info in all three option structs and that no caller anywhere
+    // sets it, so a rule landing on Low is still scanned and still reported.
+    if (auto scoreIt = metadata.find("score"); scoreIt != metadata.end()) {
+        int score = -1;
+        const auto& text = scoreIt->second;
+        if (!text.empty() &&
+            std::all_of(text.begin(), text.end(),
+                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            try {
+                score = std::stoi(text);
+            } catch (...) {
+                score = -1;
+            }
+        }
+
+        if (score >= 0) {
+            if (score >= 100) return ThreatLevel::Critical;
+            if (score >= 75)  return ThreatLevel::High;
+            if (score >= 50)  return ThreatLevel::Medium;
+            if (score >= 25)  return ThreatLevel::Low;
+            return ThreatLevel::Info;
+        }
+    }
+
+    return ThreatLevel::Medium; // Default when a rule states nothing at all
 }
 
 std::vector<std::wstring> FindYaraFiles(

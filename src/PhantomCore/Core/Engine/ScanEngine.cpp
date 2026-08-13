@@ -1575,18 +1575,64 @@ EngineResult ScanEngine::ScanFile(
 
                 if (sigResult.HasDetections()) {
                     m_impl->m_stats.signatureHits.fetch_add(1, std::memory_order_relaxed);
-                    m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
 
-                    const auto& topDetection = sigResult.detections.front();
-                    result.verdict = ScanVerdict::Infected;
+                    // THE MOST SEVERE DETECTION, not the first one.
+                    //
+                    // detections is appended in SOURCE order - hash matches, then
+                    // pattern matches, then YARA matches - so front() is whichever
+                    // store happened to run first and find something. It was named
+                    // topDetection and used for the reported threat name and
+                    // severity, which meant a Low pattern match masked the name AND
+                    // the severity of a Critical YARA detection on the same file.
+                    const auto& topDetection = *std::max_element(
+                        sigResult.detections.begin(), sigResult.detections.end(),
+                        [](const auto& a, const auto& b) {
+                            return static_cast<uint8_t>(a.threatLevel) <
+                                   static_cast<uint8_t>(b.threatLevel);
+                        });
+
+                    // A detection at ThreatLevel::Info is an INDICATOR, not a
+                    // conviction, and this is the one place that distinction can be
+                    // made. Info maps to Suspicious: still counted, still reported
+                    // through the threat callbacks, monitored or blocked according to
+                    // the protection mode - but not quarantined as malware.
+                    //
+                    // THE THRESHOLD IS AT Info AND DELIBERATELY NOT HIGHER, and the
+                    // reason is measured rather than assumed. Now that per-rule
+                    // scores are honoured, the shipped ruleset lands 652 rules on Low
+                    // and 1348 on Medium, so a threshold at Low would stop 652 rules
+                    // convicting and one at High would stop about 2,000. That is why
+                    // this must never be raised without re-measuring the content.
+                    //
+                    // Nothing in the shipped content uses Info today, so this changes
+                    // no current verdict; it gives the pattern and hash stores the
+                    // ability to express an indicative signal, which they previously
+                    // could not - every match at every level became Infected.
+                    const bool indicativeOnly =
+                        (topDetection.threatLevel == SignatureStore::ThreatLevel::Info);
+
+                    if (indicativeOnly) {
+                        result.verdict = ScanVerdict::Suspicious;
+                    } else {
+                        m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+                        result.verdict = ScanVerdict::Infected;
+                    }
+
                     result.threatName = topDetection.signatureName;
                     result.severity = topDetection.threatLevel;
                     result.threatId = topDetection.signatureId;
                     result.detectionSource = "SignatureStore";
                     result.sha256 = fileHash;
 
-                    SS_LOG_WARN(L"ScanEngine", L"Signature match found - Threat: %ls",
-                        StringUtils::ToWide(topDetection.signatureName).c_str());
+                    if (indicativeOnly) {
+                        SS_LOG_WARN(L"ScanEngine",
+                            L"Signature indicator (informational level, reported not "
+                            L"quarantined) - %ls",
+                            StringUtils::ToWide(topDetection.signatureName).c_str());
+                    } else {
+                        SS_LOG_WARN(L"ScanEngine", L"Signature match found - Threat: %ls",
+                            StringUtils::ToWide(topDetection.signatureName).c_str());
+                    }
 
                     // Invoke detection callbacks
                     m_impl->InvokeDetectionCallbacks(result);
@@ -3211,9 +3257,25 @@ EngineResult ScanEngine::ScanMemory(
 
             auto sigResult = m_impl->m_signatureStore->ScanBuffer(buffer, sigOpts);
             if (sigResult.HasDetections()) {
-                m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
-                const auto& topDet = sigResult.detections.front();
-                result.verdict = ScanVerdict::Infected;
+                // Most severe detection, and Info means indicator rather than
+                // conviction - see the equivalent block on the file scan path for the
+                // measurement behind the threshold. Kept identical on purpose: two
+                // verdict mappings that disagree is how a file and its own memory
+                // image end up reported at different severities.
+                const auto& topDet = *std::max_element(
+                    sigResult.detections.begin(), sigResult.detections.end(),
+                    [](const auto& a, const auto& b) {
+                        return static_cast<uint8_t>(a.threatLevel) <
+                               static_cast<uint8_t>(b.threatLevel);
+                    });
+
+                if (topDet.threatLevel == SignatureStore::ThreatLevel::Info) {
+                    result.verdict = ScanVerdict::Suspicious;
+                } else {
+                    m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+                    result.verdict = ScanVerdict::Infected;
+                }
+
                 result.threatName = topDet.signatureName;
                 result.severity = topDet.threatLevel;
                 result.detectionSource = "SignatureStore";

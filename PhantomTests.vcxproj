@@ -160,6 +160,12 @@
          existed in this product with zero production callers between them, so
          the wiring is the part worth testing. -->
     <ClCompile Include="tests\unit\self_exclusion\SelfExclusion_Tests.cpp" />
+
+    <!-- Enabled suite 3: threat-level mapping. The level decides conviction vs
+         indicator, so an error here is a detection defect in either direction.
+         Guards the 0-5 severity ordinal against the 0-100 score scale, which
+         would silently invert severities at the low end. -->
+    <ClCompile Include="tests\unit\threat_level\ThreatLevelMapping_Tests.cpp" />
   </ItemGroup>
 
   <ItemGroup>

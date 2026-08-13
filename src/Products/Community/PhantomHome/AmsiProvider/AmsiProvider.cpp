@@ -336,6 +336,12 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::Scan(IAmsiStream* stream,
     // ── SignatureStore scan ───────────────────────────────────────────────────
     bool hashHit    = false;
     bool patternHit = false;
+    // A pattern match whose only detections are at ThreatLevel::Info is an
+    // INDICATOR, not a conviction. patternHit used to be
+    // `!sigResult.patternMatches.empty()`, which collapsed every level into one
+    // boolean - so in Aggressive mode an informational pattern blocked the script
+    // outright and the store had no way to express anything weaker than a block.
+    // An indicator is still logged rather than discarded.
 
     if (m_impl->sigStore && m_impl->sigStore->IsInitialized()) {
         SignatureStore::ScanOptions opts;
@@ -346,8 +352,22 @@ HRESULT STDMETHODCALLTYPE AmsiProvider::Scan(IAmsiStream* stream,
         opts.stopOnFirstMatch  = true;
 
         const auto sigResult = m_impl->sigStore->ScanBuffer(bytes, opts);
-        hashHit    = !sigResult.hashMatches.empty();
-        patternHit = !sigResult.patternMatches.empty();
+        hashHit = !sigResult.hashMatches.empty();
+
+        if (!sigResult.patternMatches.empty()) {
+            patternHit = std::any_of(
+                sigResult.patternMatches.begin(), sigResult.patternMatches.end(),
+                [](const auto& d) {
+                    return d.threatLevel != SignatureStore::ThreatLevel::Info;
+                });
+
+            if (!patternHit) {
+                SS_LOG_INFO(kLogCategory,
+                    L"Scan: %zu pattern match(es) at informational level only - "
+                    L"recorded as an indicator, not treated as a detection",
+                    sigResult.patternMatches.size());
+            }
+        }
     }
 
     // ── ThreatIntel reputation lookup ─────────────────────────────────────────
