@@ -65,11 +65,15 @@ namespace ShadowStrike {
             // Warning threshold for node count
             constexpr uint64_t NODE_COUNT_WARN_THRESHOLD = 100'000'000;
 
-            // Expected trie magic number ('TRIE' in ASCII)
-            constexpr uint32_t TRIE_MAGIC = 0x54524945;
+            // Expected trie magic number ('TRIE' in ASCII).
+            // Aliases the format header so the writer and this reader cannot drift.
+            constexpr uint32_t TRIE_MAGIC = TRIE_INDEX_MAGIC;
 
-            // Current trie format version
-            constexpr uint32_t CURRENT_TRIE_VERSION = 1;
+            // Current trie format version. Bumped to 2 when the pattern section
+            // gained patternEntryOffset/patternEntryCount, which is what makes the
+            // persisted patterns locatable. The comparison below is an EXACT match,
+            // so this must move with the writer in the same commit.
+            constexpr uint32_t CURRENT_TRIE_VERSION = TRIE_INDEX_VERSION;
 
             // Default performance frequency fallback (1 MHz)
             constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000;
@@ -547,7 +551,7 @@ namespace ShadowStrike {
             SecureZeroMemory(rootNode, sizeof(TrieNodeBinary));
 
             rootNode->magic = TRIE_MAGIC;
-            rootNode->version = CURRENT_TRIE_VERSION;
+            rootNode->version = TRIE_NODE_VERSION;
             rootNode->depth = 0;
             rootNode->outputCount = 0;
             rootNode->outputOffset = 0;
@@ -1208,7 +1212,7 @@ namespace ShadowStrike {
                     // Initialize new node with SecureZeroMemory
                     SecureZeroMemory(newNode, sizeof(TrieNodeBinary));
                     newNode->magic = TRIE_MAGIC;
-                    newNode->version = CURRENT_TRIE_VERSION;
+                    newNode->version = TRIE_NODE_VERSION;
                     newNode->depth = static_cast<uint32_t>(i + 1);
                     newNode->failureLinkOffset = rootOffset; // Default failure link to root
                     newNode->outputCount = 0;

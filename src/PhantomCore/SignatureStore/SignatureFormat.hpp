@@ -180,8 +180,11 @@ struct alignas(8) PatternEntry {
     uint32_t nameOffset;                                  // Offset to name string
     uint32_t dataOffset;                                  // Offset to pattern data
     uint32_t threatLevel;                                 // 0-100 severity score
-    uint64_t signatureId;                                 // Unique signature ID
-    uint64_t flags;                                       // Additional metadata flags
+    uint64_t signatureId;                                 // Stable identity of this pattern in
+                                                          // the DATABASE. Not an array index and
+                                                          // not the runtime store's id - see
+                                                          // PatternStore::PatternMetadata.
+    uint64_t flags;                                       // PatternEntryFlags bit set
 
     // Performance hint: pattern entropy (higher = better for quick rejection)
     float entropy;
@@ -196,6 +199,29 @@ struct alignas(8) PatternEntry {
 
 static_assert(sizeof(PatternEntry) == 48, "PatternEntry must be 48 bytes");
 static_assert(alignof(PatternEntry) == 8, "PatternEntry must be 8-byte aligned");
+
+// Bit flags for PatternEntry::flags.
+namespace PatternEntryFlags {
+
+// The pattern's wildcard mask follows its data immediately, and is exactly
+// patternLength bytes long: [dataOffset, +patternLength) is the pattern and
+// [dataOffset + patternLength, +patternLength) is the mask.
+//
+// This flag exists because PatternEntry has no maskOffset field. The writer
+// emitted the mask right after the data and recorded its location NOWHERE, so
+// the bytes were on disk and unrecoverable - a pattern whose meaning depends on
+// its mask silently lost that meaning on read-back and would have matched
+// literally at the wildcard positions. mode alone is not sufficient to recover
+// it: a mode may imply a mask should exist while the writer skipped it (it does
+// skip when the compiler returns a mask whose length disagrees with the
+// pattern), and "should exist" is not "is present at this offset".
+constexpr uint64_t MaskFollowsData = 0x0000000000000001ull;
+
+// Every bit currently defined. A reader that sees anything outside this set is
+// looking at a database written by a newer builder than itself.
+constexpr uint64_t AllKnown = MaskFollowsData;
+
+} // namespace PatternEntryFlags
 
 // ============================================================================
 // YARA RULE STRUCTURES
@@ -324,11 +350,23 @@ static_assert(alignof(SignatureDatabaseHeader) == 8, "SignatureDatabaseHeader mu
 // NOTE: alignas(8) required for safe reinterpret_cast from memory-mapped files
 #pragma pack(push, 1)
 
+// Magic of the pattern section header and of every trie node in it. The builder
+// used a bare literal in two places and PatternIndex kept its own copy; named
+// once here so the sides cannot drift.
+constexpr uint32_t TRIE_INDEX_MAGIC = 0x54524945;   // 'TRIE'
+
+// Layout version of a single trie NODE. Deliberately separate from
+// TRIE_INDEX_VERSION: the node layout and the section layout are different
+// contracts and versioning them together would force a node-format bump every
+// time the section header gains a field. The two shared one constant before,
+// which meant a section change silently restamped every node.
+constexpr uint16_t TRIE_NODE_VERSION = 1;
+
 // Binary representation of a single Trie node on disk
 struct alignas(8) TrieNodeBinary {
     // Header (16 bytes)
-    uint32_t magic;                      // 0x54524945 = 'TRIE' for validation
-    uint16_t version;                    // Version 1
+    uint32_t magic;                      // TRIE_INDEX_MAGIC
+    uint16_t version;                    // TRIE_NODE_VERSION
     uint16_t reserved;                   // Alignment padding
 
     // Node structure (1024 + 4 + 4 + 4 + 4 + 4 = 1044 bytes)
@@ -354,18 +392,46 @@ static_assert(alignof(TrieNodeBinary) == 8, "TrieNodeBinary must be 8-byte align
 
 #pragma pack(push, 1)
 
+// Version 1: trie nodes and output pool only. Nothing could locate the
+//            PatternEntry records, so no reader could recover the patterns and
+//            the runtime automaton was always empty.
+// Version 2: adds patternEntryOffset / patternEntryCount below. This is the
+//            authoritative persisted form of the patterns.
+// PatternIndex requires an EXACT match, so this constant and the writer must
+// change together in one commit.
+constexpr uint32_t TRIE_INDEX_VERSION = 2;
+
 struct alignas(8) TrieIndexHeader {
-    uint32_t magic;                      // 0x54524945 = 'TRIE'
-    uint32_t version;                    // 1
+    uint32_t magic;                      // TRIE_INDEX_MAGIC
+    uint32_t version;                    // TRIE_INDEX_VERSION
     uint64_t totalNodes;                 // Total number of nodes in trie
     uint64_t totalPatterns;              // Total unique patterns indexed
-    uint64_t rootNodeOffset;             // Offset to root TrieNodeBinary
-    uint64_t outputPoolOffset;           // Offset to start of pattern ID pool
+    uint64_t rootNodeOffset;             // SECTION-RELATIVE offset to root TrieNodeBinary
+    uint64_t outputPoolOffset;           // SECTION-RELATIVE offset to the pattern ID pool
     uint64_t outputPoolSize;             // Total bytes in output pool
     uint32_t maxNodeDepth;               // Maximum depth reached in trie
     uint32_t flags;                      // Bit flags: 0x01 = Aho-Corasick optimized
-    uint64_t checksumCRC64;              // CRC64 of entire trie section (for integrity)
-    uint64_t reserved[4];                // Future use (32 bytes total)
+    uint64_t checksumCRC64;              // CRC64 over the section EXCLUDING this header,
+                                         // i.e. [section + sizeof(TrieIndexHeader), section + size).
+                                         // HONEST STATUS: the builder computes this; NO
+                                         // reader verifies it today. It is a corruption
+                                         // check when one does - never an authenticity
+                                         // check, since anything able to write the file
+                                         // can recompute it. The loader instead bounds
+                                         // and validates every field it reads, so a
+                                         // corrupt section cannot read out of bounds.
+
+    // ---- added in version 2 ----------------------------------------------
+    // Where the persisted patterns actually live. SECTION-RELATIVE, same rule
+    // as every other offset stored inside a section.
+    //
+    // The PatternEntry array is what the runtime loads to populate its pattern
+    // cache and build the matching automaton. The trie nodes above are NOT used
+    // for matching today (see PatternStore::LoadPatternsFromDatabase).
+    uint64_t patternEntryOffset;         // 0 = this database carries no pattern entries
+    uint64_t patternEntryCount;          // Number of PatternEntry records at that offset
+
+    uint64_t reserved[2];                // Future use (16 bytes)
 };
 
 #pragma pack(pop)

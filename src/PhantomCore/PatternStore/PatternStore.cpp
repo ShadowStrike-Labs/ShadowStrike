@@ -823,6 +823,21 @@ StoreError PatternStore::Initialize(
         }
     }
 
+    // Load the persisted patterns BEFORE building the automaton. BuildAutomaton
+    // compiles from m_patternCache, so without this it compiled an empty set and
+    // the store reported itself ready while matching nothing.
+    //
+    // A load failure is not fatal to the store: the mapping is valid, the other
+    // components work, and refusing to open would take hash and YARA detection
+    // down with it. But it is an ERROR, because pattern detection is off.
+    err = LoadPatternsFromDatabase();
+    if (!err.IsSuccess()) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"Initialize: the patterns in this database could not be loaded (%S); "
+            L"pattern matching will report no matches until this is resolved",
+            err.message.c_str());
+    }
+
     // Build Aho-Corasick automaton
     err = BuildAutomaton();
     if (!err.IsSuccess()) {
@@ -1096,7 +1111,14 @@ std::vector<DetectionResult> PatternStore::Scan(
         }
     }
 
-    // Update result metadata and statistics
+    // Update result metadata and statistics.
+    //
+    // The hit counters are deliberately NOT touched here. They are updated inside
+    // ScanWithAutomaton and ScanWithSIMD, under the shared lock those functions
+    // hold and indexed by the cache position. Doing it here was wrong twice over:
+    // the lock is already released by this point, so it raced with the resize in
+    // BuildAutomaton; and it indexed m_hitCounters with result.signatureId, which
+    // only works while that value happens to be an array position.
     for (auto& result : results) {
         // Safe conversion to nanoseconds
         if (scanTimeUs <= (std::numeric_limits<uint64_t>::max)() / 1'000ULL) {
@@ -1104,24 +1126,8 @@ std::vector<DetectionResult> PatternStore::Scan(
         } else {
             result.matchTimeNanoseconds = (std::numeric_limits<uint64_t>::max)();
         }
-        
+
         m_totalMatches.fetch_add(1, std::memory_order_relaxed);
-        
-        // Thread-safe hit count update
-        if (m_heatmapEnabled.load(std::memory_order_acquire)) {
-            if (result.signatureId < m_hitCounters.size()) {
-                try {
-                    std::atomic_ref<uint64_t> counter(
-                        const_cast<std::vector<uint64_t>&>(m_hitCounters)[result.signatureId]
-                    );
-                    counter.fetch_add(1, std::memory_order_relaxed);
-                } catch (const std::exception& ex) {
-                    SS_LOG_DEBUG(L"PatternStore",
-                        L"Scan: hit-counter update failed for signature %llu: %S",
-                        result.signatureId, ex.what());
-                }
-            }
-        }
     }
 
     SS_LOG_DEBUG(L"PatternStore", L"Scan: Found %zu matches in %llu µs", 
@@ -2388,18 +2394,364 @@ void PatternStore::CloseMemoryMapping() noexcept {
     MemoryMapping::CloseView(m_mappedView);
 }
 
+// ============================================================================
+// LOAD PATTERNS FROM THE DATABASE
+// ============================================================================
+// This is the path that did not exist. PatternStore::Initialize opened the
+// mapping, initialised PatternIndex over the pattern section, and went straight
+// to BuildAutomaton - which compiles from m_patternCache, and m_patternCache was
+// only ever populated by runtime AddPattern calls. So a database full of
+// patterns produced a store that reported every component ready, compiled an
+// automaton of zero patterns, and matched nothing. Measured, not inferred:
+// building a database with one verified EICAR pattern and scanning content that
+// contains it reported 0 of 1 matched.
+//
+// Everything here is read out of a memory-mapped file that lives in a directory
+// the product does not yet lock down, so every offset and length is treated as
+// untrusted: bounds are checked against the SECTION (not just the file), and a
+// field that fails validation rejects THAT ENTRY loudly instead of being
+// clamped into something plausible. A pattern quietly coerced into a different
+// threat level or a truncated length is a detection defect that looks like
+// working detection.
+StoreError PatternStore::LoadPatternsFromDatabase() noexcept {
+    if (!m_mappedView.IsValid() || m_mappedView.baseAddress == nullptr) {
+        SS_LOG_ERROR(L"PatternStore", L"LoadPatterns: mapping is not valid");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Mapping not valid" };
+    }
+
+    const auto* dbHeader = m_mappedView.GetAt<SignatureDatabaseHeader>(0);
+    if (dbHeader == nullptr) {
+        SS_LOG_ERROR(L"PatternStore", L"LoadPatterns: cannot read database header");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Cannot read database header" };
+    }
+
+    const uint64_t sectionOffset = dbHeader->patternIndexOffset;
+    const uint64_t sectionSize = dbHeader->patternIndexSize;
+
+    if (sectionOffset == 0 || sectionSize == 0) {
+        SS_LOG_INFO(L"PatternStore",
+            L"LoadPatterns: this database carries no pattern section, so no patterns "
+            L"are loaded and pattern scanning will report no matches");
+        return StoreError{ SignatureStoreError::Success };
+    }
+
+    // Re-validate the section bounds rather than trusting the caller to have done
+    // it. Every offset below is resolved relative to this window.
+    if (sectionOffset > m_mappedView.fileSize ||
+        sectionSize > m_mappedView.fileSize - sectionOffset) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: pattern section 0x%llX+0x%llX exceeds the %llu byte file",
+            sectionOffset, sectionSize, m_mappedView.fileSize);
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Pattern section out of bounds" };
+    }
+
+    const auto* trie = m_mappedView.GetAt<TrieIndexHeader>(sectionOffset);
+    if (trie == nullptr || sectionSize < sizeof(TrieIndexHeader)) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: pattern section is too small to hold its own header");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Pattern section truncated" };
+    }
+
+    if (trie->magic != TRIE_INDEX_MAGIC) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: pattern section magic is 0x%08X, expected 0x%08X",
+            trie->magic, TRIE_INDEX_MAGIC);
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Bad pattern section magic" };
+    }
+
+    // Version 1 has no patternEntryOffset/patternEntryCount - those bytes were
+    // "reserved" and carry no meaning, so they must not be interpreted. Refusing
+    // is correct rather than best-effort: reading a reserved field as an offset is
+    // how a loader ends up walking arbitrary bytes.
+    if (trie->version != TRIE_INDEX_VERSION) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: pattern section version %u is not the supported version %u; "
+            L"no patterns loaded (a version 1 section does not record where its pattern "
+            L"entries are, so they cannot be found)",
+            trie->version, TRIE_INDEX_VERSION);
+        return StoreError{ SignatureStoreError::VersionMismatch, 0,
+                          "Unsupported pattern section version" };
+    }
+
+    const uint64_t entryCount = trie->patternEntryCount;
+    const uint64_t entryOffset = trie->patternEntryOffset;
+
+    if (entryCount == 0 || entryOffset == 0) {
+        SS_LOG_INFO(L"PatternStore",
+            L"LoadPatterns: the pattern section records no pattern entries, so no "
+            L"patterns are loaded and pattern scanning will report no matches");
+        return StoreError{ SignatureStoreError::Success };
+    }
+
+    if (entryOffset < sizeof(TrieIndexHeader)) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: pattern entry offset 0x%llX overlaps the section header",
+            entryOffset);
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Entry offset overlaps header" };
+    }
+
+    // Overflow-safe: never form entryOffset + count * sizeof(PatternEntry) directly.
+    if (entryOffset >= sectionSize ||
+        entryCount > (sectionSize - entryOffset) / sizeof(PatternEntry)) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: %llu pattern entries at section offset 0x%llX do not fit "
+            L"in a 0x%llX byte section",
+            entryCount, entryOffset, sectionSize);
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "Entry array out of bounds" };
+    }
+
+    const uint64_t sectionEnd = sectionOffset + sectionSize;
+    const uint64_t entryArrayAbs = sectionOffset + entryOffset;
+
+    // A blob must lie inside the section. Checked as a closed range with no
+    // addition that can wrap.
+    const auto blobInSection = [&](uint64_t at, uint64_t len) noexcept -> bool {
+        if (at < sectionOffset || at > sectionEnd) return false;
+        return len <= sectionEnd - at;
+    };
+
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+
+    size_t loaded = 0;
+    size_t rejected = 0;
+    size_t unmatchable = 0;
+
+    for (uint64_t i = 0; i < entryCount; ++i) {
+        const auto* entry = m_mappedView.GetAt<PatternEntry>(
+            entryArrayAbs + i * sizeof(PatternEntry));
+        if (entry == nullptr) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"LoadPatterns: entry %llu is not readable; stopping", i);
+            ++rejected;
+            break;
+        }
+
+        const uint32_t patternLen = entry->patternLength;
+
+        // The three size limits in this codebase disagree: the builder validates
+        // against MAX_PATTERN_SIZE (8192), the automaton accepts up to
+        // AC_MAX_PATTERN_LENGTH (4096), and this store rejects anything over
+        // MAX_COMPILED_PATTERN_SIZE (256). A pattern between those bounds builds
+        // into the database and cannot be loaded. Report it with the actual number
+        // so the disagreement is visible instead of appearing as a missing pattern.
+        if (patternLen < MIN_COMPILED_PATTERN_SIZE || patternLen > MAX_COMPILED_PATTERN_SIZE) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"LoadPatterns: entry %llu has length %u, outside this store's accepted "
+                L"range [%zu, %zu]; the pattern is in the database and will NOT be "
+                L"matched at runtime",
+                i, patternLen, MIN_COMPILED_PATTERN_SIZE, MAX_COMPILED_PATTERN_SIZE);
+            ++rejected;
+            continue;
+        }
+
+        if (!blobInSection(entry->dataOffset, patternLen)) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"LoadPatterns: entry %llu pattern data 0x%X+%u lies outside the pattern "
+                L"section; rejected",
+                i, entry->dataOffset, patternLen);
+            ++rejected;
+            continue;
+        }
+
+        // Mode must name a real matching mode before it is cast to the enum.
+        const auto modeRaw = static_cast<uint8_t>(entry->mode);
+        if (modeRaw > static_cast<uint8_t>(PatternMode::ByteMask)) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"LoadPatterns: entry %llu has unknown pattern mode %u; rejected",
+                i, modeRaw);
+            ++rejected;
+            continue;
+        }
+
+        // Threat level must be one of the defined severities. Deliberately NOT
+        // clamped: coercing an unrecognised value down would silently weaken a
+        // detection and coercing it up would manufacture a conviction.
+        ThreatLevel level{};
+        switch (entry->threatLevel) {
+            case static_cast<uint32_t>(ThreatLevel::Info):     level = ThreatLevel::Info; break;
+            case static_cast<uint32_t>(ThreatLevel::Low):      level = ThreatLevel::Low; break;
+            case static_cast<uint32_t>(ThreatLevel::Medium):   level = ThreatLevel::Medium; break;
+            case static_cast<uint32_t>(ThreatLevel::High):     level = ThreatLevel::High; break;
+            case static_cast<uint32_t>(ThreatLevel::Critical): level = ThreatLevel::Critical; break;
+            default:
+                SS_LOG_ERROR(L"PatternStore",
+                    L"LoadPatterns: entry %llu has threat level %u, which is not a defined "
+                    L"severity; rejected rather than coerced",
+                    i, entry->threatLevel);
+                ++rejected;
+                continue;
+        }
+
+        if ((entry->flags & ~PatternEntryFlags::AllKnown) != 0) {
+            SS_LOG_WARN(L"PatternStore",
+                L"LoadPatterns: entry %llu carries flag bits 0x%llX this build does not "
+                L"know; the pattern is loaded but any behaviour those bits describe is "
+                L"not applied",
+                i, entry->flags & ~PatternEntryFlags::AllKnown);
+        }
+
+        // Name: NUL-terminated inside the section. The length is not stored, so the
+        // scan is bounded by the section end AND by a sane maximum - an unterminated
+        // string must not turn into a section-length read.
+        std::string name;
+        {
+            constexpr uint32_t kMaxNameLength = 512;
+            const auto* nameBytes = m_mappedView.GetAt<char>(entry->nameOffset);
+            uint64_t available = 0;
+            if (nameBytes != nullptr && entry->nameOffset >= sectionOffset &&
+                entry->nameOffset <= sectionEnd) {
+                available = (std::min)(static_cast<uint64_t>(kMaxNameLength),
+                                       sectionEnd - entry->nameOffset);
+            }
+
+            uint64_t len = 0;
+            while (len < available && nameBytes[len] != '\0') {
+                ++len;
+            }
+
+            if (available == 0 || len == available) {
+                // Unnamed or unterminated. The pattern is still usable, but a
+                // detection with no name is not actionable, so say so.
+                SS_LOG_WARN(L"PatternStore",
+                    L"LoadPatterns: entry %llu has no readable NUL-terminated name at "
+                    L"0x%X; it is loaded with a generated name",
+                    i, entry->nameOffset);
+                name = "UnnamedPattern_" + std::to_string(i);
+            } else {
+                name.assign(nameBytes, static_cast<size_t>(len));
+            }
+        }
+
+        const uint8_t* dataPtr = m_mappedView.GetAt<uint8_t>(entry->dataOffset);
+        if (dataPtr == nullptr) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"LoadPatterns: entry %llu pattern data is not readable; rejected", i);
+            ++rejected;
+            continue;
+        }
+
+        // Mask, only where the writer said it is present. mode alone is not proof:
+        // the writer skips the mask when its length disagrees with the pattern.
+        const uint8_t* maskPtr = nullptr;
+        if ((entry->flags & PatternEntryFlags::MaskFollowsData) != 0) {
+            const uint64_t maskAt = static_cast<uint64_t>(entry->dataOffset) + patternLen;
+            if (!blobInSection(maskAt, patternLen)) {
+                SS_LOG_ERROR(L"PatternStore",
+                    L"LoadPatterns: entry %llu claims a mask at 0x%llX+%u, outside the "
+                    L"pattern section; rejected rather than matched without its mask",
+                    i, maskAt, patternLen);
+                ++rejected;
+                continue;
+            }
+            maskPtr = m_mappedView.GetAt<uint8_t>(maskAt);
+            if (maskPtr == nullptr) {
+                SS_LOG_ERROR(L"PatternStore",
+                    L"LoadPatterns: entry %llu mask is not readable; rejected", i);
+                ++rejected;
+                continue;
+            }
+        }
+
+        try {
+            PatternMetadata meta{};
+
+            // POSITIONAL identity - see PatternMetadata in the header. The automaton
+            // is keyed by this index and every consumer indexes m_patternCache with
+            // it, so it must be the position and not the database's signatureId
+            // (which is a hash of the name and would fail every bounds check).
+            meta.signatureId = m_patternCache.size();
+            meta.name = std::move(name);
+            meta.threatLevel = level;
+            meta.mode = static_cast<PatternMode>(modeRaw);
+            meta.pattern.assign(dataPtr, dataPtr + patternLen);
+
+            if (maskPtr != nullptr) {
+                meta.mask.assign(maskPtr, maskPtr + patternLen);
+            } else {
+                // Same convention as AddCompiledPattern: absent mask means exact.
+                meta.mask.assign(patternLen, 0xFF);
+            }
+
+            meta.entropy = entry->entropy;
+            meta.hitCount = entry->hitCount;
+            meta.description = "Loaded from signature database";
+            meta.created = std::chrono::system_clock::now();
+            meta.lastModified = meta.created;
+            meta.modificationCount = 0;
+            meta.isDeprecated = false;
+
+            if (meta.mode != PatternMode::Exact) {
+                ++unmatchable;
+            }
+
+            m_patternCache.push_back(std::move(meta));
+            ++loaded;
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"LoadPatterns: out of memory after loading %zu pattern(s)", loaded);
+            return StoreError{ SignatureStoreError::OutOfMemory, 0, "Out of memory loading patterns" };
+        } catch (const std::exception&) {
+            SS_LOG_ERROR(L"PatternStore", L"LoadPatterns: exception on entry %llu", i);
+            ++rejected;
+        }
+    }
+
+    if (rejected > 0) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: %zu of %llu pattern entrie(s) were REJECTED and will never "
+            L"match; the database claims detection this build cannot perform",
+            rejected, entryCount);
+    }
+
+    // Stated explicitly because it is a real coverage hole, not a detail: nothing
+    // in the product matches a non-exact pattern. BuildAutomaton adds only
+    // PatternMode::Exact, ScanWithSIMD skips everything else, and BoyerMooreMatcher
+    // - the one matcher that takes a mask - is never instantiated anywhere.
+    if (unmatchable > 0) {
+        SS_LOG_WARN(L"PatternStore",
+            L"LoadPatterns: %zu loaded pattern(s) are wildcard/mask/regex mode, and NO "
+            L"matcher in this build scans those - they are held in the store and will "
+            L"not produce detections until a wildcard matcher is wired into the scan path",
+            unmatchable);
+    }
+
+    SS_LOG_INFO(L"PatternStore",
+        L"LoadPatterns: loaded %zu of %llu pattern entrie(s) from the database",
+        loaded, entryCount);
+
+    return StoreError{ SignatureStoreError::Success };
+}
+
 StoreError PatternStore::BuildAutomaton() noexcept {
     // Create new automaton separately for exception safety
     // Only replace m_automaton if compilation succeeds
     auto newAutomaton = std::make_unique<AhoCorasickAutomaton>();
 
-    // Add patterns from cache to automaton
+    // Add patterns from cache to automaton.
+    //
+    // THE KEY IS THE CACHE INDEX, not meta.signatureId. Every consumer of a match
+    // treats the value the automaton hands back as an index into m_patternCache -
+    // ScanWithAutomaton bounds-checks it with `patternId >= cacheSize` and then does
+    // m_patternCache[patternId], and the hit counters are indexed the same way.
+    //
+    // The two are equal today because PatternMetadata::signatureId is positional,
+    // but passing signatureId made that a coincidence rather than a contract, and
+    // the coincidence was one change away from breaking silently: the database's
+    // PatternEntry::signatureId is a hash of the pattern name, so the first loader
+    // to carry it through would have had every single match discarded by that bounds
+    // check, with a warning calling the id invalid. Store ready, automaton compiled,
+    // matches found, results thrown away.
+    //
+    // Only PatternMode::Exact is added. Non-exact patterns are not matched by
+    // anything in this build - the load path reports that count explicitly.
     size_t addedCount = 0;
-    for (const auto& meta : m_patternCache) {
+    for (size_t cacheIndex = 0; cacheIndex < m_patternCache.size(); ++cacheIndex) {
+        const auto& meta = m_patternCache[cacheIndex];
         if (meta.mode == PatternMode::Exact) {
-            if (!newAutomaton->AddPattern(meta.pattern, meta.signatureId)) {
+            if (!newAutomaton->AddPattern(meta.pattern, static_cast<uint64_t>(cacheIndex))) {
                 SS_LOG_WARN(L"PatternStore", 
-                    L"BuildAutomaton: Failed to add pattern %llu", meta.signatureId);
+                    L"BuildAutomaton: Failed to add pattern '%S' at index %zu",
+                    meta.name.c_str(), cacheIndex);
                 // Continue with other patterns, don't fail entire build
             } else {
                 addedCount++;
@@ -2525,7 +2877,7 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 
             try {
                 DetectionResult result{};
-                result.signatureId = patternId;
+                result.signatureId = meta.signatureId;
                 result.signatureName = meta.name;
                 result.threatLevel = meta.threatLevel;
                 result.fileOffset = offset;
@@ -2533,6 +2885,21 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 
                 results.push_back(std::move(result));
                 matchCount++;
+
+                // Hit counter updated HERE, under the shared lock this function
+                // already holds, indexed by the cache index. It used to be done by
+                // the caller after both scan helpers had returned and released their
+                // locks - an unsynchronised read of m_hitCounters.size() followed by
+                // taking a reference into a vector that BuildAutomaton resizes under
+                // the exclusive lock. Rebuild, Compact or OptimizeByHitRate running
+                // concurrently with a scan could therefore reallocate the storage
+                // under that reference.
+                if (m_heatmapEnabled.load(std::memory_order_acquire) &&
+                    patternId < m_hitCounters.size()) {
+                    std::atomic_ref<uint64_t> counter(
+                        const_cast<std::vector<uint64_t>&>(m_hitCounters)[patternId]);
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                }
             } catch (const std::bad_alloc&) {
                 SS_LOG_WARN(L"PatternStore", L"ScanWithAutomaton: Memory allocation failed for result");
             }
@@ -2579,15 +2946,21 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
         SS_LOG_WARN(L"PatternStore", L"ScanWithSIMD: Failed to reserve results capacity");
     }
 
-    // Use SIMD for exact patterns only
-    size_t patternIdx = 0;
-    for (const auto& meta : m_patternCache) {
+    // Use SIMD for exact patterns only.
+    // cacheIndex is the position in m_patternCache and is what the hit counters are
+    // indexed by. It is a separate variable from the deadline stride counter on
+    // purpose: that one was incremented inside the condition expression, so the
+    // value visible in the body was already one past the entry being scanned.
+    size_t checkStride = 0;
+    for (size_t cacheIndex = 0; cacheIndex < m_patternCache.size(); ++cacheIndex) {
+        const auto& meta = m_patternCache[cacheIndex];
+
         if (matchCount >= maxResults) {
             break;
         }
 
         // Periodic timeout check (every 32 patterns to amortize syscall cost)
-        if ((patternIdx++ & 31) == 0 && IsDeadlineExceeded(deadline)) {
+        if ((checkStride++ & 31) == 0 && IsDeadlineExceeded(deadline)) {
             SS_LOG_WARN(L"PatternStore", L"ScanWithSIMD: Timeout exceeded");
             break;
         }
@@ -2623,10 +2996,19 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
 
                 results.push_back(std::move(result));
                 matchCount++;
+
+                // Under the shared lock held by this function - see the equivalent
+                // comment in ScanWithAutomaton for why the caller must not do this.
+                if (m_heatmapEnabled.load(std::memory_order_acquire) &&
+                    cacheIndex < m_hitCounters.size()) {
+                    std::atomic_ref<uint64_t> counter(
+                        const_cast<std::vector<uint64_t>&>(m_hitCounters)[cacheIndex]);
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         } catch (const std::exception&) {
             SS_LOG_WARN(L"PatternStore", 
-                L"ScanWithSIMD: Exception searching pattern %llu", meta.signatureId);
+                L"ScanWithSIMD: Exception searching pattern '%S'", meta.name.c_str());
         }
     }
 
@@ -2667,22 +3049,13 @@ DetectionResult PatternStore::BuildDetectionResult(
     return result;
 }
 
-void PatternStore::UpdateHitCount(uint64_t patternId) const noexcept {
-    // Thread-safe hit count update using atomic_ref under shared lock.
-    // Shared lock prevents m_hitCounters from being resized, while
-    // atomic_ref provides safe concurrent increments.
-    std::shared_lock<std::shared_mutex> lock(m_globalLock);
-
-    if (patternId >= m_hitCounters.size()) {
-        SS_LOG_WARN(L"PatternStore", 
-            L"UpdateHitCount: Pattern ID %llu out of range (%zu)", 
-            patternId, m_hitCounters.size());
-        return;
-    }
-
-    std::atomic_ref<uint64_t> counter(m_hitCounters[patternId]);
-    counter.fetch_add(1, std::memory_order_relaxed);
-}
+// UpdateHitCount was removed. It had ZERO callers while the live hit-counter
+// update sat inline in Scan without any lock - the correct implementation was dead
+// code and the racy copy was the one that ran. It cannot simply be called from the
+// scan helpers either: they already hold a shared_lock, and re-acquiring a
+// std::shared_mutex in shared mode from inside that region can deadlock when a
+// writer is queued between the two acquisitions. The update now happens where the
+// lock is already held and the cache index is already known.
 
 bool PatternStore::IsDeadlineExceeded(const LARGE_INTEGER& deadline) const noexcept {
     if (deadline.QuadPart == 0) {

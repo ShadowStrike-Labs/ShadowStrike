@@ -967,13 +967,102 @@ namespace SignatureStore {
             SS_LOG_DEBUG(L"SignatureBuilder", L"SerializePatterns: Optimized pattern order by entropy");
 
             // ========================================================================
-            // STEP 5: WRITE OPTIMIZED PATTERN DATA USING CACHED COMPILED PATTERNS
+            // STEP 5: SERIALIZE THE AHO-CORASICK TRIE
             // ========================================================================
-            std::vector<uint64_t> patternOffsets;
-            patternOffsets.reserve(m_pendingPatterns.size());
+            // The trie is written FIRST and the pattern entries follow it, so that
+            // patternIndexOffset..+patternIndexSize describes the WHOLE pattern area.
+            //
+            // It used to be the other way round, and that was a format defect rather
+            // than a style choice: the entries were written at whatever offset the
+            // hash section happened to end on, then patternIndexOffset was set to the
+            // page-aligned trie that came after them. Every PatternEntry therefore sat
+            // BELOW the declared start of the section, in a gap no header field
+            // described - unvalidated, unbounded, and impossible for a reader to find.
+            // That is the direct reason the runtime could never load patterns.
+            //
+            // The trie header must be at the section start because that is the one
+            // address PatternIndex::Initialize can resolve without being told, exactly
+            // as the hash B+tree root must sit at bucket offset 0.
+            uint64_t trieOffset = Format::AlignToPage(m_currentOffset);
 
-            uint64_t currentOffset = m_currentOffset;
+            // Record the section start at the aligned offset where the section data
+            // actually begins. This is also the base patternIndexSize is measured
+            // from below, so offset and size describe the same span.
+            m_sectionOffsets.patternStart = trieOffset;
+
+            uint64_t currentOffset = trieOffset;
+
+            StoreError trieErr = SerializeAhoCorasickToDisk(currentOffset);
+            if (!trieErr.IsSuccess()) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"SerializePatterns: Failed to serialize trie: %S", trieErr.message.c_str());
+                return trieErr;
+            }
+
+            // SerializeAhoCorasickToDisk re-aligns the offset it is given before
+            // placing the header. We passed an already page-aligned value so the
+            // header must be exactly at trieOffset - but verify it rather than assume,
+            // because everything below writes through a pointer to that header and a
+            // wrong assumption here would corrupt the section silently.
+            auto* trieHeader = reinterpret_cast<TrieIndexHeader*>(
+                static_cast<uint8_t*>(m_outputBase) + trieOffset
+                );
+            if (trieHeader->magic != TRIE_INDEX_MAGIC) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"SerializePatterns: trie header is not at the section start "
+                    L"(offset 0x%llX holds magic 0x%08X, expected 0x%08X)",
+                    trieOffset, trieHeader->magic, TRIE_INDEX_MAGIC);
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                  "Trie header not at section start" };
+            }
+
+            // ========================================================================
+            // STEP 6: WRITE PATTERN ENTRIES USING CACHED COMPILED PATTERNS
+            // ========================================================================
+            // PatternEntry is alignas(8); the records must start aligned because the
+            // runtime indexes them as an array of PatternEntry.
+            currentOffset = AlignToCacheLine64(currentOffset);
+            const uint64_t entryRegionStart = currentOffset;
+
+            // The entries are a TRUE ARRAY: patternEntryOffset and patternEntryCount in
+            // the section header describe exactly `count` fixed-size PatternEntry
+            // records starting at that offset, so a reader can index them directly.
+            //
+            // The variable-length blobs - name, compiled pattern bytes, optional mask -
+            // follow the array in their own region. They used to be INTERLEAVED with the
+            // entries as [entry][name][data][mask][pad][entry]..., which made the stride
+            // variable and an "array of N" promise impossible to keep: nothing records a
+            // name length, so a reader could only step from one entry to the next by
+            // re-deriving the writer's exact arithmetic including its alignment rule.
+            // Publishing a count and an offset for a layout that cannot be indexed would
+            // have been the same class of defect as the offsets this change repairs.
+            const size_t entryCount = patternsByEntropy.size();
+
+            if (entryCount != 0 &&
+                entryCount > (m_outputSize - entryRegionStart) / sizeof(PatternEntry)) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"SerializePatterns: %zu pattern entries do not fit at offset 0x%llX "
+                    L"in a %llu byte database",
+                    entryCount, entryRegionStart, m_outputSize);
+                return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
+            }
+
+            const uint64_t entryArrayBytes =
+                static_cast<uint64_t>(entryCount) * sizeof(PatternEntry);
+
+            // Blobs begin after the FULL array reservation, so the array stays dense and
+            // indexable even if an individual pattern is rejected below.
+            uint64_t blobOffset = entryRegionStart + entryArrayBytes;
+
             size_t processedPatterns = 0;
+
+            // Build-time diagnostics, accumulated in the loop below rather than in a
+            // second pass. These used to be computed only to be stored in an
+            // unreadable metadata block; they are worth reporting, so they are
+            // reported.
+            float entropySum = 0.0f;
+            uint32_t minPatternLen = UINT32_MAX;
+            uint32_t maxPatternLen = 0;
 
             for (const auto& [origIdx, entropy] : patternsByEntropy) {
                 const auto& pattern = m_pendingPatterns[origIdx];
@@ -982,28 +1071,13 @@ namespace SignatureStore {
                 // Skip invalid patterns (already filtered but double-check)
                 if (!cache.valid) continue;
 
-                if (currentOffset > m_outputSize) {
-                    SS_LOG_ERROR(L"SignatureBuilder",
-                        L"SerializePatterns: Offset overflow at pattern %zu", processedPatterns);
-                    return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
-                }
-
-                if (currentOffset + sizeof(PatternEntry) > m_outputSize) {
-                    SS_LOG_ERROR(L"SignatureBuilder",
-                        L"SerializePatterns: Insufficient space for pattern entry %zu",
-                        processedPatterns);
-                    return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
-                }
-
                 PatternEntry* entryPtr = reinterpret_cast<PatternEntry*>(
-                    static_cast<uint8_t*>(m_outputBase) + currentOffset
+                    static_cast<uint8_t*>(m_outputBase) + entryRegionStart
+                    + processedPatterns * sizeof(PatternEntry)
                     );
 
-                uint64_t entryOffset = currentOffset;
-                currentOffset += sizeof(PatternEntry);
-
                 // Write pattern name string
-                uint64_t nameOffset = currentOffset;
+                uint64_t nameOffset = blobOffset;
                 std::string nameStr = pattern.name + "\0";
 
                 if (nameOffset + nameStr.length() > m_outputSize) {
@@ -1017,11 +1091,11 @@ namespace SignatureStore {
                     static_cast<uint8_t*>(m_outputBase) + nameOffset
                     );
                 std::memcpy(namePtr, nameStr.c_str(), nameStr.length());
-                currentOffset += nameStr.length();
+                blobOffset += nameStr.length();
 
                 // FIX: Use cached compiled pattern instead of re-compiling (3rd time!)
                 // This was the major performance bottleneck
-                uint64_t dataOffset = currentOffset;
+                uint64_t dataOffset = blobOffset;
                 size_t patternLen = cache.bytes.size();
 
                 if (dataOffset + patternLen > m_outputSize) {
@@ -1041,29 +1115,37 @@ namespace SignatureStore {
                     return StoreError{ SignatureStoreError::InvalidSignature, 0,
                                       "Inconsistent pattern data" };
                 }
-                currentOffset += patternLen;
+                blobOffset += patternLen;
 
-                // Write pattern mask (for wildcard patterns) - use cached mask
+                // Write pattern mask (for wildcard patterns) - use cached mask.
+                //
+                // The mask is placed immediately after the pattern data and its
+                // presence is recorded in the entry's flags. PatternEntry has no
+                // maskOffset field, so before the flag existed these bytes were
+                // written to disk at a location NOTHING could recover: the mask was
+                // present, occupied space, and was lost on every read-back. A pattern
+                // whose meaning depends on its mask would then have matched literally
+                // at the wildcard positions.
+                bool maskWritten = false;
                 if (!cache.mask.empty() && cache.mask.size() == cache.bytes.size()) {
-                    uint64_t maskOffset = currentOffset;
-
-                    if (maskOffset + cache.mask.size() > m_outputSize) {
+                    if (blobOffset + cache.mask.size() > m_outputSize) {
                         SS_LOG_ERROR(L"SignatureBuilder",
                             L"SerializePatterns: Insufficient space for mask at pattern %zu",
                             processedPatterns);
                         return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
                     }
 
-                    uint8_t* maskPtr = static_cast<uint8_t*>(m_outputBase) + maskOffset;
+                    uint8_t* maskPtr = static_cast<uint8_t*>(m_outputBase) + blobOffset;
                     std::memcpy(maskPtr, cache.mask.data(), cache.mask.size());
-                    currentOffset += cache.mask.size();
+                    blobOffset += cache.mask.size();
+                    maskWritten = true;
                 }
-
-                // Alignment to cache line (use 64-bit-safe variant)
-                currentOffset = AlignToCacheLine64(currentOffset);
 
                 // Fill pattern entry structure - use cached values
                 entryPtr->mode = cache.mode;
+                entryPtr->reserved[0] = 0;
+                entryPtr->reserved[1] = 0;
+                entryPtr->reserved[2] = 0;
                 entryPtr->patternLength = static_cast<uint32_t>(patternLen);
 
                 // Validate offsets fit in uint32_t before truncation to prevent
@@ -1080,14 +1162,17 @@ namespace SignatureStore {
                 entryPtr->dataOffset = static_cast<uint32_t>(dataOffset);
                 entryPtr->threatLevel = static_cast<uint32_t>(pattern.threatLevel);
                 entryPtr->signatureId = std::hash<std::string>{}(pattern.name);
-                entryPtr->flags = 0;
+                entryPtr->flags = maskWritten ? PatternEntryFlags::MaskFollowsData : 0ull;
                 entryPtr->entropy = entropy;
                 entryPtr->hitCount = 0;
                 // GetCurrentTimestamp returns ms; convert to seconds to fit uint32_t
                 // and remain consistent with Unix epoch convention used in the header.
                 entryPtr->lastUpdateTime = static_cast<uint32_t>(GetCurrentTimestamp() / 1000);
 
-                patternOffsets.push_back(entryOffset);
+                entropySum += entropy;
+                minPatternLen = (std::min)(minPatternLen, entryPtr->patternLength);
+                maxPatternLen = (std::max)(maxPatternLen, entryPtr->patternLength);
+
                 processedPatterns++;
 
                 if (processedPatterns % 100 == 0) {
@@ -1095,90 +1180,68 @@ namespace SignatureStore {
                 }
             }
 
+            // The section runs to the end of the blob region: array first, blobs after.
+            currentOffset = blobOffset;
+
             // ========================================================================
-            // STEP 5: SERIALIZE AHO-CORASICK TRIE TO DISK
+            // STEP 7: PUBLISH WHERE THE PATTERNS ARE
             // ========================================================================
-            uint64_t trieOffset = Format::AlignToPage(currentOffset);
-            currentOffset = trieOffset;
+            // Without this the entries are unreachable. patternIndexOffset names the
+            // trie header, so the entry region needs its own coordinates, and they go
+            // in the trie header because that is the only structure in the section a
+            // reader can find. SECTION-RELATIVE, the same rule as every other offset
+            // stored inside a section.
+            trieHeader->patternEntryOffset = entryRegionStart - trieOffset;
+            trieHeader->patternEntryCount = processedPatterns;
 
-            // Record the section start HERE, at the aligned offset where the
-            // pattern data actually begins. This is also the base that
-            // patternIndexSize is measured from a few lines below, so offset and
-            // size now describe the same span - they did not before.
-            m_sectionOffsets.patternStart = trieOffset;
-
-            StoreError trieErr = SerializeAhoCorasickToDisk(currentOffset);
-            if (!trieErr.IsSuccess()) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"SerializePatterns: Failed to serialize trie: %S", trieErr.message.c_str());
-                return trieErr;
-            }
-
+            // patternIndexSize now spans the trie AND the entries, so the section
+            // bounds cover every byte the section owns. Previously it stopped at the
+            // end of the trie while more data followed, and a fixed 1 KB metadata
+            // block was written past it that no reader could interpret - its struct
+            // was declared local to this function.
             m_statistics.patternIndexSize = currentOffset - trieOffset;
             m_statistics.optimizedSignatures += processedPatterns;
 
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"SerializePatterns: Trie serialized successfully - %llu bytes",
-                m_statistics.patternIndexSize);
-
-            // ========================================================================
-            // STEP 6: WRITE PATTERN INDEX METADATA
-            // ========================================================================
-            uint64_t metadataOffset = currentOffset;
-
-            if (metadataOffset + 1024 > m_outputSize) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"SerializePatterns: Insufficient space for index metadata");
-                return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
-            }
-
-            struct PatternIndexMetadata {
-                uint64_t totalPatterns;
-                uint64_t automationNodeCount;
-                float averageEntropy;
-                uint32_t patternLengthMin;
-                uint32_t patternLengthMax;
-                uint32_t flags;
-                uint32_t reserved;
-            } metadata{};
-
-            metadata.totalPatterns = processedPatterns;
-            metadata.automationNodeCount = automaton.GetNodeCount();
-
-            float entropySum = 0.0f;
-            uint32_t minLen = UINT32_MAX;
-            uint32_t maxLen = 0;
-
-            // Use cached compiled pattern sizes instead of re-compiling
-            for (const auto& [origIdx, entropy] : patternsByEntropy) {
-                // Bounds check before accessing cache
-                if (origIdx < m_compiledPatternCache.size()) {
-                    const auto& cache = m_compiledPatternCache[origIdx];
-                    if (cache.valid && !cache.bytes.empty()) {
-                        entropySum += entropy;
-                        uint32_t patternSize = static_cast<uint32_t>(cache.bytes.size());
-                        minLen = std::min(minLen, patternSize);
-                        maxLen = std::max(maxLen, patternSize);
-                    }
+            // Re-checksum: SerializeAhoCorasickToDisk computed the CRC over the trie
+            // only, because the entries did not exist yet. Extend it over the whole
+            // section so the recorded value means what the field says it means.
+            // Corruption detection only - anything able to write the file can
+            // recompute it, so it is not an authenticity check.
+            {
+                const uint64_t sectionSize = currentOffset - trieOffset;
+                if (sectionSize < sizeof(TrieIndexHeader)) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializePatterns: pattern section smaller than its own header");
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                      "Pattern section smaller than header" };
                 }
+                const uint8_t* checksummed = static_cast<const uint8_t*>(m_outputBase)
+                    + trieOffset + sizeof(TrieIndexHeader);
+                const size_t checksummedLen =
+                    static_cast<size_t>(sectionSize - sizeof(TrieIndexHeader));
+                trieHeader->checksumCRC64 = (checksummedLen > 0)
+                    ? ComputeCRC64(checksummed, checksummedLen)
+                    : 0;
             }
 
-            // Safe division with zero check
-            metadata.averageEntropy = (processedPatterns > 0) ? 
-                (entropySum / static_cast<float>(processedPatterns)) : 0.0f;
-            metadata.patternLengthMin = (minLen == UINT32_MAX) ? 0 : minLen;
-            metadata.patternLengthMax = maxLen;
-            metadata.flags = 0x01;
+            SS_LOG_INFO(L"SignatureBuilder",
+                L"SerializePatterns: section 0x%llX..0x%llX (%llu bytes) - trie plus %zu "
+                L"pattern entrie(s) at section offset 0x%llX",
+                trieOffset, currentOffset, m_statistics.patternIndexSize,
+                processedPatterns, trieHeader->patternEntryOffset);
 
-            uint8_t* metadataPtr = reinterpret_cast<uint8_t*>(
-                static_cast<uint8_t*>(m_outputBase) + metadataOffset
-                );
-            std::memcpy(metadataPtr, &metadata, sizeof(PatternIndexMetadata));
-
-            currentOffset = Format::AlignToPage(metadataOffset + sizeof(PatternIndexMetadata));
+            // The pattern section ends here. It used to be followed by a
+            // PatternIndexMetadata block holding totalPatterns, node count, average
+            // entropy and a pattern length range - written past the declared section
+            // size, into a struct DECLARED LOCAL TO THIS FUNCTION, so no reader could
+            // name the type let alone find the bytes. It was removed rather than
+            // relocated: totalNodes and totalPatterns already live in the trie header,
+            // and the remaining three values had no consumer anywhere. Recording
+            // statistics somewhere unreadable is not observability.
+            currentOffset = Format::AlignToPage(currentOffset);
 
             // ========================================================================
-            // STEP 7: PERFORMANCE METRICS & LOGGING
+            // STEP 8: PERFORMANCE METRICS & LOGGING
             // ========================================================================
             LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
@@ -1198,9 +1261,11 @@ namespace SignatureStore {
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Automaton nodes: %zu", automaton.GetNodeCount());
             SS_LOG_INFO(L"SignatureBuilder",
-                L"  Average entropy: %.2f", metadata.averageEntropy);
+                L"  Average entropy: %.2f",
+                (processedPatterns > 0) ? (entropySum / static_cast<float>(processedPatterns)) : 0.0f);
             SS_LOG_INFO(L"SignatureBuilder",
-                L"  Pattern length range: [%u, %u]", metadata.patternLengthMin, metadata.patternLengthMax);
+                L"  Pattern length range: [%u, %u]",
+                (minPatternLen == UINT32_MAX) ? 0u : minPatternLen, maxPatternLen);
             SS_LOG_INFO(L"SignatureBuilder",
                 L"  Serialization time: %llu us (%.2f ms)",
                 serializeTimeUs, serializeTimeUs / 1000.0);
@@ -1406,8 +1471,8 @@ namespace SignatureStore {
                 static_cast<uint8_t*>(m_outputBase) + headerOffset
                 );
 
-            header->magic = 0x54524945; // 'TRIE'
-            header->version = 1;
+            header->magic = TRIE_INDEX_MAGIC;
+            header->version = TRIE_INDEX_VERSION;
             header->totalNodes = trieNodes.size();
             header->totalPatterns = m_pendingPatterns.size();
             header->rootNodeOffset = 0; // Will be set after node serialization
@@ -1415,6 +1480,16 @@ namespace SignatureStore {
             header->outputPoolSize = 0;
             header->maxNodeDepth = 0;
             header->flags = 0x01; // Aho-Corasick optimized
+
+            // Explicitly "no pattern entries" until the caller writes them and records
+            // their coordinates. The output buffer may be a reused file (--overwrite),
+            // so these cannot be assumed zero - and if serialization fails between
+            // here and there, a header claiming entries that were never written would
+            // send the loader into arbitrary bytes.
+            header->patternEntryOffset = 0;
+            header->patternEntryCount = 0;
+            header->reserved[0] = 0;
+            header->reserved[1] = 0;
 
             // Calculate max depth (fix type mismatch for std::max)
             for (const auto& [nodeId, node] : trieNodes) {
@@ -1589,6 +1664,23 @@ namespace SignatureStore {
             // ========================================================================
             // WRITE NODE TO DISK
             // ========================================================================
+            // KNOWN INCOMPLETE - the serialized trie is NOT usable for matching yet,
+            // and the authoritative persisted form of the patterns is the PatternEntry
+            // array that SerializePatterns writes after this section. Three things are
+            // missing here, recorded so nobody mistakes this structure for a working
+            // index:
+            //   1. childOffsets below are copied verbatim from TrieNodeMemory, where
+            //      they hold NODE IDS assigned by the in-memory build - not the disk
+            //      offsets the field name and PatternIndex both expect. The
+            //      nodeIdToDiskOffset map that would translate them is built by the
+            //      caller and never applied.
+            //   2. failureLinkOffset has the same problem.
+            //   3. outputOffset is left 0. BuildOutputPool takes only an offset, so it
+            //      has no access to the nodes and structurally cannot patch them;
+            //      PatternIndex::collectOutputs returns immediately on a zero
+            //      outputOffset, so no node can report a match.
+            // Completing this is tracked separately. Until then the runtime builds its
+            // automaton from the pattern entries, and PatternStore says so explicitly.
             TrieNodeBinary* diskNode = reinterpret_cast<TrieNodeBinary*>(
                 static_cast<uint8_t*>(m_outputBase) + diskOffset
                 );
@@ -1597,8 +1689,8 @@ namespace SignatureStore {
             std::memset(diskNode, 0, sizeof(TrieNodeBinary));
 
             // Set header
-            diskNode->magic = 0x54524945; // 'TRIE'
-            diskNode->version = 1;
+            diskNode->magic = TRIE_INDEX_MAGIC;
+            diskNode->version = TRIE_NODE_VERSION;
             diskNode->reserved = 0;
 
             // Copy child offsets

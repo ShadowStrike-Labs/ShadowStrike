@@ -73,6 +73,13 @@ namespace ShadowStrike {
         using ShadowStrike::SignatureStore::SignatureDatabaseHeader;
         using ShadowStrike::SignatureStore::PatternIndex;
 
+        // Format types the pattern load path reads out of the mapped database.
+        using ShadowStrike::SignatureStore::PatternEntry;
+        using ShadowStrike::SignatureStore::TrieIndexHeader;
+        using ShadowStrike::SignatureStore::TRIE_INDEX_MAGIC;
+        using ShadowStrike::SignatureStore::TRIE_INDEX_VERSION;
+        namespace PatternEntryFlags = ShadowStrike::SignatureStore::PatternEntryFlags;
+
         // Database-format constants — referenced by PatternStore.cpp
         using ShadowStrike::SignatureStore::SIGNATURE_DB_MAGIC;
         using ShadowStrike::SignatureStore::SIGNATURE_DB_VERSION_MAJOR;
@@ -472,6 +479,17 @@ namespace ShadowStrike {
 
             [[nodiscard]] StoreError BuildAutomaton() noexcept;
 
+            // Populate m_patternCache from the PatternEntry array in the mapped
+            // database. Called from Initialize BEFORE BuildAutomaton.
+            //
+            // This is deliberately an internal path rather than a loop over
+            // AddCompiledPattern: AddCompiledPattern refuses on a read-only store, and
+            // a store opened read-only is exactly the case that must load. Loading is
+            // not a mutation of the database, it is the act of reading it.
+            //
+            // Caller must NOT hold m_globalLock; this takes it exclusively.
+            [[nodiscard]] StoreError LoadPatternsFromDatabase() noexcept;
+
             // Internal flush without locking (caller must hold appropriate lock)
             [[nodiscard]] StoreError FlushInternal() noexcept;
 
@@ -493,8 +511,6 @@ namespace ShadowStrike {
                 uint64_t matchTimeNs
             ) const noexcept;
 
-            void UpdateHitCount(uint64_t patternId) const noexcept;
-
             [[nodiscard]] bool IsDeadlineExceeded(const LARGE_INTEGER& deadline) const noexcept;
 
             // ========================================================================
@@ -510,6 +526,19 @@ namespace ShadowStrike {
             std::unique_ptr<AhoCorasickAutomaton> m_automaton;
 
             struct PatternMetadata {
+                // STORE-LOCAL identity, and it is POSITIONAL: signatureId always
+                // equals this entry's index in m_patternCache. AddCompiledPattern
+                // assigns m_patternCache.size(), and OptimizeByHitRate, Compact and
+                // Rebuild all renumber every entry after reordering. The automaton is
+                // keyed by that index and ScanWithAutomaton, BuildDetectionResult and
+                // the hit counters all index by it.
+                //
+                // It is therefore NOT the database's PatternEntry::signatureId, which
+                // is a stable hash of the pattern name. Storing that value here would
+                // be destroyed by the first OptimizeByHitRate pass anyway, and would
+                // make every automaton match fail the cache-bounds check in the
+                // meantime. The database identity that survives is the NAME, which is
+                // loaded and reported.
                 uint64_t signatureId;
                 std::string name;
                 ThreatLevel threatLevel;
