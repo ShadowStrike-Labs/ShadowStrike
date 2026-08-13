@@ -546,7 +546,7 @@ public:
         // Service keys
         success &= ProtectKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService",
             KeyProtectionType::Full, true);
-        success &= ProtectKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver",
+        success &= ProtectKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\PhantomSensor",
             KeyProtectionType::Full, true);
 
         // Configuration keys

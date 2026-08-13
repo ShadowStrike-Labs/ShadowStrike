@@ -223,11 +223,34 @@ namespace SelfDefenseConstants {
     // SERVICE PROTECTION
     // ========================================================================
     
-    /// @brief Service name
+    /// @brief Service name. Matches ServiceInstall Name in packaging/installer/Components.wxs.
     inline constexpr std::wstring_view SERVICE_NAME = L"ShadowStrikePhantomService";
-    
-    /// @brief Driver service name
-    inline constexpr std::wstring_view DRIVER_SERVICE_NAME = L"ShadowStrikeDriver";
+
+    /// @brief Driver service name.
+    ///
+    /// This is "PhantomSensor", not "ShadowStrikeDriver". PhantomSensor.inf declares
+    /// ServiceName = "PhantomSensor" and that is what the SCM registers, which is why
+    /// DriverInstaller::kServiceName, IPCManager's kPhantomMinifilterName,
+    /// AccessControlManager, FileSystemFilter and the driver's own registry
+    /// self-defence list all use that name.
+    ///
+    /// It previously read "ShadowStrikeDriver", a name nothing ever registers, and
+    /// that single wrong constant produced three separate silent failures:
+    ///
+    ///   - SelfDefenseImpl::IsDriverLoaded() opens this service to decide whether the
+    ///     driver is running. OpenServiceW failed on a nonexistent name, so the
+    ///     function returned false unconditionally - it reported the driver as not
+    ///     loaded even while PhantomSensor was running and filtering.
+    ///   - EnsureDriverLoaded() then tried to start that same nonexistent service and
+    ///     could never succeed.
+    ///   - TamperProtection derived its protected registry path from it, so the key it
+    ///     watched did not exist. Field log, twice per service start:
+    ///     "Cannot open registry key for hash:
+    ///      HKLM\SYSTEM\CurrentControlSet\Services\SSDriver (error 2)" - error 2 being
+    ///     ERROR_FILE_NOT_FOUND.
+    ///
+    /// If the driver is ever renamed, the INF is the authority and this must follow it.
+    inline constexpr std::wstring_view DRIVER_SERVICE_NAME = L"PhantomSensor";
     
     /// @brief Maximum service restart attempts
     inline constexpr uint32_t MAX_SERVICE_RESTART_ATTEMPTS = 5;

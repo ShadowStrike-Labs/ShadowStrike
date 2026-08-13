@@ -2252,7 +2252,7 @@ std::vector<ProtectedRegistryKey> SelfDefenseImpl::GetAllProtectedRegistryKeys()
 bool SelfDefenseImpl::ProtectServiceRegistryKeys() {
     bool ok = true;
     ok &= ProtectRegistryKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService", true);
-    ok &= ProtectRegistryKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver", true);
+    ok &= ProtectRegistryKey(L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\PhantomSensor", true);
     ok &= ProtectRegistryKey(L"HKLM\\SOFTWARE\\ShadowStrike", true);
     if (ok) {
         SS_LOG_INFO(LOG_CATEGORY, L"Service registry keys protected");

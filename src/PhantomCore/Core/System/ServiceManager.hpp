@@ -329,7 +329,7 @@ struct alignas(32) ServiceManagerConfig {
     
     // Our service names
     std::wstring mainServiceName{ L"ShadowStrikeAV" };
-    std::wstring driverServiceName{ L"ShadowStrikeDriver" };
+    std::wstring driverServiceName{ L"PhantomSensor" };   // PhantomSensor.inf ServiceName
     
     static ServiceManagerConfig CreateDefault() noexcept;
     static ServiceManagerConfig CreateHighSecurity() noexcept;

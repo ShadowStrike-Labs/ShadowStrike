@@ -234,7 +234,7 @@ namespace RegistryProtectionConstants {
     inline constexpr std::array<std::wstring_view, 13> DEFAULT_PROTECTED_KEYS = {
         L"HKLM\\SOFTWARE\\ShadowStrike",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService",
-        L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikeDriver",
+        L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\PhantomSensor",   // the INF registers this name
         L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
         L"HKCU\\SOFTWARE\\ShadowStrike",
