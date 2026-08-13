@@ -2014,7 +2014,30 @@ namespace ShadowStrike::AntiEvasion {
             trustData.dwStateAction = WTD_STATEACTION_VERIFY;
             trustData.hWVTStateData = NULL;
             trustData.pwszURLReference = NULL;
-            trustData.dwProvFlags = WTD_SAFER_FLAG;
+            // WTD_CACHE_ONLY_URL_RETRIEVAL is not optional here.
+            //
+            // This had WTD_SAFER_FLAG alone, which is the exact configuration that
+            // wedged a test machine for 180 seconds and was fixed under the same
+            // reasoning in ExecutableAnalyzer (commit a8cc39f6). WTD_REVOKE_WHOLECHAIN
+            // asks for revocation across the whole chain, and without the cache-only
+            // flag the provider is free to go to the network for CRL/OCSP responses
+            // AND for missing intermediates via the Authority Information Access
+            // extension. On an offline or slow-DNS host each of those is a multi-second
+            // wait inside a detector, and this detector is reached from process
+            // analysis, so the cost lands wherever that analysis runs.
+            //
+            // NO DETECTION IS LOST. Revocation checking stays ON and is evaluated
+            // against the local CRL cache, so a certificate already known to be
+            // revoked is still rejected. What changes is only where the data may come
+            // from: cache and local stores rather than a synchronous fetch. An
+            // unavailable intermediate reports an incomplete chain, which this
+            // function already treats as not-valid - the safe direction, and the
+            // caller then applies more scrutiny rather than less.
+            //
+            // The rule this follows is the project-wide one: not "never the network",
+            // but "never the network on a path that owes someone an answer". Update
+            // and certificate-pinning paths deliberately still fetch.
+            trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
             trustData.dwUIContext = 0;
             trustData.pFile = &fileInfo;
 
