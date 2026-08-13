@@ -649,7 +649,16 @@ struct FileIntegrityMonitor::Impl {
             std::shared_lock lk(baselineMutex);
             bl = baselines.size();
         }
-        SS_LOG_INFO(L"FIM", L"Monitoring started with %zu baselines", bl);
+        // Say why the count is what it is. System-file baselines are established on a
+        // background thread after startup, deliberately, because hashing everything
+        // under system32\drivers and Windows\boot is heavy synchronous self-I/O on the
+        // startup path. A bare "started with 0 baselines" reads as a broken module and
+        // has already been misdiagnosed as one; the count here is the expected state
+        // at this moment, not a failure.
+        SS_LOG_INFO(L"FIM",
+            L"Monitoring started with %zu baseline(s); directory watches are active "
+            L"now and system-file baselines are established asynchronously "
+            L"(CreateSystemBaselines logs the count when it completes)", bl);
     }
 
     void DoStop() noexcept {

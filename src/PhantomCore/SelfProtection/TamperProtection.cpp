@@ -1087,16 +1087,46 @@ public:
         baseline.type = ProtectedResourceType::RegistryKey;
         baseline.path = path;
         baseline.baselineCreated = Clock::now();
-        baseline.status = IntegrityStatus::Valid;
 
-        // Compute registry key hash
-        if (!ComputeRegistryHashInternal(path, baseline.contentHash)) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Failed to compute registry baseline hash: %ls", path.c_str());
+        // Status reflects whether a baseline actually exists.
+        //
+        // This used to be set to Valid before the hash was even attempted, and the
+        // function then warned on failure and carried on regardless: the key was
+        // inserted, the monitored-resource counter was incremented, "Protected
+        // registry key" was logged, and true was returned. A resource with no
+        // baseline was therefore indistinguishable from a verified one, and the
+        // statistics counted protection that did not exist. That is the same defect
+        // class as a detection store that reports itself ready and finds nothing.
+        //
+        // Missing is the honest status when the key cannot be opened, and Unknown
+        // when it exists but could not be hashed. The entry is still recorded in
+        // both cases, deliberately: the monitor loop re-reads these keys, so a key
+        // created after we start - or one that was transiently unreadable - can
+        // still acquire its baseline later. What must not happen is claiming it is
+        // protected in the meantime.
+        if (ComputeRegistryHashInternal(path, baseline.contentHash)) {
+            baseline.status = IntegrityStatus::Valid;
+        } else {
+            const bool exists = RegistryKeyExists(path);
+            baseline.status = exists ? IntegrityStatus::Unknown : IntegrityStatus::Missing;
+            SS_LOG_WARN(LOG_CATEGORY,
+                        L"No integrity baseline for registry key %ls (%ls) - it is "
+                        L"recorded so the monitor can baseline it later, but it is "
+                        L"NOT protected until that succeeds",
+                        path.c_str(),
+                        exists ? L"key exists but could not be hashed"
+                               : L"key does not exist");
         }
 
         {
             std::unique_lock lock(m_mutex);
             m_protectedRegistryKeys[path] = baseline;
+        }
+
+        if (baseline.status != IntegrityStatus::Valid) {
+            // Not counted as a monitored resource, and not reported as protected,
+            // because neither is true yet.
+            return false;
         }
 
         m_stats.totalResourcesMonitored.fetch_add(1, std::memory_order_relaxed);
@@ -1179,20 +1209,63 @@ public:
     }
 
     [[nodiscard]] bool ProtectServiceRegistry() {
+        // These names are taken from SelfDefenseConstants rather than written out
+        // again here, because writing them out again here is exactly what went wrong.
+        //
+        // This list previously held "...\Services\ShadowStrike" and
+        // "...\Services\SSDriver". Neither key has ever existed. The service is
+        // registered as ShadowStrikePhantomService and the driver as
+        // ShadowStrikeDriver, which is what the installer creates and what
+        // SelfDefense already opens through these same constants. The field log
+        // records the consequence plainly, twice per service start:
+        //
+        //   ComputeRegistryHashInternal - Cannot open registry key for hash:
+        //     HKLM\SYSTEM\CurrentControlSet\Services\ShadowStrike (error 2)
+        //   ProtectRegistryKey - Failed to compute registry baseline hash: ...
+        //   ProtectRegistryKey - Protected registry key: ...
+        //
+        // Error 2 is ERROR_FILE_NOT_FOUND. So the product's registry self-protection
+        // was watching two keys that do not exist, while the keys that decide whether
+        // the service and the driver start at all - ImagePath, Start, DependOnService
+        // under the real names - were not protected by anything. Those are the first
+        // things an attacker edits to disable an endpoint agent, and the log said they
+        // were protected.
+        //
+        // Deriving the paths from the constants means a future rename cannot
+        // reintroduce this: whoever changes the service name changes it in one place
+        // and this follows.
+        const std::wstring servicesRoot = L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\";
+
         std::vector<std::wstring> serviceKeys = {
-            L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrike",
-            L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SSDriver",
+            servicesRoot + std::wstring(SelfDefenseConstants::SERVICE_NAME),
+            servicesRoot + std::wstring(SelfDefenseConstants::DRIVER_SERVICE_NAME),
             L"HKLM\\SOFTWARE\\ShadowStrike"
         };
 
+        size_t protectedCount = 0;
         for (const auto& key : serviceKeys) {
-            if (!ProtectRegistryKey(key, true)) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Failed to protect service registry key: %ls", key);
+            if (ProtectRegistryKey(key, true)) {
+                ++protectedCount;
+            } else {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to protect service registry key: %ls",
+                            key.c_str());
             }
         }
 
-        SS_LOG_INFO(LOG_CATEGORY, L"Protected service registry keys");
-        return true;
+        // Report what was actually achieved. Claiming "Protected service registry
+        // keys" unconditionally is how two dead paths went unnoticed for as long as
+        // they did.
+        if (protectedCount == serviceKeys.size()) {
+            SS_LOG_INFO(LOG_CATEGORY, L"Protected %zu service registry key(s)",
+                        protectedCount);
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY,
+                        L"Protected only %zu of %zu service registry key(s); the "
+                        L"remainder have no integrity baseline and are NOT being "
+                        L"watched",
+                        protectedCount, serviceKeys.size());
+        }
+        return protectedCount > 0;
     }
 
     [[nodiscard]] std::vector<ResourceBaseline> GetAllProtectedRegistryKeys() const {
@@ -2495,22 +2568,58 @@ private:
         }
     }
 
+    // Splits "HKLM\Foo\Bar" into a predefined root handle and the remaining subkey.
+    //
+    // Shared by the hash and existence checks so the two cannot disagree about what a
+    // path means. Duplicated parsing is how the service-key paths drifted from the
+    // names the installer actually registers.
+    static void SplitRegistryPath(const std::wstring& keyPath,
+                                  HKEY& rootKeyOut,
+                                  std::wstring& subKeyOut) {
+        rootKeyOut = HKEY_LOCAL_MACHINE;
+        subKeyOut  = keyPath;
+
+        const bool isHklm = keyPath.starts_with(L"HKLM\\") ||
+                            keyPath.starts_with(L"HKEY_LOCAL_MACHINE\\");
+        const bool isHkcu = keyPath.starts_with(L"HKCU\\") ||
+                            keyPath.starts_with(L"HKEY_CURRENT_USER\\");
+
+        if (isHklm || isHkcu) {
+            rootKeyOut = isHkcu ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+            const auto pos = keyPath.find(L'\\');
+            if (pos != std::wstring::npos) {
+                subKeyOut = keyPath.substr(pos + 1);
+            }
+        }
+    }
+
+    // Distinguishes "this key is not there" from "this key is there but unreadable".
+    // Those are different problems and only the second one suggests a permissions or
+    // corruption issue worth chasing.
+    [[nodiscard]] static bool RegistryKeyExists(const std::wstring& keyPath) {
+        HKEY rootKey = HKEY_LOCAL_MACHINE;
+        std::wstring subKeyPath;
+        SplitRegistryPath(keyPath, rootKey, subKeyPath);
+
+        HKEY hKey = nullptr;
+        const LONG status = ::RegOpenKeyExW(rootKey, subKeyPath.c_str(), 0,
+                                            KEY_QUERY_VALUE, &hKey);
+        if (status == ERROR_SUCCESS) {
+            ::RegCloseKey(hKey);
+            return true;
+        }
+        // Anything other than "not found" means it is present but we could not open
+        // it, which is a different condition from absence.
+        return status != ERROR_FILE_NOT_FOUND;
+    }
+
     [[nodiscard]] bool ComputeRegistryHashInternal(const std::wstring& keyPath, Hash256& hashOut) {
         hashOut.fill(0);
 
         HKEY hKey = nullptr;
-        // Parse root key from path
         HKEY rootKey = HKEY_LOCAL_MACHINE;
-        std::wstring subKeyPath = keyPath;
-        if (keyPath.starts_with(L"HKLM\\") || keyPath.starts_with(L"HKEY_LOCAL_MACHINE\\")) {
-            rootKey = HKEY_LOCAL_MACHINE;
-            auto pos = keyPath.find(L'\\');
-            subKeyPath = keyPath.substr(pos + 1);
-        } else if (keyPath.starts_with(L"HKCU\\") || keyPath.starts_with(L"HKEY_CURRENT_USER\\")) {
-            rootKey = HKEY_CURRENT_USER;
-            auto pos = keyPath.find(L'\\');
-            subKeyPath = keyPath.substr(pos + 1);
-        }
+        std::wstring subKeyPath;
+        SplitRegistryPath(keyPath, rootKey, subKeyPath);
 
         LONG status = RegOpenKeyExW(rootKey, subKeyPath.c_str(), 0, KEY_READ, &hKey);
         if (status != ERROR_SUCCESS) {
