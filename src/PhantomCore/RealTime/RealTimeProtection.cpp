@@ -387,6 +387,23 @@ public:
     std::condition_variable                       m_deferredCv;
     std::atomic<bool>                             m_deferredStop{ false };
     std::unique_ptr<std::thread>                  m_deferredScanThread;
+    // Deepest this queue has been since the last statistics reset. The instant
+    // depth sampled every few seconds says almost nothing on its own: a queue
+    // that fills and drains between two samples reads as empty at both. The
+    // high-water mark is what shows that it happened.
+    size_t                                        m_deferredHighWater{ 0 };
+    // Rate limiting for the queue-full report, held under m_deferredMutex.
+    //
+    // Logging every drop was worse than it looks: once the queue is full it drops
+    // one entry per enqueue, so at the ~400 scans/sec this machine has actually
+    // been measured at, that is ~400 log lines a second. Our own log writes are
+    // file writes, they pass through our own minifilter, and the condition being
+    // reported is the machine already being behind - so the report amplified
+    // exactly what it was reporting. Now the drops are COUNTED always and
+    // REPORTED at a bounded rate, with the suppressed total carried in the
+    // next message so nothing is hidden by the rate limit.
+    std::chrono::steady_clock::time_point         m_deferredFullLastWarn{};
+    uint64_t                                      m_deferredFullSuppressed{ 0 };
 
     // Files whose Microsoft-signature trust verdict is not yet known.
     //
@@ -407,6 +424,12 @@ public:
     std::condition_variable                          m_sigDetermCv;
     std::atomic<bool>                                m_sigDetermStop{ false };
     std::unique_ptr<std::thread>                     m_sigDetermThread;
+    // Same reasoning as the deep-scan queue above: instant depth under-reports a
+    // queue that fills and drains between samples, and an unbounded per-drop
+    // report amplifies the busy condition it is describing.
+    size_t                                           m_sigDetermHighWater{ 0 };
+    std::chrono::steady_clock::time_point            m_sigDetermFullLastWarn{};
+    uint64_t                                         m_sigDetermFullSuppressed{ 0 };
 
     // Synchronization
     mutable std::shared_mutex m_configMutex;
@@ -489,6 +512,34 @@ public:
     // Rate calculation state (member vars instead of static locals for thread safety)
     uint64_t m_lastTotalScansForRate{ 0 };
     std::chrono::system_clock::time_point m_lastRateCalcTime{ std::chrono::system_clock::now() };
+
+    // ---- Periodic report baselines ----
+    //
+    // Members, not function-level statics. Statics outlive the object: after a
+    // Shutdown/Initialize cycle - which the integration fixture performs - or a
+    // ResetStatistics(), the counters restart at zero while a static baseline
+    // keeps its old value, so every delta computed from it underflows on unsigned
+    // arithmetic and reports something near 1.8e19. As members they are destroyed
+    // with the object, and DeltaSince below re-baselines rather than underflowing
+    // when a counter legitimately moves backwards.
+    uint64_t m_reportBaselineScans{ 0 };
+    uint64_t m_reportBaselineDeferred{ 0 };
+    uint64_t m_reportBaselineErrors{ 0 };
+    uint64_t m_reportBaselineDeepDropped{ 0 };
+    uint64_t m_reportBaselineTrustDropped{ 0 };
+    /// @brief The capacity report keeps its OWN scan baseline rather than sharing
+    ///        the pipeline report's. Sharing it made the capacity line's
+    ///        "did any scanning happen" test depend on which report ran first,
+    ///        and the one that ran second always saw a delta of zero. Two
+    ///        independent reports must not share mutable state.
+    uint64_t m_reportBaselineCapacityScans{ 0 };
+
+    /// @brief Consecutive capacity samples in which the scan pool had no free
+    ///        worker and work waiting. One sample means a burst, which is normal;
+    ///        several consecutive samples mean the machine is not keeping up, and
+    ///        that distinction is the entire point of counting rather than
+    ///        reporting each observation.
+    uint32_t m_poolSaturatedSamples{ 0 };
 
     // CPU usage measurement state (GetSystemTimes delta between samples)
     ULARGE_INTEGER m_prevIdleTime{};
@@ -2473,6 +2524,52 @@ public:
     // catch something, never whether we catch it.
     // =========================================================================
 
+    // Report a bounded queue overflowing, at a bounded rate.
+    //
+    // MUST BE CALLED WITH THE QUEUE'S OWN MUTEX HELD: lastWarn and suppressed are
+    // plain members deliberately, because both callers already hold that mutex
+    // and adding a second lock for the reporter would be synchronisation with no
+    // reader to protect against.
+    //
+    // The rate limit exists because the previous per-drop report amplified the
+    // condition it described. Once a queue is full it drops one entry per
+    // enqueue, so a sustained overflow produced one log line per enqueue - and
+    // our log writes are file writes that traverse our own minifilter on a
+    // machine that is by definition already behind. The drop COUNTERS are always
+    // incremented by the caller, so the rate limit costs no information: it only
+    // moves the total from a line-per-event into the periodic capacity report.
+    void ReportQueueFull(const char* queueName,
+                         size_t capacity,
+                         std::chrono::steady_clock::time_point& lastWarn,
+                         uint64_t& suppressed,
+                         const char* consequence) {
+        // First overflow is always reported, then at most one report per window.
+        // A default-constructed time_point is the epoch, so the first call always
+        // exceeds the window without needing a separate "have we warned" flag.
+        constexpr auto kWarnWindow = std::chrono::seconds(30);
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now - lastWarn < kWarnWindow) {
+            ++suppressed;
+            return;
+        }
+
+        if (suppressed > 0) {
+            Utils::Logger::Warn(
+                "RealTimeProtection: {} queue full (capacity {}); dropping oldest - {}. "
+                "{} further drops in the last {}s were not logged individually",
+                queueName, capacity, consequence, suppressed,
+                std::chrono::duration_cast<std::chrono::seconds>(kWarnWindow).count());
+        } else {
+            Utils::Logger::Warn(
+                "RealTimeProtection: {} queue full (capacity {}); dropping oldest - {}",
+                queueName, capacity, consequence);
+        }
+
+        suppressed = 0;
+        lastWarn = now;
+    }
+
     // Ask for a Microsoft-signature trust verdict on a thread that is not
     // holding a kernel file operation open. Never blocks the caller.
     //
@@ -2502,16 +2599,16 @@ public:
                 return;
             }
             if (m_sigDetermQueue.size() >= kMaxSigDetermQueue) {
-                // Drop the OLDEST, and say so. The oldest request is the least
-                // valuable: either the file was accessed again already and
-                // re-queued, or it has not been touched since and is not urgent.
-                // Silence here would look exactly like a working fast path that
-                // simply never warms up, which is the failure mode this codebase
-                // produces most often.
-                Utils::Logger::Warn(
-                    "RealTimeProtection: signature determination queue full ({}); "
-                    "dropping oldest - the trust fast path will warm more slowly",
-                    kMaxSigDetermQueue);
+                // Drop the OLDEST. The oldest request is the least valuable:
+                // either the file was accessed again already and re-queued, or it
+                // has not been touched since and is not urgent. Silence here
+                // would look exactly like a working fast path that simply never
+                // warms up, which is the failure mode this codebase produces most
+                // often - so it is counted, and reported at a bounded rate.
+                m_stats.sigDetermQueueDropped++;
+                ReportQueueFull("signature determination", kMaxSigDetermQueue,
+                                m_sigDetermFullLastWarn, m_sigDetermFullSuppressed,
+                                "the trust fast path will warm more slowly");
                 const auto& front = m_sigDetermQueue.front();
                 m_sigDetermSeen.erase(front.second.empty() ? front.first
                                                            : front.second);
@@ -2519,6 +2616,9 @@ public:
             }
             m_sigDetermQueue.emplace_back(filePath, identityKey);
             m_sigDetermSeen.insert(dedupKey);
+            if (m_sigDetermQueue.size() > m_sigDetermHighWater) {
+                m_sigDetermHighWater = m_sigDetermQueue.size();
+            }
         }
         m_sigDetermCv.notify_one();
     }
@@ -2634,16 +2734,23 @@ public:
                 return;
             }
             if (m_deferredQueue.size() >= kMaxDeferredQueue) {
-                // Never grow without bound. Losing the oldest entry is visible
-                // rather than silent so the backlog can be tuned.
-                Utils::Logger::Warn(
-                    "RealTimeProtection: deferred deep-scan queue full ({}); dropping oldest",
-                    kMaxDeferredQueue);
+                // Never grow without bound. A dropped entry is the one thing in
+                // this subsystem that is genuinely lost coverage - the file's
+                // deep analysis will not happen - so it is counted, not merely
+                // mentioned, and the count survives in the periodic capacity
+                // report where a log line in a burst would not be read.
+                m_stats.deepScanQueueDropped++;
+                ReportQueueFull("deferred deep-scan", kMaxDeferredQueue,
+                                m_deferredFullLastWarn, m_deferredFullSuppressed,
+                                "the deep analysis of the dropped file will not run");
                 m_deferredSeen.erase(m_deferredQueue.front().first);
                 m_deferredQueue.pop_front();
             }
             m_deferredQueue.emplace_back(filePath, processId);
             m_deferredSeen.insert(filePath);
+            if (m_deferredQueue.size() > m_deferredHighWater) {
+                m_deferredHighWater = m_deferredQueue.size();
+            }
         }
         // Counted here rather than at the call sites. The statistic previously
         // only incremented on the budget-exceeded path, so once every scanned
@@ -5398,6 +5505,129 @@ public:
         Utils::Logger::Info("RealTimeProtection: Health check thread exiting");
     }
 
+    // Difference between a monotonic counter and a stored baseline, without the
+    // unsigned underflow that makes a reset look like 18 quintillion events.
+    //
+    // A counter going BACKWARDS is not corruption here - ResetStatistics() is a
+    // supported operation - so the honest answer for that sample is "no delta
+    // available", not a wrapped number and not a fabricated one. The caller then
+    // re-baselines and the next sample is correct again.
+    [[nodiscard]] static uint64_t DeltaSince(uint64_t current, uint64_t baseline) noexcept {
+        return current >= baseline ? current - baseline : 0;
+    }
+
+    // One line answering "is this machine keeping up?".
+    //
+    // WHY THIS EXISTS: every capacity problem this product has had was diagnosed
+    // after the fact by decoding a 64 MB trace ring, because nothing reported the
+    // two numbers that would have named it immediately - how much of the scan
+    // pool was occupied, and how deep the backlogs were. A freeze was therefore
+    // indistinguishable from idleness in the log until the machine was already
+    // unusable. Reading a ring requires a hang to have happened; this line lets
+    // the degradation be seen while it is still only degradation.
+    //
+    // WHAT ESCALATES AND WHY: the pool having no free worker for one sample is
+    // normal - that is what a pool is for. The same state across several
+    // consecutive samples means arriving work is outpacing completion, which on
+    // this product means file operations elsewhere on the machine are waiting.
+    // Only the sustained condition is a warning. Dropped deep scans are warned on
+    // immediately and unconditionally, because that is the one number here that
+    // means analysis will never happen rather than happen later.
+    void ReportCapacity() {
+        const auto pool = Core::Engine::ScanEngine::Instance().GetScanPoolHealth();
+
+        size_t deepDepth = 0, deepPeak = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_deferredMutex);
+            deepDepth = m_deferredQueue.size();
+            deepPeak  = m_deferredHighWater;
+        }
+
+        size_t trustDepth = 0, trustPeak = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_sigDetermMutex);
+            trustDepth = m_sigDetermQueue.size();
+            trustPeak  = m_sigDetermHighWater;
+        }
+
+        const uint64_t deepDropped  = m_stats.deepScanQueueDropped.load(std::memory_order_relaxed);
+        const uint64_t trustDropped = m_stats.sigDetermQueueDropped.load(std::memory_order_relaxed);
+        const uint64_t cached       = m_stats.signatureVerdictsCached.load(std::memory_order_relaxed);
+        const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
+        const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
+        const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
+
+        // Saturation is "no worker free AND work waiting". Busy-with-nothing-queued
+        // is a fully used pool keeping up, which is the desired state, not a
+        // problem - reporting that as saturation would train the reader to ignore
+        // this line.
+        const bool saturated =
+            pool.valid && pool.threadCount > 0 &&
+            pool.busyThreads >= pool.threadCount && pool.queuedTasks > 0;
+
+        if (saturated) {
+            ++m_poolSaturatedSamples;
+        } else {
+            m_poolSaturatedSamples = 0;
+        }
+
+        // Three consecutive samples at the 5 s stats interval is ~15 s of
+        // continuous saturation. Chosen, not measured: short enough to precede a
+        // user-visible stall, long enough that a burst of file activity does not
+        // trip it. The sample count is printed so the threshold can be judged
+        // against what actually happened rather than argued about.
+        constexpr uint32_t kSustainedSaturationSamples = 3;
+
+        const uint64_t newDeepDrops  = DeltaSince(deepDropped, m_reportBaselineDeepDropped);
+        const uint64_t newTrustDrops = DeltaSince(trustDropped, m_reportBaselineTrustDropped);
+
+        const bool somethingToSay =
+            saturated || newDeepDrops > 0 || newTrustDrops > 0 ||
+            deepDepth > 0 || trustDepth > 0 ||
+            DeltaSince(m_stats.totalScans.load(std::memory_order_relaxed),
+                       m_reportBaselineCapacityScans) > 0;
+
+        // An idle machine stays quiet. Without this the log fills with identical
+        // all-zero lines, and a report nobody reads is not observability.
+        if (!somethingToSay) return;
+
+        const std::string poolPart = pool.valid
+            ? std::format("pool={}/{} busy queued={}/{}",
+                          pool.busyThreads, pool.threadCount,
+                          pool.queuedTasks, pool.queueCapacity)
+            : std::string("pool=unavailable");
+
+        const auto line = std::format(
+            "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
+            "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
+            "metamorphicTruncated={} packerDeferred={} processNotifyBudgetExceeded={}",
+            poolPart,
+            deepDepth, deepPeak, deepDropped, newDeepDrops,
+            trustDepth, trustPeak, trustDropped, newTrustDrops,
+            cached, metaTrunc, packerDef, notifyBudget);
+
+        if (newDeepDrops > 0) {
+            // Lost coverage. Always a warning, never rate limited here: this is
+            // one line per sample interval, not one per event.
+            Utils::Logger::Warn(
+                "{} -- {} deep scan(s) were DROPPED, not deferred: that analysis "
+                "will not run. The queue is draining slower than it fills",
+                line, newDeepDrops);
+        } else if (m_poolSaturatedSamples >= kSustainedSaturationSamples) {
+            Utils::Logger::Warn(
+                "{} -- scan pool has had no free worker with work waiting for {} "
+                "consecutive samples: file operations are queuing behind it",
+                line, m_poolSaturatedSamples);
+        } else {
+            Utils::Logger::Info("{}", line);
+        }
+
+        m_reportBaselineDeepDropped  = deepDropped;
+        m_reportBaselineTrustDropped = trustDropped;
+        m_reportBaselineCapacityScans =
+            m_stats.totalScans.load(std::memory_order_relaxed);
+    }
+
     void StatsUpdateLoop() {
         Utils::Logger::Info("RealTimeProtection: Stats update thread started");
 
@@ -5433,11 +5663,9 @@ public:
                 const uint64_t threats   = m_stats.threatsDetected.load(std::memory_order_relaxed);
                 const uint64_t blocked   = m_stats.filesBlocked.load(std::memory_order_relaxed);
 
-                static uint64_t s_lastScans = 0;
-                static uint64_t s_lastDeferred = 0;
-                static uint64_t s_lastErrors = 0;
-
-                if (scans != s_lastScans || deferred != s_lastDeferred || errors != s_lastErrors) {
+                if (scans != m_reportBaselineScans ||
+                    deferred != m_reportBaselineDeferred ||
+                    errors != m_reportBaselineErrors) {
                     size_t queueDepth = 0;
                     {
                         std::lock_guard<std::mutex> lock(m_deferredMutex);
@@ -5447,19 +5675,21 @@ public:
                         "RealTimeProtection: on-access pipeline - scans={} (+{}) clean={} "
                         "suspicious={} infected={} errors={} threats={} blocked={} "
                         "deepScansDeferred={} (+{}) queueDepth={}",
-                        scans, scans - s_lastScans,
+                        scans, DeltaSince(scans, m_reportBaselineScans),
                         m_stats.cleanFiles.load(std::memory_order_relaxed),
                         m_stats.suspiciousFiles.load(std::memory_order_relaxed),
                         m_stats.infectedFiles.load(std::memory_order_relaxed),
                         errors, threats, blocked,
-                        deferred, deferred - s_lastDeferred,
+                        deferred, DeltaSince(deferred, m_reportBaselineDeferred),
                         queueDepth);
 
-                    s_lastScans = scans;
-                    s_lastDeferred = deferred;
-                    s_lastErrors = errors;
+                    m_reportBaselineScans = scans;
+                    m_reportBaselineDeferred = deferred;
+                    m_reportBaselineErrors = errors;
                 }
             }
+
+            ReportCapacity();
         }
 
         Utils::Logger::Info("RealTimeProtection: Stats update thread exiting");
@@ -5564,9 +5794,53 @@ public:
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastRateCalcTime).count();
         if (elapsed > 0) {
             uint64_t currentScans = m_performanceMetrics.totalScans.load();
-            m_performanceMetrics.scansPerSecond = (currentScans - m_lastTotalScansForRate) / static_cast<uint64_t>(elapsed);
+            // DeltaSince, not a bare subtraction. ResetStatistics() zeroes
+            // totalScans without touching this baseline, so the next sample
+            // computed 0 - <large> on unsigned arithmetic and published a
+            // scans-per-second figure around 1.8e19. Same defect class as the
+            // static-local baselines in the reporting loop.
+            m_performanceMetrics.scansPerSecond =
+                DeltaSince(currentScans, m_lastTotalScansForRate) /
+                static_cast<uint64_t>(elapsed);
             m_lastTotalScansForRate = currentScans;
             m_lastRateCalcTime = now;
+        }
+
+        // Outstanding analysis, so that pendingScanCount stops being a constant.
+        //
+        // pendingScanQueue and maxQueueDepth were declared, reset, and NEVER
+        // WRITTEN by anything. pendingScanCount below reads the first one, so the
+        // product's status surface reported "0 scans pending" unconditionally -
+        // including, provably, throughout a 190-second period in which every file
+        // operation on the machine was blocked. A field that always says healthy
+        // is worse than an absent field, because it argues against the symptom.
+        //
+        // DEFINITION, stated because it is a choice and not the only one: this is
+        // analysis this process has ACCEPTED and not yet PERFORMED - tasks waiting
+        // for a scan worker, plus both deferral backlogs. It deliberately excludes
+        // requests still in the kernel's queue, which we cannot see from here, so
+        // it is a lower bound and must not be read as the total work in flight.
+        {
+            size_t pending = 0;
+
+            const auto pool = Core::Engine::ScanEngine::Instance().GetScanPoolHealth();
+            if (pool.valid) pending += pool.queuedTasks;
+
+            {
+                std::lock_guard<std::mutex> lock(m_deferredMutex);
+                pending += m_deferredQueue.size();
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_sigDetermMutex);
+                pending += m_sigDetermQueue.size();
+            }
+
+            m_performanceMetrics.pendingScanQueue =
+                static_cast<uint32_t>(std::min<size_t>(pending, UINT32_MAX));
+            if (pending > m_performanceMetrics.maxQueueDepth.load()) {
+                m_performanceMetrics.maxQueueDepth =
+                    static_cast<uint32_t>(std::min<size_t>(pending, UINT32_MAX));
+            }
         }
 
         // Update protection status
@@ -5815,6 +6089,20 @@ void RTPStatistics::Reset() noexcept {
     excludedByExtension = 0;
     excludedByProcess = 0;
     excludedByHash = 0;
+    // Capacity and deferral counters. These were added after this function was
+    // written and were not added to it, which left ResetStatistics() producing a
+    // block where most counters were zero and these seven still carried values
+    // from before the reset. Any rate or ratio computed after a reset was then
+    // wrong in a way nothing would report, and the delta logging below would
+    // underflow against a stale baseline. Every counter in the struct must be
+    // listed here; a partial reset is worse than none because it looks complete.
+    scansDeferred = 0;
+    signatureVerdictsCached = 0;
+    metamorphicTruncated = 0;
+    packerDeferred = 0;
+    processNotifyBudgetExceeded = 0;
+    deepScanQueueDropped = 0;
+    sigDetermQueueDropped = 0;
     threatsDetected = 0;
     performance.Reset();
     lastReset = std::chrono::system_clock::now();

@@ -898,6 +898,21 @@ struct alignas(64) RTPStatistics {
 
     // Exclusion statistics
     std::atomic<uint64_t> excludedByPath{ 0 };
+    std::atomic<uint64_t> excludedByExtension{ 0 };
+    std::atomic<uint64_t> excludedByProcess{ 0 };
+    std::atomic<uint64_t> excludedByHash{ 0 };
+
+    // ------------------------------------------------------------------------
+    // Capacity and deferral statistics
+    //
+    // Everything the fast paths move off the blocking path is counted here.
+    // These are grouped deliberately: read on their own each one is just a
+    // number, but read together they answer the only question that matters
+    // when this product misbehaves - is work being DEFERRED, or DROPPED?
+    // Deferral is a design choice; dropping is lost coverage. The pair of
+    // queue-drop counters below is the boundary between the two.
+    // ------------------------------------------------------------------------
+
     /// @brief Scans whose deep stages were handed to the background deep-scan
     ///        queue instead of holding the originating file operation open.
     ///        Counts EVERY deferral, not only budget overruns: the on-access
@@ -938,9 +953,24 @@ struct alignas(64) RTPStatistics {
     ///        the budget is too tight or a detector is misbehaving, and it names the
     ///        stage in the log so the next question is answerable.
     std::atomic<uint64_t> processNotifyBudgetExceeded{ 0 };
-    std::atomic<uint64_t> excludedByExtension{ 0 };
-    std::atomic<uint64_t> excludedByProcess{ 0 };
-    std::atomic<uint64_t> excludedByHash{ 0 };
+
+    /// @brief Deep-scan deferrals discarded because the queue was already full.
+    ///        THIS IS THE ONE COUNTER HERE THAT MEANS LOST COVERAGE. Every other
+    ///        number in this block records analysis that moved in time; this one
+    ///        records analysis that will not happen at all, because the file was
+    ///        evicted before a worker reached it. It existed only as a log line
+    ///        before, which meant the question "did we drop any?" could only be
+    ///        answered by grepping and counting text - and a burst of drops is
+    ///        exactly when nobody is reading the log.
+    std::atomic<uint64_t> deepScanQueueDropped{ 0 };
+
+    /// @brief Signature-trust determinations discarded because the queue was full.
+    ///        Less severe than a dropped deep scan: nothing is unexamined, the
+    ///        trust cache simply warms more slowly and those files take the full
+    ///        local pipeline again on their next access. Counted separately for
+    ///        exactly that reason - conflating it with lost coverage would
+    ///        overstate the harm and hide the one number that does mean harm.
+    std::atomic<uint64_t> sigDetermQueueDropped{ 0 };
 
     // Threat detection counter (unified across all detection methods)
     std::atomic<uint64_t> threatsDetected{ 0 };

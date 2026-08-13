@@ -4086,7 +4086,11 @@ ScanEngine::PerformanceMetrics ScanEngine::GetPerformanceMetrics() const {
 
     {
         std::shared_lock lock(m_impl->m_jobMutex);
-        metrics.activeThreads = m_impl->m_threadPool ? m_impl->m_threadPool->GetThreadCount() : 0;
+        // GetActiveThreadCount, not GetThreadCount. This field previously held
+        // the total pool size, so it read as a fully-staffed pool at all times
+        // and could never distinguish an idle machine from a saturated one.
+        metrics.activeThreads = m_impl->m_threadPool
+            ? m_impl->m_threadPool->GetActiveThreadCount() : 0;
         metrics.queuedJobs = 0;
         metrics.completedJobs = 0;
 
@@ -4106,6 +4110,30 @@ ScanEngine::PerformanceMetrics ScanEngine::GetPerformanceMetrics() const {
     }
 
     return metrics;
+}
+
+ScanEngine::ScanPoolHealth ScanEngine::GetScanPoolHealth() const {
+    ScanPoolHealth health{};
+
+    // No pool means no capacity, which is a different statement from an idle
+    // pool. Leaving valid == false forces the caller to say which it is instead
+    // of reporting a comfortable row of zeroes.
+    if (!m_impl || !m_impl->m_threadPool) return health;
+
+    // Deliberately does not take m_jobMutex. Every value below comes from an
+    // atomic or from the queue's own synchronisation, and this is called from a
+    // periodic reporting path: taking the mutex that scan submission uses in
+    // order to ask "is scan submission backed up" would let the observer add to
+    // the contention it is measuring.
+    const auto& pool = *m_impl->m_threadPool;
+    health.valid         = true;
+    health.threadCount   = pool.GetThreadCount();
+    health.busyThreads   = pool.GetActiveThreadCount();
+    health.idleThreads   = pool.GetIdleThreadCount();
+    health.queuedTasks   = pool.GetQueueSize();
+    health.queueCapacity = pool.GetQueueCapacity();
+
+    return health;
 }
 
 bool ScanEngine::SelfTest() {

@@ -1056,6 +1056,40 @@ public:
     [[nodiscard]] PerformanceMetrics GetPerformanceMetrics() const;
 
     /**
+     * @brief Live occupancy of the worker pool that actually executes scans.
+     *
+     * This exists because the pool is the machine's real scan capacity and
+     * nothing outside this class could see it. Every diagnosis of the
+     * system-wide freeze had to infer pool state from scan durations in a trace
+     * ring, because the only field that named it - PerformanceMetrics::activeThreads -
+     * was assigned the TOTAL thread count, so it could never show saturation.
+     *
+     * ACCURACY, STATED RATHER THAN IMPLIED: busyThreads and idleThreads are
+     * sampled by ThreadPool::MonitoringLoop once per second, so they are a
+     * one-second-granularity sample and not an instantaneous count. That is fine
+     * for answering "is the pool saturated for a sustained period", which is the
+     * question that matters, and wrong for anything finer. queuedTasks is read
+     * live from the queue.
+     *
+     * A pool with busyThreads == threadCount and queuedTasks > 0 is out of
+     * capacity: every further scan request waits, and on this product a waiting
+     * scan request means a file operation somewhere on the machine is blocked.
+     */
+    struct ScanPoolHealth {
+        /// @brief False when no pool exists yet; every other field is then zero
+        ///        and must not be read as "an idle pool", which is what a plain
+        ///        zeroed struct would look like.
+        bool   valid{ false };
+        size_t threadCount{ 0 };   ///< Live worker threads.
+        size_t busyThreads{ 0 };   ///< Executing a task (1 s sample).
+        size_t idleThreads{ 0 };   ///< Waiting for work (1 s sample).
+        size_t queuedTasks{ 0 };   ///< Tasks waiting for a worker (live).
+        size_t queueCapacity{ 0 }; ///< Configured maximum queue depth.
+    };
+
+    [[nodiscard]] ScanPoolHealth GetScanPoolHealth() const;
+
+    /**
      * @brief Run engine self-test.
      * @return True if all subsystems pass.
      */
