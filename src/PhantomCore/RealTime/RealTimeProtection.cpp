@@ -3151,6 +3151,23 @@ public:
                 ~static_cast<uint32_t>(
                     ShadowStrike::AntiEvasion::PackerAnalysisFlags::EnableSignatureVerification));
 
+            // Bound the two dimensions that were left at offline-sweep defaults.
+            //
+            // timeoutMs defaulted to 30 seconds and maxFileSize to 500 MB, on a
+            // path where a kernel thread is parked inside FltSendMessage holding an
+            // IRP_MJ_CREATE. Entropy, overlay and resource analysis are all linear
+            // in file size, so those defaults describe a sweep, not an in-line
+            // verdict. An earlier trace measured p50 0.1 ms and a 0.6 ms maximum
+            // here, which is why this has not yet been felt - but that reflects the
+            // files in that run, and MetamorphicDetector demonstrated on this exact
+            // path what an unenforced budget costs when a big input finally arrives.
+            //
+            // 32 MB is a bound on WORK, not on coverage: a larger file is not
+            // skipped, it is handed to the deferred stage below, which runs with the
+            // full defaults off the kernel's thread.
+            pdConfig.timeoutMs = 50u;
+            pdConfig.maxFileSize = 32ull * 1024ull * 1024ull;
+
             ShadowStrike::AntiEvasion::PackerError pdErr{};
             SS_DIAG_SCOPE("OnAccess", "PackerDetector::AnalyzeFile");
             auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr);
@@ -3158,6 +3175,15 @@ public:
                 Utils::Logger::Warn(
                     "RealTimeProtection: PackerDetector analysis failed for {}  -  error={} {}",
                     Utils::StringUtils::ToNarrow(filePath.substr(0, 120)), pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
+            }
+            if (!packResult.analysisComplete || packResult.analysisTruncated) {
+                // Either the in-line budget stopped it or the file exceeded the
+                // in-line size bound, so this file has NOT been cleared of packing -
+                // it was not fully examined. Re-run it off the kernel's thread with
+                // the full defaults. Without this the two bounds set above would
+                // trade detection for latency, silently.
+                m_stats.packerDeferred++;
+                QueueDeferredDeepScan(filePath, req.ProcessId);
             }
             if (packResult.isPacked) {
                 fileIsPacked = true;

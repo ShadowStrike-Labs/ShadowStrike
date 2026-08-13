@@ -1173,7 +1173,10 @@ public:
             result
         );
 
-        if (config.enableCaching) {
+        // A truncated analysis must never be cached: the cache answers later
+        // queries without re-analysing, so one exhausted budget would become a
+        // permanent partial verdict for that file.
+        if (config.enableCaching && !result.analysisTruncated) {
             UpdateCache(filePath, result);
         }
 
@@ -1195,7 +1198,9 @@ public:
         result.analysisEndTime = std::chrono::system_clock::now();
         result.analysisDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             result.analysisEndTime - result.analysisStartTime).count();
-        result.analysisComplete = true;
+        // Reports what happened rather than asserting success: a run that stopped
+        // on its time budget previously still described itself as complete.
+        result.analysisComplete = !result.analysisTruncated;
 
         m_stats.totalAnalysisTimeUs.fetch_add(
             result.analysisDurationMs * 1000, std::memory_order_relaxed);
@@ -1228,7 +1233,9 @@ public:
         result.analysisEndTime = std::chrono::system_clock::now();
         result.analysisDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             result.analysisEndTime - result.analysisStartTime).count();
-        result.analysisComplete = true;
+        // Reports what happened rather than asserting success: a run that stopped
+        // on its time budget previously still described itself as complete.
+        result.analysisComplete = !result.analysisTruncated;
 
         return result;
     }
@@ -2308,39 +2315,84 @@ private:
 
         result.isDotNetAssembly = peInfo.isDotNet;
 
+        // ENFORCE THE TIME BUDGET THIS CONFIG HAS ALWAYS ADVERTISED.
+        //
+        // PackerAnalysisConfig::timeoutMs (default PackerConstants::
+        // DEFAULT_SCAN_TIMEOUT_MS = 30000) was declared and documented and never
+        // read: before this change the string "timeoutMs" did not appear anywhere
+        // in this 4,375-line implementation, and neither did steady_clock. This is
+        // the same defect that let MetamorphicDetector run for 10.97 seconds on
+        // the on-access path against a 50 ms budget it had been given, and this
+        // module runs on that same path, so it is fixed here for the same reason
+        // rather than waiting for it to be measured.
+        //
+        // Why it has not bitten yet, stated honestly: the on-access site requests
+        // Standard depth, which is header-level work, and a field trace measured
+        // p50 0.1 ms and a 0.6 ms maximum. But maxFileSize defaults to 500 MB, and
+        // entropy, overlay and resource analysis are all linear in file size, so
+        // that measurement reflects the files in that run rather than a guarantee.
+        //
+        // timeoutMs == 0 means no limit, which is what an offline sweep wants.
+        const auto analysisStart = std::chrono::steady_clock::now();
+        const bool hasDeadline = (config.timeoutMs > 0);
+        const auto deadline =
+            analysisStart + std::chrono::milliseconds(config.timeoutMs);
+
+        const auto outOfTime = [&](const wchar_t* stage) -> bool {
+            if (!hasDeadline || std::chrono::steady_clock::now() < deadline) {
+                return false;
+            }
+            result.analysisTruncated = true;
+            result.errors.push_back({
+                static_cast<uint32_t>(ERROR_TIMEOUT),
+                std::wstring(L"Analysis budget of ") +
+                    std::to_wstring(config.timeoutMs) +
+                    L" ms exhausted; remaining stages did not run",
+                stage });
+            return true;
+        };
+
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableEntropyAnalysis)) {
             AnalyzeEntropyInternal(buffer, size, peInfo, result);
         }
 
+        if (outOfTime(L"EnableSectionAnalysis")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableSectionAnalysis)) {
             AnalyzeSectionsInternal(buffer, size, peInfo, result);
         }
 
+        if (outOfTime(L"EnableEPSignature")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableEPSignature)) {
             AnalyzeEntryPointInternal(buffer, size, peInfo, parser, result);
         }
 
+        if (outOfTime(L"EnableImportAnalysis")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableImportAnalysis)) {
             AnalyzeImportsInternal(parser, result);
         }
 
+        if (outOfTime(L"EnableOverlayAnalysis")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableOverlayAnalysis)) {
             AnalyzeOverlayInternal(buffer, size, peInfo, result);
         }
 
+        if (outOfTime(L"EnableRichHeaderAnalysis")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableRichHeaderAnalysis)) {
             AnalyzeRichHeaderInternal(parser, result);
         }
 
+        if (outOfTime(L"EnableResourceAnalysis")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableResourceAnalysis)) {
             AnalyzeResourcesInternal(parser, buffer, size, result);
         }
 
+        if (outOfTime(L"EnableSignatureVerification")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableSignatureVerification) &&
             !filePath.empty()) {
             (void)VerifySignature(filePath, result.signatureInfo, nullptr);
         }
 
+        if (outOfTime(L"EnableYARAScanning")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableYARAScanning) &&
             m_signatureStore && !filePath.empty()) {
             std::vector<PackerMatch> yaraMatches;
@@ -2350,10 +2402,14 @@ private:
             }
         }
 
+        if (outOfTime(L"EnableHeuristicAnalysis")) { return; }
         if (HasFlag(config.flags, PackerAnalysisFlags::EnableHeuristicAnalysis)) {
             PerformHeuristicAnalysis(buffer, size, peInfo, result);
         }
 
+        // IsInstaller opens the file by path, so it is I/O on a path that may be
+        // holding a kernel operation open. It is bounded by the same deadline.
+        if (outOfTime(L"IsInstaller")) { return; }
         if (!filePath.empty()) {
             std::wstring installerType;
             if (IsInstaller(filePath, installerType, nullptr)) {

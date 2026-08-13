@@ -1719,6 +1719,16 @@ namespace ShadowStrike {
             /// @brief Analysis completed
             bool analysisComplete = false;
 
+            /// @brief True when analysis stopped early on the time budget in
+            ///        PackerAnalysisConfig::timeoutMs.
+            ///
+            /// Incomplete, NOT negative: the stages that had not run yet did not
+            /// find an absence of packing, they never looked. !isPacked on a
+            /// truncated result therefore means "undetermined", and a caller on a
+            /// latency-sensitive path must re-examine the file where the full
+            /// budget applies rather than treat it as unpacked.
+            bool analysisTruncated = false;
+
             /// @brief From cache
             bool fromCache = false;
 
@@ -1805,6 +1815,7 @@ namespace ShadowStrike {
                 config = {};
                 errors.clear();
                 analysisComplete = false;
+                analysisTruncated = false;
                 fromCache = false;
             }
         };

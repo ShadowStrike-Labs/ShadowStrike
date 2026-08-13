@@ -922,6 +922,13 @@ struct alignas(64) RTPStatistics {
     ///        actual detection work, which is a very different operating regime
     ///        from the budget rarely being reached.
     std::atomic<uint64_t> metamorphicTruncated{ 0 };
+
+    /// @brief On-access packer analyses that did not complete in line - budget
+    ///        exhausted or file over the in-line size bound - and were requeued
+    ///        for full off-path analysis. Same reasoning as metamorphicTruncated:
+    ///        it distinguishes "the bound is rarely reached" from "the deferred
+    ///        queue is quietly doing all the real work".
+    std::atomic<uint64_t> packerDeferred{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
     std::atomic<uint64_t> excludedByProcess{ 0 };
     std::atomic<uint64_t> excludedByHash{ 0 };
