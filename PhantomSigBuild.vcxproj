@@ -127,6 +127,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ResourceCompile Include="tools\phantom-sigbuild\sigbuild.rc" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="PhantomCoreLib.vcxproj">
       <Project>{8A5C6B4D-2E1F-4A3B-9C7D-0E1F2A3B4C5D}</Project>
     </ProjectReference>

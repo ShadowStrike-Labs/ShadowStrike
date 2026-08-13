@@ -119,6 +119,10 @@
        IconResourceForState() so the wiring is forward-compatible. -->
   <ItemGroup>
     <ResourceCompile Include="src\Products\Community\PhantomHome\UI\Tray\tray.rc" />
+    <!-- Separate from tray.rc, which is excluded from the build until the .ico
+         files exist. Keeping the version block out of that file means the binary
+         is versioned regardless of the artwork. -->
+    <ResourceCompile Include="src\Products\Community\PhantomHome\UI\Tray\tray_version.rc" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

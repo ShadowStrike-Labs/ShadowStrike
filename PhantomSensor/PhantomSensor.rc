@@ -1,0 +1,29 @@
+// PhantomSensor.rc - version resource for PhantomSensor.sys.
+//
+// The kernel sensor shipped with no version information, which is worse for a
+// driver than for an executable: driver-enumeration tools, msinfo32's driver list,
+// Autoruns, and the driver store all read VERSIONINFO, so an anonymous .sys is a
+// .sys that looks like something to be suspicious of. On a product whose entire
+// argument is auditability, the ring-0 component being the least identifiable file
+// in the install is the wrong way round.
+//
+// FILETYPE is VFT_DRV, not the VFT_APP default. Tools that list drivers filter on
+// it, so a driver declaring itself an application is a driver those tools omit.
+//
+// THIS ADDS NO CODE AND NO RUNTIME BEHAVIOUR. A version resource is read-only data
+// in a PE resource section; nothing in the driver reads it and nothing executes.
+// It does change the binary, so the .sys must be re-signed and the catalog
+// regenerated - which the deploy pipeline already does on every build.
+//
+// NOT the same number as SHADOWSTRIKE_VERSION_MAJOR/MINOR/BUILD in
+// PhantomSensor/Shared/SharedDefs.h (3.0.0). That one is reported to user mode in
+// the driver-status message and is part of a kernel/user contract; this one is the
+// product version a human reads off the file. They are different things and are
+// deliberately left as different values.
+
+#define SS_RC_FILE_DESCRIPTION  "ShadowStrike PhantomSensor Kernel Filter"
+#define SS_RC_INTERNAL_NAME     "PhantomSensor"
+#define SS_RC_ORIGINAL_FILENAME "PhantomSensor.sys"
+#define SS_RC_FILETYPE          VFT_DRV
+
+#include "../src/VersionInfo.rc.inc"

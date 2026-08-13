@@ -1,0 +1,13 @@
+// Service.rc - version resource for ShadowStrikePhantomService.exe.
+//
+// The service is the process that loads the kernel driver, holds the minifilter
+// port, and quarantines files. It carried no version information at all, so a
+// user looking at the one process on their machine with that much authority could
+// not tell what it was, who published it, or which build was running - and
+// neither could a support conversation about a freeze.
+
+#define SS_RC_FILE_DESCRIPTION  "ShadowStrike Phantom Protection Service"
+#define SS_RC_INTERNAL_NAME     "ShadowStrikePhantomService"
+#define SS_RC_ORIGINAL_FILENAME "ShadowStrikePhantomService.exe"
+
+#include "../../VersionInfo.rc.inc"

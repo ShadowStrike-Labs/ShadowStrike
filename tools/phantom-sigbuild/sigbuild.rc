@@ -1,0 +1,12 @@
+// sigbuild.rc - version resource for phantom-sigbuild.exe.
+//
+// Build-time tooling rather than a shipped binary, but it is the thing that
+// produces signatures.sdb, and the version of the tool that built a database is
+// the first question to ask when a database misbehaves. Stamping it costs nothing
+// and means the answer is in the file rather than in somebody's memory.
+
+#define SS_RC_FILE_DESCRIPTION  "ShadowStrike Phantom Signature Database Builder"
+#define SS_RC_INTERNAL_NAME     "phantom-sigbuild"
+#define SS_RC_ORIGINAL_FILENAME "phantom-sigbuild.exe"
+
+#include "../../src/VersionInfo.rc.inc"

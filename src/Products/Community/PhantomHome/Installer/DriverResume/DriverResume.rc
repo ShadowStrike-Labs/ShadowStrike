@@ -1,0 +1,13 @@
+// DriverResume.rc - version resource for ShadowStrikeDriverResume.exe.
+//
+// This one matters more than its size suggests: it runs during installation and
+// after a reboot to bring the kernel sensor back up, so it is a small unsigned-
+// looking executable that starts a driver. That is exactly the profile another
+// security product flags, and exactly the profile a user is right to be wary of.
+// Saying who published it and what it is for is part of being installable.
+
+#define SS_RC_FILE_DESCRIPTION  "ShadowStrike Phantom Driver Resume Helper"
+#define SS_RC_INTERNAL_NAME     "ShadowStrikeDriverResume"
+#define SS_RC_ORIGINAL_FILENAME "ShadowStrikeDriverResume.exe"
+
+#include "../../../../../VersionInfo.rc.inc"

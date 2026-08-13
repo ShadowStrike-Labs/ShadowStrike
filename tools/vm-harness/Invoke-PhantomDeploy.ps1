@@ -64,7 +64,35 @@ $ResultsDir  = Join-Path $AutoDir  'results'
 $MSBuild     = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 $MsiOut      = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.msi'
 $BundleOut   = Join-Path $BuildDir 'ShadowStrikePhantom-Home-Setup.exe'
-$ProductVersion = '1.0.91'
+# Product version, read from src\VersionInfo.h rather than repeated here.
+#
+# It used to be the literal '1.0.91' on this line, while the only resource script
+# in the tree said 1.0.0.0 and the WiX sources carried their own default. Three
+# copies, no agreement, and nothing that would notice. The header is now the one
+# place the version is written down and every binary's VERSIONINFO comes from it,
+# so this script must read it rather than assert it.
+#
+# A parse failure is fatal on purpose. Falling back to a literal is precisely how
+# the previous mismatch survived: the deploy would keep working while stamping the
+# wrong number onto the MSI.
+$VersionHeader = Join-Path $RepoRoot 'src\VersionInfo.h'
+if (-not (Test-Path $VersionHeader)) {
+    throw "Cannot determine the product version: $VersionHeader is missing."
+}
+$verText = Get-Content $VersionHeader -Raw
+$verParts = @{}
+foreach ($field in @('MAJOR','MINOR','PATCH','BUILD')) {
+    $m = [regex]::Match($verText, ('#define\s+SS_VERSION_' + $field + '\s+(\d+)'))
+    if (-not $m.Success) {
+        throw "Cannot parse SS_VERSION_$field from $VersionHeader."
+    }
+    $verParts[$field] = $m.Groups[1].Value
+}
+# MSI ProductVersion is major.minor.build with at most three fields honoured by
+# Windows Installer for upgrade comparisons, so the fourth number is deliberately
+# not included here even though the binaries carry it.
+$ProductVersion = '{0}.{1}.{2}' -f $verParts['MAJOR'], $verParts['MINOR'], $verParts['PATCH']
+$FileVersionFull = '{0}.{1}.{2}.{3}' -f $verParts['MAJOR'], $verParts['MINOR'], $verParts['PATCH'], $verParts['BUILD']
 $SigningDir  = Join-Path $RepoRoot 'packaging\signing'
 $DevPfxPath  = Join-Path $SigningDir 'ShadowStrike-Dev.pfx'
 $DevCerPath  = Join-Path $SigningDir 'ShadowStrike-Dev.cer'

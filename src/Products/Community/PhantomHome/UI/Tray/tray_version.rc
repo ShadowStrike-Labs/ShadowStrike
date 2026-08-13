@@ -1,0 +1,15 @@
+// tray_version.rc - version resource for ShadowStrikePhantomTray.exe.
+//
+// Kept separate from tray.rc on purpose. tray.rc is ExcludedFromBuild because the
+// multi-resolution .ico files it references have never been generated, so putting
+// the version block there would have made the version depend on unrelated artwork
+// - the whole binary would go on shipping with no version information until
+// somebody ran ImageMagick. Two resource scripts in one binary is fine as long as
+// their resource IDs do not collide, and these do not: this file defines only
+// VS_VERSION_INFO and tray.rc defines only icons.
+
+#define SS_RC_FILE_DESCRIPTION  "ShadowStrike Phantom Tray"
+#define SS_RC_INTERNAL_NAME     "ShadowStrikePhantomTray"
+#define SS_RC_ORIGINAL_FILENAME "ShadowStrikePhantomTray.exe"
+
+#include "../../../../../VersionInfo.rc.inc"

@@ -137,6 +137,12 @@
     </ClCompile>
   </ItemGroup>
 
+  <!-- Version resource. Sourced from src\VersionInfo.h so the version is written
+       down once for every binary; see that header for why. -->
+  <ItemGroup>
+    <ResourceCompile Include="src\PhantomCore\Service\Service.rc" />
+  </ItemGroup>
+
   <!-- PhantomHome product modules -->
   <ItemGroup>
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupManager.cpp" />

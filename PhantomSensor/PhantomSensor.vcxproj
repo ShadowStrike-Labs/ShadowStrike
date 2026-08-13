@@ -160,6 +160,11 @@
   <ItemGroup>
     <Inf Include="PhantomSensor.inf" />
   </ItemGroup>
+  <!-- Version resource. Data only - no code, no runtime behaviour. See
+       PhantomSensor.rc for why a driver in particular needs one. -->
+  <ItemGroup>
+    <ResourceCompile Include="PhantomSensor.rc" />
+  </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>

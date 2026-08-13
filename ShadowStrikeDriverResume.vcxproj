@@ -122,6 +122,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ResourceCompile Include="src\Products\Community\PhantomHome\Installer\DriverResume\DriverResume.rc" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\DriverInstaller.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\TestSigningPivot.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Installer\DriverResume\RootCertInstall.hpp" />
