@@ -267,7 +267,16 @@ bool VerifySignature(const fs::path& filePath) {
         winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
         winTrustData.hWVTStateData = nullptr;
         winTrustData.pwszURLReference = nullptr;
-        winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+        // Cache-only: WTD_REVOKE_NONE suppresses CRL/OCSP but chain building still
+    // resolves missing intermediates over the network via the Authority
+    // Information Access extension, so this flag is what actually keeps the call
+    // local. This decides whether an application asking for the microphone is
+    // signed, which gates a privacy prompt the user is waiting on - a network
+    // fetch here stalls that prompt for as long as the retrieval takes.
+    // Signature cryptography is unchanged; an unresolvable intermediate reports
+    // an incomplete chain and is treated as unverified, which is the safe way to
+    // be wrong for a privacy decision.
+    winTrustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
         winTrustData.dwUIContext = 0;
         winTrustData.pFile = &fileInfo;
 
@@ -305,7 +314,16 @@ std::string GetPublisher(const fs::path& filePath) {
         winTrustData.fdwRevocationChecks = WTD_REVOKE_NONE;
         winTrustData.dwUnionChoice = WTD_CHOICE_FILE;
         winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
-        winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+        // Cache-only: WTD_REVOKE_NONE suppresses CRL/OCSP but chain building still
+    // resolves missing intermediates over the network via the Authority
+    // Information Access extension, so this flag is what actually keeps the call
+    // local. This decides whether an application asking for the microphone is
+    // signed, which gates a privacy prompt the user is waiting on - a network
+    // fetch here stalls that prompt for as long as the retrieval takes.
+    // Signature cryptography is unchanged; an unresolvable intermediate reports
+    // an incomplete chain and is treated as unverified, which is the safe way to
+    // be wrong for a privacy decision.
+    winTrustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
         winTrustData.pFile = &fileInfo;
 
         LONG result = WinVerifyTrust(nullptr, &policyGUID, &winTrustData);

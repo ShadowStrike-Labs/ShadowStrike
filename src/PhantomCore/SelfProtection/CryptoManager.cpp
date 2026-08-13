@@ -5018,7 +5018,16 @@ bool CryptoManagerImpl::ValidateKernelDriverAttestation(
     winTrustData.dwUnionChoice = WTD_CHOICE_FILE;
     winTrustData.pFile = &fileInfo;
     winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
-    winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+    // Revocation stays WHOLECHAIN - for a kernel driver that is the right
+    // strictness - but it is evaluated against the LOCAL CRL cache only.
+    // Without WTD_CACHE_ONLY_URL_RETRIEVAL this asks the provider to fetch
+    // CRL/OCSP responses and missing intermediates over the network for every
+    // certificate in the chain, inside a driver attestation decision. On an
+    // offline host, or one with slow DNS, each of those is a multi-second wait
+    // in a path that is validating whether our own sensor may be trusted.
+    // A known-revoked certificate is still rejected from the cache; only the
+    // synchronous fetch is removed.
+    winTrustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
 
     LONG trustResult = WinVerifyTrust(
         static_cast<HWND>(INVALID_HANDLE_VALUE),

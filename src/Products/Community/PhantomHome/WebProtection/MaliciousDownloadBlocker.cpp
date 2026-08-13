@@ -475,7 +475,28 @@ namespace {
         trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
         trustData.dwUnionChoice       = WTD_CHOICE_FILE;
         trustData.dwStateAction       = WTD_STATEACTION_VERIFY;
-        trustData.dwProvFlags         = WTD_SAFER_FLAG;
+        // Cache-only, and this one is a judgement call rather than an obvious fix, so
+    // the reasoning is recorded.
+    //
+    // An authoritative revocation answer genuinely has value for a downloaded
+    // executable - a freshly revoked signing certificate is exactly the signal
+    // you want. But WTD_REVOKE_WHOLECHAIN with URL retrieval permitted makes this
+    // a synchronous network fetch, per certificate in the chain, inside a decision
+    // about a file that has just landed on disk. That is latency the user feels
+    // directly, and if this runs off a file-write event it is also latency taken
+    // while our own filter may be holding that operation open.
+    //
+    // So revocation stays ENABLED against the local CRL cache: a certificate
+    // already known to be revoked is still caught, which covers the common case,
+    // because CRLs for a revoked signing cert are usually already cached by the
+    // time it matters. What is given up is discovering a revocation this machine
+    // has never heard of, at the moment of download.
+    //
+    // If that last case must be covered, the right shape is an explicit
+    // asynchronous reputation step that may take as long as it needs and reports
+    // afterwards - not a blocking fetch inside a trust call. This change does not
+    // foreclose that; it removes the stall from the inline path.
+    trustData.dwProvFlags         = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
         trustData.pFile               = &fileData;
 
         LONG lStatus = WinVerifyTrust(NULL, &guidAction, &trustData);

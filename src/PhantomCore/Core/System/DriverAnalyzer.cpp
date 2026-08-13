@@ -689,7 +689,19 @@ public:
             trustData.dwUnionChoice = WTD_CHOICE_FILE;
             trustData.pFile = &fileInfo;
             trustData.dwStateAction = WTD_STATEACTION_VERIFY;
-            trustData.dwProvFlags = WTD_SAFER_FLAG;
+            // WTD_REVOKE_NONE alone does NOT keep this call off the network.
+            // It suppresses CRL/OCSP, but chain building still resolves missing
+            // intermediate CA certificates through the Authority Information
+            // Access extension, and that retrieval happens regardless of the
+            // revocation setting. Only WTD_CACHE_ONLY_URL_RETRIEVAL suppresses
+            // URL retrieval as a whole. This is the same defect that stalled a
+            // scan worker for 180 seconds and was corrected in ExecutableAnalyzer
+            // under commit a8cc39f6; driver analysis is reachable from image-load
+            // handling, so it must not be able to block on a fetch either.
+            // No detection changes: the signature cryptography is verified
+            // identically, and an unavailable intermediate yields an incomplete
+            // chain, which is treated as unverified - the safe direction.
+            trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
 
             LONG status = WinVerifyTrust(nullptr, &policyGUID, &trustData);
 
@@ -1283,7 +1295,19 @@ private:
             trustData.dwUnionChoice = WTD_CHOICE_FILE;
             trustData.pFile = &fileInfo;
             trustData.dwStateAction = WTD_STATEACTION_VERIFY;
-            trustData.dwProvFlags = WTD_SAFER_FLAG;
+            // WTD_REVOKE_NONE alone does NOT keep this call off the network.
+            // It suppresses CRL/OCSP, but chain building still resolves missing
+            // intermediate CA certificates through the Authority Information
+            // Access extension, and that retrieval happens regardless of the
+            // revocation setting. Only WTD_CACHE_ONLY_URL_RETRIEVAL suppresses
+            // URL retrieval as a whole. This is the same defect that stalled a
+            // scan worker for 180 seconds and was corrected in ExecutableAnalyzer
+            // under commit a8cc39f6; driver analysis is reachable from image-load
+            // handling, so it must not be able to block on a fetch either.
+            // No detection changes: the signature cryptography is verified
+            // identically, and an unavailable intermediate yields an incomplete
+            // chain, which is treated as unverified - the safe direction.
+            trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
             
             LONG status = WinVerifyTrust(nullptr, &actionGUID, &trustData);
             
@@ -1441,7 +1465,19 @@ private:
                     trustData.dwUnionChoice = WTD_CHOICE_CATALOG;
                     trustData.pCatalog = &wtCatalogInfo;
                     trustData.dwStateAction = WTD_STATEACTION_VERIFY;
-                    trustData.dwProvFlags = WTD_SAFER_FLAG;
+                    // WTD_REVOKE_NONE alone does NOT keep this call off the network.
+            // It suppresses CRL/OCSP, but chain building still resolves missing
+            // intermediate CA certificates through the Authority Information
+            // Access extension, and that retrieval happens regardless of the
+            // revocation setting. Only WTD_CACHE_ONLY_URL_RETRIEVAL suppresses
+            // URL retrieval as a whole. This is the same defect that stalled a
+            // scan worker for 180 seconds and was corrected in ExecutableAnalyzer
+            // under commit a8cc39f6; driver analysis is reachable from image-load
+            // handling, so it must not be able to block on a fetch either.
+            // No detection changes: the signature cryptography is verified
+            // identically, and an unavailable intermediate yields an incomplete
+            // chain, which is treated as unverified - the safe direction.
+            trustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
                     
                     LONG verifyResult = WinVerifyTrust(nullptr, &wvtPolicyGuid, &trustData);
                     

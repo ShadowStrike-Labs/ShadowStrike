@@ -206,7 +206,11 @@ bool VerifySignature(const fs::path& filePath) {
         winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
         winTrustData.hWVTStateData = nullptr;
         winTrustData.pwszURLReference = nullptr;
-        winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+        // Cache-only, same reasoning as MicrophoneGuard: WTD_REVOKE_NONE does not
+    // stop Authority Information Access retrieval of missing intermediates, and
+    // this gates a camera-access decision the user is waiting on. Verification
+    // strength is unchanged; an incomplete chain is treated as unverified.
+    winTrustData.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
         winTrustData.dwUIContext = 0;
         winTrustData.pFile = &fileInfo;
 
@@ -244,7 +248,8 @@ std::string GetPublisher(const fs::path& filePath) {
         wtd.fdwRevocationChecks = WTD_REVOKE_NONE;
         wtd.dwUnionChoice = WTD_CHOICE_FILE;
         wtd.dwStateAction = WTD_STATEACTION_VERIFY;
-        wtd.dwProvFlags = WTD_SAFER_FLAG;
+        // Cache-only for the same reason as the call above.
+    wtd.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
         wtd.pFile = &fileInfo;
 
         LONG result = WinVerifyTrust(nullptr, &policyGUID, &wtd);
