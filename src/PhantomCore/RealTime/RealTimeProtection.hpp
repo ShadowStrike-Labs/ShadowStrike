@@ -929,6 +929,15 @@ struct alignas(64) RTPStatistics {
     ///        it distinguishes "the bound is rarely reached" from "the deferred
     ///        queue is quietly doing all the real work".
     std::atomic<uint64_t> packerDeferred{ 0 };
+
+    /// @brief Process creations where the synchronous evasion suite ran out of its
+    ///        time budget and later detectors were skipped.
+    ///        This number is the whole justification for the budget being a chosen
+    ///        value rather than a measured one: at zero, the bound costs nothing and
+    ///        no detection is being skipped. Above zero it is evidence that either
+    ///        the budget is too tight or a detector is misbehaving, and it names the
+    ///        stage in the log so the next question is answerable.
+    std::atomic<uint64_t> processNotifyBudgetExceeded{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
     std::atomic<uint64_t> excludedByProcess{ 0 };
     std::atomic<uint64_t> excludedByHash{ 0 };

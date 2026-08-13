@@ -3489,6 +3489,68 @@ public:
         // Anti-Evasion Analysis
         if (req.isCreation) {
             bool evasionDetected = false;
+
+        // ONE BUDGET FOR THE WHOLE EVASION SUITE.
+        //
+        // Five detectors run synchronously below - debugger, VM, process, network
+        // and environment - while this handler owes the kernel a verdict for a
+        // process creation. Before this there was no budget of any kind in this
+        // function: no deadline, no timeout, nothing. Four of the five also declare
+        // a timeoutMs that their implementations never read, so the appearance of
+        // being bounded came from fields wired to nothing.
+        //
+        // Bounding it here rather than in each detector is deliberate. The quantity
+        // that matters is not how long any one detector takes, it is how long the
+        // kernel is kept waiting in total, and that is only visible at this level.
+        // It also means a detector added later inherits the bound instead of having
+        // to remember to implement one.
+        //
+        // WHY SKIPPING IS SAFE FOR CORRECTNESS: evasionDetected is an OR-accumulator
+        // and the only consumer is a single `if (evasionDetected)` below. Each
+        // detector can therefore only ADD evidence; none is a required input and
+        // none can be skipped into a wrong Block. Skipping loses a chance to detect,
+        // it never manufactures a detection.
+        //
+        // AND WHY IT IS BETTER THAN NO BUDGET: unbounded, five slow detectors run
+        // past the driver's reply timeout, at which point the kernel gives up and
+        // fail-opens - so ALL the evidence is discarded and the process launches
+        // anyway, after a stall. A budget converts that into an answer delivered on
+        // time with the evidence gathered so far, plus a deferred re-examination.
+        //
+        // The value is chosen to sit far above the expected cost of header-level
+        // checks and far below the kernel reply timeout. It is not derived from a
+        // measurement, because none exists for these detectors yet - which is
+        // exactly what the counter below is for: if it ever increments in the field,
+        // the budget is too tight or a detector is misbehaving, and either way it
+        // stops being a guess.
+        constexpr uint64_t kProcessNotifyBudgetMs = 250;
+        const auto evasionStart = std::chrono::steady_clock::now();
+        bool evasionBudgetSpent = false;
+        const auto evasionBudgetExceeded = [&](const char* nextStage) -> bool {
+            if (evasionBudgetSpent) {
+                return true;
+            }
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - evasionStart).count();
+            if (static_cast<uint64_t>(elapsedMs) < kProcessNotifyBudgetMs) {
+                return false;
+            }
+            evasionBudgetSpent = true;
+            m_stats.processNotifyBudgetExceeded++;
+            Utils::Logger::Warn(
+                "RealTimeProtection: process-creation evasion budget of {} ms spent "
+                "after {} ms for PID {}; skipping {} onward and deferring analysis",
+                kProcessNotifyBudgetMs, elapsedMs, req.processId, nextStage);
+            // Coverage moves in time rather than being dropped. The behavioural
+            // detectors cannot be replayed later - the process may be gone - but the
+            // image can still be analysed in full off the kernel's thread, which is
+            // the part that survives. Stated honestly: this is not equivalent to
+            // having run the skipped detectors, it is the recoverable remainder.
+            if (!imagePath.empty()) {
+                QueueDeferredDeepScan(imagePath, req.processId);
+            }
+            return true;
+        };
             std::wstring detectionSource;
 
             // 1. Debugger Evasion — pass kernel context for APT-grade detection
@@ -3546,7 +3608,8 @@ public:
                 vmKernelCtx.creatingThreadId = req.creatingThreadId;
                 vmConfig.kernelContext = std::move(vmKernelCtx);
 
-                if (m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
+                if (!evasionBudgetExceeded("VMEvasionDetector") &&
+                    m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
                     if (vmResult.hasAntiVMBehavior) {
                         if (!evasionDetected) {
                             evasionDetected = true;
@@ -3591,7 +3654,7 @@ public:
             }
 
             // 3. Process Evasion — kernel-enriched injection/hollowing/masquerading detection
-            if (m_processDetector) {
+            if (m_processDetector && !evasionBudgetExceeded("ProcessEvasionDetector")) {
                 ShadowStrike::AntiEvasion::ProcessEvasionAnalysisConfig pedConfig;
                 pedConfig.flags = ShadowStrike::AntiEvasion::ProcessAnalysisFlags::Default
                                 | ShadowStrike::AntiEvasion::ProcessAnalysisFlags::DeepAnalysis;
@@ -3685,7 +3748,7 @@ public:
 
             // 5. Network-Based Evasion (DGA detection, DNS tunneling, C2 beaconing, fast-flux)
             // Always run network analysis for telemetry even if evasion already detected
-            if (m_networkDetector) {
+            if (m_networkDetector && !evasionBudgetExceeded("NetworkBasedEvasionDetector")) {
                 try {
                     ShadowStrike::AntiEvasion::NetworkAnalysisConfig nbedConfig;
                     nbedConfig.flags = ShadowStrike::AntiEvasion::NetworkAnalysisFlags::Default;
@@ -3735,7 +3798,8 @@ public:
             }
 
             // 6. Environment Evasion — pass kernel context for APT-grade detection
-            if (!evasionDetected && m_environmentDetector) {
+            if (!evasionDetected && m_environmentDetector &&
+                !evasionBudgetExceeded("EnvironmentEvasionDetector")) {
                 ShadowStrike::AntiEvasion::EnvironmentAnalysisConfig eedConfig;
 
                 // Populate kernel-enriched context — kernel data is tamper-proof
