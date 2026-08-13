@@ -954,6 +954,15 @@ struct alignas(64) RTPStatistics {
     ///        stage in the log so the next question is answerable.
     std::atomic<uint64_t> processNotifyBudgetExceeded{ 0 };
 
+    /// @brief Files whose content exceeded the configured real-time scan size
+    ///        bound and were handed to the background deep-scan worker instead
+    ///        of being read on the blocking path.
+    ///        Its own counter because the bound is operator-configurable: if this
+    ///        climbs on a normal workload the bound is set too low for this
+    ///        machine and real analysis is being pushed off the fast path
+    ///        wholesale, which is a different regime from it engaging rarely.
+    std::atomic<uint64_t> oversizeDeferred{ 0 };
+
     /// @brief Deep-scan deferrals discarded because the queue was already full.
     ///        THIS IS THE ONE COUNTER HERE THAT MEANS LOST COVERAGE. Every other
     ///        number in this block records analysis that moved in time; this one

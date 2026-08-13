@@ -3122,6 +3122,64 @@ public:
             }
         }
 
+        // =====================================================================
+        // CONTENT-SIZE GATE
+        //
+        // RTPConfig::maxFileSizeBytes was declared, documented, defaulted to
+        // 500 MB, and EXPLICITLY SET TO 20 MB by ServiceMain - and read by
+        // nothing. Measured: zero occurrences outside its own declaration and
+        // that one assignment. So the operator's bound did not merely have the
+        // wrong value, it had no effect at all, and the only limit in the whole
+        // path was ScanEngine's internal 100 MB read cap.
+        //
+        // This is the fourth control found this session that was wired to
+        // nothing - after MetamorphicAnalysisConfig::timeoutMs,
+        // PackerConfig::timeoutMs and the packer's unset maxFileSize. The shape
+        // is identical every time: a field exists, a caller sets it, the
+        // implementation never looks at it, and the call site therefore LOOKS
+        // bounded to anyone reading it.
+        //
+        // What it cost: everything below reads the file's bytes and then runs
+        // 11,053 YARA rules plus the pattern automaton over them, while the
+        // minifilter holds the originating operation open. An ISO, a VM disk, a
+        // database - or our own 64 MB signature database, which the service
+        // itself opens - was read up to 100 MB and fully scanned in line.
+        //
+        // req.FileSize comes from the kernel request, so this costs no I/O and
+        // no extra syscall on the blocking path. A zero or missing size can only
+        // fail the comparison, so an unknown size is never treated as oversize -
+        // it falls through to full analysis, which is the safe direction.
+        //
+        // EXECUTE ACCESS IS DELIBERATELY NOT BOUNDED HERE, for the same reason
+        // the latency budget exempts it: deferring a pre-execution decision
+        // would let an unexamined binary run, which is the one thing that must
+        // not happen. Large signed executables still take the fast path via the
+        // identity cache and the Microsoft-trust tier above, both of which run
+        // before this gate and are size-independent.
+        //
+        // RESIDUAL, STATED RATHER THAN GLOSSED: an oversize file that is
+        // EXECUTED still takes an unbounded in-line content scan. Closing that
+        // needs the analyzers to accept a bounded prefix of the file instead of
+        // the whole thing - most PE structure, entry point, imports and packer
+        // indicators live in the first few megabytes - which is a larger change
+        // than this one and is not attempted here.
+        if (!isExecuteAccess) {
+            const uint64_t sizeBound = m_config.maxFileSizeBytes;
+            // 0 means no limit, matching the convention used by the analyzer
+            // timeouts, so an offline or forensic configuration can ask for
+            // everything.
+            if (sizeBound > 0 && req.FileSize > sizeBound) {
+                // Deferred, NOT skipped. The deep-scan worker holds no kernel
+                // operation, so it can afford the read this path cannot, and
+                // coverage moves in time rather than being lost. A malicious
+                // verdict from that stage quarantines the file exactly as a
+                // synchronous one would.
+                m_stats.oversizeDeferred++;
+                deferDeepScan(L"content-size");
+                return Communication::KernelVerdict::Allow;
+            }
+        }
+
         // Anti-Evasion: Metamorphic Analysis
         if (m_metamorphicDetector) {
             if (budgetExceeded()) {
@@ -5556,6 +5614,7 @@ public:
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
+        const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
 
         // Saturation is "no worker free AND work waiting". Busy-with-nothing-queued
         // is a fully used pool keeping up, which is the desired state, not a
@@ -5600,11 +5659,12 @@ public:
         const auto line = std::format(
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
-            "metamorphicTruncated={} packerDeferred={} processNotifyBudgetExceeded={}",
+            "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
+            "processNotifyBudgetExceeded={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, notifyBudget);
+            cached, metaTrunc, packerDef, oversize, notifyBudget);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -6101,6 +6161,7 @@ void RTPStatistics::Reset() noexcept {
     metamorphicTruncated = 0;
     packerDeferred = 0;
     processNotifyBudgetExceeded = 0;
+    oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;
     threatsDetected = 0;
