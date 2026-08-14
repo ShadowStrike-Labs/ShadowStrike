@@ -80,7 +80,13 @@ TEST(DeltaUpdaterTest, HelperNamesDetectionAndSizingRemainStable) {
 
 TEST(DeltaUpdaterTest, HeaderValidationDtosAndStatisticsRemainActionable) {
     PatchHeader valid;
-    valid.version = 2;
+    // Version 1, not 2. PatchHeader::IsValid deliberately accepts ONLY version 1,
+    // with the reason stated where it is enforced: only version 1 of the wire
+    // format is implemented end-to-end. This test previously set 2 and expected
+    // it to validate, which is the older behaviour where any version up to 10 was
+    // accepted - a validator that admits a version the applier cannot handle
+    // passes a patch to code that will misread it.
+    valid.version = 1;
     valid.algorithm = PatchAlgorithm::BSDiff;
     valid.flags = 7;
     valid.sourceSize = 8192;
@@ -199,7 +205,10 @@ TEST(DeltaUpdaterTest, HeaderValidationDtosAndStatisticsRemainActionable) {
 
 TEST(DeltaUpdaterTest, BoundaryValidationAndDefaultRuntimeStateFailClosed) {
     PatchHeader maxValid;
-    maxValid.version = 10;
+    // See the note in the previous test: exactly version 1 is accepted. This case
+    // used to set 10 and expect it valid, then 11 and expect it invalid, which
+    // encoded a range that no longer exists.
+    maxValid.version = 1;
     maxValid.algorithm = PatchAlgorithm::XDelta3;
     maxValid.sourceSize =
         static_cast<uint64_t>(DeltaConstants::MAX_FILE_SIZE_GB) * 1024ull * 1024ull * 1024ull;
@@ -209,6 +218,9 @@ TEST(DeltaUpdaterTest, BoundaryValidationAndDefaultRuntimeStateFailClosed) {
     EXPECT_TRUE(maxValid.IsValid());
 
     PatchHeader invalid = maxValid;
+    // Any version other than 1 is refused, not just one past a range end.
+    invalid.version = 2;
+    EXPECT_FALSE(invalid.IsValid());
     invalid.version = 11;
     EXPECT_FALSE(invalid.IsValid());
 

@@ -456,10 +456,30 @@ TEST(CommunicationProtocolTest, CommunicationConfigSerializesAndEmptyJsonFallsBa
     EXPECT_TRUE(parsed.enableStatistics);
 
     const Comm::CommunicationConfig malformed =
-        Comm::CommunicationConfig::FromJson("{\"portName\":\"\\\\ignored\",\"replyTimeoutMs\":1}");
+        Comm::CommunicationConfig::FromJson("{\"portName\":\"\\\\ignored\", this is not json");
     EXPECT_EQ(malformed.portName, Comm::SS_COMM_PORT_NAME);
     EXPECT_EQ(malformed.replyTimeoutMs, Comm::DEFAULT_REPLY_TIMEOUT_MS);
     EXPECT_EQ(malformed.workerThreadCount, 4u);
+
+    // WELL-FORMED input is honoured, which is what makes ToJson above worth having.
+    // This block used to feed FromJson valid JSON, call it "malformed", and assert
+    // that portName and replyTimeoutMs were IGNORED - which contradicted the first
+    // half of this same test, where ToJson is checked for emitting exactly those two
+    // fields. A round trip would have been impossible.
+    //
+    // Range checking is the consumer's job and is already done there:
+    // IPCManager rejects replyTimeoutMs == 0 or > 300000 before using it, with its
+    // own tests. FromJson has no production callers at all today.
+    const Comm::CommunicationConfig roundTripped = Comm::CommunicationConfig::FromJson(json);
+    EXPECT_EQ(roundTripped.portName, config.portName);
+    EXPECT_EQ(roundTripped.replyTimeoutMs, config.replyTimeoutMs);
+    EXPECT_EQ(roundTripped.reconnectIntervalMs, config.reconnectIntervalMs);
+    EXPECT_EQ(roundTripped.maxReconnectAttempts, config.maxReconnectAttempts);
+    EXPECT_EQ(roundTripped.messageQueueSize, config.messageQueueSize);
+    EXPECT_EQ(roundTripped.workerThreadCount, config.workerThreadCount);
+    EXPECT_EQ(roundTripped.autoReconnect, config.autoReconnect);
+    EXPECT_EQ(roundTripped.blockOnTimeout, config.blockOnTimeout);
+    EXPECT_EQ(roundTripped.enableStatistics, config.enableStatistics);
 }
 
 TEST(CommunicationProtocolTest, MovedFromFilterConnectionRemainsSafelyInert) {

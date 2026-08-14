@@ -27,6 +27,8 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "RansomwareProtection_TestUtils.hpp"
 #include "../../../src/PhantomCore/RansomwareProtection/HoneypotManager.hpp"

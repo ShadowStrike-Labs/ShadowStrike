@@ -143,7 +143,21 @@ TEST_F(PolymorphicDetectorTest, StatisticsResetAndNameHelpersRemainDeterministic
 TEST_F(PolymorphicDetectorTest, PreInitializationGuardsReturnSafeDefaults) {
     auto& detector = Engine::PolymorphicDetector::Instance();
     EXPECT_FALSE(detector.IsInitialized());
-    EXPECT_EQ(detector.GetStatus(), Engine::PolyDetectorStatus::Uninitialized);
+
+    // Asserting the exact status here asked a PROCESS-WIDE SINGLETON to remember
+    // that nothing had ever used it, and 340 test suites share this process -
+    // ScanEngine borrows this detector and initializes it, so by the time this runs
+    // the status is Stopped(6) rather than Uninitialized(0). IsInitialized() being
+    // false is the precondition the guard paths below actually depend on; which
+    // not-running state it sits in is lifecycle history, not guard behaviour.
+    //
+    // Checked before relaxing it: PolymorphicDetector::Initialize gates on
+    // m_initialized, not on a status CAS, so it is re-initializable after shutdown
+    // and this is NOT the one-shot defect found in ZeroDayDetector.
+    const auto status = detector.GetStatus();
+    EXPECT_TRUE(status == Engine::PolyDetectorStatus::Uninitialized ||
+                status == Engine::PolyDetectorStatus::Stopped)
+        << "expected a not-running status, got " << static_cast<int>(status);
 
     const std::vector<uint8_t> code = {0x90, 0x90, 0xEB, 0x00, 0xCC};
     const Engine::PolyResult result = detector.Analyze(code);

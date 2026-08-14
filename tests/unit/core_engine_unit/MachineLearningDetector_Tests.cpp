@@ -238,13 +238,25 @@ TEST_F(MachineLearningDetectorTest, GuardPathsRemainBenignBeforeInitialization) 
     features.features = {0.25f, 0.75f};
     const Engine::PredictionResult prediction = detector.Analyze(features);
     EXPECT_FALSE(prediction.isMalicious);
-    EXPECT_EQ(prediction.classification, Engine::Classification::PotentiallyUnwanted);
-    EXPECT_EQ(prediction.modelName, "PhantomCortex-Fallback");
-    EXPECT_FLOAT_EQ(prediction.probability, 0.5f);
-    EXPECT_FLOAT_EQ(prediction.thresholdUsed, 0.85f);
+    // An UNINITIALIZED detector reports "not determined" - Classification::Unknown
+    // with no model name and zero probability - and does not predict.
+    //
+    // The values this used to expect (PotentiallyUnwanted, "PhantomCortex-Fallback",
+    // probability 0.5, threshold 0.85) belong to a real code path, but a different
+    // one: the heuristic fallback that runs when the detector IS initialized and no
+    // ONNX model is loaded. Expecting it here asked an uninitialized detector to
+    // invent a verdict, and 0.5/PotentiallyUnwanted is a fabricated one. Unknown is
+    // the same principle the trust cache uses: nullopt means not determined, never
+    // "clean" and never a guess.
+    EXPECT_EQ(prediction.classification, Engine::Classification::Unknown);
+    EXPECT_TRUE(prediction.modelName.empty());
+    EXPECT_FLOAT_EQ(prediction.probability, 0.0f);
+    EXPECT_FLOAT_EQ(prediction.thresholdUsed, 0.0f);
 
     const auto stats = detector.GetStatistics();
     EXPECT_EQ(stats.totalPredictions, 0u);
+    // Counted before the initialization guard, so the attempt is visible even
+    // though no prediction was produced.
     EXPECT_EQ(stats.modelInferences, 1u);
 
     const auto devices = Engine::GetAvailableDevices();

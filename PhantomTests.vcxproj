@@ -277,6 +277,53 @@
     <ClCompile Include="tests\unit\core_process_unit\ProcessInjectionDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\ProcessKiller_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\ProcessMonitor_Tests.cpp" />
+    <!-- ransomware_protection_unit -->
+    <ClCompile Include="tests\unit\ransomware_protection_unit\BackupProtector_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\FileBackupManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\HoneypotManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\LockyDetector_ValueContracts_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\RansomwareDecryptor_ValueContracts_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\RansomwareDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\ShadowCopyProtector_ValueContracts_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\VolumeSnapshotService_ValueContracts_Tests.cpp" />
+    <ClCompile Include="tests\unit\ransomware_protection_unit\WannaCryDetector_ValueContracts_Tests.cpp" />
+    <!-- antievasion_unit -->
+    <ClCompile Include="tests\unit\antievasion_unit\DebuggerEvasionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\EnvironmentEvasionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\MetamorphicDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\NetworkBasedEvasionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\PackerDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\ProcessEvasionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\SandboxEvasionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\TimeBasedEvasionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\antievasion_unit\VMEvasionDetector_Tests.cpp" />
+    <!-- update_unit -->
+    <ClCompile Include="tests\unit\update_unit\DeltaUpdater_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\LocalFolderTransport_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\ProgramUpdater_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\RollbackManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\SignatureUpdater_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\UpdateManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\UpdateScheduler_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\UpdateVerifier_Tests.cpp" />
+    <!-- core_engine_unit -->
+    <ClCompile Include="tests\unit\core_engine_unit\BehaviorAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\EmulationEngine_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\MachineLearningDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\PackerUnpacker_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\PolymorphicDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\SandboxAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\ThreatDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\ZeroDayDetector_Tests.cpp" />
+    <!-- communication_unit -->
+    <ClCompile Include="tests\unit\communication_unit\AlertSystem_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\CommunicationProtocol_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\IPCManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\NotificationManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\ReportGenerator_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\ServiceCommunication_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\TelemetryCollector_Tests.cpp" />
+    <ClCompile Include="tests\unit\communication_unit\ThreatIntelPusher_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\ReflectiveDLLDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\ThreadHijackDetector_Tests.cpp" />
   </ItemGroup>
