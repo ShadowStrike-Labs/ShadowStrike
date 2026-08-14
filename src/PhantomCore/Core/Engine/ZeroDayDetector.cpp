@@ -977,15 +977,49 @@ ZeroDayDetector::~ZeroDayDetector() { if (m_impl) Shutdown(); }
 bool ZeroDayDetector::Initialize(const ZeroDayConfiguration& config) {
     if (!m_impl) return false;
 
-    // Use status as a one-shot CAS gate: only the thread that flips
-    // Uninitialized -> Initializing performs initialization.  This avoids the
-    // race where m_initialized was eagerly set true before patterns/CVE data
-    // were populated, which let concurrent AnalyzeBuffer callers run against
-    // empty pattern stores.
+    // Claim the right to initialize, from any state that means "not running, nothing
+    // half-built".
+    //
+    // The CAS itself is unchanged and is the part that matters: exactly one thread
+    // flips into Initializing and performs the work, so a concurrent AnalyzeBuffer
+    // cannot observe half-populated pattern/CVE caches. What was wrong was the set of
+    // accepted STARTING states - only Uninitialized.
+    //
+    // Shutdown() leaves the status at Stopped, so the detector was effectively
+    // ONE-SHOT: after a single shutdown every later Initialize hit this CAS, fell
+    // through to the error branch, and returned false for the remaining life of the
+    // process. ScanEngine::Initialize treats that as fatal, so one ScanEngine::Shutdown
+    // made the whole engine permanently un-initializable - which is what made
+    // RealTimeProtection::Restart(), literally Stop() then Start(), unable to succeed
+    // and left the machine with no real-time protection.
+    //
+    // Error is accepted for the same reason rather than left as a second dead end: a
+    // caller correcting an invalid configuration must be able to try again. Retrying
+    // from a partially built state is safe because InitializePatterns,
+    // InitializeCVEDatabase and InitializeMITRE each clear their container before
+    // filling it, so initialization always rebuilds from scratch.
+    //
+    // Initializing, Stopping and Running are deliberately NOT accepted: the first two
+    // are transient states owned by another thread, and Running is reported as success
+    // below.
     ZeroDayStatus expected = ZeroDayStatus::Uninitialized;
-    if (!m_impl->m_status.compare_exchange_strong(
+    bool claimed = m_impl->m_status.compare_exchange_strong(
+        expected, ZeroDayStatus::Initializing,
+        std::memory_order_acq_rel, std::memory_order_acquire);
+
+    if (!claimed &&
+        (expected == ZeroDayStatus::Stopped || expected == ZeroDayStatus::Error)) {
+        const ZeroDayStatus restartFrom = expected;
+        claimed = m_impl->m_status.compare_exchange_strong(
             expected, ZeroDayStatus::Initializing,
-            std::memory_order_acq_rel, std::memory_order_acquire))
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        if (claimed) {
+            SS_LOG_INFO(kLogCategory, L"Re-initializing from state %u",
+                static_cast<unsigned>(restartFrom));
+        }
+    }
+
+    if (!claimed)
     {
         if (expected == ZeroDayStatus::Running) {
             SS_LOG_WARN(kLogCategory, L"Already initialized");

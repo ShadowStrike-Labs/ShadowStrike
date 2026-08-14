@@ -121,6 +121,45 @@ struct ScanJob {
 // ============================================================================
 
 /**
+ * @brief How much of the engine's teardown is safe to perform.
+ *
+ * ScanEngine is a function-local static (Instance()), so if nobody calls
+ * Shutdown() while the process is running, its destructor runs during static
+ * destruction. That matters because the engine's teardown does two different
+ * kinds of work:
+ *
+ *   - releasing things this object OWNS (its subsystems, its thread pool, its
+ *     caches), which is always safe; and
+ *   - calling into COLLABORATING SINGLETONS to coordinate their shutdown, which
+ *     is only safe while the process is still running.
+ *
+ * The second kind cannot be done during static destruction, and not because it
+ * is risky - because those objects are already gone. Impl::Initialize() is the
+ * first code to touch ExecutableAnalyzer::Instance() and PhantomCortex::Instance(),
+ * so their construction COMPLETES after ScanEngine's does; block-scope statics are
+ * destroyed in reverse order of completed construction, so both are destroyed
+ * BEFORE ScanEngine. A destructor that calls Instance().Shutdown() on them is
+ * dereferencing storage whose object has already run its destructor.
+ *
+ * That was the fault: a process which called Initialize() and exited without
+ * Shutdown() died with an access violation after all its work had succeeded - the
+ * least diagnosable failure there is, because nothing had gone wrong yet. The
+ * try/catch around the PhantomCortex call gave the appearance of protection and
+ * could never provide it, since an access violation is not a C++ exception.
+ *
+ * The Logger is deliberately NOT in this category and is safe in either scope:
+ * ScanEngine's own constructor logs, so Logger's construction completes first and
+ * it is therefore destroyed last.
+ */
+enum class TeardownScope {
+    /// Process is running. Full teardown, including collaborating singletons.
+    Full,
+    /// Static destruction. Release only what this object owns; every other
+    /// singleton is responsible for its own teardown and may already be gone.
+    OwnedOnly
+};
+
+/**
  * @brief Private implementation class following PIMPL pattern.
  *
  * This separates implementation details from the public interface,
@@ -775,7 +814,7 @@ public:
         }
     }
 
-    void Shutdown() {
+    void Shutdown(TeardownScope scope = TeardownScope::Full) {
         std::unique_lock lock(m_configMutex);
 
         if (!m_initialized.load(std::memory_order_acquire)) {
@@ -792,20 +831,69 @@ public:
             }
         }
 
-        // Shutdown subsystems in reverse order
-        if (m_packerUnpacker) {
-            m_packerUnpacker->Shutdown();
-            m_packerUnpacker = nullptr;
+        // Stop the worker pool BEFORE tearing down anything it can reach.
+        //
+        // Cancellation above is cooperative: a worker already inside
+        // m_emulationEngine->Analyze() or the heuristic analyzer does not observe
+        // cancelRequested until it returns. The teardown below then destroys those
+        // subsystems, so the previous order - cancel, destroy subsystems, reset pool -
+        // left a window in which a live worker was using an object being freed under it.
+        // Joining first closes it, and costs nothing on an idle engine.
+        //
+        // This must be an explicit Shutdown(true) rather than resetting the shared_ptr:
+        // m_threadPool is SHARED with the heuristic analyzer (Initialize passes it at
+        // :617) and the emulation engine (:717), so our reset would drop one reference
+        // and join nothing while those subsystems still held theirs. Shutdown(true)
+        // drains the queue and joins every worker regardless of who holds a reference.
+        if (m_threadPool) {
+            m_threadPool->Shutdown(true);
         }
 
-        if (m_mlDetector) {
-            m_mlDetector->Shutdown();
-            m_mlDetector = nullptr;
-        }
+        // THE OWNERSHIP RULE, and in this class the member's pointer type states it:
+        //
+        //   raw pointer   -> a SINGLETON this engine borrowed (assigned from
+        //                    &X::Instance() during Initialize). Not ours to destroy, and
+        //                    not ours to coordinate with once the process is tearing down.
+        //   smart pointer -> owned by this engine (or, for m_threatIntelStore, shared with
+        //                    the rest of the process), so the object is guaranteed alive
+        //                    for as long as we hold it.
+        //
+        // Every one of the seven raw-pointer subsystems is first touched by Initialize(),
+        // so all seven complete construction after ScanEngine and are destroyed before it.
+        // Calling ->Shutdown() through any of them from the destructor is a call on a
+        // destroyed object. The first fix here only covered the two that called
+        // ::Instance() inline inside this function, which was the visible half; the other
+        // five were held as pointers assigned earlier and looked like ordinary members.
+        //
+        // So in OwnedOnly scope a borrowed subsystem is released WITHOUT being called.
+        // That is correct rather than merely safe: each of those singletons runs its own
+        // destructor, and none of them needs us to tell it the process is ending.
+        const bool coordinateWithSingletons = (scope == TeardownScope::Full);
+        const auto releaseBorrowed = [coordinateWithSingletons](auto*& borrowed) noexcept {
+            if (borrowed == nullptr) {
+                return;
+            }
+            if (coordinateWithSingletons) {
+                borrowed->Shutdown();
+            }
+            borrowed = nullptr;
+        };
+
+        // Shutdown subsystems in reverse order
+        releaseBorrowed(m_packerUnpacker);
+        releaseBorrowed(m_mlDetector);
 
         // PhantomCortex is a singleton — tell it we're shutting down.
         // If no other consumer is active, the instance may release models.
-        if (m_config.enableMachineLearning) {
+        //
+        // Full scope only. Initialize() is the first code in the process to touch
+        // this singleton, so it is destroyed BEFORE ScanEngine and calling Instance()
+        // here during static destruction returns storage whose object is gone. The
+        // catch(...) below cannot help with that - an access violation is not a C++
+        // exception - so the guard has to be the scope, not the handler. Skipping it is
+        // correct rather than merely safe: Cortex owns its own teardown and its own
+        // destructor runs either way.
+        if (scope == TeardownScope::Full && m_config.enableMachineLearning) {
             try {
                 auto& cortex = ShadowStrike::AI::PhantomCortex::Instance();
                 if (cortex.IsOperational()) {
@@ -816,38 +904,28 @@ public:
             } catch (...) { /* Singleton shutdown is best-effort */ }
         }
 
+        // Owned outright (unique_ptr), so the object is alive in either scope and the
+        // call is safe regardless of when this runs.
         if (m_behaviorAnalyzer) {
             m_behaviorAnalyzer->Shutdown();
             m_behaviorAnalyzer.reset();
         }
 
-        if (m_heuristicAnalyzer) {
-            m_heuristicAnalyzer->Shutdown();
-            m_heuristicAnalyzer = nullptr;
-        }
+        releaseBorrowed(m_heuristicAnalyzer);
+        releaseBorrowed(m_zeroDayDetector);
+        releaseBorrowed(m_emulationEngine);
+        releaseBorrowed(m_sandboxAnalyzer);
+        releaseBorrowed(m_polymorphicDetector);
 
-        if (m_zeroDayDetector) {
-            m_zeroDayDetector->Shutdown();
-            m_zeroDayDetector = nullptr;
+        // Shutdown ExecutableAnalyzer singleton.
+        //
+        // Full scope only, for the same reason as PhantomCortex above, and this one was
+        // not even wrapped: Initialize() touches ExecutableAnalyzer::Instance() at :627,
+        // so it is destroyed before ScanEngine and this line was the unguarded
+        // dereference of an already-destroyed object during static destruction.
+        if (scope == TeardownScope::Full) {
+            FileSystem::ExecutableAnalyzer::Instance().Shutdown();
         }
-
-        if (m_emulationEngine) {
-            m_emulationEngine->Shutdown();
-            m_emulationEngine = nullptr;
-        }
-
-        if (m_sandboxAnalyzer) {
-            m_sandboxAnalyzer->Shutdown();
-            m_sandboxAnalyzer = nullptr;
-        }
-
-        if (m_polymorphicDetector) {
-            m_polymorphicDetector->Shutdown();
-            m_polymorphicDetector = nullptr;
-        }
-
-        // Shutdown ExecutableAnalyzer singleton
-        FileSystem::ExecutableAnalyzer::Instance().Shutdown();
 
         if (m_threatIntelDB) {
             m_threatIntelDB->Close();
@@ -1163,7 +1241,33 @@ ScanEngine::ScanEngine()
 
 ScanEngine::~ScanEngine() {
     if (m_impl) {
-        m_impl->Shutdown();
+        // Was the engine left running? If so nobody called Shutdown() while the
+        // process was alive, and we are now executing during static destruction.
+        const bool leftInitialized =
+            m_impl->m_initialized.load(std::memory_order_acquire);
+
+        if (leftInitialized) {
+            // Reported, not silently repaired. The engine holds a worker pool and
+            // coordinates with other singletons, so a deterministic Shutdown() is part
+            // of its contract - RealTimeProtection::Stop does it at step 4, and any test
+            // or tool that calls Initialize() owes the same. Tearing down here works,
+            // but it cannot do the cross-singleton half (those objects are already
+            // gone), so a process that relies on this path gets a quieter shutdown than
+            // it asked for. Saying so is what stops that becoming the normal case.
+            //
+            // Safe to log: ScanEngine's own constructor logs, so the Logger's
+            // construction completed first and it is destroyed after this object.
+            SS_LOG_WARN(L"ScanEngine",
+                L"Destructor reached with the engine still initialized - Shutdown() was "
+                L"never called. Releasing owned resources only; collaborating singletons "
+                L"are already destroyed at this point and are skipped.");
+        }
+
+        // OwnedOnly unconditionally: if the engine was shut down properly this call
+        // returns immediately on the !m_initialized check, and if it was not, the
+        // collaborating singletons must not be touched. There is no state in which the
+        // destructor should be reaching into another singleton.
+        m_impl->Shutdown(TeardownScope::OwnedOnly);
     }
     SS_LOG_INFO(L"ScanEngine", L"Destructor called");
 }

@@ -168,13 +168,24 @@ protected:
     }
 
     static void TearDownTestSuite() {
-        // MUST shut down explicitly. Leaving the engine initialised crashed the
-        // process at exit with an access violation AFTER every test had reported
-        // passing (measured: exit code 0xC0000005 with this teardown absent, 0 with
-        // it present, and 0 when these tests are filtered out). Initialize starts a
-        // worker pool, and letting a running pool be torn down by static
-        // destruction at process exit is unordered with respect to everything else
-        // the singleton owns.
+        // Shut down explicitly. This is the engine's documented contract - a caller
+        // that succeeds at Initialize() owes a Shutdown() while the process is still
+        // running - and it is what RealTimeProtection::Stop does at step 4.
+        //
+        // It was originally added here as a workaround: leaving the engine initialised
+        // crashed the process at exit with an access violation AFTER every test had
+        // reported passing (measured: 0xC0000005 without this call, 0 with it, and 0
+        // with these tests filtered out).
+        //
+        // THE DIAGNOSIS RECORDED HERE FIRST WAS INCOMPLETE and is corrected for
+        // anyone reading it later. It was not the worker pool being destroyed by
+        // static destruction. ScanEngine::Impl borrows SEVEN other singletons as raw
+        // pointers, all first touched by Initialize(), so all of them complete
+        // construction after ScanEngine and are destroyed BEFORE it - and the teardown
+        // called ->Shutdown() through every one. The destructor now releases borrowed
+        // subsystems without calling into them, and the invariant is checked on every
+        // run by tests/unit/scan_engine_teardown, which deliberately leaves the engine
+        // initialized at process exit.
         //
         // Worth keeping in mind beyond this test: a non-zero exit code that appears
         // only after "PASSED" is exactly the kind of signal a CI run reports as a

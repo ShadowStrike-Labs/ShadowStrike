@@ -642,11 +642,31 @@ public:
      * @brief Initialize the engine and connect to all subsystems.
      * @param config Configuration parameters.
      * @return True if all critical databases loaded successfully.
+     *
+     * @warning Every caller that succeeds here owes a matching Shutdown() while the
+     *          process is still running. See Shutdown() for why the destructor is not
+     *          an adequate substitute.
      */
     [[nodiscard]] bool Initialize(const EngineConfig& config);
 
     /**
      * @brief Gracefully shutdown and release database handles.
+     *
+     * MANDATORY after a successful Initialize(), and it must run while the process is
+     * alive - not left to the destructor.
+     *
+     * The engine starts a worker pool and coordinates teardown with other singletons
+     * (ExecutableAnalyzer, PhantomCortex). Because Initialize() is the first code to
+     * touch those, their construction completes after this object's, and block-scope
+     * statics are destroyed in reverse order of completed construction - so they are
+     * destroyed BEFORE this engine. The destructor therefore cannot coordinate with
+     * them; it releases owned resources only and warns that it had to.
+     *
+     * Leaving it to the destructor used to be worse than incomplete: it faulted. A
+     * process that called Initialize() and exited without Shutdown() died with an
+     * access violation after all of its work had already succeeded.
+     *
+     * Idempotent - safe to call when not initialized, and safe to call twice.
      */
     void Shutdown();
 
