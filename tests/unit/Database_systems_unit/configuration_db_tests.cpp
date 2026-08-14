@@ -708,16 +708,49 @@ TEST_F(ConfigurationDBTest, EmptyKeyFails) {
     EXPECT_TRUE(err.HasError());
 }
 
-TEST_F(ConfigurationDBTest, VeryLongKeySucceeds) {
+// WAS: TEST_F(ConfigurationDBTest, VeryLongKeySucceeds), which wrote a 1,000-character
+// key and expected SetString to succeed and GetString to read it back.
+// ConfigurationDB now enforces a key bound: IsValidConfigKey rejects an empty key, a
+// key longer than MAX_CONFIG_KEY_CHARS (512), and any key containing NUL, CR, LF or
+// other control characters, and SetString returns false with SQLITE_MISUSE and an
+// explanatory message. Config keys reach the audit log and the operator-facing
+// surfaces, so an unbounded key is both a storage-amplification lever (the key is
+// stored per row and per audit record) and a log-injection vector - which is why the
+// same predicate rejects control characters. 512 characters is far beyond any real
+// dotted config path.
+// The test is renamed because the old name now states the opposite of the contract.
+// If someone reverts to expecting success at 1,000 characters: it fails against the
+// current product, and satisfying it would mean raising or removing
+// MAX_CONFIG_KEY_CHARS - i.e. accepting attacker-sized keys into config and audit
+// storage. Both sides of the boundary are asserted so a future change to the constant
+// fails here instead of silently widening what is accepted.
+TEST_F(ConfigurationDBTest, KeyLengthBoundIsEnforced) {
     EXPECT_TRUE(InitializeConfigDB());
 
-    std::wstring longKey(1000, L'A');
+    // MAX_CONFIG_KEY_CHARS is 512 and is file-local to ConfigurationDB.cpp, so the
+    // boundary is expressed here as the literal it is defined as.
+    constexpr size_t kMaxConfigKeyChars = 512;
 
-    DatabaseError err;
-    EXPECT_TRUE(ConfigurationDB::Instance().SetString(longKey, L"value",
-        ConfigurationDB::ConfigScope::Global, L"Test", &err));
+    const std::wstring atLimitKey(kMaxConfigKeyChars, L'A');
+    const std::wstring overLimitKey(kMaxConfigKeyChars + 1, L'B');
 
-    EXPECT_EQ(ConfigurationDB::Instance().GetString(longKey), L"value");
+    DatabaseError atLimitErr;
+    EXPECT_TRUE(ConfigurationDB::Instance().SetString(atLimitKey, L"value",
+        ConfigurationDB::ConfigScope::Global, L"Test", &atLimitErr));
+    EXPECT_EQ(ConfigurationDB::Instance().GetString(atLimitKey), L"value");
+
+    DatabaseError overLimitErr;
+    EXPECT_FALSE(ConfigurationDB::Instance().SetString(overLimitKey, L"value",
+        ConfigurationDB::ConfigScope::Global, L"Test", &overLimitErr));
+    EXPECT_TRUE(overLimitErr.HasError());
+    EXPECT_TRUE(ConfigurationDB::Instance().GetString(overLimitKey).empty());
+
+    // The old 1,000-character key, now explicitly refused.
+    const std::wstring longKey(1000, L'A');
+    DatabaseError longErr;
+    EXPECT_FALSE(ConfigurationDB::Instance().SetString(longKey, L"value",
+        ConfigurationDB::ConfigScope::Global, L"Test", &longErr));
+    EXPECT_TRUE(longErr.HasError());
 }
 
 TEST_F(ConfigurationDBTest, VeryLongValueSucceeds) {

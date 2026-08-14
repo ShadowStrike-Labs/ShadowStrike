@@ -53,7 +53,20 @@ TEST(ServiceControllerTest, StatusReportAndRecoveryExposeCurrentPublicBehavior) 
 
     EXPECT_FALSE(controller.IsRunning());
     EXPECT_TRUE(controller.RequestRecovery("telemetry"));
-    EXPECT_TRUE(controller.RequestRecovery(""));
+
+    // WAS: EXPECT_TRUE(controller.RequestRecovery("")).
+    // RecoverComponent() now rejects an empty component id and logs it as an error
+    // (ServiceController.cpp) instead of returning success for a request that names
+    // nothing. Recovery is a "restart this component" instruction: with no id there is
+    // no component to restart, so answering true meant reporting a repair that could
+    // not have happened. Whatever asked for the recovery - a health check, the
+    // management API, an operator - would mark the fault handled and stop escalating,
+    // which is how a silently dead subsystem stays dead. Rejecting the malformed
+    // request lets the caller see that nothing was done and retry with a real id.
+    // If someone reverts this to EXPECT_TRUE: it fails against the current product,
+    // and satisfying it would mean deleting the empty-id guard and going back to an
+    // unconditional success that carries no information.
+    EXPECT_FALSE(controller.RequestRecovery(""));
 }
 
 TEST(ServiceControllerTest, StopAndUnknownControlCodesPreserveCurrentSimplifiedContracts) {

@@ -28,13 +28,25 @@ class MemoryProtectionTest : public ::testing::Test {
 protected:
     MemoryProtectionEngine& protection = MemoryProtectionEngine::Instance();
 
+    // WAS: the literal PID 4242 throughout this fixture.
+    // MonitorProcess() now refuses any PID that is not actually running (and PIDs 0
+    // and 4 outright), so the positive path needs a PID that exists. The test process
+    // is the only one a unit test can rely on. 4242 was never a valid choice even
+    // before that change: it is an arbitrary number that merely HAPPENS to be dead on
+    // most machines, so the old expectations were passing on an assumption about the
+    // host's PID allocation rather than on a product contract.
+    // Registering our own PID is inert here - it inserts into a set; the periodic
+    // scanner only runs between Start()/Stop(), which this fixture never starts - and
+    // TearDown() removes it again.
+    const uint32_t livePid = static_cast<uint32_t>(::GetCurrentProcessId());
+
     void SetUp() override {
         protection.Stop();
-        (void)protection.UnmonitorProcess(4242);
+        (void)protection.UnmonitorProcess(livePid);
     }
 
     void TearDown() override {
-        (void)protection.UnmonitorProcess(4242);
+        (void)protection.UnmonitorProcess(livePid);
         protection.Stop();
     }
 };
@@ -104,15 +116,34 @@ TEST_F(MemoryProtectionTest, MonitoringAndCallbackContractsRemainSafe) {
         [](const MemoryViolation&, uint32_t) {});
     EXPECT_NE(0u, callbackId);
 
-    EXPECT_TRUE(protection.MonitorProcess(4242));
-    EXPECT_TRUE(protection.MonitorProcess(4242));
-    EXPECT_TRUE(protection.EnableExploitProtection(4242, EXPLOIT_PROTECT_MONITOR_ONLY));
+    // WAS: MonitorProcess(4242) twice, expecting both true.
+    // MonitorProcess() now validates the target before admitting it to the monitoring
+    // set: PID 0 and PID 4 (System/Idle) are refused by identity, and anything not
+    // reported running by ProcessUtils::IsProcessRunning is refused as well. A dead
+    // PID in the set is not harmless - the periodic scanner would re-open and fail on
+    // it on every iteration, burning a pass and filling the log with noise, and if
+    // Windows later reuses that PID the engine would silently begin scanning an
+    // unrelated process it was never asked to watch.
+    // Both directions are asserted here, so the negative path is covered by the
+    // product's own contract (0 and 4) instead of by a guess about which PID is dead.
+    // If someone reverts to 4242: it fails on any machine where 4242 is not live, and
+    // "passes" on one where it is - the outcome would depend on the host again.
+    EXPECT_TRUE(protection.MonitorProcess(livePid));
+    EXPECT_TRUE(protection.MonitorProcess(livePid));  // idempotent re-registration
+    EXPECT_FALSE(protection.MonitorProcess(0));       // invalid PID
+    EXPECT_FALSE(protection.MonitorProcess(4));       // System process
+
+    // EnableExploitProtection ends in MonitorProcess(), so it inherits the same
+    // validation: it can no longer report success for a PID it could not register.
+    // MONITOR_ONLY deliberately skips the SetProcessMitigationPolicy block, so
+    // nothing is applied to the test process here.
+    EXPECT_TRUE(protection.EnableExploitProtection(livePid, EXPLOIT_PROTECT_MONITOR_ONLY));
     EXPECT_FALSE(protection.EnableExploitProtection(0, EXPLOIT_PROTECT_MONITOR_ONLY));
     EXPECT_TRUE(ContainsSubstring(protection.GetStatistics(), "\"monitoredProcesses\":1"));
     EXPECT_TRUE(ContainsSubstring(protection.GetStatistics(), "\"registeredCallbacks\":1"));
 
-    EXPECT_TRUE(protection.UnmonitorProcess(4242));
-    EXPECT_FALSE(protection.UnmonitorProcess(4242));
+    EXPECT_TRUE(protection.UnmonitorProcess(livePid));
+    EXPECT_FALSE(protection.UnmonitorProcess(livePid));
     EXPECT_TRUE(protection.UnregisterThreatCallback(callbackId));
     EXPECT_FALSE(protection.UnregisterThreatCallback(callbackId));
 }

@@ -98,7 +98,23 @@ TEST_F(BootTimeAnalyzerTest, InitializeUpdateConfigAndDiagnosticsExposePublicSta
 
     EXPECT_TRUE(BootTimeAnalyzer::HasInstance());
     EXPECT_TRUE(analyzer.IsInitialized());
-    EXPECT_EQ(analyzer.GetShadowStrikeBootImpact(), 150ms);
+
+    // WAS: EXPECT_EQ(analyzer.GetShadowStrikeBootImpact(), 150ms).
+    // 150ms was a hardcoded placeholder the accessor used to return unconditionally.
+    // GetShadowStrikeBootImpact() is now a MEASURED value with three ordered sources
+    // (BootTimeAnalyzer.cpp): the kernel-reported boot time from PhantomSensor's
+    // QueryDriverStatus telemetry if it has ever been observed, else the
+    // shadowStrikeImpact of the last full AnalyzeBootTime(), else 0ms. Initialize()
+    // triggers neither - it only builds the hash store and whitelist - and this
+    // fixture's SetUp() calls Shutdown(), which clears any cached analysis. A unit
+    // test process has no driver IPC connection, so "nothing measured yet" is the
+    // state under test and 0ms is its correct answer.
+    // If someone reverts this to 150ms: the test fails against the current product,
+    // and re-asserting a literal here would be asserting that the analyzer is
+    // allowed to invent a boot-impact figure it never measured - the exact defect
+    // the change removed. Reporting a fabricated 150ms cost is worse than reporting
+    // zero, because an operator cannot tell an unmeasured value from a real one.
+    EXPECT_EQ(analyzer.GetShadowStrikeBootImpact(), 0ms);
 
     auto updated = analyzer.GetConfig();
     updated.analyzeDrivers = false;

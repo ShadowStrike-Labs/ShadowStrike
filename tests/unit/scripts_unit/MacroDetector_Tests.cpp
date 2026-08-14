@@ -184,7 +184,32 @@ TEST_F(MacroDetectorTest, AnalysisHelpersDetectFormatsRiskyVbaAndIocs) {
         "bad = \"999.20.30.40\"\n"
         "path = \"C:\\temp\\payload.exe\"\n"
         "reg = \"HKCU\\Software\\Run\"\n");
-    EXPECT_EQ(iocs.size(), 4u);
+
+    // WAS: EXPECT_EQ(iocs.size(), 4u).
+    // ExtractIOCs() runs five passes over the code (MacroDetector.cpp): URL, bare
+    // domain, IPv4, file path, registry key. The bare-domain pass was added after
+    // this expectation was written, and it fires three times on this input - once on
+    // the host inside the URL and twice on the "<name>.<ext>" tokens, which are
+    // shaped like domains - so the correct total is 7, not 4.
+    // Asserting the CONTENTS rather than the count is the point of the rewrite: a
+    // bare "== 4" (or "== 7") passes unchanged if a future edit silently drops one
+    // whole class of indicator and gains another, e.g. loses registry-key extraction
+    // while adding e-mail extraction. IOC extraction feeds threat-intel correlation,
+    // so losing a class means losing correlation on every macro that only carries
+    // that class. Named expectations fail on exactly that.
+    // If someone reverts to the bare count: it fails against the current extractor,
+    // and restoring it would drop the per-class coverage this now guarantees.
+    EXPECT_TRUE(ContainsString(iocs, "https://evil.example/dropper.exe"));  // URL pass
+    EXPECT_TRUE(ContainsString(iocs, "evil.example"));                      // domain pass
+    EXPECT_TRUE(ContainsString(iocs, "dropper.exe"));                       // domain pass
+    EXPECT_TRUE(ContainsString(iocs, "payload.exe"));                       // domain pass
+    EXPECT_TRUE(ContainsString(iocs, "10.20.30.40"));                       // IPv4 pass
+    EXPECT_TRUE(ContainsString(iocs, "C:\\temp\\payload.exe"));             // path pass
+    EXPECT_TRUE(ContainsString(iocs, "HKCU\\Software\\Run"));               // registry pass
+    EXPECT_EQ(iocs.size(), 7u);
+
+    // Still the real assertion of the IPv4 pass: octet-range validation rejects
+    // 999.x.x.x even though it matches the \d{1,3} shape.
     EXPECT_FALSE(ContainsString(iocs, "999.20.30.40"));
 
     EXPECT_EQ(detector.Deobfuscate("Chr(72)"), "H");

@@ -66,7 +66,21 @@ TEST_F(URLAnalyzerTest, ParseUrlExtractsComponentsAndSecurityFlagsConsistently) 
     EXPECT_EQ(parsed.subdomain, "sub");
     ASSERT_EQ(parsed.labels.size(), 3u);
     EXPECT_EQ(parsed.labels[0], "sub");
-    EXPECT_EQ(parsed.normalizedUrl, "https://sub.example.com/path/index.html");
+    // WAS: EXPECT_EQ(parsed.normalizedUrl, "https://sub.example.com/path/index.html").
+    // normalizedUrl now KEEPS a non-default port and collapses only the scheme's
+    // default one (URLAnalyzer.cpp: `if (parsed.hasPort && parsed.port !=
+    // parsed.defaultPort)`), so 8443 survives while an explicit :443 on https would
+    // not. normalizedUrl is the verdict cache key (ScanURL uses it directly), which is
+    // what makes this a security property rather than cosmetics: dropping the port
+    // makes https://host:8443/path and https://host/path the same cache entry, so a
+    // verdict earned by one service is served for a different service on the same
+    // host - a cache-poisoning primitive, and one an attacker controls by choosing the
+    // port they host on. Collapsing the DEFAULT port is safe and desirable for the
+    // opposite reason: :443 and no port are genuinely the same endpoint, and treating
+    // them as different lets the same URL be rescanned under two keys.
+    // If someone reverts this expectation: the honest fix would be to drop the port
+    // from normalizedUrl again, which reintroduces the cross-port verdict collision.
+    EXPECT_EQ(parsed.normalizedUrl, "https://sub.example.com:8443/path/index.html");
     EXPECT_FALSE(parsed.isLocalhost);
     EXPECT_FALSE(parsed.isPrivateIP);
 }
@@ -231,9 +245,27 @@ TEST_F(URLAnalyzerTest, LocalListsCacheCallbacksAndConfigUpdatesRemainConsistent
 
 TEST_F(URLAnalyzerTest, AnalysisGuardsCacheAndDomainVerdictsRemainConsistent) {
     const URLVerdict empty = analyzer.ScanURL("");
-    EXPECT_EQ(empty.category, URLCategory::UNKNOWN);
+
+    // WAS: EXPECT_EQ(empty.category, URLCategory::UNKNOWN) and
+    //      EXPECT_FALSE(empty.isBlocked).
+    // ScanURL now fails CLOSED on malformed input. An empty URL - like an over-length
+    // one, one with an embedded NUL, or one carrying CR/LF or control characters - is
+    // returned as isBlocked = true, category SUSPICIOUS, severity HIGH, action BLOCK,
+    // threatName "URL.Empty", and is counted in both parseErrors and urlsBlocked.
+    // UNKNOWN + not-blocked was fail-open: it is the same verdict a URL gets when
+    // there is simply no reputation data for it, so a caller could not distinguish
+    // "nothing known about this site" from "this input is not a URL at all", and the
+    // usual `if (!verdict.isBlocked) allow();` caller would let the malformed input
+    // through. Input that cannot be parsed cannot be assessed, and unassessable input
+    // on a filtering path must not be allowed - the parser confusion these guards
+    // cover (NUL truncation, CRLF splitting) is exactly how a blocklist gets bypassed.
+    // If someone reverts these two: they fail against the current product, and
+    // honouring them would mean returning an allow-shaped verdict for unparseable
+    // input again.
+    EXPECT_EQ(empty.category, URLCategory::SUSPICIOUS);
     EXPECT_EQ(empty.recommendedAction, URLFilterAction::BLOCK);
-    EXPECT_FALSE(empty.isBlocked);
+    EXPECT_TRUE(empty.isBlocked);
+    EXPECT_EQ(empty.threatName, "URL.Empty");
     EXPECT_EQ(analyzer.GetStatistics().parseErrors.load(std::memory_order_relaxed), 1u);
 
     const DomainVerdict whitelisted = analyzer.AnalyzeDomain("bootstrap.safe");

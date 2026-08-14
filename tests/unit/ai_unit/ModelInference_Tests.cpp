@@ -147,16 +147,65 @@ TEST_F(ModelInferenceTest, ShutdownIsIdempotent) {
     EXPECT_FALSE(inference.IsInitialized());
 }
 
-#if !__has_include(<onnxruntime_c_api.h>)
-TEST_F(ModelInferenceTest, WithoutOnnxRuntimeSdkInitializeFailsAndCapabilitiesStayDisabled) {
+// WAS: a test guarded by #if !__has_include(<onnxruntime_c_api.h>) named
+// WithoutOnnxRuntimeSdkInitializeFailsAndCapabilitiesStayDisabled, asserting
+// EXPECT_FALSE(Initialize(...)), EXPECT_FALSE(HasAVX2()), EXPECT_FALSE(HasAVX512())
+// and EXPECT_FALSE(HasDirectML()).
+//
+// The guard was the defect, not the assertions. __has_include is evaluated in THIS
+// translation unit, whose include path (PhantomTests.vcxproj) does not carry
+// vendor\onnxruntime\include - so it reported "no ONNX Runtime" and compiled the
+// test in. But ModelInference.cpp is compiled into PhantomCoreLib, which DOES carry
+// that include directory, so the linked implementation is the real ORT one and
+// Initialize() succeeds. A test cannot infer the capabilities of a library it links
+// against from its own include path; the two are configured separately, and here
+// they disagree.
+//
+// The two assertions on CPU features were wrong for a second, independent reason:
+// HasAVX2()/HasAVX512() report what DetectCpuFeatures() found via CPUID plus XGETBV
+// on the machine running the test. Those vary per host, so no fixed expectation of
+// either polarity is correct.
+//
+// What is left below are the contracts that hold on every build and every CPU.
+// If someone restores the __has_include version: it fails on this build (Initialize
+// succeeds), and on a build without the SDK it would still assert host CPU features
+// it cannot know.
+TEST_F(ModelInferenceTest, CapabilityQueriesFollowConfigAndStayStableAcrossReads) {
     auto& inference = ModelInference::Instance();
 
-    EXPECT_FALSE(inference.Initialize(CortexConfig{}));
-    EXPECT_FALSE(inference.IsInitialized());
-    EXPECT_FALSE(inference.HasAVX2());
-    EXPECT_FALSE(inference.HasAVX512());
+    CortexConfig config{};
+    config.useGPU = false;
+
+    const bool initialized = inference.Initialize(config);
+
+    // Whether the engine can initialize is a property of the linked build and of the
+    // ORT runtime being loadable - not something this test may assume in either
+    // direction. What must always hold is that the reported state matches the answer.
+    EXPECT_EQ(inference.IsInitialized(), initialized);
+
+    // Config-driven and therefore machine-independent: with useGPU = false,
+    // Initialize() takes the "GPU disabled by config" branch and clears the DirectML
+    // capability instead of probing for it.
     EXPECT_FALSE(inference.HasDirectML());
+
+    // CPU features are read from CPUID on the host, so assert only that the accessors
+    // are stable and side-effect free - never a specific value.
+    EXPECT_EQ(inference.HasAVX2(), inference.HasAVX2());
+    EXPECT_EQ(inference.HasAVX512(), inference.HasAVX512());
+
+    // AVX-512F implies AVX2 on every CPU that reports both through leaf 7, so this
+    // holds regardless of which features the host actually has.
+    if (inference.HasAVX512()) {
+        EXPECT_TRUE(inference.HasAVX2());
+    }
+
+    // Guard contracts must hold in both states: a model file that does not exist is
+    // never loaded, and an unloaded slot never yields a score.
+    EXPECT_FALSE(inference.LoadModel(CortexModelType::Static, tempDir.File(L"absent.onnx")));
+    EXPECT_FALSE(inference.IsModelLoaded(CortexModelType::Static));
+
+    inference.Shutdown();
+    EXPECT_FALSE(inference.IsInitialized());
 }
-#endif
 
 }  // namespace ShadowStrike::AI::Test

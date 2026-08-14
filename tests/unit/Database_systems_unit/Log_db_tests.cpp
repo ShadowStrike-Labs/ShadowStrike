@@ -968,8 +968,31 @@ TEST_F(LogDBTest, LogEmptyMessageSucceeds) {
     EXPECT_TRUE(entry->message.empty());
 }
 
-TEST_F(LogDBTest, LogVeryLongMessageSucceeds) {
+// WAS: TEST_F(LogDBTest, LogVeryLongMessageSucceeds) expecting
+// entry->message.length() == 10000, i.e. the message stored verbatim.
+// LogDB now bounds every attacker-influenced field before it is serialized.
+// dbInsertEntry (and the batch path) run each field through ClampField with a
+// per-field cap - LOGDB_MAX_MESSAGE_LEN is 8192 - and ClampField keeps
+// maxLen - 4 code units and appends "...", so a 10,000-character message is stored as
+// exactly 8,191 characters ending in an ellipsis. Log messages come from scan results,
+// file paths and network data, so an unbounded field is a storage-amplification lever:
+// a single attacker-chosen string repeated across a flood of events is limited only by
+// how much the attacker can write. The write still SUCCEEDS - dropping the entry
+// entirely would lose the detection - it is only the field that is bounded.
+// Renamed because the old name claims the message survived intact.
+// If someone reverts to expecting 10000: it fails against the current product, and
+// satisfying it would mean removing the message clamp and taking the amplification
+// exposure back. The exact truncated length is asserted, not just "shorter than the
+// input", so a change to LOGDB_MAX_MESSAGE_LEN or to ClampField's ellipsis accounting
+// fails here rather than silently altering what operators read back.
+TEST_F(LogDBTest, LogVeryLongMessageSucceedsAndIsClampedToTheFieldBound) {
     EXPECT_TRUE(InitializeLogDB());
+
+    // LOGDB_MAX_MESSAGE_LEN / ClampField are file-local to LogDB.cpp, so the bound is
+    // expressed here as the literals they are defined as.
+    constexpr size_t kMaxMessageLen = 8192;
+    constexpr size_t kEllipsisLen = 3;
+    constexpr size_t kClampedLen = kMaxMessageLen - 4 + kEllipsisLen;  // 8191
 
     std::wstring longMessage(10000, L'A');
 
@@ -980,7 +1003,20 @@ TEST_F(LogDBTest, LogVeryLongMessageSucceeds) {
     DatabaseError err;
     auto entry = LogDB::Instance().GetEntry(entryId, &err);
     ASSERT_TRUE(entry.has_value());
-    EXPECT_EQ(entry->message.length(), 10000);
+    EXPECT_EQ(entry->message.length(), kClampedLen);
+    EXPECT_TRUE(entry->message.ends_with(L"..."));
+    EXPECT_EQ(entry->message.substr(0, kMaxMessageLen - 4),
+              longMessage.substr(0, kMaxMessageLen - 4));
+
+    // A message that fits under the cap is stored byte for byte - the clamp must not
+    // touch anything it does not have to.
+    const std::wstring atLimitMessage(kMaxMessageLen, L'B');
+    const int64_t atLimitId = LogDB::Instance().LogInfo(L"Test", atLimitMessage);
+    EXPECT_GT(atLimitId, 0);
+
+    auto atLimitEntry = LogDB::Instance().GetEntry(atLimitId, &err);
+    ASSERT_TRUE(atLimitEntry.has_value());
+    EXPECT_EQ(atLimitEntry->message, atLimitMessage);
 }
 
 // ============================================================================

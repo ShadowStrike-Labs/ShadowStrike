@@ -53,13 +53,49 @@ TEST_F(NetworkTrafficFilterTest, HelperTypesAndConfigFactoriesRemainStable) {
 
     EXPECT_TRUE(boundaryPrivate.IsPrivate());
     EXPECT_FALSE(boundaryPublic.IsPrivate());
-    EXPECT_TRUE(loopbackV4.IsPrivate());
+
+    // WAS: EXPECT_TRUE(loopbackV4.IsPrivate()) and EXPECT_TRUE(loopbackV6.IsPrivate()).
+    // THE PRODUCT IS CORRECT AND THE TEST WAS WRONG. IsPrivate() and IsLoopback() are
+    // deliberately DISJOINT predicates: IsPrivate() answers RFC 1918 (10/8,
+    // 172.16/12, 192.168/16) and RFC 4193 (fc00::/7); loopback is RFC 1122 127/8 and
+    // RFC 4291 ::1, a different address scope with its own predicate. 127.0.0.1 is
+    // therefore not private, and ::1 is not private.
+    //
+    // This is a detection question, not a naming one. IsPrivate() is the "is the peer
+    // on my LAN" predicate, and callers use it to decide how much scrutiny a flow
+    // gets - a private<->private flow is internal traffic, a private->public flow is
+    // egress that has to be examined for C2 and exfiltration. Loopback is neither: it
+    // never reaches a wire. Folding it into "private" hands every localhost flow the
+    // trusted-LAN treatment, and localhost is precisely where implants put their
+    // local hop - a SOCKS/HTTP proxy bound to 127.0.0.1 that a tunnel client chains
+    // through, or C2 relayed between two processes on the host. Any caller written as
+    // `if (remote.IsPrivate()) { /* internal, skip deep inspection */ }` would then
+    // skip exactly that traffic, and no caller could ask for localhost specifically
+    // any more, because the two scopes would be indistinguishable through this API.
+    //
+    // Keeping them disjoint forces each caller to make loopback an explicit decision,
+    // which is what the rest of the codebase already does:
+    // NetworkMonitor::DetermineDirection tests IsLoopback() first and returns
+    // ConnectionDirection::LOCAL before it ever considers INTERNAL or OUTBOUND.
+    //
+    // If someone reverts this to EXPECT_TRUE, the honest fix would have to be
+    // widening IPAddress::IsPrivate() in NetworkTrafficFilter.cpp to swallow 127/8
+    // and ::1 - which silently reclassifies all local-proxy traffic as trusted LAN
+    // traffic for every present and future caller of the predicate. That is a
+    // detection loss with no compensating gain.
+    EXPECT_FALSE(loopbackV4.IsPrivate());
     EXPECT_TRUE(loopbackV4.IsLoopback());
 
     EXPECT_EQ(IPVersion::IPv6, loopbackV6.version);
     EXPECT_EQ(std::string("::1"), loopbackV6.ToString());
-    EXPECT_TRUE(loopbackV6.IsPrivate());
+    EXPECT_FALSE(loopbackV6.IsPrivate());
     EXPECT_TRUE(loopbackV6.IsLoopback());
+
+    // The disjointness itself, stated once so a future edit that merges the two
+    // scopes fails here rather than in whichever caller happens to notice first.
+    EXPECT_FALSE(privateV4.IsLoopback());
+    EXPECT_FALSE(IPAddress::FromString("fd00::1").IsLoopback());
+    EXPECT_TRUE(IPAddress::FromString("fd00::1").IsPrivate());
 
     NetworkEndpoint endpoint{ privateV4, 443 };
     EXPECT_EQ(std::string("192.168.1.10:443"), endpoint.ToString());

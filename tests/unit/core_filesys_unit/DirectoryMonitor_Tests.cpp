@@ -83,8 +83,28 @@ TEST(DirectoryMonitorValueTests, ConfigPresetsAndValidationReflectOperationalMod
     EXPECT_TRUE(defaults.enabled);
     EXPECT_FALSE(defaults.monitorNetworkShares);
     EXPECT_TRUE(highSecurity.monitorNetworkShares);
-    EXPECT_FALSE(highSecurity.enableRateLimiting);
-    EXPECT_EQ(highSecurity.maxEventsPerWindow, UINT32_MAX);
+
+    // WAS: EXPECT_FALSE(highSecurity.enableRateLimiting) and
+    //      EXPECT_EQ(highSecurity.maxEventsPerWindow, UINT32_MAX).
+    // CreateHighSecurity() no longer disables rate limiting. It keeps it ENABLED and
+    // raises the ceiling to a finite 1,000,000 events per 60s window, versus the
+    // 1,000 default in DirectoryMonitorConstants::MAX_EVENTS_PER_PATH_PER_WINDOW.
+    // "High security" must not mean "unbounded ingest": whatever can generate
+    // filesystem churn - ransomware renaming a share, or a hostile filesystem driver
+    // deliberately emitting notifications - would otherwise be able to drive the
+    // event pipeline at line rate, and the monitor becomes the denial-of-service
+    // vector on the mode that is supposed to be the most defensive. A finite ceiling
+    // three orders of magnitude above the default keeps every realistic workload
+    // under the limit while still bounding a flood.
+    // If someone reverts this to UINT32_MAX + disabled: nothing else in the product
+    // fails, which is the danger. IsValid() accepts it (the maxEventsPerWindow check
+    // is gated on enableRateLimiting, so switching the flag off skips the bound
+    // entirely), so this expectation is the only thing standing between the
+    // high-security preset and a floodable event queue.
+    EXPECT_TRUE(highSecurity.enableRateLimiting);
+    EXPECT_EQ(highSecurity.maxEventsPerWindow, 1'000'000u);
+    EXPECT_GT(highSecurity.maxEventsPerWindow, defaults.maxEventsPerWindow);
+    EXPECT_NE(highSecurity.maxEventsPerWindow, UINT32_MAX);
     EXPECT_TRUE(defaults.IsValid());
 
     DirectoryMonitorConfig invalid = defaults;

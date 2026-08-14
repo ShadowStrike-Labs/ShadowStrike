@@ -202,7 +202,25 @@ TEST_F(DNSMonitorTest, ExpiredCacheAndDiagnosticsFailurePathsRemainSafe) {
     EXPECT_FALSE(monitor.QueryCache("expired.example", DNSRecordType::A).has_value());
     EXPECT_EQ(monitor.GetStatistics().cacheMisses.load(std::memory_order_relaxed), 1u);
 
-    EXPECT_TRUE(monitor.UnblockDomain("missing.example"));
+    // WAS: EXPECT_TRUE(monitor.UnblockDomain("missing.example")).
+    // UnblockDomain() now reports whether it actually changed policy. DNSMonitor.cpp
+    // erases every filter rule whose normalized pattern matches AND whose action is
+    // BLOCK, then returns "did I erase at least one". A domain that was never blocked
+    // erases nothing, so the answer is false - the same false the syntactic-reject
+    // path returns, both meaning "no block rule was removed".
+    // This matters to callers, not just to bookkeeping: an unblock that answers true
+    // unconditionally cannot distinguish a real policy change from a no-op. An
+    // operator (or the management API) who unblocks a mistyped domain gets "success"
+    // back while the actual block stays in force, and the same acknowledgement is
+    // returned whether or not the block is gone.
+    // If someone reverts this to EXPECT_TRUE: it fails against the current product,
+    // and honouring it would mean going back to a write API that reports success for
+    // work it did not do.
+    EXPECT_FALSE(monitor.UnblockDomain("missing.example"));
+
+    // The positive counterpart is asserted in
+    // DgaFilteringCallbackAndCacheContractsRemainDeterministic: block, then unblock
+    // the same domain, which does remove a rule and does return true.
 
     monitor.Shutdown();
     EXPECT_FALSE(monitor.PerformDiagnostics());
