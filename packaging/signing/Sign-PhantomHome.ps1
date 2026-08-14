@@ -91,12 +91,35 @@ $Targets = [ordered]@{
     "ShadowStrikePhantom-Home-Setup.msi" = Join-Path $RepoRoot "build\installer\ShadowStrikePhantom-Home-Setup.msi"
 }
 
-# Driver-specific artifacts: sign separately after the main EXE/MSI loop.
-# These require /ph (page hash) for kernel-mode components.
-$DriverTargets = [ordered]@{
-    "PhantomSensor.sys" = Join-Path $RepoRoot "build\installer\staging\drivers\PhantomSensor.sys"
-    "PhantomSensor.cat" = Join-Path $RepoRoot "build\installer\staging\drivers\PhantomSensor.cat"
-}
+# ============================================================================
+# DRIVER SIGNING DELIBERATELY DOES NOT HAPPEN HERE ANY MORE.
+# ============================================================================
+# This script runs AFTER `wix build`, so signing the staged driver here could
+# never affect what the MSI ships - the package was already assembled from the
+# files as they were a moment earlier. That is not theoretical: 1.0.92 shipped
+# PhantomSensor.sys signed by "CN=WDKTestCert RTX40,..." (the certificate the WDK
+# generates on its own, which nothing installs), while this script left the
+# staged copy correctly signed. build\installer\staging looked right and the MSI
+# was wrong, so every inspection of the staging directory confirmed a signature
+# the endpoint never received.
+#
+# The consequence was total and silent: DriverResume installs ShadowStrike-Dev.cer
+# into Root and TrustedPublisher, the shipped driver did not chain to it, runtime
+# attestation failed with 0x800B0109, the encrypted kernel channel was refused,
+# and ON-ACCESS SCANNING NEVER RAN - on a build that otherwise looked healthy.
+#
+# There is a second reason it cannot live here: PhantomSensor.cat stores the hash
+# of PhantomSensor.sys, so signing the .sys requires REGENERATING the catalog
+# afterwards (Inf2Cat). This script has no catalog step, so every driver signature
+# it applied left the neighbouring catalog describing bytes that no longer existed.
+#
+# Both concerns belong together, so Sync-DriverStaging in
+# tools\vm-harness\Invoke-PhantomDeploy.ps1 now owns the whole driver package:
+# sign the .sys (with /ph) -> Inf2Cat -> sign the .cat -> stage -> assert the
+# signer's public key matches the certificate the installer actually installs.
+# Signing the driver in two places would put us back to two owners disagreeing,
+# which is the shape of the original defect.
+$DriverTargets = [ordered]@{}
 
 $BundlePath  = Join-Path $RepoRoot "build\installer\ShadowStrikePhantom-Home-Setup.exe"
 $EngineTemp  = Join-Path $RepoRoot "build\installer\_burn-engine-tmp.exe"

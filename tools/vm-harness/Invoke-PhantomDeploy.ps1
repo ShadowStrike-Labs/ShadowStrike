@@ -129,6 +129,54 @@ function Get-LatestSigntoolPath {
     return $null
 }
 
+# Inf2Cat lives under x86 only - there is no x64 build of it in the WDK.
+function Get-LatestInf2CatPath {
+    $found = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x86\Inf2Cat.exe' -ErrorAction SilentlyContinue |
+             Sort-Object { try { [version]($_.Directory.Parent.Name) } catch { [version]'0.0' } } -Descending |
+             Select-Object -First 1
+    if ($found) { return $found.FullName }
+    $legacy = 'C:\Program Files (x86)\Windows Kits\10\bin\x86\Inf2Cat.exe'
+    if (Test-Path $legacy) { return $legacy }
+    return $null
+}
+
+# ── CERTIFICATE IDENTITY ─────────────────────────────────────────────────────
+# Both helpers return the SHA-256 of the certificate's SUBJECT PUBLIC KEY, as
+# uppercase hex.
+#
+# WHY THE PUBLIC KEY AND NOT THE THUMBPRINT: a thumbprint hashes the whole
+# certificate, so it changes when the certificate is reissued or its validity
+# window is extended even though the key - the thing that actually establishes
+# identity - is unchanged. Pinning the key survives a legitimate reissue and
+# still rejects a different signer, which is the property we want. It is also
+# what the eventual production EV/WHQL certificate will need, so the mechanism
+# does not have to be replaced when the certificate is.
+function Get-CertificateSpkiSha256 {
+    param([Parameter(Mandatory)][string]$CertPath)
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 `
+                ((Resolve-Path -LiteralPath $CertPath).Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hash = $sha.ComputeHash($cert.PublicKey.EncodedKeyValue.RawData)
+    return (($hash | ForEach-Object { $_.ToString('X2') }) -join '')
+}
+
+# Returns $null when the file carries no Authenticode signer certificate.
+#
+# NOTE: this deliberately does NOT require the signature to be TRUSTED.
+# Get-AuthenticodeSignature reports Status=UnknownError for our dev certificate
+# because this build host does not have the dev root installed, yet it still
+# hands back SignerCertificate. Asking "who signed this" is a different question
+# from "does this machine trust that signer", and conflating the two is what the
+# runtime attestation defect did.
+function Get-SignerSpkiSha256 {
+    param([Parameter(Mandatory)][string]$FilePath)
+    $sig = Get-AuthenticodeSignature -LiteralPath $FilePath
+    if (-not $sig -or -not $sig.SignerCertificate) { return $null }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hash = $sha.ComputeHash($sig.SignerCertificate.PublicKey.EncodedKeyValue.RawData)
+    return (($hash | ForEach-Object { $_.ToString('X2') }) -join '')
+}
+
 # Resolve the PFX password once: empty if the PFX has no password, otherwise
 # pulled from $env:SHADOWSTRIKE_PFX_PASSWORD.  Fails fast if neither path works.
 function Resolve-PfxPassword {
@@ -167,7 +215,12 @@ function Sign-Artifact {
         [Parameter(Mandatory)][string]$PfxPath,
         [string]$PfxPasswordPlain = '',
         [Parameter(Mandatory)][string]$Signtool,
-        [string]$TimestampUrl = 'http://timestamp.digicert.com'
+        [string]$TimestampUrl = 'http://timestamp.digicert.com',
+        # Emit page hashes (/ph). Kernel-mode images only: Code Integrity can then
+        # validate each page as it is paged in rather than only hashing the whole
+        # file at load. Meaningless for a catalog, which has no image pages, and
+        # for user-mode EXEs it only inflates the signature.
+        [switch]$PageHashes
     )
 
     Require-File -Path $Path     -Label "Artifact to sign"
@@ -178,6 +231,7 @@ function Sign-Artifact {
     if (-not [string]::IsNullOrEmpty($PfxPasswordPlain)) {
         $argList += @('/p', $PfxPasswordPlain)
     }
+    if ($PageHashes) { $argList += '/ph' }
     $argList += @('/tr', $TimestampUrl, '/td', 'SHA256', '/d', 'ShadowStrike PhantomHome', $Path)
 
     Log "[SIGN] $Path"
@@ -191,6 +245,7 @@ function Sign-Artifact {
         if (-not [string]::IsNullOrEmpty($PfxPasswordPlain)) {
             $noTs += @('/p', $PfxPasswordPlain)
         }
+        if ($PageHashes) { $noTs += '/ph' }
         $noTs += @('/d', 'ShadowStrike PhantomHome', $Path)
         & $Signtool @noTs | Out-Host
         $rc = $LASTEXITCODE
@@ -586,6 +641,61 @@ Rebuild with phantom-sigbuild, which generates the manifest alongside the output
 # hash of PhantomSensor.sys, so a catalog that does not cover the .sys beside it
 # makes the driver fail signature verification and refuse to load. Copying one
 # without the other is not a partial update, it is a broken install.
+#
+# ============================================================================
+# AND THE DRIVER MUST BE SIGNED BY THE CERTIFICATE THE INSTALLER TRUSTS.
+# ============================================================================
+# The first version of this function copied the driver straight out of the WDK
+# build output and staged it unsigned-by-us. That shipped 1.0.92 with a driver
+# signed by "CN=WDKTestCert RTX40,134178001707380803" - the certificate the WDK
+# generates by itself when a driver project has no explicit SignMode, which is
+# the case here: <DriverSign> in PhantomSensor.vcxproj sets only
+# FileDigestAlgorithm, so TestSign with an auto-generated cert is the default.
+#
+# DriverResume installs packaging\signing\ShadowStrike-Dev.cer into Root and
+# TrustedPublisher. That is a DIFFERENT certificate. The WDK test cert is
+# self-signed and is never installed anywhere, so the driver's chain could not
+# terminate in a trusted root no matter how many times the installer succeeded:
+#
+#   DriverResume 15:42:37.092  cert installed into 'Root' store
+#   DriverResume 15:42:37.092  cert installed into 'TrustedPublisher' store
+#   DriverResume 15:42:37.273  WARN dev-cert signature (root not in CA store)
+#                              HRESULT=0x800B0109        <- 180ms after installing
+#
+# and at runtime the consequence was total:
+#
+#   CryptoManager.cpp:5047  Authenticode verification FAILED (result=0x800B0109)
+#   FilterConnection        KEX: Driver attestation FAILED
+#   IPCManager              Primary encrypted scanner connection FAILED -
+#                           kernel scan requests cannot be served
+#
+# ON-ACCESS SCANNING DID NOT RUN AT ALL on that build. The machine looked
+# healthy - no freeze, no crash, UI served to the last line - precisely because
+# no scan request ever reached user mode. A packaging defect presented as a
+# clean run, which is the most expensive way for this to fail.
+#
+# WHY IT WAS INVISIBLE: Sign-PhantomHome.ps1 runs AFTER wix build and signs the
+# staged driver too, so by the time anyone inspected build\installer\staging the
+# .sys was correctly signed and 6,096 bytes larger. The MSI had already been
+# built from the test-signed copy one second earlier. The staging directory and
+# the shipped package disagreed, and staging is the one a human looks at.
+#
+# ORDER IS LOAD-BEARING, and the script already says so 200 lines above for the
+# EXEs: sign BEFORE the artifact is packaged, because wix packages whatever is
+# on disk at that moment. Within the driver package the order is tighter still:
+#   1. sign the .sys          - changes the file, therefore changes its hash
+#   2. run Inf2Cat            - hashes the .sys AS SIGNED into a new catalog
+#   3. sign the .cat
+# Signing the .sys after the catalog was generated leaves a catalog covering
+# bytes that no longer exist. Inf2Cat must run after step 1 or not at all.
+#
+# The driver loads via CreateServiceW + FilterLoad (DriverInstaller.cpp:511,
+# :631), not an INF/PnP install, so Code Integrity checks the .sys EMBEDDED
+# signature at load and the catalog is not consulted on that path. The catalog
+# is still regenerated rather than left stale: an artifact that opens fine and
+# describes the wrong file is the exact failure mode this whole function exists
+# to prevent, and this function's own catalog-freshness check would be asserting
+# something false.
 function Sync-DriverStaging {
     $driverOutDir  = Join-Path $RepoRoot 'PhantomSensor\x64\Release\PhantomSensor'
     $stagingDrvDir = Join-Path $StagingDir 'drivers'
@@ -611,14 +721,10 @@ driver build fails inf2cat with an error that names nothing useful:
     }
 
     $sysItem = Get-Item $sysSrc
-    $catItem = Get-Item $catSrc
 
-    if ($catItem.LastWriteTimeUtc -lt $sysItem.LastWriteTimeUtc) {
-        Die ("PhantomSensor.cat ({0:u}) is older than PhantomSensor.sys ({1:u}), so the catalog cannot cover this driver and it will fail signature verification at load. Rebuild the driver with /t:Rebuild." -f `
-            $catItem.LastWriteTimeUtc, $sysItem.LastWriteTimeUtc)
-    }
-
-    # This is the check that would have caught the stale staged driver.
+    # Validate the build output BEFORE signing it. Signing does not touch
+    # VERSIONINFO, so this could run either side - it runs first so a driver from
+    # the wrong build is rejected before we spend a signature on it.
     $drvVersion = $sysItem.VersionInfo.FileVersion
     if ([string]::IsNullOrWhiteSpace($drvVersion)) {
         Die "PhantomSensor.sys carries no VERSIONINFO resource, so the shipped driver would be unidentifiable in msinfo32, Autoruns and every driver-enumeration tool - on the one component that runs in ring 0. Rebuild the driver."
@@ -628,12 +734,110 @@ driver build fails inf2cat with an error that names nothing useful:
             $drvVersion.Trim(), $FileVersionFull)
     }
 
+    # ── Expected signer: the certificate the MSI ships and DriverResume trusts ──
+    # Pinned to the SUBJECT PUBLIC KEY (SPKI SHA-256), not the thumbprint,
+    # so reissuing the certificate with the same key does not break the check
+    # while a different key does.
+    $expectedCer = Join-Path $RepoRoot 'packaging\signing\ShadowStrike-Dev.cer'
+    Require-File -Path $expectedCer -Label 'ShadowStrike-Dev.cer (driver trust anchor)'
+    $expectedSpki = Get-CertificateSpkiSha256 -CertPath $expectedCer
+
+    if ($SkipSign) {
+        Log "WARNING: -SkipSign is set, so PhantomSensor.sys keeps the signature its build gave it."
+        Log "WARNING: the WDK signs with an auto-generated test certificate that NOTHING installs,"
+        Log "WARNING: so runtime driver attestation will fail with 0x800B0109, the encrypted kernel"
+        Log "WARNING: channel will NOT establish, and ON-ACCESS SCANNING WILL NOT RUN on this build."
+    }
+    else {
+        $signtool = Get-LatestSigntoolPath
+        if (-not $signtool) { Die "signtool.exe not found under Windows Kits\10\bin\*\x64." }
+        $pfxPwd = Resolve-PfxPassword -PfxPath $DevPfxPath
+
+        # 1. Sign the .sys. This REPLACES the WDK test signature (signtool sign
+        #    without /as replaces the primary signature rather than appending).
+        #    /ph emits page hashes, which is what a kernel-mode image wants: Code
+        #    Integrity can then validate pages as they are paged in. The previous
+        #    owner of this step (Sign-PhantomHome.ps1) used /ph for the driver, so
+        #    signing it here without page hashes would have quietly dropped that.
+        Log "Signing PhantomSensor.sys with the deploy certificate..."
+        Sign-Artifact -Path $sysSrc -PfxPath $DevPfxPath -PfxPasswordPlain $pfxPwd -Signtool $signtool -PageHashes
+
+        # 2. Regenerate the catalog over the driver AS SIGNED. Must follow step 1:
+        #    the catalog stores the hash of the .sys, and signing changed it.
+        $inf2cat = Get-LatestInf2CatPath
+        if (-not $inf2cat) {
+            Die "Inf2Cat.exe not found under Windows Kits\10\bin\*\x86. The catalog cannot be regenerated over the signed driver, and shipping the pre-signing catalog would describe bytes that no longer exist."
+        }
+        Log "Regenerating driver catalog over the signed binary..."
+        & $inf2cat /driver:"$driverOutDir" /os:10_X64 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Die ("Inf2Cat failed (exit {0}) for {1}. The catalog no longer covers the signed driver, so this package must not ship. An incremental driver build is the usual cause - rebuild with /t:Rebuild." -f `
+                $LASTEXITCODE, $driverOutDir)
+        }
+        if (-not (Test-Path $catSrc)) {
+            Die ("Inf2Cat reported success but {0} is absent. Check the CatalogFile directive in PhantomSensor.inf matches this filename." -f $catSrc)
+        }
+
+        # 3. Sign the regenerated catalog.
+        Log "Signing regenerated driver catalog..."
+        Sign-Artifact -Path $catSrc -PfxPath $DevPfxPath -PfxPasswordPlain $pfxPwd -Signtool $signtool
+    }
+
+    # Re-stat: both files changed on disk if we signed them.
+    $sysItem = Get-Item $sysSrc
+    $catItem = Get-Item $catSrc
+
     Copy-Item $sysSrc (Join-Path $stagingDrvDir 'PhantomSensor.sys') -Force
     Copy-Item $infSrc (Join-Path $stagingDrvDir 'PhantomSensor.inf') -Force
     Copy-Item $catSrc (Join-Path $stagingDrvDir 'PhantomSensor.cat') -Force
 
+    # ── Assert on the STAGED copies, because those are what wix packages. ──────
+    # Verifying the build output is what let the last defect ship: the build tree
+    # and the staged tree disagreed and only the staged one reaches the MSI.
+    $stagedSys = Join-Path $stagingDrvDir 'PhantomSensor.sys'
+    $stagedCat = Join-Path $stagingDrvDir 'PhantomSensor.cat'
+
+    $stagedSysItem = Get-Item $stagedSys
+    $stagedCatItem = Get-Item $stagedCat
+    if ($stagedCatItem.LastWriteTimeUtc -lt $stagedSysItem.LastWriteTimeUtc) {
+        Die ("PhantomSensor.cat ({0:u}) is older than PhantomSensor.sys ({1:u}), so the catalog cannot cover this driver. The catalog must be regenerated AFTER the driver is signed." -f `
+            $stagedCatItem.LastWriteTimeUtc, $stagedSysItem.LastWriteTimeUtc)
+    }
+
+    if (-not $SkipSign) {
+        # THE CHECK THAT MAKES THE 1.0.92 DEFECT UNSHIPPABLE.
+        # A version check and a catalog check both passed while the driver was
+        # signed by a certificate nothing trusts, because neither of them asked
+        # WHO signed it. This one does, against the anchor the installer actually
+        # installs, so the two can no longer disagree silently.
+        $actualSpki = Get-SignerSpkiSha256 -FilePath $stagedSys
+        if (-not $actualSpki) {
+            Die ("The staged PhantomSensor.sys carries no Authenticode signer certificate. An unsigned kernel driver cannot pass runtime attestation and will not load under Code Integrity. Path: {0}" -f $stagedSys)
+        }
+        if ($actualSpki -ne $expectedSpki) {
+            $actualSubject = (Get-AuthenticodeSignature -LiteralPath $stagedSys).SignerCertificate.Subject
+            Die @"
+The staged kernel driver is signed by the WRONG CERTIFICATE.
+
+  staged driver signer : $actualSubject
+       its public key  : $actualSpki
+  installer trusts     : CN=ShadowStrike-Labs Dev Code Signing
+       its public key  : $expectedSpki
+
+DriverResume installs packaging\signing\ShadowStrike-Dev.cer into the Root and
+TrustedPublisher stores. A driver signed by any other certificate cannot chain to
+a trusted root on the target machine, so runtime driver attestation fails with
+0x800B0109, the encrypted kernel channel is refused, and ON-ACCESS SCANNING NEVER
+RUNS - while the service otherwise looks completely healthy.
+
+This is exactly what shipped in 1.0.92. Do not work around this check.
+"@
+        }
+        Log ("Driver signer verified: public key matches the installer's trust anchor ({0}...)" -f $actualSpki.Substring(0, 16))
+    }
+
     Log ("Staged driver: PhantomSensor.sys {0:N0} bytes ver={1}, catalog {2:N0} bytes" -f `
-        $sysItem.Length, $drvVersion.Trim(), $catItem.Length)
+        $stagedSysItem.Length, $drvVersion.Trim(), $stagedCatItem.Length)
 }
 
 Sync-DriverStaging
