@@ -3493,11 +3493,32 @@ public:
 
                 // Critical/High severity packer = malware-specific packer → block immediately
                 if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
-                    Utils::Logger::Warn(
-                        "RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",
-                        Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName), packResult.packerMatches.size());
-                    m_stats.threatsDetected++;
-                    return Communication::KernelVerdict::Block;
+                    // A packer verdict is INFERENCE, not identification. It says
+                    // "this file is shaped like something that hides itself",
+                    // which our own statically linked, high-entropy native
+                    // binaries also are. Blocking one of those is a self-inflicted
+                    // outage, and in the 1.0.93 field run it was: our own tray was
+                    // flagged as packed eight times and the UI never completed a
+                    // single request.
+                    //
+                    // The file is NOT allowed through here - it falls through to
+                    // the full scan pipeline below, which can still convict it on
+                    // identification evidence. Coverage moves to stronger
+                    // evidence rather than being dropped.
+                    if (IsOwnInstalledBinary(filePath)) {
+                        SS_LOG_WARN(L"RealTimeProtection",
+                            L"Packer heuristic reported a malware-specific packer on our own "
+                            L"installed binary; withholding the block and continuing to full "
+                            L"analysis, which can still convict on identification evidence");
+                        m_stats.ownBinaryBlockWithheld++;
+                    }
+                    else {
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",
+                            Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName), packResult.packerMatches.size());
+                        m_stats.threatsDetected++;
+                        return Communication::KernelVerdict::Block;
+                    }
                 }
 
                 for (const auto& match : packResult.packerMatches) {
@@ -3525,14 +3546,38 @@ public:
 
             // If risk score is extremely high, block immediately without full scan
             if (quickInfo.riskScore >= 95) {
-                SS_LOG_WARN(L"RealTimeProtection",
-                    L"ExecutableAnalyzer rapid block: risk=%u, anomalies=%zu, PID=%u",
-                    static_cast<unsigned>(quickInfo.riskScore),
-                    quickInfo.anomalies.size(),
-                    req.ProcessId);
+                // This is the exact line the 1.0.93 field run emitted eight times
+                // for our own tray: "risk=98, anomalies=4, PID=7640", while the
+                // PhantomHome UI completed zero IPC requests for the whole run.
+                //
+                // A structural risk score is INFERENCE. On its own it is not
+                // authority to stop a file being used, which for an executable
+                // means stopping it running. Worse, this arm skips the full scan
+                // entirely, so the loudest WEAK signal prevented the strongest
+                // evidence -- hash, signature and YARA -- from ever being
+                // consulted on this file.
+                //
+                // Our own binaries therefore fall through to that full pipeline
+                // instead of being blocked here. They are not exempted from
+                // detection: identification evidence still convicts, which is the
+                // case that matters if one of them has been replaced.
+                if (IsOwnInstalledBinary(filePath)) {
+                    SS_LOG_WARN(L"RealTimeProtection",
+                        L"ExecutableAnalyzer risk=%u on our own installed binary; withholding "
+                        L"the inference-only block and continuing to full analysis",
+                        static_cast<unsigned>(quickInfo.riskScore));
+                    m_stats.ownBinaryBlockWithheld++;
+                }
+                else {
+                    SS_LOG_WARN(L"RealTimeProtection",
+                        L"ExecutableAnalyzer rapid block: risk=%u, anomalies=%zu, PID=%u",
+                        static_cast<unsigned>(quickInfo.riskScore),
+                        quickInfo.anomalies.size(),
+                        req.ProcessId);
 
-                m_stats.threatsDetected++;
-                return Communication::KernelVerdict::Block;
+                    m_stats.threatsDetected++;
+                    return Communication::KernelVerdict::Block;
+                }
             }
         }
 
@@ -5302,8 +5347,95 @@ public:
     // Placement is deliberate: this is the FIRST check in the handler, before the
     // identity cache, before hashing and before every analyzer, so an excluded file
     // costs a string comparison rather than a pipeline.
+    // (RegisterOwnDataFileExclusions, which the comment above documents, is
+    //  defined immediately after IsOwnInstalledBinary below.)
+
+    // ========================================================================
+    // IS THIS ONE OF OUR OWN INSTALLED BINARIES?
+    // ========================================================================
+    //
+    // WHY THIS EXISTS. In the 1.0.93 field run our own tray process was flagged
+    // eight times as a packed file and rapid-blocked eight times with
+    // "risk=98, anomalies=4, PID=7640", and the PhantomHome UI never completed a
+    // single IPC request all run. We blocked our own user interface with our own
+    // heuristics.
+    //
+    // Nothing exempted it, and the reason is specific: the Microsoft-trust fast
+    // path earlier in OnKernelFileScan only grants a fast path to
+    // MICROSOFT-signed files. Our binaries are signed
+    // "CN=ShadowStrike-Labs Dev Code Signing", so that tier determines
+    // *msTrust == false and falls through by design, straight into packer
+    // analysis and the executable analyzer.
+    //
+    // A packer heuristic firing on our own binaries is not surprising, either:
+    // they are large, statically linked, high-entropy native executables, which
+    // is what a packed binary looks like from the outside.
+    //
+    // WHAT THIS DOES AND DOES NOT GRANT. It is used ONLY to withhold a
+    // DESTRUCTIVE ACTION taken on INFERENCE ALONE. The file is still scanned,
+    // and identification evidence -- a hash, signature or YARA match -- still
+    // convicts it. That distinction is the same one drawn for remediation in
+    // DetectionSourceIdentifiesThreat, and it is what keeps the
+    // replaced-or-tampered-binary case covered: if an attacker substitutes our
+    // tray, a packer score is not what detects it, TamperProtection's baseline
+    // and the signature check are.
+    //
+    // Path comparison is sound HERE for the same reason: the install directory
+    // is admin-write-only and separately guarded by FileProtection, and the
+    // alternative is a guaranteed self-inflicted denial of service against our
+    // own UI weighed against a heuristic that was 32.7% confident.
+    [[nodiscard]] bool IsOwnInstalledBinary(const std::wstring& filePath) const noexcept {
+        try {
+            // Resolved once. The set is fixed for the process lifetime because it
+            // is derived from our own module location, and this runs on the
+            // on-access path where re-deriving it per file would be waste.
+            static const std::vector<std::wstring> s_ownBinaries = [] {
+                std::vector<std::wstring> out;
+                wchar_t modulePath[MAX_PATH]{};
+                const DWORD len = ::GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+                if (len == 0 || len >= MAX_PATH) {
+                    return out;  // cannot resolve -> exempt nothing, fail safe
+                }
+                std::wstring dir(modulePath, len);
+                const size_t slash = dir.find_last_of(L'\\');
+                if (slash == std::wstring::npos) {
+                    return out;
+                }
+                dir.resize(slash);
+
+                // Same list FileProtection and TamperProtection protect, so a
+                // binary added to the installer is added in exactly one place.
+                for (const auto& rel : Security::SelfDefenseConstants::CRITICAL_INSTALLED_FILES) {
+                    std::wstring full = dir + L"\\" + std::wstring(rel);
+                    std::transform(full.begin(), full.end(), full.begin(), ::towlower);
+                    out.emplace_back(std::move(full));
+                }
+                return out;
+            }();
+
+            if (s_ownBinaries.empty() || filePath.empty()) {
+                return false;
+            }
+
+            std::wstring lowered = filePath;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::towlower);
+
+            for (const auto& own : s_ownBinaries) {
+                if (lowered == own) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        catch (...) {
+            // An exemption we could not establish must not become an exemption.
+            return false;
+        }
+    }
+
     void RegisterOwnDataFileExclusions() {
         size_t registered = 0;
+
         for (const auto& ownFile : Utils::DataStorePaths::GetOwnedDataFiles()) {
             if (ownFile.empty()) {
                 continue;
@@ -6322,6 +6454,7 @@ void RTPStatistics::Reset() noexcept {
     filesCleaned = 0;
     processesTerminated = 0;
     signedFileRemediationWithheld = 0;
+    ownBinaryBlockWithheld = 0;
     excludedByPath = 0;
     excludedByExtension = 0;
     excludedByProcess = 0;

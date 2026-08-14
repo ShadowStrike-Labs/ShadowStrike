@@ -913,6 +913,15 @@ struct alignas(64) RTPStatistics {
     /// System32\urlmon.dll.
     std::atomic<uint64_t> signedFileRemediationWithheld{ 0 };
 
+    /// Times an inference-only BLOCK was withheld because the target was one of our
+    /// own installed binaries. Separate from the remediation counter above because
+    /// it is a different action on a different path: this one is the on-access
+    /// kernel verdict, so a non-zero value means our own heuristics tried to stop
+    /// our own product from running. At zero it costs nothing; above zero it is the
+    /// number that would have named the 1.0.93 UI outage directly, instead of
+    /// leaving it to be inferred from an absence of IPC requests.
+    std::atomic<uint64_t> ownBinaryBlockWithheld{ 0 };
+
     // Exclusion statistics
     std::atomic<uint64_t> excludedByPath{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };

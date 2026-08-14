@@ -59,6 +59,9 @@
 
 // IpcAuthToken — header is pure C++; compiled into PhantomCoreLib.lib.
 #include <PhantomCore/Service/IpcAuthToken.hpp>
+// CommunicationConstants::PIPE_NAME — the single definition of the service pipe
+// name, referenced below instead of being copied.
+#include <PhantomCore/Service/ServiceCommunicator.hpp>
 
 // nlohmann/json — no Qt dependency; available via $(SolutionDir)include.
 #include <nlohmann/json.hpp>
@@ -88,9 +91,20 @@ static constexpr std::uint32_t kCmdUpdateConfig    = 30u;
 static constexpr std::uint32_t kCmdPauseProtection = 210u;
 static constexpr std::uint32_t kCmdResumeProtection= 211u;
 
-// Pipe name — must match CommunicationConstants::PIPE_NAME in
-// ServiceCommunicator.hpp.
-static constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\ShadowStrikeServicePipe";
+// Pipe name — taken from the service's own constant rather than repeated here.
+//
+// This was a duplicated string literal with a comment asking the reader to keep
+// it in step with CommunicationConstants::PIPE_NAME. That is the same
+// arrangement that made SelfDefenseConstants::DRIVER_SERVICE_NAME name a service
+// which has never existed: the two copies agreed on the day they were written
+// and nothing could tell anyone when they stopped agreeing. A tray connecting to
+// a pipe no one serves fails exactly like a service that is not running, which
+// is one of the hardest failures here to attribute.
+//
+// Referencing the constant makes a mismatch a compile-time impossibility instead
+// of a field symptom.
+static constexpr const wchar_t* kPipeName =
+    ShadowStrike::Service::CommunicationConstants::PIPE_NAME;
 
 // State-query timeout.
 static constexpr DWORD kStateQueryTimeoutMs = 500u;
