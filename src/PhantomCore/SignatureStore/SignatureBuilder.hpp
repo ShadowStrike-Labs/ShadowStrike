@@ -454,13 +454,34 @@ private:
   // HELPER METHODS (internal only)
   // ========================================================================
 
-    [[nodiscard]] uint64_t CalculateRequiredSize() const noexcept;
-    [[nodiscard]] std::array<uint8_t, 16> GenerateDatabaseUUID() const noexcept;
     [[nodiscard]] std::array<uint8_t, 32> ComputeDatabaseChecksum() const noexcept;
 
     void CleanupOutputHandles() noexcept;
 
+public:
+    // ========================================================================
+    // PURE QUERIES ON THE PENDING BUILD
+    // ========================================================================
+    //
+    // These three are public because they are observable CONTRACTS, not internals:
+    // how large a database the pending inputs require, the identity stamped into it,
+    // and the unit of its timestamps. None of them mutates anything - two are const
+    // and one is static - so exposing them widens what can be checked without
+    // widening what can be changed.
+    //
+    // GetCurrentTimestamp in particular earns its place. It returns MILLISECONDS, and
+    // that was not always agreed across the codebase: YaraRuleStore wrote seconds into
+    // the same header field while ValidateHeader compared against second-shaped bounds,
+    // so every valid database was reported as having an out-of-range creation time and
+    // the seeding logic's "is the baseline newer" comparison could not work. A unit
+    // that two modules disagreed about is exactly the kind of thing a test should be
+    // able to pin down.
+
+    [[nodiscard]] uint64_t CalculateRequiredSize() const noexcept;
+    [[nodiscard]] std::array<uint8_t, 16> GenerateDatabaseUUID() const noexcept;
     [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
+
+private:
 
     // ========================================================================
    // PATTERN SECTION HEADER (Private)

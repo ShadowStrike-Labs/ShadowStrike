@@ -71,6 +71,9 @@
 #include <array>
 
 using namespace ShadowStrike::SignatureStore;
+// The types this suite exercises do NOT live in SignatureStore. Without this the
+// file produced ~100 cascading errors that all trace back to one missing namespace.
+using namespace ShadowStrike::HashStore;
 namespace fs = std::filesystem;
 
 // ============================================================================
@@ -430,9 +433,20 @@ TEST_F(HashStoreTestFixture, BloomFilter_StressTest) {
 
 TEST_F(HashStoreTestFixture, HashBucket_Construction) {
     HashBucket bucket(HashType::MD5);
-    
-    EXPECT_TRUE(bucket.m_index != nullptr);  // Index is pre-allocated by constructor
-    EXPECT_TRUE(bucket.m_bloomFilter == nullptr);
+
+    // Asserted through the public surface rather than by reaching into m_index and
+    // m_bloomFilter. Those two assertions did not compile against the current class
+    // and, more to the point, they checked the shape of construction rather than any
+    // behaviour: a bucket whose members are non-null can still answer every lookup
+    // wrongly, which is precisely what happened when the bloom filter was constructed
+    // empty and made every lookup return not-present.
+    //
+    // What is worth pinning down is that a freshly constructed bucket reports itself
+    // empty and finds nothing, because "finds nothing" is indistinguishable from a
+    // clean file at runtime and so has to be the deliberate, asserted state here.
+    auto stats = bucket.GetStatistics();
+    EXPECT_EQ(stats.totalHashes, 0u);
+    EXPECT_EQ(stats.indexLookups, 0u);
 }
 
 TEST_F(HashStoreTestFixture, HashBucket_StatisticsInitialState) {

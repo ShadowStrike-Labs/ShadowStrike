@@ -482,6 +482,35 @@ bool SignatureBuilder::ValidatePatternSyntax(
         return false;
     }
 
+    // Compiled SIZE, enforced here so it is enforced at every entry point.
+    //
+    // AddPattern and the import path both reach this function, and until now neither
+    // bounded the number of bytes a pattern compiles to. An over-length pattern was
+    // therefore accepted, added to the pending set, and only removed later during
+    // Build()'s validation stage - so the caller who could have corrected it was told
+    // nothing, and the failure surfaced as a count of skipped signatures with no
+    // indication of which one or why.
+    //
+    // Counted in half-bytes because every token in the accepted syntax is built from
+    // them: a hex digit is one, and each '?' of a '??' wildcard is one. That makes the
+    // figure exact rather than an estimate, and matches what PatternCompiler computes.
+    {
+        size_t halfBytes = 0;
+        for (const char c : pattern) {
+            if (std::isxdigit(static_cast<unsigned char>(c)) != 0 || c == '?') {
+                ++halfBytes;
+            }
+        }
+        const size_t compiledBytes = halfBytes / 2;
+
+        if (compiledBytes > MAX_PATTERN_LENGTH) {
+            errorMessage = "Pattern compiles to " + std::to_string(compiledBytes) +
+                " bytes, over the " + std::to_string(MAX_PATTERN_LENGTH) +
+                "-byte limit this build can compile, store and scan";
+            return false;
+        }
+    }
+
     // Named explicitly rather than falling out of the character-set loop, so the
     // author is told which construct is unsupported and not merely which character
     // was unexpected.

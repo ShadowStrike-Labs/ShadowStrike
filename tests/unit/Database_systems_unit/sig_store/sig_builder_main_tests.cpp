@@ -684,9 +684,22 @@ TEST_F(SignatureBuilderTest, ValidatePatternSyntaxWithWildcards) {
 
 TEST_F(SignatureBuilderTest, ValidatePatternSyntaxWithRanges) {
     std::string errorMsg;
-    
-    EXPECT_TRUE(m_builder->ValidatePatternSyntax("48 [88 89 8A 8B] 05", errorMsg));
-    EXPECT_TRUE(m_builder->ValidatePatternSyntax("[48 50] [8B 8D] 05", errorMsg));
+
+    // Byte ranges are REFUSED, and this test asserted the opposite until the
+    // compiler was measured. PatternCompiler did not fail on a range, it
+    // MIS-COMPILED it and returned success: '[88 89 8A 8B]' emitted only its lower
+    // bound with a fully exact mask, so a pattern meant to admit four values became
+    // an exact match on one of them, and '[00-FF]' - any byte - became "exactly
+    // 0x00". A range admits a SET of values and this store matches a fixed byte
+    // sequence plus a per-position AND-mask, which cannot express one.
+    //
+    // So the validator refusing them is the fix, not a regression. Use '??' for a
+    // position that may hold any byte.
+    EXPECT_FALSE(m_builder->ValidatePatternSyntax("48 [88 89 8A 8B] 05", errorMsg));
+    EXPECT_FALSE(errorMsg.empty()) << "a refusal must say why";
+
+    EXPECT_FALSE(m_builder->ValidatePatternSyntax("[48 50] [8B 8D] 05", errorMsg));
+    EXPECT_FALSE(errorMsg.empty());
 }
 
 TEST_F(SignatureBuilderTest, IsRegexSafeComplexPatterns) {

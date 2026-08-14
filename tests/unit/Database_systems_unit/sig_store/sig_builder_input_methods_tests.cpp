@@ -787,7 +787,15 @@ TEST_F(SignatureBuilderInputTest, AddPattern_EmptyPattern_ShouldFail) {
 TEST_F(SignatureBuilderInputTest, AddPattern_PatternTooLong_ShouldFail) {
     // ARRANGE
     PatternSignatureInput input{};
-    input.patternString = CreateValidPattern(3000);  // INVALID: exceeds 8KB
+    // Expressed against the governing constant, not a literal. This read
+    // CreateValidPattern(3000) with the comment "exceeds 8KB", which was wrong twice
+    // over: 3000 is the byte count, not a character count, and the effective ceiling
+    // was never 8192 - it was an undocumented 256 inside PatternStore.cpp, the
+    // smallest of five limits that each claimed to govern this value. The limit is
+    // now one constant at 4096 compiled bytes, so 3000 is legitimately VALID and this
+    // test has to ask for one byte more than whatever the constant says.
+    input.patternString = CreateValidPattern(
+        ShadowStrike::SignatureStore::MAX_PATTERN_LENGTH + 1);
     input.name = "ValidName";
     input.threatLevel = ThreatLevel::High;
 

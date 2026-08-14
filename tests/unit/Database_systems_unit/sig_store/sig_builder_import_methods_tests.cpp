@@ -513,13 +513,31 @@ TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileWithComments) {
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileWithWildcards) {
     std::string content = "48 ?? 05:pattern1:50\n";
     content += "?? ?? ?? ??:pattern2:75\n";
-    content += "48 [40-60] 05:pattern3:100\n";
-    
+
     auto filePath = CreateTempFile(content, L"patterns_wildcards.txt");
-    
+
     StoreError err = m_builder->ImportPatternsFromFile(filePath);
     EXPECT_TRUE(err.IsSuccess());
-    EXPECT_EQ(m_builder->GetPendingPatternCount(), 3u);
+
+    // '??' wildcards ARE supported: they compile to a masked pattern that
+    // PatternStore's Boyer-Moore pass scans.
+    EXPECT_EQ(m_builder->GetPendingPatternCount(), 2u);
+}
+
+TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileWithByteRangeIsRefused) {
+    // A byte range is refused rather than imported, and the whole import fails rather
+    // than silently dropping the line. That is the point: the compiler used to turn
+    // '[40-60]' into an exact match on 0x40 and report success, so importing it would
+    // have put a pattern in the database that does not mean what its author wrote -
+    // and no message anywhere would have said so.
+    std::string content = "48 ?? 05:pattern1:50\n";
+    content += "48 [40-60] 05:pattern2:100\n";
+
+    auto filePath = CreateTempFile(content, L"patterns_byterange.txt");
+
+    StoreError err = m_builder->ImportPatternsFromFile(filePath);
+    EXPECT_FALSE(err.IsSuccess())
+        << "an unrepresentable pattern must fail the import, not be dropped from it";
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileLargeFile) {

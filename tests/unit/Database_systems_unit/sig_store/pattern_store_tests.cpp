@@ -52,6 +52,9 @@
 #include <future>
 
 using namespace ShadowStrike::SignatureStore;
+// The types this suite exercises do NOT live in SignatureStore. Without this the
+// file produced ~100 cascading errors that all trace back to one missing namespace.
+using namespace ShadowStrike::PatternStore;
 
 // ============================================================================
 // TEST FIXTURES
