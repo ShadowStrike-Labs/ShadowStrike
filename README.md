@@ -8,17 +8,17 @@
 <strong>Open-Source Next-Generation Endpoint Protection Platform for Windows</strong>
 
 <br/>
-<em>Custom kernel sensor · On-device analysis · Full-system emulation engine · 2.3M+ lines of C/C++/ASM</em>
+<em>Custom kernel sensor · On-device analysis · Full-system emulation engine · 1.9M+ lines of C/C++/ASM</em>
 
 <br/><br/>
 
 [![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE.txt)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
-[![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B20%20%2F%20ASM%20%2F%20Python-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
-[![Coverity](https://img.shields.io/badge/Coverity%20Scan-0.25%20defect%2FKLoC-brightgreen?style=flat-square&logo=synopsys)](https://scan.coverity.com/projects/ShadowStrike-Labs-ShadowStrike)
+[![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B23%20%2F%20ASM%20%2F%20Python-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
+[![Coverity](https://img.shields.io/badge/Coverity%20Scan-kernel%20sensor%200.25%20defect%2FKLoC-brightgreen?style=flat-square&logo=synopsys)](https://scan.coverity.com/projects/ShadowStrike-Labs-ShadowStrike)
 [![Commits](https://img.shields.io/github/commit-activity/w/ShadowStrike-Labs/ShadowStrike?style=flat-square&label=commits%2Fweek)](https://github.com/ShadowStrike-Labs/ShadowStrike/commits/master)
-[![LoC](https://img.shields.io/badge/lines%20of%20code-1.5M%2B-blue?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
+[![LoC](https://img.shields.io/badge/lines%20of%20code-1.9M%2B-blue?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![Beta](https://img.shields.io/badge/beta%20target-early%202027-blueviolet?style=flat-square)](https://www.shadowstrike.dev/beta)
 
 [Website](https://www.shadowstrike.dev) · [Architecture](https://www.shadowstrike.dev/architecture) · [Roadmap](https://www.shadowstrike.dev/roadmap) · [Join Beta](https://www.shadowstrike.dev/beta) · [Research](https://www.shadowstrike.dev/research)
@@ -59,18 +59,20 @@ Your support helps build transparent, auditable endpoint protection that anyone 
 
 ShadowStrike Phantom is a **from-scratch, open-source endpoint protection platform** for Windows 10/11 x64, engineered to compete with the detection capabilities of commercial EDR/XDR solutions — CrowdStrike Falcon, SentinelOne Singularity, Microsoft Defender for Endpoint — with one fundamental difference: **every line of code is auditable.**
 
-This is not a wrapper around existing tools. This is not a PoC. This is a production-grade security platform comprising **five major subsystems**, each purpose-built from the ground up:
+This is not a wrapper around existing tools and it is not a proof of concept. It is a security platform built to production engineering standards — comprising **five major subsystems**, each purpose-built from the ground up — that is currently at **alpha maturity** and being hardened against live Windows endpoints. The distinction matters and is kept throughout this document: the code is written to ship, and it is not finished shipping.
 
-| Subsystem | What It Is | Scale |
+| Subsystem | What It Is | Scale (measured) |
 |-----------|-----------|-------|
-| **[PhantomSensor](#-phantomsensor--kernel-driver)** | WDM minifilter kernel driver with 20 detection subsystems |
-| **[Shared Modules](#-shared-modules--user-mode-detection-infrastructure)** | User-mode detection, protection, and intelligence infrastructure |
-| **[PhantomEmulator](#-phantomemulator--malware-emulation-engine)** | Custom x86/x64 CPU emulation engine for safe malware detonation |
-| **[PhantomCortex](#-phantomcortex--ondevice-aiml)** | On-device threat classification — 5 neural network models |
-| **[PhantomDisassembler](#-phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 disassembler replacing third-party dependencies |
+| **[PhantomSensor](#-phantomsensor--kernel-driver)** | WDM minifilter kernel driver with 20 detection subsystems | 240 files · 357K lines |
+| **[Shared Modules](#-shared-modules--user-mode-detection-infrastructure)** | User-mode detection, protection, and intelligence infrastructure | 944 files · 1.31M lines |
+| **[PhantomEmulator](#-phantomemulator--malware-emulation-engine)** | Custom x86/x64 CPU emulation engine for safe malware detonation | 265 files · 143K lines |
+| **[PhantomCortex](#-phantomcortex--ondevice-aiml)** | On-device threat classification — 5 model architectures, inference path wired, models not yet shipped to endpoints | 5 models · ONNX bridge |
+| **[PhantomDisassembler](#-phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 disassembler intended to replace the vendored Zydis dependency | in development |
+
+Totals, counted from the working tree: **1,947,218 lines** of handwritten C, C++ and Assembly including 134,991 lines of tests, plus 92,195 lines of vendored third-party headers and libraries.
 
 
-> **Current state:** Alpha. Kernel driver is complete and Coverity-verified. PhantomCore is ready. AI models trained on 3.5M+ real PE samples (EMBER 2018 + EMBER 2024). Emulation engine operational. On track for public beta early 2027.
+> **Current state:** Alpha, under active development and tested against live Windows endpoints. The kernel driver is complete, Coverity-verified at 0.25 defects/KLoC and passes Driver Verifier with zero violations. The user-mode engine is feature-complete and in a security-hardening phase: the product installs, loads its signed driver, establishes an encrypted kernel channel and performs on-access scanning — a recent field run scanned 56,866 files on a live endpoint. The emulation engine is implemented. The AI models are trained on 3.5M+ real PE samples (EMBER 2018 + EMBER 2024) and the inference path is wired into the scan pipeline, but the models are not yet packaged for endpoint deployment. Public beta targeted for the start of 2027. See [Known Limitations](#known-limitations) for an honest account of what is not finished.
 
 ---
 
@@ -91,15 +93,15 @@ ShadowStrike Phantom is the alternative:
 | Component | Status | Detail |
 |-----------|--------|--------|
 | Architecture | ✅ Complete | Designed and documented |
-| PhantomSensor.sys | ✅ Complete | 20 subsystems · Coverity 0.25 defect/KLoC · Driver Verifier passed |
-| PhantomCore | ✅ Complete | 23 modules — security audit phase |
-| PhantomEmulator | ✅ Complete | CPU emulation · 10 DLL stubs · Analysis suite |
-| PhantomCortex | 🔧 85% | 4 models trained + 1 model will be retrained with the comprehensive datasets + synthetic datas · ONNX inference · Nightly retraining pipeline |
-| PhantomDisassembler | ✅ Complete | Custom x86/x64 decoder — replacing Zydis dependency |
-| Kernel ↔ User-Mode Wiring | ✅ Complete | Encrypted IPC · Module-by-module integration in progress |
-| Product Tiers (Home/EDR/XDR) | 🔧 58% | After shared infrastructure |
-| Management Dashboard | 🔧 38% | EDR/XDR fleet management |
-| Public Beta | 🎯 1st day of 2027 | |
+| PhantomSensor.sys | ✅ Complete | 357K lines · 20 subsystems · Coverity 0.25 defect/KLoC · Driver Verifier zero violations · loads and filters on a live endpoint |
+| PhantomCore | 🔧 Feature-complete, hardening | 23 module families · 1.31M lines · on-access scanning verified in the field · active security-audit and false-positive work |
+| PhantomEmulator | 🔧 Implemented, harness pending | 265 source files · CPU emulation · 10 emulated DLLs · 12 analysis modules · no dedicated CLI harness exercising it yet |
+| PhantomCortex | 🔧 Inference wired, models not yet shipped | ONNX Runtime bridge integrated into the scan pipeline · 4 models trained on EMBER 2018/2024, 1 to be retrained · endpoint model packaging and signed distribution still to build |
+| PhantomDisassembler | 🔧 In development | Custom x86/x64 decoder, intended to replace the vendored Zydis dependency |
+| Kernel ↔ User-Mode Wiring | 🔧 Operational, hardening | Encrypted IPC established and carrying scan traffic · frame-level robustness work in progress |
+| Product Tiers (Home/EDR/XDR) | 🔧 In progress | Phantom Home is the active target; EDR and XDR follow the shared infrastructure |
+| Management Dashboard | 🔧 Early | EDR/XDR fleet management |
+| Public Beta | 🎯 Target: 1 January 2027 | |
 
 ---
 
@@ -208,7 +210,9 @@ A **From scratch WDM minifilter** kernel driver that intercepts, analyzes, and b
 
 ## 🧠 PhantomCortex — On-Device Analysis
 
-Five purpose-built neural network models running inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on **3.5-3.6M real PE samples** from the EMBER 2018-2024 datasets plus synthetic behavioral, memory, network, and emulation data.
+Five purpose-built neural network models designed to run inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on **3.5-3.6M real PE samples** from the EMBER 2018-2024 datasets plus synthetic behavioral, memory, network, and emulation data.
+
+> **Status — read this before relying on the table below.** The C++ inference bridge and the ONNX Runtime integration are built and wired into the scan pipeline, and four of the five models are trained (the fifth is to be retrained). What is **not** done is endpoint delivery: the models are not yet packaged into the installer or distributed with signature verification, so on a currently installed endpoint the ML path finds no models and is inactive. Sub-millisecond scoring is the design target measured in development, not a figure from a shipped deployment. Model packaging and signed model distribution are tracked work, not finished work.
 
 | Model | Architecture | Input | Purpose |
 |-------|-------------|-------|---------|
@@ -219,9 +223,9 @@ Five purpose-built neural network models running inference **locally on each end
 | **Cortex-Network** | Autoencoder (anomaly) | Network flow features | C2 communication and exfiltration anomaly detection |
 
 ### Training Pipeline
-- **Nightly automated retraining** with fresh threat intelligence feeds
+- **Automated retraining pipeline** with fresh threat intelligence feeds
 - **INT8 quantization** for minimal CPU footprint on endpoints
-- **ONNX Runtime** inference — sub-millisecond scoring per sample
+- **ONNX Runtime** inference — sub-millisecond scoring per sample as measured in development
 - **6 threat intel feeds**: EMBER, Feodo Tracker, MalwareBazaar, OTX AlienVault, ThreatFox, URLhaus
 - **Feature extraction pipeline** with PE, behavioral, emulation, memory, and network feature modules
 - **Model evaluation** with precision/recall/F1 tracking, A/B deployment support
@@ -332,7 +336,7 @@ The PhantomEmulator's existing instruction decoder (VEX/EVEX/AVX-512 support) se
 | **SignatureStore** | Custom B-tree index · YARA rule integration · Copy-on-write updates · Bulk import |
 | **PatternStore** | Aho-Corasick automaton · Boyer-Moore · KMP failure functions · SSE4.2/AVX2 SIMD acceleration |
 | **HashStore** | Bloom filter (0.001% FP) · Memory-mapped DB · O(1) reputation lookups |
-| **FuzzyHasher** | Custom approximate hash engine · Clean-room implementation · Zero GPL dependencies |
+| **FuzzyHasher** | Approximate/similarity hashing built on TLSH (Apache-2.0), deliberately chosen over GPL-licensed ssdeep to keep the dependency set permissive |
 | **ThreatIntel** | STIX 2.1 / TAXII 2.1 ingestion · Sharded B-tree index · LRU cache · IOC correlation |
 | **Whitelist** | Hash + pattern whitelisting · Bloom filter · Publisher trust chains |
 
@@ -396,7 +400,7 @@ The PhantomEmulator's existing instruction decoder (VEX/EVEX/AVX-512 support) se
 
 ### MITRE ATT&CK Coverage
 
-**550+ technique IDs** mapped across all 14 ATT&CK tactics. Every detection fires with precise T-ID attribution for SOC integration.
+**526 distinct ATT&CK technique IDs** (193 base techniques plus sub-techniques) are referenced across the kernel sensor and the user-mode detection sources, so detections carry T-ID attribution for SOC integration. That figure counts technique IDs present in the detection sources; it is not a claim of independently benchmarked detection efficacy for each one.
 
 ---
 
@@ -417,7 +421,7 @@ All three tiers share the same kernel sensor, detection engines, AI models, and 
 > ⚠️ The codebase is under active development and not yet packaged for external builds. Full build instructions will be provided when the project reaches beta.
 
 **Requirements:**
-- Visual Studio 2022 with C++20 support (MSVC v143)
+- Visual Studio 2022 with C++23 support (MSVC v143)
 - Windows Driver Kit (WDK) 10.0.22621.0+
 - Windows SDK 10.0.22621.0+
 - Python 3.10+ with PyTorch (for PhantomCortex training only)
@@ -439,7 +443,7 @@ MSBuild.exe ShadowStrike.sln /p:Configuration=Release /p:Platform=x64 /m
 
 ```
 ShadowStrike/
-├── PhantomSensor/              # Kernel driver — WDM minifilter (380K LoC, 20 subsystems)
+├── PhantomSensor/              # Kernel driver — WDM minifilter (357K lines, 240 files, 20 subsystems)
 │   └── PhantomSensor/
 │       ├── Behavioral/         # MITRE engine · Threat scoring · IOC matching
 │       ├── Callbacks/          # Process · Thread · Image · Registry · FS callbacks
@@ -451,7 +455,7 @@ ShadowStrike/
 │       ├── Sync/               # Thread pool · Timer · Work queue · DPC
 │       └── ...                 # 20 subsystem folders total
 │
-├── PhantomEmulator/            # Custom x86/x64 emulation engine (195 source files)
+├── PhantomEmulator/            # Custom x86/x64 emulation engine (265 source files, 143K lines)
 │   ├── Core/                   # CPU · Memory · JIT · PE Loader · Threading
 │   │   ├── CPU/                # Instruction decoder · Executor (15 categories)
 │   │   ├── Memory/             # Virtual memory manager · Memory tracker
@@ -473,7 +477,7 @@ ShadowStrike/
 │       └── export/             # ONNX export · Quantization
 │
 ├── src/
-│   └── PhantomCore/         # User-mode detection infrastructure (461 source files)
+│   └── PhantomCore/         # User-mode detection infrastructure (527 source files, 1.04M lines)
 │       ├── AI/                 # C++ inference bridge → PhantomCortex models
 │       ├── Core/               # Engine · FileSystem · Network · Process · Registry · System
 │       ├── RealTime/           # RTP · Exploit prevention · Behavior blocking
@@ -495,6 +499,51 @@ ShadowStrike/
 ├── malware_tests/              # Malware sample testing framework
 └── docs/                       # Architecture documentation
 ```
+
+---
+
+## Dependencies
+
+A deliberate design goal is a small, permissively licensed dependency set: the supply chain of a security product is part of its attack surface, and every third-party component in a Ring-0-adjacent product is something a user would otherwise have to audit separately.
+
+**There are no GPL dependencies, and no cloud service is required to reach a detection verdict.**
+
+| Dependency | Licence | Role | Notes |
+|-----------|---------|------|-------|
+| [YARA](https://github.com/VirusTotal/yara) | BSD-3-Clause | Malware pattern matching | 11,053 rules compiled into the shipped database; third-party rule attribution ships with the product |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) 1.20 | MIT | ML inference for PhantomCortex | |
+| [Zydis](https://github.com/zyantific/zydis) | MIT | x86/x64 instruction decoding | **Being removed** — PhantomDisassembler is the in-house replacement |
+| [SQLite](https://sqlite.org) + [SQLiteCpp](https://github.com/SRombauts/SQLiteCpp) | Public domain / MIT | Persistent configuration and event storage | |
+| [nlohmann/json](https://github.com/nlohmann/json) | MIT | JSON parsing | |
+| [pugixml](https://pugixml.org) | MIT | XML parsing | |
+| [TLSH](https://github.com/trendmicro/tlsh) | Apache-2.0 | Fuzzy / similarity hashing | Chosen over GPL-licensed ssdeep specifically to keep the dependency set permissive |
+| OpenSSL | Apache-2.0 | Vendored | The product's own cryptography uses Windows CNG/BCrypt; OpenSSL's remaining surface is being reduced |
+| [Qt 6](https://www.qt.io) | LGPL-3.0 | Desktop UI only | Not present in the kernel sensor or the detection path |
+| [googletest / googlemock](https://github.com/google/googletest) | BSD-3-Clause | Test framework | Test-only, not shipped |
+
+Platform APIs used directly rather than through a wrapper: Windows Filter Manager (WDK), CNG/BCrypt, WinVerifyTrust, AMSI, Windows Filtering Platform, and ETW.
+
+---
+
+## Known Limitations
+
+Stated plainly, because a security product that is vague about its own gaps is asking for trust it has not earned. This is an alpha under active development; the list below is the current, honest picture rather than a roadmap.
+
+**Not yet shipped to endpoints**
+- **ML models.** The inference bridge is wired into the scan pipeline and four models are trained, but the models are not packaged into the installer and there is no signed model distribution yet, so ML detection is inactive on an installed endpoint.
+- **Detection content is thin.** The shipped database carries 11,053 YARA rules, but the malware hash section holds only EICAR test hashes. Most public malware-hash feeds are licensed for non-commercial use only, which constrains what this project may redistribute; hash content is therefore user-supplied via the updater for now.
+
+**Verified working, still hardening**
+- **False positives on signed OS binaries.** A recent field run flagged Microsoft-signed system files. Trust determination for catalog-signed binaries is the active defect under investigation, and remediation of a file carrying a valid OS signature is being made contingent on corroboration.
+- **Kernel IPC frame robustness.** The encrypted kernel channel is established and carrying scan traffic, but a fraction of frames currently fail integrity checks and are answered fail-open. Every such frame is an unscanned file, and this is treated as a correctness defect, not a performance one.
+- **Cloud-backed files.** Files stored as OneDrive placeholders are currently unreadable by the scanner and are not yet distinguishable from scanned files in the statistics.
+
+**Infrastructure and process**
+- **Single maintainer.** ~1.9M lines including ring-0 code, with one person as the bus factor.
+- **Kernel testing is manual.** No CI can load a kernel driver, so integration verification runs as build-deploy-test cycles against real Windows endpoints, analysed from logs and kernel traces. 4,891 automated tests cover the user-mode code.
+- **Static analysis coverage is partial.** The Coverity result of 0.25 defects/KLoC applies to the kernel sensor; extending the same analysis across every source tree is outstanding work.
+- **No independent security review or third-party detection benchmark.** Neither has been funded or performed.
+- **Driver signing.** Distribution to end users without disabling Secure Boot requires Microsoft attestation/WHQL signing, which is not yet in place.
 
 ---
 
