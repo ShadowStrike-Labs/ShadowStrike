@@ -213,6 +213,23 @@
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\HashStoreTests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\BoyerMooreTests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\AhoCorasick_Tests.cpp" />
+    <!-- utils_unit: added as one batch. -->
+    <ClCompile Include="tests\unit\utils_unit\Base64UtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\CacheManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\CertUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\CompressionUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\CryptoUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\FileUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\HashUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\JSONUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\MemoryUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\NetworkUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\PE_sig_verf_tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\ProcessUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\RegistryUtilsTests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\SystemUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\ThreadPool_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\XMLUtils_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="PhantomCoreLib.vcxproj">

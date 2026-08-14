@@ -433,10 +433,19 @@ size_t PriorityTaskQueue::GetMaxSize() const noexcept {
 size_t PriorityTaskQueue::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // Clear the queue by swapping with empty queue (efficient)
+    // Every dropped task must have its future resolved, not just be destroyed.
+    // Swapping in an empty queue discarded them, so their promises died
+    // unsatisfied and anything waiting on one saw
+    // std::future_error("broken promise") instead of a cancellation. That matters
+    // here more than at the worker: ClearQueue is a bulk operation, so one call
+    // could break every outstanding future at once - and ThreadPool::ParallelFor
+    // waits on its chunk futures with an unguarded future.get().
     const size_t clearedCount = queue_.size();
-    std::priority_queue<TaskWrapper, std::vector<TaskWrapper>, TaskComparator> emptyQueue;
-    std::swap(queue_, emptyQueue);
+    while (!queue_.empty()) {
+        TaskWrapper task = std::move(const_cast<TaskWrapper&>(queue_.top()));
+        queue_.pop();
+        task.CompleteAsCancelled();
+    }
     return clearedCount;
 }
 
@@ -1234,7 +1243,17 @@ void WorkerThread::ExecuteTask(TaskWrapper& task) {
                 std::format(L"Task {} cancelled before execution", task.GetContext().taskId),
                 ETWLevel::Warning
             );
-             
+
+            // Resolve the future before dropping the task. Returning here used to
+            // destroy the promise unsatisfied, so every waiter got
+            // std::future_error("broken promise") - which cannot be told apart from
+            // a defect in the pool, and is not what SubmitCancellable promises: it
+            // wraps the callable to throw runtime_error("Task was cancelled"), but
+            // that wrapper only runs if the task runs. Cancellation noticed here
+            // and cancellation noticed inside the task now look identical to the
+            // caller.
+            task.CompleteAsCancelled();
+
             busy_.store(false, std::memory_order_release);
             taskStats_.cancelledCount.fetch_add(1, std::memory_order_relaxed);
             DecrementAtomicFloor(pendingTasks_, 1);

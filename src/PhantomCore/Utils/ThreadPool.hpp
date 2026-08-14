@@ -580,6 +580,41 @@ public:
     [[nodiscard]] std::shared_future<ResultType> GetFuture() const noexcept {
         return future_;
     }
+
+    /**
+     * @brief Produce a callable that completes this task's future as cancelled.
+     *
+     * A task that is dropped instead of run leaves its promise unsatisfied, and a
+     * promise destroyed without a value or an exception gives every waiter
+     * std::future_error("broken promise"). That cannot be told apart from a bug in
+     * the pool, which is the one thing a caller most needs to distinguish, and it
+     * is not what this class intends: SubmitCancellable wraps the callable so that
+     * a cancelled task throws std::runtime_error("Task was cancelled") - but the
+     * wrapper only runs if the task runs, and a cancelled task does not.
+     *
+     * So the same exception is set here, giving one observable outcome for
+     * cancellation whether it is noticed before execution or inside it.
+     *
+     * The returned callable holds only the promise, not the task, so it costs one
+     * reference count and no allocation.
+     *
+     * @note Safe to call after the task has completed: set_exception then throws
+     *       promise_already_satisfied, which is swallowed, because a task that ran
+     *       already has its real answer and that answer wins.
+     */
+    [[nodiscard]] std::function<void()> MakeCancelCompleter() const {
+        return [promise = promise_]() noexcept {
+            if (!promise) {
+                return;
+            }
+            try {
+                promise->set_exception(std::make_exception_ptr(
+                    std::runtime_error("Task was cancelled")));
+            } catch (...) {
+                // Already satisfied - the task ran after all. Keep its result.
+            }
+        };
+    }
     
     /** @return Const reference to task context */
     [[nodiscard]] const TaskContext& GetContext() const noexcept {
@@ -637,6 +672,7 @@ public:
     template<typename ResultType>
     explicit TaskWrapper(Task<ResultType> task)
         : context_(task.GetContext())
+        , cancelCompleter_(task.MakeCancelCompleter())
         , executor_([t = std::move(task)]() mutable { return t.Execute(); })
     {}
     
@@ -646,6 +682,19 @@ public:
             return executor_();
         }
         return false;
+    }
+
+    /**
+     * @brief Complete this task's future as cancelled instead of running it.
+     *
+     * Must be called by any path that drops a task rather than executing it.
+     * Dropping one silently destroys its promise, and every waiter then sees
+     * std::future_error("broken promise") - indistinguishable from a pool defect.
+     */
+    void CompleteAsCancelled() noexcept {
+        if (cancelCompleter_) {
+            cancelCompleter_();
+        }
     }
     
     /** @return Const reference to task context */
@@ -675,6 +724,7 @@ public:
     
 private:
     TaskContext context_;
+    std::function<void()> cancelCompleter_;
     std::function<bool()> executor_;
 };
 

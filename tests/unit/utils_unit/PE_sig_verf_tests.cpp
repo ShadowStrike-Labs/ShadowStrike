@@ -218,8 +218,22 @@ protected:
 TEST_F(PESignatureVerifierTest, DefaultConfiguration) {
     PEFileSignatureVerifier verifier;
     
-    // Verify default settings
-    EXPECT_EQ(verifier.GetRevocationMode(), RevocationMode::OnlineOnly);
+    // OfflineAllowed, NOT OnlineOnly, and this default is load-bearing rather than
+    // a preference. Six modules construct a verifier without ever calling
+    // SetRevocationMode - PackerDetector, StartupAnalyzer, PersistenceDetector,
+    // FileProtection, FileIntegrityMonitor, ProgramUpdater - and PackerDetector runs
+    // on the synchronous on-access scan path. With OnlineOnly, a revocation fetch on
+    // that path blocks a thread that is holding a kernel file operation open, which
+    // is the cross-process stall that wedged a machine for 180 seconds.
+    //
+    // No detection is lost by the change: OfflineAllowed still checks revocation,
+    // against the local CRL cache, so an already-known-revoked certificate is still
+    // rejected. Only the synchronous network fetch is gone. ProgramUpdater asks for
+    // OnlineOnly explicitly, because update trust does want an authoritative answer
+    // and a slow fetch there delays only the update.
+    //
+    // If this assertion is ever "fixed" back to OnlineOnly, the stall returns.
+    EXPECT_EQ(verifier.GetRevocationMode(), RevocationMode::OfflineAllowed);
     EXPECT_EQ(verifier.GetTimestampGraceSeconds(), 300u);
     EXPECT_TRUE(verifier.GetAllowCatalogFallback());
     EXPECT_FALSE(verifier.GetAllowMultipleSignatures());
