@@ -79,10 +79,26 @@ class CryptoUtilsTest : public ::testing::Test {
 protected:
     void SetUp() override {
 
-        if (!Logger::Instance().IsInitialized()) {
-            std::cerr << "[TEST FATAL] Logger not initialized before test!\n";
-            GTEST_SKIP() << "Logger not initialized";
-        }
+        // The Logger is initialised once for the whole binary in tests/test_main.cpp
+        // before RUN_ALL_TESTS, so by the time any fixture runs this must hold.
+        //
+        // This was previously a GTEST_SKIP, and it silently disabled all 30 cases
+        // in this suite -- AES-256-GCM including the AAD-mismatch and truncated-tag
+        // REJECTION cases, AES-CBC, RSA-2048, ECDH P-256, PBKDF2, HKDF, file and
+        // string encryption, and the constant-time compare. That is precisely the
+        // cryptography the encrypted kernel channel and the quarantine vault are
+        // built on, so "skipped" here meant those primitives had no executed
+        // coverage at all while the suite still reported success.
+        //
+        // It is an ASSERT, not a skip, because nothing in this fixture can repair
+        // the condition and a logger has no bearing on whether AES-GCM is correct.
+        // If the invariant breaks, the right outcome is a loud failure naming the
+        // cause, not 30 tests quietly declining to run.
+        ASSERT_TRUE(Logger::Instance().IsInitialized())
+            << "Logger is not initialised. tests/test_main.cpp must call "
+               "Logger::Initialize before RUN_ALL_TESTS; note that Logger::Initialize "
+               "CAS-guards the same flag the logging write path sets via "
+               "EnsureInitialized, so whichever runs first wins.";
 
         testDir = std::filesystem::temp_directory_path() / "cryptoutils_tests";
         std::filesystem::create_directories(testDir);
