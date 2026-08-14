@@ -200,9 +200,7 @@
          fallback used when no compiled automaton is available, so if the fault is in the
          matcher it is reachable in production, just not on the common path.
          Tracked as its own task. Re-enable in the SAME change that resolves it. -->
-    <ClCompile Include="tests\unit\Database_systems_unit\sig_store\SIMD_matcher_tests.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="tests\unit\Database_systems_unit\sig_store\SIMD_matcher_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\sig_store_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\sig_index_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\sig_format_tests.cpp" />
@@ -222,4 +220,86 @@
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <!-- ======================================================================
+       BUILD-TIME CHECK: no two test files may define a fixture with the same
+       class name.
+
+       Why this is a build failure rather than a convention. Two definitions of
+       one class name at namespace scope in different translation units is an ODR
+       violation. The linker keeps ONE layout and one set of implicit members, so
+       TEST_F(F, X) in file A is allocated with A's idea of sizeof(F) and then
+       constructed by whichever definition the linker chose. When the two bodies
+       differ in size, that write runs past the allocation.
+
+       This is not hypothetical. pattern_store_tests.cpp and SIMD_matcher_tests.cpp
+       both defined `SIMDMatcherTest`: two bools in one, a std::mt19937 (~5 KB of
+       state) in the other. The small allocation was constructed by the large
+       definition and the process died with STATUS_HEAP_CORRUPTION (0xC0000374) -
+       after 40+ tests had already reported PASSED, in a test that had nothing
+       wrong with it, in a different file from the one that caused it. Heap damage
+       surfaces at a later allocation, so the failing test never names the culprit.
+       Two more fixtures were duplicated the same way and did not crash, which is
+       the worse half: they ran against whichever layout won, silently.
+
+       googletest cannot catch this while the names are identical - it compares
+       fixture type ids, and an ODR violation makes them the same id. So the check
+       has to happen here. It uses MSBuild's inline task facility, deliberately
+       adding no new build dependency.
+
+       This matters most for what has not been added yet: 199 test files are still
+       excluded from this project, and every one of them is a chance to reintroduce
+       a duplicate fixture name.
+       ====================================================================== -->
+  <UsingTask TaskName="CheckTestFixtureUniqueness"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Sources ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Code Type="Fragment" Language="cs">
+        <![CDATA[
+        var fixturePattern = new Regex(@"class\s+(\w+)\s*:\s*public\s+::testing::Test");
+        var firstSeenIn = new Dictionary<string, string>(StringComparer.Ordinal);
+        bool unique = true;
+
+        foreach (var source in Sources)
+        {
+            var path = source.GetMetadata("FullPath");
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) { continue; }
+
+            foreach (Match match in fixturePattern.Matches(File.ReadAllText(path)))
+            {
+                var fixtureName = match.Groups[1].Value;
+                string previousPath;
+                if (firstSeenIn.TryGetValue(fixtureName, out previousPath))
+                {
+                    Log.LogError(
+                        "Duplicate gtest fixture '" + fixtureName + "' is defined in two files: '" +
+                        previousPath + "' and '" + path + "'. Two definitions of one class name in " +
+                        "different translation units is an ODR violation: the linker keeps one " +
+                        "layout, so a TEST_F is allocated with one size and constructed with " +
+                        "another. This has already produced STATUS_HEAP_CORRUPTION in this suite. " +
+                        "Give each fixture a name unique across the whole test project.");
+                    unique = false;
+                }
+                else
+                {
+                    firstSeenIn[fixtureName] = path;
+                }
+            }
+        }
+
+        return unique;
+        ]]>
+      </Code>
+    </Task>
+  </UsingTask>
+  <Target Name="VerifyTestFixtureUniqueness" BeforeTargets="ClCompile">
+    <CheckTestFixtureUniqueness Sources="@(ClCompile)" />
+  </Target>
 </Project>

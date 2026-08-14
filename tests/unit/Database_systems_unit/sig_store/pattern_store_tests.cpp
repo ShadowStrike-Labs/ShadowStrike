@@ -60,7 +60,7 @@ using namespace ShadowStrike::PatternStore;
 // TEST FIXTURES
 // ============================================================================
 
-class AhoCorasickTest : public ::testing::Test {
+class PatternStoreAhoCorasickTest : public ::testing::Test {
 protected:
     AhoCorasickAutomaton automaton;
 
@@ -73,7 +73,7 @@ protected:
     }
 };
 
-class BoyerMooreTest : public ::testing::Test {
+class PatternStoreBoyerMooreTest : public ::testing::Test {
 protected:
     // Test helper to create matcher
     std::unique_ptr<BoyerMooreMatcher> CreateMatcher(
@@ -91,7 +91,7 @@ protected:
     }
 };
 
-class SIMDMatcherTest : public ::testing::Test {
+class PatternStoreSimdMatcherTest : public ::testing::Test {
 protected:
     void SetUp() override {
         m_hasAVX2 = SIMDMatcher::IsAVX2Available();
@@ -156,7 +156,7 @@ protected:
 // AHO-CORASICK AUTOMATON TESTS
 // ============================================================================
 
-TEST_F(AhoCorasickTest, BasicPatternAddition) {
+TEST_F(PatternStoreAhoCorasickTest, BasicPatternAddition) {
     std::vector<uint8_t> pattern1 = {0x48, 0x8B, 0x05};
     std::vector<uint8_t> pattern2 = {0xFF, 0xD0};
 
@@ -166,14 +166,14 @@ TEST_F(AhoCorasickTest, BasicPatternAddition) {
     EXPECT_EQ(automaton.GetPatternCount(), 2);
 }
 
-TEST_F(AhoCorasickTest, EmptyPatternRejection) {
+TEST_F(PatternStoreAhoCorasickTest, EmptyPatternRejection) {
     std::vector<uint8_t> emptyPattern;
 
     EXPECT_FALSE(automaton.AddPattern(emptyPattern, 1));
     EXPECT_EQ(automaton.GetPatternCount(), 0);
 }
 
-TEST_F(AhoCorasickTest, ExcessivelyLongPatternRejection) {
+TEST_F(PatternStoreAhoCorasickTest, ExcessivelyLongPatternRejection) {
     // Create pattern > 4096 bytes
     std::vector<uint8_t> longPattern(5000, 0xAA);
 
@@ -181,7 +181,7 @@ TEST_F(AhoCorasickTest, ExcessivelyLongPatternRejection) {
     EXPECT_EQ(automaton.GetPatternCount(), 0);
 }
 
-TEST_F(AhoCorasickTest, CannotAddAfterCompilation) {
+TEST_F(PatternStoreAhoCorasickTest, CannotAddAfterCompilation) {
     std::vector<uint8_t> pattern1 = {0x48, 0x8B};
 
     ASSERT_TRUE(automaton.AddPattern(pattern1, 1));
@@ -191,7 +191,7 @@ TEST_F(AhoCorasickTest, CannotAddAfterCompilation) {
     EXPECT_FALSE(automaton.AddPattern(pattern2, 2));
 }
 
-TEST_F(AhoCorasickTest, BasicSearch) {
+TEST_F(PatternStoreAhoCorasickTest, BasicSearch) {
     std::vector<uint8_t> pattern = {0x48, 0x8B, 0x05};
     std::vector<uint8_t> buffer = {
         0x00, 0x48, 0x8B, 0x05, 0xFF,  // Match at offset 1
@@ -213,7 +213,7 @@ TEST_F(AhoCorasickTest, BasicSearch) {
     EXPECT_EQ(matches[1].second, 7);  // End offset of second match
 }
 
-TEST_F(AhoCorasickTest, MultiplePatternSearch) {
+TEST_F(PatternStoreAhoCorasickTest, MultiplePatternSearch) {
     std::vector<uint8_t> pattern1 = {0x48, 0x8B};
     std::vector<uint8_t> pattern2 = {0xFF, 0xD0};
     std::vector<uint8_t> buffer = {
@@ -234,7 +234,7 @@ TEST_F(AhoCorasickTest, MultiplePatternSearch) {
     EXPECT_TRUE(std::find(foundIds.begin(), foundIds.end(), 2) != foundIds.end());
 }
 
-TEST_F(AhoCorasickTest, OverlappingPatterns) {
+TEST_F(PatternStoreAhoCorasickTest, OverlappingPatterns) {
     std::vector<uint8_t> pattern1 = {0xAA, 0xBB};
     std::vector<uint8_t> pattern2 = {0xBB, 0xCC};
     std::vector<uint8_t> buffer = {0xAA, 0xBB, 0xCC};
@@ -247,7 +247,7 @@ TEST_F(AhoCorasickTest, OverlappingPatterns) {
     EXPECT_EQ(matchCount, 2);
 }
 
-TEST_F(AhoCorasickTest, NoMatchScenario) {
+TEST_F(PatternStoreAhoCorasickTest, NoMatchScenario) {
     std::vector<uint8_t> pattern = {0x48, 0x8B, 0x05};
     std::vector<uint8_t> buffer = {0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -258,7 +258,7 @@ TEST_F(AhoCorasickTest, NoMatchScenario) {
     EXPECT_EQ(matchCount, 0);
 }
 
-TEST_F(AhoCorasickTest, LargeScalePatternAddition) {
+TEST_F(PatternStoreAhoCorasickTest, LargeScalePatternAddition) {
     // Add 10,000 unique patterns
     const size_t patternCount = 10000;
     std::mt19937 rng(42);
@@ -278,7 +278,7 @@ TEST_F(AhoCorasickTest, LargeScalePatternAddition) {
     ASSERT_TRUE(automaton.Compile());
 }
 
-TEST_F(AhoCorasickTest, MemoryExhaustionProtection) {
+TEST_F(PatternStoreAhoCorasickTest, MemoryExhaustionProtection) {
     // Test that the implementation can handle many patterns efficiently
     // when they share common prefixes (trie optimization working correctly).
     // 
@@ -316,7 +316,7 @@ TEST_F(AhoCorasickTest, MemoryExhaustionProtection) {
 // BOYER-MOORE MATCHER TESTS
 // ============================================================================
 
-TEST_F(BoyerMooreTest, ExactPatternMatch) {
+TEST_F(PatternStoreBoyerMooreTest, ExactPatternMatch) {
     auto matcher = CreateMatcher("48 8B 05");
     std::vector<uint8_t> buffer = {0x00, 0x48, 0x8B, 0x05, 0xFF};
 
@@ -325,7 +325,7 @@ TEST_F(BoyerMooreTest, ExactPatternMatch) {
     EXPECT_EQ(matches[0], 1);
 }
 
-TEST_F(BoyerMooreTest, MultipleMatches) {
+TEST_F(PatternStoreBoyerMooreTest, MultipleMatches) {
     auto matcher = CreateMatcher("AA BB");
     std::vector<uint8_t> buffer = {
         0xAA, 0xBB, 0x00,
@@ -337,7 +337,7 @@ TEST_F(BoyerMooreTest, MultipleMatches) {
     EXPECT_EQ(matches.size(), 3);
 }
 
-TEST_F(BoyerMooreTest, FindFirstOptimization) {
+TEST_F(PatternStoreBoyerMooreTest, FindFirstOptimization) {
     auto matcher = CreateMatcher("FF FF FF FF");
     std::vector<uint8_t> buffer(10000, 0x00);
     buffer[5000] = 0xFF;
@@ -350,7 +350,7 @@ TEST_F(BoyerMooreTest, FindFirstOptimization) {
     EXPECT_EQ(result.value(), 5000);
 }
 
-TEST_F(BoyerMooreTest, WildcardMaskMatching) {
+TEST_F(PatternStoreBoyerMooreTest, WildcardMaskMatching) {
     // Pattern: 48 ?? 05 (matches 48 XX 05 for any XX)
     auto pattern = HexStringToBytes("48 00 05").value(); //-V836
     std::vector<uint8_t> mask = {0xFF, 0x00, 0xFF};  // Don't care about middle byte //-V826
@@ -366,7 +366,7 @@ TEST_F(BoyerMooreTest, WildcardMaskMatching) {
     EXPECT_EQ(matcher.Search(buffer3).size(), 1);
 }
 
-TEST_F(BoyerMooreTest, NoMatchScenario) {
+TEST_F(PatternStoreBoyerMooreTest, NoMatchScenario) {
     auto matcher = CreateMatcher("DE AD BE EF");
     std::vector<uint8_t> buffer(1000, 0x00);
 
@@ -374,7 +374,7 @@ TEST_F(BoyerMooreTest, NoMatchScenario) {
     EXPECT_EQ(matches.size(), 0);
 }
 
-TEST_F(BoyerMooreTest, PatternAtBufferBoundaries) {
+TEST_F(PatternStoreBoyerMooreTest, PatternAtBufferBoundaries) {
     auto matcher = CreateMatcher("AA BB");
 
     // Pattern at start
@@ -388,7 +388,7 @@ TEST_F(BoyerMooreTest, PatternAtBufferBoundaries) {
     EXPECT_EQ(matcher->Search(buffer2)[0], 1);
 }
 
-TEST_F(BoyerMooreTest, SingleBytePattern) {
+TEST_F(PatternStoreBoyerMooreTest, SingleBytePattern) {
     auto matcher = CreateMatcher("FF");
     std::vector<uint8_t> buffer = {0x00, 0xFF, 0x00, 0xFF, 0x00};
 
@@ -396,7 +396,7 @@ TEST_F(BoyerMooreTest, SingleBytePattern) {
     EXPECT_EQ(matches.size(), 2);
 }
 
-TEST_F(BoyerMooreTest, LongPatternPerformance) {
+TEST_F(PatternStoreBoyerMooreTest, LongPatternPerformance) {
     // 128-byte pattern
     std::string patternHex;
     for (int i = 0; i < 128; ++i) {
@@ -427,7 +427,7 @@ TEST_F(BoyerMooreTest, LongPatternPerformance) {
 // SIMD MATCHER TESTS
 // ============================================================================
 
-TEST_F(SIMDMatcherTest, AVX2BasicSearch) {
+TEST_F(PatternStoreSimdMatcherTest, AVX2BasicSearch) {
     std::vector<uint8_t> pattern = {0x48, 0x8B, 0x05};
     std::vector<uint8_t> buffer(1000, 0x00);
     
@@ -442,7 +442,7 @@ TEST_F(SIMDMatcherTest, AVX2BasicSearch) {
     EXPECT_TRUE(std::find(matches.begin(), matches.end(), 500) != matches.end());
 }
 
-TEST_F(SIMDMatcherTest, AVX2VsScalarConsistency) {
+TEST_F(PatternStoreSimdMatcherTest, AVX2VsScalarConsistency) {
     std::vector<uint8_t> pattern = {0xDE, 0xAD, 0xBE, 0xEF};
     
     // Generate random buffer
@@ -470,7 +470,7 @@ TEST_F(SIMDMatcherTest, AVX2VsScalarConsistency) {
     }
 }
 
-TEST_F(SIMDMatcherTest, AVX512Availability) {
+TEST_F(PatternStoreSimdMatcherTest, AVX512Availability) {
     if (SIMDMatcher::IsAVX512Available()) {
         std::vector<uint8_t> pattern = {0x90, 0x90, 0x90};
         std::vector<uint8_t> buffer(1000, 0x90);
@@ -482,7 +482,7 @@ TEST_F(SIMDMatcherTest, AVX512Availability) {
     }
 }
 
-TEST_F(SIMDMatcherTest, SingleBytePatternSIMD) {
+TEST_F(PatternStoreSimdMatcherTest, SingleBytePatternSIMD) {
     std::vector<uint8_t> pattern = {0xFF};
     std::vector<uint8_t> buffer(1000, 0x00);
     
@@ -495,7 +495,7 @@ TEST_F(SIMDMatcherTest, SingleBytePatternSIMD) {
     EXPECT_EQ(matches.size(), 3);
 }
 
-TEST_F(SIMDMatcherTest, LargeBufferPerformance) {
+TEST_F(PatternStoreSimdMatcherTest, LargeBufferPerformance) {
     std::vector<uint8_t> pattern = {0x48, 0x89, 0x5C, 0x24};
     
     // 10MB buffer
