@@ -19,8 +19,12 @@
 
 #include "../src/PhantomCore/Utils/Logger.hpp"
 
+#include <cstddef>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -127,6 +131,137 @@ namespace {
 
 }  // namespace
 
+namespace {
+
+    // ========================================================================
+    // SKIP REPORT - the structural defence against a silently disabled test
+    // ========================================================================
+    //
+    // A skipped test reports neither pass nor fail. It contributes nothing and
+    // costs nothing to leave in place, which is exactly what makes it the
+    // easiest way for coverage to disappear without anyone noticing. gtest
+    // prints skips inline among thousands of lines of output and then reports a
+    // cheerful "[  PASSED  ] N tests" that does not mention them at all.
+    //
+    // THIS IS NOT HYPOTHETICAL IN THIS REPOSITORY. Established from git:
+    //
+    //   2026-04-08  9f1f8e6d  "fix: resolve all 253 Shared_modules compilation
+    //                          errors" is the commit that changed the number of
+    //                          GTEST_SKIP occurrences in CryptoUtils_Tests.cpp.
+    //                          A commit whose stated purpose was fixing
+    //                          compilation errors disabled a test suite, and
+    //                          said nothing about it in its message.
+    //   2026-08-14  7c62acc5  the file entered the build for the first time,
+    //                          which is when those skips finally became visible
+    //                          as 30 skipped tests.
+    //
+    // For four months the entire crypto suite was dark: AES-256-GCM including
+    // AAD-mismatch and truncated-tag rejection, AES-CBC, RSA-2048, ECDH P-256,
+    // PBKDF2, HKDF and constant-time compare. Those are the primitives the
+    // encrypted kernel channel and the quarantine vault are built on.
+    //
+    // So this banner prints on EVERY run, including - deliberately - when the
+    // count is zero. A report that only appears when something is wrong trains
+    // the reader to expect silence, and silence is the failure mode here. Naming
+    // the number every time is what makes a change in it obvious.
+    //
+    // Skips are reported rather than banned because some are legitimate: a test
+    // whose precondition genuinely cannot exist on this host has nothing useful
+    // to assert. TrustDetermination_Tests skips when a system binary is no
+    // longer of the signing form the case is written to cover. The distinction
+    // that matters is not skip-versus-no-skip, it is whether a human decided.
+    // PHANTOM_TESTS_STRICT_NO_SKIP=1 turns any skip into a non-zero exit, for
+    // CI or for a run where the answer is meant to be "everything executed".
+
+    [[nodiscard]] std::string FirstSkipReason(const ::testing::TestResult* result) {
+        if (result == nullptr) return {};
+        for (int i = 0; i < result->total_part_count(); ++i) {
+            const auto& part = result->GetTestPartResult(i);
+            if (part.type() == ::testing::TestPartResult::kSkip) {
+                std::string msg = part.message() != nullptr ? part.message() : "";
+                // Collapse to a single line: these messages are multi-line and a
+                // one-per-test report is far easier to scan.
+                for (char& c : msg) {
+                    if (c == '\n' || c == '\r') c = ' ';
+                }
+                if (msg.size() > 160) msg = msg.substr(0, 157) + "...";
+                return msg;
+            }
+        }
+        return {};
+    }
+
+    // Returns the number of skipped tests, after printing the report.
+    int ReportSkippedTests() {
+        const auto* unitTest = ::testing::UnitTest::GetInstance();
+        if (unitTest == nullptr) return 0;
+
+        struct SkippedCase {
+            std::string name;
+            std::string reason;
+        };
+        std::vector<SkippedCase> skipped;
+
+        for (int s = 0; s < unitTest->total_test_suite_count(); ++s) {
+            const auto* suite = unitTest->GetTestSuite(s);
+            if (suite == nullptr) continue;
+            for (int t = 0; t < suite->total_test_count(); ++t) {
+                const auto* info = suite->GetTestInfo(t);
+                if (info == nullptr) continue;
+                // A test excluded by --gtest_filter never ran and is not a skip.
+                if (!info->should_run()) continue;
+                const auto* result = info->result();
+                if (result == nullptr || !result->Skipped()) continue;
+                skipped.push_back(
+                    SkippedCase{std::string(info->test_suite_name()) + "." + info->name(),
+                                FirstSkipReason(result)});
+            }
+        }
+
+        const int ran = unitTest->test_to_run_count();
+
+        std::cout << "\n"
+                  << "================================================================================\n"
+                  << " SKIP REPORT\n"
+                  << "================================================================================\n"
+                  << " " << ran << " tests were selected to run. " << skipped.size()
+                  << " were SKIPPED.\n";
+
+        if (skipped.empty()) {
+            std::cout << "\n Every selected test executed and returned a real verdict.\n";
+        } else {
+            std::cout << "\n A skipped test reports neither pass nor fail. Each of these is a gap\n"
+                         " in coverage until someone decides otherwise:\n\n";
+            for (const auto& c : skipped) {
+                std::cout << "   " << c.name << "\n";
+                if (!c.reason.empty()) {
+                    std::cout << "       reason: " << c.reason << "\n";
+                }
+            }
+        }
+
+        std::cout << "\n This banner prints on every run, including at zero, because a skip that\n"
+                     " nobody sees is indistinguishable from coverage. Set\n"
+                     " PHANTOM_TESTS_STRICT_NO_SKIP=1 to make any skip a non-zero exit.\n"
+                  << "================================================================================\n"
+                  << std::endl;
+
+        return static_cast<int>(skipped.size());
+    }
+
+    [[nodiscard]] bool StrictNoSkipRequested() {
+        char* value = nullptr;
+        std::size_t len = 0;
+        if (::_dupenv_s(&value, &len, "PHANTOM_TESTS_STRICT_NO_SKIP") != 0 || value == nullptr) {
+            return false;
+        }
+        const bool on = (len > 0) && (value[0] != '\0') && (value[0] != '0');
+        std::free(value);
+        return on;
+    }
+
+}  // namespace
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
 
@@ -137,5 +272,19 @@ int main(int argc, char** argv) {
 
     ::testing::AddGlobalTestEnvironment(new LoggerEnvironment());
 
-    return RUN_ALL_TESTS();
+    const int gtestResult = RUN_ALL_TESTS();
+
+    // After RUN_ALL_TESTS so every result is final. Reported unconditionally -
+    // see the long note above ReportSkippedTests for why this is not optional.
+    const int skippedCount = ReportSkippedTests();
+
+    if (skippedCount > 0 && StrictNoSkipRequested()) {
+        std::cout << "PHANTOM_TESTS_STRICT_NO_SKIP is set and " << skippedCount
+                  << " test(s) were skipped: failing the run." << std::endl;
+        // Deliberately does not mask a real gtest failure: if tests also failed,
+        // that exit code is the more urgent one and is preserved.
+        return gtestResult != 0 ? gtestResult : 2;
+    }
+
+    return gtestResult;
 }
