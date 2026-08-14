@@ -61,6 +61,7 @@
 #include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
+#include "../../../src/PhantomCore/RealTime/RealTimeProtection.hpp"
 
 #include <Windows.h>
 
@@ -437,6 +438,83 @@ namespace {
                    "impossible to diagnose from its logs."
                 << Describe(path, info);
         }
+    }
+
+    // ========================================================================
+    // REMEDIATION POLICY
+    // ========================================================================
+    // The classifier below decides whether a detection carries enough authority
+    // to destroy a file the operating system vouches for. Getting it wrong is
+    // expensive in both directions: too permissive and the product deletes parts
+    // of Windows, which is what the 1.0.93 field run attempted five times on
+    // System32\urlmon.dll; too strict and real malware carrying a stolen
+    // Microsoft signature is detected and then left in place.
+    //
+    // The source strings are asserted individually rather than as a set, because
+    // each one is a separate decision and a reader should be able to see which
+    // way each falls without running anything.
+
+    TEST(RemediationPolicyTest, IdentifyingSourcesRetainAuthorityToRemediate) {
+        using ShadowStrike::RealTime::RealTimeProtection;
+
+        // A named known-bad match. On a signed file this is the stolen-certificate
+        // and supply-chain case, which is precisely when we must still act.
+        EXPECT_TRUE(RealTimeProtection::DetectionSourceIdentifiesThreat("HashStore"));
+        EXPECT_TRUE(RealTimeProtection::DetectionSourceIdentifiesThreat("SignatureStore"));
+        EXPECT_TRUE(RealTimeProtection::DetectionSourceIdentifiesThreat("ThreatIntelStore"));
+        EXPECT_TRUE(RealTimeProtection::DetectionSourceIdentifiesThreat("ThreatIntel"));
+    }
+
+    TEST(RemediationPolicyTest, InferentialSourcesDoNotAuthoriseDestroyingASignedFile) {
+        using ShadowStrike::RealTime::RealTimeProtection;
+
+        // Every one of these produced a false positive on a Microsoft or OneDrive
+        // binary in the 1.0.93 field run, or is of the same class as one that did.
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("Heuristic"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("ExecutableAnalyzer"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("PolymorphicDetector"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("SandboxAnalyzer"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("EmulationEngine"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("ZeroDayDetector"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat(
+            "EmulationEngine+ExecutableAnalyzer"));
+
+        // Similarity, not identity. "Resembles something bad" is not grounds to
+        // delete part of Windows.
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("FuzzyHasher"));
+
+        // Script scanners: a signed OS binary is not a script, so a hit here on
+        // one is far more likely to be wrong than right.
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("PowerShellScanner"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("MacroDetector"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("DocumentScanner"));
+    }
+
+    TEST(RemediationPolicyTest, UnknownSourceDefaultsToRequiringStrongerEvidence) {
+        using ShadowStrike::RealTime::RealTimeProtection;
+
+        // The default for a DESTRUCTIVE action must be to require the stronger
+        // evidence, not to assume it. A detector added later that nobody
+        // classified must not inherit the authority to delete system files.
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat(""));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("SomeFutureDetector"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("Unknown"));
+    }
+
+    TEST(RemediationPolicyTest, ComposedSourceNamesAreClassifiedByTheirPrefix) {
+        using ShadowStrike::RealTime::RealTimeProtection;
+
+        // ScanEngine composes some source names at the assignment site, so the
+        // match is by prefix. These pin that behaviour in both directions so a
+        // future composite cannot silently change class.
+        EXPECT_TRUE(RealTimeProtection::DetectionSourceIdentifiesThreat("HashStore.SHA256"));
+        EXPECT_TRUE(RealTimeProtection::DetectionSourceIdentifiesThreat("SignatureStore/YARA"));
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("PowerShellScanner.Batch"));
+
+        // A source that merely CONTAINS an identifying name must not be promoted:
+        // only a prefix counts, so a hypothetical "PseudoHashStore" stays
+        // inferential.
+        EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("PseudoHashStore"));
     }
 
 }  // namespace

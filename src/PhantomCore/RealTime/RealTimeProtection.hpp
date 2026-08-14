@@ -896,6 +896,23 @@ struct alignas(64) RTPStatistics {
     std::atomic<uint64_t> filesCleaned{ 0 };
     std::atomic<uint64_t> processesTerminated{ 0 };
 
+    /// @brief Detections on files carrying a valid operating-system signature
+    ///        where the DESTRUCTIVE action was withheld because the only
+    ///        evidence was inferential (a heuristic, packer, polymorphism,
+    ///        emulation or ML score) rather than an identification (a hash,
+    ///        signature or threat-intel match).
+    ///
+    /// The detection itself is still counted in threatsDetected and still
+    /// reported. This counts only the cases where we declined to quarantine.
+    ///
+    /// A non-zero value is NOT automatically good news: it means the heuristics
+    /// are firing on signed operating-system binaries, which is worth
+    /// investigating on its own. It exists so that condition is VISIBLE rather
+    /// than either silently destructive or silently ignored. In the 1.0.93 field
+    /// run this would have read 14, with five of them being repeat attempts on
+    /// System32\urlmon.dll.
+    std::atomic<uint64_t> signedFileRemediationWithheld{ 0 };
+
     // Exclusion statistics
     std::atomic<uint64_t> excludedByPath{ 0 };
     std::atomic<uint64_t> excludedByExtension{ 0 };
@@ -1344,6 +1361,33 @@ public:
      * @return True if quarantined successfully.
      */
     bool QuarantineFile(const std::wstring& filePath, std::wstring_view threatName = L"");
+
+    /**
+     * @brief Does this detection source IDENTIFY a known-bad thing, or merely
+     *        INFER badness from a score?
+     *
+     * This is the remediation policy that decides whether a detection carries
+     * enough authority to destroy a file the operating system vouches for.
+     * Identification (a hash, shipped signature or threat-intel match) does;
+     * inference (heuristic, packer, polymorphism, emulation, ML or similarity
+     * scoring) does not, because in the 1.0.93 field run every one of fourteen
+     * inferential detections was a Microsoft or OneDrive binary and one of them
+     * was called for remediation five times.
+     *
+     * PUBLIC AND STATIC ON PURPOSE. It is a pure function of the source string
+     * with no state, and it is the single most safety-critical branch in the
+     * remediation path: too permissive and we delete parts of Windows, too strict
+     * and we decline to remove real malware. A security policy that cannot be
+     * tested or read from outside the class is a policy nobody can verify, and
+     * this one is exercised directly by
+     * tests/unit/trust_determination/TrustDetermination_Tests.cpp.
+     *
+     * An unknown or unlisted source returns false, because the safe default for
+     * a destructive action is to require the stronger evidence rather than
+     * assume it.
+     */
+    [[nodiscard]] static bool DetectionSourceIdentifiesThreat(
+        const std::string& detectionSource) noexcept;
 
     /**
      * @brief Manually blocks a network connection.

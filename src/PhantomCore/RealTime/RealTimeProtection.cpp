@@ -2767,6 +2767,122 @@ public:
         m_deferredCv.notify_one();
     }
 
+    // =========================================================================
+    // REMEDIATION POLICY: destroying an operating-system file needs more than a
+    // score
+    // =========================================================================
+    //
+    // The 1.0.93 field run detected fourteen threats and every single one was a
+    // Microsoft or OneDrive binary. It called for remediation of
+    // C:\Windows\System32\urlmon.dll five separate times. The only reason that
+    // endpoint still works is that urlmon.dll was in use and the quarantine
+    // failed; had it succeeded we would have removed a core Windows component
+    // ourselves, which is a worse outcome than any malware those heuristics were
+    // looking for.
+    //
+    // Trust determination has been fixed separately (see
+    // DigitalSignatureValidator's status triage). This is the independent second
+    // control, and it is deliberately independent: a remediation path that
+    // destroys operating-system files whenever trust determination fails for ANY
+    // reason is one defect away from breaking the machine, and trust
+    // determination is exactly the kind of thing that can fail for environmental
+    // reasons we do not control.
+    //
+    // WHAT THIS DOES NOT DO, because it would violate the rule that detection is
+    // never weakened: it does not suppress detection, change a verdict, alter any
+    // heuristic threshold, or stop a threat being reported. The detection is
+    // already counted in threatsDetected before this runs and is still logged and
+    // still surfaced. What is withheld is only the DESTRUCTIVE ACTION, and only
+    // for a file the operating system vouches for, and only when the evidence is
+    // inferential.
+    //
+    // THE DISTINCTION THAT MAKES THIS SAFE is between identifying a file and
+    // judging it. Measured from ScanEngine's actual assignments to
+    // EngineResult::detectionSource rather than from the field's doc comment:
+    //
+    //   IDENTIFICATION - a specific known-bad thing was matched. Still quarantines
+    //     even on a signed file, because a Microsoft-signed binary matching a
+    //     malware hash or shipped signature IS the stolen-certificate and
+    //     supply-chain case, which is precisely when we must act.
+    //       HashStore, SignatureStore, ThreatIntelStore, ThreatIntel
+    //
+    //   INFERENCE - a score or behavioural judgement, with no named referent.
+    //     Every one of the fourteen field false positives came from this class:
+    //     Heur:PE.Suspicious, Heuristic:Win/Packed, Heuristic:Win/Generic,
+    //     Polymorphic.Generic and a metamorphic score of 52.0.
+    //       Heuristic, ExecutableAnalyzer, PolymorphicDetector, SandboxAnalyzer,
+    //       EmulationEngine, ZeroDayDetector, FuzzyHasher, the script scanners
+    //
+    // FuzzyHasher is classed as inference on purpose: a similarity match is not an
+    // identification, and "resembles something bad" is not sufficient grounds to
+    // delete part of Windows. An unknown or unlisted source is also treated as
+    // inference, because the safe default for a destructive action is to require
+    // the stronger evidence rather than to assume it.
+    // Delegates to the public policy function so there is exactly ONE
+    // implementation of this classification. Two copies of a security policy is
+    // how the two YARA metadata builders and the two on-disk trie producers in
+    // this codebase drifted apart, with the worse one being the one that ran.
+    [[nodiscard]] static bool DetectionIdentifiesRatherThanInfers(
+        const std::string& detectionSource) noexcept {
+        return RealTimeProtection::DetectionSourceIdentifiesThreat(detectionSource);
+    }
+
+    // Returns true when the destructive action may proceed.
+    [[nodiscard]] bool MayRemediateDetectedFile(
+        const std::wstring& filePath,
+        const Core::Engine::EngineResult& result) {
+        // Checked first, so an identification never pays for a signature lookup
+        // and can never be withheld by this control.
+        if (DetectionIdentifiesRatherThanInfers(result.detectionSource)) {
+            return true;
+        }
+
+        // SAFE TO BLOCK HERE. This runs on the deferred deep-scan thread, which
+        // owes the kernel nothing -- nothing is waiting on it, which is the whole
+        // reason the deep scan was deferred to it. The 180-second cross-process
+        // stall this codebase has hit repeatedly only occurs when a thread
+        // holding a kernel file operation open calls into CryptSvc. That is not
+        // this thread. Calling the cache-only accessor instead would be wrong
+        // here: an undetermined verdict would silently become "not signed" and
+        // this control would fail open exactly when it matters.
+        bool osSigned = false;
+        try {
+            osSigned = Security::DigitalSignatureValidator::Instance()
+                           .IsMicrosoftSigned(filePath);
+        } catch (...) {
+            // A verification we could not complete must not be read as "this is
+            // not an operating-system file". Leaving osSigned false would do
+            // exactly that, so the failure is reported and remediation proceeds
+            // as it did before this control existed -- which is the pre-existing
+            // behaviour, not a new risk.
+            Utils::Logger::Warn(
+                "RealTimeProtection: signature check threw while deciding whether to "
+                "remediate {} - proceeding with remediation as before",
+                Utils::StringUtils::ToNarrow(filePath));
+            return true;
+        }
+
+        if (!osSigned) {
+            return true;
+        }
+
+        m_stats.signedFileRemediationWithheld++;
+        Utils::Logger::Warn(
+            "RealTimeProtection: WITHHELD remediation of Microsoft-signed file {} - "
+            "detection was inferential (source='{}', threat='{}', confidence={:.1f}, "
+            "score={:.1f}, severity={}). The detection stands and is reported; the "
+            "file is NOT quarantined. Quarantining an operating-system binary on a "
+            "heuristic score alone risks breaking the endpoint. An identification "
+            "(hash, signature or threat-intel match) would still remediate.",
+            Utils::StringUtils::ToNarrow(filePath),
+            result.detectionSource,
+            result.threatName,
+            result.confidence,
+            result.threatScore,
+            static_cast<int>(result.severity));
+        return false;
+    }
+
     void HandleDeferredThreat(const std::wstring& filePath, uint32_t processId,
                               const Core::Engine::EngineResult& result) {
         // Same remediation the synchronous path would have applied. Deferral
@@ -2775,6 +2891,12 @@ public:
         const std::wstring threatName = result.threatName.empty()
             ? std::wstring(L"Deferred.DeepScan.Detection")
             : Utils::StringUtils::ToWide(result.threatName);
+
+        if (!MayRemediateDetectedFile(filePath, result)) {
+            // Detection preserved and already counted; only the destructive
+            // action is declined. See MayRemediateDetectedFile for the reasoning.
+            return;
+        }
 
         if (!QuarantineFile(filePath, threatName)) {
             Utils::Logger::Error(
@@ -6199,6 +6321,7 @@ void RTPStatistics::Reset() noexcept {
     filesDeleted = 0;
     filesCleaned = 0;
     processesTerminated = 0;
+    signedFileRemediationWithheld = 0;
     excludedByPath = 0;
     excludedByExtension = 0;
     excludedByProcess = 0;
@@ -6502,6 +6625,42 @@ bool RealTimeProtection::BlockProcess(uint32_t pid, bool terminate) {
 
 bool RealTimeProtection::QuarantineFile(const std::wstring& filePath, std::wstring_view threatName) {
     return m_impl->QuarantineFile(filePath, threatName);
+}
+
+bool RealTimeProtection::DetectionSourceIdentifiesThreat(
+    const std::string& detectionSource) noexcept {
+    // The values below are not guessed from the field's doc comment; they were
+    // read off ScanEngine's actual assignments to EngineResult::detectionSource.
+    //
+    // IDENTIFICATION: a specific, named known-bad thing was matched. A
+    // Microsoft-signed binary that matches a malware hash, a shipped signature or
+    // a threat-intel indicator is the stolen-certificate and supply-chain case,
+    // which is exactly when remediation must proceed rather than be withheld.
+    //
+    // Everything else is INFERENCE - a score with no named referent - and
+    // includes Heuristic, ExecutableAnalyzer, PolymorphicDetector,
+    // SandboxAnalyzer, EmulationEngine, ZeroDayDetector, FuzzyHasher and the
+    // script scanners. FuzzyHasher is inference deliberately: a similarity match
+    // means "resembles something bad", which is not grounds to delete part of
+    // Windows.
+    static constexpr std::string_view kIdentifyingSources[] = {
+        "HashStore",
+        "SignatureStore",
+        "ThreatIntelStore",
+        "ThreatIntel",
+    };
+
+    // Prefix match rather than equality, because some sources are composed at the
+    // assignment site (ScanEngine writes "EmulationEngine+ExecutableAnalyzer",
+    // and the script path writes "PowerShellScanner.Batch"). A future composite
+    // beginning with an identifying source must not silently drop out of the
+    // identifying class.
+    for (const std::string_view candidate : kIdentifyingSources) {
+        if (detectionSource.rfind(candidate, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool RealTimeProtection::BlockNetworkAddress(const std::wstring& address, uint16_t port, uint32_t durationMs) {
