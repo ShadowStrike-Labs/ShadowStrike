@@ -43,7 +43,7 @@
 // ---------------------------------------------------------------------------
 #define SS_VERSION_MAJOR      1
 #define SS_VERSION_MINOR      0
-#define SS_VERSION_PATCH      92
+#define SS_VERSION_PATCH      93
 #define SS_VERSION_BUILD      0
 
 // String form, built from the numbers above so the two cannot disagree.
