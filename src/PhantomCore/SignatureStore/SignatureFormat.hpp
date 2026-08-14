@@ -88,7 +88,32 @@ constexpr size_t HASH_BUCKET_SIZE = 1024;                // Hash table bucket si
 
 // Size limits
 constexpr size_t MAX_SIGNATURE_NAME_LEN = 256;
-constexpr size_t MAX_PATTERN_LENGTH = 8192;              // Max single pattern size
+
+// The longest COMPILED pattern (bytes after tokenization, not input characters) that
+// this build can compile, store, and scan. This is the single governing limit for the
+// whole pattern path - the builder validates against it, the serializer writes nothing
+// longer, PatternIndex and PatternStore reject anything longer on load, and each matcher
+// carries a static_assert that its own internal ceiling is at least this large.
+//
+// It is deliberately ONE number. Five limits used to govern this value independently:
+// this constant at 8192, a local copy in the builder's input validation at 8192 that
+// measured CHARACTERS rather than bytes, Boyer-Moore at 8192, Aho-Corasick at 4096, and
+// PatternStore's own MAX_COMPILED_PATTERN_SIZE at 256. The smallest of them decided what
+// actually worked, and it was the one nobody advertised: a 300-byte pattern passed every
+// visible check, failed to compile during serialization, and was dropped from the
+// database while the build reported success.
+//
+// The value is bounded by the Aho-Corasick trie, which is the tightest REASONED
+// capability on the path (one node per pattern byte, so a pattern of this length can add
+// up to 4096 nodes at ~1 KB each). Raising it further requires raising AC_MAX_PATTERN_LENGTH
+// and re-examining the aggregate MAX_TOTAL_NODES ceiling that protects endpoint memory.
+// Lowering it silently removes detection capability, so do neither without measuring.
+//
+// Scan cost does NOT grow with this number: Aho-Corasick is O(buffer) regardless of
+// pattern length, and an unmasked Boyer-Moore pass gets FASTER with longer patterns
+// because the skip distance grows. The cost of a longer pattern is trie memory at build
+// time, paid once.
+constexpr size_t MAX_PATTERN_LENGTH = 4096;              // Max single compiled pattern, in BYTES
 constexpr size_t MAX_YARA_RULE_SIZE = 1024 * 1024;       // 1MB per YARA rule
 constexpr uint64_t MAX_DATABASE_SIZE = 16ULL * 1024 * 1024 * 1024; // 16GB database limit
 

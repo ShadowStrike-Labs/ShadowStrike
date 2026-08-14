@@ -62,14 +62,24 @@ namespace PatternStore {
 
 namespace {
 
-    // Maximum pattern string length (DoS protection)
-    constexpr size_t MAX_PATTERN_STRING_LENGTH = 10'000;
-    
-    // Maximum compiled pattern size
-    constexpr size_t MAX_COMPILED_PATTERN_SIZE = 256;
-    
+    // Maximum compiled pattern size, in bytes. Defined BY the governing format constant
+    // rather than restated here - this local name used to hold an independent 256, which
+    // was the smallest of five limits on the path and therefore the one that decided what
+    // actually worked, while every advertised limit said 8192 or 4096.
+    constexpr size_t MAX_COMPILED_PATTERN_SIZE = SignatureStore::MAX_PATTERN_LENGTH;
+
     // Minimum compiled pattern size
     constexpr size_t MIN_COMPILED_PATTERN_SIZE = 1;
+
+    // Maximum pattern STRING length (DoS protection), in input characters.
+    //
+    // Derived from the byte limit, because the two are not independent: the accepted
+    // syntax spends 2 characters per byte packed ("48 8B") and 3 with single-space
+    // separation ("48 8B "), so a byte limit of N needs at least 3N characters to be
+    // reachable at all. An independent character bound smaller than that refuses long
+    // patterns FIRST, with a message about string length, and the byte limit never gets
+    // to speak. The factor of 4 leaves room for multi-space and newline separation.
+    constexpr size_t MAX_PATTERN_STRING_LENGTH = MAX_COMPILED_PATTERN_SIZE * 4;
     
     // Maximum expansion size for variable gaps (DoS protection)
     constexpr size_t MAX_EXPANDED_SIZE = 10'000;
@@ -461,8 +471,9 @@ bool PatternCompiler::ValidatePattern(
         return false;
     }
 
-    if (patternStr.length() > 10000) {
-        errorMessage = "Pattern string too long (max 10000 characters)";
+    if (patternStr.length() > MAX_PATTERN_STRING_LENGTH) {
+        errorMessage = "Pattern string too long (max " +
+            std::to_string(MAX_PATTERN_STRING_LENGTH) + " characters)";
         return false;
     }
 
@@ -519,21 +530,32 @@ bool PatternCompiler::ValidatePattern(
         }
     }
 
-    // Check estimated pattern size
+    // Check the compiled size this pattern will produce.
+    //
+    // Counted in HALF-BYTES because every token in the accepted syntax is made of
+    // half-byte units: a hex digit is one, and each '?' of a '??' wildcard is one. That
+    // makes the count exact rather than an estimate, and the earlier version was not:
+    // it added 2 per '?', so a '??' wildcard - one byte - counted as two. A pattern of
+    // mostly wildcards was therefore over-counted by up to 2x and could be refused for
+    // being "too large" while its true compiled size was well inside the limit. A
+    // rejection that names a size the compiler would never produce sends the author
+    // looking for a problem that is not in their pattern.
     {
-        size_t estimatedSize = 0;
+        size_t halfBytes = 0;
         for (char c : patternStr) {
-            if (std::isxdigit(static_cast<unsigned char>(c))) estimatedSize++;
-            if (c == '?') estimatedSize += 2;
+            if (std::isxdigit(static_cast<unsigned char>(c)) != 0 || c == '?') {
+                ++halfBytes;
+            }
         }
-        estimatedSize /= 2;
+        const size_t compiledSize = halfBytes / 2;
 
-        if (estimatedSize > 256) {
-            errorMessage = "Pattern too large (estimated " + std::to_string(estimatedSize) + " bytes)";
+        if (compiledSize > MAX_COMPILED_PATTERN_SIZE) {
+            errorMessage = "Pattern too large (" + std::to_string(compiledSize) +
+                " bytes, max " + std::to_string(MAX_COMPILED_PATTERN_SIZE) + ")";
             return false;
         }
 
-        if (estimatedSize == 0) {
+        if (compiledSize == 0) {
             errorMessage = "Pattern results in empty byte sequence";
             return false;
         }
@@ -2423,12 +2445,12 @@ StoreError PatternStore::LoadPatternsFromDatabase() noexcept {
 
         const uint32_t patternLen = entry->patternLength;
 
-        // The three size limits in this codebase disagree: the builder validates
-        // against MAX_PATTERN_SIZE (8192), the automaton accepts up to
-        // AC_MAX_PATTERN_LENGTH (4096), and this store rejects anything over
-        // MAX_COMPILED_PATTERN_SIZE (256). A pattern between those bounds builds
-        // into the database and cannot be loaded. Report it with the actual number
-        // so the disagreement is visible instead of appearing as a missing pattern.
+        // One constant governs this value across the whole path
+        // (SignatureStore::MAX_PATTERN_LENGTH), and both matchers static_assert that they
+        // can handle it, so an entry outside this range means the database was written by
+        // a build with a different limit or the section is corrupt. Report the actual
+        // number either way: a rejected entry is a pattern that is present in the database
+        // and will NOT be matched, which is otherwise indistinguishable from a clean scan.
         if (patternLen < MIN_COMPILED_PATTERN_SIZE || patternLen > MAX_COMPILED_PATTERN_SIZE) {
             SS_LOG_ERROR(L"PatternStore",
                 L"LoadPatterns: entry %llu has length %u, outside this store's accepted "

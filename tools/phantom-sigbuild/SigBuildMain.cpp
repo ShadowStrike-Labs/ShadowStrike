@@ -982,6 +982,23 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
                 continue;
             }
 
+            // Longer than the product can compile, store and scan. Refused HERE, with the
+            // real number, because every other place an author would look reports a
+            // different one - and until this check existed an over-long pattern passed
+            // input validation, failed silently during serialization, and was simply
+            // absent from the finished database while the build reported success.
+            //
+            // One constant governs this across the whole path, so quoting it here cannot
+            // drift from what the store will actually accept.
+            if (line.bytes.size() > ShadowStrike::SignatureStore::MAX_PATTERN_LENGTH) {
+                outUnmatchable.push_back(
+                    patternName + " compiles to " + std::to_string(line.bytes.size()) +
+                    " bytes, over the " +
+                    std::to_string(ShadowStrike::SignatureStore::MAX_PATTERN_LENGTH) +
+                    "-byte limit this build can compile, store and scan");
+                continue;
+            }
+
             out.push_back(std::move(line));
         }
     }
@@ -1499,9 +1516,18 @@ int wmain(int argc, wchar_t** argv) {
          static_cast<double>(st.hashIndexSize)     / (1024.0 * 1024.0),
          static_cast<double>(st.patternIndexSize)  / (1024.0 * 1024.0));
 
-    if (st.invalidSignaturesSkipped > 0 && cfg.strictValidation) {
-        Fail("%llu signatures were skipped as invalid while strict validation "
-             "was on - fix the input rather than shipping a partial set",
+    // Independent of the library's strictValidation, deliberately.
+    //
+    // SignatureBuilder::Build() now honours that flag itself, so with it on this branch is
+    // normally unreachable - Build() fails first and we return 3 above. It is kept, and
+    // kept UNCONDITIONAL, because the rule for SHIPPED content is stronger than the
+    // library's default: content in this repository is authored by hand, every pattern and
+    // hash in it is meant to be there, and a database missing one of them must never leave
+    // this tool regardless of how the builder happens to be configured. Duplicating the
+    // check is cheap; shipping a silently incomplete detection database is not.
+    if (st.invalidSignaturesSkipped > 0) {
+        Fail("%llu signature(s) were skipped as invalid. Shipped content must be "
+             "complete - fix the input rather than shipping a partial set",
              st.invalidSignaturesSkipped);
         return 3;
     }

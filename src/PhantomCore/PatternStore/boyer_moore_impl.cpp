@@ -109,6 +109,14 @@ namespace ShadowStrike {
             /// @note Chosen to fit good suffix table in L2 cache (64KB typical)
             constexpr size_t BM_MAX_PATTERN_LENGTH = 8192;
 
+            // Same contract as the automaton: this matcher serves every MASKED pattern in
+            // the store, so its ceiling must cover the longest pattern the store permits.
+            // A masked pattern refused here is owned by neither pass and is not scanned by
+            // anything, while still being counted as loaded.
+            static_assert(BM_MAX_PATTERN_LENGTH >= SignatureStore::MAX_PATTERN_LENGTH,
+                "Boyer-Moore cannot accept the longest pattern the store permits, so masked "
+                "patterns within the governing limit would be scanned by nothing.");
+
             /// @brief Maximum matches to return (10M - prevents memory exhaustion)
             /// @note At 8 bytes per match, this caps output at 80MB
             constexpr size_t BM_MAX_MATCH_COUNT = 10'000'000;

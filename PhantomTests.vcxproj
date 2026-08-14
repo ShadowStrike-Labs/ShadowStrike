@@ -175,6 +175,15 @@
          consulting the mask they jump over valid matches instead, giving a matcher
          that is correct on most inputs and silently blind on the rest. -->
     <ClCompile Include="tests\unit\masked_patterns\MaskedPattern_Tests.cpp" />
+
+    <!-- Enabled suite 5: compiled-pattern size limits. Five constants used to govern
+         one value independently and the smallest of them - an undocumented 256 inside
+         PatternStore.cpp - decided what actually worked, while the builder advertised
+         8KB. These cases assert against the governing constant rather than a literal
+         and check both sides of the boundary, so moving one of the five numbers and
+         not the others fails here instead of silently shrinking what a signature
+         author is allowed to write. -->
+    <ClCompile Include="tests\unit\pattern_limits\PatternLimits_Tests.cpp" />
   </ItemGroup>
 
   <ItemGroup>

@@ -482,13 +482,27 @@ namespace SignatureStore {
                                   "Name must be 1-256 characters" };
             }
 
-            // Validate pattern string
-            constexpr size_t MAX_PATTERN_SIZE = 8192;  // 8KB
-            if (input.patternString.empty() || input.patternString.length() > MAX_PATTERN_SIZE) {
+            // Validate pattern string LENGTH IN CHARACTERS.
+            //
+            // This is a cheap DoS pre-filter on the input text, not the pattern size
+            // limit. The two are different units and used to be conflated: this check
+            // read 8192 and the message said "1-8KB", which reads like a byte limit,
+            // while the accepted syntax spends 2-3 characters per byte - so it actually
+            // admitted roughly 2,730 bytes and could never enforce a byte bound.
+            //
+            // The AUTHORITATIVE limit is MAX_PATTERN_LENGTH compiled bytes, enforced by
+            // PatternCompiler::ValidatePattern (called just below via ValidatePatternSyntax)
+            // and again by CompilePattern itself. Keep the factor here at least as large as
+            // the compiler's own string bound so this check cannot refuse a pattern the
+            // compiler would have accepted.
+            constexpr size_t MAX_PATTERN_CHARS = MAX_PATTERN_LENGTH * 4;
+            if (input.patternString.empty() || input.patternString.length() > MAX_PATTERN_CHARS) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"AddPattern: Invalid pattern size %zu", input.patternString.length());
+                    L"AddPattern: pattern text is %zu characters, outside 1-%zu",
+                    input.patternString.length(), MAX_PATTERN_CHARS);
                 return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                                  "Pattern must be 1-8KB" };
+                                  "Pattern text must be 1-" + std::to_string(MAX_PATTERN_CHARS) +
+                                  " characters" };
             }
 
             // Validate description

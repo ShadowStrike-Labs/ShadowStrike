@@ -907,8 +907,21 @@ namespace SignatureStore {
                     cache.entropy = PatternStore::PatternCompiler::ComputeEntropy(cache.bytes);
                     cache.valid = true;
                 } else {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"SerializePatterns: Failed to compile pattern %zu: %S",
+                    // A pattern that does not compile is skipped by every write site
+                    // below (cache.valid gates them all), so it is ABSENT from the
+                    // finished database - not truncated, not degraded, absent. The author
+                    // asked for a signature and the build will not contain one.
+                    //
+                    // This is an ERROR, not a warning: it is silent coverage loss, and
+                    // the surrounding build still succeeds by design (one bad pattern in
+                    // a 10,000-entry feed must not zero out the other 9,999). The count
+                    // is what callers act on - phantom-sigbuild treats any non-zero
+                    // invalidSignaturesSkipped as a failed content build, because shipped
+                    // content is authored and every pattern in it is meant to be there.
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializePatterns: pattern %zu ('%S') failed to compile and will "
+                        L"be ABSENT from the database; it passed input validation, so this "
+                        L"is a disagreement between ValidatePattern and CompilePattern",
                         patternIdx, pattern.name.c_str());
                     m_statistics.invalidSignaturesSkipped++;
                 }
@@ -929,9 +942,20 @@ namespace SignatureStore {
                 if (!cache.valid) continue;
 
                 if (!automaton.AddPattern(cache.bytes, static_cast<uint64_t>(patternIdx))) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"SerializePatterns: Failed to add pattern to automaton: %S",
-                        m_pendingPatterns[patternIdx].name.c_str());
+                    // Narrower consequence than a compile failure, and worth stating
+                    // precisely: the pattern IS still written to the PatternEntry array,
+                    // and PatternStore rebuilds its own automaton from those entries at
+                    // load, so this does not by itself remove the pattern from the product.
+                    // What it means is that the builder's automaton - and therefore the
+                    // serialized trie - does not contain it. With one governing length
+                    // limit and a static_assert on the matcher's ceiling, the remaining
+                    // reachable cause is the aggregate MAX_TOTAL_NODES cap, which is a real
+                    // limit on how much pattern content one database can hold.
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializePatterns: pattern '%S' (%zu bytes) was refused by the "
+                        L"automaton; it remains in the entry array but is absent from the "
+                        L"serialized trie. Check the aggregate node ceiling.",
+                        m_pendingPatterns[patternIdx].name.c_str(), cache.bytes.size());
                     m_statistics.invalidSignaturesSkipped++;
                 }
             }

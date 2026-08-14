@@ -71,6 +71,16 @@ namespace {
 /// @note Uses local name to avoid conflict with SignatureFormat.hpp's MAX_PATTERN_LENGTH
 constexpr size_t AC_MAX_PATTERN_LENGTH = 4096;
 
+// This matcher's capability must cover everything the store is allowed to hold. If it
+// does not, patterns inside the governing limit are accepted by the builder, written to
+// the database, loaded by the store, and then silently refused by AddPattern - which
+// looks exactly like a pattern that simply never matches. Fail the build instead.
+static_assert(AC_MAX_PATTERN_LENGTH >= SignatureStore::MAX_PATTERN_LENGTH,
+    "Aho-Corasick cannot accept the longest pattern the store permits. Either raise "
+    "AC_MAX_PATTERN_LENGTH (and re-check MAX_TOTAL_NODES, since trie nodes grow with "
+    "pattern length) or lower SignatureStore::MAX_PATTERN_LENGTH, which removes "
+    "detection capability.");
+
 /// @brief Maximum total nodes to prevent memory exhaustion attacks
 /// ACNode is ~1056 bytes (1024 children + 24 vector + 8 misc).
 /// 2M nodes ≈ 2GB — hard ceiling to protect endpoint stability.

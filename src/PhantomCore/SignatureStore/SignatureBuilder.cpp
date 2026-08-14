@@ -902,12 +902,55 @@ StoreError SignatureBuilder::Build() noexcept {
         return err;
     }
 
+    // Strict-validation gate, placed HERE deliberately: stages 1-4 remove signatures
+    // that failed validation or could not be compiled, and Serialize() below is the first
+    // stage that writes to the output file. Refusing now means a rejected build leaves no
+    // partial database behind.
+    //
+    // BuildConfiguration::strictValidation is documented as "Fail on invalid signatures"
+    // and, until this gate existed, was READ NOWHERE in src - the flag was declared, it
+    // defaulted to true, and it did nothing. The only thing enforcing it was a post-build
+    // check inside phantom-sigbuild, so the library silently produced a database missing
+    // whatever it could not validate, and every non-sigbuild caller inherited that.
+    //
+    // A partial signature database is the worst possible output for a detection product:
+    // it loads cleanly, reports ready, and is missing exactly the signatures nobody
+    // noticed were dropped. Callers that genuinely want a best-effort build must ask for
+    // one by setting strictValidation to false.
+    if (m_config.strictValidation && m_statistics.invalidSignaturesSkipped > 0) {
+        SS_LOG_ERROR(L"SignatureBuilder",
+            L"Build refused: %llu signature(s) were skipped as invalid and "
+            L"strictValidation is on. No output was written.",
+            m_statistics.invalidSignaturesSkipped);
+        CleanupOutputHandles();
+        return StoreError{SignatureStoreError::InvalidSignature, 0,
+            "strictValidation: " + std::to_string(m_statistics.invalidSignaturesSkipped) +
+            " signature(s) were skipped as invalid; fix the input or set "
+            "strictValidation=false to accept a partial set"};
+    }
+
     // Stage 5: Serialize (includes checksum computation before file cleanup)
     ReportProgress("Serialization", 4, 7);
     err = Serialize();
     if (!err.IsSuccess()) {
         CleanupOutputHandles();
         return err;
+    }
+
+    // Second gate, for signatures dropped DURING serialization. With one governing length
+    // limit and a static_assert on each matcher's ceiling, a pattern reaching this point
+    // and failing to compile is a contradiction between ValidatePattern and CompilePattern
+    // rather than an expected outcome - but it still costs a signature, so it still fails
+    // the build. Unlike the gate above, the output file HAS been written by now, so the
+    // caller must treat it as incomplete rather than merely absent.
+    if (m_config.strictValidation && m_statistics.invalidSignaturesSkipped > 0) {
+        SS_LOG_ERROR(L"SignatureBuilder",
+            L"Build refused after serialization: %llu signature(s) were dropped while "
+            L"writing. The output file is INCOMPLETE and must not be shipped.",
+            m_statistics.invalidSignaturesSkipped);
+        return StoreError{SignatureStoreError::InvalidSignature, 0,
+            "strictValidation: " + std::to_string(m_statistics.invalidSignaturesSkipped) +
+            " signature(s) were dropped during serialization; the output is incomplete"};
     }
 
     // Stage 6: Integrity verification is now done within Serialize()
