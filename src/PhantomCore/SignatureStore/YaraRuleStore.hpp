@@ -622,6 +622,59 @@ private:
     /// @note Caller must hold m_globalLock exclusively.
     [[nodiscard]] bool AdoptRulesFromCompiler(YaraCompiler& compiler) noexcept;
 
+    /// @brief Recompile m_rules from m_ruleSources. THE ONLY function that
+    ///        changes which rules this store holds.
+    ///
+    /// THE INVARIANT THIS ENFORCES, and the reason it exists as one function:
+    ///   - m_ruleSources is the authoritative record of what the store holds.
+    ///   - m_rules is a compiled image of exactly those sources, OWNED by this
+    ///     store, obtained only from yr_rules_load / yr_rules_load_stream.
+    ///   - m_ruleMetadata is derived from m_rules, by RebuildRuleMetadataFromRules.
+    /// A mutator therefore edits m_ruleSources and calls this. It must never
+    /// assign to m_rules and never call yr_rules_destroy, because getting that
+    /// wrong is not a leak - it is a use-after-free on every subsequent scan.
+    /// Five sites previously maintained these three fields independently and
+    /// three of them maintained them incorrectly.
+    ///
+    /// STRICT BY DESIGN: if any stored source fails to compile, the rule set is
+    /// left exactly as it was and the failure names the source. The previous
+    /// behaviour ("partial merge is better than nothing") produced a rule set
+    /// silently missing whichever rules lost a conflict, while reporting
+    /// success - the same hazard as a partial signature database, which opens
+    /// cleanly and is missing exactly what nobody noticed was gone. Every entry
+    /// in m_ruleSources compiled on its own when it was accepted, so a failure
+    /// here means two sources conflict, which is precisely the case where
+    /// carrying on would drop rules invisibly.
+    ///
+    /// An empty m_ruleSources is a valid state: rules are released, metadata is
+    /// cleared, and Success is returned. A store holding nothing is different
+    /// from a store that failed to load.
+    ///
+    /// @note Caller must hold m_globalLock exclusively.
+    [[nodiscard]] StoreError RebuildRulesFromSources() noexcept;
+
+    /// @brief Decide whether an already-compiled rule set can be merged into this
+    ///        store, and count what it would contribute.
+    ///
+    /// Takes a pointer the CALLER compiled, so no source is compiled twice. The
+    /// pointer is only read; it is never stored and never destroyed - it belongs
+    /// to the caller's compiler.
+    ///
+    /// @param compiled          rules produced from one source
+    /// @param fallbackNamespace used when a rule carries no namespace name
+    /// @param[out] newRules     rules this source contributes that the store lacks
+    /// @return Success when every named rule is new; DuplicateEntry when the
+    ///         source redefines a rule the store already holds (YARA rejects a
+    ///         duplicated identifier for the whole source, so a partial accept
+    ///         would silently drop the new rules too); InvalidSignature when it
+    ///         contributes nothing.
+    /// @note Caller must hold m_globalLock exclusively.
+    [[nodiscard]] StoreError SurveyCompiledRules(
+        YR_RULES* compiled,
+        const std::string& fallbackNamespace,
+        size_t& newRules
+    ) noexcept;
+
     [[nodiscard]] std::vector<YaraMatch> PerformScan(
         const void* buffer,
         size_t size,
@@ -662,6 +715,19 @@ private:
     // Key: "namespace::__source__<id>", Value: rule source string
     // This enables proper rule merging by recompiling all sources together
     std::map<std::string, std::string> m_ruleSources;
+
+    // True when m_rules holds rules that m_ruleSources CANNOT reproduce, because
+    // they arrived as compiled bytecode - from the signature database
+    // (LoadRulesInternal), a compiled rule file (LoadCompiledRules), or a repo
+    // import that compiles files in place (ImportFromYaraRulesRepo).
+    //
+    // While this is true, a source-driven rebuild is refused, because it would
+    // replace the compiled image with only what the sources describe and thereby
+    // DELETE every rule that arrived as bytecode. On the shipped database that is
+    // 11,053 rules - the bulk of detection - silently removed by adding one rule.
+    // Today m_readOnly happens to prevent it on that store, but read-only is a
+    // caller-supplied parameter, not an invariant, so it is not a guard.
+    bool m_hasUntrackedRules{false};
     
     // Monotonically increasing counter for unique source IDs (avoids hash collisions)
     std::atomic<uint64_t> m_sourceIdCounter{0};

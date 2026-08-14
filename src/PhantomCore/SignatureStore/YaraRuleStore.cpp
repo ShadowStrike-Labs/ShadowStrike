@@ -1322,6 +1322,11 @@ StoreError YaraRuleStore::LoadCompiledRules(const std::wstring& compiledRulePath
     // arena memory. One implementation, one place to fix.
     const size_t ruleCount = RebuildRuleMetadataFromRules();
 
+    // Loaded from compiled bytecode, so no tracked source describes these rules.
+    // See m_hasUntrackedRules: while this holds, a source-driven rebuild is refused
+    // rather than allowed to discard them.
+    m_hasUntrackedRules = (ruleCount > 0u);
+
     SS_LOG_INFO(L"YaraRuleStore", L"LoadCompiledRules: Loaded %zu rules from %s", 
         ruleCount, compiledRulePath.c_str());
     return StoreError{SignatureStoreError::Success};
@@ -1363,6 +1368,10 @@ void YaraRuleStore::Close() noexcept {
         }
         m_rules = nullptr;
     }
+
+    // Reset with the rules it describes, so a reopened store does not inherit a
+    // claim about a rule set that no longer exists.
+    m_hasUntrackedRules = false;
 
     // ========================================================================
     // STEP 3: CLEAR METADATA (with logging)
@@ -1450,7 +1459,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanBuffer(
     {
         std::shared_lock<std::shared_mutex> scanLock(m_globalLock);
 
-        // Re-check initialization under the lock — Close() may have run between
+        // Re-check initialization under the lock â€” Close() may have run between
         // the unlocked fast-path check and lock acquisition.
         if (!m_initialized.load(std::memory_order_acquire)) {
             SS_LOG_DEBUG(L"YaraRuleStore", L"ScanBuffer: Store closed during entry");
@@ -1926,7 +1935,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanContext::FeedChunk(
     // the form `chunk.size() > MAX - m_buffer.size()` to avoid overflow.
     constexpr size_t MAX_CONTEXT_BUFFER = 100 * 1024 * 1024; // 100MB max
 
-    // If the chunk alone exceeds the cap, reject it outright — there is no
+    // If the chunk alone exceeds the cap, reject it outright â€” there is no
     // safe way to accumulate it.
     if (chunk.size() > MAX_CONTEXT_BUFFER) {
         SS_LOG_ERROR(L"YaraRuleStore",
@@ -2415,239 +2424,132 @@ StoreError YaraRuleStore::AddRulesFromSource(
                           "Maximum rule source count exceeded" };
     }
 
-    size_t rulesAdded = 0;
-    size_t rulesSkipped = 0;
-    
-    // Track added metadata keys for rollback on failure
-    std::vector<std::string> addedMetadataKeys;
-
-    YR_RULE* rule = nullptr;
-    yr_rules_foreach(compiledRules, rule) {
-        if (!rule || !rule->identifier) {
-            SS_LOG_WARN(L"YaraRuleStore",
-                L"AddRulesFromSource: Encountered rule with null identifier, skipping");
-            rulesSkipped++;
-            continue;
-        }
-
-        std::string ruleName = rule->identifier;
-        std::string ruleNamespace = rule->ns ? rule->ns->name : namespace_;
-        std::string fullName = ruleNamespace + "::" + ruleName;
-
-        // Check if rule already exists
-        if (m_ruleMetadata.find(fullName) != m_ruleMetadata.end()) {
-            SS_LOG_WARN(L"YaraRuleStore",
-                L"AddRulesFromSource: Rule already exists, skipping: %S",
-                fullName.c_str());
-            rulesSkipped++;
-            continue;
-        }
-
-        // ====================================================================
-        // CREATE METADATA ENTRY
-        // ====================================================================
-        YaraRuleMetadata metadata{};
-        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
-        metadata.ruleName = ruleName;
-        metadata.namespace_ = ruleNamespace;
-        metadata.threatLevel = ThreatLevel::Medium; // Default
-        metadata.isGlobal = (rule->flags & RULE_FLAGS_GLOBAL) != 0;
-        metadata.isPrivate = (rule->flags & RULE_FLAGS_PRIVATE) != 0;
-        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
-        metadata.hitCount = 0;
-        metadata.averageMatchTimeMicroseconds = 0;
-
-        // ====================================================================
-        // EXTRACT TAGS
-        // ====================================================================
-        const char* tag = nullptr;
-        yr_rule_tags_foreach(rule, tag) {
-            if (tag && std::strlen(tag) > 0 && std::strlen(tag) <= 64) {
-                metadata.tags.emplace_back(tag);
-            }
-        }
-
-        // ====================================================================
-        // EXTRACT METADATA (author, description, reference, severity)
-        // ====================================================================
-        YR_META* meta = nullptr;
-        yr_rule_metas_foreach(rule, meta) {
-            if (!meta || !meta->identifier) {
-                continue;
-            }
-
-            std::string metaKey = meta->identifier;
-
-            if (metaKey == "author" && meta->type == META_TYPE_STRING && meta->string) {
-                metadata.author = meta->string;
-            }
-            else if (metaKey == "description" && meta->type == META_TYPE_STRING && meta->string) {
-                metadata.description = meta->string;
-            }
-            else if (metaKey == "reference" && meta->type == META_TYPE_STRING && meta->string) {
-                metadata.reference = meta->string;
-            }
-            else if (metaKey == "severity" && meta->type == META_TYPE_STRING && meta->string) {
-                // Parse threat level from metadata
-                auto threatMap = std::map<std::string, std::string>{
-                    {"severity", meta->string}
-                };
-                metadata.threatLevel = YaraUtils::ParseThreatLevel(threatMap);
-            }
-        }
-
-        // ====================================================================
-        // EXTRACT STRING INFORMATION (for statistics)
-        // ====================================================================
-        uint32_t stringCount = 0;
-        YR_STRING* string = nullptr;
-        yr_rule_strings_foreach(rule, string) {
-            if (string) {
-                stringCount++;
-            }
-        }
-
-        SS_LOG_DEBUG(L"YaraRuleStore",
-            L"AddRulesFromSource: Added rule: %S (tags: %zu, strings: %u, global: %s, private: %s)",
-            fullName.c_str(), metadata.tags.size(), stringCount,
-            metadata.isGlobal ? "yes" : "no",
-            metadata.isPrivate ? "yes" : "no");
-
-        // ====================================================================
-        // STORE METADATA (track for potential rollback)
-        // ====================================================================
-        m_ruleMetadata[fullName] = std::move(metadata);
-        addedMetadataKeys.push_back(fullName);
-        rulesAdded++;
+    // ========================================================================
+    // STEP 4: SURVEY THE NEWLY COMPILED RULES
+    // ========================================================================
+    // The survey READS compiledRules and writes nothing to m_ruleMetadata. The
+    // authoritative metadata comes from RebuildRuleMetadataFromRules once the
+    // rebuild below succeeds, so there is ONE producer of that map rather than two
+    // that can disagree - two producers is exactly what left every YARA rule
+    // reporting ThreatLevel::Medium.
+    //
+    // It runs before the source is recorded because both of its answers - does
+    // this source add anything, and can it merge at all - must be known before
+    // m_ruleSources changes. A source that cannot compile alongside the others
+    // would otherwise sit there and fail every future rebuild.
+    size_t rulesNew = 0;
+    const StoreError surveyResult =
+        SurveyCompiledRules(compiledRules, namespace_, rulesNew);
+    if (!surveyResult.IsSuccess()) {
+        // Returning without touching compiledRules is deliberate: it is the local
+        // compiler's singleton and ~YaraCompiler releases it. Destroying it here
+        // freed the compiler's only rule set together with the arena that holds
+        // every rule identifier and namespace name.
+        return surveyResult;
     }
 
     // ========================================================================
-    // STEP 5: MERGE COMPILED RULES (Enterprise-Grade Implementation)
+    // STEP 5: RECORD THE SOURCE, THEN REBUILD FROM ALL SOURCES
     // ========================================================================
-    if (rulesAdded > 0) {
-        // Store the new rule source for future merging operations
-        // Use monotonically increasing counter to avoid hash collisions
-        uint64_t sourceId = m_sourceIdCounter.fetch_add(1, std::memory_order_relaxed);
-        std::string sourceKey = namespace_ + "::__source__" + std::to_string(sourceId);
-        m_ruleSources[sourceKey] = ruleSource;
-        
-        // If we have existing rules, perform proper merge by recompiling all sources
-        if (m_rules) {
-            SS_LOG_INFO(L"YaraRuleStore",
-                L"AddRulesFromSource: Merging with existing rules (recompilation)");
-            
-            // Create a new compiler and add ALL stored rule sources
-            YaraCompiler mergeCompiler;
-            bool mergeSuccess = true;
-            size_t sourcesCompiled = 0;
-            
-            for (const auto& [key, source] : m_ruleSources) {
-                // Extract namespace from key (format: "namespace::__source__hash")
-                std::string ns = "default";
-                size_t delimPos = key.find("::");
-                if (delimPos != std::string::npos) {
-                    ns = key.substr(0, delimPos);
-                }
-                
-                StoreError addResult = mergeCompiler.AddString(source, ns);
-                if (!addResult.IsSuccess()) {
-                    SS_LOG_WARN(L"YaraRuleStore",
-                        L"AddRulesFromSource: Failed to add stored source during merge: %S",
-                        addResult.message.c_str());
-                    // Continue with other sources - partial merge is better than nothing
-                } else {
-                    sourcesCompiled++;
-                }
-            }
-            
-            if (sourcesCompiled == 0) {
-                SS_LOG_ERROR(L"YaraRuleStore",
-                    L"AddRulesFromSource: Merge failed - no sources compiled successfully");
-                
-                // Rollback: remove the new source from cache
-                m_ruleSources.erase(sourceKey);
-                
-                // Rollback: remove all metadata entries that were added
-                for (const auto& key : addedMetadataKeys) {
-                    m_ruleMetadata.erase(key);
-                }
-                
-                // Cleanup the originally compiled rules
-                yr_rules_destroy(compiledRules);
-                
-                return StoreError{SignatureStoreError::CompilationFailed, 0,
-                    "Rule merge failed - compilation error"};
-            }
-            
-            // Get merged compiled rules
-            YR_RULES* mergedRules = mergeCompiler.GetRules();
-            if (!mergedRules) {
-                SS_LOG_ERROR(L"YaraRuleStore",
-                    L"AddRulesFromSource: Failed to get merged compiled rules");
-                
-                // Rollback: remove the new source from cache
-                m_ruleSources.erase(sourceKey);
-                
-                // Rollback: remove all metadata entries that were added
-                for (const auto& key : addedMetadataKeys) {
-                    m_ruleMetadata.erase(key);
-                }
-                
-                // Cleanup the originally compiled rules
-                yr_rules_destroy(compiledRules);
-                
-                return StoreError{SignatureStoreError::CompilationFailed, 0,
-                    "Rule merge failed - could not get compiled rules"};
-            }
-            
-            // Success: destroy old rules and replace with merged rules
-            int destroyResult = yr_rules_destroy(m_rules);
-            if (destroyResult != ERROR_SUCCESS) {
-                SS_LOG_WARN(L"YaraRuleStore",
-                    L"AddRulesFromSource: Failed to destroy old rules during merge (error: %d)",
-                    destroyResult);
-            }
-            
-            // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
-            // the store owns what it keeps and releases the previous set only after the
-            // replacement has loaded. Direct assignment stored the LOCAL compiler's
-            // singleton, which yr_compiler_destroy frees on return - leaving m_rules
-            // dangling for every subsequent scan, and double freeing at teardown.
-            if (!AdoptRulesFromCompiler(mergeCompiler)) {
-                return StoreError{ SignatureStoreError::Unknown, 0,
-                                   "Could not adopt merged YARA rules" };
-            }
-            
-            SS_LOG_INFO(L"YaraRuleStore",
-                L"AddRulesFromSource: Successfully merged %zu rule sources, added %zu new rules",
-                sourcesCompiled, rulesAdded);
-        } else {
-            // No existing rules - just use the newly compiled rules
-            m_rules = compiledRules;
-            
-            SS_LOG_INFO(L"YaraRuleStore",
-                L"AddRulesFromSource: Successfully added %zu rules (%zu skipped)",
-                rulesAdded, rulesSkipped);
-        }
+    // m_ruleSources is what the store holds; RebuildRulesFromSources makes m_rules
+    // agree with it. This function deliberately never assigns m_rules, never calls
+    // yr_rules_destroy, and never stores compiledRules.
+    //
+    // What it used to do instead, and why the tests fault: on a first add it did
+    // `m_rules = compiledRules`, storing the LOCAL compiler's singleton, so m_rules
+    // dangled the moment this function returned. Every later scan walked released
+    // memory, and the next add or removal called yr_rules_destroy on it. On the
+    // merge path it then destroyed m_rules a second time, because
+    // AdoptRulesFromCompiler destroys the old set itself.
+    const uint64_t sourceId = m_sourceIdCounter.fetch_add(1, std::memory_order_relaxed);
+    const std::string sourceKey = namespace_ + "::__source__" + std::to_string(sourceId);
+    m_ruleSources[sourceKey] = ruleSource;
 
-        return StoreError{ SignatureStoreError::Success };
+    const StoreError rebuildResult = RebuildRulesFromSources();
+    if (!rebuildResult.IsSuccess()) {
+        // A failed add must leave the store exactly as it was. The rebuild
+        // guarantees m_rules and m_ruleMetadata are untouched on failure, so
+        // dropping the source key restores full consistency.
+        m_ruleSources.erase(sourceKey);
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: rebuild failed, so the source was discarded and "
+            L"the rule set is unchanged: %S", rebuildResult.message.c_str());
+        return rebuildResult;
     }
-    else {
-        // No rules were added
-        SS_LOG_WARN(L"YaraRuleStore",
-            L"AddRulesFromSource: No rules were added (%zu skipped)",
-            rulesSkipped);
 
-        int destroyResult = yr_rules_destroy(compiledRules);
-        if (destroyResult != ERROR_SUCCESS) {
-            SS_LOG_WARN(L"YaraRuleStore",
-                L"AddRulesFromSource: Failed to destroy compiled rules (error: %d)",
-                destroyResult);
-        }
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"AddRulesFromSource: added %zu rule(s); the store now holds %zu rule(s) "
+        L"from %zu source(s)",
+        rulesNew, m_ruleMetadata.size(), m_ruleSources.size());
 
-        return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                          "No valid rules found in source" };
+    return StoreError{ SignatureStoreError::Success };
+}
+
+// Read a YARA rule file into text, bounded before allocating.
+//
+// Shared by AddRulesFromFile and AddRulesFromDirectory so the two cannot diverge
+// on size limits or on what a short read means. The bound is the same constant
+// AddRulesFromSource enforces, so an oversized file is refused here rather than
+// read into memory and rejected one call later.
+static StoreError ReadRuleFileText(
+    const std::wstring& filePath,
+    std::string& out
+) noexcept {
+    out.clear();
+
+    std::ifstream input(filePath, std::ios::binary | std::ios::ate);
+    if (!input.is_open()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ReadRuleFileText: cannot open %s",
+            filePath.c_str());
+        return StoreError{ SignatureStoreError::AccessDenied, 0,
+                           "Cannot open rule file" };
     }
+
+    const std::streamoff sizeOnDisk = input.tellg();
+    if (sizeOnDisk < 0) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ReadRuleFileText: cannot size %s",
+            filePath.c_str());
+        return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                           "Cannot determine rule file size" };
+    }
+
+    if (static_cast<uint64_t>(sizeOnDisk) > YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"ReadRuleFileText: rule file too large (%llu > %zu bytes): %s",
+            static_cast<uint64_t>(sizeOnDisk),
+            YaraTitaniumLimits::MAX_RULE_SOURCE_SIZE, filePath.c_str());
+        return StoreError{ SignatureStoreError::TooLarge, 0,
+                           "Rule file exceeds the maximum rule source size" };
+    }
+
+    input.seekg(0, std::ios::beg);
+
+    try {
+        out.resize(static_cast<size_t>(sizeOnDisk));
+    } catch (const std::bad_alloc&) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ReadRuleFileText: out of memory reading %s",
+            filePath.c_str());
+        return StoreError{ SignatureStoreError::OutOfMemory, 0,
+                           "Out of memory reading rule file" };
+    }
+
+    if (sizeOnDisk > 0) {
+        input.read(out.data(), sizeOnDisk);
+        if (input.gcount() != sizeOnDisk) {
+            // A partially read rule file is refused, never compiled. Truncated
+            // rule text can still parse into FEWER rules than the file declares,
+            // which would silently reduce detection.
+            SS_LOG_ERROR(L"YaraRuleStore",
+                L"ReadRuleFileText: short read on %s (%lld of %lld bytes)",
+                filePath.c_str(), static_cast<long long>(input.gcount()),
+                static_cast<long long>(sizeOnDisk));
+            out.clear();
+            return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                               "Short read on rule file" };
+        }
+    }
+
+    return StoreError{ SignatureStoreError::Success };
 }
 
 StoreError YaraRuleStore::AddRulesFromFile(
@@ -2715,70 +2617,44 @@ StoreError YaraRuleStore::AddRulesFromFile(
     }
 
     // ========================================================================
-    // READ FILE AND COMPILE
+    // READ THE FILE, THEN GO THROUGH THE SINGLE ADD PATH
     // ========================================================================
-    YaraCompiler compiler;
-    StoreError err = compiler.AddFile(filePath, namespace_);
-    
-    if (!err.IsSuccess()) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: Compilation failed: %S", 
-            err.message.c_str());
-        
-        // Log compiler errors
-        auto errors = compiler.GetErrors();
-        for (size_t i = 0; i < std::min(errors.size(), size_t(3)); ++i) {
-            SS_LOG_ERROR(L"YaraRuleStore", L"  Error: %S", errors[i].c_str());
-        }
-        
-        return err;
+    // This used to compile the file with its own local YaraCompiler, adopt the
+    // result, and then run a FOURTH copy of the metadata loop - which overwrote
+    // everything RebuildRuleMetadataFromRules had just derived, flattening every
+    // rule to ThreatLevel::Medium and erasing author, description and tags. Since
+    // threat level decides the verdict, a Critical rule added this way convicted
+    // as Medium.
+    //
+    // It was also not an add. Adopting a compiler that held only this file
+    // REPLACED the store's entire rule set, and the file was never recorded in
+    // m_ruleSources - so it discarded every previously added rule, and its own
+    // rules disappeared at the next rebuild because no source described them.
+    //
+    // Reading the text and going through AddRulesFromSource makes it a real add:
+    // one merge model, one metadata producer, one function that mutates the rules.
+    //
+    // LIMITATION, stated because it is a real behaviour change: the file is stored
+    // as text, so a YARA `include` directive is no longer resolved relative to the
+    // file. Pass pre-resolved rule text, or use ImportFromYaraRulesRepo, which
+    // compiles files in place. Nothing in the product calls this entry point.
+    std::string ruleText;
+    const StoreError readResult = ReadRuleFileText(filePath, ruleText);
+    if (!readResult.IsSuccess()) {
+        return readResult;
     }
-    
-    // ========================================================================
-    // GET COMPILED RULES AND UPDATE STORE
-    // ========================================================================
-    YR_RULES* compiledRules = compiler.GetRules();
-    if (!compiledRules) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: No compiled rules returned");
-        return StoreError{SignatureStoreError::InvalidSignature, 0, "No rules compiled"};
+
+    // No lock is held here on purpose: AddRulesFromSource takes m_globalLock
+    // itself and std::shared_mutex is not recursive.
+    const StoreError addResult = AddRulesFromSource(ruleText, namespace_);
+    if (!addResult.IsSuccess()) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"AddRulesFromFile: %s rejected: %S",
+            filePath.c_str(), addResult.message.c_str());
+        return addResult;
     }
-    
-    // Acquire lock and update rules
-    std::unique_lock<std::shared_mutex> lock(m_globalLock);
-    
-    // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
-    // the store owns what it keeps and releases the previous set only after the
-    // replacement has loaded. Direct assignment stored the LOCAL compiler's
-    // singleton, which yr_compiler_destroy frees on return - leaving m_rules
-    // dangling for every subsequent scan, and double freeing at teardown.
-    if (!AdoptRulesFromCompiler(compiler)) {
-        return StoreError{ SignatureStoreError::Unknown, 0,
-                           "Could not adopt rules from file" };
-    }
-    
-    // Extract metadata from loaded rules
-    size_t ruleCount = 0;
-    YR_RULE* rule = nullptr;
-    yr_rules_foreach(m_rules, rule) {
-        if (!rule || !rule->identifier) continue;
-        
-        std::string ruleName = rule->identifier;
-        std::string ruleNamespace = rule->ns && rule->ns->name ? rule->ns->name : 
-            (namespace_.empty() ? "default" : namespace_);
-        std::string fullName = ruleNamespace + "::" + ruleName;
-        
-        YaraRuleMetadata metadata{};
-        metadata.ruleId = static_cast<uint64_t>(std::hash<std::string>{}(fullName));
-        metadata.ruleName = ruleName;
-        metadata.namespace_ = ruleNamespace;
-        metadata.threatLevel = ThreatLevel::Medium;
-        metadata.lastModified = static_cast<uint64_t>(std::time(nullptr));
-        
-        m_ruleMetadata[fullName] = std::move(metadata);
-        ruleCount++;
-    }
-    
-    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromFile: Loaded %zu rules from %s", 
-        ruleCount, filePath.c_str());
+
+    SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromFile: added rules from %s",
+        filePath.c_str());
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -2861,10 +2737,153 @@ StoreError YaraRuleStore::AddRulesFromDirectory(
     SS_LOG_INFO(L"YaraRuleStore", L"AddRulesFromDirectory: Found %zu YARA files", yaraFiles.size());
 
     // ========================================================================
-    // COMPILE ALL FILES
+    // READ AND STAGE EVERY FILE, THEN REBUILD ONCE
     // ========================================================================
-    YaraCompiler compiler;
-    return compiler.AddFiles(yaraFiles, namespace_, progressCallback);
+    // What this did before: compiled every file into a LOCAL YaraCompiler and
+    // returned that compiler's result, without ever touching m_rules,
+    // m_ruleSources or m_ruleMetadata. The compiler was then destroyed along with
+    // its rules. So it compiled the whole directory, reported success, and added
+    // nothing - indistinguishable from a working import from the outside, which is
+    // this codebase's characteristic failure mode.
+    //
+    // Staging every file and rebuilding ONCE, rather than calling
+    // AddRulesFromSource per file, keeps the cost at one compile per file plus one
+    // combined compile. A per-file add would recompile every already-added source
+    // each time, which is quadratic in the file count, and the cap checked above
+    // admits MAX_YARA_FILES_IN_REPO files.
+    //
+    // The lock spans the file reads deliberately: replacing a rule set has to be
+    // atomic, and a half-imported directory visible to scans is worse than a
+    // longer exclusive section on a bulk administrative operation.
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
+
+    if (m_ruleSources.size() + yaraFiles.size() > YaraTitaniumLimits::MAX_RULE_SOURCES) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromDirectory: %zu existing source(s) plus %zu file(s) would "
+            L"exceed the %zu source limit",
+            m_ruleSources.size(), yaraFiles.size(), YaraTitaniumLimits::MAX_RULE_SOURCES);
+        return StoreError{SignatureStoreError::TooLarge, 0,
+                          "Directory would exceed the maximum rule source count"};
+    }
+
+    std::vector<std::string> stagedKeys;
+    std::set<std::string> stagedRuleNames;
+    size_t filesRejected = 0;
+    size_t rulesStaged = 0;
+
+    for (size_t i = 0; i < yaraFiles.size(); ++i) {
+        const std::wstring& yaraFile = yaraFiles[i];
+
+        if (progressCallback) {
+            try {
+                progressCallback(i + 1, yaraFiles.size());
+            } catch (...) {
+                SS_LOG_WARN(L"YaraRuleStore",
+                    L"AddRulesFromDirectory: progress callback threw");
+            }
+        }
+
+        std::string ruleText;
+        if (!ReadRuleFileText(yaraFile, ruleText).IsSuccess()) {
+            ++filesRejected;
+            continue;
+        }
+
+        // Compiled on its own so a bad file is rejected by itself rather than
+        // failing the combined build and taking every good file down with it.
+        YaraCompiler fileCompiler;
+        const StoreError compileResult = fileCompiler.AddString(ruleText, namespace_);
+        if (!compileResult.IsSuccess()) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"AddRulesFromDirectory: %s does not compile, skipping: %S",
+                yaraFile.c_str(), compileResult.message.c_str());
+            ++filesRejected;
+            continue;
+        }
+
+        YR_RULES* fileRules = fileCompiler.GetRules();
+        size_t newRules = 0;
+        const StoreError surveyResult =
+            SurveyCompiledRules(fileRules, namespace_, newRules);
+        if (!surveyResult.IsSuccess()) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"AddRulesFromDirectory: %s skipped: %S",
+                yaraFile.c_str(), surveyResult.message.c_str());
+            ++filesRejected;
+            continue;
+        }
+
+        // The survey compares against rules the STORE holds. Files staged earlier
+        // in this same import are not in the store yet, so their rule names are
+        // tracked here as well - otherwise two files declaring the same rule would
+        // both pass, and the combined rebuild would fail with a duplicated
+        // identifier that named a source key rather than a file.
+        std::vector<std::string> thisFileRules;
+        bool collides = false;
+        YR_RULE* rule = nullptr;
+        yr_rules_foreach(fileRules, rule) {
+            if (rule == nullptr || rule->identifier == nullptr) {
+                continue;
+            }
+            const std::string ruleNamespace =
+                (rule->ns != nullptr && rule->ns->name != nullptr)
+                    ? rule->ns->name : namespace_;
+            std::string fullName = ruleNamespace + "::" + rule->identifier;
+            if (stagedRuleNames.count(fullName) != 0) {
+                SS_LOG_WARN(L"YaraRuleStore",
+                    L"AddRulesFromDirectory: %s redeclares %S, already staged by an "
+                    L"earlier file in this import; skipping the file",
+                    yaraFile.c_str(), fullName.c_str());
+                collides = true;
+                break;
+            }
+            thisFileRules.push_back(std::move(fullName));
+        }
+
+        if (collides) {
+            ++filesRejected;
+            continue;
+        }
+
+        const uint64_t sourceId =
+            m_sourceIdCounter.fetch_add(1, std::memory_order_relaxed);
+        const std::string sourceKey =
+            namespace_ + "::__source__" + std::to_string(sourceId);
+
+        m_ruleSources[sourceKey] = std::move(ruleText);
+        stagedKeys.push_back(sourceKey);
+        for (auto& name : thisFileRules) {
+            stagedRuleNames.insert(std::move(name));
+        }
+        rulesStaged += newRules;
+    }
+
+    if (stagedKeys.empty()) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromDirectory: none of the %zu file(s) in %s produced rules "
+            L"that could be added; the rule set is unchanged",
+            yaraFiles.size(), directoryPath.c_str());
+        return StoreError{SignatureStoreError::InvalidSignature, 0,
+                          "No rules from the directory could be added"};
+    }
+
+    const StoreError rebuildResult = RebuildRulesFromSources();
+    if (!rebuildResult.IsSuccess()) {
+        for (const std::string& key : stagedKeys) {
+            m_ruleSources.erase(key);
+        }
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromDirectory: rebuild failed, so all %zu staged file(s) were "
+            L"discarded and the rule set is unchanged: %S",
+            stagedKeys.size(), rebuildResult.message.c_str());
+        return rebuildResult;
+    }
+
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"AddRulesFromDirectory: added %zu file(s) contributing %zu rule(s), "
+        L"%zu file(s) rejected; the store now holds %zu rule(s)",
+        stagedKeys.size(), rulesStaged, filesRejected, m_ruleMetadata.size());
+    return StoreError{SignatureStoreError::Success};
 }
 
 StoreError YaraRuleStore::RemoveRule(
@@ -2951,68 +2970,38 @@ StoreError YaraRuleStore::RemoveRule(
         }
     }
     
+    // Snapshot before mutating, so a failed rebuild can restore the store exactly.
+    const std::map<std::string, std::string> previousSources = m_ruleSources;
+
     // Rebuild m_ruleSources with only kept sources
     m_ruleSources.clear();
     for (size_t i = 0; i < keysToKeep.size(); ++i) {
         m_ruleSources[keysToKeep[i]] = sourcesToKeep[i];
     }
-    
-    // Recompile remaining rules
-    if (!m_ruleSources.empty()) {
-        YaraCompiler recompiler;
-        size_t compiledCount = 0;
-        
-        for (const auto& [key, source] : m_ruleSources) {
-            std::string ns = "default";
-            size_t delimPos = key.find("::");
-            if (delimPos != std::string::npos) {
-                ns = key.substr(0, delimPos);
-            }
-            
-            StoreError addResult = recompiler.AddString(source, ns);
-            if (addResult.IsSuccess()) {
-                compiledCount++;
-            } else {
-                SS_LOG_WARN(L"YaraRuleStore",
-                    L"RemoveRule: Failed to recompile source: %S", addResult.message.c_str());
-            }
-        }
-        
-        YR_RULES* newRules = recompiler.GetRules();
-        if (newRules) {
-            // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
-            // the store owns what it keeps and releases the previous set only after the
-            // replacement has loaded. Direct assignment stored the LOCAL compiler's
-            // singleton, which yr_compiler_destroy frees on return - leaving m_rules
-            // dangling for every subsequent scan, and double freeing at teardown.
-            if (!AdoptRulesFromCompiler(recompiler)) {
-                return StoreError{ SignatureStoreError::Unknown, 0,
-                                   "Could not adopt rules after rule removal" };
-            }
-            
-            SS_LOG_INFO(L"YaraRuleStore", 
-                L"RemoveRule: Successfully removed rule %S and recompiled %zu sources", 
-                fullName.c_str(), compiledCount);
-        } else if (compiledCount == 0) {
-            // All sources failed, destroy current rules
-            if (m_rules) {
-                yr_rules_destroy(m_rules);
-                m_rules = nullptr;
-            }
-            SS_LOG_WARN(L"YaraRuleStore", 
-                L"RemoveRule: All sources failed to recompile, rules cleared");
-        } else {
-            SS_LOG_ERROR(L"YaraRuleStore", 
-                L"RemoveRule: Recompilation failed despite %zu successful AddString calls", 
-                compiledCount);
-            return StoreError{SignatureStoreError::CompilationFailed, 0, 
-                "Recompilation failed after rule removal"};
-        }
-    } else if (m_rules) {
-        // No more sources, destroy all rules
-        yr_rules_destroy(m_rules);
-        m_rules = nullptr;
-        SS_LOG_INFO(L"YaraRuleStore", L"RemoveRule: Last rule removed, rules cleared");
+
+    // One function changes the rule set: it recompiles what remains, adopts a copy
+    // this store owns, and re-derives the metadata. On failure it leaves m_rules
+    // untouched, so restoring the source map restores the whole store.
+    //
+    // What this replaced was another copy of the compile-all-sources loop whose
+    // branches called yr_rules_destroy(m_rules) directly - and on any store built
+    // by AddRulesFromSource that pointer was already dangling, which is what made
+    // rule removal fault.
+    const StoreError rebuildResult = RebuildRulesFromSources();
+    if (!rebuildResult.IsSuccess()) {
+        m_ruleSources = previousSources;
+
+        // The metadata entry was erased above on the assumption the removal would
+        // succeed. Re-derive it from the compiled image - which the failed rebuild
+        // guarantees is unchanged - so the store cannot report a rule as gone while
+        // that rule still matches.
+        (void)RebuildRuleMetadataFromRules();
+
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"RemoveRule: %S was not removed because the remaining sources would "
+            L"not rebuild; the rule set is unchanged: %S",
+            fullName.c_str(), rebuildResult.message.c_str());
+        return rebuildResult;
     }
 
     SS_LOG_DEBUG(L"YaraRuleStore", L"Removed rule: %S", fullName.c_str());
@@ -3026,93 +3015,72 @@ StoreError YaraRuleStore::RemoveNamespace(const std::string& namespace_) noexcep
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    // Remove all rules in namespace from metadata
-    size_t rulesRemoved = 0;
-    for (auto it = m_ruleMetadata.begin(); it != m_ruleMetadata.end(); ) {
-        if (it->second.namespace_ == namespace_) {
-            it = m_ruleMetadata.erase(it);
-            rulesRemoved++;
-        } else {
-            ++it;
+    // Snapshot before mutating, so a failed rebuild can restore the store exactly.
+    const std::map<std::string, std::string> previousSources = m_ruleSources;
+
+    // Count what the caller is asking to remove, before anything changes.
+    size_t rulesInNamespace = 0;
+    for (const auto& [metaKey, metadata] : m_ruleMetadata) {
+        if (metadata.namespace_ == namespace_) {
+            ++rulesInNamespace;
         }
-    }
-    
-    // Remove all source entries for this namespace
-    size_t sourcesRemoved = 0;
-    std::string nsPrefix = namespace_ + "::";
-    for (auto it = m_ruleSources.begin(); it != m_ruleSources.end(); ) {
-        if (it->first.substr(0, nsPrefix.length()) == nsPrefix) {
-            it = m_ruleSources.erase(it);
-            sourcesRemoved++;
-        } else {
-            ++it;
-        }
-    }
-    
-    // If sources were removed, recompile remaining rules
-    if (sourcesRemoved > 0 && !m_ruleSources.empty()) {
-        // Recompile all remaining sources with proper error handling
-        YaraCompiler recompiler;
-        size_t compiledCount = 0;
-        
-        for (const auto& [key, source] : m_ruleSources) {
-            std::string ns = "default";
-            size_t delimPos = key.find("::");
-            if (delimPos != std::string::npos) {
-                ns = key.substr(0, delimPos);
-            }
-            
-            StoreError addResult = recompiler.AddString(source, ns);
-            if (addResult.IsSuccess()) {
-                compiledCount++;
-            } else {
-                SS_LOG_WARN(L"YaraRuleStore",
-                    L"RemoveNamespace: Failed to add source during recompile: %S",
-                    addResult.message.c_str());
-            }
-        }
-        
-        YR_RULES* newRules = recompiler.GetRules();
-        if (newRules) {
-            // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
-            // the store owns what it keeps and releases the previous set only after the
-            // replacement has loaded. Direct assignment stored the LOCAL compiler's
-            // singleton, which yr_compiler_destroy frees on return - leaving m_rules
-            // dangling for every subsequent scan, and double freeing at teardown.
-            if (!AdoptRulesFromCompiler(recompiler)) {
-                return StoreError{ SignatureStoreError::Unknown, 0,
-                                   "Could not adopt rules after namespace removal" };
-            }
-            
-            SS_LOG_INFO(L"YaraRuleStore", 
-                L"RemoveNamespace: Successfully recompiled %zu sources after removal", 
-                compiledCount);
-        } else if (compiledCount == 0) {
-            // All sources failed to compile, clear rules
-            if (m_rules) {
-                yr_rules_destroy(m_rules);
-                m_rules = nullptr;
-            }
-            SS_LOG_WARN(L"YaraRuleStore", 
-                L"RemoveNamespace: All sources failed to recompile, rules cleared");
-        } else {
-            // Some sources compiled but GetRules failed - critical error
-            // Keep old rules to maintain consistency
-            SS_LOG_ERROR(L"YaraRuleStore", 
-                L"RemoveNamespace: Recompilation failed despite %zu successful AddString calls. "
-                L"Keeping old rules for consistency - state may be inconsistent.", 
-                compiledCount);
-            return StoreError{SignatureStoreError::CompilationFailed, 0, 
-                "Recompilation failed after namespace removal - state may be inconsistent"};
-        }
-    } else if (m_ruleSources.empty() && m_rules) {
-        // No more rules, destroy all
-        yr_rules_destroy(m_rules);
-        m_rules = nullptr;
     }
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Removed namespace: %S (%zu rules, %zu sources)", 
-        namespace_.c_str(), rulesRemoved, sourcesRemoved);
+    // Removal is expressed against the SOURCES, because those are what the store
+    // holds. The metadata is derived and gets re-produced from the rebuilt rules,
+    // so it is deliberately not edited here: editing it separately is precisely how
+    // this function came to report a namespace as removed while every rule in it
+    // stayed compiled and went on matching.
+    size_t sourcesRemoved = 0;
+    const std::string nsPrefix = namespace_ + "::";
+    for (auto it = m_ruleSources.begin(); it != m_ruleSources.end(); ) {
+        if (it->first.compare(0, nsPrefix.length(), nsPrefix) == 0) {
+            it = m_ruleSources.erase(it);
+            ++sourcesRemoved;
+        } else {
+            ++it;
+        }
+    }
+
+    if (sourcesRemoved == 0) {
+        if (rulesInNamespace == 0) {
+            // Idempotent: the store holds nothing under that name, so there is
+            // nothing to remove and that is not an error.
+            SS_LOG_DEBUG(L"YaraRuleStore",
+                L"RemoveNamespace: %S holds nothing; nothing to remove",
+                namespace_.c_str());
+            return StoreError{SignatureStoreError::Success};
+        }
+
+        // The namespace has rules, but no tracked source produced them, so
+        // recompiling cannot remove them. Refusing is the only honest answer: the
+        // previous code erased the metadata and returned success, leaving the rules
+        // compiled and live, so the store claimed the namespace was gone while
+        // every rule in it kept matching.
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"RemoveNamespace: %S holds %zu rule(s) that came from compiled bytecode "
+            L"rather than a tracked source, so recompiling cannot remove them. "
+            L"Nothing was changed.",
+            namespace_.c_str(), rulesInNamespace);
+        return StoreError{SignatureStoreError::AccessDenied, 0,
+                          "Namespace holds compiled rules that no tracked source can "
+                          "reproduce; nothing was removed"};
+    }
+
+    const StoreError rebuildResult = RebuildRulesFromSources();
+    if (!rebuildResult.IsSuccess()) {
+        m_ruleSources = previousSources;
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"RemoveNamespace: %S was not removed because the remaining sources "
+            L"would not rebuild; the rule set is unchanged: %S",
+            namespace_.c_str(), rebuildResult.message.c_str());
+        return rebuildResult;
+    }
+
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"RemoveNamespace: removed %S (%zu rule(s) from %zu source(s)); the store "
+        L"now holds %zu rule(s)",
+        namespace_.c_str(), rulesInNamespace, sourcesRemoved, m_ruleMetadata.size());
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -3181,6 +3149,14 @@ StoreError YaraRuleStore::UpdateRuleMetadata(
     // Update the metadata
     it->second = updatedMetadata;
 
+    // HONEST LIMITATION, stated where a caller will read it: this override lives
+    // only in m_ruleMetadata, and that map is re-derived from the compiled rules
+    // whenever the rule set changes - any add, removal or recompile. Accumulated
+    // statistics are carried across a rebuild; an author, description or threat
+    // level set here is not, because the rule's own metadata is what the store
+    // treats as authoritative. Nothing in the product calls this today; a caller
+    // that needs a durable override needs a field the rebuild consults, which does
+    // not exist yet.
     SS_LOG_DEBUG(L"YaraRuleStore", L"Updated metadata for rule: %S", ruleName.c_str());
     return StoreError{ SignatureStoreError::Success };
 }
@@ -3398,7 +3374,196 @@ bool YaraRuleStore::AdoptRulesFromCompiler(YaraCompiler& compiler) noexcept {
     return true;
 }
 
+// The one place the store's compiled rule set changes. See the header for the
+// invariant; the short version is that m_ruleSources decides what the store
+// holds, this function makes m_rules agree with it, and nothing else may touch
+// either pointer.
+StoreError YaraRuleStore::RebuildRulesFromSources() noexcept {
+    // REFUSE rather than narrow detection. If the compiled image contains rules
+    // that arrived as bytecode, no set of sources can reproduce them, so
+    // recompiling from sources would delete them - and a rule set that silently
+    // loses most of its rules while reporting success is the worst outcome this
+    // store can produce.
+    if (m_hasUntrackedRules && m_rules != nullptr) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"RebuildRulesFromSources: refusing to rebuild. This store holds %zu "
+            L"rule(s) that came from compiled bytecode rather than from tracked "
+            L"sources, and rebuilding from %zu source(s) would DELETE them. Load "
+            L"rules from sources, or use Recompile on a source-backed store.",
+            m_ruleMetadata.size(), m_ruleSources.size());
+        return StoreError{ SignatureStoreError::AccessDenied, 0,
+                           "Store holds compiled rules that no tracked source can "
+                           "reproduce; rebuilding would discard them" };
+    }
+
+    // An empty source set is a legitimate state, not a failure. Releasing the
+    // rules here is what makes removal actually remove: keeping the previous
+    // compiled image would go on matching rules the store no longer holds.
+    if (m_ruleSources.empty()) {
+        if (m_rules != nullptr) {
+            yr_rules_destroy(m_rules);
+            m_rules = nullptr;
+        }
+        m_ruleMetadata.clear();
+        m_hasUntrackedRules = false;
+        SS_LOG_INFO(L"YaraRuleStore",
+            L"RebuildRulesFromSources: no sources remain; rule set is now empty");
+        return StoreError{ SignatureStoreError::Success };
+    }
+
+    YaraCompiler compiler;
+    size_t compiled = 0;
+
+    for (const auto& [key, source] : m_ruleSources) {
+        // Key format is "<namespace>::__source__<id>", written by
+        // AddRulesFromSource. Namespaces are validated alphanumeric-plus-
+        // underscore at entry, so the first "::" is unambiguous.
+        std::string ns = "default";
+        const size_t delimPos = key.find("::");
+        if (delimPos != std::string::npos && delimPos > 0) {
+            ns = key.substr(0, delimPos);
+        }
+
+        const StoreError addResult = compiler.AddString(source, ns);
+        if (!addResult.IsSuccess()) {
+            // Named, at ERROR, with the consequence stated: this source compiled
+            // on its own when it was accepted, so reaching here means it
+            // conflicts with another stored source - most often a duplicated rule
+            // identifier in the same namespace.
+            SS_LOG_ERROR(L"YaraRuleStore",
+                L"RebuildRulesFromSources: stored source '%S' no longer compiles (%S). "
+                L"The rule set is UNCHANGED - no rule was added or removed.",
+                key.c_str(), addResult.message.c_str());
+
+            const auto errors = compiler.GetErrors();
+            for (size_t i = 0; i < (std::min)(errors.size(), size_t(3)); ++i) {
+                SS_LOG_ERROR(L"YaraRuleStore", L"  compiler: %S", errors[i].c_str());
+            }
+
+            return StoreError{ SignatureStoreError::CompilationFailed, 0,
+                               "A stored rule source conflicts with another; "
+                               "rule set left unchanged" };
+        }
+        ++compiled;
+    }
+
+    // AdoptRulesFromCompiler serialises and reloads, so what lands in m_rules is
+    // independent of this local compiler's lifetime, and it releases the previous
+    // set only after the replacement has loaded. On failure m_rules is untouched.
+    if (!AdoptRulesFromCompiler(compiler)) {
+        return StoreError{ SignatureStoreError::Unknown, 0,
+                           "Could not adopt the recompiled rule set; "
+                           "rule set left unchanged" };
+    }
+
+    // Every rule now present came from a tracked source, by construction.
+    m_hasUntrackedRules = false;
+
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"RebuildRulesFromSources: recompiled %zu source(s) into %zu rule(s)",
+        compiled, m_ruleMetadata.size());
+    return StoreError{ SignatureStoreError::Success };
+}
+
+// Reads the caller's compiled rules and answers one question: can this source be
+// merged into the store, and what would it add? Never stores or destroys the
+// pointer - it belongs to the caller's compiler.
+StoreError YaraRuleStore::SurveyCompiledRules(
+    YR_RULES* compiled,
+    const std::string& fallbackNamespace,
+    size_t& newRules
+) noexcept {
+    newRules = 0;
+
+    if (compiled == nullptr) {
+        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                           "No compiled rules to survey" };
+    }
+
+    size_t duplicates = 0;
+    size_t unnamed = 0;
+
+    YR_RULE* rule = nullptr;
+    yr_rules_foreach(compiled, rule) {
+        if (rule == nullptr || rule->identifier == nullptr) {
+            ++unnamed;
+            continue;
+        }
+
+        const std::string ruleNamespace =
+            (rule->ns != nullptr && rule->ns->name != nullptr)
+                ? rule->ns->name
+                : fallbackNamespace;
+        const std::string fullName = ruleNamespace + "::" + rule->identifier;
+
+        if (m_ruleMetadata.find(fullName) != m_ruleMetadata.end()) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"SurveyCompiledRules: rule already present in this store: %S",
+                fullName.c_str());
+            ++duplicates;
+            continue;
+        }
+
+        ++newRules;
+    }
+
+    if (unnamed > 0) {
+        SS_LOG_WARN(L"YaraRuleStore",
+            L"SurveyCompiledRules: %zu compiled rule(s) carried no identifier and "
+            L"were not surveyed", unnamed);
+    }
+
+    if (newRules == 0) {
+        SS_LOG_WARN(L"YaraRuleStore",
+            L"SurveyCompiledRules: source contributes no new rules (%zu already "
+            L"present)", duplicates);
+        return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                           "No valid rules found in source" };
+    }
+
+    if (duplicates > 0) {
+        // REFUSED rather than partially accepted. YARA rejects a duplicated
+        // identifier for the WHOLE source, so this source could never compile
+        // alongside the one already defining those rules. Accepting it would store
+        // a source that contributes nothing and breaks every later rebuild, while
+        // this call reported success and the new rules never appeared.
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"SurveyCompiledRules: source mixes %zu new rule(s) with %zu this store "
+            L"already defines. YARA rejects a duplicated identifier for the entire "
+            L"source, so nothing was added. Remove the duplicates, or use a "
+            L"different namespace, and retry.",
+            newRules, duplicates);
+        return StoreError{ SignatureStoreError::DuplicateEntry, 0,
+                           "Source redefines rules this store already holds" };
+    }
+
+    return StoreError{ SignatureStoreError::Success };
+}
+
 size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
+    // Accumulated statistics are NOT derivable from the compiled rules, so they are
+    // carried across the rebuild by rule name. Everything else in the map is
+    // re-derived from the bytecode, which is the whole point of this function.
+    //
+    // This matters more than it used to: the rule set is now rebuilt on every add
+    // and every removal, so without this a single added rule would reset the hit
+    // count of every rule already in the store, and an edited store would report
+    // that nothing had ever matched.
+    //
+    // Carried by NAME, which is the only identity that survives recompilation - the
+    // numeric ruleId is a hash of the name and the compiled order is not stable.
+    struct CarriedStats {
+        uint32_t hitCount;
+        uint64_t averageMatchTimeMicroseconds;
+    };
+    std::map<std::string, CarriedStats> carried;
+    for (const auto& [carriedName, carriedMeta] : m_ruleMetadata) {
+        if (carriedMeta.hitCount != 0u || carriedMeta.averageMatchTimeMicroseconds != 0u) {
+            carried[carriedName] =
+                CarriedStats{ carriedMeta.hitCount, carriedMeta.averageMatchTimeMicroseconds };
+        }
+    }
+
     m_ruleMetadata.clear();
 
     if (m_rules == nullptr) {
@@ -3483,6 +3648,12 @@ size_t YaraRuleStore::RebuildRuleMetadataFromRules() noexcept {
         if (!severityMetadata.empty()) {
             metadata.threatLevel = YaraUtils::ParseThreatLevel(severityMetadata);
             ++rulesWithReadableMetadata;
+        }
+
+        const auto carriedIt = carried.find(fullName);
+        if (carriedIt != carried.end()) {
+            metadata.hitCount = carriedIt->second.hitCount;
+            metadata.averageMatchTimeMicroseconds = carriedIt->second.averageMatchTimeMicroseconds;
         }
 
         m_ruleMetadata[fullName] = std::move(metadata);
@@ -3950,6 +4121,12 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
     // therefore decided whether a rule had an author or a severity at all, and both
     // are reachable from a plain Initialize depending on how the rules arrived.
     const size_t ruleCount = RebuildRuleMetadataFromRules();
+
+    // These rules arrived as compiled bytecode, so m_ruleSources cannot reproduce
+    // them. Recording that here is what stops a later source-driven rebuild from
+    // silently replacing the whole database rule set with whatever sources happen
+    // to be tracked - on the shipped database that would delete 11,053 rules.
+    m_hasUntrackedRules = (ruleCount > 0u);
 
     // ========================================================================
     // LOAD STATISTICS FROM HEADER
@@ -4449,6 +4626,19 @@ StoreError YaraRuleStore::ImportFromYaraRulesRepo(
             return StoreError{ SignatureStoreError::Unknown, 0,
                                "Could not adopt imported YARA rules" };
         }
+
+        // This is a REPLACE, not a merge: the store now holds exactly the repo's
+        // rules. Two consequences, recorded rather than left implicit:
+        //  - previously tracked sources no longer describe anything that is loaded,
+        //    so they are dropped instead of being left to resurrect removed rules
+        //    at the next rebuild;
+        //  - these rules came from bytecode, so no source can reproduce them, and a
+        //    source-driven rebuild must refuse rather than silently discard them.
+        // Compiling the files in place is deliberate and is why this path exists
+        // separately from AddRulesFromDirectory: it keeps YARA `include` resolution,
+        // which storing rule text cannot do.
+        m_ruleSources.clear();
+        m_hasUntrackedRules = true;
     } else {
         SS_LOG_ERROR(L"YaraRuleStore", L"ImportFromYaraRulesRepo: No rules compiled");
         return StoreError{ SignatureStoreError::Unknown, 0, "No rules compiled successfully" };
@@ -4473,57 +4663,25 @@ StoreError YaraRuleStore::Recompile() noexcept {
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
-    if (m_ruleSources.empty()) {
-        SS_LOG_WARN(L"YaraRuleStore", L"Recompile: No rule sources to compile");
-        return StoreError{ SignatureStoreError::Success };
-    }
-
-    YaraCompiler compiler;
-    size_t sourcesCompiled = 0;
-
-    for (const auto& [key, source] : m_ruleSources) {
-        std::string ns = "default";
-        size_t delimPos = key.find("::");
-        if (delimPos != std::string::npos) {
-            ns = key.substr(0, delimPos);
-        }
-
-        StoreError addResult = compiler.AddString(source, ns);
-        if (!addResult.IsSuccess()) {
-            SS_LOG_WARN(L"YaraRuleStore",
-                L"Recompile: Failed to compile source '%S': %S",
-                key.c_str(), addResult.message.c_str());
-        } else {
-            sourcesCompiled++;
-        }
-    }
-
-    if (sourcesCompiled == 0) {
+    // Recompiling from the stored sources is exactly what RebuildRulesFromSources
+    // does, so this delegates instead of keeping a sixth copy of the
+    // compile-every-source loop. The copy that used to live here tolerated sources
+    // that failed to compile and adopted whatever was left, then reported how many
+    // had "succeeded" - a quietly reduced rule set presented as success.
+    //
+    // An empty source set is handled there too, and now means what it says: the
+    // rules are released rather than left standing with nothing describing them.
+    const StoreError rebuildResult = RebuildRulesFromSources();
+    if (!rebuildResult.IsSuccess()) {
         SS_LOG_ERROR(L"YaraRuleStore",
-            L"Recompile: All %zu sources failed compilation", m_ruleSources.size());
-        return StoreError{ SignatureStoreError::Unknown, 0, "All sources failed recompilation" };
-    }
-
-    YR_RULES* newRules = compiler.GetRules();
-    if (!newRules) {
-        SS_LOG_ERROR(L"YaraRuleStore",
-            L"Recompile: GetRules failed after %zu successful compilations", sourcesCompiled);
-        return StoreError{ SignatureStoreError::Unknown, 0, "Recompilation failed at GetRules" };
-    }
-
-    // AdoptRulesFromCompiler serialises the compiler's output and reloads it, so
-    // the store owns what it keeps and releases the previous set only after the
-    // replacement has loaded. Direct assignment stored the LOCAL compiler's
-    // singleton, which yr_compiler_destroy frees on return - leaving m_rules
-    // dangling for every subsequent scan, and double freeing at teardown.
-    if (!AdoptRulesFromCompiler(compiler)) {
-        return StoreError{ SignatureStoreError::Unknown, 0,
-                           "Could not adopt recompiled YARA rules" };
+            L"Recompile failed; the rule set is unchanged: %S",
+            rebuildResult.message.c_str());
+        return rebuildResult;
     }
 
     SS_LOG_INFO(L"YaraRuleStore",
-        L"Recompilation complete: %zu/%zu sources compiled",
-        sourcesCompiled, m_ruleSources.size());
+        L"Recompilation complete: %zu source(s) produced %zu rule(s)",
+        m_ruleSources.size(), m_ruleMetadata.size());
     return StoreError{ SignatureStoreError::Success };
 }
 

@@ -181,22 +181,15 @@
          failing tests was the only symptom. Keeping this suite means the invariant is
          checked on every run instead of rediscovered. -->
     <ClCompile Include="tests\unit\scan_engine_teardown\ScanEngineTeardown_Tests.cpp" />
-    <!-- EXCLUDED, and the reason is a PRODUCT defect this suite found rather than any
-         problem with the tests. Four cases fault with SEH 0xC0000005 in the test body
-         (RuleMerging_AddMultipleRuleSets, RuleMerging_ThreeRuleSetsSequential,
-         RemoveNamespace_WithRules, RemoveNamespace_PreservesOtherNamespaces) and
-         ThreadSafety_ConcurrentRuleAddition kills the process outright.
-         YaraRuleStore.cpp carries several comments about previous double-frees of the
-         compiler-owned rules singleton, and RemoveNamespace calls yr_rules_destroy on
-         m_rules at :3093 - which is exactly the pointer those comments warn is owned by
-         the compiler. RemoveNamespace has production callers in HuntRuleManager
-         (:2192, :2248), so this is live code, not a test-only path.
-         Tracked as its own task. Re-enable in the SAME change that fixes the ownership,
-         never before: a suite that crashes the runner destroys the signal from the other
-         20 files that now pass. -->
-    <ClCompile Include="tests\unit\Database_systems_unit\sig_store\yara_rule_store_tests.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <!-- RE-ENABLED together with the ownership fix that made it pass. This suite is
+         what found the defect: on a first add the store kept the LOCAL compiler's
+         YR_RULES singleton, so m_rules dangled as soon as the call returned, and the
+         next add or namespace removal called yr_rules_destroy on it. Four cases
+         faulted with SEH 0xC0000005 and ThreadSafety_ConcurrentRuleAddition killed the
+         process. m_ruleSources is now the authoritative record of what the store holds
+         and RebuildRulesFromSources is the only function that changes the compiled
+         rules, so no path can store or free a pointer it does not own. -->
+    <ClCompile Include="tests\unit\Database_systems_unit\sig_store\yara_rule_store_tests.cpp" />
     <!-- EXCLUDED. SIMDMatcherTest.AVX2BasicSearch terminates the process with
          STATUS_HEAP_CORRUPTION (0xC0000374) - not an assertion failure, actual heap
          damage, which means every test that ran before it is also suspect. 40+ cases in

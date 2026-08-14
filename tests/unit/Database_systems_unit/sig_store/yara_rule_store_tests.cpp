@@ -297,7 +297,11 @@ TEST_F(YaraRuleStoreTest, AddRulesFromFile_ValidFile) {
     
     auto error = yara_store_->AddRulesFromFile(rule_file, "default");
     
-    EXPECT_TRUE(error.IsSuccess());
+    // Reporting success is not the same as holding the rule.
+    ASSERT_TRUE(error.IsSuccess()) << "Error: " << error.message;
+    const auto meta = yara_store_->GetRuleMetadata("FileAddTest", "default");
+    ASSERT_TRUE(meta.has_value()) << "the file reported success but the rule is absent";
+    EXPECT_EQ(meta->ruleName, "FileAddTest");
 }
 
 TEST_F(YaraRuleStoreTest, AddRulesFromDirectory_EmptyDirectory) {
@@ -329,8 +333,17 @@ TEST_F(YaraRuleStoreTest, AddRulesFromDirectory_WithRules) {
             progress_count++;
         });
     
-    if (error.IsSuccess()) {
-        EXPECT_GT(progress_count, 0);
+    // Unconditional on purpose. This assertion used to be guarded by
+    // if (error.IsSuccess()), so it passed throughout the entire period in which
+    // this function compiled every file into a local compiler, discarded it, and
+    // added nothing at all.
+    ASSERT_TRUE(error.IsSuccess()) << "Error: " << error.message;
+    EXPECT_EQ(progress_count, 3u);
+
+    for (int i = 0; i < 3; ++i) {
+        const std::string name = "DirRule" + std::to_string(i);
+        EXPECT_TRUE(yara_store_->GetRuleMetadata(name, "default").has_value())
+            << name << " was not added to the store";
     }
 }
 
@@ -1296,6 +1309,147 @@ TEST_F(YaraRuleStoreTest, RemoveNamespace_PreservesOtherNamespaces) {
     // Other namespace should be preserved
     EXPECT_TRUE(yara_store_->GetRuleMetadata("PreserveRule1", "keep_ns").has_value());
     EXPECT_FALSE(yara_store_->GetRuleMetadata("PreserveRule2", "remove_ns").has_value());
+}
+
+// ============================================================================
+// Rule-set ownership and merge semantics
+//
+// Every test below fails against the previous implementation. The four cases
+// above crashed outright; these check the quieter half of the same defect, where
+// a call reported success and the store did not hold what it claimed.
+//
+// NOTE ON THE SCAN TESTS HERE: they call CreateNew first, because ScanBuffer
+// returns {} unless m_initialized is set, and this fixture does not initialize the
+// store. That is worth knowing beyond these tests - every ScanBuffer_* case in
+// this file asserts an EMPTY result set and therefore passes without the scan
+// path ever running. Those are vacuous as written; the ones below are the pattern
+// to follow, because a scan is the only way to observe the compiled rules, which
+// is where the defect lived.
+// ============================================================================
+
+TEST_F(YaraRuleStoreTest, RuleMerging_BothRuleSetsMatchOnScan) {
+    ASSERT_TRUE(yara_store_->CreateNew(test_db_path_).IsSuccess());
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(
+        CreateTestRule("MergeScanA", "4D 5A"), "ns_a").IsSuccess());
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(
+        CreateTestRule("MergeScanB", "50 45 00 00"), "ns_b").IsSuccess());
+
+    const std::vector<uint8_t> buffer = {0x4D, 0x5A, 0x50, 0x45, 0x00, 0x00};
+    YaraScanOptions options;
+    auto matches = yara_store_->ScanBuffer(buffer, options);
+
+    // Metadata presence cannot tell a merged rule set from a replaced one - both
+    // leave two entries in the map. Scanning can, because it goes through the
+    // compiled rules, which is the thing that was being corrupted.
+    bool sawA = false;
+    bool sawB = false;
+    for (const auto& match : matches) {
+        if (match.ruleName == "MergeScanA") { sawA = true; }
+        if (match.ruleName == "MergeScanB") { sawB = true; }
+    }
+    EXPECT_TRUE(sawA) << "the first rule set stopped matching after the merge";
+    EXPECT_TRUE(sawB) << "the second rule set never matched";
+}
+
+TEST_F(YaraRuleStoreTest, RemoveNamespace_RemovedRulesStopMatching) {
+    ASSERT_TRUE(yara_store_->CreateNew(test_db_path_).IsSuccess());
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(
+        CreateTestRule("StopMatchingRule", "4D 5A 90 00"), "doomed_ns").IsSuccess());
+
+    const std::vector<uint8_t> buffer = {0x4D, 0x5A, 0x90, 0x00, 0x11, 0x22};
+    YaraScanOptions options;
+
+    auto before = yara_store_->ScanBuffer(buffer, options);
+    ASSERT_EQ(before.size(), 1u) << "precondition: the rule must match before removal";
+    EXPECT_EQ(before[0].ruleName, "StopMatchingRule");
+
+    ASSERT_TRUE(yara_store_->RemoveNamespace("doomed_ns").IsSuccess());
+
+    // The point: removal has to change the COMPILED rules, not just the metadata
+    // map. The old implementation erased metadata and left the rules compiled, so
+    // a rule reported as removed went on matching every scan.
+    auto after = yara_store_->ScanBuffer(buffer, options);
+    EXPECT_TRUE(after.empty()) << "a removed rule is still matching";
+}
+
+TEST_F(YaraRuleStoreTest, AddRulesFromSource_RedefiningARuleIsRefusedAndStoreSurvives) {
+    ASSERT_TRUE(yara_store_->CreateNew(test_db_path_).IsSuccess());
+    const std::string rule = CreateTestRule("RedefinedRule", "4D 5A 90");
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(rule, "default").IsSuccess());
+
+    // Same rule name in the same namespace. YARA rejects a duplicated identifier
+    // for the entire source, so accepting this would store a source that can never
+    // compile alongside the first and would fail every later rebuild.
+    const auto second = yara_store_->AddRulesFromSource(rule, "default");
+    EXPECT_FALSE(second.IsSuccess());
+
+    // And the refusal must leave the store working.
+    const std::vector<uint8_t> buffer = {0x4D, 0x5A, 0x90, 0x00};
+    YaraScanOptions options;
+    auto matches = yara_store_->ScanBuffer(buffer, options);
+    ASSERT_EQ(matches.size(), 1u);
+    EXPECT_EQ(matches[0].ruleName, "RedefinedRule");
+}
+
+TEST_F(YaraRuleStoreTest, AddRulesFromFile_AddsWithoutDiscardingExistingRules) {
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(
+        CreateTestRule("AlreadyHere", "4D 5A"), "default").IsSuccess());
+
+    auto rule_file = CreateRuleFile("second.yar", CreateTestRule("FromFile", "50 45 00 00"));
+    ASSERT_TRUE(yara_store_->AddRulesFromFile(rule_file, "default").IsSuccess());
+
+    // The file add used to adopt a compiler holding only that file, which REPLACED
+    // the store's whole rule set while reporting success.
+    EXPECT_TRUE(yara_store_->GetRuleMetadata("AlreadyHere", "default").has_value())
+        << "adding a file discarded a rule that was already in the store";
+    EXPECT_TRUE(yara_store_->GetRuleMetadata("FromFile", "default").has_value());
+}
+
+TEST_F(YaraRuleStoreTest, AddRulesFromFile_KeepsSeverityFromTheRuleItself) {
+    const std::string rule =
+        "rule SeverityFromFile {\n"
+        "    meta:\n"
+        "        author = \"Severity Author\"\n"
+        "        severity = \"critical\"\n"
+        "    strings:\n"
+        "        $a = { 4D 5A 90 }\n"
+        "    condition:\n"
+        "        $a\n"
+        "}\n";
+
+    auto rule_file = CreateRuleFile("severity.yar", rule);
+    ASSERT_TRUE(yara_store_->AddRulesFromFile(rule_file, "default").IsSuccess());
+
+    // This path used to run its own metadata loop AFTER the canonical one, with
+    // threatLevel hardcoded to Medium and no author, description or tags. Since
+    // threat level decides the verdict, a Critical rule added this way convicted
+    // as Medium.
+    const auto meta = yara_store_->GetRuleMetadata("SeverityFromFile", "default");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->threatLevel, ThreatLevel::Critical);
+    EXPECT_EQ(meta->author, "Severity Author");
+}
+
+TEST_F(YaraRuleStoreTest, Statistics_HitCountSurvivesARuleSetChange) {
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(
+        CreateTestRule("CountedRule", "4D 5A"), "default").IsSuccess());
+
+    auto meta = yara_store_->GetRuleMetadata("CountedRule", "default");
+    ASSERT_TRUE(meta.has_value());
+    YaraRuleMetadata updated = meta.value();
+    updated.hitCount = 7;
+    ASSERT_TRUE(yara_store_->UpdateRuleMetadata("CountedRule", updated).IsSuccess());
+
+    // Adding a rule rebuilds the compiled set and re-derives the metadata from the
+    // bytecode. Accumulated statistics are not derivable from bytecode, so they are
+    // carried across; without that, one added rule would zero the hit count of
+    // every rule already in the store.
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(
+        CreateTestRule("UnrelatedRule", "50 45"), "default").IsSuccess());
+
+    auto after = yara_store_->GetRuleMetadata("CountedRule", "default");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->hitCount, 7u);
 }
 
 // UpdateRuleMetadata tests
