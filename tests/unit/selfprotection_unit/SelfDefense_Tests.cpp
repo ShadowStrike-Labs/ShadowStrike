@@ -1,4 +1,6 @@
 #include "../../../src/pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include <nlohmann/json.hpp>
 #include "../../../src/PhantomCore/SelfProtection/SelfDefense.hpp"
 

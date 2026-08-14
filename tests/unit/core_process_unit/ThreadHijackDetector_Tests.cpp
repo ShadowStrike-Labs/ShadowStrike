@@ -25,6 +25,7 @@
  */
 
 #include "../../../src/pch.h"
+#include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/Core/Process/ThreadHijackDetector.hpp"
 

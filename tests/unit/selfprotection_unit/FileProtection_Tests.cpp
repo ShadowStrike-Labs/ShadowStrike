@@ -1,4 +1,6 @@
 #include "../../../src/pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include <nlohmann/json.hpp>
 #include "../../../src/PhantomCore/SelfProtection/FileProtection.hpp"
 
@@ -39,9 +41,13 @@ TEST(FileProtectionTests, ProtectionModesAndValidationRemainCoherent) {
 }
 
 TEST(FileProtectionTests, EventsSerializeDecisionAndOperationNamesConsistently) {
-    const auto readWrite = static_cast<FileOperation>(
-        static_cast<uint32_t>(FileOperation::Read) |
-        static_cast<uint32_t>(FileOperation::Write));
+    // Qualified deliberately: the Windows SDK declares a global FileOperation
+    // coclass in shobjidl_core.h, which is ambiguous with
+    // ShadowStrike::Security::FileOperation under the using-directive above.
+    // Do not shorten these back.
+    const auto readWrite = static_cast<ShadowStrike::Security::FileOperation>(
+        static_cast<uint32_t>(ShadowStrike::Security::FileOperation::Read) |
+        static_cast<uint32_t>(ShadowStrike::Security::FileOperation::Write));
 
     FileProtectionEvent event{};
     event.eventId = 17;
@@ -96,9 +102,9 @@ TEST(FileProtectionTests, StatisticsAndHelperNamesExposeStableContracts) {
     EXPECT_EQ(payload.at("filesRestored").get<int>(), 2);
     EXPECT_GE(payload.at("uptimeMs").get<int64_t>(), 0);
 
-    const auto combinedOperation = static_cast<FileOperation>(
-        static_cast<uint32_t>(FileOperation::Delete) |
-        static_cast<uint32_t>(FileOperation::Write));
+    const auto combinedOperation = static_cast<ShadowStrike::Security::FileOperation>(
+        static_cast<uint32_t>(ShadowStrike::Security::FileOperation::Delete) |
+        static_cast<uint32_t>(ShadowStrike::Security::FileOperation::Write));
     EXPECT_EQ(GetProtectionModeName(FileProtectionMode::Strict), "Strict");
     EXPECT_EQ(GetFileOperationName(combinedOperation), "Write");
     EXPECT_EQ(GetProtectionTypeName(ProtectionType::NoDelete), "NoDelete");

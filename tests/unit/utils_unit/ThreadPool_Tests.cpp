@@ -1811,7 +1811,21 @@ TEST_F(ThreadPoolTest, DecreaseThreadCountByZeroIsNoop) {
 
 TEST_F(ThreadPoolTest, ManyShortTasksNoMemoryLeak) {
     SS_LOG_INFO(L"ThreadPool_Tests", L"[ManyShortTasksNoMemoryLeak] Testing...");
-    ThreadPool pool(config_);
+
+    // The fixture caps the queue at 100 while each round below submits 200 tasks
+    // without waiting, so with the shared config this test only passed when the
+    // workers happened to drain more than half the queue while the loop was still
+    // enqueuing. On a loaded machine they do not, and Submit throws "queue is full"
+    // - which is the pool behaving correctly, not a defect.
+    //
+    // Queue-full rejection has its own coverage (PriorityTaskQueueTest.
+    // PushRespectsMaxSize and the Submit-on-full-queue cases), so giving this test
+    // a queue that fits one round removes an unintended dependency on timing
+    // without giving up what it is actually for: task volume and completion.
+    ThreadPoolConfig config = config_;
+    config.maxQueueSize = 256;
+
+    ThreadPool pool(config);
     ASSERT_TRUE(pool.Initialize());
 
     std::atomic<int> completedCount{0};

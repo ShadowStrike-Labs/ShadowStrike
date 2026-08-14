@@ -1,4 +1,6 @@
 #include "../../../src/pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include "../../../src/PhantomCore/SelfProtection/MemoryProtection.hpp"

@@ -95,7 +95,20 @@
         SHADOWSTRIKE_TESTING=1;
         SHADOWSTRIKE_DIAG_TRACE=0;
         SHADOWSTRIKE_HAS_YARA;
-        GTEST_HAS_PTHREAD=0;%(PreprocessorDefinitions)
+        <!-- gtest.lib and gmock.lib in vendor\gtest_framework are IMPORT libraries for
+           gtest.dll and gmock.dll, not static libraries. googletest requires a
+           consumer of the shared build to say so, because these macros are what put
+           __declspec(dllimport) on EXPORTED DATA. Function calls resolve through the
+           import thunks either way, which is why 2,000+ tests linked without them -
+           the first thing to fail was testing::internal::g_gmock_mutex, a data
+           symbol, reached only by the one file that uses EXPECT_CALL.
+           Every other project in this solution already defines both. The test
+           project not doing so was the same class of divergence as it missing
+           SHADOWSTRIKE_HAS_YARA: the project that consumes a dependency held a
+           different view of it than everything else. -->
+      GTEST_LINKED_AS_SHARED_LIBRARY=1;
+      GMOCK_LINKED_AS_SHARED_LIBRARY=1;
+      GTEST_HAS_PTHREAD=0;%(PreprocessorDefinitions)
       </PreprocessorDefinitions>
       <SDLCheck>false</SDLCheck>
     </ClCompile>
@@ -230,6 +243,42 @@
     <ClCompile Include="tests\unit\utils_unit\SystemUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\ThreadPool_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\XMLUtils_Tests.cpp" />
+    <!-- threat_intel: added as one batch. -->
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ReputationCache_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntel_bloom_filter_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelDatabase_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelExporter_Tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFeedManagerTests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFormat_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelImporter_Tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelIndex_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelIOCManager_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelLookup_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelStoreTests.cpp" />
+    <!-- selfprotection_unit: added as one batch. -->
+    <ClCompile Include="tests\unit\selfprotection_unit\AntiDebug_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\CertificateValidator_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\CryptoManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\DigitalSignatureValidator_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\FileProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\MemoryProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\ProcessProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\RegistryProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\SelfDefense_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\SelfProtection_LinkShim.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\TamperProtection_Tests.cpp" />
+    <!-- core_process_unit: added as one batch. -->
+    <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\DLLInjectionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\MemoryScanner_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessHollowingDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessInjectionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessKiller_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ReflectiveDLLDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ThreadHijackDetector_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="PhantomCoreLib.vcxproj">

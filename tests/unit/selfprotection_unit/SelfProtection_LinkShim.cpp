@@ -1,4 +1,5 @@
 #include "../../../src/pch.h"
+#include <gtest/gtest.h>
 
 #ifdef SHADOWSTRIKE_SELFPROTECTION_TEST_SHIMS
 

@@ -26,6 +26,7 @@
  */
 
 #include "../../../src/pch.h"
+#include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/Core/Process/ProcessInjectionDetector.hpp"
 
@@ -281,9 +282,20 @@ TEST_F(ProcessInjectionValueTest, ClassificationAndConfidenceRemainDeterministic
     whitelistedUnknown.targetProcessName = L"shadowstrike-test.exe";
     whitelistedUnknown.startAddressLegitimate = true;
 
+    // 30, not 20, and the difference is a deliberate recalibration rather than
+    // drift. CalculateConfidence bases an unclassified injection on the switch's
+    // default arm, which was raised from 50 to 60 because techniques falling
+    // through it - IFEO redirection, AppInit_DLLs, COM hijacking, cross-process
+    // SetWindowsHookEx - landed below MIN_ALERT_CONFIDENCE (60) and became silent
+    // no-ops. The arithmetic here is 60 base, no correlation boost (no events), no
+    // illegitimate-start-address boost (it is legitimate), minus 30 for a
+    // whitelisted process pair.
+    //
+    // If this assertion is ever "fixed" by lowering the base back to 50, those
+    // techniques stop alerting again.
     EXPECT_DOUBLE_EQ(
         detector.CalculateConfidence(InjectionType::Unknown, whitelistedUnknown),
-        20.0);
+        30.0);
 }
 
 }  // namespace
