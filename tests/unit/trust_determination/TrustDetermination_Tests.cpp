@@ -294,4 +294,149 @@ namespace {
                "Find another catalog-only binary rather than dropping the coverage.";
     }
 
+    // ------------------------------------------------------------------------
+    // The property that the field defect actually violated
+    // ------------------------------------------------------------------------
+    // Whether a file is Microsoft-signed is a question about WHO SIGNED IT. It
+    // must not change based on whether this machine currently happens to hold a
+    // usable CRL. Before the status triage, requesting revocation was enough to
+    // turn a valid Microsoft signature into InvalidSignature on a host with a
+    // cold revocation cache, because CRYPT_E_REVOCATION_OFFLINE and
+    // CERT_E_REVOCATION_FAILURE were unnamed and fell into a default arm that
+    // reported "invalid signature".
+    //
+    // This case is host-independent: on a warm cache both paths succeed, on a
+    // cold cache the revocation path returns a revocation status, and either way
+    // the IDENTITY answer must agree. A disagreement is the defect.
+    //
+    // CacheResult is deliberately CLEARED in both option sets. VerifyFile caches
+    // by path, so leaving it on would let the first call's verdict be replayed to
+    // the second and the comparison would be vacuous -- it would pass no matter
+    // what the code did.
+    TEST_F(TrustDeterminationTest, MicrosoftTrustDoesNotDependOnRevocationReachability) {
+        using ShadowStrike::Security::SignatureValidationFlags;
+        using ShadowStrike::Security::SignatureValidationOptions;
+
+        for (const wchar_t* leaf : {L"kernel32.dll", L"urlmon.dll"}) {
+            const std::wstring path = SystemFile(leaf);
+            ASSERT_FALSE(path.empty());
+            if (::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                continue;
+            }
+
+            SignatureValidationOptions withRevocation;
+            withRevocation.flags = SignatureValidationFlags::VerifyChain |
+                                   SignatureValidationFlags::CheckRevocation |
+                                   SignatureValidationFlags::AllowCatalogSignatures;
+
+            SignatureValidationOptions withoutRevocation;
+            withoutRevocation.flags = SignatureValidationFlags::VerifyChain |
+                                      SignatureValidationFlags::AllowCatalogSignatures;
+
+            auto& validator = DigitalSignatureValidator::Instance();
+            const SignatureInfo a = validator.VerifyFile(path, withRevocation);
+            const SignatureInfo b = validator.VerifyFile(path, withoutRevocation);
+
+            EXPECT_EQ(a.isMicrosoftSigned, b.isMicrosoftSigned)
+                << "Whether this binary is Microsoft-signed changed depending on "
+                   "whether revocation was requested. Signer identity cannot depend "
+                   "on CRL availability."
+                << "\n  with revocation:" << Describe(path, a)
+                << "\n  without revocation:" << Describe(path, b);
+
+            EXPECT_EQ(a.isValid, b.isValid)
+                << "Signature validity changed depending on whether revocation was "
+                   "requested, on a file Windows reports as Valid."
+                << "\n  with revocation:" << Describe(path, a)
+                << "\n  without revocation:" << Describe(path, b);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The contract, asserted directly
+    // ------------------------------------------------------------------------
+    // "Revocation could not be checked" is not "the signature is invalid". This
+    // assertion is CONDITIONAL by nature: it can only fire on a host where the
+    // revocation lookup actually fails, which is the freshly imaged machine the
+    // field defect appeared on and not necessarily a long-lived build host. It is
+    // written this way deliberately rather than skipped, because a conditional
+    // assertion that is silent here still fails loudly on the machine that
+    // matters, whereas a skip would report nothing anywhere.
+    TEST_F(TrustDeterminationTest, RevocationFailureIsNeverReportedAsAnInvalidSignature) {
+        using ShadowStrike::Security::SignatureValidationFlags;
+        using ShadowStrike::Security::SignatureValidationOptions;
+
+        // Values are stated numerically as well as by name because the whole
+        // point is that these two specific HRESULTs used to be anonymous.
+        constexpr int32_t kCryptERevocationOffline  = static_cast<int32_t>(0x80092013);
+        constexpr int32_t kCertERevocationFailure   = static_cast<int32_t>(0x80092012);
+
+        for (const wchar_t* leaf : {L"kernel32.dll", L"urlmon.dll", L"ntmarta.dll"}) {
+            const std::wstring path = SystemFile(leaf);
+            if (path.empty() ||
+                ::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                continue;
+            }
+
+            SignatureValidationOptions options;
+            options.flags = SignatureValidationFlags::VerifyChain |
+                            SignatureValidationFlags::CheckRevocation |
+                            SignatureValidationFlags::AllowCatalogSignatures;
+
+            const SignatureInfo info =
+                DigitalSignatureValidator::Instance().VerifyFile(path, options);
+
+            if (info.errorCode == kCryptERevocationOffline ||
+                info.errorCode == kCertERevocationFailure) {
+                EXPECT_TRUE(info.isValid)
+                    << "A revocation check that could not be PERFORMED was reported "
+                       "as a signature that is INVALID. The digest verified and the "
+                       "chain built; only the revocation state is unknown."
+                    << Describe(path, info);
+                EXPECT_FALSE(info.revocationChecked)
+                    << "Revocation was reported as checked despite returning a "
+                       "revocation-unavailable status."
+                    << Describe(path, info);
+            }
+
+            // Holds on every host: a valid verdict must never claim revocation was
+            // established when revocation was not even requested.
+            if (info.isValid && info.revocationChecked) {
+                EXPECT_TRUE((options.flags & SignatureValidationFlags::CheckRevocation) !=
+                            SignatureValidationFlags::None)
+                    << "revocationChecked is true but revocation was never requested."
+                    << Describe(path, info);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The diagnostic gap that made the field run unreadable
+    // ------------------------------------------------------------------------
+    // errorCode used to be assigned ONLY in the default arm of the status switch,
+    // so any named failure returned 0 and a caller could not tell which status
+    // produced the verdict. A successful verification must report 0 because
+    // ERROR_SUCCESS is 0; a refusal must report something.
+    TEST_F(TrustDeterminationTest, ARefusedVerdictCarriesTheStatusCodeThatCausedIt) {
+        const std::wstring path = SystemFile(L"kernel32.dll");
+        ASSERT_FALSE(path.empty());
+        ASSERT_NE(INVALID_FILE_ATTRIBUTES, ::GetFileAttributesW(path.c_str()));
+
+        const SignatureInfo info =
+            DigitalSignatureValidator::Instance().VerifyFile(path);
+
+        if (info.isValid) {
+            EXPECT_EQ(0, info.errorCode)
+                << "A valid signature reported a non-zero status code."
+                << Describe(path, info);
+        } else {
+            EXPECT_NE(0, info.errorCode)
+                << "Trust was refused for a Windows system binary and the verdict "
+                   "carried no status code, so nothing downstream can report WHY. "
+                   "This is the exact condition that made the 1.0.93 field run "
+                   "impossible to diagnose from its logs."
+                << Describe(path, info);
+        }
+    }
+
 }  // namespace

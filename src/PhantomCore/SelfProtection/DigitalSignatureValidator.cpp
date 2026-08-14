@@ -325,6 +325,8 @@ std::string SignatureValidatorStatistics::ToJson() const {
     oss << "\"revocationChecks\":" << revocationChecks << ",";
     oss << "\"revokedCertificates\":" << revokedCertificates << ",";
     oss << "\"expiredCertificates\":" << expiredCertificates << ",";
+    oss << "\"revocationUndetermined\":" << revocationUndetermined << ",";
+    oss << "\"unrecognisedTrustStatus\":" << unrecognisedTrustStatus << ",";
     oss << "\"blockedSigners\":" << blockedSigners << ",";
     oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"stolenCertDetections\":" << stolenCertDetections << ",";
@@ -819,7 +821,44 @@ public:
 
     [[nodiscard]] bool IsMicrosoftSigned(std::wstring_view filePath) noexcept {
         auto result = VerifyFile(std::wstring(filePath));
-        return result.isValid && result.isMicrosoftSigned;
+        const bool trusted = result.isValid && result.isMicrosoftSigned;
+
+        // WHY THIS LOG EXISTS, and why it is at DEBUG rather than WARN.
+        //
+        // This function is the product's Microsoft-trust fast path: a true answer
+        // lets a file skip analysis, a false answer sends it through the full
+        // heuristic pipeline on every single access. In the 1.0.93 field run it
+        // answered false for effectively every operating-system binary on the
+        // machine -- trustVerdictsCached stayed at 0 across all 34 capacity
+        // samples while the trust queue demonstrably drained -- and fourteen
+        // Microsoft-signed files were then convicted by heuristics, with five
+        // attempts to quarantine System32\urlmon.dll.
+        //
+        // None of that could be diagnosed from the logs, because a refusal here
+        // was silent. The verdict, the WinVerifyTrust status and the signer were
+        // all computed and then discarded. Recording them is the difference
+        // between naming the mechanism and guessing at it across a deploy cycle.
+        //
+        // DEBUG, not WARN: this runs for large numbers of files and our own log
+        // writes traverse our own minifilter, so a per-file WARN on a machine
+        // that is already behind would amplify exactly the condition it reports
+        // -- the same mistake the deferred-queue drop warning made. The
+        // aggregate counters (revocationUndetermined, unrecognisedTrustStatus)
+        // are the always-on signal; this line is for when someone is looking.
+        if (!trusted) {
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Microsoft trust refused: result=%u isValid=%d isMsSigned=%d "
+                L"revocationChecked=%d status=0x%08X signer='%ls' file=%ls",
+                static_cast<unsigned>(result.result),
+                result.isValid ? 1 : 0,
+                result.isMicrosoftSigned ? 1 : 0,
+                result.revocationChecked ? 1 : 0,
+                static_cast<unsigned>(result.errorCode),
+                result.signer.signerName.c_str(),
+                std::wstring(filePath).c_str());
+        }
+
+        return trusted;
     }
 
     // Cache-only counterpart of IsMicrosoftSigned. Deliberately does NOT call
@@ -1527,7 +1566,25 @@ private:
         winTrustData.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
 
         // Set revocation check if enabled
-        if ((options.flags & SignatureValidationFlags::CheckRevocation) != SignatureValidationFlags::None) {
+        //
+        // NOTE ON WHAT THIS COMBINATION MEANS, because it looks contradictory
+        // and is not. WTD_REVOKE_WHOLECHAIN asks for revocation across the whole
+        // chain while WTD_CACHE_ONLY_URL_RETRIEVAL forbids fetching anything, so
+        // revocation is evaluated against the LOCAL CRL cache only. That is the
+        // correct posture for this process: a certificate this machine already
+        // knows to be revoked is still rejected, and no thread ever blocks on a
+        // network fetch. Reaching outside the process here is what wedged two
+        // scan workers for 180 seconds each in the 1.0.86 and 1.0.91 field runs,
+        // because WinVerifyTrust is an RPC into CryptSvc whose own file I/O our
+        // minifilter then intercepts.
+        //
+        // The consequence that must be handled honestly is that on a machine
+        // with a cold CRL cache this request CANNOT be satisfied, and
+        // WinVerifyTrust reports that as a distinct status. See the revocation
+        // arm of the switch below: it is not a signature failure.
+        const bool revocationRequested =
+            (options.flags & SignatureValidationFlags::CheckRevocation) != SignatureValidationFlags::None;
+        if (revocationRequested) {
             winTrustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
             winTrustData.dwProvFlags |= WTD_REVOCATION_CHECK_CHAIN;
             m_stats.revocationChecks++;
@@ -1639,16 +1696,101 @@ private:
             }
         }
 
-        // Interpret WinVerifyTrust result
+        // ====================================================================
+        // Interpret the WinVerifyTrust status
+        // ====================================================================
+        //
+        // errorCode is recorded on EVERY arm, including success. Previously it
+        // was assigned only in the default arm, so a caller handed Expired,
+        // Revoked, TamperedFile, UntrustedRoot or ChainError received
+        // errorCode == 0 and had no way to learn which status produced the
+        // verdict. On the trust path that is the difference between a
+        // diagnosable false positive and an inexplicable one: the 1.0.93 field
+        // run refused Microsoft trust for effectively every operating-system
+        // binary on the machine and left no record anywhere of the reason.
+        result.errorCode = static_cast<int32_t>(status);
+
         switch (status) {
             case ERROR_SUCCESS:
                 result.result = SignatureValidationResult::Valid;
                 result.isValid = true;
                 result.isEV = result.signer.isEV;
+                // Only claim revocation was evaluated if it was actually asked for.
+                result.revocationChecked = revocationRequested;
                 break;
 
+            // ----------------------------------------------------------------
+            // NOT SIGNED - and all three of these must reach the catalog
+            // ----------------------------------------------------------------
+            // Microsoft's documented idiom treats TRUST_E_NOSIGNATURE,
+            // TRUST_E_SUBJECT_FORM_UNKNOWN and TRUST_E_PROVIDER_UNKNOWN alike as
+            // "this file carries no embedded signature WinTrust can read". Only
+            // the first was named here; the other two fell through to the default
+            // arm and became InvalidSignature. That is not merely a less precise
+            // label - VerifyFile's catalog fallback fires ONLY on Unsigned, so
+            // two of the three documented "now go look in the catalog" signals
+            // never reached the catalog at all.
+            //
+            // This is not a corner case. A large share of Windows system binaries
+            // carry no embedded signature whatsoever and are vouched for solely
+            // by a security catalog. Measured on this host via the PE certificate
+            // directory (IMAGE_DIRECTORY_ENTRY_SECURITY): urlmon.dll, usbmon.dll
+            // and notepad.exe all have a zero-length certificate table while
+            // Windows reports each as Valid. urlmon.dll is the file the 1.0.93
+            // field run attempted to quarantine five times.
             case TRUST_E_NOSIGNATURE:
+            case TRUST_E_SUBJECT_FORM_UNKNOWN:
+            case TRUST_E_PROVIDER_UNKNOWN:
                 result.result = SignatureValidationResult::Unsigned;
+                break;
+
+            // ----------------------------------------------------------------
+            // REVOCATION COULD NOT BE DETERMINED - NOT a signature failure
+            // ----------------------------------------------------------------
+            // A revocation check we were unable to PERFORM is not a signature we
+            // have found to be INVALID, and conflating the two is what made this
+            // function report catalog-signed and embedded-signed Microsoft
+            // binaries alike as untrustworthy.
+            //
+            // Both of these statuses are only reachable AFTER the Authenticode
+            // digest has been verified and the chain has been built - revocation
+            // is the last stage of the policy evaluation. So the signature and
+            // the chain demonstrably succeeded; the single unknown is whether one
+            // of the certificates has since been revoked, and we cannot know
+            // because we are deliberately forbidden from fetching a CRL on this
+            // path (see the note at the flag setup above).
+            //
+            // Reported as Valid with revocationChecked == false so the fact is
+            // carried rather than hidden. A caller that genuinely requires
+            // confirmed revocation status can demand it; nothing is asserted here
+            // that was not established.
+            //
+            // WHY VALID IS THE CORRECT ANSWER AND NOT A WEAKENING: the state
+            // being described is "correctly signed, revocation unknown". Windows
+            // itself resolves this exact state the same way - it does not refuse
+            // to load a system DLL because a CRL is unreachable. Reporting it as
+            // InvalidSignature had a measured cost and no security benefit: the
+            // trust fast path never warmed on a freshly installed machine
+            // (trustVerdictsCached was 0 across all 34 capacity samples of the
+            // 1.0.93 run while the trust queue demonstrably drained), so every
+            // operating-system binary was treated as unknown, took the full
+            // heuristic pipeline on every access, and fourteen of them were
+            // convicted - including five attempts to quarantine urlmon.dll. The
+            // risk avoided by the old behaviour was a revoked Microsoft
+            // code-signing certificate on a machine whose CRL cache is cold; the
+            // cost was attempting to quarantine the operating system.
+            case CRYPT_E_REVOCATION_OFFLINE:
+            case CERT_E_REVOCATION_FAILURE:
+                result.result = SignatureValidationResult::Valid;
+                result.isValid = true;
+                result.isEV = result.signer.isEV;
+                result.revocationChecked = false;
+                m_stats.revocationUndetermined++;
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"Signature valid but revocation undetermined (0x%08X, cache-only "
+                    L"retrieval): %ls signer='%ls'",
+                    static_cast<unsigned>(status), filePath.c_str(),
+                    result.signer.signerName.c_str());
                 break;
 
             case TRUST_E_EXPLICIT_DISTRUST:
@@ -1659,12 +1801,29 @@ private:
                 result.result = SignatureValidationResult::UntrustedRoot;
                 break;
 
+            // Named explicitly rather than left to the default arm: the enum has
+            // an exact state for an untrusted root, and reporting it as the
+            // generic InvalidSignature discarded information the caller needs to
+            // distinguish "signed by someone we do not trust" from "the signature
+            // does not verify". Only the second implies tampering.
+            case CERT_E_UNTRUSTEDROOT:
+            case CERT_E_UNTRUSTEDTESTROOT:
+                result.result = SignatureValidationResult::UntrustedRoot;
+                break;
+
             case CRYPT_E_SECURITY_SETTINGS:
                 result.result = SignatureValidationResult::PolicyViolation;
                 break;
 
             case TRUST_E_BAD_DIGEST:
                 result.result = SignatureValidationResult::TamperedFile;
+                break;
+
+            // A failed certificate signature IS a signature failure, unlike the
+            // revocation cases above. Named so it is distinguishable from the
+            // unknown-status bucket.
+            case TRUST_E_CERT_SIGNATURE:
+                result.result = SignatureValidationResult::InvalidSignature;
                 break;
 
             case CERT_E_EXPIRED:
@@ -1681,9 +1840,34 @@ private:
                 result.result = SignatureValidationResult::ChainError;
                 break;
 
+            // Timestamp problems have their own state and are not signature
+            // failures; a validly signed file with an unusable countersignature
+            // is a different condition from a corrupted one.
+            case TRUST_E_TIME_STAMP:
+            case TRUST_E_COUNTER_SIGNER:
+                result.result = SignatureValidationResult::BadTimestamp;
+                break;
+
+            case CERT_E_WRONG_USAGE:
+            case CERT_E_PURPOSE:
+                result.result = SignatureValidationResult::InvalidCertificate;
+                break;
+
             default:
+                // Genuinely unrecognised. Still InvalidSignature, because an
+                // unknown trust status must never be optimistically trusted --
+                // but it is now REPORTED rather than silently absorbed. Every
+                // status that used to arrive here anonymously is why the field
+                // run could not be diagnosed from its logs, and any status
+                // appearing in this line is a candidate for explicit triage
+                // above rather than something to leave in the bucket.
                 result.result = SignatureValidationResult::InvalidSignature;
-                result.errorCode = static_cast<int32_t>(status);
+                m_stats.unrecognisedTrustStatus++;
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Unrecognised WinVerifyTrust status 0x%08X treated as invalid "
+                    L"signature: %ls signer='%ls'",
+                    static_cast<unsigned>(status), filePath.c_str(),
+                    result.signer.signerName.c_str());
                 break;
         }
 
@@ -2001,6 +2185,17 @@ private:
         std::atomic<uint64_t> revocationChecks{0};
         std::atomic<uint64_t> revokedCertificates{0};
         std::atomic<uint64_t> expiredCertificates{0};
+        // Signature verified but revocation could not be established, because
+        // this path is forbidden from fetching a CRL. Distinct from
+        // revokedCertificates: that counts certificates found to BE revoked.
+        // A high value here on a freshly imaged machine is expected; a high
+        // value on a long-running one suggests the CRL cache is not warming.
+        std::atomic<uint64_t> revocationUndetermined{0};
+        // WinVerifyTrust returned a status with no explicit mapping. Every one
+        // of these is reported as an invalid signature, so a non-zero value is
+        // a direct measure of how much trust is being refused for a reason
+        // nobody has triaged yet.
+        std::atomic<uint64_t> unrecognisedTrustStatus{0};
         std::atomic<uint64_t> blockedSigners{0};
         std::atomic<uint64_t> avgValidationTimeUs{0};
         std::atomic<uint64_t> stolenCertDetections{0};
@@ -2011,6 +2206,7 @@ private:
             totalValidations = 0; validSignatures = 0; invalidSignatures = 0;
             unsignedFiles = 0; cacheHits = 0; cacheMisses = 0;
             revocationChecks = 0; revokedCertificates = 0; expiredCertificates = 0;
+            revocationUndetermined = 0; unrecognisedTrustStatus = 0;
             blockedSigners = 0; avgValidationTimeUs = 0;
             stolenCertDetections = 0; anomalyDetections = 0;
             startTime = Clock::now();
@@ -2027,6 +2223,8 @@ private:
             s.revocationChecks    = revocationChecks.load(std::memory_order_relaxed);
             s.revokedCertificates = revokedCertificates.load(std::memory_order_relaxed);
             s.expiredCertificates = expiredCertificates.load(std::memory_order_relaxed);
+            s.revocationUndetermined = revocationUndetermined.load(std::memory_order_relaxed);
+            s.unrecognisedTrustStatus = unrecognisedTrustStatus.load(std::memory_order_relaxed);
             s.blockedSigners      = blockedSigners.load(std::memory_order_relaxed);
             s.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
             s.stolenCertDetections = stolenCertDetections.load(std::memory_order_relaxed);

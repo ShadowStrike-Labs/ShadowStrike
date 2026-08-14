@@ -559,7 +559,29 @@ struct SignatureInfo {
     
     /// @brief Is EV code signing
     bool isEV = false;
-    
+
+    /// @brief Was revocation status actually established?
+    ///
+    /// FALSE means "not determined", NEVER "not revoked". Three different
+    /// situations produce false and a caller must not conflate them with a
+    /// clean revocation result:
+    ///   - revocation was not requested (CheckRevocation absent from the flags)
+    ///   - revocation was requested but could not be performed, because this
+    ///     process deliberately forbids fetching a CRL on the verification path
+    ///     (a network fetch there wedged two scan workers for 180 seconds each
+    ///     in two separate field runs)
+    ///   - verification failed before revocation was ever reached
+    ///
+    /// A file may therefore be reported Valid with revocationChecked == false.
+    /// That combination is honest and is the normal state on a machine with a
+    /// cold CRL cache: correctly signed, revocation unknown. A caller for which
+    /// that is not good enough must require this flag explicitly rather than
+    /// inferring revocation from isValid.
+    ///
+    /// The default is false because false is the safe thing to assume about a
+    /// fact nobody established.
+    bool revocationChecked = false;
+
     /// @brief Error message (if any)
     std::string errorMessage;
     
@@ -685,6 +707,14 @@ struct SignatureValidatorStatistics {
     uint64_t revocationChecks    = 0;
     uint64_t revokedCertificates = 0;
     uint64_t expiredCertificates = 0;
+    /// @brief Signature verified but revocation could not be established.
+    ///        Distinct from revokedCertificates, which counts certificates
+    ///        actually found to be revoked. See SignatureInfo::revocationChecked.
+    uint64_t revocationUndetermined = 0;
+    /// @brief WinVerifyTrust statuses with no explicit mapping, each reported as
+    ///        an invalid signature. Non-zero means trust is being refused for a
+    ///        reason nobody has triaged; the status is named in the log.
+    uint64_t unrecognisedTrustStatus = 0;
     uint64_t blockedSigners      = 0;
     uint64_t avgValidationTimeUs = 0;
     uint64_t stolenCertDetections = 0;
