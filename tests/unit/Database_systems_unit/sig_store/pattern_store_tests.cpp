@@ -562,25 +562,35 @@ TEST_F(PatternCompilerTest, WildcardPattern) {
     EXPECT_EQ(mask[2], 0xFF);
 }
 
-TEST_F(PatternCompilerTest, ByteRangePattern) {
+// Byte ranges are REFUSED, not compiled.
+//
+// This test previously asserted the opposite - has_value() true, mode Regex, size 3 -
+// and it would have passed while the compiler was silently wrong. '48 [8B-8D] 05'
+// compiled to three bytes because the range emitted its LOWER BOUND (0x8B) with an
+// exact mask, so the stored pattern matched only 0x8B of the three values the author
+// asked for. The size and the mode were right; the meaning was not. A test that checks
+// shape rather than meaning cannot tell those apart.
+TEST_F(PatternCompilerTest, ByteRangeIsRefused) {
     PatternMode mode;
     std::vector<uint8_t> mask;
 
-    auto result = CompilePattern("48 [8B-8D] 05", mode, mask);
-
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(mode, PatternMode::Regex);
-    EXPECT_EQ(result->size(), 3);
+    EXPECT_FALSE(CompilePattern("48 [8B-8D] 05", mode, mask).has_value());
+    EXPECT_FALSE(CompilePattern("48 [00-FF] 05", mode, mask).has_value());
 }
 
-TEST_F(PatternCompilerTest, VariableGapPattern) {
+// Variable gaps are REFUSED, not compiled.
+//
+// Previously asserted to succeed with mode Regex. The gap token was dropped from the
+// output entirely, so '48 8B {0-4} C3' compiled to the three CONTIGUOUS bytes
+// 48 8B C3 - a pattern that matches something the author never wrote and never
+// matches what they did. The old test asserted only has_value() and the mode, so it
+// never looked at the bytes that would have exposed it.
+TEST_F(PatternCompilerTest, VariableGapIsRefused) {
     PatternMode mode;
     std::vector<uint8_t> mask;
 
-    auto result = CompilePattern("48 8B {0-4} C3", mode, mask);
-
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(mode, PatternMode::Regex);
+    EXPECT_FALSE(CompilePattern("48 8B {0-4} C3", mode, mask).has_value());
+    EXPECT_FALSE(CompilePattern("48 8B {0-16} C3", mode, mask).has_value());
 }
 
 TEST_F(PatternCompilerTest, EmptyPatternRejection) {
@@ -604,8 +614,14 @@ TEST_F(PatternCompilerTest, PatternValidation) {
 
     EXPECT_TRUE(PatternCompiler::ValidatePattern("48 8B 05", errorMsg));
     EXPECT_TRUE(PatternCompiler::ValidatePattern("48 ?? 05", errorMsg));
-    EXPECT_FALSE(PatternCompiler::ValidatePattern("48 [ 05", errorMsg));  // Unbalanced
-    EXPECT_FALSE(PatternCompiler::ValidatePattern("{ 8B", errorMsg));     // Unbalanced
+
+    // Refused because the construct is unsupported, which subsumes the old
+    // balance check - balance was never the issue.
+    EXPECT_FALSE(PatternCompiler::ValidatePattern("48 [ 05", errorMsg));
+    EXPECT_FALSE(PatternCompiler::ValidatePattern("{ 8B", errorMsg));
+    EXPECT_FALSE(PatternCompiler::ValidatePattern("48 [8B-8D] 05", errorMsg));
+    EXPECT_FALSE(PatternCompiler::ValidatePattern("48 8B {0-4} C3", errorMsg));
+    EXPECT_FALSE(PatternCompiler::ValidatePattern("48 8B ? C3", errorMsg));
 }
 
 TEST_F(PatternCompilerTest, EntropyCalculation) {

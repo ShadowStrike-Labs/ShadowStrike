@@ -27,7 +27,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "src/PhantomCore/PatternStore/PatternStore.hpp"
@@ -247,10 +249,150 @@ TEST(MaskedPattern, ExactTextCompilesWithAFullyExactMask) {
     }
 }
 
-// A compiled wildcard pattern must be matchable by the matcher the store builds
-// for it. This is the end-to-end shape of task 60 at unit scale: compile the text
-// an author writes, hand the result to the matcher the store would use, and
-// require it to find a concrete instance.
+// ---------------------------------------------------------------------------
+// The compiler refuses what it cannot represent
+//
+// These matter because phantom-sigbuild's refusal does NOT cover this path.
+// PatternStore::AddPattern and AddPatternBatch call CompilePattern directly, so a
+// caller adding a pattern at runtime bypasses the build-time check entirely. Before
+// this, such a caller received a successfully compiled pattern that meant something
+// other than what it asked for.
+// ---------------------------------------------------------------------------
+
+TEST(MaskedPattern, CompilerRefusesByteRanges) {
+    PatternMode mode = PatternMode::Exact;
+    std::vector<uint8_t> mask;
+
+    // Previously compiled to the single byte 0x01 with an exact mask - the range's
+    // lower bound - and returned success.
+    EXPECT_FALSE(PatternCompiler::CompilePattern("48 8B [01-FF] C3", mode, mask).has_value());
+    EXPECT_FALSE(PatternCompiler::CompilePattern("48 [8B-8D] 05", mode, mask).has_value());
+
+    // '[00-FF]' means "any byte" and previously compiled to "exactly 0x00", which is
+    // the narrowest possible reading of the widest possible expression.
+    EXPECT_FALSE(PatternCompiler::CompilePattern("48 [00-FF] C3", mode, mask).has_value());
+}
+
+TEST(MaskedPattern, CompilerRefusesVariableGaps) {
+    PatternMode mode = PatternMode::Exact;
+    std::vector<uint8_t> mask;
+
+    // Previously the gap token was dropped entirely, so this compiled to the three
+    // CONTIGUOUS bytes 48 8B C3 - a different pattern, reported as success.
+    EXPECT_FALSE(PatternCompiler::CompilePattern("48 8B {0-16} C3", mode, mask).has_value());
+    EXPECT_FALSE(PatternCompiler::CompilePattern("48 8B {0-4} C3", mode, mask).has_value());
+}
+
+TEST(MaskedPattern, CompilerRefusesHalfWildcard) {
+    PatternMode mode = PatternMode::Exact;
+    std::vector<uint8_t> mask;
+
+    // A lone '?' is an unrecognised token the tokeniser skips with a warning, which
+    // would silently shorten the pattern by one byte.
+    EXPECT_FALSE(PatternCompiler::CompilePattern("48 8B ? C3", mode, mask).has_value());
+}
+
+// ValidatePattern and CompilePattern are a matched pair - the fuzz harness runs both
+// on the same input and expects them to agree - so a construct one accepts and the
+// other refuses is a contradiction inside one module.
+TEST(MaskedPattern, ValidatorAgreesWithCompiler) {
+    std::string error;
+
+    EXPECT_TRUE(PatternCompiler::ValidatePattern("48 8B 05 C3", error));
+    EXPECT_TRUE(PatternCompiler::ValidatePattern("48 8B ?? C3", error));
+
+    for (const char* refused : { "48 8B [01-FF] C3", "48 [8B-8D] 05",
+                                 "48 8B {0-16} C3", "48 8B ? C3", "48 [ 05", "{ 8B" }) {
+        error.clear();
+        EXPECT_FALSE(PatternCompiler::ValidatePattern(refused, error)) << refused;
+        EXPECT_FALSE(error.empty()) << refused;
+
+        PatternMode mode = PatternMode::Exact;
+        std::vector<uint8_t> mask;
+        EXPECT_FALSE(PatternCompiler::CompilePattern(refused, mode, mask).has_value()) << refused;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Removal keeps the store consistent
+// ---------------------------------------------------------------------------
+
+// PatternMetadata::signatureId is documented as POSITIONAL - always equal to the
+// entry's index. RemovePattern erased from the cache without renumbering, so every
+// entry after the removed one carried an id one higher than its position.
+//
+// This asserts the OBSERVABLE consequence rather than reading the field: after the
+// middle pattern is removed the survivors must still match by name and report an id
+// that is a valid index, and the removed pattern must stop matching. Checking the
+// field alone would miss the other half of what RemovePattern got wrong - it called
+// m_automaton->Clear() directly when the cache emptied, leaving the hit counters and
+// the masked matchers populated with patterns the store no longer held.
+TEST(MaskedPattern, RemovalRenumbersAndLeavesTheStoreConsistent) {
+    const std::filesystem::path dbPath =
+        std::filesystem::temp_directory_path() /
+        ("ss_pattern_removal_" + std::to_string(::GetCurrentProcessId()) + ".sdb");
+    std::error_code ec;
+    std::filesystem::remove(dbPath, ec);
+
+    {
+        ShadowStrike::PatternStore::PatternStore store;
+        const auto created = store.CreateNew(dbPath.wstring(), 4ull * 1024 * 1024);
+        ASSERT_TRUE(created.IsSuccess()) << created.message;
+
+        using ShadowStrike::SignatureStore::ThreatLevel;
+        ASSERT_TRUE(store.AddPattern("11 22 33 44", "PatA", ThreatLevel::Low).IsSuccess());
+        ASSERT_TRUE(store.AddPattern("55 66 77 88", "PatB", ThreatLevel::Low).IsSuccess());
+        ASSERT_TRUE(store.AddPattern("99 AA BB CC", "PatC", ThreatLevel::Low).IsSuccess());
+
+        const auto scanFor = [&store](const std::vector<uint8_t>& body) {
+            std::vector<uint8_t> buffer(32, 0x00);
+            buffer.insert(buffer.end(), body.begin(), body.end());
+            buffer.insert(buffer.end(), 32, 0xFF);
+            ShadowStrike::SignatureStore::QueryOptions opts{};
+            return store.Scan(buffer, opts);
+        };
+
+        const std::vector<uint8_t> bytesA{ 0x11, 0x22, 0x33, 0x44 };
+        const std::vector<uint8_t> bytesB{ 0x55, 0x66, 0x77, 0x88 };
+        const std::vector<uint8_t> bytesC{ 0x99, 0xAA, 0xBB, 0xCC };
+
+        ASSERT_EQ(scanFor(bytesA).size(), 1u);
+        ASSERT_EQ(scanFor(bytesB).size(), 1u);
+        ASSERT_EQ(scanFor(bytesC).size(), 1u);
+
+        // Remove the MIDDLE one - that is what shifts every entry after it.
+        ASSERT_TRUE(store.RemovePattern(1).IsSuccess());
+
+        EXPECT_TRUE(scanFor(bytesB).empty()) << "a removed pattern must stop matching";
+
+        const auto hitsA = scanFor(bytesA);
+        ASSERT_EQ(hitsA.size(), 1u);
+        EXPECT_EQ(hitsA[0].signatureName, "PatA");
+        EXPECT_LT(hitsA[0].signatureId, 2u);
+
+        const auto hitsC = scanFor(bytesC);
+        ASSERT_EQ(hitsC.size(), 1u) << "the pattern after the removed one must survive";
+        EXPECT_EQ(hitsC[0].signatureName, "PatC");
+        // The invariant: a valid index into a now two-entry cache. Before the
+        // renumbering fix this reported 2, which is out of range.
+        EXPECT_LT(hitsC[0].signatureId, 2u);
+
+        // Emptying the store must leave it matching nothing, rather than leaving
+        // matchers that still hold the departed patterns.
+        ASSERT_TRUE(store.RemovePattern(0).IsSuccess());
+        ASSERT_TRUE(store.RemovePattern(0).IsSuccess());
+        EXPECT_TRUE(scanFor(bytesA).empty());
+        EXPECT_TRUE(scanFor(bytesC).empty());
+
+        store.Close();
+    }
+
+    std::filesystem::remove(dbPath, ec);
+}
+
+// A compiled wildcard pattern must be matchable by the matcher the store builds for
+// it: compile the text an author writes, hand the result to the matcher the store
+// would use, and require it to find a concrete instance.
 TEST(MaskedPattern, CompiledWildcardPatternIsMatchedByTheStoresMatcher) {
     PatternMode mode = PatternMode::Exact;
     std::vector<uint8_t> mask;

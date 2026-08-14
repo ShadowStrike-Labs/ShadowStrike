@@ -163,25 +163,71 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
     // STEP 1: DETECT PATTERN MODE
     // ========================================================================
 
+    // REFUSE WHAT THIS COMPILER CANNOT REPRESENT, BEFORE PARSING ANYTHING.
+    //
+    // Byte ranges and variable gaps used to be accepted here and compiled into a
+    // DIFFERENT pattern, successfully. Measured on the real implementation:
+    //
+    //   '[8B-8D]'  emitted its LOWER BOUND with a 0xFF (exact) mask, so the range
+    //              became "the byte 0x8B". '[00-FF]', which means any byte, became
+    //              "exactly 0x00" - the narrowest possible reading of the widest
+    //              possible expression.
+    //   '{0-16}'   was parsed, added to a local expansion counter used only for a
+    //              size check, and then DROPPED. "48 8B {0-16} C3" compiled to the
+    //              three CONTIGUOUS bytes 48 8B C3.
+    //
+    // Both returned a valid pattern and reported success, so an author had no way to
+    // learn that the stored bytes were not the bytes they wrote. Only PatternMode
+    // being Regex - which nothing in the product matches - kept the wrong pattern
+    // from producing wrong detections.
+    //
+    // Neither construct is expressible in this store's model, which is a fixed-length
+    // byte sequence plus a per-position AND-mask: a range admits a SET of values that
+    // no single mask describes, and a gap changes the LENGTH of a match. Supporting
+    // them needs a different matcher and a format that can carry per-position sets,
+    // not a wider mask. Until that exists, refusing is the only honest answer - a
+    // compiler that emits a pattern meaning something other than its input is worse
+    // than one that fails, because the failure is visible and the wrong pattern is not.
+    if (patternStr.find('[') != std::string::npos ||
+        patternStr.find(']') != std::string::npos) {
+        SS_LOG_ERROR(L"PatternCompiler",
+            L"Byte ranges are not supported: this store matches a fixed byte sequence "
+            L"plus an AND-mask, which cannot express a set of admissible values. Use "
+            L"'??' for any byte.");
+        return std::nullopt;
+    }
+
+    if (patternStr.find('{') != std::string::npos ||
+        patternStr.find('}') != std::string::npos) {
+        SS_LOG_ERROR(L"PatternCompiler",
+            L"Variable gaps are not supported: a gap changes the length of a match and "
+            L"every matcher here is fixed-length. Use a fixed number of '??' wildcards.");
+        return std::nullopt;
+    }
+
+    // A '?' must always be part of a '??' pair. The tokeniser below treats an
+    // unrecognised token as one to skip with a warning, so a lone '?' would silently
+    // shorten the pattern by one byte and still compile.
+    for (size_t i = 0; i < patternStr.length(); ++i) {
+        if (patternStr[i] != '?') {
+            continue;
+        }
+        const bool pairedWithNext = (i + 1 < patternStr.length() && patternStr[i + 1] == '?');
+        const bool pairedWithPrev = (i > 0 && patternStr[i - 1] == '?');
+        if (!pairedWithNext && !pairedWithPrev) {
+            SS_LOG_ERROR(L"PatternCompiler",
+                L"A wildcard must be written as '??' (one whole byte); a single '?' "
+                L"would be dropped and silently shorten the pattern");
+            return std::nullopt;
+        }
+    }
+
     const bool hasWildcard = patternStr.find("??") != std::string::npos;
-    const bool hasRegex = patternStr.find('[') != std::string::npos;
-    const bool hasVarGap = patternStr.find('{') != std::string::npos;
 
-    if (hasVarGap) {
-        outMode = PatternMode::Regex;
-    }
-    else if (hasRegex) {
-        outMode = PatternMode::Regex;
-    }
-    else if (hasWildcard) {
-        outMode = PatternMode::Wildcard;
-    }
-    else {
-        outMode = PatternMode::Exact;
-    }
+    outMode = hasWildcard ? PatternMode::Wildcard : PatternMode::Exact;
 
-    SS_LOG_DEBUG(L"PatternCompiler", L"Pattern mode: %u, HasWildcard=%d, HasRegex=%d, HasVarGap=%d",
-        static_cast<uint8_t>(outMode), hasWildcard, hasRegex, hasVarGap);
+    SS_LOG_DEBUG(L"PatternCompiler", L"Pattern mode: %u, HasWildcard=%d",
+        static_cast<uint8_t>(outMode), hasWildcard ? 1 : 0);
 
     // ========================================================================
     // STEP 2: TOKENIZE PATTERN
@@ -259,134 +305,10 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
     // STEP 3: PARSE EACH TOKEN
     // ========================================================================
 
-    size_t expandedSize = 0;
-
     for (size_t tokenIdx = 0; tokenIdx < tokens.size(); ++tokenIdx) {
         const std::string& token = tokens[tokenIdx];
 
         if (token.empty()) {
-            continue;
-        }
-
-        // Variable gap: {min-max}
-        if (token[0] == '{') {
-            if (outMode != PatternMode::Regex) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Variable gap only in regex mode");
-                return std::nullopt;
-            }
-
-            const size_t dashPos = token.find('-');
-            if (dashPos == std::string::npos || token.back() != '}') {
-                SS_LOG_ERROR(L"PatternCompiler", L"Invalid variable gap format: %S", token.c_str());
-                return std::nullopt;
-            }
-
-            try {
-                const std::string minStr = token.substr(1, dashPos - 1);
-                const std::string maxStr = token.substr(dashPos + 1, token.length() - dashPos - 2);
-
-                // Safe conversion with overflow protection
-                const unsigned long minGapUL = std::stoul(minStr);
-                const unsigned long maxGapUL = std::stoul(maxStr);
-
-                if (minGapUL > MAX_VAR_GAP_RANGE || maxGapUL > MAX_VAR_GAP_RANGE) {
-                    SS_LOG_ERROR(L"PatternCompiler", 
-                        L"Gap values exceed maximum (%zu)", MAX_VAR_GAP_RANGE);
-                    return std::nullopt;
-                }
-
-                const size_t minGap = static_cast<size_t>(minGapUL);
-                const size_t maxGap = static_cast<size_t>(maxGapUL);
-
-                if (minGap > maxGap) {
-                    SS_LOG_ERROR(L"PatternCompiler", L"Invalid gap range: [%zu, %zu]", minGap, maxGap);
-                    return std::nullopt;
-                }
-
-                // Check for expansion overflow
-                if (expandedSize > MAX_EXPANDED_SIZE - minGap) {
-                    SS_LOG_ERROR(L"PatternCompiler", L"Pattern expansion too large");
-                    return std::nullopt;
-                }
-
-                expandedSize += minGap;
-
-                SS_LOG_DEBUG(L"PatternCompiler", L"Variable gap: [%zu, %zu]", minGap, maxGap);
-            }
-            catch (const std::out_of_range&) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Gap value out of range: %S", token.c_str());
-                return std::nullopt;
-            }
-            catch (const std::invalid_argument&) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Invalid gap format: %S", token.c_str());
-                return std::nullopt;
-            }
-            catch (const std::exception& ex) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse gap '%S': %S",
-                    token.c_str(), ex.what());
-                return std::nullopt;
-            }
-
-            continue;
-        }
-
-        // Byte range: [01-FF] or [8B-8D]
-        if (token[0] == '[' && token.back() == ']') {
-            if (token.length() < 3) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Byte range too short: %S", token.c_str());
-                return std::nullopt;
-            }
-
-            const std::string rangeContent = token.substr(1, token.length() - 2);
-            const size_t dashPos = rangeContent.find('-');
-
-            if (dashPos == std::string::npos || dashPos == 0 || dashPos >= rangeContent.length() - 1) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Invalid byte range: %S", token.c_str());
-                return std::nullopt;
-            }
-
-            try {
-                const std::string minStr = rangeContent.substr(0, dashPos);
-                const std::string maxStr = rangeContent.substr(dashPos + 1);
-
-                const int minVal = std::stoi(minStr, nullptr, 16);
-                const int maxVal = std::stoi(maxStr, nullptr, 16);
-
-                // Validate byte range
-                if (minVal < 0 || minVal > 255 || maxVal < 0 || maxVal > 255) {
-                    SS_LOG_ERROR(L"PatternCompiler", 
-                        L"Byte range out of bounds: [%d, %d]", minVal, maxVal);
-                    return std::nullopt;
-                }
-
-                const uint8_t minByte = static_cast<uint8_t>(minVal);
-                const uint8_t maxByte = static_cast<uint8_t>(maxVal);
-
-                if (minByte > maxByte) {
-                    SS_LOG_ERROR(L"PatternCompiler", 
-                        L"Invalid byte range: [0x%02X, 0x%02X]", minByte, maxByte);
-                    return std::nullopt;
-                }
-
-                pattern.push_back(minByte);
-                outMask.push_back(0xFF);
-
-                SS_LOG_DEBUG(L"PatternCompiler", L"Byte range: [0x%02X, 0x%02X]", minByte, maxByte);
-            }
-            catch (const std::out_of_range&) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Byte range value out of range: %S", token.c_str());
-                return std::nullopt;
-            }
-            catch (const std::invalid_argument&) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Invalid byte range format: %S", token.c_str());
-                return std::nullopt;
-            }
-            catch (const std::exception& ex) {
-                SS_LOG_ERROR(L"PatternCompiler", L"Failed to parse byte range '%S': %S",
-                    token.c_str(), ex.what());
-                return std::nullopt;
-            }
-
             continue;
         }
 
@@ -486,11 +408,6 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
         return std::nullopt;
     }
 
-    if (expandedSize > MAX_EXPANDED_SIZE) {
-        SS_LOG_ERROR(L"PatternCompiler",
-            L"Pattern expansion too large: %zu (max=%zu)", expandedSize, MAX_EXPANDED_SIZE);
-        return std::nullopt;
-    }
 
     if (outMask.size() != pattern.size()) {
         SS_LOG_ERROR(L"PatternCompiler",
@@ -549,140 +466,56 @@ bool PatternCompiler::ValidatePattern(
         return false;
     }
 
-    // Check for balanced brackets
-    {
-        int bracketBalance = 0;
-        int braceBalance = 0;
+    // Refuse exactly what CompilePattern refuses, for exactly the same reasons.
+    //
+    // These two functions are a matched pair - the Fuzzer harness calls ValidatePattern
+    // and then CompilePattern on the same input and expects them to agree - so a
+    // construct accepted here and rejected there (or worse, MIS-COMPILED there) is a
+    // contradiction inside one module. This block used to validate the syntax of byte
+    // ranges and variable gaps in detail: balanced brackets, well-formed min-max pairs,
+    // ranges in ascending order. All of it carefully checked the shape of constructs the
+    // compiler then turned into a different pattern.
+    if (patternStr.find('[') != std::string::npos ||
+        patternStr.find(']') != std::string::npos) {
+        errorMessage = "Byte ranges ('[8B-8D]') are not supported: a fixed byte sequence "
+                       "plus an AND-mask cannot express a set of admissible values. "
+                       "Use '??' for any byte.";
+        return false;
+    }
 
-        for (size_t i = 0; i < patternStr.length(); ++i) {
-            char c = patternStr[i];
+    if (patternStr.find('{') != std::string::npos ||
+        patternStr.find('}') != std::string::npos) {
+        errorMessage = "Variable gaps ('{0-16}') are not supported: a gap changes the "
+                       "length of a match and every matcher here is fixed-length. "
+                       "Use a fixed number of '??' wildcards.";
+        return false;
+    }
 
-            if (c == '[') bracketBalance++;
-            else if (c == ']') bracketBalance--;
-            else if (c == '{') braceBalance++;
-            else if (c == '}') braceBalance--;
-
-            if (bracketBalance < 0 || braceBalance < 0) {
-                errorMessage = "Unbalanced brackets at position " + std::to_string(i);
-                return false;
-            }
+    // Character set: hex digits, whitespace, and '?' for wildcards. Nothing else.
+    for (size_t i = 0; i < patternStr.length(); ++i) {
+        const char c = patternStr[i];
+        if (std::isxdigit(static_cast<unsigned char>(c)) != 0 ||
+            std::isspace(static_cast<unsigned char>(c)) != 0 ||
+            c == '?') {
+            continue;
         }
+        errorMessage = std::string("Invalid character '") + c +
+            "' at position " + std::to_string(i);
+        return false;
+    }
 
-        if (bracketBalance != 0) {
-            errorMessage = "Unbalanced [ ] brackets";
+    // A '?' must be part of a '??' pair: the tokeniser skips an unrecognised token with
+    // a warning, so a lone '?' would silently shorten the pattern by one byte.
+    for (size_t i = 0; i < patternStr.length(); ++i) {
+        if (patternStr[i] != '?') {
+            continue;
+        }
+        const bool pairedWithNext = (i + 1 < patternStr.length() && patternStr[i + 1] == '?');
+        const bool pairedWithPrev = (i > 0 && patternStr[i - 1] == '?');
+        if (!pairedWithNext && !pairedWithPrev) {
+            errorMessage = "A wildcard must be written as '??' (one whole byte) at "
+                           "position " + std::to_string(i);
             return false;
-        }
-
-        if (braceBalance != 0) {
-            errorMessage = "Unbalanced { } braces";
-            return false;
-        }
-    }
-
-    // Validate hex characters
-    {
-        bool inBracket = false;
-        bool inBrace = false;
-
-        for (size_t i = 0; i < patternStr.length(); ++i) {
-            char c = patternStr[i];
-
-            if (c == '[') inBracket = true;
-            else if (c == ']') inBracket = false;
-            else if (c == '{') inBrace = true;
-            else if (c == '}') inBrace = false;
-
-            // Outside brackets/braces: must be hex, space, ?, -, [, ], {, }
-            if (!inBracket && !inBrace) {
-                if (!std::isxdigit(static_cast<unsigned char>(c)) &&
-                    !std::isspace(static_cast<unsigned char>(c)) &&
-                    c != '?' && c != '-' && c != '[' && c != ']' && c != '{' && c != '}') {
-
-                    errorMessage = std::string("Invalid character '") + c +
-                        "' at position " + std::to_string(i);
-                    return false;
-                }
-            }
-        }
-    }
-
-    // Validate variable gaps syntax
-    {
-        size_t bracePos = 0;
-        while ((bracePos = patternStr.find('{', bracePos)) != std::string::npos) {
-            size_t closePos = patternStr.find('}', bracePos);
-            if (closePos == std::string::npos) {
-                errorMessage = "Unclosed { at position " + std::to_string(bracePos);
-                return false;
-            }
-
-            std::string gapStr = patternStr.substr(bracePos + 1, closePos - bracePos - 1);
-            size_t dashPos = gapStr.find('-');
-
-            if (dashPos == std::string::npos) {
-                errorMessage = "Invalid gap format (need min-max)";
-                return false;
-            }
-
-            try {
-                size_t minGap = std::stoul(gapStr.substr(0, dashPos));
-                size_t maxGap = std::stoul(gapStr.substr(dashPos + 1));
-
-                if (minGap > maxGap || maxGap > 256) {
-                    errorMessage = "Gap range invalid: [" + std::to_string(minGap) +
-                        ", " + std::to_string(maxGap) + "]";
-                    return false;
-                }
-            }
-            catch (const std::exception& ex) {
-                errorMessage = std::string("Failed to parse gap values: ") + ex.what();
-                return false;
-            }
-
-            bracePos = closePos + 1;
-        }
-    }
-
-    // Validate byte ranges
-    {
-        size_t bracketPos = 0;
-        while ((bracketPos = patternStr.find('[', bracketPos)) != std::string::npos) {
-            // Skip if this is part of a variable gap
-            if (bracketPos > 0 && patternStr[bracketPos - 1] == '{') {
-                bracketPos++;
-                continue;
-            }
-
-            size_t closePos = patternStr.find(']', bracketPos);
-            if (closePos == std::string::npos) {
-                errorMessage = "Unclosed [ at position " + std::to_string(bracketPos);
-                return false;
-            }
-
-            std::string rangeStr = patternStr.substr(bracketPos + 1, closePos - bracketPos - 1);
-            size_t dashPos = rangeStr.find('-');
-
-            if (dashPos == std::string::npos) {
-                errorMessage = "Invalid byte range (need min-max)";
-                return false;
-            }
-
-            try {
-                uint8_t minByte = static_cast<uint8_t>(std::stoi(rangeStr.substr(0, dashPos), nullptr, 16));
-                uint8_t maxByte = static_cast<uint8_t>(std::stoi(rangeStr.substr(dashPos + 1), nullptr, 16));
-
-                if (minByte > maxByte) {
-                    errorMessage = "Byte range invalid: [0x" + rangeStr.substr(0, dashPos) +
-                        ", 0x" + rangeStr.substr(dashPos + 1) + "]";
-                    return false;
-                }
-            }
-            catch (const std::exception& ex) {
-                errorMessage = std::string("Failed to parse byte range: ") + ex.what();
-                return false;
-            }
-
-            bracketPos = closePos + 1;
         }
     }
 
@@ -1593,20 +1426,32 @@ StoreError PatternStore::RemovePattern(uint64_t signatureId) noexcept {
 
     m_patternCache.erase(it);
 
-    // Rebuild automaton only if there are patterns remaining
-    if (!m_patternCache.empty()) {
-        StoreError rebuildErr = BuildAutomaton();
-        if (!rebuildErr.IsSuccess()) {
-            SS_LOG_WARN(L"PatternStore", L"RemovePattern: Automaton rebuild failed");
-            return rebuildErr;
-        }
+    // RENUMBER. PatternMetadata::signatureId is POSITIONAL - the header states that it
+    // always equals the entry's index - and erase() shifts every element after the one
+    // removed, so without this the cache [A:0, B:1, C:2] minus B leaves index 1 holding
+    // signatureId 2 and the invariant is broken for the rest of the store's life.
+    //
+    // Rebuild, Compact and OptimizeByHitRate all renumber after reordering; this was the
+    // one mutator that did not. It did not break matching, because task 59 keyed the
+    // automaton by cache index rather than by this field - but it broke the id reported
+    // in every DetectionResult produced afterwards, and it left a documented invariant
+    // false for any future consumer that trusts it.
+    for (size_t i = 0; i < m_patternCache.size(); ++i) {
+        m_patternCache[i].signatureId = i;
     }
-    else {
-        // Clear automaton when all patterns are removed
-        SS_LOG_DEBUG(L"PatternStore", L"RemovePattern: No patterns remaining, clearing automaton");
-        if (m_automaton) {
-            m_automaton->Clear();
-        }
+
+    // Rebuild unconditionally, including when the cache is now empty.
+    //
+    // The empty case used to call m_automaton->Clear() directly instead, which left
+    // m_hitCounters and (once masked matchers existed) m_maskedMatchers holding entries
+    // for patterns the store no longer has - so a masked pattern could keep matching
+    // after being removed. BuildAutomaton already handles an empty cache correctly: it
+    // releases the automaton, clears the counters and rebuilds the masked matchers from
+    // the now-empty cache, reporting the state plainly rather than as a failure.
+    const StoreError rebuildErr = BuildAutomaton();
+    if (!rebuildErr.IsSuccess()) {
+        SS_LOG_WARN(L"PatternStore", L"RemovePattern: Automaton rebuild failed");
+        return rebuildErr;
     }
 
     return StoreError{ SignatureStoreError::Success };
