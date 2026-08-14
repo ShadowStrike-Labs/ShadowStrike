@@ -1065,29 +1065,78 @@ std::vector<DetectionResult> PatternStore::Scan(
         return results;
     }
 
-    // Use SIMD if enabled and available
-    if (m_simdEnabled.load(std::memory_order_acquire) && SIMDMatcher::IsAVX2Available()) {
+    // ========================================================================
+    // DISPATCH: cheapest matcher that can answer, then the ones it cannot
+    // ========================================================================
+    //
+    // The order here used to be inverted, and the cost of that fell hardest on
+    // exactly the common case. ScanWithSIMD ran FIRST and unconditionally, doing a
+    // full AVX2 pass over the buffer for EVERY pattern - O(patterns x bytes) - and
+    // the O(bytes) automaton ran only `if (results.empty())`. So a clean file, which
+    // is almost every file, paid the entire per-pattern sweep AND then the automaton
+    // sweep, while a file that matched early paid the sweep and skipped the cheap
+    // pass. With one shipped pattern that is invisible; the pattern section is meant
+    // to hold thousands, and at that size the default was the expensive one.
+    //
+    // Aho-Corasick finds every exact pattern in ONE pass whose cost is independent of
+    // how many patterns are loaded, so it is strictly the better default and there is
+    // no coverage argument for the old order: both matchers consider precisely the
+    // PatternMode::Exact set.
+    //
+    // The three passes cover disjoint pattern sets and are not alternatives:
+    //   automaton  -> every exact pattern, O(bytes)
+    //   SIMD       -> the same exact patterns, ONLY when no automaton is available
+    //                 (compilation failed and a previous automaton was not retained)
+    //   masked     -> wildcard/byte-mask patterns, which the automaton cannot express
+    bool automatonServedExactPatterns = false;
+
+    {
+        auto acResults = ScanWithAutomaton(buffer, options, deadline,
+            automatonServedExactPatterns);
         try {
-            auto simdResults = ScanWithSIMD(buffer, options, deadline);
-            results.insert(results.end(), 
-                std::make_move_iterator(simdResults.begin()),
-                std::make_move_iterator(simdResults.end()));
-        } catch (const std::exception& ex) {
-            SS_LOG_WARN(L"PatternStore", L"Scan: SIMD scan failed (%S), falling back to automaton",
-                ex.what());
-            results.clear();
-        }
-    }
-    
-    // Fall back to or supplement with automaton search
-    if (results.empty() || !m_simdEnabled.load(std::memory_order_acquire)) {
-        try {
-            auto acResults = ScanWithAutomaton(buffer, options, deadline);
             results.insert(results.end(),
                 std::make_move_iterator(acResults.begin()),
                 std::make_move_iterator(acResults.end()));
-        } catch (const std::exception& ex) {
-            SS_LOG_ERROR(L"PatternStore", L"Scan: Automaton scan failed: %S", ex.what());
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"PatternStore", L"Scan: out of memory collecting automaton matches");
+        }
+    }
+
+    // Fallback for the exact patterns, NOT a supplement: reached only when the
+    // automaton could not run. Skipping it there would silently drop every exact
+    // pattern for as long as the automaton stays unavailable.
+    if (!automatonServedExactPatterns) {
+        if (m_simdEnabled.load(std::memory_order_acquire) && SIMDMatcher::IsAVX2Available()) {
+            auto simdResults = ScanWithSIMD(buffer, options, deadline);
+            try {
+                results.insert(results.end(),
+                    std::make_move_iterator(simdResults.begin()),
+                    std::make_move_iterator(simdResults.end()));
+            } catch (const std::bad_alloc&) {
+                SS_LOG_ERROR(L"PatternStore", L"Scan: out of memory collecting SIMD matches");
+            }
+        } else {
+            // Reported rather than passed over: with no automaton and no SIMD, the
+            // exact patterns in this store are not being scanned at all, and that
+            // must not look like a clean result.
+            SS_LOG_ERROR(L"PatternStore",
+                L"Scan: no automaton is available and the SIMD fallback is unavailable "
+                L"(simdEnabled=%d avx2=%d) - exact patterns were NOT scanned for this buffer",
+                m_simdEnabled.load(std::memory_order_acquire) ? 1 : 0,
+                SIMDMatcher::IsAVX2Available() ? 1 : 0);
+        }
+    }
+
+    // Masked patterns, always, in addition to the above. Returns immediately when the
+    // store holds none, which is the case for all shipped content today.
+    {
+        auto maskedResults = ScanWithMaskedPatterns(buffer, options, deadline);
+        try {
+            results.insert(results.end(),
+                std::make_move_iterator(maskedResults.begin()),
+                std::make_move_iterator(maskedResults.end()));
+        } catch (const std::bad_alloc&) {
+            SS_LOG_ERROR(L"PatternStore", L"Scan: out of memory collecting masked matches");
         }
     }
 
@@ -2515,6 +2564,7 @@ StoreError PatternStore::LoadPatternsFromDatabase() noexcept {
     size_t loaded = 0;
     size_t rejected = 0;
     size_t unmatchable = 0;
+    size_t maskedLoaded = 0;
 
     for (uint64_t i = 0; i < entryCount; ++i) {
         const auto* entry = m_mappedView.GetAt<PatternEntry>(
@@ -2680,8 +2730,14 @@ StoreError PatternStore::LoadPatternsFromDatabase() noexcept {
             meta.modificationCount = 0;
             meta.isDeprecated = false;
 
-            if (meta.mode != PatternMode::Exact) {
+            // Counted by what can actually scan the pattern, not by whether it is
+            // exact. Wildcard and ByteMask entries are scanned by the Boyer-Moore pass;
+            // Regex mode - byte ranges and variable gaps - is matched by nothing,
+            // because neither is expressible as a fixed-length pattern plus an AND-mask.
+            if (meta.mode == PatternMode::Regex) {
                 ++unmatchable;
+            } else if (meta.mode != PatternMode::Exact) {
+                ++maskedLoaded;
             }
 
             m_patternCache.push_back(std::move(meta));
@@ -2703,15 +2759,26 @@ StoreError PatternStore::LoadPatternsFromDatabase() noexcept {
             rejected, entryCount);
     }
 
-    // Stated explicitly because it is a real coverage hole, not a detail: nothing
-    // in the product matches a non-exact pattern. BuildAutomaton adds only
-    // PatternMode::Exact, ScanWithSIMD skips everything else, and BoyerMooreMatcher
-    // - the one matcher that takes a mask - is never instantiated anywhere.
+    // Masked patterns ARE scanned now, by the Boyer-Moore pass that BuildMaskedMatchers
+    // compiles and ScanWithMaskedPatterns runs. This line used to say that nothing in
+    // the product matched them, which was true when it was written and would now be a
+    // false statement in the log.
+    if (maskedLoaded > 0) {
+        SS_LOG_INFO(L"PatternStore",
+            L"LoadPatterns: %zu loaded pattern(s) carry a wildcard mask and are scanned "
+            L"by the masked pass rather than the automaton",
+            maskedLoaded);
+    }
+
+    // Regex mode remains matched by NOTHING, and that is a property of the construct
+    // rather than a missing implementation: a byte range is not a bitmask and a variable
+    // gap changes the length of a match, so neither the automaton nor a fixed-length
+    // masked matcher can express one. phantom-sigbuild refuses both at build time.
     if (unmatchable > 0) {
-        SS_LOG_WARN(L"PatternStore",
-            L"LoadPatterns: %zu loaded pattern(s) are wildcard/mask/regex mode, and NO "
-            L"matcher in this build scans those - they are held in the store and will "
-            L"not produce detections until a wildcard matcher is wired into the scan path",
+        SS_LOG_ERROR(L"PatternStore",
+            L"LoadPatterns: %zu loaded pattern(s) are Regex mode (byte range or variable "
+            L"gap) and NO matcher in this build scans those - they are held in the store "
+            L"and will never produce a detection",
             unmatchable);
     }
 
@@ -2722,7 +2789,135 @@ StoreError PatternStore::LoadPatternsFromDatabase() noexcept {
     return StoreError{ SignatureStoreError::Success };
 }
 
+void PatternStore::BuildMaskedMatchers() noexcept {
+    m_maskedMatchers.clear();
+
+    size_t withWildcards = 0;
+    size_t maskIsFullyExact = 0;
+    size_t refusedMaskShape = 0;
+    size_t refusedRegex = 0;
+    size_t refusedBuild = 0;
+
+    for (size_t cacheIndex = 0; cacheIndex < m_patternCache.size(); ++cacheIndex) {
+        const auto& meta = m_patternCache[cacheIndex];
+
+        // Exact patterns belong to the automaton. Building a Boyer-Moore matcher for
+        // them as well would double every match.
+        if (meta.mode == PatternMode::Exact) {
+            continue;
+        }
+
+        if (meta.pattern.empty()) {
+            continue;
+        }
+
+        // Regex mode covers byte ranges ([01-FF]) and variable gaps ({0-16}). Neither
+        // is expressible as a fixed-length pattern plus an AND-mask: a range is not a
+        // bitmask, and a variable gap changes the LENGTH of a match. Boyer-Moore is a
+        // fixed-length matcher, so it cannot be made to serve these by configuration.
+        //
+        // Reported at ERROR because the pattern is in the store and will never fire.
+        // phantom-sigbuild refuses both constructs at build time, so a Regex-mode entry
+        // can only arrive through the runtime AddPattern API, which bypasses that
+        // check - and see the compiler defect that makes such an entry wrong as well as
+        // unmatched: '[01-FF]' compiles to an exact match on 0x01 and '{0-16}' is
+        // dropped entirely, so the stored bytes are not what the author wrote.
+        if (meta.mode == PatternMode::Regex) {
+            ++refusedRegex;
+            SS_LOG_ERROR(L"PatternStore",
+                L"BuildMaskedMatchers: pattern '%S' (index %zu) is Regex mode - no "
+                L"matcher in this build can scan a byte range or a variable gap, so it "
+                L"will never produce a detection",
+                meta.name.c_str(), cacheIndex);
+            continue;
+        }
+
+        // A masked pattern whose mask does not describe its bytes cannot be scanned
+        // correctly. BoyerMooreMatcher would silently reconcile the two by padding with
+        // 0xFF or truncating, which changes which bytes are wildcards - so the entry is
+        // refused here instead, where the disagreement can be named.
+        if (meta.mask.size() != meta.pattern.size()) {
+            ++refusedMaskShape;
+            SS_LOG_ERROR(L"PatternStore",
+                L"BuildMaskedMatchers: pattern '%S' (index %zu) declares mode %u but its "
+                L"mask is %zu byte(s) for %zu pattern byte(s) - refused rather than "
+                L"padded, because padding would change which positions are wildcards",
+                meta.name.c_str(), cacheIndex, static_cast<unsigned>(meta.mode),
+                meta.mask.size(), meta.pattern.size());
+            continue;
+        }
+
+        const bool hasWildcardPosition = std::any_of(meta.mask.begin(), meta.mask.end(),
+            [](uint8_t maskByte) { return maskByte != 0xFFu; });
+
+        // A mask of all 0xFF still gets a matcher. It is equivalent to an exact pattern,
+        // but the automaton only accepts mode == Exact, so declining to build one here
+        // would leave the pattern owned by neither pass - scanned by nothing while
+        // looking loaded. Cheap to keep correct, and Boyer-Moore keeps its full
+        // good-suffix shifts in this case because no mask position is degraded.
+        if (hasWildcardPosition) {
+            ++withWildcards;
+        } else {
+            ++maskIsFullyExact;
+        }
+
+        try {
+            auto matcher = std::make_unique<BoyerMooreMatcher>(
+                std::span<const uint8_t>(meta.pattern),
+                std::span<const uint8_t>(meta.mask));
+
+            if (!matcher->IsValid()) {
+                ++refusedBuild;
+                SS_LOG_ERROR(L"PatternStore",
+                    L"BuildMaskedMatchers: matcher for pattern '%S' (index %zu, %zu byte(s)) "
+                    L"did not build a usable state and is DISCARDED - it would have "
+                    L"reported no matches for every buffer",
+                    meta.name.c_str(), cacheIndex, meta.pattern.size());
+                continue;
+            }
+
+            m_maskedMatchers.push_back(MaskedMatcher{ cacheIndex, std::move(matcher) });
+        } catch (const std::bad_alloc&) {
+            ++refusedBuild;
+            SS_LOG_ERROR(L"PatternStore",
+                L"BuildMaskedMatchers: out of memory building a matcher for pattern '%S' "
+                L"(index %zu); it will not be scanned",
+                meta.name.c_str(), cacheIndex);
+        }
+    }
+
+    const size_t unscannable = refusedRegex + refusedMaskShape + refusedBuild;
+
+    if (unscannable > 0) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"BuildMaskedMatchers: %zu non-exact pattern(s) CANNOT be scanned by this "
+            L"build (%zu regex, %zu mask/pattern size disagreement, %zu failed to build) "
+            L"- the store holds them and they will never produce a detection",
+            unscannable, refusedRegex, refusedMaskShape, refusedBuild);
+    }
+
+    if (!m_maskedMatchers.empty()) {
+        SS_LOG_INFO(L"PatternStore",
+            L"BuildMaskedMatchers: %zu masked pattern(s) ready to scan (%zu with wildcard "
+            L"positions, %zu whose mask is fully exact)",
+            m_maskedMatchers.size(), withWildcards, maskIsFullyExact);
+    }
+}
+
 StoreError PatternStore::BuildAutomaton() noexcept {
+    // Rebuild the masked matchers FIRST, and unconditionally.
+    //
+    // This must happen before any early return below. A store holding only masked
+    // patterns produces addedCount == 0, which returns Success early - so building the
+    // matchers after that point would leave a store full of wildcard patterns with no
+    // matchers at all, reporting success. That is the same shape as the empty automaton
+    // this function already had to learn to distinguish from a failure.
+    //
+    // Both callers of this function hold m_globalLock exclusively, which is what makes
+    // clearing and repopulating m_maskedMatchers safe against the shared_lock the scan
+    // passes take.
+    BuildMaskedMatchers();
+
     // Create new automaton separately for exception safety
     // Only replace m_automaton if compilation succeeds
     auto newAutomaton = std::make_unique<AhoCorasickAutomaton>();
@@ -2742,8 +2937,10 @@ StoreError PatternStore::BuildAutomaton() noexcept {
     // check, with a warning calling the id invalid. Store ready, automaton compiled,
     // matches found, results thrown away.
     //
-    // Only PatternMode::Exact is added. Non-exact patterns are not matched by
-    // anything in this build - the load path reports that count explicitly.
+    // Only PatternMode::Exact is added, because Aho-Corasick keys its transitions on
+    // exact byte values and has no edge to follow for a "match any byte" position.
+    // Masked patterns are therefore not a gap here - they are owned by the separate
+    // Boyer-Moore pass that BuildMaskedMatchers compiled above.
     size_t addedCount = 0;
     for (size_t cacheIndex = 0; cacheIndex < m_patternCache.size(); ++cacheIndex) {
         const auto& meta = m_patternCache[cacheIndex];
@@ -2777,11 +2974,28 @@ StoreError PatternStore::BuildAutomaton() noexcept {
     // previous automaton would go on matching content the store no longer holds.
     if (addedCount == 0) {
         m_automaton.reset();
-        m_hitCounters.clear();
-        SS_LOG_INFO(L"PatternStore",
-            L"BuildAutomaton: no exact patterns are loaded, so there is nothing to "
-            L"compile; pattern scanning will report no matches until pattern content "
-            L"is added to the database");
+
+        // The hit counters are sized to the CACHE, not to the automaton. A store with
+        // no exact patterns can still hold masked ones that the Boyer-Moore pass scans
+        // and counts, and clearing the counters unconditionally would silently disable
+        // the heatmap for exactly that store.
+        if (m_maskedMatchers.empty()) {
+            m_hitCounters.clear();
+            SS_LOG_INFO(L"PatternStore",
+                L"BuildAutomaton: no exact patterns are loaded, so there is nothing to "
+                L"compile; pattern scanning will report no matches until pattern content "
+                L"is added to the database");
+        } else {
+            m_hitCounters.assign(m_patternCache.size(), 0);
+            for (size_t i = 0; i < m_patternCache.size(); ++i) {
+                m_hitCounters[i] = m_patternCache[i].hitCount;
+            }
+            SS_LOG_INFO(L"PatternStore",
+                L"BuildAutomaton: no exact patterns to compile, but %zu masked pattern(s) "
+                L"are loaded and will be scanned by the Boyer-Moore pass",
+                m_maskedMatchers.size());
+        }
+
         return StoreError{ SignatureStoreError::Success };
     }
 
@@ -2817,14 +3031,12 @@ StoreError PatternStore::BuildAutomaton() noexcept {
 std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
     std::span<const uint8_t> buffer,
     const QueryOptions& options,
-    const LARGE_INTEGER& deadline
+    const LARGE_INTEGER& deadline,
+    bool& outServedExactPatterns
 ) const noexcept {
     std::vector<DetectionResult> results;
 
-    if (!m_automaton) {
-        SS_LOG_DEBUG(L"PatternStore", L"ScanWithAutomaton: No automaton available");
-        return results;
-    }
+    outServedExactPatterns = false;
 
     if (buffer.empty()) {
         return results;
@@ -2832,7 +3044,28 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
 
     // Take reader lock for thread-safe access to pattern cache
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
-    
+
+    // The automaton is checked HERE, under the lock, and not before it.
+    //
+    // This test used to sit above the lock acquisition while m_automaton->Search()
+    // below runs inside it. BuildAutomaton both resets that unique_ptr (when no exact
+    // patterns remain) and move-assigns it (destroying the previous automaton), under
+    // the exclusive lock - so between an unlocked check and the locked dereference the
+    // pointer could become null or refer to a destroyed object. Task 61 fixed the hit
+    // counters in this same function and left the pointer they are reached through
+    // unsynchronised, which is the more serious half.
+    if (!m_automaton) {
+        SS_LOG_DEBUG(L"PatternStore", L"ScanWithAutomaton: No automaton available");
+        return results;
+    }
+
+    // Reaching this point means the automaton is present and will be searched, so the
+    // exact patterns are covered and the caller must not run the fallback. Set before
+    // the search rather than after: a search that finds nothing, times out, or stops
+    // at maxResults has still covered them, and re-running a per-pattern sweep after a
+    // timeout would spend more of a budget that has already expired.
+    outServedExactPatterns = true;
+
     // Capture cache size once under lock to avoid TOCTOU
     const size_t cacheSize = m_patternCache.size();
 
@@ -3013,6 +3246,135 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
     }
 
     SS_LOG_DEBUG(L"PatternStore", L"ScanWithSIMD: Found %zu matches", results.size());
+
+    return results;
+}
+
+std::vector<DetectionResult> PatternStore::ScanWithMaskedPatterns(
+    std::span<const uint8_t> buffer,
+    const QueryOptions& options,
+    const LARGE_INTEGER& deadline
+) const noexcept {
+    std::vector<DetectionResult> results;
+
+    if (buffer.empty()) {
+        return results;
+    }
+
+    // Reader lock, held for the whole pass: it guards both m_maskedMatchers (which
+    // BuildMaskedMatchers clears and repopulates under the exclusive lock) and the
+    // cache entries the results are built from.
+    std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+    // Checked under the lock for the same reason the automaton pointer is - the vector
+    // this reads is replaced wholesale by a rebuild.
+    if (m_maskedMatchers.empty()) {
+        return results;
+    }
+
+    const size_t cacheSize = m_patternCache.size();
+
+    size_t matchCount = 0;
+    const size_t maxResults = options.maxResults > 0 ? options.maxResults : SIZE_MAX;
+
+    try {
+        const size_t reserveCapacity = (std::min)(static_cast<size_t>(256),
+            static_cast<size_t>(maxResults));
+        results.reserve(reserveCapacity);
+    } catch (const std::bad_alloc&) {
+        SS_LOG_WARN(L"PatternStore", L"ScanWithMaskedPatterns: Failed to reserve results capacity");
+    }
+
+    size_t scannedPatterns = 0;
+
+    for (const auto& entry : m_maskedMatchers) {
+        if (matchCount >= maxResults) {
+            break;
+        }
+
+        // The deadline is tested on EVERY iteration, not on a stride like the SIMD pass.
+        // One iteration here is a full traversal of the buffer, and a masked pattern
+        // degrades Boyer-Moore's good-suffix shifts to 1, so a single iteration is the
+        // most expensive unit of work in the whole scan path. Amortising the clock read
+        // across 32 of them, which is right for cheap iterations, would allow a 32-pass
+        // overrun of a budget that exists to bound the kernel's wait.
+        //
+        // HONEST LIMIT: this bounds the pass BETWEEN patterns, not within one. A single
+        // masked pattern against a large buffer runs to completion regardless of the
+        // deadline, because BoyerMooreMatcher::Search has no interruption point. Its own
+        // iteration cap is the only bound inside a call.
+        if (IsDeadlineExceeded(deadline)) {
+            SS_LOG_WARN(L"PatternStore",
+                L"ScanWithMaskedPatterns: deadline exceeded after %zu of %zu masked "
+                L"pattern(s); the remainder were NOT scanned for this buffer",
+                scannedPatterns, m_maskedMatchers.size());
+            break;
+        }
+
+        // Both guards are structural rather than defensive: the matcher is only ever
+        // stored non-null and valid, and cacheIndex is only ever set from a live cache
+        // position under the exclusive lock. They are here because this vector and the
+        // cache are two structures that must agree, and if a future change breaks that
+        // agreement the correct outcome is to skip and say so, not to index out of range.
+        if (!entry.matcher) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"ScanWithMaskedPatterns: null matcher at cache index %zu - skipped",
+                entry.cacheIndex);
+            continue;
+        }
+
+        if (entry.cacheIndex >= cacheSize) {
+            SS_LOG_ERROR(L"PatternStore",
+                L"ScanWithMaskedPatterns: matcher references cache index %zu but the cache "
+                L"holds %zu entrie(s) - skipped; the matchers are out of step with the cache",
+                entry.cacheIndex, cacheSize);
+            continue;
+        }
+
+        const auto& meta = m_patternCache[entry.cacheIndex];
+
+        if (meta.pattern.size() > buffer.size()) {
+            continue;
+        }
+
+        ++scannedPatterns;
+
+        const std::vector<size_t> offsets = entry.matcher->Search(buffer);
+
+        for (const size_t offset : offsets) {
+            if (matchCount >= maxResults) {
+                break;
+            }
+
+            try {
+                DetectionResult result{};
+                result.signatureId = meta.signatureId;
+                result.signatureName = meta.name;
+                result.threatLevel = meta.threatLevel;
+                result.fileOffset = offset;
+                result.description = "Masked pattern match";
+
+                results.push_back(std::move(result));
+                matchCount++;
+
+                // Under the shared lock held by this function - see the equivalent
+                // comment in ScanWithAutomaton for why the caller must not do this.
+                if (m_heatmapEnabled.load(std::memory_order_acquire) &&
+                    entry.cacheIndex < m_hitCounters.size()) {
+                    std::atomic_ref<uint64_t> counter(
+                        const_cast<std::vector<uint64_t>&>(m_hitCounters)[entry.cacheIndex]);
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                }
+            } catch (const std::bad_alloc&) {
+                SS_LOG_WARN(L"PatternStore",
+                    L"ScanWithMaskedPatterns: Memory allocation failed for result");
+            }
+        }
+    }
+
+    SS_LOG_DEBUG(L"PatternStore",
+        L"ScanWithMaskedPatterns: Found %zu matches across %zu masked pattern(s)",
+        results.size(), scannedPatterns);
 
     return results;
 }

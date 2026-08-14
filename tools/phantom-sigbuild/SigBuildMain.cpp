@@ -835,28 +835,50 @@ void CollectHashLinesForVerification(const std::vector<std::wstring>& files,
 // pattern that will not match.
 struct PatternLine {
     std::vector<uint8_t> bytes;
+    // Parallel to bytes: 0xFF means the byte must match exactly, 0x00 means any byte
+    // matches there. Mirrors PatternCompiler's own mask convention so the instance this
+    // tool plants for verification is the same shape the store will scan for.
+    std::vector<uint8_t> mask;
     std::string          name;
+    bool                 masked{ false };
 };
 
 // Collects the literal pattern lines, and REPORTS any pattern this build cannot
 // match so the caller can refuse it.
 //
-// Wildcards ('??'), byte ranges ('[01-FF]') and variable gaps ('{0-16}') are not
-// merely unverifiable here - nothing in the product matches them at all.
-// PatternStore::BuildAutomaton adds only PatternMode::Exact, ScanWithSIMD skips
-// every other mode, and BoyerMooreMatcher - the one matcher that accepts a mask -
-// is never instantiated anywhere in the product. So such a pattern is compiled,
-// written to the database, counted in the statistics, and can never fire.
+// WHAT CHANGED AND WHY THE REFUSAL IS NOW PARTIAL:
 //
-// Measured before this refusal existed: "48 8B ?? C3" and "48 8B [01-FF] C3" both
-// built at exit 0 and shipped, while "48 8B {0-16} C3" failed with a message about
-// the HASH line format - a rejection whose stated reason pointed at the wrong file
-// type entirely. Two silent holes and one misleading error.
+// '??' wildcards ARE matched now. PatternStore compiles a BoyerMooreMatcher per
+// masked pattern in BuildMaskedMatchers and scans them in ScanWithMaskedPatterns,
+// which runs on every buffer alongside the automaton. The matcher's bad-character
+// table is mask-aware and its good-suffix table degrades to shift-1 whenever any
+// mask position is not 0xFF, so the skip logic cannot step over a valid match.
 //
-// Refusing is the honest outcome: an author gets a build error naming the exact
-// construct instead of a database that reports a pattern it will never match. The
-// refusal must be lifted in the SAME change that wires a wildcard-capable matcher
-// into the scan path, never before.
+// Byte ranges ('[01-FF]') and variable gaps ('{0-16}') are STILL refused, and this
+// is a property of the constructs rather than a missing matcher:
+//   - a byte range is not an AND-mask. '[8B-8D]' admits three values; no single
+//     pattern byte plus mask byte expresses that.
+//   - a variable gap changes the LENGTH of a match, and Boyer-Moore is a
+//     fixed-length matcher.
+// Making either work needs a different algorithm, not a wider mask.
+//
+// There is a second and worse reason to refuse them: PatternCompiler does not merely
+// fail to match them, it compiles them into a DIFFERENT pattern and reports success.
+// '[01-FF]' becomes an exact match on 0x01 - the range's lower bound - and '{0-16}'
+// is dropped from the output entirely, so "48 8B {0-16} C3" becomes the three
+// contiguous bytes 48 8B C3. Permitting them here would ship patterns whose stored
+// bytes are not what the author wrote.
+//
+// Measured before any of this existed: "48 8B ?? C3" and "48 8B [01-FF] C3" both
+// built at exit 0 and shipped while nothing could match either, and "48 8B {0-16} C3"
+// failed with a message about the HASH line format - a rejection whose stated reason
+// pointed at the wrong file type entirely. Two silent holes and one misleading error.
+//
+// TOKENISATION MIRRORS PatternCompiler DELIBERATELY: it splits on whitespace and
+// accepts a token of exactly '??', two hex characters, or four hex characters. Any
+// other token it logs as unknown and SKIPS, which silently shortens the pattern - so
+// this collector must reject what the compiler would drop rather than compute a byte
+// sequence the database does not contain.
 void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
                                         std::vector<PatternLine>& out,
                                         std::vector<std::string>& outUnmatchable) {
@@ -888,9 +910,19 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
             const std::string patternName =
                 raw.substr(firstColon + 1, secondColon - firstColon - 1);
 
+            // A nameless pattern is refused rather than shipped. The name is the ONLY
+            // database identity that survives into a detection - the numeric id is
+            // positional and renumbered by any reordering - so a pattern with no name
+            // produces a match the user cannot act on and an operator cannot look up.
+            if (patternName.empty()) {
+                outUnmatchable.push_back(
+                    "<unnamed> has an empty name field, so any detection it produces "
+                    "would name nothing");
+                continue;
+            }
+
             const char* construct = nullptr;
-            if (patternText.find('?') != std::string::npos)      construct = "'??' wildcard";
-            else if (patternText.find('{') != std::string::npos) construct = "'{n-m}' variable gap";
+            if (patternText.find('{') != std::string::npos)      construct = "'{n-m}' variable gap";
             else if (patternText.find('[') != std::string::npos) construct = "'[a-b]' byte range";
 
             if (construct != nullptr) {
@@ -902,27 +934,54 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
             line.name = patternName;
 
             bool ok = true;
-            std::string nibble;
-            for (const char c : patternText) {
-                if (c == ' ' || c == '\t') {
+            std::istringstream tokens(patternText);
+            std::string token;
+            while (tokens >> token) {
+                if (token == "??") {
+                    // 0x00 with a 0x00 mask, exactly what PatternCompiler emits. The
+                    // stored byte is irrelevant to matching; the mask is what decides.
+                    line.bytes.push_back(0x00);
+                    line.mask.push_back(0x00);
+                    line.masked = true;
                     continue;
                 }
-                if (std::isxdigit(static_cast<unsigned char>(c)) == 0) {
-                    ok = false;
-                    break;
+
+                const bool allHex = !token.empty() &&
+                    std::all_of(token.begin(), token.end(), [](unsigned char c) {
+                        return std::isxdigit(c) != 0;
+                    });
+
+                if (allHex && (token.size() == 2 || token.size() == 4)) {
+                    for (size_t at = 0; at + 1 < token.size(); at += 2) {
+                        line.bytes.push_back(static_cast<uint8_t>(
+                            std::stoul(token.substr(at, 2), nullptr, 16)));
+                        line.mask.push_back(0xFF);
+                    }
+                    continue;
                 }
-                nibble.push_back(c);
-                if (nibble.size() == 2) {
-                    line.bytes.push_back(static_cast<uint8_t>(
-                        std::stoul(nibble, nullptr, 16)));
-                    nibble.clear();
-                }
+
+                ok = false;
+                break;
             }
-            if (!ok || !nibble.empty() || line.bytes.empty()) {
+
+            if (!ok || line.bytes.empty() || line.mask.size() != line.bytes.size()) {
                 outUnmatchable.push_back(
-                    patternName + " is not a whole sequence of hex byte pairs");
+                    patternName + " is not a whitespace-separated sequence of hex byte "
+                    "pairs and '??' wildcards");
                 continue;
             }
+
+            // A pattern with no fixed byte at all would match at every offset in every
+            // buffer. Refused rather than shipped: that is not detection, it is a
+            // guaranteed false positive on every file scanned.
+            if (std::none_of(line.mask.begin(), line.mask.end(),
+                             [](uint8_t m) { return m == 0xFFu; })) {
+                outUnmatchable.push_back(
+                    patternName + " is entirely wildcards, so it would match every "
+                    "buffer at every offset");
+                continue;
+            }
+
             out.push_back(std::move(line));
         }
     }
@@ -1022,33 +1081,117 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
     opts.stopOnFirstMatch  = false;
 
     size_t matched = 0;
+    size_t negativeChecked = 0;
+    size_t negativeFailed = 0;
+    size_t maskedCount = 0;
     std::string firstMissReport;
+    std::string firstFalsePositive;
+
+    // Surround the body with filler so a match is proven at a NON-ZERO offset rather
+    // than only when the pattern is the entire buffer. A trie that only matches at
+    // offset 0 is a substring search that happens to pass a test written the easy way.
+    const auto plant = [](const std::vector<uint8_t>& body) {
+        std::vector<uint8_t> buffer;
+        buffer.reserve(body.size() + 128);
+        buffer.insert(buffer.end(), 64, 0x41);
+        buffer.insert(buffer.end(), body.begin(), body.end());
+        buffer.insert(buffer.end(), 64, 0x42);
+        return buffer;
+    };
 
     for (const auto& line : expected) {
-        // The pattern bytes surrounded by filler, so the match is proven to work
-        // at a non-zero offset rather than only when the pattern is the entire
-        // buffer. A trie that only matches at offset 0 is a substring search that
-        // happens to pass a test written the easy way.
-        std::vector<uint8_t> buffer;
-        buffer.reserve(line.bytes.size() + 128);
-        buffer.insert(buffer.end(), 64, 0x41);
-        buffer.insert(buffer.end(), line.bytes.begin(), line.bytes.end());
-        buffer.insert(buffer.end(), 64, 0x42);
-
-        const auto result = store.ScanBuffer(buffer, opts);
-        if (!result.patternMatches.empty()) {
-            ++matched;
-            continue;
+        if (line.masked) {
+            ++maskedCount;
         }
-        if (firstMissReport.empty()) {
-            firstMissReport = line.name;
+
+        // A CONCRETE INSTANCE of the pattern, not the stored bytes.
+        //
+        // For a masked pattern the stored byte at a wildcard position is 0x00 - which is
+        // precisely the value that would still match if the mask were being ignored and
+        // the bytes compared literally. So the instance plants 0x5A at every wildcard
+        // position instead. A matcher that ignored the mask would now MISS, which means
+        // a pass here proves the wildcard was honoured rather than that zeros lined up.
+        std::vector<uint8_t> instance = line.bytes;
+        for (size_t at = 0; at < instance.size() && at < line.mask.size(); ++at) {
+            if (line.mask[at] != 0xFF) {
+                instance[at] = 0x5A;
+            }
+        }
+
+        // Matched BY NAME, not by "some pattern matched". With more than one pattern in
+        // the database, checking only that the result set is non-empty would let one
+        // working pattern vouch for every broken one.
+        const auto namesThisPattern =
+            [&line](const ShadowStrike::SignatureStore::ScanResult& r) {
+                for (const auto& det : r.patternMatches) {
+                    if (det.signatureName == line.name) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+        const std::vector<uint8_t> positiveBuffer = plant(instance);
+        const auto positive = store.ScanBuffer(positiveBuffer, opts);
+        if (namesThisPattern(positive)) {
+            ++matched;
+        } else if (firstMissReport.empty()) {
+            // Report what the scan DID return, not merely that this pattern was absent.
+            // "no matches at all" and "matched but reported under another name" are
+            // different defects and the second is invisible to a check that only asks
+            // whether the result set is empty.
+            firstMissReport = line.name + " (scan returned " +
+                std::to_string(positive.patternMatches.size()) + " pattern match(es)";
+            for (size_t at = 0; at < positive.patternMatches.size() && at < 4; ++at) {
+                firstMissReport += ", name='" + positive.patternMatches[at].signatureName + "'";
+            }
+            firstMissReport += ")";
+        }
+
+        // NEGATIVE CHECK, masked patterns only: corrupt one position the mask says must
+        // match exactly, and require that the pattern no longer fires.
+        //
+        // Without this the positive check alone cannot distinguish a correct masked
+        // matcher from one that matches everything - and "matches everything" is the
+        // failure mode a mask makes possible. A pattern that still matches after a
+        // fixed byte is destroyed is either ignoring its own fixed positions or short
+        // enough to occur in the filler, and both are build-stopping problems.
+        if (line.masked) {
+            size_t fixedAt = std::string::npos;
+            for (size_t at = 0; at < line.mask.size(); ++at) {
+                if (line.mask[at] == 0xFF) {
+                    fixedAt = at;
+                    break;
+                }
+            }
+
+            if (fixedAt != std::string::npos) {
+                std::vector<uint8_t> corrupted = instance;
+                corrupted[fixedAt] = static_cast<uint8_t>(corrupted[fixedAt] ^ 0xFF);
+
+                ++negativeChecked;
+                const std::vector<uint8_t> negativeBuffer = plant(corrupted);
+                const auto negative = store.ScanBuffer(negativeBuffer, opts);
+                if (namesThisPattern(negative)) {
+                    ++negativeFailed;
+                    if (firstFalsePositive.empty()) {
+                        firstFalsePositive = line.name;
+                    }
+                }
+            }
         }
     }
 
     store.Close();
 
-    Info("  verified   : %zu of %zu pattern(s) matched by scan",
-         matched, expected.size());
+    Info("  verified   : %zu of %zu pattern(s) matched by scan (%zu masked)",
+         matched, expected.size(), maskedCount);
+
+    if (negativeChecked > 0) {
+        Info("  verified   : %zu masked pattern(s) correctly STOPPED matching when a "
+             "fixed byte was corrupted",
+             negativeChecked - negativeFailed);
+    }
 
     if (matched != expected.size()) {
         Fail("%zu of %zu imported pattern(s) do not match content that contains "
@@ -1056,6 +1199,15 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
              "complaint, so from outside this looks like working detection - it "
              "simply never fires. First unmatched: %s",
              expected.size() - matched, expected.size(), firstMissReport.c_str());
+        return false;
+    }
+
+    if (negativeFailed > 0) {
+        Fail("%zu masked pattern(s) STILL matched after a byte their own mask marks as "
+             "fixed was corrupted. Either the mask is not constraining those positions - "
+             "in which case the pattern fires on content it does not describe - or the "
+             "pattern is short enough to occur in the filler. First: %s",
+             negativeFailed, firstFalsePositive.c_str());
         return false;
     }
 
@@ -1253,11 +1405,13 @@ int wmain(int argc, wchar_t** argv) {
 
         if (!unmatchable.empty()) {
             Fail("%zu pattern(s) cannot be matched by this build and were refused. "
-                 "Nothing in the product matches wildcards, byte ranges or variable "
-                 "gaps: the automaton takes exact patterns only, the SIMD path skips "
-                 "every other mode, and no masked matcher is wired into the scan "
-                 "path. A pattern like that would be stored, counted, and never "
-                 "fire. Use exact hex byte sequences.",
+                 "'??' wildcards ARE supported - the masked Boyer-Moore pass scans "
+                 "them - but byte ranges ('[a-b]') and variable gaps ('{n-m}') are "
+                 "not, and cannot be: a range is not an AND-mask and a gap changes "
+                 "the length of a match. Worse, the compiler turns them into a "
+                 "DIFFERENT pattern and reports success - a range becomes an exact "
+                 "match on its lower bound and a gap is dropped entirely - so such a "
+                 "line would ship bytes the author never wrote.",
                  unmatchable.size());
             for (const auto& why : unmatchable) {
                 Fail("  refused    : %s", why.c_str());

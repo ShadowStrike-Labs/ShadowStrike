@@ -1076,11 +1076,34 @@ namespace SignatureStore {
                     + processedPatterns * sizeof(PatternEntry)
                     );
 
-                // Write pattern name string
-                uint64_t nameOffset = blobOffset;
-                std::string nameStr = pattern.name + "\0";
+                // The name is stored NUL-TERMINATED, because a terminator is the only
+                // thing a reader can use to find its end: no name length is recorded
+                // anywhere in this format. The terminator is written EXPLICITLY, as its
+                // own byte, and the blob cursor advances past it.
+                //
+                // This block used to read:
+                //     std::string nameStr = pattern.name + "\0";
+                //     std::memcpy(namePtr, nameStr.c_str(), nameStr.length());
+                //     blobOffset += nameStr.length();
+                // which appends NOTHING. operator+(std::string, const char*) copies the
+                // literal up to its first NUL, and the first character of "\0" IS that
+                // NUL - so nameStr was exactly pattern.name, one byte shorter than the
+                // code appears to say, and no terminator ever reached the file. The
+                // intent was stated in the source and absent from the output.
+                //
+                // What it cost, measured: the name ran straight into the pattern bytes
+                // written immediately after it, PatternStore's loader scanned for a
+                // terminator bounded by the section end, found none, and substituted a
+                // generated placeholder. A pattern named TestPattern was reported by a
+                // real scan as "UnnamedPattern_0" - so a pattern detection named a
+                // placeholder instead of the signature, in the log, in the threat
+                // callback, and in whatever the user is shown. The previous verification
+                // could not see it because it only asked whether ANY pattern matched.
+                const uint64_t nameOffset = blobOffset;
+                const uint64_t nameBytesWithNul =
+                    static_cast<uint64_t>(pattern.name.length()) + 1u;
 
-                if (nameOffset + nameStr.length() > m_outputSize) {
+                if (nameOffset + nameBytesWithNul > m_outputSize) {
                     SS_LOG_ERROR(L"SignatureBuilder",
                         L"SerializePatterns: Insufficient space for name at pattern %zu",
                         processedPatterns);
@@ -1090,8 +1113,11 @@ namespace SignatureStore {
                 char* namePtr = reinterpret_cast<char*>(
                     static_cast<uint8_t*>(m_outputBase) + nameOffset
                     );
-                std::memcpy(namePtr, nameStr.c_str(), nameStr.length());
-                blobOffset += nameStr.length();
+                if (!pattern.name.empty()) {
+                    std::memcpy(namePtr, pattern.name.data(), pattern.name.length());
+                }
+                namePtr[pattern.name.length()] = '\0';
+                blobOffset += nameBytesWithNul;
 
                 // FIX: Use cached compiled pattern instead of re-compiling (3rd time!)
                 // This was the major performance bottleneck

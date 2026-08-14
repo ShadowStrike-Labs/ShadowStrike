@@ -182,6 +182,24 @@ namespace ShadowStrike {
                 std::span<const uint8_t> buffer
             ) const noexcept;
 
+            // True when construction produced a usable matcher.
+            //
+            // The constructor clears its own state on any failure (allocation, a mask
+            // whose size cannot be reconciled with the pattern, a good-suffix table
+            // that did not build), and Search/FindFirst then return nothing. Without
+            // this accessor a matcher that failed to build is indistinguishable from
+            // one that found no match, so a pattern could be counted as scanned while
+            // no scan of it was ever possible.
+            //
+            // The conditions checked here are exactly the invariants Search() tests
+            // before it does any work, deliberately: if they diverge, this would report
+            // healthy for a matcher that refuses to run.
+            [[nodiscard]] bool IsValid() const noexcept {
+                return !m_pattern.empty()
+                    && m_mask.size() == m_pattern.size()
+                    && m_goodSuffixTable.size() == m_pattern.size();
+            }
+
         private:
             std::vector<uint8_t> m_pattern;
             std::vector<uint8_t> m_mask;
@@ -493,17 +511,58 @@ namespace ShadowStrike {
             // Internal flush without locking (caller must hold appropriate lock)
             [[nodiscard]] StoreError FlushInternal() noexcept;
 
+            // Single O(bytes) pass over every exact pattern.
+            //
+            // outServedExactPatterns reports whether a compiled automaton was actually
+            // available and used. It exists because the caller must decide whether to
+            // run the per-pattern fallback, and it cannot answer that by inspecting
+            // m_automaton itself: reading that pointer outside this function's lock is
+            // the race this signature was introduced to remove, and an empty result set
+            // does not distinguish "no automaton" from "no matches".
             [[nodiscard]] std::vector<DetectionResult> ScanWithAutomaton(
                 std::span<const uint8_t> buffer,
                 const QueryOptions& options,
-                const LARGE_INTEGER& deadline
+                const LARGE_INTEGER& deadline,
+                bool& outServedExactPatterns
             ) const noexcept;
 
+            // Per-pattern AVX2 scan over every exact pattern. This is O(patterns x
+            // bytes) and exists ONLY as the fallback for when no compiled automaton is
+            // available - see the dispatch comment in Scan(). It is not the default and
+            // must not become one again: the automaton answers the same question for
+            // every exact pattern in a single O(bytes) pass.
             [[nodiscard]] std::vector<DetectionResult> ScanWithSIMD(
                 std::span<const uint8_t> buffer,
                 const QueryOptions& options,
                 const LARGE_INTEGER& deadline
             ) const noexcept;
+
+            // Scan the patterns the automaton structurally cannot express: those whose
+            // bytes carry a mask with wildcard positions (PatternMode::Wildcard and
+            // PatternMode::ByteMask). Aho-Corasick keys transitions on exact byte
+            // values, so a "match any byte here" position has no edge to follow; that
+            // is a property of the algorithm, not a gap in the implementation.
+            //
+            // Runs IN ADDITION to the automaton pass, never instead of it, because the
+            // two cover disjoint sets of patterns. Returns immediately when the store
+            // holds no masked patterns, which is the case for all shipped content today.
+            [[nodiscard]] std::vector<DetectionResult> ScanWithMaskedPatterns(
+                std::span<const uint8_t> buffer,
+                const QueryOptions& options,
+                const LARGE_INTEGER& deadline
+            ) const noexcept;
+
+            // Rebuild m_maskedMatchers from the current cache.
+            //
+            // Called from BuildAutomaton, which is the single funnel every mutator
+            // already goes through (Initialize, AddCompiledPattern, AddPatternBatch,
+            // RemovePattern, Rebuild, Compact, OptimizeByHitRate). Building them
+            // anywhere else would let the compiled matchers drift out of sync with the
+            // cache they were built from, which is the defect shape this store has
+            // already produced twice.
+            //
+            // Caller must hold m_globalLock EXCLUSIVELY.
+            void BuildMaskedMatchers() noexcept;
 
             [[nodiscard]] DetectionResult BuildDetectionResult(
                 uint64_t patternId,
@@ -524,6 +583,25 @@ namespace ShadowStrike {
 
             std::unique_ptr<PatternIndex> m_patternIndex;
             std::unique_ptr<AhoCorasickAutomaton> m_automaton;
+
+            // Compiled Boyer-Moore matchers for the masked patterns, one per pattern,
+            // built once per rebuild rather than per scan: constructing a matcher builds
+            // a 256-entry bad-character table and a good-suffix table, which is work
+            // that depends only on the pattern and would otherwise be repeated on every
+            // buffer scanned.
+            //
+            // cacheIndex is the position in m_patternCache, which is what the hit
+            // counters and every DetectionResult are keyed by. It is stored explicitly
+            // rather than recomputed because this vector is SPARSE with respect to the
+            // cache - it holds only the masked subset, so its own index means nothing.
+            //
+            // Held under m_globalLock exactly like m_automaton: exclusive to rebuild,
+            // shared to scan.
+            struct MaskedMatcher {
+                size_t cacheIndex{ 0 };
+                std::unique_ptr<BoyerMooreMatcher> matcher;
+            };
+            std::vector<MaskedMatcher> m_maskedMatchers;
 
             struct PatternMetadata {
                 // STORE-LOCAL identity, and it is POSITIONAL: signatureId always

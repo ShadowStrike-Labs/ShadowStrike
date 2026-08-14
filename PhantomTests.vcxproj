@@ -166,6 +166,15 @@
          Guards the 0-5 severity ordinal against the 0-100 score scale, which
          would silently invert severities at the low end. -->
     <ClCompile Include="tests\unit\threat_level\ThreatLevelMapping_Tests.cpp" />
+
+    <!-- Enabled suite 4: masked pattern matching. A masked matcher can fail in two
+         opposite directions - miss content it describes, or match content it does
+         not - so every positive case here is paired with a negative one. The
+         OverShift cases specifically guard Boyer-Moore's skip tables, which are
+         fast because they jump over positions proven impossible; built without
+         consulting the mask they jump over valid matches instead, giving a matcher
+         that is correct on most inputs and silently blind on the rest. -->
+    <ClCompile Include="tests\unit\masked_patterns\MaskedPattern_Tests.cpp" />
   </ItemGroup>
 
   <ItemGroup>

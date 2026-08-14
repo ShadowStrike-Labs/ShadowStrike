@@ -447,6 +447,34 @@ bool SignatureBuilder::ValidatePatternSyntax(
     /*
      * Validates hex pattern syntax and wildcards
      * Format: "48 8B 05 ?? ?? ?? ??" (space-separated hex with wildcards)
+     *
+     * WHAT IS ACCEPTED, AND WHY THE SET SHRANK
+     *
+     * Hex byte pairs and '??' wildcards only. A wildcard pattern is genuinely
+     * matched: PatternStore compiles a mask-aware BoyerMooreMatcher for it in
+     * BuildMaskedMatchers and scans it in ScanWithMaskedPatterns.
+     *
+     * Byte ranges ('[8B-8D]') were previously accepted here - the character set
+     * allowed '[', ']' and '-', and the only structural check was that brackets
+     * balanced. They are now REFUSED, for a stronger reason than "nothing matches
+     * them":
+     *
+     *   PatternCompiler::CompilePattern does not fail on a range, it MIS-COMPILES
+     *   it. The range token emits its LOWER BOUND with a 0xFF (exact) mask, so
+     *   '[8B-8D]' becomes "the byte 0x8B, exactly" and '[00-FF]' - meaning any
+     *   byte - becomes "exactly 0x00". The stored pattern is then a different
+     *   pattern from the one written, and it reports success.
+     *
+     * Variable gaps ('{0-16}') were already refused because '{' is not in the
+     * accepted character set, and they stay refused for the same class of reason:
+     * the compiler drops the gap token entirely, so "48 8B {0-16} C3" compiles to
+     * the three CONTIGUOUS bytes 48 8B C3.
+     *
+     * Accepting either would mean storing bytes the author never wrote. The right
+     * order of work is to fix the compiler (make it refuse what it cannot
+     * represent), then decide whether a matcher for ranges or gaps is wanted -
+     * neither is expressible as a fixed-length pattern plus an AND-mask, so both
+     * need a different algorithm rather than a wider mask.
      */
 
     if (pattern.empty()) {
@@ -454,30 +482,46 @@ bool SignatureBuilder::ValidatePatternSyntax(
         return false;
     }
 
+    // Named explicitly rather than falling out of the character-set loop, so the
+    // author is told which construct is unsupported and not merely which character
+    // was unexpected.
+    if (pattern.find('[') != std::string::npos || pattern.find(']') != std::string::npos) {
+        errorMessage = "Byte ranges ('[8B-8D]') are not supported: the compiler stores "
+                       "only the range's lower bound with an exact mask, so the pattern "
+                       "written is not the pattern stored. Use '??' for any byte.";
+        return false;
+    }
+
+    if (pattern.find('{') != std::string::npos || pattern.find('}') != std::string::npos) {
+        errorMessage = "Variable gaps ('{0-16}') are not supported: the compiler drops "
+                       "the gap entirely, so the surrounding bytes become contiguous. "
+                       "Use a fixed number of '??' wildcards instead.";
+        return false;
+    }
+
     // Check for invalid characters
     for (size_t i = 0; i < pattern.length(); ++i) {
         char c = pattern[i];
-        if (!std::isxdigit(c) && c != ' ' && c != '?' && c != '-' && c != '[' && c != ']') {
+        if (!std::isxdigit(static_cast<unsigned char>(c)) && c != ' ' && c != '\t' && c != '?') {
             errorMessage = "Invalid character in pattern: " + std::string(1, c);
             return false;
         }
     }
 
-    // Check balanced brackets for ranges
-    int bracketCount = 0;
-    for (char c : pattern) {
-        if (c == '[') bracketCount++;
-        else if (c == ']') bracketCount--;
-
-        if (bracketCount < 0) {
-            errorMessage = "Unbalanced brackets";
+    // A '?' must always be part of a '??' pair. A single '?' would be dropped by the
+    // compiler's tokeniser as an unknown token, silently shortening the pattern by one
+    // byte - so it is refused here where it can be explained.
+    for (size_t i = 0; i < pattern.length(); ++i) {
+        if (pattern[i] != '?') {
+            continue;
+        }
+        const bool pairedWithNext = (i + 1 < pattern.length() && pattern[i + 1] == '?');
+        const bool pairedWithPrev = (i > 0 && pattern[i - 1] == '?');
+        if (!pairedWithNext && !pairedWithPrev) {
+            errorMessage = "A wildcard must be written as '??' (one whole byte); a "
+                           "single '?' would be dropped and shorten the pattern";
             return false;
         }
-    }
-
-    if (bracketCount != 0) {
-        errorMessage = "Unbalanced brackets";
-        return false;
     }
 
     return true;

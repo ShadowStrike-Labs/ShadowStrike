@@ -271,10 +271,9 @@ TEST_F(SignatureBuilderTest, LogCallback) {
 TEST_F(SignatureBuilderTest, ValidatePatternSyntaxValid) {
     std::string errorMsg;
     
-    // Valid patterns
+    // Valid patterns: hex byte pairs and whole-byte '??' wildcards.
     EXPECT_TRUE(m_builder->ValidatePatternSyntax("48 8B 05", errorMsg));
     EXPECT_TRUE(m_builder->ValidatePatternSyntax("48 8B 05 ?? ?? ?? ??", errorMsg));
-    EXPECT_TRUE(m_builder->ValidatePatternSyntax("48 8B [45 50] 05", errorMsg));
 }
 
 TEST_F(SignatureBuilderTest, ValidatePatternSyntaxEmpty) {
@@ -289,13 +288,40 @@ TEST_F(SignatureBuilderTest, ValidatePatternSyntaxInvalidCharacters) {
     EXPECT_FALSE(errorMsg.empty());
 }
 
-TEST_F(SignatureBuilderTest, ValidatePatternSyntaxUnbalancedBrackets) {
+// Byte ranges are refused outright, balanced or not.
+//
+// This test previously asserted the opposite for a BALANCED range - it expected
+// "48 8B [45 50] 05" to validate - and checked only that an UNBALANCED one failed.
+// That was the wrong property to pin down: PatternCompiler mis-compiles a range
+// rather than rejecting it, emitting only the range's lower bound with an exact
+// mask, so a balanced range produces a stored pattern that differs from the one
+// written and still reports success. Balance was never the issue.
+TEST_F(SignatureBuilderTest, ValidatePatternSyntaxRejectsByteRanges) {
     std::string errorMsg;
+
+    EXPECT_FALSE(m_builder->ValidatePatternSyntax("48 8B [45 50] 05", errorMsg));
+    EXPECT_FALSE(errorMsg.empty());
+
     EXPECT_FALSE(m_builder->ValidatePatternSyntax("48 [8B 05", errorMsg));
-    EXPECT_EQ(errorMsg, "Unbalanced brackets");
-    
+    EXPECT_FALSE(errorMsg.empty());
+
     EXPECT_FALSE(m_builder->ValidatePatternSyntax("48 8B 05]", errorMsg));
-    EXPECT_EQ(errorMsg, "Unbalanced brackets");
+    EXPECT_FALSE(errorMsg.empty());
+}
+
+// Variable gaps stay refused: the compiler drops the gap token entirely, making the
+// surrounding bytes contiguous.
+TEST_F(SignatureBuilderTest, ValidatePatternSyntaxRejectsVariableGaps) {
+    std::string errorMsg;
+    EXPECT_FALSE(m_builder->ValidatePatternSyntax("48 8B {0-16} C3", errorMsg));
+    EXPECT_FALSE(errorMsg.empty());
+}
+
+// A lone '?' is refused rather than silently shortening the pattern by one byte.
+TEST_F(SignatureBuilderTest, ValidatePatternSyntaxRejectsHalfWildcard) {
+    std::string errorMsg;
+    EXPECT_FALSE(m_builder->ValidatePatternSyntax("48 8B ? C3", errorMsg));
+    EXPECT_FALSE(errorMsg.empty());
 }
 
 TEST_F(SignatureBuilderTest, IsRegexSafeValid) {
