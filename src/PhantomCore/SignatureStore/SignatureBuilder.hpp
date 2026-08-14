@@ -463,33 +463,21 @@ private:
     [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
 
     // ========================================================================
-   // TRIE SERIALIZATION HELPERS (Private)
+   // PATTERN SECTION HEADER (Private)
    // ========================================================================
 
-   // Helper structure for building trie in memory before serialization
-    struct TrieNodeMemory {
-        std::array<uint32_t, 256> childOffsets{};        // Offsets or 0
-        uint32_t failureLinkOffset{ 0 };                   // Offset or 0
-        std::vector<uint64_t> outputs;                   // Pattern IDs at this node
-        uint32_t depth{ 0 };
-        uint64_t diskOffset{ 0 };                          // Will be calculated during serialization
-    };
-
-    // Serialize Aho-Corasick automaton to disk trie format
+    // Writes the pattern section's TrieIndexHeader. Despite the name it no longer
+    // serializes an automaton: the nodes it used to write held node ids where disk
+    // offsets were required and never had their outputOffset set, so nothing could
+    // match through them, and at 1056 bytes per node they consumed roughly a
+    // thousand bytes per byte of pattern content in a fixed-size database. The
+    // authoritative persisted form is the PatternEntry array whose location this
+    // header publishes. See the function body for the full reasoning and for what
+    // any future on-disk automaton would have to do differently.
     [[nodiscard]] StoreError SerializeAhoCorasickToDisk(
         uint64_t& currentOffset
     ) noexcept;
 
-    // Write single trie node to disk
-    [[nodiscard]] StoreError WriteTrieNodeToDisk(
-        const TrieNodeMemory& nodeMemory,
-        uint64_t diskOffset
-    ) noexcept;
-
-    // Build output pattern ID pool
-    [[nodiscard]] StoreError BuildOutputPool(
-        uint64_t& poolOffset
-    ) noexcept;
     // ========================================================================
     // INTERNAL BUILD STAGES
     // ========================================================================

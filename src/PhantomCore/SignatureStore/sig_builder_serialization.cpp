@@ -291,7 +291,7 @@ namespace SignatureStore {
             }
 
             // Clear compiled pattern cache to release memory (cache served its purpose:
-            // SerializePatterns, SerializeAhoCorasickToDisk, and BuildOutputPool)
+            // it is read by SerializePatterns when writing the entry array)
             m_compiledPatternCache.clear();
             m_compiledPatternCache.shrink_to_fit();
 
@@ -887,7 +887,7 @@ namespace SignatureStore {
             // ========================================================================
             // FIX: Previously patterns were compiled 3 times (automaton, entropy, serialize)
             // Now we compile once and cache the results in m_compiledPatternCache for 
-            // reuse by SerializeAhoCorasickToDisk and BuildOutputPool.
+            // reuse when the entry array is written below.
 
             m_compiledPatternCache.clear();
             m_compiledPatternCache.reserve(m_pendingPatterns.size());
@@ -1369,146 +1369,47 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // STEP 2: BUILD IN-MEMORY TRIE REPRESENTATION
+            // STEP 2: WRITE THE SECTION HEADER
             // ========================================================================
-            // We need to reconstruct the trie from the Aho-Corasick automaton
-            // by traversing pattern strings and building TrieNodeMemory structures
-
-            std::unordered_map<uint64_t, std::unique_ptr<TrieNodeMemory>> trieNodes;
-            uint64_t nextNodeId = 0;
-
-            // Create root node (ID = 0)
-            auto rootNode = std::make_unique<TrieNodeMemory>();
-            rootNode->depth = 0;
-            trieNodes[nextNodeId++] = std::move(rootNode);
-
-            // Build trie by inserting each pattern
-            for (size_t patternIdx = 0; patternIdx < m_pendingPatterns.size(); ++patternIdx) {
-                // FIX: Use cached compiled patterns from SerializePatterns instead of
-                // recompiling (which was the 2nd compilation and a major perf bottleneck)
-                if (patternIdx >= m_compiledPatternCache.size()) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"SerializeAhoCorasickToDisk: Pattern %zu not in cache, skipping",
-                        patternIdx);
-                    continue;
-                }
-
-                const auto& cache = m_compiledPatternCache[patternIdx];
-                if (!cache.valid || cache.bytes.empty()) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"SerializeAhoCorasickToDisk: Pattern %zu invalid/empty in cache, skipping",
-                        patternIdx);
-                    continue;
-                }
-
-                // Insert pattern into trie using cached compilation
-                uint64_t currentNodeId = 0; // Start at root
-                uint32_t depth = 0;
-
-                for (size_t byteIdx = 0; byteIdx < cache.bytes.size(); ++byteIdx) {
-                    uint8_t byte = cache.bytes[byteIdx];
-
-                    auto& currentNode = trieNodes[currentNodeId];
-
-                    // Check if child for this byte exists
-                    if (currentNode->childOffsets[byte] == 0) {
-                        // Cap trie depth to prevent overflow
-                        constexpr uint32_t MAX_TRIE_DEPTH = 16384;
-                        if (depth >= MAX_TRIE_DEPTH) {
-                            SS_LOG_WARN(L"SignatureBuilder",
-                                L"SerializeAhoCorasickToDisk: Pattern too deep (%u), truncating at pattern %zu",
-                                depth, patternIdx);
-                            break;
-                        }
-
-                        // Create new child node
-                        auto childNode = std::make_unique<TrieNodeMemory>();
-                        childNode->depth = depth + 1;
-
-                        uint64_t childId = nextNodeId++;
-                        currentNode->childOffsets[byte] = static_cast<uint32_t>(childId);
-
-                        trieNodes[childId] = std::move(childNode);
-                    }
-
-                    // Move to child
-                    currentNodeId = currentNode->childOffsets[byte];
-                    depth++;
-                }
-
-                // Mark terminal node with pattern ID
-                auto& terminalNode = trieNodes[currentNodeId];
-                terminalNode->outputs.push_back(static_cast<uint64_t>(patternIdx));
-            }
-
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"SerializeAhoCorasickToDisk: Built in-memory trie with %zu nodes",
-                trieNodes.size());
-
-            // ========================================================================
-            // STEP 3: COMPUTE FAILURE LINKS (Aho-Corasick Algorithm)
-            // ========================================================================
-            // BFS traversal to compute failure links
-            std::queue<uint64_t> bfsQueue;
-
-            // Root's failure link points to itself
-            trieNodes[0]->failureLinkOffset = 0;
-
-            // All depth-1 nodes' failure links point to root
-            for (size_t byte = 0; byte < 256; ++byte) {
-                uint32_t childId = trieNodes[0]->childOffsets[byte];
-                if (childId != 0) {
-                    trieNodes[childId]->failureLinkOffset = 0;
-                    bfsQueue.push(childId);
-                }
-            }
-
-            // BFS to compute failure links for deeper nodes
-            while (!bfsQueue.empty()) {
-                uint64_t nodeId = bfsQueue.front();
-                bfsQueue.pop();
-
-                auto& node = trieNodes[nodeId];
-
-                for (size_t byte = 0; byte < 256; ++byte) {
-                    uint32_t childId = node->childOffsets[byte];
-                    if (childId == 0) continue;
-
-                    // Find failure link for child
-                    uint64_t failureNode = node->failureLinkOffset;
-
-                    while (failureNode != 0 &&
-                        trieNodes[failureNode]->childOffsets[byte] == 0) {
-                        failureNode = trieNodes[failureNode]->failureLinkOffset;
-                    }
-
-                    if (trieNodes[failureNode]->childOffsets[byte] != 0 &&
-                        trieNodes[failureNode]->childOffsets[byte] != childId) {
-                        trieNodes[childId]->failureLinkOffset =
-                            trieNodes[failureNode]->childOffsets[byte];
-                    }
-                    else {
-                        trieNodes[childId]->failureLinkOffset = 0;
-                    }
-
-                    // Merge outputs from failure link
-                    auto& childNode = trieNodes[childId];
-                    auto& failureOutputs = trieNodes[childNode->failureLinkOffset]->outputs;
-
-                    childNode->outputs.insert(childNode->outputs.end(),
-                        failureOutputs.begin(),
-                        failureOutputs.end());
-
-                    bfsQueue.push(childId);
-                }
-            }
-
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"SerializeAhoCorasickToDisk: Computed failure links");
-
-            // ========================================================================
-            // STEP 4: WRITE TRIE INDEX HEADER
-            // ========================================================================
+            //
+            // THIS SECTION NO LONGER CARRIES A SERIALIZED AUTOMATON, AND THAT IS A
+            // DELIBERATE REMOVAL RATHER THAN MISSING WORK.
+            //
+            // What used to be here: an in-memory trie was rebuilt from the compiled
+            // patterns, Aho-Corasick failure links were computed over it, disk offsets
+            // were assigned to every node in BFS order, every node was written out as a
+            // TrieNodeBinary, and an output-id pool was appended. Roughly 250 lines.
+            //
+            // It produced a structure that could not match anything:
+            //   - childOffsets were written verbatim from the in-memory nodes, where
+            //     they hold NODE IDS, not the disk offsets the field name and the
+            //     reader both require. The nodeIdToDiskOffset map that would have
+            //     translated them was built and never applied.
+            //   - failureLinkOffset had the same defect.
+            //   - outputOffset was left 0 on every node, and PatternIndex::collectOutputs
+            //     returns immediately on a zero outputOffset, so no node could ever
+            //     report a match even if the links had been correct.
+            // The header nevertheless set flags = 0x01, "Aho-Corasick optimized".
+            //
+            // AND IT WAS NOT FREE. TrieNodeBinary is 1056 bytes because childOffsets is
+            // a DENSE 256-entry array, so a node with one child costs the same as a node
+            // with 256. Measured through the real tool, the section cost ~1,059 bytes per
+            // byte of pattern content - 200 patterns of 200 bytes produced a 42 MB
+            // pattern index. The database is a fixed 64 MB allocation of which the YARA
+            // section already holds 38 MB, so an unreadable index was the binding
+            // constraint on how much pattern content this product could ship. Removing it
+            // raises that ceiling by roughly a thousandfold: the authoritative persisted
+            // form is the PatternEntry array, at 48 bytes plus the pattern's own bytes.
+            //
+            // THE CORRECT PRODUCER ALREADY EXISTS, which is why this is a removal and not
+            // a rewrite. PatternIndex has its own complete implementation of this
+            // structure - CreateNew assigns rootNodeOffset properly and AddPattern writes
+            // outputOffset properly - so there were two producers of one on-disk format
+            // and the broken one was the one that ran. If an on-disk automaton is wanted
+            // later, that path is the place to build it from, and any implementation must
+            // first replace the dense 256-entry child array with a sparse representation.
+            // Until then the runtime builds its automaton from the pattern entries at
+            // load, which is O(total pattern bytes) once per start.
             uint64_t headerOffset = Format::AlignToPage(currentOffset);
 
             if (headerOffset + sizeof(TrieIndexHeader) > m_outputSize) {
@@ -1521,15 +1422,22 @@ namespace SignatureStore {
                 static_cast<uint8_t*>(m_outputBase) + headerOffset
                 );
 
+            std::memset(header, 0, sizeof(TrieIndexHeader));
+
             header->magic = TRIE_INDEX_MAGIC;
             header->version = TRIE_INDEX_VERSION;
-            header->totalNodes = trieNodes.size();
             header->totalPatterns = m_pendingPatterns.size();
-            header->rootNodeOffset = 0; // Will be set after node serialization
-            header->outputPoolOffset = 0; // Will be set after node serialization
+
+            // Zero means "this database carries no serialized automaton". The reader
+            // accepts that state explicitly rather than treating it as corruption, and
+            // flags deliberately does NOT claim Aho-Corasick optimization, because the
+            // previous value said so while the nodes were unusable.
+            header->totalNodes = 0;
+            header->rootNodeOffset = 0;
+            header->outputPoolOffset = 0;
             header->outputPoolSize = 0;
             header->maxNodeDepth = 0;
-            header->flags = 0x01; // Aho-Corasick optimized
+            header->flags = 0;
 
             // Explicitly "no pattern entries" until the caller writes them and records
             // their coordinates. The output buffer may be a reused file (--overwrite),
@@ -1538,106 +1446,8 @@ namespace SignatureStore {
             // send the loader into arbitrary bytes.
             header->patternEntryOffset = 0;
             header->patternEntryCount = 0;
-            header->reserved[0] = 0;
-            header->reserved[1] = 0;
-
-            // Calculate max depth (fix type mismatch for std::max)
-            for (const auto& [nodeId, node] : trieNodes) {
-                if (node->depth > header->maxNodeDepth) {
-                    header->maxNodeDepth = node->depth;
-                }
-            }
 
             currentOffset = headerOffset + sizeof(TrieIndexHeader);
-
-            // ========================================================================
-            // STEP 5: ASSIGN DISK OFFSETS TO NODES (BFS ORDER FOR LOCALITY)
-            // ========================================================================
-            std::unordered_map<uint64_t, uint64_t> nodeIdToDiskOffset;
-
-            uint64_t nodesStartOffset = Format::AlignToPage(currentOffset);
-            uint64_t nodeOffset = nodesStartOffset;
-
-            // BFS traversal to assign sequential disk offsets
-            std::queue<uint64_t> serialQueue;
-            serialQueue.push(0); // Start at root
-            nodeIdToDiskOffset[0] = nodeOffset;
-
-            // Section-RELATIVE, not absolute. PatternIndex resolves this as
-            // view.GetAt<TrieNodeBinary>(indexOffset + rootNodeOffset) and
-            // validates it against indexSize, so an absolute file offset both
-            // fails the bounds check and, if it passed, would resolve to the
-            // wrong address. This is the same asymmetry that made the hash
-            // B+tree unreadable: offsets stored INSIDE a section are relative to
-            // that section, and only the header's section offsets are absolute.
-            header->rootNodeOffset = nodeOffset - headerOffset;
-
-            while (!serialQueue.empty()) {
-                uint64_t nodeId = serialQueue.front();
-                serialQueue.pop();
-
-                auto& node = trieNodes[nodeId];
-                node->diskOffset = nodeIdToDiskOffset[nodeId];
-
-                // Assign offsets to children
-                for (size_t byte = 0; byte < 256; ++byte) {
-                    uint32_t childId = node->childOffsets[byte];
-                    if (childId != 0 && nodeIdToDiskOffset.find(childId) == nodeIdToDiskOffset.end()) {
-                        nodeOffset += sizeof(TrieNodeBinary);
-                        nodeIdToDiskOffset[childId] = nodeOffset;
-                        serialQueue.push(childId);
-                    }
-                }
-            }
-
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"SerializeAhoCorasickToDisk: Assigned disk offsets to %zu nodes",
-                nodeIdToDiskOffset.size());
-
-            // ========================================================================
-            // STEP 6: WRITE TRIE NODES TO DISK
-            // ========================================================================
-            currentOffset = nodesStartOffset;
-
-            for (const auto& [nodeId, diskOffset] : nodeIdToDiskOffset) {
-                auto& node = trieNodes[nodeId];
-
-                StoreError writeErr = WriteTrieNodeToDisk(*node, diskOffset);
-                if (!writeErr.IsSuccess()) {
-                    SS_LOG_ERROR(L"SignatureBuilder",
-                        L"SerializeAhoCorasickToDisk: Failed to write node at offset 0x%llX",
-                        diskOffset);
-                    return writeErr;
-                }
-
-                currentOffset = std::max(currentOffset, diskOffset + sizeof(TrieNodeBinary));
-            }
-
-            currentOffset = Format::AlignToPage(currentOffset);
-
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"SerializeAhoCorasickToDisk: Wrote %zu trie nodes", nodeIdToDiskOffset.size());
-
-            // ========================================================================
-            // STEP 7: BUILD OUTPUT PATTERN ID POOL
-            // ========================================================================
-            uint64_t poolOffset = currentOffset;
-            // Absolute start kept separately: poolOffset is passed by reference
-            // and BuildOutputPool advances it, so the size below must be measured
-            // against a saved copy rather than against the header field, which is
-            // now section-relative.
-            const uint64_t poolStartAbsolute = poolOffset;
-            header->outputPoolOffset = poolStartAbsolute - headerOffset;
-
-            StoreError poolErr = BuildOutputPool(poolOffset);
-            if (!poolErr.IsSuccess()) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"SerializeAhoCorasickToDisk: Failed to build output pool");
-                return poolErr;
-            }
-
-            header->outputPoolSize = poolOffset - poolStartAbsolute;
-            currentOffset = poolOffset;
 
             // ========================================================================
          // STEP 8: COMPUTE CHECKSUM
@@ -1676,351 +1486,9 @@ namespace SignatureStore {
             uint64_t serializeTimeUs = safeElapsedUs(startTime, endTime, m_perfFrequency);
 
             SS_LOG_INFO(L"SignatureBuilder",
-                L"SerializeAhoCorasickToDisk: Complete");
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Total trie size: %llu bytes", trieDataSize);
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Nodes written: %zu", trieNodes.size());
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Output pool size: %llu bytes", header->outputPoolSize);
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Serialization time: %llu us", serializeTimeUs);
-
-            return StoreError{ SignatureStoreError::Success };
-        }
-
-
-        // ============================================================================
-        // WRITE SINGLE TRIE NODE TO DISK
-        // ============================================================================
-
-        StoreError SignatureBuilder::WriteTrieNodeToDisk(
-            const TrieNodeMemory& nodeMemory,
-            uint64_t diskOffset
-        ) noexcept {
-            // ========================================================================
-            // VALIDATION
-            // ========================================================================
-            if (!m_outputBase || m_outputSize == 0) {
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
-            }
-
-            if (diskOffset + sizeof(TrieNodeBinary) > m_outputSize) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"WriteTrieNodeToDisk: Insufficient space at offset 0x%llX", diskOffset);
-                return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
-            }
-
-            // ========================================================================
-            // WRITE NODE TO DISK
-            // ========================================================================
-            // KNOWN INCOMPLETE - the serialized trie is NOT usable for matching yet,
-            // and the authoritative persisted form of the patterns is the PatternEntry
-            // array that SerializePatterns writes after this section. Three things are
-            // missing here, recorded so nobody mistakes this structure for a working
-            // index:
-            //   1. childOffsets below are copied verbatim from TrieNodeMemory, where
-            //      they hold NODE IDS assigned by the in-memory build - not the disk
-            //      offsets the field name and PatternIndex both expect. The
-            //      nodeIdToDiskOffset map that would translate them is built by the
-            //      caller and never applied.
-            //   2. failureLinkOffset has the same problem.
-            //   3. outputOffset is left 0. BuildOutputPool takes only an offset, so it
-            //      has no access to the nodes and structurally cannot patch them;
-            //      PatternIndex::collectOutputs returns immediately on a zero
-            //      outputOffset, so no node can report a match.
-            // Completing this is tracked separately. Until then the runtime builds its
-            // automaton from the pattern entries, and PatternStore says so explicitly.
-            TrieNodeBinary* diskNode = reinterpret_cast<TrieNodeBinary*>(
-                static_cast<uint8_t*>(m_outputBase) + diskOffset
-                );
-
-            // Clear memory
-            std::memset(diskNode, 0, sizeof(TrieNodeBinary));
-
-            // Set header
-            diskNode->magic = TRIE_INDEX_MAGIC;
-            diskNode->version = TRIE_NODE_VERSION;
-            diskNode->reserved = 0;
-
-            // Copy child offsets
-            std::memcpy(diskNode->childOffsets.data(),
-                nodeMemory.childOffsets.data(),
-                sizeof(diskNode->childOffsets));
-
-            // Set failure link
-            diskNode->failureLinkOffset = nodeMemory.failureLinkOffset;
-
-            // Set output info
-            diskNode->outputCount = static_cast<uint32_t>(nodeMemory.outputs.size());
-            diskNode->outputOffset = 0; // Will be set during output pool construction
-
-            // Set depth
-            diskNode->depth = nodeMemory.depth;
-            diskNode->reserved2 = 0;
-
-            return StoreError{ SignatureStoreError::Success };
-        }
-
-
-        // ============================================================================
-        // BUILD OUTPUT PATTERN ID POOL - PRODUCTION GRADE IMPLEMENTATION
-        // ============================================================================
-
-        StoreError SignatureBuilder::BuildOutputPool(
-            uint64_t& poolOffset
-        ) noexcept {
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"BuildOutputPool: Starting at offset 0x%llX", poolOffset);
-
-            // ========================================================================
-            // STEP 1: COMPREHENSIVE VALIDATION
-            // ========================================================================
-            if (!m_outputBase || m_outputSize == 0) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"BuildOutputPool: Invalid output buffer (base=%p, size=%llu)",
-                    m_outputBase, m_outputSize);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid output buffer" };
-            }
-
-            if (poolOffset >= m_outputSize) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"BuildOutputPool: Pool offset beyond output size (offset=%llu, size=%llu)",
-                    poolOffset, m_outputSize);
-                return StoreError{ SignatureStoreError::TooLarge, 0, "Pool offset out of bounds" };
-            }
-
-            // ========================================================================
-            // STEP 2: ESTIMATE POOL SIZE
-            // ========================================================================
-            // Each pattern can match at multiple trie nodes, so we need to account for:
-            // - Pattern count stored as uint32_t (4 bytes per output list)
-            // - Pattern IDs stored as uint64_t (8 bytes each)
-            // - Average matches per pattern estimated at 1-10
-
-            constexpr uint64_t ESTIMATED_MATCHES_PER_PATTERN = 5;
-            uint64_t estimatedPoolSize = 0;
-
-            // Calculate size: (count + IDs) for each pattern entry in output pool
-            estimatedPoolSize = m_pendingPatterns.size() *
-                (sizeof(uint32_t) +
-                    (sizeof(uint64_t) * ESTIMATED_MATCHES_PER_PATTERN));
-
-            // Add safety margin (50% overhead for variable-length outputs)
-            // Use overflow-safe multiplication: check before multiplying
-            if (estimatedPoolSize > UINT64_MAX / 150ULL) {
-                estimatedPoolSize = UINT64_MAX;  // Cap at max on overflow
-            } else {
-                estimatedPoolSize = (estimatedPoolSize * 150) / 100;
-            }
-
-            // Validate we have enough space
-            if (poolOffset + estimatedPoolSize > m_outputSize) {
-                SS_LOG_WARN(L"SignatureBuilder",
-                    L"BuildOutputPool: Estimated pool size (%llu) exceeds available space (%llu)",
-                    estimatedPoolSize, m_outputSize - poolOffset);
-
-                // Reduce estimate if we're close to limit
-                estimatedPoolSize = (m_outputSize - poolOffset) * 90 / 100; // Use 90% of remaining
-            }
-
-            uint64_t currentPoolOffset = poolOffset;
-            uint64_t poolEndOffset = poolOffset + estimatedPoolSize;
-
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"BuildOutputPool: Estimated pool size: %llu bytes (offset: 0x%llX - 0x%llX)",
-                estimatedPoolSize, poolOffset, poolEndOffset);
-
-            // ========================================================================
-            // STEP 3: CLEAR POOL MEMORY (IMPORTANT FOR INTEGRITY)
-            // ========================================================================
-            if (estimatedPoolSize > 0) {
-                std::memset(
-                    static_cast<uint8_t*>(m_outputBase) + poolOffset,
-                    0,
-                    estimatedPoolSize
-                );
-            }
-
-            // ========================================================================
-            // STEP 4: BUILD OUTPUT LIST MAP FROM TRIE NODES
-            // ========================================================================
-            // We need to track which pattern IDs are output at each trie node
-            // This is done by traversing the compiled trie structure
-
-            struct OutputListEntry {
-                uint64_t trieNodeOffset;           // Trie node this output list belongs to
-                std::vector<uint64_t> patternIds;  // Pattern IDs matched at this node
-                uint64_t diskOffset;               // Where in pool this list is stored
-            };
-
-            std::vector<OutputListEntry> outputLists;
-            outputLists.reserve(m_pendingPatterns.size() * 2); // Estimate 2x for multiple matches
-
-            // ========================================================================
-            // STEP 5: TRAVERSE PATTERN TRIE AND COLLECT OUTPUT LISTS
-            // ========================================================================
-            // For each pattern, we need to track terminal nodes where it matches
-
-            size_t totalOutputs = 0;
-
-            for (size_t patternIdx = 0; patternIdx < m_pendingPatterns.size(); ++patternIdx) {
-                // FIX: Use cached compiled patterns from SerializePatterns instead of
-                // recompiling (which was the 3rd compilation and a major perf bottleneck)
-                if (patternIdx >= m_compiledPatternCache.size()) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"BuildOutputPool: Pattern %zu not in cache, skipping", patternIdx);
-                    continue;
-                }
-
-                const auto& cache = m_compiledPatternCache[patternIdx];
-                if (!cache.valid || cache.bytes.empty()) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"BuildOutputPool: Pattern %zu invalid/empty in cache, skipping",
-                        patternIdx);
-                    continue;
-                }
-
-                // For Aho-Corasick, each pattern creates output at its terminal node
-                // and potentially at ancestor nodes (suffix matches)
-                OutputListEntry entry;
-                entry.trieNodeOffset = 0; // FIXME: This field is never used; the runtime
-                                          // trie-walker relies on the output pool offsets
-                                          // being embedded in the terminal nodes during
-                                          // serialization. If the reader expects non-zero
-                                          // trieNodeOffset, this is a silent data-loss bug.
-                entry.patternIds.push_back(static_cast<uint64_t>(patternIdx));
-
-                outputLists.push_back(std::move(entry));
-                totalOutputs++;
-            }
-
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"BuildOutputPool: Collected %zu output list entries", outputLists.size());
-
-            // ========================================================================
-            // STEP 6: SERIALIZE OUTPUT LISTS TO DISK
-            // ========================================================================
-            // Format per output list:
-            // [uint32_t count] [uint64_t patternId1] [uint64_t patternId2] ...
-
-            std::map<uint64_t, uint64_t> outputListOffsets; // Maps pattern index to disk offset
-            size_t writtenLists = 0;
-
-            for (const auto& entry : outputLists) {
-                // Validate we have space for count + IDs
-                uint64_t requiredSpace = sizeof(uint32_t) +
-                    (sizeof(uint64_t) * entry.patternIds.size());
-
-                if (currentPoolOffset + requiredSpace > poolEndOffset) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"BuildOutputPool: Insufficient space for output list (needed=%llu, available=%llu)",
-                        requiredSpace, poolEndOffset - currentPoolOffset);
-                    break; // Graceful degradation
-                }
-
-                // Write pattern count
-                uint32_t* countPtr = reinterpret_cast<uint32_t*>(
-                    static_cast<uint8_t*>(m_outputBase) + currentPoolOffset
-                    );
-                *countPtr = static_cast<uint32_t>(entry.patternIds.size());
-                currentPoolOffset += sizeof(uint32_t);
-
-                // Write pattern IDs
-                uint64_t* idsPtr = reinterpret_cast<uint64_t*>(
-                    static_cast<uint8_t*>(m_outputBase) + currentPoolOffset
-                    );
-
-                for (size_t i = 0; i < entry.patternIds.size(); ++i) {
-                    idsPtr[i] = entry.patternIds[i];
-                }
-                currentPoolOffset += entry.patternIds.size() * sizeof(uint64_t);
-
-                // Record offset for later reference.
-                // INVARIANT: entry.patternIds[0] == patternIdx (unique per pattern),
-                // so this map assignment never overwrites. If patterns could share
-                // IDs, this would be a collision bug.
-                if (!entry.patternIds.empty()) {
-                    outputListOffsets[entry.patternIds[0]] = currentPoolOffset - requiredSpace;
-                }
-
-                writtenLists++;
-
-                // Log progress every 100 entries
-                if (writtenLists % 100 == 0) {
-                    ReportProgress("BuildOutputPool", writtenLists, outputLists.size());
-                }
-            }
-
-            // ========================================================================
-            // STEP 7: VALIDATION & ERROR HANDLING
-            // ========================================================================
-            if (writtenLists == 0) {
-                SS_LOG_WARN(L"SignatureBuilder",
-                    L"BuildOutputPool: No output lists were written");
-                // This is not necessarily fatal - patterns might not have outputs
-            }
-
-            if (writtenLists < outputLists.size()) {
-                size_t skipped = outputLists.size() - writtenLists;
-                SS_LOG_WARN(L"SignatureBuilder",
-                    L"BuildOutputPool: Skipped %zu output lists due to space constraints", skipped);
-                m_statistics.invalidSignaturesSkipped += skipped;
-            }
-
-            // ========================================================================
-            // STEP 8: UPDATE TRIE NODES WITH OUTPUT OFFSETS
-            // ========================================================================
-            // Go back and update trie nodes to point to their output lists
-            // This requires re-reading the trie nodes and updating pointers
-            // (This is complex and would normally be done during trie serialization)
-
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"BuildOutputPool: Updated %zu trie nodes with output offsets",
-                outputListOffsets.size());
-
-            // ========================================================================
-            // STEP 9: RECORD POOL STATISTICS
-            // ========================================================================
-            uint64_t actualPoolSize = currentPoolOffset - poolOffset;
-
-            m_statistics.patternIndexSize += actualPoolSize;
-
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"BuildOutputPool: Complete");
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Output lists written: %zu/%zu", writtenLists, outputLists.size());
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Pool size: %llu bytes (estimated: %llu)",
-                actualPoolSize, estimatedPoolSize);
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"  Pool offset: 0x%llX - 0x%llX",
-                poolOffset, currentPoolOffset);
-            
-            // HARDENED: Division-by-zero protection for pool utilization percentage
-            if (estimatedPoolSize > 0) {
-                SS_LOG_INFO(L"SignatureBuilder",
-                    L"  Pool utilization: %.2f%%",
-                    (100.0 * actualPoolSize) / estimatedPoolSize);
-            } else {
-                SS_LOG_INFO(L"SignatureBuilder",
-                    L"  Pool utilization: N/A (no patterns)");
-            }
-
-            // ========================================================================
-            // STEP 10: FINAL VALIDATION
-            // ========================================================================
-            // Verify no memory corruption occurred
-            if (currentPoolOffset > m_outputSize) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"BuildOutputPool: Pool offset exceeded output size!");
-                return StoreError{ SignatureStoreError::TooLarge, 0, "Pool overflow" };
-            }
-
-            // Update offset for next section -- propagate back to caller via reference
-            poolOffset = Format::AlignToPage(currentPoolOffset);
-
-            ReportProgress("BuildOutputPool", outputLists.size(), outputLists.size());
+                L"SerializeAhoCorasickToDisk: wrote the pattern section header "
+                L"(%llu bytes, no serialized automaton) in %llu us",
+                trieDataSize, serializeTimeUs);
 
             return StoreError{ SignatureStoreError::Success };
         }

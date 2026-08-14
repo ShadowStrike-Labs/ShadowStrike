@@ -53,8 +53,21 @@ namespace ShadowStrike {
             // Timeout check interval (every N bytes)
             constexpr size_t TIMEOUT_CHECK_INTERVAL = 1024;
 
-            // Minimum index size (header + root node + minimal pool)
-            constexpr uint64_t MIN_INDEX_SIZE = 512;
+            // Minimum index size: the section header, and nothing more.
+            //
+            // This was 512 with the comment "header + root node + minimal pool", which
+            // described a layout that no longer exists - the serialized automaton was
+            // removed because it could not match anything and cost ~1,056 bytes per byte
+            // of pattern content. It also never matched its own stated basis, since a
+            // header plus one TrieNodeBinary is 1,152 bytes, not 512.
+            //
+            // Keeping 512 after the removal rejected VALID databases: a section holding
+            // the header plus the entry array for one pattern is 322 bytes, so the real
+            // shipped content failed to open and took the pattern store down with it. The
+            // bound now comes from the format - a section must at least contain its own
+            // header - and the checks that actually detect a corrupt section are the
+            // magic number, the version, and the bounds validation on the entry array.
+            constexpr uint64_t MIN_INDEX_SIZE = sizeof(TrieIndexHeader);
 
             // Maximum index size (2GB limit)
             constexpr uint64_t MAX_INDEX_SIZE = 2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -324,31 +337,49 @@ namespace ShadowStrike {
             // ========================================================================
             // STEP 6: VALIDATE ROOT NODE OFFSET
             // ========================================================================
+            //
+            // Zero is a VALID, EXPECTED value and means "this database carries no
+            // serialized automaton". It is the state SignatureBuilder now writes: the
+            // trie it used to emit could not match anything (child and failure links
+            // held node ids rather than disk offsets, and outputOffset was never set)
+            // while costing about 1,056 bytes per byte of pattern content, so it was
+            // removed rather than completed. The pattern section still exists and still
+            // publishes the PatternEntry array, which is the authoritative form; the
+            // runtime compiles its automaton from those entries.
+            //
+            // This is consistent with the contract already stated below, where a
+            // non-zero m_rootOffset is the module's own readiness flag. Treating zero as
+            // corruption would refuse to open a perfectly good section - and because
+            // PatternStore::Initialize propagates that failure, it would take hash and
+            // YARA detection down with it.
+            const bool hasSerializedAutomaton = (indexHeader->rootNodeOffset != 0);
 
-            // Root node offset must be within index bounds
-            if (indexHeader->rootNodeOffset >= indexSize) {
-                SS_LOG_ERROR(L"PatternIndex",
-                    L"Initialize: Root node offset (0x%llX) beyond index size (0x%llX)",
-                    indexHeader->rootNodeOffset, indexSize);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                                  "Invalid root node offset" };
-            }
+            if (hasSerializedAutomaton) {
+                // Root node offset must be within index bounds
+                if (indexHeader->rootNodeOffset >= indexSize) {
+                    SS_LOG_ERROR(L"PatternIndex",
+                        L"Initialize: Root node offset (0x%llX) beyond index size (0x%llX)",
+                        indexHeader->rootNodeOffset, indexSize);
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                      "Invalid root node offset" };
+                }
 
-            // Ensure root node fits within index
-            if (indexHeader->rootNodeOffset > indexSize - sizeof(TrieNodeBinary)) {
-                SS_LOG_ERROR(L"PatternIndex",
-                    L"Initialize: Root node would extend beyond index bounds");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                                  "Root node extends beyond index bounds" };
-            }
+                // Ensure root node fits within index
+                if (indexHeader->rootNodeOffset > indexSize - sizeof(TrieNodeBinary)) {
+                    SS_LOG_ERROR(L"PatternIndex",
+                        L"Initialize: Root node would extend beyond index bounds");
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                      "Root node extends beyond index bounds" };
+                }
 
-            // Validate root node offset is after header
-            if (indexHeader->rootNodeOffset < sizeof(TrieIndexHeader)) {
-                SS_LOG_ERROR(L"PatternIndex",
-                    L"Initialize: Root node offset (0x%llX) overlaps with header",
-                    indexHeader->rootNodeOffset);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                                  "Root node offset overlaps with header" };
+                // Validate root node offset is after header
+                if (indexHeader->rootNodeOffset < sizeof(TrieIndexHeader)) {
+                    SS_LOG_ERROR(L"PatternIndex",
+                        L"Initialize: Root node offset (0x%llX) overlaps with header",
+                        indexHeader->rootNodeOffset);
+                    return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                      "Root node offset overlaps with header" };
+                }
             }
 
             // ========================================================================
@@ -430,10 +461,21 @@ namespace ShadowStrike {
 
             SS_LOG_INFO(L"PatternIndex", L"Initialize: Successfully initialized");
             SS_LOG_INFO(L"PatternIndex", L"  Total patterns: %llu", indexHeader->totalPatterns);
-            SS_LOG_INFO(L"PatternIndex", L"  Total nodes: %llu", indexHeader->totalNodes);
-            SS_LOG_INFO(L"PatternIndex", L"  Max depth: %u", indexHeader->maxNodeDepth);
-            SS_LOG_INFO(L"PatternIndex", L"  Flags: 0x%08X (Aho-Corasick: %s)",
-                indexHeader->flags, (indexHeader->flags & 0x01) ? "yes" : "no");
+            if (hasSerializedAutomaton) {
+                SS_LOG_INFO(L"PatternIndex", L"  Total nodes: %llu", indexHeader->totalNodes);
+                SS_LOG_INFO(L"PatternIndex", L"  Max depth: %u", indexHeader->maxNodeDepth);
+                SS_LOG_INFO(L"PatternIndex", L"  Flags: 0x%08X (Aho-Corasick: %s)",
+                    indexHeader->flags, (indexHeader->flags & 0x01) ? "yes" : "no");
+            }
+            else {
+                // Stated rather than left to be inferred from a zero node count: this
+                // index answers no searches, by design, and the patterns are matched
+                // from the entry array instead.
+                SS_LOG_INFO(L"PatternIndex",
+                    L"  No serialized automaton in this database - Search() through this "
+                    L"index will report no matches; patterns are compiled from the entry "
+                    L"array by PatternStore");
+            }
 
             return StoreError{ SignatureStoreError::Success };
         }
@@ -686,6 +728,21 @@ namespace ShadowStrike {
 
             if (view->baseAddress == nullptr) {
                 SS_LOG_ERROR(L"PatternIndex", L"Search: Memory view base address is null");
+                return results;
+            }
+
+            // Zero root means there is no automaton to walk - either the index was never
+            // initialized, or this database carries no serialized trie, which is the
+            // state SignatureBuilder now writes deliberately (see PatternIndex::Initialize
+            // for why). Return empty WITHOUT descending, because every offset below is
+            // resolved relative to this one and a zero root would walk the section header.
+            //
+            // DEBUG rather than WARN on purpose: Initialize already reports this once, at
+            // INFO, and callers such as MemoryScanner invoke Search per memory region -
+            // a per-call warning would bury the one line that matters under thousands.
+            if (rootOffset == 0) {
+                SS_LOG_DEBUG(L"PatternIndex",
+                    L"Search: no serialized automaton in this index; returning no matches");
                 return results;
             }
 

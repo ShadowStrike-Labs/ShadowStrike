@@ -1228,6 +1228,75 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // The pattern section must cost what its CONTENT costs.
+    //
+    // This section used to carry a serialized Aho-Corasick trie whose nodes were
+    // 1,056 bytes each because childOffsets is a dense 256-entry array. Measured:
+    // ~1,059 bytes of section per byte of pattern content, so 200 patterns of 200
+    // bytes produced a 42 MB pattern index inside a fixed 64 MB database whose YARA
+    // section already held 38 MB. The structure could not match anything - its child
+    // and failure links held node ids where disk offsets were required, and
+    // outputOffset was never written - so the binding constraint on how much pattern
+    // content this product could ship was a structure nothing could read.
+    //
+    // It was removed, and this check is what stops it coming back. The bound is
+    // derived from the format rather than being a chosen number: the section holds
+    // its header, a cache-line-aligned dense array of PatternEntry, and one blob per
+    // pattern (NUL-terminated name, the pattern bytes, and a mask of equal length),
+    // then page alignment at the end. Anything materially larger means something is
+    // writing per-node or per-byte structure again, and the failure names both
+    // numbers so the ratio is visible immediately.
+    {
+        uint64_t sectionSize = 0;
+        std::ifstream dbFile(std::filesystem::path(path), std::ios::binary);
+        if (dbFile) {
+            // patternIndexSize lives at offset 72 of SignatureDatabaseHeader.
+            dbFile.seekg(72, std::ios::beg);
+            dbFile.read(reinterpret_cast<char*>(&sectionSize), sizeof(sectionSize));
+            if (!dbFile) {
+                sectionSize = 0;
+            }
+        }
+
+        if (sectionSize > 0) {
+            using ShadowStrike::SignatureStore::PatternEntry;
+            using ShadowStrike::SignatureStore::TrieIndexHeader;
+
+            uint64_t contentBytes = 0;
+            for (const auto& line : expected) {
+                contentBytes += line.name.size() + 1;          // NUL-terminated name
+                contentBytes += line.bytes.size();             // pattern bytes
+                contentBytes += line.mask.size();              // mask, same length
+            }
+
+            const uint64_t expectedMax =
+                sizeof(TrieIndexHeader) +
+                ShadowStrike::SignatureStore::CACHE_LINE_SIZE +          // entry array alignment
+                (expected.size() * sizeof(PatternEntry)) +
+                contentBytes +
+                ShadowStrike::SignatureStore::PAGE_SIZE;                 // trailing alignment
+
+            if (sectionSize > expectedMax) {
+                Fail("the pattern section is %llu bytes for %zu pattern(s) totalling "
+                     "%llu bytes of name, pattern and mask data - more than the %llu "
+                     "bytes the format needs (%.1f bytes of section per byte of "
+                     "content). Something is writing per-node structure into this "
+                     "section again; a dense 256-entry trie node costs 1,056 bytes "
+                     "each and previously made this section 460x larger than its "
+                     "content while being unable to match anything.",
+                     sectionSize, expected.size(), contentBytes, expectedMax,
+                     contentBytes > 0
+                         ? static_cast<double>(sectionSize) / static_cast<double>(contentBytes)
+                         : 0.0);
+                return false;
+            }
+
+            Info("  verified   : pattern section is %llu bytes for %llu bytes of "
+                 "pattern content", sectionSize, contentBytes);
+        }
+    }
+
     return true;
 }
 
