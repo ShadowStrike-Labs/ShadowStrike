@@ -340,6 +340,22 @@ namespace {
     // resident memory in the user-mode service.
     constexpr size_t kRecentEventDataPreview = 256;
 
+    // The same reasoning applies to the STRING fields, which this helper
+    // previously left untouched. keyPath is bounded only by
+    // RegistryMonitorConstants::MAX_KEY_PATH_LENGTH (16384 wchars) and valueName
+    // by MAX_VALUE_NAME_LENGTH (16383), both attacker-controlled, and an event
+    // is retained even when it is REJECTED for being overlong - which is correct
+    // for forensics but means the ring can be filled with 1000 maximal paths,
+    // roughly 32 MB of resident memory in the service, by a process that simply
+    // asks for absurd key names in a loop.
+    //
+    // A preview is sufficient for the ring's purpose: it exists so a blocked or
+    // dropped operation is visible to the UI and to an investigator, and the
+    // leading portion of a path identifies the hive and target. The full value
+    // still reaches the log and the event callbacks, which receive the
+    // untruncated event.
+    constexpr size_t kRecentEventStringPreview = 512;
+
     void TruncateEventForRetention(RegistryEvent& ev) noexcept {
         try {
             if (ev.data.size() > kRecentEventDataPreview) {
@@ -347,6 +363,15 @@ namespace {
             }
             if (ev.previousData.size() > kRecentEventDataPreview) {
                 ev.previousData.resize(kRecentEventDataPreview);
+            }
+            if (ev.keyPath.size() > kRecentEventStringPreview) {
+                ev.keyPath.resize(kRecentEventStringPreview);
+            }
+            if (ev.valueName.size() > kRecentEventStringPreview) {
+                ev.valueName.resize(kRecentEventStringPreview);
+            }
+            if (ev.processName.size() > kRecentEventStringPreview) {
+                ev.processName.resize(kRecentEventStringPreview);
             }
         } catch (...) {
             ev.data.clear();

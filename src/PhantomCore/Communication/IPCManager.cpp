@@ -1514,10 +1514,17 @@ ConnectionInfo IPCManager::GetConnectionInfo(ChannelType channel) const {
             info.status = m_hPipe != nullptr
                           ? ConnectionStatus::Connected
                           : ConnectionStatus::Disconnected;
-            {
-                std::shared_lock lock(m_impl->configMutex);
-                info.endpoint = m_impl->config.servicePipeName;
-            }
+            // Left empty deliberately. This channel has no configured endpoint:
+            // the name it used to report came from config.servicePipeName, which
+            // was a duplicate of ServiceCommConstants::SERVICE_PIPE_NAME and has
+            // been removed, and nothing in this build can open this transport
+            // anyway (CreatePipeServer has no callers). Reporting a plausible
+            // pipe name for a channel that is never opened is how a status
+            // display comes to describe a connection that does not exist - the
+            // same class of defect as the UI reporting the driver ONLINE while
+            // the kernel channel was refused. An empty endpoint alongside
+            // Disconnected is the accurate answer.
+            info.endpoint.clear();
             break;
 
         default:
@@ -1558,15 +1565,23 @@ void IPCManager::Reconnect(ChannelType channel) {
             break;
 
         case ChannelType::NamedPipe:
+            // Deliberately does nothing beyond dropping any handle.
+            //
+            // This branch used to call ConnectToPipe(config.servicePipeName),
+            // which was a "reconnect" of a channel nothing ever connects in the
+            // first place: CreatePipeServer has no callers and the only caller of
+            // ConnectToPipe was this line. It also counted a reconnect in the
+            // statistics, so the numbers reported channel recoveries that never
+            // happened - a counter that reads healthy for work not done is worse
+            // than an absent one.
+            //
+            // The name it read has been removed as a duplicate of
+            // ServiceCommConstants::SERVICE_PIPE_NAME. When this transport is
+            // either wired up or removed as its own change, this branch is where
+            // a real reconnect belongs, and it must name its channel explicitly.
             DisconnectPipe();
-            {
-                std::shared_lock lock(m_impl->configMutex);
-                if (!ConnectToPipe(m_impl->config.servicePipeName)) {
-                    Utils::Logger::Warn("[IPCManager] Failed to reconnect named pipe channel");
-                    m_impl->stats.errors++;
-                }
-            }
-            m_impl->stats.reconnects++;
+            Utils::Logger::Warn("[IPCManager] Reconnect(NamedPipe): this transport has no "
+                                "connect path in this build; nothing to re-establish");
             break;
 
         default:

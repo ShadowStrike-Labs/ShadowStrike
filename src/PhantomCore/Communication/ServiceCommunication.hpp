@@ -146,11 +146,26 @@ namespace ServiceCommConstants {
     inline constexpr uint32_t VERSION_MINOR = 0;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
-    /// @brief Service pipe name
+    /// @brief The ServiceCommunication control-channel pipe.
+    ///
+    /// THIS IS NOT THE PIPE THE PHANTOMHOME UI AND TRAY USE. That one is
+    /// ShadowStrike::Service::CommunicationConstants::PIPE_NAME
+    /// (\\.\pipe\ShadowStrikeServicePipe), served by ServiceCommunicator, which
+    /// is where the HomeIpcDispatcher v2 verb handlers live. The two names differ
+    /// by one word and the classes differ by two letters
+    /// (ServiceCommunication vs ServiceCommunicator), so the distinction is
+    /// stated here rather than left to be inferred.
+    ///
+    /// This pipe is created by ServiceCommunicationImpl with the DACL
+    /// D:P(A;;GA;;;SY)(A;;GA;;;BA) and PIPE_REJECT_REMOTE_CLIENTS, i.e. local
+    /// SYSTEM and Administrators only.
+    ///
+    /// This declaration is the ONLY definition of this name. IPCManager
+    /// previously declared its own identical literal for the same channel; two
+    /// copies of one wire-level name is the arrangement that let
+    /// SelfDefenseConstants::DRIVER_SERVICE_NAME name a service which has never
+    /// existed.
     inline constexpr const wchar_t* SERVICE_PIPE_NAME = L"\\\\.\\pipe\\ShadowStrikeService";
-    
-    /// @brief GUI pipe name
-    inline constexpr const wchar_t* GUI_PIPE_NAME = L"\\\\.\\pipe\\ShadowStrikeGUI";
     
     /// @brief Maximum message size
     inline constexpr size_t MAX_MESSAGE_SIZE = 1024 * 1024;  // 1 MB

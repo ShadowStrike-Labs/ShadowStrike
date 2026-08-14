@@ -290,7 +290,28 @@ TEST_F(RegistryMonitorTest, AnalyzeValueAndProcessEventBoundariesStayDeterminist
     nullByteEvent.keyPath.push_back(L'\0');
     nullByteEvent.keyPath += L"\\Hidden";
     EXPECT_EQ(monitor.ProcessEvent(nullByteEvent), RegistryVerdict::Block);
-    EXPECT_TRUE(monitor.GetRecentEvents().empty());
+
+    // A BLOCKED EVENT IS RETAINED. This previously asserted the ring was empty,
+    // i.e. that a blocked event is not recorded, and it had never passed.
+    //
+    // The product deliberately does the opposite, and says so at the
+    // FinalizeGuard in RegistryMonitorImpl::ProcessEvent: "regardless of which
+    // return path we take, the event is recorded into the bounded recent-events
+    // ring (forensics) and the event callbacks fire. This eliminates the silent
+    // loss bug where Block/Alert/SilentDrop events vanished from the UI ring."
+    //
+    // Retaining it is the correct behaviour and the old expectation was the
+    // defect written down as a contract: a blocked registry tamper attempt is
+    // precisely the event an investigator most needs, and dropping it from the
+    // ring means the UI shows nothing happened while the product blocked an
+    // attack. Asserting the pre-fix behaviour here would have made a future
+    // reader "fix" the product back.
+    {
+        const auto afterBlock = monitor.GetRecentEvents();
+        ASSERT_EQ(afterBlock.size(), 1u)
+            << "a blocked event must stay in the forensic ring";
+        EXPECT_EQ(afterBlock.front().keyPath, nullByteEvent.keyPath);
+    }
 
     RegistryEvent firstAllowed;
     firstAllowed.processId = 10;
@@ -320,9 +341,22 @@ TEST_F(RegistryMonitorTest, AnalyzeValueAndProcessEventBoundariesStayDeterminist
     EXPECT_EQ(monitor.ProcessEvent(protectedEvent), RegistryVerdict::Block);
 
     recentEvents = monitor.GetRecentEvents(10);
-    ASSERT_EQ(recentEvents.size(), 2u);
-    EXPECT_EQ(recentEvents.front().keyPath, secondAllowed.keyPath);
-    EXPECT_EQ(recentEvents.back().keyPath, firstAllowed.keyPath);
+
+    // All four processed events are retained, newest first: the protected-key
+    // Block, the two Allows, then the null-byte Block. This asserted 2 before,
+    // counting only the allowed events, which is the same pre-fix assumption
+    // corrected above.
+    //
+    // The ordering is asserted at BOTH ends rather than just the front, because
+    // GetRecentEvents walks the deque in reverse and an off-by-one there would
+    // still satisfy a front-only check.
+    ASSERT_EQ(recentEvents.size(), 4u);
+    EXPECT_EQ(recentEvents.front().keyPath, protectedEvent.keyPath)
+        << "newest event must come first";
+    EXPECT_EQ(recentEvents.back().keyPath, nullByteEvent.keyPath)
+        << "oldest retained event must come last";
+    EXPECT_EQ(recentEvents[1].keyPath, secondAllowed.keyPath);
+    EXPECT_EQ(recentEvents[2].keyPath, firstAllowed.keyPath);
 }
 
 TEST_F(RegistryMonitorTest, RulePriorityAndProtectedKeyBoundariesRemainDeterministic) {
@@ -395,7 +429,26 @@ TEST_F(RegistryMonitorTest, RulePriorityAndProtectedKeyBoundariesRemainDetermini
         std::wstring(RegistryMonitorConstants::MAX_KEY_PATH_LENGTH, L'A');
     const auto recentCountBefore = monitor.GetRecentEvents(32).size();
     EXPECT_EQ(monitor.ProcessEvent(overlongEvent), RegistryVerdict::Block);
-    EXPECT_EQ(monitor.GetRecentEvents(32).size(), recentCountBefore);
+
+    // A REJECTED EVENT IS ALSO RETAINED, for the same forensic reason as the
+    // blocked events above. This asserted the count was UNCHANGED, i.e. that an
+    // overlong key path is silently dropped from the ring, and had never passed.
+    // An attacker probing with absurd key names is exactly what should be
+    // visible.
+    const auto afterOverlong = monitor.GetRecentEvents(32);
+    ASSERT_EQ(afterOverlong.size(), recentCountBefore + 1u)
+        << "a rejected overlong event must still be recorded for forensics";
+
+    // And retention must BOUND it. keyPath is attacker-controlled up to
+    // MAX_KEY_PATH_LENGTH (16384 wchars), and the ring holds 1000 events, so an
+    // uncapped path lets a process fill roughly 32 MB of service memory by
+    // asking for long key names in a loop. TruncateEventForRetention caps the
+    // string fields; this asserts the retained copy is shorter than what was
+    // submitted, which is what makes the retention above safe to keep.
+    EXPECT_LT(afterOverlong.front().keyPath.size(), overlongEvent.keyPath.size())
+        << "an overlong key path must be truncated before it is retained";
+    EXPECT_FALSE(afterOverlong.front().keyPath.empty())
+        << "truncation must keep enough of the path to identify the target";
 }
 
 }  // namespace ShadowStrike::Core::Registry::Test

@@ -97,7 +97,18 @@ namespace Service {
 // CONSTANTS
 // ============================================================================
 namespace CommunicationConstants {
-    constexpr const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\ShadowStrikeServicePipe";
+    // The PhantomHome UI and tray channel. This is the pipe a user-facing client
+// connects to, served by ServiceCommunicator, carrying the HomeIpcDispatcher v2
+// verbs (AuthHandshake, GetStatus, scan controls).
+//
+// Referenced rather than copied by every client - TrayIpc.cpp and
+// UI/Client/IPC/PipeClient.cpp both use this constant - so the name cannot drift
+// between server and client.
+//
+// Do not confuse with Communication::ServiceCommConstants::SERVICE_PIPE_NAME
+// (\\.\pipe\ShadowStrikeService), a different channel served by a different
+// class whose name differs from this one by two letters.
+constexpr const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\ShadowStrikeServicePipe";
 
     // Default buffer sizes
     constexpr uint32_t IN_BUFFER_SIZE = 64 * 1024;  // 64KB

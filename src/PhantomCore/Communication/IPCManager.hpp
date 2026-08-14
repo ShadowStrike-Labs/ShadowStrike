@@ -191,8 +191,29 @@ namespace IPCConstants {
     /// @brief Filter port name
     inline constexpr const wchar_t* FILTER_PORT_NAME = L"\\ShadowStrikePort";
     
-    /// @brief Named pipe name (Service-GUI)
-    inline constexpr const wchar_t* SERVICE_PIPE_NAME = L"\\\\.\\pipe\\ShadowStrikeService";
+    // The service pipe name is deliberately NOT declared here.
+    //
+    // This header previously carried
+    //     SERVICE_PIPE_NAME = L"\\\\.\\pipe\\ShadowStrikeService"
+    // commented "Named pipe name (Service-GUI)". That comment was wrong and
+    // wrong in the most misleading direction available: the Service-to-GUI pipe
+    // is \\.\pipe\ShadowStrikeServicePipe, declared as
+    // ShadowStrike::Service::CommunicationConstants::PIPE_NAME and served by
+    // ServiceCommunicator. A reader wiring new UI traffic to the constant that
+    // called itself the Service-GUI pipe would have reached a different channel
+    // and produced a failure indistinguishable from the service being down.
+    //
+    // The literal was also a second, independent copy of a name already declared
+    // by ServiceCommConstants::SERVICE_PIPE_NAME for the same channel. Two
+    // declarations of one wire-level name agreed on the day they were written
+    // with nothing able to report when they stopped agreeing - the same
+    // arrangement that let SelfDefenseConstants::DRIVER_SERVICE_NAME name a
+    // service which has never existed.
+    //
+    // Where the names now live, once each:
+    //   UI and tray channel   Service::CommunicationConstants::PIPE_NAME
+    //   control channel       Communication::ServiceCommConstants::SERVICE_PIPE_NAME
+    //   kernel filter port    FILTER_PORT_NAME, immediately above
     
     /// @brief Maximum message size
     inline constexpr size_t MAX_MESSAGE_SIZE = 65536;
@@ -612,9 +633,6 @@ struct IPCConfiguration {
     /// @brief Filter port name
     std::wstring filterPortName = IPCConstants::FILTER_PORT_NAME;
     
-    /// @brief Service pipe name
-    std::wstring servicePipeName = IPCConstants::SERVICE_PIPE_NAME;
-    
     /// @brief Worker thread count
     uint32_t workerThreadCount = IPCConstants::DEFAULT_WORKER_COUNT;
     
@@ -734,12 +752,27 @@ public:
     // ========================================================================
     // NAMED PIPE OPERATIONS
     // ========================================================================
-    
+    //
+    // NOT REACHED BY ANY PRODUCTION CODE TODAY, established by measurement
+    // rather than assumed: CreatePipeServer has no callers anywhere in src,
+    // tests or Fuzzer; ConnectToPipe is called only from IPCManager::Reconnect,
+    // which itself has no callers. So this transport can neither be served nor
+    // connected, and the send/receive machinery behind m_hPipe is unreachable
+    // with it. It is left in place rather than deleted here because removing a
+    // whole transport from the class that also owns the kernel filter port
+    // deserves its own change, with its own verification, rather than riding
+    // along with a naming fix.
+    //
+    // The pipe name is now a REQUIRED argument. It previously defaulted to a
+    // duplicate of ServiceCommConstants::SERVICE_PIPE_NAME declared in this
+    // header - see the note where that literal used to be. A caller must state
+    // which channel it means.
+
     /// @brief Create named pipe server
-    [[nodiscard]] bool CreatePipeServer(const std::wstring& pipeName = IPCConstants::SERVICE_PIPE_NAME);
+    [[nodiscard]] bool CreatePipeServer(const std::wstring& pipeName);
     
     /// @brief Connect to pipe server
-    [[nodiscard]] bool ConnectToPipe(const std::wstring& pipeName = IPCConstants::SERVICE_PIPE_NAME);
+    [[nodiscard]] bool ConnectToPipe(const std::wstring& pipeName);
     
     /// @brief Disconnect pipe
     void DisconnectPipe();
