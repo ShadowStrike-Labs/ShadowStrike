@@ -90,6 +90,15 @@ constexpr uint16_t kKernelEncAlgorithmAes256Gcm = 2;
 constexpr uint32_t kKernelEncFlagUseAad = 0x00000002;
 constexpr uint32_t kKernelEncCrc32Polynomial = 0xEDB88320UL;
 
+// Size of the HMAC-SHA256 trailer the driver appends when
+// SHADOWSTRIKE_MSG_FLAG_HMAC is set. Declared here, once, because this value is
+// part of the WIRE FORMAT and two places need it: the function that reports how
+// long a frame is on the wire, and the function that locates the tag by counting
+// back from the end. It previously existed only as a local constant inside the
+// second of those, so the first did not account for the trailer at all and every
+// end-relative offset it produced was displaced by exactly this many bytes.
+constexpr size_t kKernelMessageHmacSize = 32;
+
 [[nodiscard]] std::string WideToUtf8String(const std::wstring& value) noexcept {
     if (value.empty()) {
         return {};
@@ -131,7 +140,37 @@ constexpr uint32_t kKernelEncCrc32Polynomial = 0xEDB88320UL;
     return utf8;
 }
 
-[[nodiscard]] DWORD GetDeliveredMessageSize(
+// Validates the two-header framing of a delivered message and reports the size
+// the frame CLAIMS to be, including any transport trailer.
+//
+// THIS MUST NOT BE USED AS THE AUTHORITY ON HOW MANY BYTES ARRIVED. The only
+// authority for that is the byte count the operating system reports through
+// GetOverlappedResult. This function reads a length the SENDER wrote, so using
+// it in place of the OS count means trusting the frame to describe itself
+// correctly -- and when the two disagree, every length-derived offset computed
+// downstream is wrong.
+//
+// THAT DISAGREEMENT WAS REAL AND COST 1,048 UNSCANNED FILES in the 1.0.93 field
+// run. SHADOWSTRIKE_MESSAGE_HEADER::TotalSize is defined by the driver as
+// sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + payload (CommPort.c:582), and the
+// HMAC-SHA256 tag is a 32-byte trailer written AFTER that payload -- the flag's
+// own definition says so (MessageProtocol.h:32, "appended after data"). So a
+// size derived from TotalSize alone is 32 bytes SHORT of what the kernel
+// actually wrote for any HMAC-bearing frame, and DecryptReceivedMessage locates
+// the tag as "the last 32 bytes", which then pointed 32 bytes INSIDE the
+// ciphertext. The HMAC was verified against ciphertext instead of against the
+// tag and could not possibly match.
+//
+// It only affected a fraction of frames because it only affected ONE of the two
+// delivery paths: an asynchronous completion supplies the true count via
+// GetOverlappedResult, while a synchronous completion previously fell back to
+// this function. Whether FilterGetMessage completes synchronously depends on
+// whether a message was already queued on the port, which is a function of load
+// -- so the failures were load-dependent and looked random.
+//
+// The trailer is therefore accounted for here, and the caller compares this
+// claim against the OS count rather than substituting it.
+[[nodiscard]] DWORD GetClaimedMessageSize(
     const uint8_t* buffer,
     size_t bufferSize
 ) noexcept {
@@ -149,7 +188,15 @@ constexpr uint32_t kKernelEncCrc32Polynomial = 0xEDB88320UL;
         return 0;
     }
 
-    const size_t totalSize = sizeof(FILTER_MESSAGE_HEADER) + ssHeader->TotalSize;
+    size_t totalSize = sizeof(FILTER_MESSAGE_HEADER) + ssHeader->TotalSize;
+
+    // The HMAC trailer is NOT counted in TotalSize. Any consumer that needs to
+    // know how long the frame is on the wire must add it, or every offset
+    // measured back from the end of the frame is displaced by exactly 32 bytes.
+    if (ssHeader->Flags & SHADOWSTRIKE_MSG_FLAG_HMAC) {
+        totalSize += kKernelMessageHmacSize;
+    }
+
     if (totalSize > bufferSize || totalSize > static_cast<size_t>(MAXDWORD)) {
         return 0;
     }
@@ -539,10 +586,47 @@ public:
                     GetOverlappedResult(guard.get(), &overlapped, &ignored, TRUE);
                 }
             } else if (SUCCEEDED(hr)) {
-                // Completed synchronously despite async request
-                actualBytes = GetDeliveredMessageSize(buffer.data(), bufferSize);
-                if (actualBytes == 0) {
-                    hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                // Completed synchronously despite the asynchronous request.
+                //
+                // The OVERLAPPED is still filled in on a synchronous completion,
+                // so the OS-reported byte count is available here exactly as it
+                // is on the pending path above. Use it. This branch previously
+                // derived the length from the frame's own TotalSize field
+                // instead, which is 32 bytes short for every HMAC-bearing frame
+                // because the tag is a trailer the driver does not count -- see
+                // GetClaimedMessageSize. That made the HMAC check read the last
+                // 32 bytes of CIPHERTEXT as the tag, so it could never match,
+                // and the frame was answered fail-open. 544 of the 1,048
+                // fail-open frames in the 1.0.93 field run were this, and each
+                // one is a file that went unscanned.
+                //
+                // Two sources of truth for one value is the defect; the OS count
+                // is the one that describes what actually arrived.
+                DWORD bytesTransferred = 0;
+                if (GetOverlappedResult(guard.get(), &overlapped,
+                                        &bytesTransferred, FALSE)) {
+                    actualBytes = bytesTransferred;
+                } else {
+                    hr = HRESULT_FROM_WIN32(::GetLastError());
+                }
+
+                // The frame's self-reported size is still checked, but as a
+                // CLAIM measured against the delivered count rather than as a
+                // substitute for it. A frame whose header disagrees with what
+                // the OS delivered is desynchronised and must not be parsed:
+                // that is what produced magics of 0x0000106C (4204) and
+                // 0x00002638 (9784) in the field, both of which are plausible
+                // byte LENGTHS being read at an offset where a magic was
+                // expected.
+                if (SUCCEEDED(hr)) {
+                    const DWORD claimed = GetClaimedMessageSize(buffer.data(), bufferSize);
+                    if (claimed == 0 || claimed != actualBytes) {
+                        Utils::Logger::Debug(
+                            "[FilterConnection] Frame size disagreement: OS delivered {} "
+                            "bytes, frame claims {} - discarding as desynchronised",
+                            actualBytes, claimed);
+                        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                    }
                 }
             }
 
@@ -579,7 +663,7 @@ public:
 
             if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_DATA)) {
                 // Delivered frame failed the two-header size/framing check (see
-                // GetDeliveredMessageSize) -- an unusable/desynced frame. The
+                // GetClaimedMessageSize) -- an unusable/desynced frame. The
                 // receive worker handles this with escalating back-off + a
                 // single aggregated warning, so logging EVERY occurrence at Warn
                 // only floods the log (field: 3392 lines in 3.3s). Keep per-frame
@@ -1200,7 +1284,7 @@ private:
         // HMAC-SHA256 tag after the encrypted payload. Verify before any
         // decryption to detect tampering/replay early.
         if (ssHeader->Flags & SHADOWSTRIKE_MSG_FLAG_HMAC) {
-            constexpr size_t kHmacSize = 32;
+            constexpr size_t kHmacSize = kKernelMessageHmacSize;
             if (actualBytes < sizeof(FILTER_MESSAGE_HEADER) +
                               sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + kHmacSize) {
                 Utils::Logger::Warn("[FilterConnection] HMAC flag set but message too small");
