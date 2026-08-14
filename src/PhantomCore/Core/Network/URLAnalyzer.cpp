@@ -1447,25 +1447,43 @@ public:
                 return parsed;
             }
 
-            // Reject control characters (CR/LF/TAB/etc.) anywhere in URL.
-            // RFC 3986 forbids these and they are common log/HTTP smuggling
-            // vectors.  We tolerate a single trailing newline that crept in
-            // from line-oriented input formats by trimming below.
-            if (ContainsControlOrSpace(url)) {
+            // Trim surrounding whitespace BEFORE the control-character rejection.
+            //
+            // WHY THE ORDER MATTERS, and it was a real hole: the dangerous-scheme block
+            // below strips leading whitespace itself, with the explicit intent of
+            // catching "  javascript:alert(1)" - whitespace padding is the standard way
+            // to hide a scheme from a naive prefix check. That defence could never run,
+            // because ContainsControlOrSpace saw the leading spaces first and returned
+            // isValid = false. So a script URI was reported as INVALID rather than as
+            // URLScheme::JAVASCRIPT with hasJavaScript set, and any caller reading
+            // "invalid" as "nothing to analyse" let it through. The intent was in the
+            // source and absent from the behaviour.
+            //
+            // Trimming first closes it without weakening anything: the rejection still
+            // applies to the trimmed value, so a URL with an INTERNAL space or any
+            // embedded CR/LF/TAB is still refused, which is what that check is for.
+            const size_t firstReal = url.find_first_not_of(" \t\r\n");
+            if (firstReal == std::string::npos) {
+                parsed.isValid = false;
+                return parsed;
+            }
+            const size_t lastReal = url.find_last_not_of(" \t\r\n");
+            const std::string trimmedUrl = url.substr(firstReal, lastReal - firstReal + 1);
+
+            // Reject control characters (CR/LF/TAB/etc.) anywhere in the URL.
+            // RFC 3986 forbids these and they are common log/HTTP smuggling vectors.
+            if (ContainsControlOrSpace(trimmedUrl)) {
                 parsed.isValid = false;
                 return parsed;
             }
 
-            std::string remaining = url;
+            std::string remaining = trimmedUrl;
 
             // Detect dangerous URI schemes that don't use ://
             {
-                std::string lowerUrl = NarrowToLower(url);
-                // Strip leading whitespace that could bypass scheme detection
-                size_t start = lowerUrl.find_first_not_of(" \t\r\n");
-                if (start != std::string::npos) {
-                    lowerUrl = lowerUrl.substr(start);
-                }
+                // Already trimmed above, so the redundant strip that used to live here
+                // is gone; keeping it would suggest the input might still be padded.
+                const std::string lowerUrl = NarrowToLower(trimmedUrl);
 
                 if (lowerUrl.starts_with("javascript:")) {
                     parsed.scheme = URLScheme::JAVASCRIPT;
@@ -1473,7 +1491,7 @@ public:
                     parsed.hasJavaScript = true;
                     parsed.isValid = true;
                     parsed.host = "";
-                    parsed.path = url.substr(url.find(':') + 1);
+                    parsed.path = trimmedUrl.substr(trimmedUrl.find(':') + 1);
                     return parsed;
                 }
                 if (lowerUrl.starts_with("data:")) {
@@ -1482,7 +1500,7 @@ public:
                     parsed.hasDataUri = true;
                     parsed.isValid = true;
                     parsed.host = "";
-                    parsed.path = url.substr(url.find(':') + 1);
+                    parsed.path = trimmedUrl.substr(trimmedUrl.find(':') + 1);
                     return parsed;
                 }
                 if (lowerUrl.starts_with("mailto:")) {
@@ -1490,7 +1508,7 @@ public:
                     parsed.schemeString = "mailto";
                     parsed.isValid = true;
                     parsed.host = "";
-                    parsed.path = url.substr(url.find(':') + 1);
+                    parsed.path = trimmedUrl.substr(trimmedUrl.find(':') + 1);
                     return parsed;
                 }
             }

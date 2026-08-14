@@ -1688,9 +1688,45 @@ private:
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
+// Reports, ONCE per process, that a PerformanceMonitor data accessor was reached
+// before Initialize(). Rate-limited to a single line on purpose: these accessors are
+// called from monitoring and UI paths, and an unbounded warning here would repeat
+// the queue-full logging defect, which emitted roughly 400 lines a second on a
+// machine that was already behind - and our log writes traverse our own minifilter.
+// One line is enough to tell a reader the API is being used out of order; silence
+// would not be.
+static void WarnMonitorNotInitializedOnce(const wchar_t* what) noexcept {
+    static std::atomic<bool> reported{ false };
+    bool expected = false;
+    if (reported.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        SS_LOG_WARN(LOG_CATEGORY,
+                    L"%ls called before Initialize(); returning no data. "
+                    L"Further occurrences are not logged.",
+                    what);
+    }
+}
+
 class PerformanceMonitorImpl {
 public:
-    PerformanceMonitorImpl() = default;
+    // The callback registry and the history buffer are created HERE rather than in
+    // Initialize(), because they are the two managers that need no configuration and
+    // no OS resources: a map of callbacks and a ring of samples.
+    //
+    // WHY THAT MATTERS. RegisterResourceUsageCallback and its five siblings are
+    // public and dereference m_callbackManager unconditionally. While that pointer
+    // was created only by Initialize(), every one of those calls on a monitor that
+    // had not been initialized was an access violation - and PerformanceMonitor is a
+    // process-wide singleton, so one caller registering a callback before the service
+    // got around to initializing the monitor took the whole process down. Three unit
+    // tests reproduce it deterministically, each on its own.
+    //
+    // Constructing them here makes non-null an invariant that is TRUE rather than one
+    // asserted by a check repeated at fourteen call sites, and it makes registration
+    // actually WORK before Initialize - which is what a public Register that hands
+    // back a live id already promises the caller.
+    PerformanceMonitorImpl()
+        : m_callbackManager(std::make_unique<CallbackManager>())
+        , m_historyManager(std::make_unique<HistoryManager>()) {}
     ~PerformanceMonitorImpl() {
         StopMonitoring();
     }
@@ -1743,9 +1779,16 @@ public:
 
             m_config = safeConfig;
 
-            // Initialize managers
-            m_callbackManager = std::make_unique<CallbackManager>();
-            m_historyManager = std::make_unique<HistoryManager>();
+            // The callback registry and the history buffer already exist (see the
+            // constructor) and are deliberately NOT replaced here. Replacing the
+            // registry would silently discard every callback registered before this
+            // point: the caller holds an id it was handed, believes it is registered,
+            // and would never be told its callback can no longer fire. Re-initialising
+            // a running monitor would do that to every consumer at once. Callbacks
+            // belong to the monitor, not to one initialisation epoch.
+            //
+            // The three below DO depend on configuration or OS resources, so they are
+            // built from the validated config each time.
             m_anomalyDetector = std::make_unique<AnomalyDetector>(safeConfig.thresholds, safeConfig.samplingIntervalMs);
             m_processTracker = std::make_unique<ProcessResourceTracker>();
             m_systemTracker = std::make_unique<SystemResourceTracker>();
@@ -1818,11 +1861,24 @@ public:
     // PROCESS MONITORING
     // ========================================================================
 
+    // The three managers below exist only after Initialize(), because each needs the
+    // validated configuration or an OS resource. An un-initialized monitor genuinely
+    // HAS no samples, so reporting none is the accurate answer rather than a
+    // substituted one - these are observability accessors, not detection verdicts, so
+    // nothing is suppressed by answering "no data".
     ProcessResourceUsage GetProcessUsage(uint32_t processId) const {
+        if (!m_processTracker) {
+            WarnMonitorNotInitializedOnce(L"GetProcessUsage");
+            return {};
+        }
         return m_processTracker->GetUsage(processId);
     }
 
     std::vector<ProcessResourceUsage> GetAllProcessUsage() const {
+        if (!m_processTracker) {
+            WarnMonitorNotInitializedOnce(L"GetAllProcessUsage");
+            return {};
+        }
         return m_processTracker->GetAllProcessUsage();
     }
 
@@ -1923,14 +1979,26 @@ public:
     // ========================================================================
 
     std::vector<PerformanceAnomaly> GetActiveAnomalies() const {
+        if (!m_anomalyDetector) {
+            WarnMonitorNotInitializedOnce(L"GetActiveAnomalies");
+            return {};
+        }
         return m_anomalyDetector->GetActiveAnomalies();
     }
 
     std::vector<PerformanceAnomaly> GetProcessAnomalies(uint32_t processId) const {
+        if (!m_anomalyDetector) {
+            WarnMonitorNotInitializedOnce(L"GetProcessAnomalies");
+            return {};
+        }
         return m_anomalyDetector->GetProcessAnomalies(processId);
     }
 
     std::vector<uint32_t> DetectPotentialMiners() const {
+        if (!m_anomalyDetector) {
+            WarnMonitorNotInitializedOnce(L"DetectPotentialMiners");
+            return {};
+        }
         return m_anomalyDetector->GetPotentialMiners();
     }
 
@@ -1975,7 +2043,15 @@ public:
         const bool lowPressure = m_currentSystemUsage.cpuPressure <= ResourcePressure::Normal &&
                                 m_currentSystemUsage.memoryPressure <= ResourcePressure::Normal;
 
-        const auto anomalies = m_anomalyDetector->GetActiveAnomalies();
+        // Guarded inline rather than by an early return, deliberately: the idle and
+        // pressure signals above come from m_currentSystemUsage, which is a plain
+        // member and always readable. Returning early would have changed this
+        // function's answer for an un-initialized monitor, and this answer gates
+        // whether intensive scanning proceeds - so it must not become "no" for a
+        // reason unrelated to system load.
+        const auto anomalies = m_anomalyDetector
+            ? m_anomalyDetector->GetActiveAnomalies()
+            : std::vector<PerformanceAnomaly>{};
         bool noCriticalAnomalies = true;
         for (const auto& anomaly : anomalies) {
             if (anomaly.severity >= 80) {
@@ -1995,6 +2071,10 @@ public:
      * @brief Gets the EDR's own resource usage for self-monitoring.
      */
     SelfResourceUsage GetSelfResourceUsage() const {
+        if (!m_processTracker) {
+            WarnMonitorNotInitializedOnce(L"GetSelfResourceUsage");
+            return {};
+        }
         return m_processTracker->GetSelfUsage();
     }
 

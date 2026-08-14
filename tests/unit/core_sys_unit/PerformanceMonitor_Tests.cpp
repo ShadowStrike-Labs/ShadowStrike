@@ -26,6 +26,7 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/Core/System/PerformanceMonitor.hpp"
 

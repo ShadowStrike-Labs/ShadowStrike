@@ -166,12 +166,18 @@ TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterm
         [](NotificationSeverity, std::wstring_view, std::wstring_view,
             const std::optional<ThreatEvent>&) {});
 
-    EXPECT_NE(0u, nullFileScanId);
-    EXPECT_NE(0u, nullProcessId);
-    EXPECT_NE(0u, nullThreatId);
-    EXPECT_NE(0u, nullStateId);
-    EXPECT_NE(0u, nullComponentId);
-    EXPECT_NE(0u, nullNotificationId);
+    // An EMPTY callback is REFUSED and 0 is the invalid-id sentinel this test already
+    // uses for everything else. These asserted the opposite - that registering {} hands
+    // back a live id - which would mean the protection engine later invokes an empty
+    // std::function and throws bad_function_call on a path that owes the kernel a
+    // verdict. Refusing at registration is the only safe answer, so the registry never
+    // holds a callback that cannot be called.
+    EXPECT_EQ(0u, nullFileScanId);
+    EXPECT_EQ(0u, nullProcessId);
+    EXPECT_EQ(0u, nullThreatId);
+    EXPECT_EQ(0u, nullStateId);
+    EXPECT_EQ(0u, nullComponentId);
+    EXPECT_EQ(0u, nullNotificationId);
     EXPECT_NE(0u, fileScanId);
     EXPECT_NE(0u, processId);
     EXPECT_NE(0u, threatId);
@@ -179,12 +185,15 @@ TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterm
     EXPECT_NE(0u, componentId);
     EXPECT_NE(0u, notificationId);
 
-    EXPECT_TRUE(rtp.UnregisterCallback(nullFileScanId));
-    EXPECT_TRUE(rtp.UnregisterCallback(nullProcessId));
-    EXPECT_TRUE(rtp.UnregisterCallback(nullThreatId));
-    EXPECT_TRUE(rtp.UnregisterCallback(nullStateId));
-    EXPECT_TRUE(rtp.UnregisterCallback(nullComponentId));
-    EXPECT_TRUE(rtp.UnregisterCallback(nullNotificationId));
+    EXPECT_FALSE(rtp.UnregisterCallback(nullFileScanId));
+    // Unregistering an id that was never issued fails, and 0 is never issued - the same
+    // reasoning as the block above, and consistent with the last line of this test,
+    // which already requires a second unregister of a real id to return false.
+    EXPECT_FALSE(rtp.UnregisterCallback(nullProcessId));
+    EXPECT_FALSE(rtp.UnregisterCallback(nullThreatId));
+    EXPECT_FALSE(rtp.UnregisterCallback(nullStateId));
+    EXPECT_FALSE(rtp.UnregisterCallback(nullComponentId));
+    EXPECT_FALSE(rtp.UnregisterCallback(nullNotificationId));
     EXPECT_TRUE(rtp.UnregisterCallback(fileScanId));
     EXPECT_TRUE(rtp.UnregisterCallback(processId));
     EXPECT_TRUE(rtp.UnregisterCallback(threatId));

@@ -27,6 +27,8 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "CoreSystem_TestUtils.hpp"
 #include "../../../src/PhantomCore/Core/System/BootTimeAnalyzer.hpp"

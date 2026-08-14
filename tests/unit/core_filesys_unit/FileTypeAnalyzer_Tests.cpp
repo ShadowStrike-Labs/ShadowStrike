@@ -27,6 +27,8 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "CoreFileSystem_TestUtils.hpp"
 #include "../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp"

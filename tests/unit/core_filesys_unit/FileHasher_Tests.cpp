@@ -28,6 +28,8 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "CoreFileSystem_TestUtils.hpp"
 #include "../../../src/PhantomCore/Core/FileSystem/FileHasher.hpp"
@@ -216,7 +218,10 @@ TEST_F(FileHasherTest, HexUtilitiesRoundTripAndValidateHashFormats) {
 
     EXPECT_EQ(hasher.ToHexString(raw, HashFormat::Hex), "000fa5");
     EXPECT_EQ(hasher.ToHexString(raw, HashFormat::HexUpper), "000FA5");
-    EXPECT_EQ(hasher.ToHexString(raw, HashFormat::Base64), "000fa5");
+    // Base64 of {0x00, 0x0F, 0xA5}, not hex: three bytes encode to exactly four
+    // characters with no padding. This asserted the hex string for a Base64 request,
+    // so it required ToHexString to ignore the format it was given.
+    EXPECT_EQ(hasher.ToHexString(raw, HashFormat::Base64), "AA+l");
     EXPECT_EQ(hasher.ToHexString(raw, HashFormat::Raw).size(), raw.size());
 
     const auto roundTrip = hasher.FromHexString("000FA5");

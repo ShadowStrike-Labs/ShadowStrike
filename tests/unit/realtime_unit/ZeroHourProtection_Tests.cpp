@@ -133,10 +133,13 @@ TEST_F(ZeroHourProtectionTest, CallbackGuardsAndIdentifiersRemainStable) {
     const uint64_t cloudId = protection.RegisterCloudStatusCallback(
         [](CloudServiceStatus, CloudServiceStatus) {});
 
-    EXPECT_NE(0u, nullVerdictId);
-    EXPECT_NE(0u, nullHoldId);
-    EXPECT_NE(0u, nullOutbreakId);
-    EXPECT_NE(0u, nullThreatLevelId);
+    // Empty callbacks are refused; 0 is the invalid-id sentinel. Same reasoning as
+    // RealTimeProtection_Tests: a registry that accepts an uncallable callback would
+    // throw bad_function_call the first time a verdict needed to be published.
+    EXPECT_EQ(0u, nullVerdictId);
+    EXPECT_EQ(0u, nullHoldId);
+    EXPECT_EQ(0u, nullOutbreakId);
+    EXPECT_EQ(0u, nullThreatLevelId);
     EXPECT_NE(0u, verdictId);
     EXPECT_NE(0u, holdId);
     EXPECT_NE(0u, outbreakId);
@@ -144,10 +147,11 @@ TEST_F(ZeroHourProtectionTest, CallbackGuardsAndIdentifiersRemainStable) {
     EXPECT_NE(0u, signatureId);
     EXPECT_NE(0u, cloudId);
 
-    EXPECT_TRUE(protection.UnregisterCallback(nullVerdictId));
-    EXPECT_TRUE(protection.UnregisterCallback(nullHoldId));
-    EXPECT_TRUE(protection.UnregisterCallback(nullOutbreakId));
-    EXPECT_TRUE(protection.UnregisterCallback(nullThreatLevelId));
+    // Never-issued ids cannot be unregistered.
+    EXPECT_FALSE(protection.UnregisterCallback(nullVerdictId));
+    EXPECT_FALSE(protection.UnregisterCallback(nullHoldId));
+    EXPECT_FALSE(protection.UnregisterCallback(nullOutbreakId));
+    EXPECT_FALSE(protection.UnregisterCallback(nullThreatLevelId));
     EXPECT_TRUE(protection.UnregisterCallback(verdictId));
     EXPECT_TRUE(protection.UnregisterCallback(holdId));
     EXPECT_TRUE(protection.UnregisterCallback(outbreakId));

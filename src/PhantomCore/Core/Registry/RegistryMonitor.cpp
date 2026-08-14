@@ -1276,11 +1276,23 @@ public:
                         value.pop_back();
                     }
 
-                    if (charCount > value.size() + 1) {
-                        // Embedded null bytes BEFORE the trailing null and
-                        // before the end of the declared buffer — classic
-                        // cloaking pattern (path appears short to RegEdit
-                        // but the kernel writes the full hidden string).
+                    // Cloaking: the value carries a NUL that is not its terminator, so
+                    // RegEdit and anything else using C string semantics shows a short
+                    // harmless path while the kernel stored the whole hidden string.
+                    //
+                    // Two distinct shapes, and only the second used to be caught:
+                    //   "C:\Temp\svc.exe\0--shadow"   embedded NUL mid-value, NO trailing
+                    //                                 NUL, so charCount == trimmed size
+                    //   "C:\Temp\svc.exe\0\0\0..."    trailing padding after the
+                    //                                 terminator, so charCount is larger
+                    //
+                    // The old test was charCount > value.size() + 1 alone, an arithmetic
+                    // proxy that can only see the padding case - it reported nothing for
+                    // the exact example in its own comment. Asking whether a NUL is still
+                    // present after stripping the terminator answers the question
+                    // directly instead of inferring it from a length.
+                    if (value.find(L'\0') != std::wstring::npos ||
+                        charCount > value.size() + 1) {
                         analysis.riskFactors.push_back("Embedded null bytes (cloaking attempt)");
                     }
 

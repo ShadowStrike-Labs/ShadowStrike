@@ -1181,10 +1181,15 @@ TEST_F(PhantomEmulatorTest, MemProt_BitwiseOps) {
 }
 
 // ============================================================================
-// Entry point: GoogleTest main
+// Entry point: GoogleTest main - STANDALONE BUILDS ONLY
 // ============================================================================
-
+//
+// Guarded because this suite is compiled into phantom-tests alongside
+// tests\test_main.cpp, and a second definition of main is LNK2005. Same guard
+// WhiteListPatternIndex_Tests.cpp already uses.
+#if defined(BUILD_TEST_EXECUTABLE) || defined(STANDALONE_TEST)
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
+#endif

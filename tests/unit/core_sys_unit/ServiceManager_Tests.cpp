@@ -26,6 +26,7 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/Core/System/ServiceManager.hpp"
 
@@ -59,7 +60,15 @@ TEST(ServiceManagerValueTests, ConfigPresetsAndStatisticsResetReflectProtectionI
     EXPECT_TRUE(defaults.validateSignatures);
     EXPECT_EQ(defaults.watchdogIntervalMs, 5000u);
     EXPECT_EQ(defaults.mainServiceName, L"ShadowStrikeAV");
-    EXPECT_EQ(defaults.driverServiceName, L"ShadowStrikeDriver");
+    // PhantomSensor, not ShadowStrikeDriver. Nothing has ever registered a service
+    // called ShadowStrikeDriver: PhantomSensor.inf declares ServiceName =
+    // "PhantomSensor", which is what the SCM creates, and the driver itself protects
+    // its own key under ...\Services\PhantomSensor. The old name silently disabled
+    // driver-presence detection (OpenServiceW failed, so IsDriverLoaded returned false
+    // while the driver was loaded and filtering), driver recovery, and registry
+    // protection for the driver's own service key. This assertion would put that name
+    // back, so it tracks the real one.
+    EXPECT_EQ(defaults.driverServiceName, L"PhantomSensor");
 
     EXPECT_TRUE(highSecurity.enableSelfProtection);
     EXPECT_EQ(highSecurity.watchdogIntervalMs, 2000u);

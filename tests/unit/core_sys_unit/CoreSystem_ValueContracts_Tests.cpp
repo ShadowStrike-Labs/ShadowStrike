@@ -27,6 +27,8 @@
  */
 
 #include "pch.h"
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "../../../src/PhantomCore/Core/System/CrashHandler.hpp"
 #include "../../../src/PhantomCore/Core/System/DriverAnalyzer.hpp"

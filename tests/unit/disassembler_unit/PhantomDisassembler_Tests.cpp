@@ -885,11 +885,19 @@ TEST_F(PhantomDisassemblerTest, BatchDecodeSequentialBytes) {
 }
 
 // ============================================================================
-// GoogleTest main (may be overridden by test_main.cpp linkage)
+// GoogleTest main - STANDALONE BUILDS ONLY
 // ============================================================================
-
-// Standalone test entry point
+//
+// The comment here used to say this main "may be overridden by test_main.cpp
+// linkage". It cannot be: two definitions of main in one binary is LNK2005, a
+// hard link error, not an override - which is exactly what happened the moment
+// this suite was added to phantom-tests. Guarded the same way
+// WhiteListPatternIndex_Tests.cpp already guards its own entry point, so the
+// suite keeps working as a standalone executable without colliding with
+// tests\test_main.cpp (which is the identical two lines).
+#if defined(BUILD_TEST_EXECUTABLE) || defined(STANDALONE_TEST)
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
+#endif
