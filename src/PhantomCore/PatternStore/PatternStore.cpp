@@ -1063,9 +1063,19 @@ std::vector<DetectionResult> PatternStore::ScanFile(
     // Memory-map file for scanning
     StoreError err{};
     MemoryMappedView fileView{};
-    
-    if (!MemoryMapping::OpenView(filePath, true, fileView, err)) {
-        SS_LOG_ERROR(L"PatternStore", L"ScanFile: Failed to map file: %S", err.message.c_str());
+
+    // OpenFileView, NOT OpenView. Third independent instance of the same defect
+    // (SignatureStore::ScanFile and YaraRuleStore::ScanFile carried it too):
+    // OpenView enforces a SignatureDatabaseHeader on whatever it maps, so a scan
+    // target had to look like a signature database to be readable at all. Every
+    // real file therefore failed to map here and this function returned an empty
+    // detection vector -- indistinguishable from "scanned, no patterns matched".
+    //
+    // 100 MB ceiling to match the scan limit SignatureStore::ScanFile enforces,
+    // rather than MAX_DATABASE_SIZE, which is 16 GB and is not a scan bound.
+    constexpr uint64_t kMaxScanFileSize = 100ULL * 1024 * 1024;
+    if (!MemoryMapping::OpenFileView(filePath, fileView, err, kMaxScanFileSize)) {
+        SS_LOG_ERROR(L"PatternStore", L"ScanFile: Failed to map file for scanning: %S", err.message.c_str());
         return results;
     }
 

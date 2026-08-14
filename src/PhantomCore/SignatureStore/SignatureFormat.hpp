@@ -701,12 +701,53 @@ namespace Format {
 } // namespace Format
 namespace MemoryMapping {
 
-    // Open memory-mapped view
+    // Open a memory-mapped view of a SIGNATURE DATABASE.
+    //
+    // This function is NOT a general-purpose file mapper. It enforces the
+    // signature-database format: the file must be at least
+    // sizeof(SignatureDatabaseHeader) bytes, must not exceed MAX_DATABASE_SIZE,
+    // and must carry a header that passes Format::ValidateHeader. Any file that
+    // is not a ShadowStrike signature database is refused with InvalidFormat.
+    //
+    // USE OpenFileView FOR ANYTHING BEING SCANNED. Calling this function on a
+    // scan target cannot succeed -- an executable, an archive or a document has
+    // no database header -- and that mistake was live on the scan path: it made
+    // SignatureStore::ScanFile refuse every real file it was ever asked to
+    // examine. See the comment on OpenFileView.
     [[nodiscard]] bool OpenView(
         const std::wstring& path,
         bool readOnly,
         MemoryMappedView& view,
         StoreError& error
+    ) noexcept;
+
+    // Open a read-only memory-mapped view of an ARBITRARY FILE, for scanning.
+    //
+    // Shares every security property of OpenView -- path canonicalisation and
+    // traversal rejection, reserved device-name rejection, embedded-NUL
+    // detection, RAII cleanup on every failure path, SIZE_MAX bounds check --
+    // and drops only the three checks that are meaningful for a database and
+    // meaningless for a scan target:
+    //
+    //   * no SignatureDatabaseHeader validation
+    //   * no sizeof(SignatureDatabaseHeader) minimum; any non-empty file maps
+    //   * caller-supplied size ceiling instead of MAX_DATABASE_SIZE
+    //
+    // WHY THIS EXISTS. SignatureStore::ScanFile called OpenView on its scan
+    // target, so the target had to look like a signature database to be mapped
+    // at all. In the 1.0.93 field run that produced 246 map failures: 208 files
+    // rejected at header validation with magic 0x00905A4D (an MZ executable),
+    // 8 with 0x04034B50 (a PK archive), and 43 rejected for being smaller than a
+    // database header. Roughly 289 files received no hash, pattern or YARA
+    // examination whatsoever, and the caller was handed a result it could not
+    // tell apart from a clean scan.
+    //
+    // maxFileSize of 0 means "no ceiling beyond what the address space allows".
+    [[nodiscard]] bool OpenFileView(
+        const std::wstring& path,
+        MemoryMappedView& view,
+        StoreError& error,
+        uint64_t maxFileSize = 0
     ) noexcept;
 
     // Close memory-mapped view

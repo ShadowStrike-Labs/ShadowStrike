@@ -1574,8 +1574,20 @@ std::vector<YaraMatch> YaraRuleStore::ScanFile(
     StoreError err{};
     MemoryMappedView fileView{};
     
-    if (!ShadowStrike::SignatureStore::MemoryMapping::OpenView(filePath, true, fileView, err)) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to map file: %S", err.message.c_str());
+    // OpenFileView, NOT OpenView. This is the same defect that disabled
+    // SignatureStore::ScanFile, present independently here: OpenView enforces a
+    // SignatureDatabaseHeader on whatever it maps, so a scan target had to look
+    // like a signature database to be readable. No executable, archive or
+    // document does, which means every real file handed to this function failed
+    // to map and returned a result with no matches -- so none of the 11,053
+    // compiled rules could ever match through this entry point.
+    //
+    // The ceiling is the caller's scan limit, already validated above, not
+    // MAX_DATABASE_SIZE.
+    if (!ShadowStrike::SignatureStore::MemoryMapping::OpenFileView(
+            filePath, fileView, err, options.maxFileSizeBytes)) {
+        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to map file for scanning: %S",
+            err.message.c_str());
         return {};
     }
     

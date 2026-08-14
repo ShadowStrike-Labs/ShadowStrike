@@ -982,8 +982,27 @@ void* MapViewOfFileForAccess(HANDLE hMapping, bool readOnly, uint64_t size, DWOR
 
 namespace MemoryMapping {
 
-// Open memory-mapped view with RAII for exception safety
-bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, StoreError& error) noexcept {
+// Shared implementation behind OpenView and OpenFileView.
+//
+// The two callers differ ONLY in whether the mapped file is required to be a
+// signature database. Everything else -- path canonicalisation, RAII, the size
+// and addressability checks -- is identical and must stay identical, which is
+// why this is one function with a policy rather than two copies. A second copy
+// would be free to drift, and the security checks in step 1 are the ones that
+// must never drift.
+//
+// requireDatabaseHeader : validate a SignatureDatabaseHeader before committing
+// minFileSize           : smallest acceptable file, in bytes (must be >= 1)
+// maxFileSize           : size ceiling; 0 means no ceiling beyond SIZE_MAX
+static bool OpenViewInternal(
+    const std::wstring& path,
+    bool readOnly,
+    MemoryMappedView& view,
+    StoreError& error,
+    bool requireDatabaseHeader,
+    uint64_t minFileSize,
+    uint64_t maxFileSize
+) noexcept {
     /*
      * ========================================================================
      * RAII-BASED MEMORY-MAPPED FILE OPENING
@@ -1033,7 +1052,9 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
     if (!fileGuard.IsValid()) {
         error.code = SignatureStoreError::FileNotFound;
         error.win32Error = win32Error;
-        error.message = "Failed to open database file";
+        error.message = requireDatabaseHeader
+            ? "Failed to open database file"
+            : "Failed to open file for scanning";
         return false;
     }
 
@@ -1049,19 +1070,26 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
         return false;
     }
 
-    // Minimum size validation
-    if (fileSize < sizeof(SignatureDatabaseHeader)) {
+    // Minimum size validation. For a database this is the header; for a scan
+    // target it is simply "not empty", because a two-byte file is a perfectly
+    // legitimate thing to be asked to scan and refusing it silently is how 43
+    // files went unexamined in the field.
+    if (fileSize < minFileSize) {
         error.code = SignatureStoreError::InvalidFormat;
         error.win32Error = 0;
-        error.message = "File too small to contain valid header";
+        error.message = requireDatabaseHeader
+            ? "File too small to contain valid header"
+            : "File is empty";
         return false;
     }
 
     // Maximum size validation
-    if (fileSize > MAX_DATABASE_SIZE) {
+    if (maxFileSize != 0 && fileSize > maxFileSize) {
         error.code = SignatureStoreError::TooLarge;
         error.win32Error = 0;
-        error.message = "Database file exceeds maximum size";
+        error.message = requireDatabaseHeader
+            ? "Database file exceeds maximum size"
+            : "File exceeds the caller's size limit";
         return false;
     }
 
@@ -1103,16 +1131,20 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
     }
 
     // ========================================================================
-    // STEP 6: VALIDATE HEADER BEFORE COMMITTING
+    // STEP 6: VALIDATE HEADER BEFORE COMMITTING (databases only)
     // ========================================================================
 
-    const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(viewGuard.Get());
-    if (!Format::ValidateHeader(header, fileSize)) {
-        error.code = SignatureStoreError::InvalidFormat;
-        error.win32Error = 0;
-        error.message = "Invalid database header";
-        return false;
-        // RAII guards will clean up automatically
+    // A scan target is not a database and has no such header. Applying this
+    // check to one is what made ScanFile unable to map any real file.
+    if (requireDatabaseHeader) {
+        const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(viewGuard.Get());
+        if (!Format::ValidateHeader(header, fileSize)) {
+            error.code = SignatureStoreError::InvalidFormat;
+            error.win32Error = 0;
+            error.message = "Invalid database header";
+            return false;
+            // RAII guards will clean up automatically
+        }
     }
 
     // ========================================================================
@@ -1132,6 +1164,36 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
 
     error.code = SignatureStoreError::Success;
     return true;
+}
+
+// Open a signature database. Enforces the database format -- see the contract on
+// the declaration, and do not call this on a scan target.
+bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, StoreError& error) noexcept {
+    return OpenViewInternal(
+        path,
+        readOnly,
+        view,
+        error,
+        /* requireDatabaseHeader */ true,
+        /* minFileSize           */ sizeof(SignatureDatabaseHeader),
+        /* maxFileSize           */ MAX_DATABASE_SIZE);
+}
+
+// Open an arbitrary file for scanning. Read-only by construction: a scan must
+// never be able to modify the thing it is examining, so this takes no writable
+// mode rather than accepting one and trusting every caller to pass true.
+bool OpenFileView(const std::wstring& path,
+                  MemoryMappedView& view,
+                  StoreError& error,
+                  uint64_t maxFileSize) noexcept {
+    return OpenViewInternal(
+        path,
+        /* readOnly              */ true,
+        view,
+        error,
+        /* requireDatabaseHeader */ false,
+        /* minFileSize           */ 1,
+        maxFileSize);
 }
 
 // Close memory-mapped view

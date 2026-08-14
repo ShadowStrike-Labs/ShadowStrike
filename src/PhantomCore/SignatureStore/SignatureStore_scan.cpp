@@ -36,7 +36,12 @@ namespace ShadowStrike {
             // VALIDATION 1: Initialization state (acquire ensures visibility of init state)
             if (!m_initialized.load(std::memory_order_acquire)) {
                 SS_LOG_WARN(L"SignatureStore", L"ScanBuffer: Store not initialized");
-                return ScanResult{};
+                ScanResult result{};
+                result.examinedState = NotExaminedReason::StoreNotReady;
+                result.notExaminedDetail = "signature store is not initialised";
+                result.errorCount = 1;
+                result.lastError = result.notExaminedDetail;
+                return result;
             }
 
             // VALIDATION 2: Empty buffer check - nothing to scan
@@ -44,6 +49,8 @@ namespace ShadowStrike {
                 SS_LOG_DEBUG(L"SignatureStore", L"ScanBuffer: Empty buffer, nothing to scan");
                 ScanResult result{};
                 result.totalBytesScanned = 0;
+                result.examinedState = NotExaminedReason::EmptyFile;
+                result.notExaminedDetail = "buffer is empty";
                 return result;
             }
 
@@ -54,6 +61,8 @@ namespace ShadowStrike {
                     buffer.size(), MAX_BUFFER_SIZE);
                 ScanResult result{};
                 result.timedOut = true; // Indicate scan was not completed
+                result.examinedState = NotExaminedReason::TooLarge;
+                result.notExaminedDetail = "buffer exceeds the 500 MB scan limit";
                 return result;
             }
 
@@ -62,7 +71,12 @@ namespace ShadowStrike {
             const uintptr_t bufferAddr = reinterpret_cast<uintptr_t>(buffer.data());
             if (bufferAddr == 0) {
                 SS_LOG_ERROR(L"SignatureStore", L"ScanBuffer: Null buffer pointer with non-zero size");
-                return ScanResult{};
+                ScanResult result{};
+                result.examinedState = NotExaminedReason::InvalidArgument;
+                result.notExaminedDetail = "null buffer pointer with non-zero size";
+                result.errorCount = 1;
+                result.lastError = result.notExaminedDetail;
+                return result;
             }
 
             // VALIDATION 5: Options sanity check. We reject syntactically invalid
@@ -85,7 +99,12 @@ namespace ShadowStrike {
             if (options.maxResults == 0) {
                 SS_LOG_DEBUG(L"SignatureStore", L"ScanBuffer: Zero maxResults specified, will return no results");
                 ScanResult result{};
-                result.totalBytesScanned = buffer.size();
+                // Not buffer.size(): no byte of it is examined on this path. The
+                // old value claimed a full scan's worth of throughput for work
+                // that never happened.
+                result.totalBytesScanned = 0;
+                result.examinedState = NotExaminedReason::InvalidArgument;
+                result.notExaminedDetail = "caller requested a maximum of zero results";
                 return result;
             }
 
@@ -139,6 +158,15 @@ namespace ShadowStrike {
             }
 
             result.totalBytesScanned = buffer.size();
+
+            // The buffer was genuinely run through the enabled matchers, so this
+            // is the ONE place entitled to make that claim. Every path above
+            // returns early without it, which is what keeps "no detections" from
+            // meaning "clean" when nothing was ever looked at.
+            //
+            // Set after the scan rather than before, so a failure inside the scan
+            // block cannot leave a positive claim behind.
+            result.examinedState = NotExaminedReason::Examined;
 
             // Update statistics
             m_totalDetections.fetch_add(result.detections.size(), std::memory_order_relaxed);
@@ -239,7 +267,12 @@ namespace ShadowStrike {
                 if (ec) {
                     SS_LOG_ERROR(L"SignatureStore", L"Failed to get file size: %s (error: %S)",
                         filePath.c_str(), ec.message().c_str());
-                    return ScanResult{};
+                    ScanResult result{};
+                    result.examinedState = NotExaminedReason::AccessDenied;
+                    result.notExaminedDetail = "could not read file size: " + ec.message();
+                    result.errorCount = 1;
+                    result.lastError = result.notExaminedDetail;
+                    return result;
                 }
 
                 // VALIDATION 9: File size limits
@@ -250,14 +283,23 @@ namespace ShadowStrike {
                     ScanResult result{};
                     result.timedOut = true; // Indicate incomplete scan
                     result.totalBytesScanned = 0;
+                    result.examinedState = NotExaminedReason::TooLarge;
+                    result.notExaminedDetail = "file exceeds the 100 MB scan limit";
                     return result;
                 }
 
                 // VALIDATION 10: Check for zero-size files
+                //
+                // A zero-byte file genuinely has no contents to examine, so this
+                // is EmptyFile rather than Examined. It is not a threat, but it is
+                // also not a file we inspected, and the statistics should not
+                // claim otherwise.
                 if (fileSize == 0) {
                     SS_LOG_DEBUG(L"SignatureStore", L"Empty file, nothing to scan: %s", filePath.c_str());
                     ScanResult result{};
                     result.totalBytesScanned = 0;
+                    result.examinedState = NotExaminedReason::EmptyFile;
+                    result.notExaminedDetail = "file is zero bytes";
                     return result;
                 }
 
@@ -267,9 +309,26 @@ namespace ShadowStrike {
                 StoreError err{};
                 MemoryMappedView fileView{};
 
-                if (!MemoryMapping::OpenView(canonicalPath.wstring(), true, fileView, err)) {
-                    SS_LOG_ERROR(L"SignatureStore", L"Failed to map file: %S", err.message.c_str());
-                    return ScanResult{};
+                // OpenFileView, NOT OpenView. OpenView enforces a
+                // SignatureDatabaseHeader on whatever it maps, so calling it here
+                // meant a scan target had to look like a signature database to be
+                // readable at all -- which no executable, archive or document
+                // does. That is why the 1.0.93 field run logged 246 map failures
+                // (208 with magic 0x00905A4D = "MZ", 8 with 0x04034B50 = "PK", 43
+                // rejected as smaller than a database header) and why those files
+                // received no hash, pattern or YARA examination.
+                //
+                // The size ceiling is passed explicitly so the limit enforced here
+                // is the SCAN limit checked above, not MAX_DATABASE_SIZE.
+                if (!MemoryMapping::OpenFileView(canonicalPath.wstring(), fileView, err, MAX_FILE_SIZE)) {
+                    SS_LOG_ERROR(L"SignatureStore", L"Failed to map file for scanning: %s (%S)",
+                        filePath.c_str(), err.message.c_str());
+                    ScanResult result{};
+                    result.examinedState = NotExaminedReason::AccessDenied;
+                    result.notExaminedDetail = err.message;
+                    result.errorCount = 1;
+                    result.lastError = err.message;
+                    return result;
                 }
 
                 // VALIDATION 11: Memory mapping integrity check
@@ -277,14 +336,22 @@ namespace ShadowStrike {
                     SS_LOG_ERROR(L"SignatureStore", L"Invalid memory mapping (null base) for file: %s",
                         filePath.c_str());
                     MemoryMapping::CloseView(fileView);
-                    return ScanResult{};
+                    ScanResult result{};
+                    result.examinedState = NotExaminedReason::InternalError;
+                    result.notExaminedDetail = "memory mapping succeeded but returned a null base address";
+                    result.errorCount = 1;
+                    result.lastError = result.notExaminedDetail;
+                    return result;
                 }
 
                 if (fileView.fileSize == 0) {
                     SS_LOG_ERROR(L"SignatureStore", L"Invalid memory mapping (zero size) for file: %s",
                         filePath.c_str());
                     MemoryMapping::CloseView(fileView);
-                    return ScanResult{};
+                    ScanResult result{};
+                    result.examinedState = NotExaminedReason::EmptyFile;
+                    result.notExaminedDetail = "mapped view reported zero bytes";
+                    return result;
                 }
 
                 // VALIDATION 12: Cross-check mapped size with expected file size
@@ -299,7 +366,13 @@ namespace ShadowStrike {
                         SS_LOG_ERROR(L"SignatureStore",
                             L"ScanFile: Mapped size exceeds limit after TOCTOU race, aborting scan");
                         MemoryMapping::CloseView(fileView);
-                        return ScanResult{};
+                        ScanResult result{};
+                        result.examinedState = NotExaminedReason::TooLarge;
+                        result.notExaminedDetail =
+                            "file grew past the scan size limit while being opened";
+                        result.errorCount = 1;
+                        result.lastError = result.notExaminedDetail;
+                        return result;
                     }
                 }
 

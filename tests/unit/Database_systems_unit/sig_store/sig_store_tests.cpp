@@ -27,6 +27,7 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
+#include "PhantomCore/SignatureStore/SignatureBuilder.hpp"  // fixture builds a real DB
 #include "PhantomCore/SignatureStore/SignatureStore.hpp"
 #include "PhantomCore/SignatureStore/SignatureFormat.hpp"
 #include "PhantomCore/HashStore/HashStore.hpp"
@@ -53,6 +54,10 @@ protected:
     std::unique_ptr<SignatureStore> sig_store_;
     std::wstring test_db_path_;
     fs::path test_dir_;
+    // True once SetUp has a genuinely initialised store. Tests that assert a
+    // scan actually ran depend on it, and it makes the precondition explicit
+    // rather than assumed.
+    bool store_ready_{ false };
     
     void SetUp() override {
         // Create temporary test directory
@@ -67,6 +72,49 @@ protected:
         
         // Create new signature store
         sig_store_ = std::make_unique<SignatureStore>();
+
+        // ====================================================================
+        // BUILD A REAL DATABASE AND INITIALIZE THE STORE.
+        // ====================================================================
+        //
+        // This fixture previously constructed a SignatureStore and stopped there,
+        // leaving it UNINITIALIZED for every test. ScanBuffer refuses to run on an
+        // uninitialized store, and it used to signal that refusal by returning a
+        // default-constructed ScanResult -- whose IsSuccessful() answered TRUE,
+        // because "successful" was defined as merely `!timedOut && errorCount==0`.
+        //
+        // So five tests that asserted IsSuccessful() after calling ScanBuffer
+        // passed for their entire existence WITHOUT A SINGLE SCAN EVER RUNNING.
+        // ThreadSafety_ConcurrentScans was the clearest: it started 8 threads,
+        // required 8 successes, and got them while scanning nothing at all, so it
+        // never tested concurrent scanning.
+        //
+        // Building a real (empty) database here is what lets those tests exercise
+        // the code they name. It is deliberately an ASSERT rather than a silent
+        // best-effort: if the store cannot be initialised, the tests below cannot
+        // mean what they say, and the fixture must fail loudly instead of quietly
+        // restoring the vacuum.
+        store_ready_ = false;
+        {
+            SignatureBuilder builder;
+            BuildConfiguration cfg{};
+            cfg.outputPath = test_db_path_;
+            cfg.overwriteExisting = true;
+            cfg.initialDatabaseSize = 1024 * 1024;  // 1 MB is ample for unit tests
+            builder.SetConfiguration(cfg);
+
+            const StoreError buildErr = builder.Build();
+            ASSERT_TRUE(buildErr.IsSuccess())
+                << "fixture could not build a test database, so no scan test below "
+                   "can exercise a scan: " << buildErr.message;
+        }
+
+        const StoreError initErr = sig_store_->Initialize(test_db_path_);
+        ASSERT_TRUE(initErr.IsSuccess())
+            << "fixture could not initialise the store from its freshly built "
+               "database: " << initErr.message;
+        ASSERT_TRUE(sig_store_->IsInitialized());
+        store_ready_ = true;
     }
     
     void TearDown() override {
@@ -129,29 +177,53 @@ protected:
 // Initialization & Lifecycle Tests
 // ============================================================================
 
-TEST_F(SignatureStoreTest, Initialize_MissingDatabase_FailsClosed) {
-    EXPECT_FALSE(sig_store_->IsInitialized());
+// ============================================================================
+// These three tests own their store.
+//
+// They are about what an UNINITIALISED store does, so they cannot use the
+// fixture's store -- the fixture now builds a real database and initialises it,
+// which is what allows the scan tests further down to actually scan instead of
+// silently doing nothing. A test that needs a specific lifecycle state should
+// establish that state itself rather than depend on the fixture happening to
+// leave it behind.
+//
+// Plain TEST, not TEST_F, so the dependency is impossible to reintroduce by
+// accident.
+// ============================================================================
 
-    auto error = sig_store_->Initialize(test_db_path_);
+TEST(SignatureStoreLifecycleTest, Initialize_MissingDatabase_FailsClosed) {
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "shadowstrike_sigstore_lifecycle";
+    fs::create_directories(dir, ec);
+    const std::wstring missing = (dir / "definitely-not-built.ssdb").wstring();
+    fs::remove(missing, ec);
+
+    SignatureStore store;
+    EXPECT_FALSE(store.IsInitialized());
+
+    auto error = store.Initialize(missing);
 
     EXPECT_FALSE(error.IsSuccess())
         << "Initializing against a missing signature database must fail closed.";
-    EXPECT_FALSE(sig_store_->IsInitialized());
+    EXPECT_FALSE(store.IsInitialized());
 
-    const auto status = sig_store_->GetStatus();
+    const auto status = store.GetStatus();
     EXPECT_FALSE(status.hashStoreReady);
     EXPECT_FALSE(status.patternStoreReady);
     EXPECT_FALSE(status.yaraStoreReady);
     EXPECT_FALSE(status.allReady);
 }
 
-TEST_F(SignatureStoreTest, Initialize_InvalidPath) {
-    auto error = sig_store_->Initialize(L"\\\\invalid\\path\\nonexistent.ssdb");
+TEST(SignatureStoreLifecycleTest, Initialize_InvalidPath) {
+    SignatureStore store;
+    auto error = store.Initialize(L"\\\\invalid\\path\\nonexistent.ssdb");
     EXPECT_FALSE(error.IsSuccess());
+    EXPECT_FALSE(store.IsInitialized());
 }
 
-TEST_F(SignatureStoreTest, GetStatus_UninitializedStore) {
-    auto status = sig_store_->GetStatus();
+TEST(SignatureStoreLifecycleTest, GetStatus_UninitializedStore) {
+    SignatureStore store;
+    auto status = store.GetStatus();
     EXPECT_FALSE(status.allReady);
     EXPECT_FALSE(status.hashStoreReady);
     EXPECT_FALSE(status.patternStoreReady);
@@ -773,17 +845,76 @@ TEST_F(SignatureStoreTest, ScanResult_GetDetectionCount) {
 
 TEST_F(SignatureStoreTest, ScanResult_IsSuccessful) {
     ScanResult result;
-    
+
+    // A DEFAULT-CONSTRUCTED RESULT IS NOT A SUCCESSFUL SCAN.
+    //
+    // This test previously asserted the opposite: that with timedOut false and
+    // errorCount zero, a result was successful. That is how a scan which never
+    // examined a single byte came to report success, and it is the assertion that
+    // let ~289 unexamined files be counted as clean in the 1.0.93 field run. The
+    // test encoded the defect as the contract, which is why the defect survived.
     result.timedOut = false;
     result.errorCount = 0;
+    EXPECT_FALSE(result.IsSuccessful())
+        << "a result that examined nothing must not report success";
+    EXPECT_FALSE(result.WasExamined());
+    EXPECT_EQ(result.examinedState, NotExaminedReason::NotAttempted);
+
+    // Success requires a positive claim that the contents were examined.
+    result.examinedState = NotExaminedReason::Examined;
+    EXPECT_TRUE(result.WasExamined());
     EXPECT_TRUE(result.IsSuccessful());
-    
+
+    // The original two conditions still hold, on top of having been examined.
     result.timedOut = true;
     EXPECT_FALSE(result.IsSuccessful());
-    
+
     result.timedOut = false;
     result.errorCount = 1;
     EXPECT_FALSE(result.IsSuccessful());
+
+    // Every not-examined reason must keep the result out of "successful", so a
+    // new reason added later cannot accidentally read as clean.
+    result.errorCount = 0;
+    for (const auto reason : {
+             NotExaminedReason::NotAttempted,
+             NotExaminedReason::FileMissing,
+             NotExaminedReason::AccessDenied,
+             NotExaminedReason::TooLarge,
+             NotExaminedReason::EmptyFile,
+             NotExaminedReason::StoreNotReady,
+             NotExaminedReason::InvalidArgument,
+             NotExaminedReason::InternalError }) {
+        result.examinedState = reason;
+        EXPECT_FALSE(result.IsSuccessful())
+            << "reason " << static_cast<unsigned>(reason)
+            << " reported success despite not being Examined";
+    }
+
+    // Clear must return to the conservative default, not leave a stale claim.
+    result.examinedState = NotExaminedReason::Examined;
+    result.Clear();
+    EXPECT_FALSE(result.WasExamined())
+        << "Clear left behind a claim that contents had been examined";
+}
+
+// An uninitialised store must say WHY it did not scan, rather than handing back
+// something indistinguishable from a clean result. This is the case the five
+// vacuous tests were unintentionally exercising.
+TEST(SignatureStoreUninitialisedTest, ScanningAnUninitialisedStoreIsNotACleanVerdict) {
+    SignatureStore store;
+    ASSERT_FALSE(store.IsInitialized());
+
+    const std::vector<uint8_t> data{ 0x4D, 0x5A, 0x90, 0x00 };
+    const auto result = store.ScanBuffer(data);
+
+    EXPECT_FALSE(result.WasExamined());
+    EXPECT_FALSE(result.IsSuccessful())
+        << "an uninitialised store reported a successful scan";
+    EXPECT_EQ(result.examinedState, NotExaminedReason::StoreNotReady);
+    EXPECT_FALSE(result.notExaminedDetail.empty())
+        << "the refusal should state its cause for the log";
+    EXPECT_TRUE(result.detections.empty());
 }
 
 TEST_F(SignatureStoreTest, ScanResult_HasCriticalDetection) {

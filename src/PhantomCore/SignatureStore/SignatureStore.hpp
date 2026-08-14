@@ -219,6 +219,21 @@ namespace ShadowStrike {
         // UNIFIED SCAN RESULT
         // ============================================================================
 
+        // Why a scan did not examine the file's contents. Ordered so the zero
+        // value is the unsafe-to-assume-clean one: a default-constructed
+        // ScanResult has examined NOTHING, and saying so is the whole point.
+        enum class NotExaminedReason : uint8_t {
+            NotAttempted = 0,     // default-constructed; no scan was ever run
+            Examined,             // contents were actually scanned
+            FileMissing,          // path did not resolve to an existing file
+            AccessDenied,         // could not be opened or mapped
+            TooLarge,             // exceeded the scan size ceiling
+            EmptyFile,            // zero bytes; nothing to examine
+            StoreNotReady,        // store was not initialised
+            InvalidArgument,      // caller passed something unusable
+            InternalError         // an exception or an unexpected failure
+        };
+
         struct ScanResult {
             // Matched signatures
             std::vector<DetectionResult> detections;              // All detection results
@@ -233,6 +248,29 @@ namespace ShadowStrike {
             uint64_t scanTimeMicroseconds{ 0 };
             bool timedOut{ false };
             bool stoppedEarly{ false };                             // Due to stopOnFirstMatch
+
+            // ====================================================================
+            // WAS THE FILE ACTUALLY EXAMINED?
+            // ====================================================================
+            //
+            // A result carrying no detections means one of two completely
+            // different things: the contents were scanned and nothing matched, or
+            // the contents were never looked at. Those were indistinguishable,
+            // and every early return on the scan path produced the second while
+            // looking like the first.
+            //
+            // THE DEFAULT IS DELIBERATELY THE UNSAFE-TO-TRUST ONE. ScanResult{}
+            // says "nothing was examined", so the many `return ScanResult{}`
+            // statements on the failure paths are already correct, and it is the
+            // SUCCESS path that must make a positive claim. If a future early
+            // return is added and its author forgets this field entirely, the
+            // result is conservative rather than a false clean.
+            //
+            // In the 1.0.93 field run this mattered concretely: roughly 289 files
+            // were never examined and landed in the same statistical bucket as
+            // files that were scanned and found clean.
+            NotExaminedReason examinedState{ NotExaminedReason::NotAttempted };
+            std::string notExaminedDetail;                          // human-readable cause
 
             // TITANIUM: Error tracking
             uint32_t errorCount{ 0 };                               // Number of errors during scan
@@ -272,9 +310,25 @@ namespace ShadowStrike {
                 return detections.size();
             }
 
+            // Did this scan actually look at the file's contents?
+            //
+            // Ask this before treating an empty detection list as evidence of
+            // anything. "No detections" from a scan that never ran is not a
+            // clean verdict, and callers that conflate the two are reporting
+            // unexamined files as safe.
+            [[nodiscard]] bool WasExamined() const noexcept {
+                return examinedState == NotExaminedReason::Examined;
+            }
+
             // TITANIUM: Check if scan completed successfully
+            //
+            // Now requires that the contents were examined. Previously this was
+            // only `!timedOut && errorCount == 0`, which a default-constructed
+            // ScanResult satisfies -- so a scan that never happened reported
+            // itself as successful, which is precisely how ~289 unexamined files
+            // passed for clean in the field.
             [[nodiscard]] bool IsSuccessful() const noexcept {
-                return !timedOut && errorCount == 0;
+                return WasExamined() && !timedOut && errorCount == 0;
             }
 
             // TITANIUM: Check if any critical-level detection found
@@ -317,6 +371,10 @@ namespace ShadowStrike {
                 scanTimeMicroseconds = 0;
                 timedOut = false;
                 stoppedEarly = false;
+                // Back to "examined nothing" -- a reused result must not carry a
+                // previous scan's claim that contents were looked at.
+                examinedState = NotExaminedReason::NotAttempted;
+                notExaminedDetail.clear();
                 errorCount = 0;
                 lastError.clear();
                 performance = PerformanceBreakdown{};
