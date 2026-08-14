@@ -570,6 +570,73 @@ Rebuild with phantom-sigbuild, which generates the manifest alongside the output
         [BitConverter]::ToUInt16($bytes, 6))
 }
 
+# Stage PhantomSensor.sys / .inf / .cat for CmpPhantomSensorDriver.
+#
+# WHY THIS EXISTS: DriverComponent.wxs sources all three files from
+# $(var.StagingDir)\drivers, and NOTHING in this script ever wrote to that
+# directory. The files got there by hand, once, and then stopped tracking the
+# driver build - so 1.0.91 shipped a PhantomSensor.sys with NO VERSIONINFO
+# resource at all, after that resource had been added AND verified. It was
+# verified on the BUILD OUTPUT while the MSI packages the STAGED copy, and the
+# two had silently diverged. A driver rebuild that never reaches the installer is
+# the same silent staleness this project keeps paying for, so the copy is now part
+# of the deploy rather than a step someone has to remember.
+#
+# THE CATALOG AND THE BINARY MUST MOVE TOGETHER. PhantomSensor.cat contains the
+# hash of PhantomSensor.sys, so a catalog that does not cover the .sys beside it
+# makes the driver fail signature verification and refuse to load. Copying one
+# without the other is not a partial update, it is a broken install.
+function Sync-DriverStaging {
+    $driverOutDir  = Join-Path $RepoRoot 'PhantomSensor\x64\Release\PhantomSensor'
+    $stagingDrvDir = Join-Path $StagingDir 'drivers'
+    New-Item -ItemType Directory -Force -Path $stagingDrvDir | Out-Null
+
+    $sysSrc = Join-Path $driverOutDir 'PhantomSensor.sys'
+    $infSrc = Join-Path $driverOutDir 'PhantomSensor.inf'
+    $catSrc = Join-Path $driverOutDir 'phantomsensor.cat'
+
+    foreach ($need in @(@{ P = $sysSrc; L = 'driver binary' },
+                        @{ P = $infSrc; L = 'driver INF' },
+                        @{ P = $catSrc; L = 'driver catalog' })) {
+        if (-not (Test-Path $need.P)) {
+            Die @"
+The $($need.L) is missing:
+  $($need.P)
+
+Build the driver before deploying, and build it with /t:Rebuild - an incremental
+driver build fails inf2cat with an error that names nothing useful:
+  MSBuild PhantomSensor\PhantomSensor.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Rebuild
+"@
+        }
+    }
+
+    $sysItem = Get-Item $sysSrc
+    $catItem = Get-Item $catSrc
+
+    if ($catItem.LastWriteTimeUtc -lt $sysItem.LastWriteTimeUtc) {
+        Die ("PhantomSensor.cat ({0:u}) is older than PhantomSensor.sys ({1:u}), so the catalog cannot cover this driver and it will fail signature verification at load. Rebuild the driver with /t:Rebuild." -f `
+            $catItem.LastWriteTimeUtc, $sysItem.LastWriteTimeUtc)
+    }
+
+    # This is the check that would have caught the stale staged driver.
+    $drvVersion = $sysItem.VersionInfo.FileVersion
+    if ([string]::IsNullOrWhiteSpace($drvVersion)) {
+        Die "PhantomSensor.sys carries no VERSIONINFO resource, so the shipped driver would be unidentifiable in msinfo32, Autoruns and every driver-enumeration tool - on the one component that runs in ring 0. Rebuild the driver."
+    }
+    if ($drvVersion.Trim() -ne $FileVersionFull) {
+        Die ("PhantomSensor.sys reports version '{0}' but this deploy is {1}, so the driver was not rebuilt after the version bump and the MSI would ship a driver from a different build than every other binary. Rebuild it with /t:Rebuild." -f `
+            $drvVersion.Trim(), $FileVersionFull)
+    }
+
+    Copy-Item $sysSrc (Join-Path $stagingDrvDir 'PhantomSensor.sys') -Force
+    Copy-Item $infSrc (Join-Path $stagingDrvDir 'PhantomSensor.inf') -Force
+    Copy-Item $catSrc (Join-Path $stagingDrvDir 'PhantomSensor.cat') -Force
+
+    Log ("Staged driver: PhantomSensor.sys {0:N0} bytes ver={1}, catalog {2:N0} bytes" -f `
+        $sysItem.Length, $drvVersion.Trim(), $catItem.Length)
+}
+
+Sync-DriverStaging
 Sync-DetectionContentStaging
 
 # ── PACKAGE ──────────────────────────────────────────────────────────────────
