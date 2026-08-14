@@ -132,7 +132,13 @@ TEST_F(RegistryAnalyzerTest, OfflineHiveAndIndicatorHelpersHandleMalformedInputs
     EXPECT_FALSE(analyzer.GetKeyCell(missingHive.wstring(), 0).has_value());
     EXPECT_FALSE(analyzer.GetKeyCell(missingHive.wstring(), 0xFFFFFFFFu).has_value());
 
-    std::vector<uint8_t> malformedHive(0x100, 0x41);
+    // The hive base block is 0x1000 bytes and ParseHiveHeaderImpl rejects anything
+    // smaller BEFORE it reads the signature (RegistryAnalyzer.cpp:1658 - "Hive file
+    // missing or too small"), returning the same shape as a missing file. A 0x100
+    // byte buffer therefore never reached the signature check this case is about, so
+    // isCorrupted was false for a reason that had nothing to do with the bad magic.
+    // Size the buffer to a full base block so the "regf" validation actually runs.
+    std::vector<uint8_t> malformedHive(0x1000, 0x41);
     malformedHive[0] = 'B';
     malformedHive[1] = 'A';
     malformedHive[2] = 'D';
@@ -143,6 +149,27 @@ TEST_F(RegistryAnalyzerTest, OfflineHiveAndIndicatorHelpersHandleMalformedInputs
     EXPECT_FALSE(malformedHeader.isValid);
     EXPECT_TRUE(malformedHeader.isCorrupted);
     EXPECT_FALSE(analyzer.ValidateHiveStructure(malformedHivePath.wstring()));
+
+    // A present-but-truncated hive: smaller than one base block, so the parser
+    // cannot even reach the signature. Only the contract that holds regardless of
+    // how the product classifies it is asserted here - the header is not usable and
+    // structure validation refuses it.
+    //
+    // REPORTED PRODUCT GAP (not asserted either way on purpose): ParseHiveHeader
+    // reports isCorrupted == false for this file, i.e. a truncated hive that EXISTS
+    // on disk is reported identically to one that is absent. Pinning the current
+    // value here would freeze that behaviour as a contract; pinning the opposite
+    // would fail until the product changes. So this asserts neither.
+    std::vector<uint8_t> truncatedHive(0x200, 0x41);
+    truncatedHive[0] = 'r';
+    truncatedHive[1] = 'e';
+    truncatedHive[2] = 'g';
+    truncatedHive[3] = 'f';
+    const auto truncatedHivePath = temp.WriteBytes(L"truncated.hiv", truncatedHive);
+
+    const HiveHeader truncatedHeader = analyzer.ParseHiveHeader(truncatedHivePath.wstring());
+    EXPECT_FALSE(truncatedHeader.isValid);
+    EXPECT_FALSE(analyzer.ValidateHiveStructure(truncatedHivePath.wstring()));
 
     const AnalysisResult hiveResult = analyzer.AnalyzeHiveFile(malformedHivePath.wstring());
     EXPECT_TRUE(hiveResult.hadErrors);

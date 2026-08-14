@@ -538,11 +538,24 @@ TEST_F(ConfigManagerTest, CallbacksSnapshotsImportExportAndResetsPreserveObserva
     exportOptions.layers = {ConfigLayer::Default, ConfigLayer::User};
     exportOptions.categories = {"export", "secrets"};
 
+    // ExportToJson emits every value as a TYPED WRAPPER, not a bare JSON scalar:
+    //   "<key>": {"_t": "<type_tag>", "_v": <native_json_value>}
+    // (ConfigManager.cpp:1456-1479). The wrapper exists because ConfigValue is a
+    // variant and bare JSON cannot distinguish i32/i64/u32/u64/f64, so a bare-scalar
+    // export could not round-trip through ImportFromJson without silently changing a
+    // value's type. Reading values[key] as a string threw
+    // json.exception.type_error.302 ("type must be string, but is object") - the test
+    // was written against the pre-wrapper format, not a product defect.
     const auto exportedJson = ParseJson(manager.ExportToJson(exportOptions));
     ASSERT_TRUE(exportedJson.contains("values"));
-    EXPECT_EQ(exportedJson.at("values").at(defaultKey).get<std::string>(), "balanced");
-    EXPECT_EQ(exportedJson.at("values").at(userKey).get<std::string>(), "strict");
-    EXPECT_FALSE(exportedJson.at("values").contains(sensitiveKey));
+    const auto& exportedValues = exportedJson.at("values");
+    ASSERT_TRUE(exportedValues.at(defaultKey).is_object());
+    EXPECT_EQ(exportedValues.at(defaultKey).at("_t").get<std::string>(), "str");
+    EXPECT_EQ(exportedValues.at(defaultKey).at("_v").get<std::string>(), "balanced");
+    ASSERT_TRUE(exportedValues.at(userKey).is_object());
+    EXPECT_EQ(exportedValues.at(userKey).at("_t").get<std::string>(), "str");
+    EXPECT_EQ(exportedValues.at(userKey).at("_v").get<std::string>(), "strict");
+    EXPECT_FALSE(exportedValues.contains(sensitiveKey));
     EXPECT_EQ(exportedJson.at("metadata").at(defaultKey).at("category").get<std::string>(), "export");
     EXPECT_TRUE(exportedJson.at("metadata").at(sensitiveKey).at("isSensitive").get<bool>());
 
