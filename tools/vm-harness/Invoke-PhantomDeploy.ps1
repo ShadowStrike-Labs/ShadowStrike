@@ -957,11 +957,34 @@ $job = [ordered]@{
     waitSeconds    = $WaitSeconds
     collectPaths   = @(
         '%ProgramData%\ShadowStrike\Logs'
+        # THE CLIENT LOGS LIVE SOMEWHERE ELSE, and not collecting them is why the
+        # 1.0.93 run could not answer "why did the UI never connect?".
+        #
+        # The UI and tray run as the interactive user and the install directory is
+        # read-only to that user, so both resolve their log directory to
+        # %LOCALAPPDATA%\ShadowStrike\Logs (UI/Client/main.cpp InitLogger and
+        # Tray/main.cpp InitTrayLogger). Only %ProgramData% was collected, so the
+        # service's account of events was the only account available, and it
+        # cannot see a client that fails before it sends anything.
+        #
+        # PhantomHomeUI*.log and PhantomHomeTray*.log land here.
+        '%LOCALAPPDATA%\ShadowStrike\Logs'
     )
     extraCommands  = @(
         @{ label='service-status';    script='Get-Service ShadowStrikePhantomService -ErrorAction SilentlyContinue | Select Status,DisplayName | ConvertTo-Json' }
         @{ label='event-log-errors';  script='Get-WinEvent -LogName Application -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -like "*Shadow*" -or $_.ProviderName -like "*Phantom*" } | Select TimeCreated,LevelDisplayName,Message | ConvertTo-Json' }
-        @{ label='pipe-exists';       script='[bool](Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue | Where-Object Name -like "*ShadowStrike*") | ConvertTo-Json' }
+        # Names, not a boolean. The previous probe answered only "does some pipe
+        # matching *ShadowStrike* exist", which is true whenever ANY of our
+        # servers is up and therefore cannot distinguish the UI channel being
+        # absent from the control channel being present. Task 94 needed exactly
+        # that distinction: there are two servers on two names one word apart.
+        @{ label='pipe-names';        script='Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*ShadowStrike*" -or $_.Name -like "*Phantom*" } | Select-Object -ExpandProperty Name | ConvertTo-Json' }
+        # Did the client processes even start? A UI that never launched and a UI
+        # that launched and could not authenticate look identical in a service log.
+        @{ label='client-processes';  script='Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "*ShadowStrikePhantom*" } | Select ProcessName,Id,StartTime | ConvertTo-Json' }
+        # Does the per-session auth token the UI must read actually exist? An
+        # empty read is the tray's own reported reason for failing to authenticate.
+        @{ label='ui-auth-token';     script='$p = Join-Path $env:LOCALAPPDATA "ShadowStrike\ui.token"; $e = Test-Path $p; $len = 0; if ($e) { $len = (Get-Item $p).Length }; [ordered]@{ path=$p; exists=$e; length=$len } | ConvertTo-Json' }
     ) + $extraCmds
     submittedAt    = (Get-Date -Format 'o')
     submittedBy    = $env:COMPUTERNAME
