@@ -255,7 +255,22 @@ Generated_Code/
 # to a newer Visual Studio version. Backup files are not needed,
 # because we have git ;-)
 _UpgradeReport_Files/
-Backup*/
+# ANCHORED TO THE REPO ROOT ON PURPOSE. This was "Backup*/", which has no slash
+# before it, so git matched a directory called Backup at ANY depth - including
+# src/Products/Community/PhantomHome/Backup/, the ransomware rollback module
+# (BackupManager, BackupScheduler, IncrementalBackup, RestoreManager,
+# BackupWiring). Verified with git check-ignore:
+#     .gitignore:258:Backup*/  src/Products/Community/PhantomHome/Backup/probe.cpp
+# Those nine files are tracked and were never lost, because .gitignore does not
+# apply to files git already tracks - so nothing is missing from history today.
+# The hazard is the NEXT file added to that directory: it would be invisible to
+# git add, absent from the commit, and the build would keep working locally
+# because the file is on disk. A clone would then be missing part of the
+# rollback path with no error anywhere.
+# The rule's own comment says it exists for Visual Studio project-upgrade
+# backup folders, and those are created beside the .sln at the repo root, so
+# anchoring loses nothing it was written to catch.
+/Backup*/
 UpgradeLog*.XML
 UpgradeLog*.htm
 ServiceFabricBackup/
