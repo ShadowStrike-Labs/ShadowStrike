@@ -89,6 +89,9 @@ extern "C" {
 /// @brief Version mismatch
 #define SHADOWSTRIKE_ERROR_VERSION_MISMATCH     (SHADOWSTRIKE_ERROR_BASE | 0x009)
 
+/// @brief Arithmetic on caller-supplied sizes would overflow; nothing was done
+#define SHADOWSTRIKE_ERROR_INTEGER_OVERFLOW     (SHADOWSTRIKE_ERROR_BASE | 0x00A)
+
 // ============================================================================
 // COMMUNICATION ERRORS (0x100 - 0x1FF)
 // ============================================================================
@@ -120,6 +123,9 @@ extern "C" {
 /// @brief Client disconnected unexpectedly
 #define SHADOWSTRIKE_ERROR_CLIENT_DISCONNECTED  (SHADOWSTRIKE_ERROR_BASE | 0x108)
 
+/// @brief Message exceeds SHADOWSTRIKE_MAX_MESSAGE_SIZE and was not transmitted
+#define SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE    (SHADOWSTRIKE_ERROR_BASE | 0x109)
+
 // ============================================================================
 // SCANNING ERRORS (0x200 - 0x2FF)
 // ============================================================================
@@ -141,6 +147,12 @@ extern "C" {
 
 /// @brief File too large for scan
 #define SHADOWSTRIKE_ERROR_FILE_TOO_LARGE       (SHADOWSTRIKE_ERROR_BASE | 0x205)
+
+/// @brief Scan refused without being attempted: the scanner circuit breaker is
+///        open because user mode has been failing or timing out. Distinct from
+///        SCANNER_UNAVAILABLE (0x203), which means no scanner is connected at
+///        all - here one is connected and is deliberately being spared.
+#define SHADOWSTRIKE_ERROR_CIRCUIT_OPEN         (SHADOWSTRIKE_ERROR_BASE | 0x206)
 
 // ============================================================================
 // CACHE ERRORS (0x300 - 0x3FF)

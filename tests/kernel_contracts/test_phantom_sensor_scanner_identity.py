@@ -23,6 +23,7 @@ SCAN_BRIDGE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/ScanBridg
 COMM_PORT_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.c"
 COMM_PORT_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.h"
 DRIVER_ENTRY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/DriverEntry.c"
+ERROR_CODES_H_PATH = ROOT / "PhantomSensor/Shared/ErrorCodes.h"
 
 
 def read_source(path: Path) -> str:
@@ -144,6 +145,7 @@ class SourceContractTests(unittest.TestCase):
         cls.comm_port_c = read_source(COMM_PORT_C_PATH)
         cls.comm_port_h = read_source(COMM_PORT_H_PATH)
         cls.driver_entry_c = read_source(DRIVER_ENTRY_C_PATH)
+        cls.error_codes_h = read_source(ERROR_CODES_H_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -859,6 +861,79 @@ class SourceContractTests(unittest.TestCase):
         )
         self.assertNotIn("ShadowStrikeBufferUndelivered", scan)
         self.assertNotIn("MqEnqueueMessage", scan)
+
+    def test_the_driver_has_exactly_one_error_code_space(self) -> None:
+        # ScanBridge.h used to define five error codes underneath its OWN include
+        # of ErrorCodes.h. Two (PORT_NOT_CONNECTED, SCAN_TIMEOUT) sat behind
+        # #ifndef guards, so the canonical values always won and those fallbacks
+        # could never be produced - dead code that read like the definitions in
+        # force. The other three were unconditional and live, but numbered
+        # 0xE00000xx, i.e. NTSTATUS facility 0x000, while the project's space is
+        # facility 0x100. SHADOWSTRIKE_IS_ERROR() tests for exactly
+        # SHADOWSTRIKE_ERROR_BASE, so it answered FALSE for three of the driver's
+        # own error codes.
+        self.assertIn('#include "../../Shared/ErrorCodes.h"', self.scan_bridge_h)
+        local_defines = re.findall(
+            r"#\s*define\s+SHADOWSTRIKE_ERROR_[A-Z0-9_]+",
+            strip_c_comments(self.scan_bridge_h),
+        )
+        self.assertEqual(
+            local_defines,
+            [],
+            "ScanBridge.h must not define error codes; move these to ErrorCodes.h: "
+            f"{local_defines}",
+        )
+
+        defines = dict(
+            re.findall(
+                r"#\s*define\s+(SHADOWSTRIKE_ERROR_[A-Z0-9_]+)[ \t]+([^\r\n]+)",
+                strip_c_comments(self.error_codes_h),
+            )
+        )
+        self.assertIn("SHADOWSTRIKE_ERROR_BASE", defines)
+
+        # Every code must be expressed as BASE | <offset>. A bare hex literal is
+        # exactly how the second facility appeared, so the shape is the contract,
+        # not just the resulting value.
+        offsets: dict[int, str] = {}
+        for name, body in defines.items():
+            if name in ("SHADOWSTRIKE_ERROR_BASE", "SHADOWSTRIKE_ERROR_CODES_H"):
+                continue
+            match = re.fullmatch(
+                r"\(\s*SHADOWSTRIKE_ERROR_BASE\s*\|\s*(0x[0-9A-Fa-f]+)\s*\)",
+                body.strip(),
+            )
+            self.assertIsNotNone(
+                match, f"{name} does not derive from SHADOWSTRIKE_ERROR_BASE: {body!r}"
+            )
+            assert match is not None
+            offset = int(match.group(1), 16)
+            self.assertNotIn(
+                offset,
+                offsets,
+                f"{name} collides with {offsets.get(offset)} at offset {offset:#05x}",
+            )
+            offsets[offset] = name
+
+        # The three that moved out of ScanBridge.h must have landed here, and
+        # every code ScanBridge.c names must resolve - so deleting a define
+        # instead of relocating it is named by this test rather than by a build
+        # error that does not explain itself.
+        for relocated in (
+            "SHADOWSTRIKE_ERROR_CIRCUIT_OPEN",
+            "SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE",
+            "SHADOWSTRIKE_ERROR_INTEGER_OVERFLOW",
+        ):
+            self.assertIn(relocated, defines)
+
+        used = set(
+            re.findall(
+                r"\bSHADOWSTRIKE_ERROR_[A-Z0-9_]+\b",
+                strip_c_comments(self.scan_bridge_c),
+            )
+        )
+        self.assertTrue(used)
+        self.assertEqual(used - set(defines), set())
 
     def test_legacy_builder_uses_operation_requestor(self) -> None:
         legacy = extract_c_function(

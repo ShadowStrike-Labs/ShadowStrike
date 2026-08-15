@@ -262,33 +262,30 @@ extern "C" {
 // ============================================================================
 
 //
-// Use canonical error codes from ErrorCodes.h when available.
-// ScanBridge-specific error codes use the 0xE00000xx range.
+// Every status this module returns comes from the canonical error space in
+// ErrorCodes.h. ScanBridge defines NONE of its own, deliberately.
+//
+// It used to define five, and they were wrong in two different ways at once:
+//
+//   SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED and SHADOWSTRIKE_ERROR_SCAN_TIMEOUT
+//   were wrapped in #ifndef guards placed BELOW this very include, so the
+//   canonical definitions always won and the fallback values could never be
+//   produced by anything. They read like the definitions in force and were
+//   unreachable dead code.
+//
+//   SHADOWSTRIKE_ERROR_CIRCUIT_OPEN, _MESSAGE_TOO_LARGE and _INTEGER_OVERFLOW
+//   were unconditional and therefore live, but numbered 0xE00000xx - NTSTATUS
+//   facility 0x000 - while this project's entire error space is facility 0x100
+//   (SHADOWSTRIKE_ERROR_BASE == 0xE0100000). SHADOWSTRIKE_IS_ERROR() tests for
+//   exactly that base, so it answered FALSE for three of the driver's own
+//   errors. Those three now live in ErrorCodes.h, each in the category it
+//   belongs to, so there is one error space rather than two.
+//
+// Do not reintroduce a local #define here. A code this module needs and the
+// canonical header lacks belongs in ErrorCodes.h; the kernel contract test
+// asserts that this file declares none.
 //
 #include "../../Shared/ErrorCodes.h"
-
-#ifndef SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED
-#define SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED   ((NTSTATUS)0xE0000001L)
-#endif
-
-#ifndef SHADOWSTRIKE_ERROR_SCAN_TIMEOUT
-#define SHADOWSTRIKE_ERROR_SCAN_TIMEOUT         ((NTSTATUS)0xE0000002L)
-#endif
-
-/**
- * @brief Circuit breaker open error
- */
-#define SHADOWSTRIKE_ERROR_CIRCUIT_OPEN         ((NTSTATUS)0xE0000003L)
-
-/**
- * @brief Message too large error
- */
-#define SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE    ((NTSTATUS)0xE0000004L)
-
-/**
- * @brief Integer overflow error
- */
-#define SHADOWSTRIKE_ERROR_INTEGER_OVERFLOW     ((NTSTATUS)0xE0000005L)
 
 // ============================================================================
 // ENUMERATIONS
