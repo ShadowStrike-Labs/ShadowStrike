@@ -1469,9 +1469,80 @@ void IPCManager::RegisterRegistryHandler(RegistryOpCallback handler) {
     Utils::Logger::Info("[IPCManager] Registered registry handler");
 }
 
-void IPCManager::RegisterGenericHandler(GenericMessageCallback handler) {
+void IPCManager::RegisterGenericHandler(std::string subscriber, GenericMessageCallback handler) {
+    // An unnamed subscriber cannot be removed and cannot be attributed in a
+    // log. Refuse it rather than accept a subscription nobody can account for:
+    // the whole point of this signature is that the feed's membership is
+    // answerable.
+    if (subscriber.empty()) {
+        Utils::Logger::Error("[IPCManager] Refusing generic subscription with no subscriber name");
+        return;
+    }
+
     std::lock_guard lock(m_handlerMutex);
-    m_genericHandler = std::move(handler);
+
+    auto updated = std::make_shared<std::vector<GenericSubscription>>(*m_genericSubscribers);
+
+    auto existing = std::find_if(updated->begin(), updated->end(),
+        [&subscriber](const GenericSubscription& s) { return s.name == subscriber; });
+
+    if (existing != updated->end()) {
+        if (handler) {
+            // Re-registration by the same module: replace in place so a module
+            // that re-initializes updates its callback instead of receiving
+            // every message twice.
+            existing->handler = std::move(handler);
+            Utils::Logger::Info("[IPCManager] Generic subscriber '{}' re-registered ({} total)",
+                                subscriber, updated->size());
+        } else {
+            // A null handler from a known subscriber means "remove me". The
+            // previous single-slot API used RegisterGenericHandler(nullptr) as
+            // its unregister idiom and two modules still call it that way, so
+            // honouring it here keeps their teardown correct.
+            updated->erase(existing);
+            Utils::Logger::Info("[IPCManager] Generic subscriber '{}' removed ({} remain)",
+                                subscriber, updated->size());
+        }
+    } else if (handler) {
+        updated->push_back(GenericSubscription{ std::move(subscriber), std::move(handler) });
+        Utils::Logger::Info("[IPCManager] Generic subscriber '{}' registered ({} total)",
+                            updated->back().name, updated->size());
+    } else {
+        // Removing something that was never there is not an error, but it is
+        // worth saying: it usually means a shutdown path names itself
+        // differently from its registration path.
+        Utils::Logger::Debug("[IPCManager] Generic unsubscribe for unknown subscriber '{}'",
+                             subscriber);
+        return;
+    }
+
+    m_genericSubscribers = std::move(updated);
+}
+
+void IPCManager::UnregisterGenericHandler(std::string_view subscriber) {
+    std::lock_guard lock(m_handlerMutex);
+
+    auto updated = std::make_shared<std::vector<GenericSubscription>>(*m_genericSubscribers);
+
+    const auto removed = std::erase_if(*updated,
+        [subscriber](const GenericSubscription& s) { return s.name == subscriber; });
+
+    if (removed == 0) {
+        return;
+    }
+
+    Utils::Logger::Info("[IPCManager] Generic subscriber '{}' unregistered ({} remain)",
+                        std::string(subscriber), updated->size());
+    m_genericSubscribers = std::move(updated);
+}
+
+size_t IPCManager::GenericSubscriberCount() const noexcept {
+    try {
+        std::lock_guard lock(m_handlerMutex);
+        return m_genericSubscribers ? m_genericSubscribers->size() : 0u;
+    } catch (...) {
+        return 0u;
+    }
 }
 
 void IPCManager::SetMessageCallback(std::function<void(const std::string&)> cb) {
@@ -1485,7 +1556,7 @@ void IPCManager::UnregisterHandlers() {
     m_processHandler = nullptr;
     m_imageLoadHandler = nullptr;
     m_registryHandler = nullptr;
-    m_genericHandler = nullptr;
+    m_genericSubscribers = std::make_shared<const std::vector<GenericSubscription>>();
     m_messageCallback = nullptr;
     Utils::Logger::Info("[IPCManager] Unregistered all handlers");
 }
@@ -2043,7 +2114,7 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
     ProcessNotifyCallback processHandler;
     ImageLoadCallback imageLoadHandler;
     RegistryOpCallback registryHandler;
-    GenericMessageCallback genericHandler;
+    std::shared_ptr<const std::vector<GenericSubscription>> genericSubscribers;
 
     {
         std::lock_guard lock(m_handlerMutex);
@@ -2051,7 +2122,37 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         processHandler   = m_processHandler;
         imageLoadHandler = m_imageLoadHandler;
         registryHandler  = m_registryHandler;
-        genericHandler   = m_genericHandler;
+        genericSubscribers = m_genericSubscribers;   // one refcount, not N copies
+    }
+
+    // Stand in for the old single generic handler so every dispatch site below
+    // is unchanged: the routing decision (which message types reach the generic
+    // feed, and that ImageLoad/RegistryNotify reach it only when their TYPED
+    // handler is absent) is deliberately not altered here. What changes is
+    // arity - one subscriber becomes all of them.
+    //
+    // Left EMPTY when there are no subscribers, because the existing sites test
+    // this callable for emptiness to decide whether anything is listening.
+    // Capturing by reference is safe: the snapshot outlives every use below.
+    GenericMessageCallback genericHandler;
+    if (genericSubscribers && !genericSubscribers->empty()) {
+        genericHandler = [&genericSubscribers](SHADOWSTRIKE_MESSAGE_TYPE type,
+                                              const void* data, size_t size) {
+            for (const auto& sub : *genericSubscribers) {
+                if (!sub.handler) {
+                    continue;
+                }
+                try {
+                    sub.handler(type, data, size);
+                } catch (...) {
+                    // Contain per subscriber. One module throwing must not stop
+                    // delivery to the modules behind it in the list, and must
+                    // not escape into the IPC pump - an exception reaching the
+                    // dispatch loop terminates kernel message servicing for the
+                    // whole process.
+                }
+            }
+        };
     }
 
     switch (static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType)) {

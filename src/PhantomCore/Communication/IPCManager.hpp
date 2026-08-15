@@ -701,6 +701,34 @@ using GenericMessageCallback = std::function<void(SHADOWSTRIKE_MESSAGE_TYPE, con
 using ConnectionCallback = std::function<void(ChannelType, ConnectionStatus)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
+/**
+ * @brief One named subscriber to the generic (non-verdict) kernel message feed.
+ *
+ * The generic feed is a FAN-OUT, not a slot. It used to be a single
+ * std::function, and eight modules registered against it: RealTimeProtection,
+ * ProcessInjectionDetector, AtomBombingDetector, StackPivotDetector,
+ * ROPProtection, BufferOverflowProtection, FileProtection and SelfDefense.
+ * The last registrant silently evicted the other seven, so exactly one of
+ * eight consumers ever received a kernel event, and which one depended on
+ * module startup order rather than on any decision.
+ *
+ * Two consequences were measured rather than inferred:
+ *   - FilterMessageType_ThreadNotify has THREE would-be consumers
+ *     (RealTimeProtection, ProcessInjectionDetector, AtomBombingDetector).
+ *   - FilterMessageType_SelfProtectAlert has TWO, both of them self-defence
+ *     (SelfDefense and FileProtection), so one half of self-defence's kernel
+ *     reporting was always dead.
+ *
+ * The subscriber NAME is load-bearing, not decorative: every registrant used
+ * to emit the identical "[IPCManager] Registered generic handler" line, so a
+ * field log could not say which module owned the feed. The name makes the
+ * subscription list answerable from a log.
+ */
+struct GenericSubscription {
+    std::string            name;
+    GenericMessageCallback handler;
+};
+
 // ============================================================================
 // IPC MANAGER CLASS
 // ============================================================================
@@ -867,8 +895,30 @@ public:
     /// @brief Register registry operation handler
     void RegisterRegistryHandler(RegistryOpCallback handler);
     
-    /// @brief Register generic message handler
-    void RegisterGenericHandler(GenericMessageCallback handler);
+    /**
+     * @brief Subscribe to the generic (non-verdict) kernel message feed.
+     *
+     * ADDITIVE, not a slot: every subscriber receives every generic message
+     * that reaches the feed. Registering twice under the same @p subscriber
+     * name REPLACES that subscriber's callback and leaves all others intact,
+     * so a module that re-initializes cannot accumulate duplicate deliveries.
+     *
+     * @param subscriber Stable identity of the registering module. Must be
+     *                   non-empty; an unnamed subscriber cannot be removed and
+     *                   cannot be attributed in a log, which is the defect this
+     *                   signature exists to prevent.
+     * @param handler    Invoked OUTSIDE the handler mutex. Must not throw; a
+     *                   throwing subscriber is contained so it cannot starve
+     *                   the subscribers behind it, but it will be dropped for
+     *                   that message.
+     */
+    void RegisterGenericHandler(std::string subscriber, GenericMessageCallback handler);
+
+    /// @brief Remove one named subscriber from the generic feed. Unknown names are ignored.
+    void UnregisterGenericHandler(std::string_view subscriber);
+
+    /// @brief Number of live generic subscribers. Zero means no module observes kernel alerts.
+    [[nodiscard]] size_t GenericSubscriberCount() const noexcept;
     
     /// @brief Set message callback (for pipe messages)
     void SetMessageCallback(std::function<void(const std::string&)> cb);
@@ -1004,7 +1054,14 @@ private:
     ProcessNotifyCallback m_processHandler;
     ImageLoadCallback m_imageLoadHandler;
     RegistryOpCallback m_registryHandler;
-    GenericMessageCallback m_genericHandler;
+
+    // Generic (non-verdict) subscribers, held as an immutable snapshot behind a
+    // shared_ptr so the DISPATCH path copies one refcount instead of N
+    // std::functions. Registration is a startup-time event and rebuilds the
+    // vector; delivery happens per kernel message and must stay cheap.
+    // Never null once constructed.
+    std::shared_ptr<const std::vector<GenericSubscription>> m_genericSubscribers{
+        std::make_shared<const std::vector<GenericSubscription>>() };
     std::function<void(const std::string&)> m_messageCallback;
     mutable std::mutex m_handlerMutex;
     

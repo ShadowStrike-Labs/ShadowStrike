@@ -727,7 +727,7 @@ FileProtectionImpl::~FileProtectionImpl() {
     // WIRE-03: Register handler for kernel-side file protection block events
     try {
         auto& ipc = Communication::IPCManager::Instance();
-        ipc.RegisterGenericHandler(
+        ipc.RegisterGenericHandler("FileProtection",
             [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* data, size_t size) {
                 if (msgType == FilterMessageType_SelfProtectAlert) {
                     OnKernelBlockEventInternal(data, static_cast<uint32_t>(size));
@@ -759,10 +759,13 @@ void FileProtectionImpl::Shutdown(std::string_view authorizationToken) {
 
     // FIX: Unregister kernel event handler BEFORE stopping threads.
     // The lambda captured `this`; if IPCManager dispatches after destruction,
-    // we get use-after-free.
+    // we get use-after-free. Remove ONLY our own subscription: this used to be
+    // RegisterGenericHandler(nullptr) against a single-slot sink, which cleared
+    // whatever module happened to own the feed - so our teardown disabled
+    // everyone else's kernel event handling as a side effect.
     try {
         if (Communication::IPCManager::HasInstance()) {
-            Communication::IPCManager::Instance().RegisterGenericHandler(nullptr);
+            Communication::IPCManager::Instance().UnregisterGenericHandler("FileProtection");
         }
     } catch (...) {
         // IPCManager may already be torn down during process exit

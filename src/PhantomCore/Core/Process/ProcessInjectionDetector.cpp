@@ -1840,22 +1840,19 @@ void ProcessInjectionDetector::Impl::RegisterKernelHandlers() {
         // HandleAlert messages from the kernel driver into our detection
         // pipeline. This is the critical kernel<->user-mode bridge.
         //
-        // ARCH-BLOCKER (pre-existing, documented in audit report):
-        //   IPCManager::RegisterGenericHandler is a SINGLE-SLOT sink — the
-        //   last caller wins.  Other modules (AtomBombing/StackPivot/ROP/
-        //   BufferOverflow/RealTime/FileProtection/SelfDefense) all register
-        //   against the same slot, and whichever loads last silently
-        //   evicts the others.  Fixing this requires extending IPCManager
-        //   to a multi-handler dispatch table; that's out of scope for
-        //   this component-level audit but recorded so the platform team
-        //   can plan a coordinated change.
+        // The generic feed is a FAN-OUT (IPCManager::GenericSubscription), so
+        // this subscription no longer competes with the other seven modules
+        // that also observe it. It used to: the feed was a single slot and the
+        // last registrant silently evicted the rest, which is why the audit
+        // note that stood here called it an ARCH-BLOCKER. Registering under a
+        // stable name is what makes the membership removable and attributable.
         //
         // SAFETY: the lambda guards against use-after-free at process
         // exit (IPCManager and ProcessInjectionDetector singletons have
         // unspecified destruction order) by checking the static
         // g_implAlive flag under acquire ordering BEFORE touching any
         // captured pointer.
-        ipc.RegisterGenericHandler(
+        ipc.RegisterGenericHandler("ProcessInjectionDetector",
             [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* payload, size_t payloadSize) noexcept {
                 if (!g_implAlive.load(std::memory_order_acquire)) {
                     return;

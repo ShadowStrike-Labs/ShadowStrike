@@ -1366,7 +1366,8 @@ public:
                 return MapKernelVerdictToScanVerdict(OnKernelRegistryOp(req));
             });
 
-            ipc.RegisterGenericHandler([this](SHADOWSTRIKE_MESSAGE_TYPE type,
+            ipc.RegisterGenericHandler("RealTimeProtection",
+                                      [this](SHADOWSTRIKE_MESSAGE_TYPE type,
                                               const void* data, size_t size) {
                 OnKernelGenericEvent(type, data, size);
             });

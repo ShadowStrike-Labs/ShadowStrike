@@ -2996,7 +2996,7 @@ void SelfDefenseImpl::RegisterKernelHandler() {
     }
 
     auto& ipc = Communication::IPCManager::Instance();
-    ipc.RegisterGenericHandler(
+    ipc.RegisterGenericHandler("SelfDefense",
         [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* data, size_t size) {
             if (!m_kernelHandlerRegistered.load(std::memory_order_acquire)) return;
             if (msgType == FilterMessageType_SelfProtectAlert) {
@@ -3013,13 +3013,15 @@ void SelfDefenseImpl::UnregisterKernelHandler() {
     if (!m_kernelHandlerRegistered.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    // IPCManager::RegisterGenericHandler stores a single callable. Clearing it
-    // is the only way to drop our `this`-capturing lambda and prevent IPCManager
-    // from dispatching into a destroyed SelfDefenseImpl after Shutdown. This
-    // mirrors the pattern used by FileProtection on its own teardown.
+    // Drop our `this`-capturing lambda so IPCManager cannot dispatch into a
+    // destroyed SelfDefenseImpl after Shutdown. Removes ONLY our own
+    // subscription: this used to be RegisterGenericHandler(nullptr) against a
+    // single-slot sink, so it cleared whichever module owned the feed - and
+    // FileProtection, which subscribes to the SAME SelfProtectAlert type, did
+    // the same thing to us on its teardown.
     if (Communication::IPCManager::HasInstance()) {
         try {
-            Communication::IPCManager::Instance().RegisterGenericHandler(nullptr);
+            Communication::IPCManager::Instance().UnregisterGenericHandler("SelfDefense");
         } catch (...) {
             SS_LOG_WARN(LOG_CATEGORY, L"Exception while clearing IPC kernel handler during shutdown");
         }

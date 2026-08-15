@@ -204,3 +204,135 @@ TEST(IpcStatisticsContractTest, ProcessNotifyVariableLengthsAreByteCounts) {
     EXPECT_EQ(base + sizeof(ProcessNotifyRequest) + 8,
               reinterpret_cast<const unsigned char*>(req->commandLineData()));
 }
+
+// ============================================================================
+// GENERIC SUBSCRIBER FAN-OUT
+// ============================================================================
+//
+// The generic (non-verdict) kernel message feed used to be a SINGLE
+// std::function. Eight modules registered against it - RealTimeProtection,
+// ProcessInjectionDetector, AtomBombingDetector, StackPivotDetector,
+// ROPProtection, BufferOverflowProtection, FileProtection and SelfDefense - so
+// the last registrant silently evicted the other seven and exactly one of eight
+// consumers ever saw a kernel event.
+//
+// HONEST LIMIT, stated because it bounds what these tests prove: DELIVERY runs
+// inside IPCManager::DispatchMessage, which needs a loaded driver and a live
+// filter port, so it cannot be exercised here. What IS asserted is MEMBERSHIP -
+// and membership is precisely where the defect lived. "The last caller wins" is
+// a statement about the subscriber list, not about the dispatch loop.
+//
+// These cases cannot fail against the previous code because the previous API had
+// a different signature and no way to ask how many subscribers exist. They
+// discriminate instead against the plausible WRONG implementations of this API:
+// appending without de-duplicating (every message delivered twice to a module
+// that re-initializes), and removing one subscriber by clearing the list (which
+// is exactly what SelfDefense and FileProtection each did to the other, via
+// RegisterGenericHandler(nullptr) against the old slot).
+
+namespace {
+
+// Every case measures against a baseline rather than an absolute count, so no
+// case depends on which other cases have run or on what production code has
+// registered in this process.
+ShadowStrike::Communication::IPCManager& Ipc() {
+    return ShadowStrike::Communication::IPCManager::Instance();
+}
+
+auto NoopSubscriber() {
+    return [](SHADOWSTRIKE_MESSAGE_TYPE, const void*, size_t) {};
+}
+
+}  // namespace
+
+TEST(GenericSubscriberFanOut, EverySubscriberSurvivesTheNextRegistration) {
+    const size_t baseline = Ipc().GenericSubscriberCount();
+
+    Ipc().RegisterGenericHandler("fanout.test.first", NoopSubscriber());
+    EXPECT_EQ(baseline + 1, Ipc().GenericSubscriberCount());
+
+    Ipc().RegisterGenericHandler("fanout.test.second", NoopSubscriber());
+    EXPECT_EQ(baseline + 2, Ipc().GenericSubscriberCount())
+        << "A second registration evicted the first: the feed is behaving as a "
+           "slot again, which is the defect this fan-out replaced.";
+
+    Ipc().RegisterGenericHandler("fanout.test.third", NoopSubscriber());
+    EXPECT_EQ(baseline + 3, Ipc().GenericSubscriberCount());
+
+    Ipc().UnregisterGenericHandler("fanout.test.first");
+    Ipc().UnregisterGenericHandler("fanout.test.second");
+    Ipc().UnregisterGenericHandler("fanout.test.third");
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount());
+}
+
+TEST(GenericSubscriberFanOut, ReRegisteringOneNameReplacesRatherThanDuplicates) {
+    const size_t baseline = Ipc().GenericSubscriberCount();
+
+    Ipc().RegisterGenericHandler("fanout.test.repeat", NoopSubscriber());
+    Ipc().RegisterGenericHandler("fanout.test.repeat", NoopSubscriber());
+    Ipc().RegisterGenericHandler("fanout.test.repeat", NoopSubscriber());
+
+    EXPECT_EQ(baseline + 1, Ipc().GenericSubscriberCount())
+        << "A module that re-initializes accumulated duplicate subscriptions, so "
+           "every kernel event would be delivered to it more than once.";
+
+    Ipc().UnregisterGenericHandler("fanout.test.repeat");
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount());
+}
+
+TEST(GenericSubscriberFanOut, RemovingOneSubscriberLeavesTheOthers) {
+    const size_t baseline = Ipc().GenericSubscriberCount();
+
+    // SelfDefense and FileProtection both subscribe to SelfProtectAlert, and
+    // each used to clear the entire feed on its own teardown. This is that case.
+    Ipc().RegisterGenericHandler("fanout.test.keeper", NoopSubscriber());
+    Ipc().RegisterGenericHandler("fanout.test.leaver", NoopSubscriber());
+    ASSERT_EQ(baseline + 2, Ipc().GenericSubscriberCount());
+
+    Ipc().UnregisterGenericHandler("fanout.test.leaver");
+
+    EXPECT_EQ(baseline + 1, Ipc().GenericSubscriberCount())
+        << "Removing one subscriber took others with it - one module's shutdown "
+           "would silently disable every other module's kernel event handling.";
+
+    Ipc().UnregisterGenericHandler("fanout.test.keeper");
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount());
+}
+
+TEST(GenericSubscriberFanOut, ANullHandlerFromAKnownSubscriberRemovesOnlyItself) {
+    const size_t baseline = Ipc().GenericSubscriberCount();
+
+    Ipc().RegisterGenericHandler("fanout.test.legacyA", NoopSubscriber());
+    Ipc().RegisterGenericHandler("fanout.test.legacyB", NoopSubscriber());
+    ASSERT_EQ(baseline + 2, Ipc().GenericSubscriberCount());
+
+    // The pre-fan-out unregister idiom was RegisterGenericHandler(nullptr).
+    // It is still honoured, but scoped to the caller that names itself.
+    Ipc().RegisterGenericHandler("fanout.test.legacyA", nullptr);
+
+    EXPECT_EQ(baseline + 1, Ipc().GenericSubscriberCount());
+
+    Ipc().UnregisterGenericHandler("fanout.test.legacyB");
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount());
+}
+
+TEST(GenericSubscriberFanOut, AnUnnamedSubscriptionIsRefused) {
+    const size_t baseline = Ipc().GenericSubscriberCount();
+
+    // An unnamed subscriber can never be removed and can never be attributed in
+    // a log. Accepting one reintroduces the condition that made the original
+    // defect invisible: every registrant logged an identical line.
+    Ipc().RegisterGenericHandler("", NoopSubscriber());
+
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount());
+}
+
+TEST(GenericSubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
+    const size_t baseline = Ipc().GenericSubscriberCount();
+
+    Ipc().UnregisterGenericHandler("fanout.test.neverRegistered");
+
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount())
+        << "A shutdown path whose name disagrees with its registration path must "
+           "not be able to damage the feed.";
+}

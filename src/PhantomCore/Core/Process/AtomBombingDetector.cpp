@@ -562,7 +562,7 @@ public:
             }
 
             auto& ipc = Communication::IPCManager::Instance();
-            ipc.RegisterGenericHandler(
+            ipc.RegisterGenericHandler("AtomBombingDetector",
                 [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* payload, size_t payloadSize) {
                     if (!m_initialized.load(std::memory_order_acquire)) return;
 
