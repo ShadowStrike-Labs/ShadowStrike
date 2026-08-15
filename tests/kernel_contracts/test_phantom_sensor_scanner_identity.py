@@ -33,6 +33,7 @@ PROCESS_NOTIFY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/Process/Pr
 # port - which is the same reason the driver's own invariants are asserted here
 # against source text rather than behaviour.
 IPC_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.cpp"
+IPC_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.hpp"
 
 
 def read_source(path: Path) -> str:
@@ -157,6 +158,7 @@ class SourceContractTests(unittest.TestCase):
         cls.error_codes_h = read_source(ERROR_CODES_H_PATH)
         cls.process_notify_c = read_source(PROCESS_NOTIFY_C_PATH)
         cls.ipc_manager_cpp = read_source(IPC_MANAGER_CPP_PATH)
+        cls.ipc_manager_hpp = read_source(IPC_MANAGER_HPP_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1039,6 +1041,62 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("PsGetThreadId(Data->Thread)", legacy)
         self.assertNotIn("PsGetCurrentProcessId()", legacy)
         self.assertNotIn("PsGetCurrentThreadId()", legacy)
+
+    def test_the_process_fan_out_budget_stays_below_the_driver_wait(self) -> None:
+        # A CROSS-LANGUAGE, CROSS-FILE INVARIANT, which is why it lives here and
+        # not in the C++ suite: the user-mode fan-out budget is meaningless
+        # unless it is smaller than the interval the DRIVER actually waits, and
+        # no C++ unit test can see the driver's constant.
+        #
+        # The process feed is the only fanned-out kernel feed with a waiter.
+        # ProcessNotify.c blocks the thread that called CreateProcess for
+        # PN_VERDICT_REPLY_TIMEOUT_MS waiting for this verdict. If user mode
+        # spends that entire interval walking its subscribers, the driver gives
+        # up, fails open, and EVERY subscriber's evidence is discarded while the
+        # process launches anyway - strictly worse than answering on time with
+        # the evidence gathered.
+        driver_wait = re.search(
+            r"#define\s+PN_VERDICT_REPLY_TIMEOUT_MS\s+(\d+)", self.process_notify_c
+        )
+        self.assertIsNotNone(
+            driver_wait,
+            "PN_VERDICT_REPLY_TIMEOUT_MS is gone from ProcessNotify.c, so the "
+            "user-mode fan-out budget has nothing left to be bounded by.",
+        )
+
+        fanout_budget = re.search(
+            r"kProcessFanOutBudgetMs\s*=\s*(\d+)", self.ipc_manager_hpp
+        )
+        self.assertIsNotNone(
+            fanout_budget,
+            "kProcessFanOutBudgetMs is gone from IPCManager.hpp, so the process "
+            "fan-out is unbounded again: a second subscriber can push a "
+            "suspicious process creation past the driver's reply budget.",
+        )
+
+        driver_ms = int(driver_wait.group(1))
+        budget_ms = int(fanout_budget.group(1))
+        self.assertLess(
+            budget_ms,
+            driver_ms,
+            f"Process fan-out budget {budget_ms} ms is not below the driver's "
+            f"{driver_ms} ms wait. The remainder has to cover payload "
+            f"validation, verdict serialisation and the ReplyMessage round "
+            f"trip; an answer that arrives after the driver gave up is not an "
+            f"answer.",
+        )
+
+        # AND THE BUDGET MUST ACTUALLY BE READ. This codebase has produced
+        # thirteen separate controls that were declared, documented, set by a
+        # caller and never consulted by the implementation - the call site looks
+        # bounded while nothing enforces anything. A budget nobody reads is that
+        # defect with a new name.
+        self.assertIn(
+            "kProcessFanOutBudgetMs",
+            strip_c_comments(self.ipc_manager_cpp),
+            "kProcessFanOutBudgetMs is declared but never read in "
+            "IPCManager.cpp, so the process fan-out is unbounded in practice.",
+        )
 
     def test_a_reply_bearing_process_notification_is_answered(self) -> None:
         # THE KERNEL HALF OF THIS CONTRACT IS ASSERTED ABOVE, in

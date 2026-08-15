@@ -1445,82 +1445,167 @@ void IPCManager::CloseSharedMemory(const std::wstring& name) {
 // HANDLER REGISTRATION
 // ============================================================================
 
+namespace {
+
+// ONE implementation of named-subscriber semantics, shared by all four feeds
+// (process, image-load, registry, generic).
+//
+// WRITTEN AS A TEMPLATE RATHER THAN COPIED PER FEED ON PURPOSE. Four copies of
+// "same name replaces, null removes only me, empty name refused" is precisely
+// how this codebase has drifted before: two YARA metadata builders where the
+// poorer one turned out to be the one that ran, two on-disk trie producers
+// where the broken one ran, and six copies of a compile-and-adopt sequence that
+// had to be fixed six times because each fix addressed a site instead of the
+// question. One implementation cannot disagree with itself.
+//
+// Semantics, identical for every feed:
+//   empty name             -> REFUSED at Error. A subscriber nobody can name is
+//                             one nobody can remove or attribute in a log, and
+//                             that is the exact condition under which both
+//                             evictions found so far stayed invisible.
+//   known name + handler   -> replace in place, so a module that re-initializes
+//                             updates its callback instead of receiving every
+//                             message twice. This is what makes a
+//                             Stop()/Start() cycle safe.
+//   known name + nullptr   -> remove ONLY that subscriber. The legacy
+//                             Register(nullptr) teardown idiom is honoured but
+//                             scoped; it used to clear the whole slot, so one
+//                             module shutting down disabled the feed for all.
+//   new name + handler     -> append.
+//   unknown name + nullptr -> no-op at Debug.
+//
+// PRECONDITION: the caller holds m_handlerMutex. The empty-name refusal is
+// inside the helper rather than at each call site so that rule also has exactly
+// one implementation; taking an uncontended startup-time lock before refusing
+// costs nothing.
+template <typename SubscriptionT, typename CallbackT>
+void UpsertNamedSubscriber(
+    std::shared_ptr<const std::vector<SubscriptionT>>& subscribers,
+    std::string subscriber,
+    CallbackT handler,
+    std::string_view feed) {
+
+    if (subscriber.empty()) {
+        Utils::Logger::Error("[IPCManager] Refusing {} subscription with no subscriber name",
+                             feed);
+        return;
+    }
+
+    auto updated = std::make_shared<std::vector<SubscriptionT>>(
+        subscribers ? *subscribers : std::vector<SubscriptionT>{});
+
+    auto existing = std::find_if(updated->begin(), updated->end(),
+        [&subscriber](const SubscriptionT& s) { return s.name == subscriber; });
+
+    if (existing != updated->end()) {
+        if (handler) {
+            existing->handler = std::move(handler);
+            Utils::Logger::Info("[IPCManager] {} subscriber '{}' re-registered ({} total)",
+                                feed, subscriber, updated->size());
+        } else {
+            updated->erase(existing);
+            Utils::Logger::Info("[IPCManager] {} subscriber '{}' removed ({} remain)",
+                                feed, subscriber, updated->size());
+        }
+    } else if (handler) {
+        updated->push_back(SubscriptionT{ std::move(subscriber), std::move(handler) });
+        Utils::Logger::Info("[IPCManager] {} subscriber '{}' registered ({} total)",
+                            feed, updated->back().name, updated->size());
+    } else {
+        Utils::Logger::Debug("[IPCManager] {} unsubscribe for unknown subscriber '{}'",
+                             feed, subscriber);
+        return;
+    }
+
+    subscribers = std::move(updated);
+}
+
+// Companion to the above for the explicit Unregister* entry points. Same
+// precondition: the caller holds m_handlerMutex. Removing a name that is not
+// subscribed is deliberately silent at Info level and leaves the snapshot
+// untouched, so a defensive teardown cannot churn the shared_ptr.
+template <typename SubscriptionT>
+void EraseNamedSubscriber(
+    std::shared_ptr<const std::vector<SubscriptionT>>& subscribers,
+    std::string_view subscriber,
+    std::string_view feed) {
+
+    auto updated = std::make_shared<std::vector<SubscriptionT>>(
+        subscribers ? *subscribers : std::vector<SubscriptionT>{});
+
+    const size_t removed = std::erase_if(*updated,
+        [subscriber](const SubscriptionT& s) { return s.name == subscriber; });
+
+    if (removed == 0) {
+        return;
+    }
+
+    Utils::Logger::Info("[IPCManager] {} subscriber '{}' unregistered ({} remain)",
+                        feed, std::string(subscriber), updated->size());
+    subscribers = std::move(updated);
+}
+
+} // namespace
+
 void IPCManager::RegisterFileScanHandler(FileScanCallback handler) {
     std::lock_guard lock(m_handlerMutex);
     m_fileScanHandler = std::move(handler);
     Utils::Logger::Info("[IPCManager] Registered file scan handler");
 }
 
-void IPCManager::RegisterProcessHandler(ProcessNotifyCallback handler) {
+void IPCManager::RegisterProcessHandler(std::string subscriber, ProcessNotifyCallback handler) {
     std::lock_guard lock(m_handlerMutex);
-    m_processHandler = std::move(handler);
-    Utils::Logger::Info("[IPCManager] Registered process handler");
+    UpsertNamedSubscriber(m_processSubscribers, std::move(subscriber), std::move(handler),
+                          "Process");
 }
 
-void IPCManager::RegisterImageLoadHandler(ImageLoadCallback handler) {
+void IPCManager::UnregisterProcessHandler(std::string_view subscriber) {
     std::lock_guard lock(m_handlerMutex);
-    m_imageLoadHandler = std::move(handler);
-    Utils::Logger::Info("[IPCManager] Registered image load handler");
+    EraseNamedSubscriber(m_processSubscribers, subscriber, "Process");
+}
+
+size_t IPCManager::ProcessSubscriberCount() const noexcept {
+    try {
+        std::lock_guard lock(m_handlerMutex);
+        return m_processSubscribers ? m_processSubscribers->size() : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+void IPCManager::RegisterImageLoadHandler(std::string subscriber, ImageLoadCallback handler) {
+    std::lock_guard lock(m_handlerMutex);
+    UpsertNamedSubscriber(m_imageLoadSubscribers, std::move(subscriber), std::move(handler),
+                          "ImageLoad");
+}
+
+void IPCManager::UnregisterImageLoadHandler(std::string_view subscriber) {
+    std::lock_guard lock(m_handlerMutex);
+    EraseNamedSubscriber(m_imageLoadSubscribers, subscriber, "ImageLoad");
+}
+
+size_t IPCManager::ImageLoadSubscriberCount() const noexcept {
+    try {
+        std::lock_guard lock(m_handlerMutex);
+        return m_imageLoadSubscribers ? m_imageLoadSubscribers->size() : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 void IPCManager::RegisterRegistryHandler(std::string subscriber, RegistryOpCallback handler) {
-    // Same refusal as the generic feed, same reason: a subscriber nobody can
-    // name is one nobody can remove or attribute, and that is exactly the
-    // condition under which RegistryProtection's handler was evicted without
-    // a single log line naming either party.
-    if (subscriber.empty()) {
-        Utils::Logger::Error("[IPCManager] Refusing registry subscription with no subscriber name");
-        return;
-    }
-
+    // Semantics - the refusal of an unnamed subscriber, same-name replacement,
+    // and the scoping of the legacy Register(nullptr) teardown idiom to its own
+    // caller - all live in UpsertNamedSubscriber, which is the single
+    // implementation shared by all four feeds.
     std::lock_guard lock(m_handlerMutex);
-
-    auto updated = std::make_shared<std::vector<RegistrySubscription>>(*m_registrySubscribers);
-
-    auto existing = std::find_if(updated->begin(), updated->end(),
-        [&subscriber](const RegistrySubscription& s) { return s.name == subscriber; });
-
-    if (existing != updated->end()) {
-        if (handler) {
-            existing->handler = std::move(handler);
-            Utils::Logger::Info("[IPCManager] Registry subscriber '{}' re-registered ({} total)",
-                                subscriber, updated->size());
-        } else {
-            // Legacy RegisterRegistryHandler(nullptr) idiom, still honoured but
-            // now SCOPED TO ITS CALLER. It used to clear the whole slot, so
-            // RegistryProtection's shutdown disabled registry dispatch for
-            // every other module as a side effect.
-            updated->erase(existing);
-            Utils::Logger::Info("[IPCManager] Registry subscriber '{}' removed ({} remain)",
-                                subscriber, updated->size());
-        }
-    } else if (handler) {
-        updated->push_back(RegistrySubscription{ std::move(subscriber), std::move(handler) });
-        Utils::Logger::Info("[IPCManager] Registry subscriber '{}' registered ({} total)",
-                            updated->back().name, updated->size());
-    } else {
-        Utils::Logger::Debug("[IPCManager] Registry unsubscribe for unknown subscriber '{}'",
-                             subscriber);
-        return;
-    }
-
-    m_registrySubscribers = std::move(updated);
+    UpsertNamedSubscriber(m_registrySubscribers, std::move(subscriber), std::move(handler),
+                          "Registry");
 }
 
 void IPCManager::UnregisterRegistryHandler(std::string_view subscriber) {
     std::lock_guard lock(m_handlerMutex);
-
-    auto updated = std::make_shared<std::vector<RegistrySubscription>>(*m_registrySubscribers);
-    const size_t removed = std::erase_if(*updated,
-        [subscriber](const RegistrySubscription& s) { return s.name == subscriber; });
-
-    if (removed == 0) {
-        return;
-    }
-
-    Utils::Logger::Info("[IPCManager] Registry subscriber '{}' unregistered ({} remain)",
-                        std::string(subscriber), updated->size());
-    m_registrySubscribers = std::move(updated);
+    EraseNamedSubscriber(m_registrySubscribers, subscriber, "Registry");
 }
 
 size_t IPCManager::RegistrySubscriberCount() const noexcept {
@@ -1532,7 +1617,7 @@ size_t IPCManager::RegistrySubscriberCount() const noexcept {
     }
 }
 
-SHADOWSTRIKE_SCAN_VERDICT IPCManager::CombineRegistryVerdicts(
+SHADOWSTRIKE_SCAN_VERDICT IPCManager::CombineKernelVerdicts(
     SHADOWSTRIKE_SCAN_VERDICT a, SHADOWSTRIKE_SCAN_VERDICT b) noexcept {
     // Explicit severity rank. Do NOT replace with a comparison on the enum
     // values: the enum is declared in detection-vocabulary order, not severity
@@ -1555,67 +1640,18 @@ void IPCManager::RegisterGenericHandler(std::string subscriber, GenericMessageCa
     // An unnamed subscriber cannot be removed and cannot be attributed in a
     // log. Refuse it rather than accept a subscription nobody can account for:
     // the whole point of this signature is that the feed's membership is
-    // answerable.
-    if (subscriber.empty()) {
-        Utils::Logger::Error("[IPCManager] Refusing generic subscription with no subscriber name");
-        return;
-    }
-
+    // answerable. That refusal, same-name replacement, and the legacy
+    // RegisterGenericHandler(nullptr) unregister idiom that two modules still
+    // use, all live in UpsertNamedSubscriber - the single implementation shared
+    // by the process, image-load, registry and generic feeds.
     std::lock_guard lock(m_handlerMutex);
-
-    auto updated = std::make_shared<std::vector<GenericSubscription>>(*m_genericSubscribers);
-
-    auto existing = std::find_if(updated->begin(), updated->end(),
-        [&subscriber](const GenericSubscription& s) { return s.name == subscriber; });
-
-    if (existing != updated->end()) {
-        if (handler) {
-            // Re-registration by the same module: replace in place so a module
-            // that re-initializes updates its callback instead of receiving
-            // every message twice.
-            existing->handler = std::move(handler);
-            Utils::Logger::Info("[IPCManager] Generic subscriber '{}' re-registered ({} total)",
-                                subscriber, updated->size());
-        } else {
-            // A null handler from a known subscriber means "remove me". The
-            // previous single-slot API used RegisterGenericHandler(nullptr) as
-            // its unregister idiom and two modules still call it that way, so
-            // honouring it here keeps their teardown correct.
-            updated->erase(existing);
-            Utils::Logger::Info("[IPCManager] Generic subscriber '{}' removed ({} remain)",
-                                subscriber, updated->size());
-        }
-    } else if (handler) {
-        updated->push_back(GenericSubscription{ std::move(subscriber), std::move(handler) });
-        Utils::Logger::Info("[IPCManager] Generic subscriber '{}' registered ({} total)",
-                            updated->back().name, updated->size());
-    } else {
-        // Removing something that was never there is not an error, but it is
-        // worth saying: it usually means a shutdown path names itself
-        // differently from its registration path.
-        Utils::Logger::Debug("[IPCManager] Generic unsubscribe for unknown subscriber '{}'",
-                             subscriber);
-        return;
-    }
-
-    m_genericSubscribers = std::move(updated);
+    UpsertNamedSubscriber(m_genericSubscribers, std::move(subscriber), std::move(handler),
+                          "Generic");
 }
 
 void IPCManager::UnregisterGenericHandler(std::string_view subscriber) {
     std::lock_guard lock(m_handlerMutex);
-
-    auto updated = std::make_shared<std::vector<GenericSubscription>>(*m_genericSubscribers);
-
-    const auto removed = std::erase_if(*updated,
-        [subscriber](const GenericSubscription& s) { return s.name == subscriber; });
-
-    if (removed == 0) {
-        return;
-    }
-
-    Utils::Logger::Info("[IPCManager] Generic subscriber '{}' unregistered ({} remain)",
-                        std::string(subscriber), updated->size());
-    m_genericSubscribers = std::move(updated);
+    EraseNamedSubscriber(m_genericSubscribers, subscriber, "Generic");
 }
 
 size_t IPCManager::GenericSubscriberCount() const noexcept {
@@ -1635,8 +1671,11 @@ void IPCManager::SetMessageCallback(std::function<void(const std::string&)> cb) 
 void IPCManager::UnregisterHandlers() {
     std::lock_guard lock(m_handlerMutex);
     m_fileScanHandler = nullptr;
-    m_processHandler = nullptr;
-    m_imageLoadHandler = nullptr;
+    // Fresh empty snapshots rather than clearing in place: the dispatch path
+    // holds a refcount on whatever snapshot it copied, so replacing the pointer
+    // lets an in-flight delivery finish against the list it started with.
+    m_processSubscribers   = std::make_shared<const std::vector<ProcessSubscription>>();
+    m_imageLoadSubscribers = std::make_shared<const std::vector<ImageLoadSubscription>>();
     m_registrySubscribers = std::make_shared<const std::vector<RegistrySubscription>>();
     m_genericSubscribers = std::make_shared<const std::vector<GenericSubscription>>();
     m_messageCallback = nullptr;
@@ -2193,18 +2232,116 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
     // FIX [BUG #14]: Snapshot handlers under lock, invoke outside lock.
     // Holding the mutex during file scan I/O would serialize all worker threads.
     FileScanCallback fileScanHandler;
-    ProcessNotifyCallback processHandler;
-    ImageLoadCallback imageLoadHandler;
+    std::shared_ptr<const std::vector<ProcessSubscription>>   processSubscribers;
+    std::shared_ptr<const std::vector<ImageLoadSubscription>> imageLoadSubscribers;
     std::shared_ptr<const std::vector<RegistrySubscription>> registrySubscribers;
     std::shared_ptr<const std::vector<GenericSubscription>> genericSubscribers;
 
     {
         std::lock_guard lock(m_handlerMutex);
         fileScanHandler  = m_fileScanHandler;
-        processHandler   = m_processHandler;
-        imageLoadHandler = m_imageLoadHandler;
+        processSubscribers   = m_processSubscribers;   // one refcount, not N copies
+        imageLoadSubscribers = m_imageLoadSubscribers; // one refcount, not N copies
         registrySubscribers = m_registrySubscribers; // one refcount, not N copies
         genericSubscribers = m_genericSubscribers;   // one refcount, not N copies
+    }
+
+    // Stand in for the old single process handler so the dispatch site below
+    // keeps its shape, exactly as the registry feed does. Left EMPTY when
+    // nobody subscribes, because that site tests this callable for emptiness to
+    // decide whether to refuse the notification and release the kernel waiter.
+    //
+    // THIS IS THE ONE FAN-OUT THE KERNEL IS WAITING ON, so it is also the one
+    // that enforces a deadline. Rules, in order of importance:
+    //   - The FIRST subscriber ALWAYS runs. Skipping it would mean a fan-out
+    //     could answer without consulting anybody, which is losing coverage
+    //     rather than deferring it.
+    //   - Later subscribers run only while the shared budget holds. A skip is
+    //     reported at WARN naming the module and the elapsed time, which is
+    //     strictly more diagnostic than a counter here: this condition cannot
+    //     arise at all until a second subscriber exists, so a counter would
+    //     read a structural zero - the same always-healthy-looking number as
+    //     pool=0/0 and pendingScanQueue.
+    //   - Verdicts combine most-severe-wins, so a subscriber asking to deny
+    //     cannot be overruled by one reporting Clean. On this feed that is not
+    //     an abstract ordering: Verdict_Malicious is what the driver turns into
+    //     STATUS_ACCESS_DENIED.
+    ProcessNotifyCallback processHandler;
+    if (processSubscribers && !processSubscribers->empty()) {
+        processHandler = [&processSubscribers](const ProcessNotifyRequest& req)
+                             -> SHADOWSTRIKE_SCAN_VERDICT {
+            SHADOWSTRIKE_SCAN_VERDICT combined = Verdict_Clean;
+            const auto started = std::chrono::steady_clock::now();
+            bool isFirst = true;
+
+            for (const auto& sub : *processSubscribers) {
+                if (!sub.handler) {
+                    continue;
+                }
+
+                if (!isFirst) {
+                    const auto elapsedMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+                    if (elapsedMs >= static_cast<long long>(kProcessFanOutBudgetMs)) {
+                        Utils::Logger::Warn(
+                            "[IPCManager] Process fan-out budget exhausted after {} ms; "
+                            "subscriber '{}' skipped for this notification. The kernel is "
+                            "waiting {} ms for this verdict, so answering late means it "
+                            "fails open and discards every subscriber's evidence.",
+                            elapsedMs, sub.name, kProcessFanOutBudgetMs);
+                        break;
+                    }
+                }
+                isFirst = false;
+
+                try {
+                    combined = CombineKernelVerdicts(combined, sub.handler(req));
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Process subscriber '{}' threw: {}",
+                                         sub.name, e.what());
+                    combined = CombineKernelVerdicts(combined, Verdict_Error);
+                } catch (...) {
+                    Utils::Logger::Error("[IPCManager] Process subscriber '{}' threw a non-exception",
+                                         sub.name);
+                    combined = CombineKernelVerdicts(combined, Verdict_Error);
+                }
+            }
+            return combined;
+        };
+    }
+
+    // Stand in for the old single image-load handler. NO DEADLINE HERE, and the
+    // asymmetry with the process feed above is deliberate rather than an
+    // oversight: ShadowStrikeSendImageNotification delivers through
+    // ShadowStrikeSendNotification, which takes no reply buffer and is
+    // documented zero-timeout fire-and-forget, so no kernel thread is blocked
+    // while these subscribers run. Left EMPTY when nobody subscribes, because
+    // the dispatch site tests it to decide whether ImageLoad falls through to
+    // the GENERIC feed - routing that is deliberately unchanged.
+    ImageLoadCallback imageLoadHandler;
+    if (imageLoadSubscribers && !imageLoadSubscribers->empty()) {
+        imageLoadHandler = [&imageLoadSubscribers](const ImageLoadRequest& req)
+                               -> SHADOWSTRIKE_SCAN_VERDICT {
+            SHADOWSTRIKE_SCAN_VERDICT combined = Verdict_Clean;
+            for (const auto& sub : *imageLoadSubscribers) {
+                if (!sub.handler) {
+                    continue;
+                }
+                try {
+                    combined = CombineKernelVerdicts(combined, sub.handler(req));
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] ImageLoad subscriber '{}' threw: {}",
+                                         sub.name, e.what());
+                    combined = CombineKernelVerdicts(combined, Verdict_Error);
+                } catch (...) {
+                    Utils::Logger::Error("[IPCManager] ImageLoad subscriber '{}' threw a non-exception",
+                                         sub.name);
+                    combined = CombineKernelVerdicts(combined, Verdict_Error);
+                }
+            }
+            return combined;
+        };
     }
 
     // Stand in for the old single registry handler so the dispatch site below
@@ -2228,15 +2365,15 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                     continue;
                 }
                 try {
-                    combined = CombineRegistryVerdicts(combined, sub.handler(req));
+                    combined = CombineKernelVerdicts(combined, sub.handler(req));
                 } catch (const std::exception& e) {
                     Utils::Logger::Error("[IPCManager] Registry subscriber '{}' threw: {}",
                                          sub.name, e.what());
-                    combined = CombineRegistryVerdicts(combined, Verdict_Error);
+                    combined = CombineKernelVerdicts(combined, Verdict_Error);
                 } catch (...) {
                     Utils::Logger::Error("[IPCManager] Registry subscriber '{}' threw a non-exception",
                                          sub.name);
-                    combined = CombineRegistryVerdicts(combined, Verdict_Error);
+                    combined = CombineKernelVerdicts(combined, Verdict_Error);
                 }
             }
             return combined;

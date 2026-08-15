@@ -330,11 +330,22 @@ TEST(GenericSubscriberFanOut, AnUnnamedSubscriptionIsRefused) {
 TEST(GenericSubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
     const size_t baseline = Ipc().GenericSubscriberCount();
 
+    // A LIVE SUBSCRIBER IS REGISTERED FIRST ON PURPOSE. Asserting only that an
+    // empty feed stays empty cannot fail: if UnregisterGenericHandler cleared
+    // the whole list instead of matching one name, a zero baseline would still
+    // read zero afterwards and the test would pass while the feed was being
+    // destroyed. The survivor is what makes this observable.
+    Ipc().RegisterGenericHandler("fanout.test.bystander", NoopSubscriber());
+    ASSERT_EQ(baseline + 1, Ipc().GenericSubscriberCount());
+
     Ipc().UnregisterGenericHandler("fanout.test.neverRegistered");
 
-    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount())
+    EXPECT_EQ(baseline + 1, Ipc().GenericSubscriberCount())
         << "A shutdown path whose name disagrees with its registration path must "
            "not be able to damage the feed.";
+
+    Ipc().UnregisterGenericHandler("fanout.test.bystander");
+    EXPECT_EQ(baseline, Ipc().GenericSubscriberCount());
 }
 
 // ============================================================================
@@ -438,8 +449,18 @@ TEST(RegistrySubscriberFanOut, AnUnnamedSubscriptionIsRefused) {
 TEST(RegistrySubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
     const size_t baseline = Ipc().RegistrySubscriberCount();
 
+    // Live subscriber first, for the same reason as the generic case above: an
+    // assertion that an empty feed stays empty cannot detect an Unregister that
+    // clears everything.
+    Ipc().RegisterRegistryHandler("regfanout.test.bystander", NoopRegistrySubscriber());
+    ASSERT_EQ(baseline + 1, Ipc().RegistrySubscriberCount());
+
     Ipc().UnregisterRegistryHandler("regfanout.test.neverRegistered");
 
+    EXPECT_EQ(baseline + 1, Ipc().RegistrySubscriberCount())
+        << "Unregistering an unknown name removed a subscriber that was there.";
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.bystander");
     EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
 }
 
@@ -453,7 +474,7 @@ TEST(RegistrySubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
 
 TEST(RegistryVerdictCombination, TheEnumsOwnOrderWouldGiveTheWrongAnswer) {
     // THIS CASE EXISTS TO DOCUMENT THE TRAP, so a future reader who wants to
-    // replace CombineRegistryVerdicts with std::max can see why that fails
+    // replace CombineKernelVerdicts with std::max can see why that fails
     // before they try it. SHADOWSTRIKE_SCAN_VERDICT is declared in
     // detection-vocabulary order, NOT severity order.
     EXPECT_GT(static_cast<int>(Verdict_Timeout), static_cast<int>(Verdict_Malicious));
@@ -463,7 +484,7 @@ TEST(RegistryVerdictCombination, TheEnumsOwnOrderWouldGiveTheWrongAnswer) {
     // So a numeric maximum would rank a transient failure above a conviction.
     // The combiner must not.
     EXPECT_EQ(Verdict_Malicious,
-              ShadowStrike::Communication::IPCManager::CombineRegistryVerdicts(
+              ShadowStrike::Communication::IPCManager::CombineKernelVerdicts(
                   Verdict_Malicious, Verdict_Timeout));
 }
 
@@ -475,9 +496,9 @@ TEST(RegistryVerdictCombination, MaliciousOutranksEveryOtherVerdict) {
     // reporting that it saw nothing.
     for (const auto other : { Verdict_Unknown, Verdict_Clean, Verdict_Suspicious,
                               Verdict_Error, Verdict_Timeout }) {
-        EXPECT_EQ(Verdict_Malicious, Ipc_::CombineRegistryVerdicts(Verdict_Malicious, other))
+        EXPECT_EQ(Verdict_Malicious, Ipc_::CombineKernelVerdicts(Verdict_Malicious, other))
             << "Malicious lost to verdict " << static_cast<int>(other);
-        EXPECT_EQ(Verdict_Malicious, Ipc_::CombineRegistryVerdicts(other, Verdict_Malicious))
+        EXPECT_EQ(Verdict_Malicious, Ipc_::CombineKernelVerdicts(other, Verdict_Malicious))
             << "Malicious lost to verdict " << static_cast<int>(other) << " (reversed)";
     }
 }
@@ -494,8 +515,8 @@ TEST(RegistryVerdictCombination, CombinationIsOrderIndependent) {
     };
     for (const auto a : all) {
         for (const auto b : all) {
-            EXPECT_EQ(Ipc_::CombineRegistryVerdicts(a, b),
-                      Ipc_::CombineRegistryVerdicts(b, a))
+            EXPECT_EQ(Ipc_::CombineKernelVerdicts(a, b),
+                      Ipc_::CombineKernelVerdicts(b, a))
                 << "Asymmetric for a=" << static_cast<int>(a)
                 << " b=" << static_cast<int>(b);
         }
@@ -509,11 +530,213 @@ TEST(RegistryVerdictCombination, CleanIsTheIdentityAndUnknownIsNotDiscarded) {
     // otherwise a single quiet subscriber would set a floor on the result.
     for (const auto other : { Verdict_Unknown, Verdict_Malicious, Verdict_Suspicious,
                               Verdict_Error, Verdict_Timeout }) {
-        EXPECT_EQ(other, Ipc_::CombineRegistryVerdicts(Verdict_Clean, other))
+        EXPECT_EQ(other, Ipc_::CombineKernelVerdicts(Verdict_Clean, other))
             << "Clean altered verdict " << static_cast<int>(other);
     }
 
     // And an undetermined answer must outrank a clean one - "I could not tell"
     // is not evidence of cleanliness, the same rule the trust path follows.
-    EXPECT_EQ(Verdict_Unknown, Ipc_::CombineRegistryVerdicts(Verdict_Clean, Verdict_Unknown));
+    EXPECT_EQ(Verdict_Unknown, Ipc_::CombineKernelVerdicts(Verdict_Clean, Verdict_Unknown));
+}
+
+// ============================================================================
+// PROCESS AND IMAGE-LOAD SUBSCRIBER FAN-OUT
+// ============================================================================
+//
+// The last two single-assignment verdict slots. Both were contested by two
+// production modules and both resolved by "whoever registered last", with no
+// log line naming either party:
+//
+//   ProcessNotify  RealTimeProtection.cpp:1357  vs  ProcessMonitor.cpp:1623
+//   ImageLoad      RealTimeProtection.cpp:1361  vs  ReflectiveDLLDetector.cpp:2542
+//
+// Both contests were LATENT rather than active, and that was measured rather
+// than hoped: nothing in production calls ProcessMonitor::Initialize() or
+// ReflectiveDLLDetector::Instance().Initialize(). So unlike the registry slot
+// these had not yet cost coverage - they were armed, not fired. Wiring either
+// module up would have silently replaced RealTimeProtection's process analysis
+// or its image-load analysis wholesale.
+//
+// DELIBERATELY NOT MIRRORED CASE-FOR-CASE from the registry suite. The four
+// feeds now share ONE implementation (UpsertNamedSubscriber), and cross-wiring
+// one feed's member into another feed's registration cannot compile because the
+// subscription types differ. What is worth asserting is what the type system
+// does NOT check: that each feed is additive in its own right, and that the
+// shared helper keeps the four feeds independent.
+
+namespace {
+
+auto NoopProcessSubscriber() {
+    return [](const ShadowStrike::Communication::ProcessNotifyRequest&)
+               -> SHADOWSTRIKE_SCAN_VERDICT { return Verdict_Clean; };
+}
+
+auto NoopImageLoadSubscriber() {
+    return [](const ShadowStrike::Communication::ImageLoadRequest&)
+               -> SHADOWSTRIKE_SCAN_VERDICT { return Verdict_Clean; };
+}
+
+}  // namespace
+
+TEST(ProcessSubscriberFanOut, EverySubscriberSurvivesTheNextRegistration) {
+    const size_t baseline = Ipc().ProcessSubscriberCount();
+
+    Ipc().RegisterProcessHandler("procfanout.test.first", NoopProcessSubscriber());
+    EXPECT_EQ(baseline + 1, Ipc().ProcessSubscriberCount());
+
+    Ipc().RegisterProcessHandler("procfanout.test.second", NoopProcessSubscriber());
+    EXPECT_EQ(baseline + 2, Ipc().ProcessSubscriberCount())
+        << "A second registration evicted the first. On THIS feed that is the "
+           "difference between the kernel receiving a considered verdict and "
+           "receiving one module's opinion while another module's detector is "
+           "silently dead.";
+
+    Ipc().UnregisterProcessHandler("procfanout.test.first");
+    Ipc().UnregisterProcessHandler("procfanout.test.second");
+    EXPECT_EQ(baseline, Ipc().ProcessSubscriberCount());
+}
+
+TEST(ProcessSubscriberFanOut, ReRegisteringOneNameReplacesRatherThanDuplicates) {
+    const size_t baseline = Ipc().ProcessSubscriberCount();
+
+    Ipc().RegisterProcessHandler("procfanout.test.repeat", NoopProcessSubscriber());
+    Ipc().RegisterProcessHandler("procfanout.test.repeat", NoopProcessSubscriber());
+
+    // This is what makes an RTP Stop()/Start() cycle safe: InitializeIPCManager
+    // re-registers on every Start() and nothing in production ever calls
+    // UnregisterHandlers(), so without same-name replacement a restart would
+    // accumulate a duplicate subscriber and the kernel would pay for RTP's
+    // whole process analysis twice inside one reply budget.
+    EXPECT_EQ(baseline + 1, Ipc().ProcessSubscriberCount())
+        << "Re-registering one name duplicated the subscriber instead of "
+           "replacing it.";
+
+    Ipc().UnregisterProcessHandler("procfanout.test.repeat");
+    EXPECT_EQ(baseline, Ipc().ProcessSubscriberCount());
+}
+
+TEST(ProcessSubscriberFanOut, RemovingOneSubscriberLeavesTheOthers) {
+    const size_t baseline = Ipc().ProcessSubscriberCount();
+
+    Ipc().RegisterProcessHandler("procfanout.test.keep", NoopProcessSubscriber());
+    Ipc().RegisterProcessHandler("procfanout.test.drop", NoopProcessSubscriber());
+    ASSERT_EQ(baseline + 2, Ipc().ProcessSubscriberCount());
+
+    Ipc().UnregisterProcessHandler("procfanout.test.drop");
+    EXPECT_EQ(baseline + 1, Ipc().ProcessSubscriberCount())
+        << "Removing one subscriber cleared more than itself - the teardown "
+           "defect that made a self-protection shutdown disable a feed for "
+           "every other module.";
+
+    Ipc().UnregisterProcessHandler("procfanout.test.keep");
+    EXPECT_EQ(baseline, Ipc().ProcessSubscriberCount());
+}
+
+TEST(ProcessSubscriberFanOut, AnUnnamedSubscriptionIsRefused) {
+    const size_t baseline = Ipc().ProcessSubscriberCount();
+
+    Ipc().RegisterProcessHandler("", NoopProcessSubscriber());
+
+    EXPECT_EQ(baseline, Ipc().ProcessSubscriberCount())
+        << "An unnamed subscriber was accepted. It could never be removed or "
+           "attributed in a log, which is the condition that kept the original "
+           "evictions invisible.";
+}
+
+TEST(ImageLoadSubscriberFanOut, EverySubscriberSurvivesTheNextRegistration) {
+    const size_t baseline = Ipc().ImageLoadSubscriberCount();
+
+    Ipc().RegisterImageLoadHandler("imgfanout.test.first", NoopImageLoadSubscriber());
+    Ipc().RegisterImageLoadHandler("imgfanout.test.second", NoopImageLoadSubscriber());
+
+    EXPECT_EQ(baseline + 2, Ipc().ImageLoadSubscriberCount())
+        << "A second registration evicted the first on the highest-frequency "
+           "kernel feed in the product.";
+
+    Ipc().UnregisterImageLoadHandler("imgfanout.test.first");
+    Ipc().UnregisterImageLoadHandler("imgfanout.test.second");
+    EXPECT_EQ(baseline, Ipc().ImageLoadSubscriberCount());
+}
+
+TEST(ImageLoadSubscriberFanOut, ANullHandlerFromAKnownSubscriberRemovesOnlyItself) {
+    const size_t baseline = Ipc().ImageLoadSubscriberCount();
+
+    Ipc().RegisterImageLoadHandler("imgfanout.test.stay", NoopImageLoadSubscriber());
+    Ipc().RegisterImageLoadHandler("imgfanout.test.legacy", NoopImageLoadSubscriber());
+    ASSERT_EQ(baseline + 2, Ipc().ImageLoadSubscriberCount());
+
+    // The legacy Register(nullptr) teardown idiom, which used to clear the
+    // whole slot. Honoured, but scoped to its caller.
+    Ipc().RegisterImageLoadHandler("imgfanout.test.legacy", nullptr);
+    EXPECT_EQ(baseline + 1, Ipc().ImageLoadSubscriberCount())
+        << "A null handler cleared the feed rather than removing its own "
+           "subscription.";
+
+    Ipc().UnregisterImageLoadHandler("imgfanout.test.stay");
+    EXPECT_EQ(baseline, Ipc().ImageLoadSubscriberCount());
+}
+
+TEST(ImageLoadSubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
+    const size_t baseline = Ipc().ImageLoadSubscriberCount();
+
+    // A live subscriber has to be present for this to be able to fail at all.
+    // Asserting that an empty feed stays empty would pass even if Unregister
+    // cleared the entire list, which is the defect worth guarding against here.
+    Ipc().RegisterImageLoadHandler("imgfanout.test.bystander", NoopImageLoadSubscriber());
+    ASSERT_EQ(baseline + 1, Ipc().ImageLoadSubscriberCount());
+
+    Ipc().UnregisterImageLoadHandler("imgfanout.test.never.registered");
+
+    EXPECT_EQ(baseline + 1, Ipc().ImageLoadSubscriberCount())
+        << "Unregistering a name that was never subscribed removed a live "
+           "subscriber - a mismatched shutdown path must not damage the feed.";
+
+    Ipc().UnregisterImageLoadHandler("imgfanout.test.bystander");
+    EXPECT_EQ(baseline, Ipc().ImageLoadSubscriberCount());
+}
+
+TEST(SubscriberFeedsAreIndependent, RegisteringOnOneFeedDoesNotDisturbTheOthers) {
+    // THE PROPERTY THE SHARED HELPER HAS TO PRESERVE. All four feeds now route
+    // through one UpsertNamedSubscriber template, which is deliberate - four
+    // copies of these semantics is how this codebase has drifted before. The
+    // risk that trade introduces is a feed being wired to the wrong member, so
+    // this asserts the thing a reader most needs to be true: each feed's
+    // membership answers only for itself.
+    const size_t procBase = Ipc().ProcessSubscriberCount();
+    const size_t imgBase  = Ipc().ImageLoadSubscriberCount();
+    const size_t regBase  = Ipc().RegistrySubscriberCount();
+    const size_t genBase  = Ipc().GenericSubscriberCount();
+
+    Ipc().RegisterProcessHandler("independence.test", NoopProcessSubscriber());
+    EXPECT_EQ(procBase + 1, Ipc().ProcessSubscriberCount());
+    EXPECT_EQ(imgBase,  Ipc().ImageLoadSubscriberCount()) << "process leaked into image-load";
+    EXPECT_EQ(regBase,  Ipc().RegistrySubscriberCount())  << "process leaked into registry";
+    EXPECT_EQ(genBase,  Ipc().GenericSubscriberCount())   << "process leaked into generic";
+
+    Ipc().RegisterImageLoadHandler("independence.test", NoopImageLoadSubscriber());
+    EXPECT_EQ(imgBase + 1,  Ipc().ImageLoadSubscriberCount());
+    EXPECT_EQ(procBase + 1, Ipc().ProcessSubscriberCount()) << "image-load disturbed process";
+    EXPECT_EQ(regBase,      Ipc().RegistrySubscriberCount());
+    EXPECT_EQ(genBase,      Ipc().GenericSubscriberCount());
+
+    Ipc().RegisterRegistryHandler("independence.test", NoopRegistrySubscriber());
+    Ipc().RegisterGenericHandler("independence.test", NoopSubscriber());
+    EXPECT_EQ(regBase + 1, Ipc().RegistrySubscriberCount());
+    EXPECT_EQ(genBase + 1, Ipc().GenericSubscriberCount());
+
+    // The same name on four feeds must be four independent subscriptions, so
+    // removing it from one must leave the other three intact.
+    Ipc().UnregisterProcessHandler("independence.test");
+    EXPECT_EQ(procBase,     Ipc().ProcessSubscriberCount());
+    EXPECT_EQ(imgBase + 1,  Ipc().ImageLoadSubscriberCount())
+        << "Unregistering one feed removed a same-named subscriber from another.";
+    EXPECT_EQ(regBase + 1,  Ipc().RegistrySubscriberCount());
+    EXPECT_EQ(genBase + 1,  Ipc().GenericSubscriberCount());
+
+    Ipc().UnregisterImageLoadHandler("independence.test");
+    Ipc().UnregisterRegistryHandler("independence.test");
+    Ipc().UnregisterGenericHandler("independence.test");
+    EXPECT_EQ(imgBase, Ipc().ImageLoadSubscriberCount());
+    EXPECT_EQ(regBase, Ipc().RegistrySubscriberCount());
+    EXPECT_EQ(genBase, Ipc().GenericSubscriberCount());
 }

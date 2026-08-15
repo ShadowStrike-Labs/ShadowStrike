@@ -752,6 +752,73 @@ struct RegistrySubscription {
     RegistryOpCallback handler;
 };
 
+/**
+ * @brief One named subscriber to the kernel image-load notification feed.
+ *
+ * SAME SHAPE, SAME REASON, AND THE SAME NO-WAITER ARGUMENT AS
+ * RegistrySubscription: ShadowStrikeSendImageNotification (ScanBridge.c:1639,
+ * called from ImageNotify.c:2686) also delivers through
+ * ShadowStrikeSendNotification, whose declaration takes no reply buffer, so no
+ * kernel thread is blocked while these subscribers run.
+ *
+ * Two production modules registered against the single slot this replaces:
+ * RealTimeProtection (RealTimeProtection.cpp:1361, from Start()) and
+ * ReflectiveDLLDetector (ReflectiveDLLDetector.cpp:2542, from
+ * RegisterKernelHandlers, called unconditionally inside its Initialize()).
+ * The contest is LATENT rather than active only because nothing in production
+ * calls ReflectiveDLLDetector::Instance().Initialize() - grepped, not assumed.
+ * Wiring that module up would have silently evicted RealTimeProtection's whole
+ * image-load analysis, and no log line would have named either party.
+ *
+ * SEPARATE DEFECT ON THIS PATH, DELIBERATELY NOT ADDRESSED HERE:
+ * OnKernelImageLoad returns KernelVerdict::Block for a stolen code-signing
+ * certificate and records actionTaken="Blocked", but the module loads anyway.
+ * The verdict is never transmitted, AND ImageNotify.c:2341 states plainly that
+ * "ImageNotify is notification-only (cannot block loads)" - the documented
+ * PsSetLoadImageNotifyRoutine contract. So that is a reporting-honesty defect
+ * requiring an owner decision about what SHOULD act, not a wiring gap this
+ * fan-out could close. Fanning the slot out neither fixes nor worsens it.
+ */
+struct ImageLoadSubscription {
+    std::string       name;
+    ImageLoadCallback handler;
+};
+
+/**
+ * @brief One named subscriber to the kernel process-creation feed.
+ *
+ * THE ONLY FANNED-OUT SLOT WHERE THE KERNEL IS ACTUALLY WAITING, and that
+ * changes what the fan-out must guarantee. ProcessNotify.c requests a reply
+ * whenever the process scored PN_SUSPICION_MEDIUM or above, then blocks the
+ * thread that called CreateProcess for PN_VERDICT_REPLY_TIMEOUT_MS
+ * (500 ms, ProcessNotify.c:301) waiting for it. Verdict_Malicious is the one
+ * value the driver converts into STATUS_ACCESS_DENIED, so this feed can stop a
+ * process from starting - it is the only fanned-out feed that can.
+ *
+ * Subscribers therefore run under a SHARED DEADLINE (kProcessFanOutBudgetMs)
+ * instead of running for as long as they like. Without one, wiring up a second
+ * subscriber would push the total past the driver's budget, the kernel would
+ * time out and fail open, and EVERY subscriber's evidence would be discarded
+ * while the process launched anyway - strictly worse than answering on time
+ * with the evidence gathered. That is the same argument, and the same choice,
+ * as the 250 ms budget already covering the five evasion detectors inside
+ * RealTimeProtection::OnKernelProcessNotify.
+ *
+ * Two production modules registered against the single slot this replaces:
+ * RealTimeProtection (RealTimeProtection.cpp:1357, from Start()) and
+ * ProcessMonitor (ProcessMonitor.cpp:1623, from RegisterKernelProcessHandler).
+ * LATENT rather than active only because nothing in production calls
+ * ProcessMonitor::Initialize() - grepped. MonitorConfig::useKernelCallback
+ * defaults TRUE (ProcessMonitor.hpp:596), so initializing that module would
+ * have replaced RealTimeProtection's ENTIRE process analysis - the five
+ * evasion detectors, the ScanEngine verdict and the Microsoft-trust gate - with
+ * ProcessMonitor's own, on every startup, with nothing reporting the swap.
+ */
+struct ProcessSubscription {
+    std::string           name;
+    ProcessNotifyCallback handler;
+};
+
 // ============================================================================
 // IPC MANAGER CLASS
 // ============================================================================
@@ -906,14 +973,73 @@ public:
     // HANDLER REGISTRATION
     // ========================================================================
     
-    /// @brief Register file scan handler
+    /**
+     * @brief Register the file-scan handler.
+     *
+     * DELIBERATELY STILL A SINGLE SLOT while the process, image-load, registry
+     * and generic feeds are all fan-outs. It has exactly ONE registrant in
+     * production - RealTimeProtection.cpp:1353, measured - so there is no
+     * contest here to resolve, and it is the hottest reply-bearing path in the
+     * product, so it has no latency headroom to spend running a second
+     * consumer while IRP_MJ_CREATE is held open.
+     *
+     * If a second consumer is ever genuinely needed, fan this out the way
+     * RegisterProcessHandler below was rather than adding a second assignment
+     * to the member: a second assignment is how the registry and generic feeds
+     * each lost a detector without a single log line naming either party.
+     */
     void RegisterFileScanHandler(FileScanCallback handler);
-    
-    /// @brief Register process notification handler
-    void RegisterProcessHandler(ProcessNotifyCallback handler);
-    
-    /// @brief Register image load handler
-    void RegisterImageLoadHandler(ImageLoadCallback handler);
+
+    /**
+     * @brief Subscribe to the kernel process-creation feed.
+     *
+     * ADDITIVE, not a slot. Registering twice under the same @p subscriber name
+     * REPLACES that subscriber's callback and leaves the others intact, which
+     * is what makes an Stop()/Start() cycle safe: RealTimeProtection
+     * re-registers from InitializeIPCManager() on every Start(), and nothing in
+     * production ever calls UnregisterHandlers().
+     *
+     * Subscribers are invoked under a shared deadline and their verdicts are
+     * combined most-severe-wins by CombineKernelVerdicts, so a subscriber
+     * asking to block cannot be overruled by one reporting Clean. See
+     * ProcessSubscription for why the deadline exists on this feed and not on
+     * the registry or image-load feeds.
+     *
+     * @param subscriber Stable identity of the registering module. Must be
+     *                   non-empty: an unnamed subscriber cannot be removed and
+     *                   cannot be attributed in a log, which is precisely the
+     *                   condition that hid the original eviction.
+     * @param handler    Verdict-returning callback. Passing a null handler for
+     *                   a KNOWN subscriber removes only that subscriber, so the
+     *                   legacy Register(nullptr) teardown idiom keeps working
+     *                   without clearing the whole feed.
+     */
+    void RegisterProcessHandler(std::string subscriber, ProcessNotifyCallback handler);
+
+    /// @brief Remove one named subscriber from the process feed. No-op if absent.
+    void UnregisterProcessHandler(std::string_view subscriber);
+
+    /// @brief Number of live process subscribers. Exposed so a test can prove a
+    ///        registration was ADDITIVE rather than a silent replacement.
+    [[nodiscard]] size_t ProcessSubscriberCount() const noexcept;
+
+    /**
+     * @brief Subscribe to the kernel image-load notification feed.
+     *
+     * ADDITIVE, not a slot, with the same name semantics as the process feed
+     * above. No shared deadline here, and that asymmetry is deliberate: this
+     * feed has no kernel waiter (see ImageLoadSubscription), and both existing
+     * consumers already bound their own work - RealTimeProtection's image-load
+     * path runs Standard-depth packer analysis at 50 ms / 32 MB with signature
+     * verification cleared.
+     */
+    void RegisterImageLoadHandler(std::string subscriber, ImageLoadCallback handler);
+
+    /// @brief Remove one named subscriber from the image-load feed. No-op if absent.
+    void UnregisterImageLoadHandler(std::string_view subscriber);
+
+    /// @brief Number of live image-load subscribers.
+    [[nodiscard]] size_t ImageLoadSubscriberCount() const noexcept;
     
     /**
      * @brief Subscribe to the kernel registry-notification feed.
@@ -937,7 +1063,7 @@ public:
      *                   made the eviction invisible.
      * @param handler    Invoked OUTSIDE the handler mutex. Verdicts from all
      *                   subscribers are combined most-severe-wins; see
-     *                   CombineRegistryVerdicts.
+     *                   CombineKernelVerdicts.
      */
     void RegisterRegistryHandler(std::string subscriber, RegistryOpCallback handler);
 
@@ -948,7 +1074,16 @@ public:
     [[nodiscard]] size_t RegistrySubscriberCount() const noexcept;
 
     /**
-     * @brief Combine two registry verdicts, most severe wins.
+     * @brief Combine two kernel verdicts, most severe wins.
+     *
+     * ONE POLICY WITH THREE USERS, NOT THREE COPIES. Every fanned-out
+     * verdict-bearing feed - process, image-load and registry - reduces its
+     * subscribers' answers through this function. It was originally written as
+     * CombineRegistryVerdicts; generalising it rather than copying it is
+     * deliberate, because duplication-with-drift is the single most repeated
+     * defect in this codebase (two YARA metadata builders where the poorer one
+     * ran, two on-disk trie producers where the broken one ran, six copies of
+     * one compile-and-adopt sequence).
      *
      * PUBLIC AND STATIC BECAUSE THE ORDERING IS A POLICY, NOT AN IMPLEMENTATION
      * DETAIL, and a policy nobody can test is a policy nobody can verify.
@@ -957,13 +1092,14 @@ public:
      * severity. VerdictTypes.h:21 declares Unknown 0, Clean 1, Malicious 2,
      * Suspicious 3, Error 4, Timeout 5 - so a naive std::max would rank Timeout
      * and Error ABOVE Malicious and silently downgrade a conviction to a
-     * transient failure. The rank below is explicit for that reason.
+     * transient failure. The rank in the definition is explicit for that reason.
      *
      * Malicious outranks everything: it is the only value the driver turns into
      * STATUS_ACCESS_DENIED, so a subscriber asking to deny must never be
-     * overruled by another subscriber's "nothing to report".
+     * overruled by another subscriber's "nothing to report". On the process feed
+     * that is not a theoretical ordering - it decides whether a process starts.
      */
-    [[nodiscard]] static SHADOWSTRIKE_SCAN_VERDICT CombineRegistryVerdicts(
+    [[nodiscard]] static SHADOWSTRIKE_SCAN_VERDICT CombineKernelVerdicts(
         SHADOWSTRIKE_SCAN_VERDICT a, SHADOWSTRIKE_SCAN_VERDICT b) noexcept;
     
     /**
@@ -1121,9 +1257,41 @@ private:
     std::vector<std::thread> m_workerThreads;
     
     // Handlers
+    //
+    // File scan stays a single slot on purpose - one registrant, hottest
+    // reply-bearing path. See RegisterFileScanHandler for the full reasoning.
     FileScanCallback m_fileScanHandler;
-    ProcessNotifyCallback m_processHandler;
-    ImageLoadCallback m_imageLoadHandler;
+
+    /// Shared wall-clock budget for one process-notification fan-out.
+    ///
+    /// MUST STAY BELOW the driver's PN_VERDICT_REPLY_TIMEOUT_MS (500 ms,
+    /// ProcessNotify.c:301), which is how long the thread that called
+    /// CreateProcess is blocked waiting for this answer. The remainder covers
+    /// payload validation, verdict serialisation and the ReplyMessage round
+    /// trip; an answer that arrives after the driver gave up is not an answer,
+    /// and the driver then fails open having discarded every subscriber's
+    /// evidence. A kernel-source contract test pins this constant beneath the
+    /// driver's so the two numbers cannot drift apart in separate commits.
+    ///
+    /// CANNOT BIND TODAY, and that is stated rather than glossed: there is
+    /// exactly one production process subscriber, the first subscriber is never
+    /// skipped, so with one subscriber this budget is unreachable by
+    /// construction. It exists so that wiring up the second one cannot
+    /// silently turn every suspicious process creation into a stalled
+    /// fail-open, which is what an unbounded fan-out here would do.
+    static constexpr uint32_t kProcessFanOutBudgetMs = 400;
+
+    // Process subscribers, same copy-on-write snapshot discipline as the
+    // registry and generic feeds: rebuilt on registration (a startup event),
+    // copied by refcount on delivery. Never null once constructed.
+    std::shared_ptr<const std::vector<ProcessSubscription>> m_processSubscribers{
+        std::make_shared<const std::vector<ProcessSubscription>>() };
+
+    // Image-load subscribers, same discipline. This is the highest-frequency
+    // kernel feed in the product (every module load in every process), which is
+    // why delivery copies one refcount rather than N std::functions.
+    std::shared_ptr<const std::vector<ImageLoadSubscription>> m_imageLoadSubscribers{
+        std::make_shared<const std::vector<ImageLoadSubscription>>() };
 
     // Registry subscribers, same copy-on-write snapshot discipline as the
     // generic feed below: rebuilt on registration (a startup event), copied by

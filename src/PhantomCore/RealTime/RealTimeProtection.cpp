@@ -1354,11 +1354,13 @@ public:
                 return MapKernelVerdictToScanVerdict(OnKernelFileScan(req));
             });
 
-            ipc.RegisterProcessHandler([this](const Communication::ProcessNotifyRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+            ipc.RegisterProcessHandler("RealTimeProtection",
+                                       [this](const Communication::ProcessNotifyRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
                 return MapKernelVerdictToScanVerdict(OnKernelProcessNotify(req));
             });
 
-            ipc.RegisterImageLoadHandler([this](const Communication::ImageLoadRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+            ipc.RegisterImageLoadHandler("RealTimeProtection",
+                                         [this](const Communication::ImageLoadRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
                 return MapKernelVerdictToScanVerdict(OnKernelImageLoad(req));
             });
 

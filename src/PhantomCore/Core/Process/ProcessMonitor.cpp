@@ -1620,7 +1620,16 @@ public:
                 return;
             }
 
-            ipc.RegisterProcessHandler(
+            // NAMED SUBSCRIPTION, not a slot assignment. This used to call
+            // RegisterProcessHandler(handler) against a single member that
+            // RealTimeProtection also wrote (RealTimeProtection.cpp:1357), so
+            // whichever module registered last silently replaced the other.
+            // Only the absence of any production caller for
+            // ProcessMonitor::Initialize kept that latent - and
+            // MonitorConfig::useKernelCallback defaults true, so wiring this
+            // module up would have replaced RealTimeProtection's entire process
+            // analysis with this one, on every startup, silently.
+            ipc.RegisterProcessHandler("ProcessMonitor",
                 [this](const Communication::ProcessNotifyRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
                     return OnKernelProcessNotify(req);
                 }

@@ -2539,7 +2539,13 @@ private:
             // Register for image-load notifications from the kernel driver.
             // When the driver's PsSetLoadImageNotifyRoutine callback fires,
             // it sends an ImageLoadRequest through the filter port.
-            ipc.RegisterImageLoadHandler(
+            //
+            // NAMED SUBSCRIPTION, not a slot assignment. This used to write a
+            // single member that RealTimeProtection also wrote
+            // (RealTimeProtection.cpp:1361); the last registrant won and
+            // nothing reported the swap. Latent only because nothing in
+            // production calls ReflectiveDLLDetector::Instance().Initialize().
+            ipc.RegisterImageLoadHandler("ReflectiveDLLDetector",
                 [this](const Communication::ImageLoadRequest& req)
                     -> SHADOWSTRIKE_SCAN_VERDICT {
                     if (!m_monitoring)
