@@ -40,6 +40,7 @@
 #include "../../Core/FileSystem/FileHasher.hpp"
 #include "../../Core/FileSystem/FileLockManager.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../Registry/RegistryMonitor.hpp"
 
 // Cross-module wiring includes
 // NOTE: Direct #include of RegistryMonitor.hpp, ProcessMonitor.hpp, DriverAnalyzer.hpp,
@@ -698,6 +699,11 @@ public:
     std::atomic<uint64_t> m_nextCallbackId{1};
     std::unordered_map<uint64_t, ServiceChangeCallback> m_serviceChangeCallbacks;
     std::unordered_map<uint64_t, TamperAlertCallback> m_tamperAlertCallbacks;
+
+    // Registry event callback id handed out by RegistryMonitor. 0 = not registered.
+    // Kept so teardown can unregister exactly our own callback rather than
+    // disturbing anyone else's.
+    uint64_t m_registryCallbackId{ 0 };
 
     // Watchdog thread
     std::unique_ptr<std::jthread> m_watchdogThread;
@@ -2426,9 +2432,155 @@ public:
      * Full RegistryMonitor callback wiring (RegisterEventCallback) should be enabled once
      * the ThreatIntelStore.hpp header chain issue is resolved.
      */
+    /**
+     * @brief Is this registry path a Windows service key?
+     *
+     * The predicate the surrounding comments claimed already existed. It did
+     * not - grepping the whole repository for IsServiceKey found exactly two
+     * hits, both inside comments asserting that it filtered events. So the
+     * "service persistence is monitored via RegistryMonitor's IsServiceKey()
+     * filter" claim named a function nobody had written, guarding a callback
+     * nobody had registered.
+     */
+    [[nodiscard]] static bool IsServiceKey(const std::wstring& keyPath) noexcept {
+        if (keyPath.empty()) return false;
+        std::wstring lower = keyPath;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+        // Matches both the NT form (\registry\machine\system\...) and the Win32
+        // form (HKLM\SYSTEM\...), because the kernel delivers NT paths while
+        // user-mode callers hand us Win32 ones.
+        return lower.find(L"\\services\\") != std::wstring::npos;
+    }
+
+    /**
+     * @brief Does this service key belong to one of OUR services?
+     *
+     * Compared against the configured names rather than literals, so the two
+     * places that decide what we protect cannot drift apart.
+     */
+    [[nodiscard]] bool IsOwnServiceKey(const std::wstring& lowerKeyPath) const {
+        auto contains = [&lowerKeyPath](const std::wstring& name) {
+            if (name.empty()) return false;
+            std::wstring n = name;
+            std::transform(n.begin(), n.end(), n.begin(),
+                [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+            return lowerKeyPath.find(L"\\services\\" + n) != std::wstring::npos;
+        };
+        return contains(m_config.mainServiceName) || contains(m_config.driverServiceName);
+    }
+
+    /**
+     * @brief Live registry event handler for service-key activity.
+     *
+     * This is what the four Wire* functions claimed to have and did not. It
+     * reports CONFIGURATION modification, which is what a registry write to a
+     * service key actually evidences - not binary modification, which needs the
+     * image hashed and is what the watchdog's own tamper check covers. Claiming
+     * more than the evidence supports is the defect being removed here, so the
+     * flags are set narrowly and startTypeChanged only when the Start value is
+     * the one written.
+     */
+    void OnServiceRegistryEvent(const ::ShadowStrike::Core::Registry::RegistryEvent& event) {
+        using Op = ::ShadowStrike::Core::Registry::RegistryOp;
+
+        if (!IsServiceKey(event.keyPath)) {
+            return;  // Not a service key - not ours to interpret.
+        }
+
+        // Only mutations matter. A read of a service key is ordinary behaviour
+        // and reporting it would bury the writes that are worth seeing.
+        const bool isMutation =
+            event.operation == Op::SetValue    || event.operation == Op::DeleteValue ||
+            event.operation == Op::CreateKey   || event.operation == Op::DeleteKey   ||
+            event.operation == Op::RenameKey;
+        if (!isMutation) {
+            return;
+        }
+
+        std::wstring lower = event.keyPath;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+
+        if (!IsOwnServiceKey(lower)) {
+            // Another service's key being modified is service-based persistence
+            // territory (MITRE T1543.003) but it is not tampering with US, so it
+            // is recorded at debug rather than raised as a tamper alert.
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"ServiceManager: service key mutation pid=%u key=%ls value=%ls",
+                event.processId, event.keyPath.c_str(), event.valueName.c_str());
+            return;
+        }
+
+        std::wstring valueLower = event.valueName;
+        std::transform(valueLower.begin(), valueLower.end(), valueLower.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(::towlower(c)); });
+
+        TamperDetectionResult result{};
+        result.isTampered       = true;
+        result.configModified   = true;
+        result.startTypeChanged = (valueLower == L"start");
+        result.accountChanged   = (valueLower == L"objectname");
+        result.details =
+            L"Registry mutation on our own service key: " + event.keyPath +
+            (event.valueName.empty() ? std::wstring{} : (L" value=" + event.valueName)) +
+            L" by pid " + std::to_wstring(event.processId);
+
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"ServiceManager: TAMPER - our service key was modified: %ls (pid=%u)",
+            result.details.c_str(), event.processId);
+
+        InvokeTamperAlertCallbacks(result);
+    }
+
+    /**
+     * @brief Wire ServiceManager to RegistryMonitor's live event stream.
+     *
+     * THE RECORDED BLOCKER WAS DISPROVEN BEFORE THIS WAS WRITTEN. All four Wire*
+     * functions carried a note saying the module header "cannot be included due
+     * to transitive ThreatIntelStore.hpp compilation issue". Adding the include
+     * and building produced exit 0 with zero errors and ServiceManager.cpp
+     * confirmed recompiled, so the recorded reason was not the reason. Four
+     * other production translation units already include RegistryMonitor.hpp.
+     *
+     * The previous body was a single SS_LOG_INFO announcing that service registry
+     * monitoring was "active via watchdog + RegistryUtils". The watchdog does
+     * exist, so that sentence was not baseless - but no registry event ever
+     * reached this module, which is what the line implied.
+     *
+     * Registration is deliberately NOT gated on RegistryMonitor running:
+     * RegisterEventCallback only inserts into a callback map under the monitor's
+     * mutex, so registering before the kernel feed goes live is correct and the
+     * callback simply begins receiving events when it does. Gating on IsRunning()
+     * is what left three other consumers permanently deferred (commit 5fe45d55).
+     */
     void WireRegistryMonitor() {
-        SS_LOG_INFO(LOG_CATEGORY,
-            L"ServiceManager: Service registry monitoring active via watchdog + RegistryUtils");
+        try {
+            auto& regMon = ::ShadowStrike::Core::Registry::RegistryMonitor::Instance();
+
+            m_registryCallbackId = regMon.RegisterEventCallback(
+                [this](const ::ShadowStrike::Core::Registry::RegistryEvent& event,
+                       ::ShadowStrike::Core::Registry::RegistryVerdict /*verdict*/) {
+                    OnServiceRegistryEvent(event);
+                });
+
+            if (m_registryCallbackId == 0) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ServiceManager: RegistryMonitor refused our event callback - "
+                    L"service key monitoring is NOT active");
+                return;
+            }
+
+            SS_LOG_INFO(LOG_CATEGORY,
+                L"ServiceManager: service key registry monitoring wired to RegistryMonitor "
+                L"(callback id %llu)",
+                static_cast<unsigned long long>(m_registryCallbackId));
+
+        } catch (const std::exception& e) {
+            m_registryCallbackId = 0;
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"ServiceManager: failed to wire RegistryMonitor: %hs", e.what());
+        }
     }
 
     /**
@@ -2440,8 +2592,21 @@ public:
      * ThreatIntelStore.hpp header issue is resolved.
      */
     void WireDriverAnalyzer() {
+        // ATTRIBUTION CORRECTED, MECHANISM CONFIRMED REAL. Unlike the other three,
+        // this claim had a genuine referent: GetSuspiciousServicesImpl does run a
+        // whitelist check and does carry a dedicated BYOVD branch for
+        // KernelDriver/FileSystemDriver service types. What was wrong is the
+        // credit - DriverAnalyzer is not wired and contributes nothing, so a
+        // reader chasing a BYOVD verdict would have gone to the wrong module.
+        //
+        // The recorded reason for not wiring it ("cannot be included due to
+        // transitive ThreatIntelStore.hpp compilation issue") is DISPROVEN: adding
+        // RegistryMonitor.hpp - which itself pulls ThreatIntelLookup.hpp - builds
+        // with zero errors. Whether DriverAnalyzer.hpp specifically has its own
+        // problem is untested and must not be assumed either way.
         SS_LOG_INFO(LOG_CATEGORY,
-            L"ServiceManager: DriverAnalyzer BYOVD detection active via hash-based whitelist checking");
+            L"ServiceManager: driver-service BYOVD screening active via our own whitelist "
+            L"and driver-type checks in GetSuspiciousServices (DriverAnalyzer is not wired)");
     }
 
     /**
@@ -2452,8 +2617,20 @@ public:
      * chain is fixed.
      */
     void WireProcessMonitor() {
+        // CORRECTED CLAIM. This previously logged "Service host process tracking
+        // active via RegistryMonitor", which is a category error as well as a
+        // false statement: registry events describe key mutations, not process
+        // lifetimes, so no amount of registry monitoring can track a service
+        // host process. There is no service-host process tracking in this module.
+        //
+        // The honest report is that the capability is absent. Wiring it needs
+        // ProcessMonitor, which nothing initializes in production (task 130), so
+        // it would report nothing today even if included - and the include is
+        // NOT blocked, since the ThreatIntelStore reason recorded here was
+        // disproven by building with RegistryMonitor.hpp added.
         SS_LOG_INFO(LOG_CATEGORY,
-            L"ServiceManager: Service host process tracking active via RegistryMonitor");
+            L"ServiceManager: service host process tracking is NOT wired "
+            L"(requires ProcessMonitor, which is not initialized in production)");
     }
 
     /**
@@ -2464,17 +2641,52 @@ public:
      * wiring (RegisterAlertCallback) will be enabled once the enum conflict is resolved.
      */
     void WirePersistenceDetector() {
-        SS_LOG_INFO(LOG_CATEGORY,
-            L"ServiceManager: Service persistence detection active via RegistryMonitor service key monitoring");
+        // THIS CLAIM IS NOW TRUE, AND WAS NOT BEFORE. It asserted that service
+        // persistence was "monitored via RegistryMonitor's IsServiceKey() filter
+        // in the registry event callback above" - a function that did not exist
+        // guarding a callback that was never registered. Both now exist
+        // (IsServiceKey / OnServiceRegistryEvent), so service-key mutations are
+        // genuinely observed.
+        //
+        // Stated precisely: what runs is ServiceManager's OWN service-key filter,
+        // NOT PersistenceDetector. Full PersistenceDetector wiring would add its
+        // scoring and MITRE attribution (T1543.003) on top; the RiskLevel enum ODR
+        // conflict recorded for it is a SEPARATE claim from the ThreatIntelStore
+        // one and has not been tested.
+        if (m_registryCallbackId != 0) {
+            SS_LOG_INFO(LOG_CATEGORY,
+                L"ServiceManager: service persistence monitoring active via our own "
+                L"service-key registry filter (PersistenceDetector itself is not wired)");
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"ServiceManager: service persistence monitoring is NOT active - "
+                L"the registry event callback was not registered");
+        }
     }
 
     /**
      * @brief Unregister all cross-module callbacks on shutdown.
      */
     void UnwireAllCallbacks() noexcept {
-        // NOTE: Once ThreatIntelStore.hpp is fixed and module headers can be included,
-        // callback unregistration for RegistryMonitor, ProcessMonitor, DriverAnalyzer,
-        // and PersistenceDetector should be added here.
+        // Unregister OUR callback BY ID, not by clearing anything global. The id
+        // is what makes this precise: RegistryMonitor::UnregisterCallback removes
+        // exactly the entry we were given and leaves every other subscriber
+        // intact. Passing a null handler or clearing the map would take the other
+        // consumers down with us - the teardown defect fixed in commit c65d6fc2.
+        if (m_registryCallbackId != 0) {
+            try {
+                (void)::ShadowStrike::Core::Registry::RegistryMonitor::Instance()
+                    .UnregisterCallback(m_registryCallbackId);
+            } catch (...) {
+                // Teardown must not throw.
+            }
+            m_registryCallbackId = 0;
+        }
+
+        // ProcessMonitor, DriverAnalyzer and PersistenceDetector have nothing to
+        // unregister because nothing was ever registered for them - see the
+        // corrected notes on each Wire* function. This is stated rather than left
+        // as a TODO citing a compilation error that does not reproduce.
     }
 
     // ========================================================================
