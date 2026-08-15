@@ -51,9 +51,11 @@
 // ============================================================================
 // FILTER MANAGER USER-MODE API (must precede MessageProtocol.h)
 // ============================================================================
-// Include fltUser.h FIRST so that __FLT_USER_STRUCTURES_H__ is defined before
-// MessageProtocol.h is parsed. This prevents MessageProtocol.h from creating
-// a typedef alias for FILTER_MESSAGE_HEADER that conflicts with the OS definition.
+// FILTER_MESSAGE_HEADER comes from the OS here. This used to be described as
+// ordering the include so that __FLT_USER_STRUCTURES_H__ is defined before
+// MessageProtocol.h can alias FILTER_MESSAGE_HEADER to our own 40-byte header.
+// That alias has been removed at its source and the OS structure's size is now
+// asserted in FilterPortGate.hpp, so this is an ordinary include again.
 #include <fltUser.h>
 #pragma comment(lib, "fltlib.lib")
 

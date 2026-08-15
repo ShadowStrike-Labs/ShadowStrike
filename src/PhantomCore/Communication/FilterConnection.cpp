@@ -55,8 +55,13 @@
 #pragma comment(lib, "fltlib.lib")
 #endif
 
-// Include AFTER fltuser.h so __FLT_USER_STRUCTURES_H__ is defined,
-// preventing MessageProtocol.h from redefining FILTER_MESSAGE_HEADER.
+// FILTER_MESSAGE_HEADER comes from <fltuser.h> above. This used to say that
+// including it first defines __FLT_USER_STRUCTURES_H__ and so prevents
+// MessageProtocol.h redefining the type - which was not true: <fltuser.h> does
+// not define that macro, and this translation unit only happened to be safe
+// because something else in the include graph defined it first. The alias has
+// been removed at its source, and the OS structure's size is asserted in
+// FilterPortGate.hpp, so the ordering here no longer decides anything.
 #include "../../../PhantomSensor/Shared/MessageProtocol.h"
 #include "../../../PhantomSensor/Shared/MessageTypes.h"
 

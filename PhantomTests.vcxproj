@@ -264,6 +264,25 @@
          valid=true with a count of zero and any test checking only validity
          would have passed throughout. -->
     <ClCompile Include="tests\unit\scan_pool_health\ScanPoolHealth_Tests.cpp" />
+    <!-- Pins every structure that crosses the kernel boundary, by absolute offset.
+         The transport prefix name FILTER_MESSAGE_HEADER used to resolve to a
+         DIFFERENT TYPE depending on include order: MessageProtocol.h aliased our
+         own 40-byte application header to the name of the 16-byte OS structure
+         for any translation unit that had not yet reached <fltUser.h>. Five
+         subsystems parse that buffer and all compute the payload offset from
+         that sizeof; two guarded the include explicitly, the rest relied on
+         their include graph. The only compile-time check that existed was
+         "sizeof <= 64", which 16 and 40 both satisfy.
+         The application header is also declared TWICE (SHADOWSTRIKE_MESSAGE_HEADER
+         and FileSystemFilter's FilterMessageHeader) and the magic constant three
+         times. They agree only while every enum inside the duplicate keeps an
+         explicit underlying type - drop one and every later field shifts two
+         bytes in one consumer only, with no error anywhere.
+         BothHeaderDeclarationsReadIdenticalBytesIdentically is the discriminator:
+         it writes a distinct value per field through one declaration and reads
+         them back through the other, which is the property the product relies on
+         and the only one that catches two same-width neighbours swapping. -->
+    <ClCompile Include="tests\unit\wire_format\WireFormat_Tests.cpp" />
     <!-- RE-ENABLED together with the ownership fix that made it pass. This suite is
          what found the defect: on a first add the store kept the LOCAL compiler's
          YR_RULES singleton, so m_rules dangled as soon as the call returned, and the

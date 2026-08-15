@@ -150,15 +150,19 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
-// FIX [BUG #3 CRITICAL]: fltUser.h defines FILTER_MESSAGE_HEADER (WDK version:
-// ReplyLength + MessageId, 12 bytes). MessageProtocol.h tries to typedef
-// SHADOWSTRIKE_MESSAGE_HEADER as FILTER_MESSAGE_HEADER, but only when
-// __FLT_USER_STRUCTURES_H__ is not defined. The guard name doesn't match
-// the WDK's actual guard, causing a type redefinition conflict. Force the
-// guard so the WDK version takes precedence.
-#ifndef __FLT_USER_STRUCTURES_H__
-#  define __FLT_USER_STRUCTURES_H__
-#endif
+// The transport header comes from <fltUser.h> above, and MessageProtocol.h no
+// longer aliases FILTER_MESSAGE_HEADER to anything.
+//
+// This is where a `#define __FLT_USER_STRUCTURES_H__` used to sit, to suppress
+// that alias. Two things were wrong with it. It force-defined a RESERVED
+// WDK-INTERNAL GUARD NAME to steer a third header's behaviour - so an SDK that
+// ever adopted that name as its real guard would have had its own structure
+// definitions suppressed instead - and it only protected translation units that
+// included THIS header, which FileSystemFilter.cpp does not. The alias is gone
+// at its source, so nothing needs suppressing here.
+//
+// The size claim that used to accompany it was also wrong: the OS structure is
+// 16 bytes on x64, not 12. It is asserted in FilterPortGate.hpp.
 
 #include "../../../PhantomSensor/Shared/MessageProtocol.h"
 #include "../../../PhantomSensor/Shared/MessageTypes.h"

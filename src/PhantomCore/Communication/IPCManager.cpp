@@ -1654,7 +1654,10 @@ void IPCManager::WorkerRoutine() {
     }
 
     // Allocate per-thread receive buffer.
-    // Wire format: [FILTER_MESSAGE_HEADER (WDK, 12 bytes)] [SHADOWSTRIKE_MESSAGE_HEADER (40 bytes)] [payload]
+    // Wire format: [FILTER_MESSAGE_HEADER (fltmgr, 16 bytes on x64)] [SHADOWSTRIKE_MESSAGE_HEADER (40 bytes)] [payload]
+    // Both sizes are asserted - the transport prefix in FilterPortGate.hpp, the
+    // application header in MessageProtocol.h - because this comment previously
+    // said 12 bytes and nothing contradicted it.
     std::vector<uint8_t> buffer(IPCConstants::MAX_MESSAGE_SIZE);
 
     // Consecutive "unusable receive" counter: GetMessage returned 0 while the

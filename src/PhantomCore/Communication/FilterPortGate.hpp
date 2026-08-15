@@ -33,7 +33,55 @@
 #pragma once
 
 #include <Windows.h>
+
+//
+// The filter manager's own transport header, obtained from the OS.
+//
+// This include is part of the contract, not a convenience. Every subsystem named
+// above receives frames as
+//
+//     [FILTER_MESSAGE_HEADER (fltmgr, cleartext)][SHADOWSTRIKE_MESSAGE_HEADER][payload]
+//
+// and locates the payload as `buffer + sizeof(FILTER_MESSAGE_HEADER)`. That name
+// must therefore resolve to the OS structure in every one of them.
+//
+// It did not. MessageProtocol.h used to typedef our own 40-byte
+// SHADOWSTRIKE_MESSAGE_HEADER to FILTER_MESSAGE_HEADER whenever a translation
+// unit had not already reached <fltUser.h>, so the payload offset a given .cpp
+// computed depended on its include order: 16 bytes if it had the OS definition,
+// 40 if it had ours. IPCManager.hpp and NetworkTrafficFilter.cpp each carried an
+// explicit include and a comment about the hazard; FileSystemFilter.cpp - the
+// on-access scan orchestrator - carried neither. Getting it wrong is not a
+// failure, it is a 24-byte displacement read as a structure.
+//
+// Putting the include here fixes that structurally rather than per-file: this is
+// the one header all five filter-port consumers already include, so obtaining
+// the OS definition is no longer something a consumer can forget. The alias has
+// also been removed outright, so a translation unit that somehow lacks this
+// definition now fails to compile instead of computing a wrong offset.
+//
+#include <fltUser.h>
+
 #include <string>
+
+//
+// Transport prefix size, asserted where the OS definition is in scope.
+//
+// x64: ULONG ReplyLength at 0, ULONGLONG MessageId at 8 (8-byte aligned), 16
+// total. Two comments in this repo described it as 12 bytes - which is what it
+// would be under pack(1) - and a third asserted only `<= 64`. None of them could
+// have caught a wrong value; this does. If the SDK ever changes this structure,
+// every offset computed from it must be revisited deliberately.
+//
+static_assert(sizeof(FILTER_MESSAGE_HEADER) == 16,
+              "FILTER_MESSAGE_HEADER must be the OS filter-manager structure (16 bytes on x64). "
+              "A different size means this translation unit resolved the name to something "
+              "other than the OS type, and every payload offset computed from it is displaced.");
+static_assert(offsetof(FILTER_MESSAGE_HEADER, ReplyLength) == 0,
+              "FILTER_MESSAGE_HEADER::ReplyLength must be the first field.");
+static_assert(offsetof(FILTER_MESSAGE_HEADER, MessageId) == 8,
+              "FILTER_MESSAGE_HEADER::MessageId must be at offset 8; it is the value used to "
+              "reply, so a displaced read answers the wrong kernel request.");
 
 namespace ShadowStrike::Communication::FilterPortGate {
 

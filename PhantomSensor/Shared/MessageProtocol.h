@@ -84,23 +84,74 @@ typedef struct _SHADOWSTRIKE_MESSAGE_HEADER {
 } SHADOWSTRIKE_MESSAGE_HEADER, *PSHADOWSTRIKE_MESSAGE_HEADER;
 
 //
-// Backward compatibility aliases for code that references FILTER_MESSAGE_HEADER.
-// In kernel mode, WDK defines its own FILTER_MESSAGE_HEADER (fltUserStructures.h)
-// with a completely different layout, so we must NOT redefine it there.
-// Instead, redirect all our references to SHADOWSTRIKE_MESSAGE_HEADER.
+// Portable alias used by driver-side code that predates this header's naming.
+// Defined unconditionally: it is the same type on both sides of the boundary.
 //
-#ifdef __FLT_USER_STRUCTURES_H__
-// Kernel mode: WDK owns FILTER_MESSAGE_HEADER. Our code must use SHADOWSTRIKE_MESSAGE_HEADER.
-// MessageHandler code uses SS_MESSAGE_HEADER as the portable alias.
 #define SS_MESSAGE_HEADER   SHADOWSTRIKE_MESSAGE_HEADER
 #define PSS_MESSAGE_HEADER  PSHADOWSTRIKE_MESSAGE_HEADER
-#else
-// User mode: no WDK conflict, provide direct aliases.
-typedef SHADOWSTRIKE_MESSAGE_HEADER  FILTER_MESSAGE_HEADER;
-typedef PSHADOWSTRIKE_MESSAGE_HEADER PFILTER_MESSAGE_HEADER;
-#define SS_MESSAGE_HEADER   SHADOWSTRIKE_MESSAGE_HEADER
-#define PSS_MESSAGE_HEADER  PSHADOWSTRIKE_MESSAGE_HEADER
-#endif
+
+//
+// THIS HEADER DELIBERATELY DOES NOT DEFINE FILTER_MESSAGE_HEADER.
+//
+// It used to. In user mode - selected by `#ifndef __FLT_USER_STRUCTURES_H__` -
+// it did:
+//
+//     typedef SHADOWSTRIKE_MESSAGE_HEADER  FILTER_MESSAGE_HEADER;
+//
+// which made the name of a 16-byte OPERATING SYSTEM structure resolve to a
+// 40-byte structure of ours, on the same received buffer, decided purely by
+// whether the translation unit had reached <fltUser.h> first.
+//
+// FILTER_MESSAGE_HEADER belongs to the filter manager. It is the transport
+// prefix fltmgr itself writes ahead of our payload, in cleartext, and every
+// consumer in this product uses the name to mean exactly that - all of them
+// compute the payload offset as `buffer + sizeof(FILTER_MESSAGE_HEADER)`. The
+// alias was therefore not merely risky, it was wrong for every real caller: a
+// translation unit that resolved it to our 40-byte header located the payload
+// 24 bytes past where the kernel put it, and then read whatever was there as a
+// structure. That is a silent wrong answer, not an error.
+//
+// Nothing detected it, and it could not have. `sizeof` compiles either way, the
+// only pre-existing compile-time check on this type was
+// `C_ASSERT(sizeof(SS_MESSAGE_HEADER) <= 64)` (MessageHandler.h) - which 16 and
+// 40 both satisfy - and the protection relied on each consumer remembering to
+// include <fltUser.h>, or force-defining __FLT_USER_STRUCTURES_H__, which is a
+// RESERVED WDK-INTERNAL GUARD NAME. Two of the four filter-port consumers had
+// that include and a comment explaining it; two did not.
+//
+// So the name is not defined here at all. A user-mode translation unit that
+// needs the transport prefix must obtain it from the OS, which is guaranteed by
+// including Communication/FilterPortGate.hpp - the one header every filter-port
+// consumer already includes, and where the OS structure's size is asserted. A
+// translation unit that forgets now fails to COMPILE rather than silently
+// reading the wrong offset.
+//
+// Do not reintroduce an alias for an OS type under any condition.
+//
+
+//
+// ============================================================================
+// WIRE FORMAT CONTRACT - ASSERTED, NOT DOCUMENTED
+// ============================================================================
+//
+// Both the driver and the service include this header, so this is the one place
+// the on-wire layout can be pinned once for both sides. Every field offset is
+// asserted, not just the total size: a struct can keep its size while two
+// fields swap, and that reads back as plausible values rather than as an error.
+//
+// If one of these fails, do not adjust the number - find the edit that moved the
+// field, because the other side of the boundary has not moved with it.
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_MESSAGE_HEADER) == 40);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, Magic)       ==  0);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, Version)     ==  4);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, MessageType) ==  6);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, MessageId)   ==  8);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, TotalSize)   == 16);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, DataSize)    == 20);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, Timestamp)   == 24);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, Flags)       == 32);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_MESSAGE_HEADER, Reserved)    == 36);
 
 //
 // 1. File Scan Request (FilterMessageType_ScanRequest)
