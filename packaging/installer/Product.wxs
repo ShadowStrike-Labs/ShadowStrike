@@ -5,9 +5,12 @@
   UpgradeCode: {C8F5D9A3-7E4B-4D28-9C1F-5A2E6B4D8F01}
   IMMUTABLE – changing this breaks the upgrade chain for every existing endpoint.
 
-  Build (from repo root):
+  Build: tools\vm-harness\Invoke-PhantomDeploy.ps1 IS THE AUTHORITY, not this comment.
+  It resolves $(var.ProductVersion) by parsing src\VersionInfo.h, stages the payload,
+  generates QtHarvest.wxs and then invokes (see Invoke-PhantomDeploy.ps1:849-866):
+
     wix build -arch x64 ^
-      -d ProductVersion=1.0.17.0 ^
+      -d ProductVersion=<parsed from src\VersionInfo.h> ^
       -d BinDir=bin\Release ^
       -d StagingDir=build\installer\staging ^
       -d InstallerDir=packaging\installer ^
@@ -15,8 +18,19 @@
       -ext WixToolset.UI.wixext ^
       packaging\installer\Product.wxs ^
       packaging\installer\Components.wxs ^
+      packaging\installer\ContentComponent.wxs ^
+      packaging\installer\DriverComponent.wxs ^
+      packaging\installer\DriverInstallCA.wxs ^
       build\installer\QtHarvest.wxs ^
       -o build\installer\ShadowStrikePhantom-Home-Setup.msi
+
+  ALL SIX SOURCES ARE REQUIRED. This comment previously listed only Product,
+  Components and QtHarvest, and pinned a stale ProductVersion. Building from that
+  command produces an MSI that omits the signature database, the ProgramData
+  directories and the entire driver payload - and it succeeds while doing so,
+  because the missing pieces are separate Fragments nothing forces it to reference.
+  A build recipe that quietly produces a crippled installer is the same hazard as a
+  second installer definition, which is why both were corrected together.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
@@ -209,6 +223,7 @@
         reports healthy and detects nothing - see ContentComponent.wxs.
       -->
       <ComponentRef Id="CmpProgramDataData"/>
+      <ComponentRef Id="CmpCortexModelStore"/>
       <ComponentRef Id="CmpDetectionContent"/>
 
       <!-- Qt 6 runtime DLLs and plugins (auto-harvested from windeployqt staging). -->

@@ -8,6 +8,9 @@
                            [INSTALLFOLDER]\content\.
     CmpProgramDataData   - creates ProgramData\ShadowStrike\Data\ with the ACL
                            the service expects.
+    CmpCortexModelStore  - creates ProgramData\ShadowStrike\Models\ with the same
+                           ACL and writes the PhantomCortex ModelDirectory pointer
+                           that CortexConfigManager::LoadFromRegistry reads.
 
   WHY THE BASELINE LIVES IN PROGRAM FILES AND NOT IN PROGRAMDATA
   ==============================================================
@@ -69,6 +72,30 @@
     </DirectoryRef>
 
     <!--
+      ProgramData\ShadowStrike\Models\ - the PhantomCortex model store.
+
+      WHY THIS EXISTS HERE AT ALL: CortexConfigManager::LoadFromRegistry reads
+      HKLM\SOFTWARE\ShadowStrike\PhantomCortex\ModelDirectory (CortexConfig.cpp:65,
+      schema documented at CortexConfig.hpp:41) and no shipped installer wrote it.
+      The product compensated with a hardcoded L"C:\ProgramData\ShadowStrike\Models"
+      in RealTimeProtection.cpp, so the documented configuration surface had a reader
+      and no writer, and the fallback assumes ProgramData is on C: - which is not
+      guaranteed. [CommonAppDataFolder] resolves it correctly on any host.
+
+      This is carried over from packaging\wix\ShadowStrikePhantomHome.wxs, an earlier
+      single-file installer that was never wired into the build. That file is deleted
+      in the same change; this was the ONE capability in it the shipping installer did
+      not already have or better.
+
+      THE DIRECTORY IS CREATED EMPTY AND THAT IS THE HONEST STATE: no models are
+      packaged yet (tasks 21 and 77), so ML detection stays inactive on an endpoint.
+      What this closes is the configuration gap, not the content gap.
+    -->
+    <DirectoryRef Id="ProgramDataSS">
+      <Directory Id="ProgramDataModels" Name="Models"/>
+    </DirectoryRef>
+
+    <!--
       Shipped detection content. signatures.sdb is the KeyPath: it is the file
       whose presence defines whether this component is installed, and it is the
       one the service looks for.
@@ -126,6 +153,46 @@
                      Name="Data"
                      Type="string"
                      Value="[ProgramDataData]"
+                     KeyPath="yes"/>
+    </Component>
+
+    <!--
+      PhantomCortex model store, plus the registry pointer the service reads to
+      find it.
+
+      THE ACL IS THE SAME RESTRICTION AS THE Data DIRECTORY, and for a stronger
+      reason: these files are ONNX graphs handed to onnxruntime, so a directory any
+      user can write to is a way to feed attacker-chosen input to a parser running
+      as LocalSystem, and at the cheap end it lets an attacker replace a classifier
+      with one that answers "clean". Users get no grant.
+
+      ONE POINTER, NOT TWO. The sibling component above also publishes its path
+      under ...\PhantomHome\Dirs for symmetry, but the value written here is
+      specifically PhantomCortex\ModelDirectory because that is the name
+      CortexConfigManager::LoadFromRegistry actually reads. A second copy under
+      Dirs\Models would be a path with two sources of truth and no reader, which is
+      the defect class this repository keeps finding rather than one to add.
+
+      KeyPath is the registry value rather than a file because the directory ships
+      empty; a component whose KeyPath is a file that does not exist is not
+      installed, and the pointer must exist even before any model does.
+    -->
+    <Component Id="CmpCortexModelStore"
+               Directory="ProgramDataModels"
+               Guid="{C4A1B2D3-5E6F-4708-9A1B-2C3D4E5F60A2}"
+               Bitness="always64">
+      <CreateFolder>
+        <util:PermissionEx User="System"
+                           Domain="NT AUTHORITY"
+                           GenericAll="yes"/>
+        <util:PermissionEx User="Administrators"
+                           GenericAll="yes"/>
+      </CreateFolder>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomCortex"
+                     Name="ModelDirectory"
+                     Type="string"
+                     Value="[ProgramDataModels]"
                      KeyPath="yes"/>
     </Component>
 

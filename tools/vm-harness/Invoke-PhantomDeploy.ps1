@@ -384,6 +384,25 @@ function Assert-MsiAuthoring {
             $failures.Add('CmpInstallAnchor registry component is missing')
         }
 
+        # ── PhantomCortex model-store pointer ──
+        # CortexConfigManager::LoadFromRegistry reads
+        # HKLM\SOFTWARE\ShadowStrike\PhantomCortex\ModelDirectory (CortexConfig.cpp:65).
+        # That reader existed for a long time with NO writer in any shipped installer -
+        # the only authoring that wrote it was packaging\wix\ShadowStrikePhantomHome.wxs,
+        # a duplicate installer definition that was never wired into this build and has
+        # since been deleted. The value is asserted here rather than trusted because a
+        # missing pointer does not fail anything visibly: the service silently falls back
+        # to a hardcoded C:\ProgramData path and ML stays quiet either way.
+        if ($content -notmatch '<Component\b[^>]*\bId="CmpCortexModelStore"') {
+            $failures.Add('CmpCortexModelStore component is missing')
+        }
+        if ($content -notmatch '<RegistryValue\b[^>]*\bKey="SOFTWARE\\ShadowStrike\\PhantomCortex"[^>]*\bName="ModelDirectory"') {
+            $failures.Add('PhantomCortex ModelDirectory registry pointer is missing')
+        }
+        if ($content -notmatch '<Directory\b[^>]*\bId="ProgramDataModels"[^>]*\bName="Models"') {
+            $failures.Add('ProgramData\ShadowStrike\Models directory is missing')
+        }
+
         # ── Trust-root cert + ExecInstallRootCert authoring assertions ──
         if ($content -notmatch '<Component\b[^>]*\bId="CmpShadowStrikeRootCert"') {
             $failures.Add('CmpShadowStrikeRootCert component is missing')

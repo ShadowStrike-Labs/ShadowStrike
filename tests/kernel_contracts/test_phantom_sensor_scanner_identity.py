@@ -1230,6 +1230,77 @@ class SourceContractTests(unittest.TestCase):
         # And the detection itself is never conditional - only the enforcement is.
         self.assertIn("EmitEvasionAlert", body)
 
+    def test_the_repository_declares_exactly_one_product_installer(self) -> None:
+        # A SECOND INSTALLER DEFINITION IS NOT A TIDINESS PROBLEM, IT IS AN UPGRADE
+        # HAZARD. packaging\wix\ShadowStrikePhantomHome.wxs was a complete, standalone
+        # MSI definition that no build referenced, and it declared
+        #   UpgradeCode="D8A6D9E2-4E2F-4A8B-9D3E-7F6B0E2C1A11"
+        # while the shipping installer declares
+        #   UpgradeCode="{C8F5D9A3-7E4B-4D28-9C1F-5A2E6B4D8F01}".
+        # The UpgradeCode is the product's permanent identity - the dead file's own
+        # README said so - so building the wrong one does NOT upgrade an installed
+        # endpoint. MajorUpgrade matches on UpgradeCode, finds nothing, and installs a
+        # SECOND copy alongside the first: two ServiceInstall entries, two payload
+        # trees, two drivers competing for one altitude. It also declared a different
+        # ServiceControl and no install anchor.
+        #
+        # So the invariant is not "only one file" for neatness. It is: exactly one thing
+        # in this repository may claim to be the product MSI.
+        wxs_files = []
+        for path in ROOT.rglob("*.wxs"):
+            parts = path.relative_to(ROOT).parts
+            # build\ holds generated authoring (QtHarvest.wxs, emitted per build) and
+            # obj\ holds NuGet/MSBuild intermediates. Neither is hand-authored.
+            if parts[0] == "build" or "obj" in parts:
+                continue
+            wxs_files.append(path)
+
+        self.assertTrue(
+            wxs_files,
+            "no hand-authored .wxs found at all - the glob or the layout changed and "
+            "this test is no longer looking at anything",
+        )
+
+        stray = [
+            str(p.relative_to(ROOT))
+            for p in wxs_files
+            if p.relative_to(ROOT).parts[:2] != ("packaging", "installer")
+        ]
+        self.assertEqual(
+            stray,
+            [],
+            "hand-authored installer sources must live only in packaging\\installer, "
+            "which is the set tools\\vm-harness\\Invoke-PhantomDeploy.ps1 compiles; "
+            "anything else is authoring nothing builds and nobody validates",
+        )
+
+        # Exactly one <Package> may carry an UpgradeCode. Bundle.wxs legitimately has
+        # its own UpgradeCode on <Bundle> - the burn bundle is a separate installable
+        # identity from the MSI - so the count is scoped to Package elements.
+        package_upgrade_codes = []
+        service_installs = []
+        for path in wxs_files:
+            text = read_source(path)
+            for match in re.finditer(r"<Package\b[^>]*?\bUpgradeCode=\"([^\"]+)\"", text):
+                package_upgrade_codes.append((str(path.relative_to(ROOT)), match.group(1)))
+            for match in re.finditer(r"<ServiceInstall\b[^>]*?\bName=\"([^\"]+)\"", text):
+                service_installs.append((str(path.relative_to(ROOT)), match.group(1)))
+
+        self.assertEqual(
+            len(package_upgrade_codes),
+            1,
+            "exactly one <Package> may declare an UpgradeCode; more than one means two "
+            "product identities and an upgrade that installs side by side instead of "
+            f"replacing. Found: {package_upgrade_codes}",
+        )
+        self.assertEqual(
+            len(service_installs),
+            1,
+            "exactly one ServiceInstall may exist across the installer sources; a second "
+            "one registers a second service. "
+            f"Found: {service_installs}",
+        )
+
     def test_every_site_names_the_service_the_installer_actually_registers(self) -> None:
         # THE INSTALLER IS THE AUTHORITY. packaging/installer/Components.wxs carries the
         # ServiceInstall the deploy harness compiles, so whatever @Name says is the only
