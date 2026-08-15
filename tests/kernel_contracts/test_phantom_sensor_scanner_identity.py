@@ -337,11 +337,29 @@ class SourceContractTests(unittest.TestCase):
             drain, r"sendSize\s*<=\s*sizeof\(SHADOWSTRIKE_MESSAGE_HEADER\)"
         )
 
-        # In the funnel the refusal must precede the queue fallback: a frame that
-        # must not be transmitted must not be buffered for later transmission.
+        # In the funnel the refusal must precede EVERY buffering call: a frame that
+        # must not be transmitted must not be buffered for later transmission
+        # either, or it would be handed straight back to the path that refused it.
+        #
+        # This used to compare against MqEnqueueMessage directly. The enqueue now
+        # sits behind ShadowStrikeBufferUndeliveredNotification, which the funnel
+        # calls from three places - no client connected yet, no reader acquired, and
+        # a send that did not reach a reader - so the assertion is made against the
+        # FIRST of them. That is strictly stronger than the single site it replaces,
+        # because it constrains all three rather than one.
         refusal_at = notify.index("Size <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)")
-        enqueue_at = notify.index("MqEnqueueMessage")
-        self.assertLess(refusal_at, enqueue_at)
+        self.assertEqual(
+            notify.count("ShadowStrikeBufferUndeliveredNotification("),
+            3,
+            "the funnel must buffer at exactly three points; a new one needs review",
+        )
+        self.assertLess(
+            refusal_at, notify.index("ShadowStrikeBufferUndeliveredNotification(")
+        )
+
+        # The enqueue must stay reachable only through that helper, so a later edit
+        # cannot reintroduce a queue path that bypasses the refusal above.
+        self.assertNotIn("MqEnqueueMessage", notify)
 
     def test_behavioural_alert_producer_carries_a_payload(self) -> None:
         # The ETW consumer callback is the ONLY producer of
@@ -697,6 +715,150 @@ class SourceContractTests(unittest.TestCase):
             "PC_FAILOPEN_CACHE_TTL_SEC",
         ):
             self.assertIn(required, body)
+
+    def test_telemetry_fallback_requires_a_declared_reader(self) -> None:
+        # The fallback telemetry target must require the peer's OWN declaration that
+        # it is the connection which reads kernel messages (ConnectionType == 1,
+        # recorded as IsPrimaryScanner). Without that the predicate was "has a
+        # session key and is not disconnecting", which describes the TRANSPORT and
+        # not whether anyone calls FilterGetMessage.
+        #
+        # Measured consequence, which is why this is pinned: the service opens three
+        # connections - liveness gate, threat-intel push, primary scanner - and only
+        # the primary scanner is pumped. Slot allocation is a first-free scan from 0
+        # and this loop is a first-match scan from 0, so the gate held slot 0 and was
+        # always the slot the fallback chose. Capabilities cannot separate them
+        # because ShadowStrikeVerifyClient keys capabilities on the PROCESS, so all
+        # three carry an identical mask including ShadowStrikeCapScanFiles.
+        body = strip_c_comments(
+            extract_c_function(
+                self.comm_port_c, "ShadowStrikeAcquirePrimaryScannerPort"
+            )
+        )
+
+        gate_at = body.index("targetSlot < 0 && AllowFallback")
+        fallback = body[gate_at:]
+
+        self.assertIn("g_ClientPortRefs[i].IsPrimaryScanner", fallback)
+        # The rest of the predicate must survive too, so this is not "fixed" later
+        # by deleting conditions instead of adding one.
+        self.assertIn("ShadowStrikeIsClientEncryptionEstablished", fallback)
+        self.assertIn("g_ClientSessionEncKeys[i] != NULL", fallback)
+        self.assertIn("Disconnecting == 0", fallback)
+
+    def test_an_undelivered_notification_is_buffered_not_destroyed(self) -> None:
+        # Both senders already buffered into MessageQueue when NO client was
+        # connected, for the stated reason that telemetry must survive agent restart
+        # windows. Neither buffered when a client WAS selected and the send then did
+        # not deliver: that path incremented MessagesDropped and returned, so a
+        # connected-but-unread peer lost telemetry an ABSENT peer would have kept.
+        #
+        # With a zero timeout STATUS_TIMEOUT is the ordinary report for "nobody was
+        # waiting in FilterGetMessage", so for a non-reading peer that was the common
+        # path, not a rare one.
+        notify = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendNotification")
+        )
+        proc = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendProcessNotification")
+        )
+
+        # The notification funnel's delivery verdict must end in buffering, never in
+        # a bare drop. Anchored on the LAST MessagesSent, which is the delivered arm.
+        tail = notify[notify.rindex("SHADOWSTRIKE_INC_STAT(MessagesSent)") :]
+        self.assertIn("ShadowStrikeBufferUndeliveredNotification(", tail)
+        self.assertNotIn("SHADOWSTRIKE_INC_STAT(MessagesDropped)", tail)
+
+        # Same for the process path's fire-and-forget branch, anchored on its zero
+        # timeout. The reply branch is deliberately excluded - see the test below.
+        ff_tail = proc[proc.rindex("timeout.QuadPart = 0") :]
+        self.assertIn("ShadowStrikeBufferUndeliveredProcessNotification(", ff_tail)
+        self.assertNotIn("SHADOWSTRIKE_INC_STAT(MessagesDropped)", ff_tail)
+
+        # And the no-client fast paths must buffer rather than discard. This is the
+        # window the queue most exists for and the one it never covered.
+        for body, helper in (
+            (notify, "ShadowStrikeBufferUndeliveredNotification("),
+            (proc, "ShadowStrikeBufferUndeliveredProcessNotification("),
+        ):
+            with self.subTest(path=helper):
+                at = body.index("g_DriverData.ConnectedClients == 0")
+                self.assertIn(helper, body[at : at + 400])
+
+    def test_buffering_queues_plaintext_and_only_counts_real_loss(self) -> None:
+        # Queueing the ENCRYPTED buffer would be encrypted a second time by the
+        # drain, and user mode would decrypt once and then parse ciphertext as a
+        # structure - silently. That is the same class of failure the removed LZ4
+        # path produced on this exact path, so every call site must pass the
+        # caller's plaintext parameters rather than sendBuffer/sendSize.
+        notify = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendNotification")
+        )
+
+        calls = list(
+            re.finditer(
+                r"ShadowStrikeBufferUndeliveredNotification\s*\(([^;]*?)\)\s*;",
+                notify,
+                re.S,
+            )
+        )
+        self.assertEqual(len(calls), 3)
+        for index, match in enumerate(calls):
+            args = " ".join(match.group(1).split())
+            with self.subTest(call=index):
+                self.assertTrue(
+                    args.startswith("Notification, Size,"),
+                    f"buffered frame must be the caller's plaintext, got: {args}",
+                )
+
+        # MessagesDropped must mean "this message is gone", not "gone or deferred",
+        # because it is the counter a field log is read to answer whether telemetry
+        # was lost. So the helper returns on a successful enqueue BEFORE reaching it.
+        helper = strip_c_comments(
+            extract_c_function(
+                self.comm_port_c, "ShadowStrikeBufferUndeliveredNotification"
+            )
+        )
+        success_at = helper.index("NT_SUCCESS(mqStatus)")
+        drop_at = helper.index("SHADOWSTRIKE_INC_STAT(MessagesDropped)")
+        self.assertLess(success_at, drop_at)
+        self.assertIn("return;", helper[success_at:drop_at])
+
+    def test_a_reply_required_process_notification_is_never_buffered(self) -> None:
+        # REGRESSION GUARD, not a discriminator: this held before the buffering work
+        # and must keep holding. Its caller decides a process verdict from the reply
+        # buffer, so a copy delivered later is useless to that decision and is also
+        # a duplicate event. The reply branch must therefore count the timeout and
+        # let the caller fail open, never defer.
+        proc = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendProcessNotification")
+        )
+
+        start = proc.index("replyBufferSize = *ReplySize")
+        end = proc.rindex("timeout.QuadPart = 0")
+        reply_branch = proc[start:end]
+
+        self.assertNotIn(
+            "ShadowStrikeBufferUndeliveredProcessNotification(", reply_branch
+        )
+        self.assertIn("SHADOWSTRIKE_INC_STAT(ScanTimeouts)", reply_branch)
+
+    def test_the_scan_path_refuses_fallback_and_never_defers(self) -> None:
+        # REGRESSION GUARD for the same reason in the more dangerous direction. The
+        # verdict-blocking scan transport must keep AllowFallback == FALSE, and it
+        # must never gain buffering: IRP_MJ_CREATE is waiting on the answer, so a
+        # queued copy delivered minutes later cannot inform it, while the create
+        # would have paid the full timeout to learn nothing.
+        scan = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendScanRequest")
+        )
+
+        self.assertRegex(
+            scan,
+            r"ShadowStrikeAcquirePrimaryScannerPort\s*\(\s*&clientRef,\s*FALSE\s*\)",
+        )
+        self.assertNotIn("ShadowStrikeBufferUndelivered", scan)
+        self.assertNotIn("MqEnqueueMessage", scan)
 
     def test_legacy_builder_uses_operation_requestor(self) -> None:
         legacy = extract_c_function(

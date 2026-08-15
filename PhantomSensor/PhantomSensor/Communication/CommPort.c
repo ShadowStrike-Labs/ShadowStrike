@@ -3610,21 +3610,67 @@ ShadowStrikeAcquirePrimaryScannerPort(
     }
 
     //
-    // Fall back to first connected client.
+    // Fall back to another connection that READS kernel messages.
     //
-    // CRITICAL: the fallback is ONLY permitted for fire-and-forget telemetry
-    // paths (process/alert notifications) where delivering to any verified
-    // client — or buffering on failure — is acceptable. The verdict-blocking
-    // scan path MUST pass AllowFallback == FALSE: routing a synchronous scan to
-    // a non-scanner connection (which has no scan-reply loop) would block
-    // FltSendMessage for the entire timeout budget on every file create and
-    // freeze the system. With fallback disabled the scan path fails fast with
-    // SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED and the caller fails open.
+    // The IsPrimaryScanner requirement in the loop below is the whole point of
+    // this block. Without it the predicate was "has a session key and is not
+    // disconnecting", which is a property of the TRANSPORT rather than of the
+    // peer. The property that actually decides whether a fire-and-forget send
+    // arrives is whether anyone on the other end ever calls FilterGetMessage,
+    // and the peer already declares that: ConnectionType == 1 in
+    // SHADOWSTRIKE_CONNECTION_CONTEXT, recorded on the slot as IsPrimaryScanner.
+    //
+    // MEASURED, which is why the old predicate was not merely loose but wrong.
+    // The service opens THREE connections to this port, in this order: the
+    // liveness gate, the threat-intel push connection, then the primary scanner
+    // (IPCManager.cpp). Only the primary scanner is pumped for incoming
+    // messages. The gate's own documentation states it "is a connect/liveness
+    // gate only and is never used for encrypted I/O" and it deliberately
+    // discards the key material the kernel sends it; the push connection is
+    // handed to ThreatIntelPusher, which only ever writes user -> kernel.
+    // Capabilities cannot separate them, because ShadowStrikeVerifyClient keys
+    // capabilities on the PROCESS, so all three connections of one service carry
+    // an identical capability mask including ShadowStrikeCapScanFiles.
+    //
+    // Slot assignment is a first-free scan from index 0 and this loop is a
+    // first-match scan from index 0, so the gate holds slot 0 and was ALWAYS the
+    // slot this fallback chose. Every fallback send went to the one connection
+    // guaranteed not to read it. Two distinct consequences, both real:
+    //
+    //   - ShadowStrikeSendNotification passes a zero timeout, so the send came
+    //     back STATUS_TIMEOUT at once and the notification was DESTROYED rather
+    //     than buffered. Those send paths now buffer instead, but the routing was
+    //     the reason there was anything to lose.
+    //   - ShadowStrikeSendProcessNotification with RequireReply passes
+    //     Config.ScanTimeoutMs, so a suspicious process creation (ProcessNotify.c,
+    //     SuspicionScore >= PN_SUSPICION_MEDIUM) blocked the process-creation
+    //     callback for that whole budget waiting on a reply from a port with no
+    //     reader. Only ShadowFsIsBootPhase() clamped it, to 250 ms, and only
+    //     during boot.
+    //
+    // NO COVERAGE IS LOST BY NARROWING THIS, and that is measured rather than
+    // argued: the only connections that satisfied the old predicate without
+    // satisfying the new one are the gate and the push connection, neither of
+    // which reads, so every such "success" was a silent loss. Failing here
+    // instead routes the message to MessageQueue, which exists for exactly this
+    // window and is drained when a primary scanner publishes readiness.
+    //
+    // What this still relaxes relative to the primary selection above is the
+    // scan-capability bit and the accepted-primary pid pin. Neither describes
+    // whether the peer reads telemetry, and telemetry carries no verdict.
+    //
+    // CRITICAL, UNCHANGED: the verdict-blocking scan path MUST pass
+    // AllowFallback == FALSE. Routing a synchronous scan to a connection with no
+    // scan-reply loop would block FltSendMessage for the entire timeout budget on
+    // every file create and freeze the system. With fallback disabled the scan
+    // path fails fast with SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED and the caller
+    // fails open.
     //
     if (targetSlot < 0 && AllowFallback) {
         for (i = 0; i < SHADOWSTRIKE_MAX_CONNECTIONS; i++) {
             if (g_ClientPortRefs[i].ClientPort != NULL &&
                 g_ClientPortRefs[i].Disconnecting == 0 &&
+                g_ClientPortRefs[i].IsPrimaryScanner &&
                 ShadowStrikeIsClientEncryptionEstablished(&g_ClientPortRefs[i]) &&
                 g_ClientSessionEncKeys[i] != NULL) {
                 targetSlot = i;
@@ -4038,6 +4084,132 @@ ShadowStrikeSendScanRequest(
     return status;
 }
 
+//
+// Buffer a notification the transport could not deliver.
+//
+// THE ASYMMETRY THIS EXISTS TO REMOVE. Both notification senders below already
+// buffered into MessageQueue when NO client was connected, with the stated reason
+// that telemetry must survive "user-mode agent restart / reconnect windows".
+// Neither buffered when a client WAS selected and the send then failed to deliver:
+// that path incremented MessagesDropped and returned, destroying the message. So
+// the mere presence of a connected-but-unread peer converted "buffer for later
+// delivery" into permanent loss, and the buffer was defeated for precisely the
+// window it was built to cover.
+//
+// That is the same shape as the scan cache refusing transient verdicts while its
+// caller relabelled one as Verdict_Clean: the defence was intact, correct, and
+// unreachable. Fixing the routing alone would have left this hole open for any
+// future non-reading peer, so both halves are fixed.
+//
+// The caller's PLAINTEXT frame is queued, never an encrypted one. The drain
+// encrypts under the session key of whichever slot it later targets, so queueing
+// ciphertext would be encrypted a second time and user mode would decrypt once
+// and then parse ciphertext as a structure - silently, which is exactly the class
+// of failure the removed LZ4 compression path used to produce on this very path.
+//
+// A reply-required message must NOT be routed here: its caller needs a
+// synchronous verdict, and a copy delivered later is both useless to that
+// decision and a duplicate event.
+//
+// Deliberately NOT counted as a drop on success. MessagesDropped now means "this
+// message is gone", not "gone or deferred", which is the only reading that lets a
+// field log answer whether telemetry was lost. Deferral is observable through the
+// queue's own depth and its high-water warning below.
+//
+_IRQL_requires_max_(APC_LEVEL)
+static VOID
+ShadowStrikeBufferUndeliveredNotification(
+    _In_reads_bytes_(Size) PSHADOWSTRIKE_MESSAGE_HEADER Notification,
+    _In_ ULONG Size,
+    _In_ const char* Reason
+    )
+{
+    NTSTATUS mqStatus;
+
+    //
+    // Backpressure check: log if the queue is at its high water mark.
+    //
+    if (MqIsHighWaterMark()) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/CommPort] Queue at high water mark (depth=%u), "
+                   "enqueue may be dropped. Consider client reconnect.\n",
+                   MqGetQueueDepth());
+    }
+
+    mqStatus = MqEnqueueMessage(
+        (SHADOWSTRIKE_MESSAGE_TYPE)Notification->MessageType,
+        Notification,
+        Size,
+        MessagePriority_Normal,
+        MQ_MSG_FLAG_NOTIFY_ONLY,
+        NULL
+        );
+
+    if (NT_SUCCESS(mqStatus)) {
+        return;
+    }
+
+    //
+    // Only here is the message genuinely lost.
+    //
+    SHADOWSTRIKE_INC_STAT(MessagesDropped);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+               "[ShadowStrike/CommPort] Notification LOST (%s): type=%u size=%lu "
+               "mqStatus=0x%08X depth=%u\n",
+               Reason,
+               (unsigned)Notification->MessageType,
+               (unsigned long)Size,
+               mqStatus,
+               MqGetQueueDepth());
+}
+
+//
+// Same decision for a process notification, which arrives UNFRAMED.
+//
+// ShadowStrikeSendProcessNotification takes a bare SHADOWSTRIKE_PROCESS_NOTIFICATION
+// rather than a complete message, so buffering it means building the frame the
+// drain will later transmit. That framing existed inline at one of the two sites
+// that need it; keeping a second copy is how the two would eventually disagree
+// about the message type or the header's DataSize, which on this wire is the
+// difference between a parsed event and a misparsed one.
+//
+// MqEnqueueMessage copies the buffer, which is why the original inline version
+// freed its allocation immediately after enqueueing and why this one can too.
+//
+_IRQL_requires_max_(APC_LEVEL)
+static VOID
+ShadowStrikeBufferUndeliveredProcessNotification(
+    _In_reads_bytes_(Size) PSHADOWSTRIKE_PROCESS_NOTIFICATION Notification,
+    _In_ ULONG Size,
+    _In_ const char* Reason
+    )
+{
+    const ULONG framedSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + Size;
+    PSHADOWSTRIKE_MESSAGE_HEADER framed;
+
+    framed = (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, framedSize, 'mqCP');
+    if (framed == NULL) {
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                   "[ShadowStrike/CommPort] Process notification LOST (%s): "
+                   "could not allocate %lu bytes to buffer it\n",
+                   Reason, (unsigned long)framedSize);
+        return;
+    }
+
+    ShadowStrikeInitMessageHeader(
+        framed, ShadowStrikeMessageProcessNotify, Size);
+    RtlCopyMemory(
+        (PUCHAR)framed + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+        Notification,
+        Size);
+
+    ShadowStrikeBufferUndeliveredNotification(framed, framedSize, Reason);
+
+    ExFreePoolWithTag(framed, 'mqCP');
+}
+
 NTSTATUS
 ShadowStrikeSendNotification(
     _In_reads_bytes_(Size) PSHADOWSTRIKE_MESSAGE_HEADER Notification,
@@ -4053,16 +4225,6 @@ ShadowStrikeSendNotification(
 
     if (!g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
-    }
-
-    //
-    // Fast-path bail when no user-mode client has connected yet. Avoids
-    // allocating encryption buffers and walking the port list during early
-    // boot before the service registers.
-    //
-    if (g_DriverData.ConnectedClients == 0) {
-        SHADOWSTRIKE_INC_STAT(MessagesDropped);
-        return STATUS_PORT_DISCONNECTED;
     }
 
     //
@@ -4105,6 +4267,40 @@ ShadowStrikeSendNotification(
                    (unsigned long)sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
         SHADOWSTRIKE_INC_STAT(MessagesDropped);
         return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // No user-mode client has connected yet: BUFFER, do not discard.
+    //
+    // This used to be the FIRST check in the function, and it incremented
+    // MessagesDropped and returned. So every notification produced before the
+    // service registered its port was destroyed - while the MessageQueue that
+    // exists to cover "user-mode agent restart / reconnect windows" sat empty a
+    // few lines below. The largest such window in this product's life is the one
+    // before the first connection, and it was the single window the buffer never
+    // covered. The 1.0.94 field run shows exactly that: kernel notifications
+    // emitted about a second before the first client connected, counted as
+    // dropped, gone.
+    //
+    // It now runs AFTER the header-only refusal above, deliberately. A frame that
+    // must not be transmitted must not be queued for later transmission either,
+    // and queueing one here would hand it straight back to the send path that
+    // just refused it.
+    //
+    // The fast-path justification for testing this early was avoiding "allocating
+    // encryption buffers and walking the port list". Neither is given up: the port
+    // walk is bounded by SHADOWSTRIKE_MAX_CONNECTIONS and only runs while no
+    // client is connected, and encryption still happens strictly after a port has
+    // been acquired.
+    //
+    // STATUS_PORT_DISCONNECTED is preserved rather than replaced with the acquire
+    // path's SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED, because PreSetInfo.c tests for
+    // this exact status to keep a benign no-client case out of its error log.
+    //
+    if (g_DriverData.ConnectedClients == 0) {
+        ShadowStrikeBufferUndeliveredNotification(
+            Notification, Size, "no client connected yet");
+        return STATUS_PORT_DISCONNECTED;
     }
 
     //
@@ -4152,8 +4348,11 @@ ShadowStrikeSendNotification(
     // Acquire reference to client port.
     //
     // AllowFallback == TRUE: this is a fire-and-forget telemetry/notification
-    // path. Delivering to any verified connected client (or buffering on
-    // failure) is acceptable, and there is no synchronous reply to block on.
+    // path with no synchronous reply to block on, so a connection other than the
+    // designated primary scanner is an acceptable target - PROVIDED it actually
+    // reads. The fallback enforces that by requiring the peer's own
+    // IsPrimaryScanner declaration; the reasoning is recorded there. When no
+    // reader exists the message is buffered below rather than discarded.
     //
     status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, TRUE);
     if (!NT_SUCCESS(status)) {
@@ -4162,32 +4361,18 @@ ShadowStrikeSendNotification(
         // for delivery when a client reconnects.  This prevents telemetry
         // loss during user-mode agent restart / reconnect windows.
         //
-        // Backpressure check: log if queue is at high water mark
+        // Buffering is factored into one helper so this site and the
+        // undelivered-send site below cannot drift apart. They are the same
+        // decision reached two different ways: the message did not reach a reader,
+        // and the queue exists so that does not have to mean it is gone.
         //
-        if (MqIsHighWaterMark()) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                       "[ShadowStrike/CommPort] Queue at high water mark (depth=%u), "
-                       "enqueue may be dropped. Consider client reconnect.\n",
-                       MqGetQueueDepth());
-        }
-        {
-            NTSTATUS mqStatus = MqEnqueueMessage(
-                (SHADOWSTRIKE_MESSAGE_TYPE)Notification->MessageType,
-                sendBuffer,
-                sendSize,
-                MessagePriority_Normal,
-                MQ_MSG_FLAG_NOTIFY_ONLY,
-                NULL
-            );
-            if (!NT_SUCCESS(mqStatus)) {
-                SHADOWSTRIKE_INC_STAT(MessagesDropped);
-                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                           "[ShadowStrike/CommPort] MqEnqueueMessage dropped notification "
-                           "(type=%u, size=%lu, status=0x%08X, depth=%u)\n",
-                           (unsigned)Notification->MessageType,
-                           (unsigned long)sendSize, mqStatus, MqGetQueueDepth());
-            }
-        }
+        // The caller's plaintext frame is passed rather than sendBuffer/sendSize.
+        // They are identical at this point because encryption happens only after a
+        // port has been acquired, but naming the parameters makes it impossible for
+        // a later edit to queue ciphertext.
+        //
+        ShadowStrikeBufferUndeliveredNotification(
+            Notification, Size, "no reader available");
 
         return status;
     }
@@ -4339,10 +4524,24 @@ ShadowStrikeSendNotification(
         SHADOWSTRIKE_INC_STAT(MessagesSent);
     } else {
         //
-        // Previously counted nowhere: neither a delivery timeout nor an outright
-        // FltSendMessage failure incremented anything here.
+        // NOT DELIVERED IS NOT THE SAME AS LOST, AND THIS USED TO TREAT THEM AS
+        // THE SAME. The previous code incremented MessagesDropped here and
+        // returned, destroying the notification - while the identical situation
+        // reached through a failed port acquisition a few dozen lines above was
+        // buffered for later delivery. A peer that was connected but not reading
+        // therefore lost telemetry that an absent peer would have kept, which is
+        // the wrong way round.
         //
-        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        // With a zero timeout STATUS_TIMEOUT is not an edge case here: it is the
+        // ordinary report for "no user-mode thread was waiting in
+        // FilterGetMessage". So for any non-reading peer this was the common path,
+        // not a rare one.
+        //
+        // The plaintext frame is queued, never the encrypted buffer - which has
+        // already been freed above in any case.
+        //
+        ShadowStrikeBufferUndeliveredNotification(
+            Notification, Size, "send did not reach a reader");
     }
 
     return status;
@@ -4378,16 +4577,39 @@ ShadowStrikeSendProcessNotification(
     }
 
     //
-    // Boot-phase guard: no listener yet → fast bail. Avoids per-process
-    // boot storm hitting FltSendMessage with no client registered.
+    // Boot-phase guard: no listener yet.
     //
-    if (g_DriverData.ConnectedClients == 0) {
-        SHADOWSTRIKE_INC_STAT(MessagesDropped);
-        return STATUS_PORT_DISCONNECTED;
-    }
-
     if (!g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
+    }
+
+    //
+    // BUFFER a fire-and-forget notification rather than discarding it, exactly as
+    // the acquire-failure path below already did. A reply-required message cannot
+    // be deferred, because its caller decides a process verdict from the reply and
+    // a copy delivered later is both useless to that decision and a duplicate.
+    //
+    // Process create/exit events produced before the service registers are events
+    // an endpoint product most wants - early persistence and injection happen
+    // there - and they were being destroyed while the queue built to survive
+    // "agent restart windows" sat empty. The queue is bounded and REFUSES at
+    // capacity rather than evicting, so a boot storm costs bounded memory and then
+    // counts honest drops; it cannot displace what is already held.
+    //
+    // This now runs AFTER the NotificationsEnabled test. It used to run before it,
+    // so a build with notifications disabled still incremented MessagesDropped for
+    // every process event - reporting as lost the messages that were never meant
+    // to be sent, in the single counter a field log is read to answer whether
+    // telemetry is going missing.
+    //
+    if (g_DriverData.ConnectedClients == 0) {
+        if (!RequireReply) {
+            ShadowStrikeBufferUndeliveredProcessNotification(
+                Notification, Size, "no client connected yet");
+        } else {
+            SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        }
+        return STATUS_PORT_DISCONNECTED;
     }
 
     //
@@ -4408,35 +4630,8 @@ ShadowStrikeSendProcessNotification(
         // (caller needs a synchronous verdict).
         //
         if (!RequireReply) {
-            ULONG mqSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + Size;
-            PSHADOWSTRIKE_MESSAGE_HEADER mqHeader =
-                (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
-                    POOL_FLAG_NON_PAGED, mqSize, 'mqCP');
-            if (mqHeader != NULL) {
-                ShadowStrikeInitMessageHeader(
-                    mqHeader, ShadowStrikeMessageProcessNotify, Size);
-                RtlCopyMemory(
-                    (PUCHAR)mqHeader + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
-                    Notification, Size);
-                {
-                    NTSTATUS mqStatus = MqEnqueueMessage(
-                        ShadowStrikeMessageProcessNotify,
-                        mqHeader,
-                        mqSize,
-                        MessagePriority_Normal,
-                        MQ_MSG_FLAG_NOTIFY_ONLY,
-                        NULL
-                    );
-                    if (!NT_SUCCESS(mqStatus)) {
-                        SHADOWSTRIKE_INC_STAT(MessagesDropped);
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                                   "[ShadowStrike/CommPort] MqEnqueueMessage dropped process notify "
-                                   "(size=%lu, status=0x%08X, depth=%u)\n",
-                                   (unsigned long)mqSize, mqStatus, MqGetQueueDepth());
-                    }
-                }
-                ExFreePoolWithTag(mqHeader, 'mqCP');
-            }
+            ShadowStrikeBufferUndeliveredProcessNotification(
+                Notification, Size, "no reader available");
         }
         return status;
     }
@@ -4662,7 +4857,18 @@ ShadowStrikeSendProcessNotification(
         if ((status != STATUS_TIMEOUT) && NT_SUCCESS(status)) {
             SHADOWSTRIKE_INC_STAT(MessagesSent);
         } else {
-            SHADOWSTRIKE_INC_STAT(MessagesDropped);
+            //
+            // Buffered rather than destroyed, for the same reason as the
+            // notification funnel: this branch passes a ZERO timeout, so
+            // STATUS_TIMEOUT is the ordinary report for "nobody was waiting in
+            // FilterGetMessage", and a process create/exit event that nothing read
+            // is exactly what the queue is for. The reply branch above must NOT do
+            // this - its caller decides a process verdict from the reply, and a
+            // copy delivered later is both useless to that decision and a
+            // duplicate event.
+            //
+            ShadowStrikeBufferUndeliveredProcessNotification(
+                Notification, Size, "send did not reach a reader");
         }
     }
 
