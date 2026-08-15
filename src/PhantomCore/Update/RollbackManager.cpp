@@ -65,10 +65,28 @@ namespace {
     constexpr const wchar_t* kFilesSubdir = L"files";
     constexpr const wchar_t* kConfigSubdir = L"config";
 
-    // Service names to check during health validation.
+    // Service names to check during health validation, and to stop/restart around a
+    // file restore. BOTH are SCM service names, so both must be what the SCM actually
+    // registers or the call fails with ERROR_SERVICE_DOES_NOT_EXIST and the loop does
+    // nothing while reporting nothing.
+    //
+    // The second entry read L"ShadowStrikeSensor", which appeared exactly ONCE in the
+    // whole repository - here. Nothing registers it. The kernel driver's service name
+    // is "PhantomSensor": PhantomSensor.inf declares ServiceName = "PhantomSensor",
+    // and DriverInstaller::kServiceName, IPCManager's kPhantomMinifilterName,
+    // AccessControlManager, FileSystemFilter and SelfDefenseConstants::DRIVER_SERVICE_NAME
+    // all use that name. Same defect class as task 44's L"ShadowStrikeDriver".
+    //
+    // CONSEQUENCE OF THE FIX, STATED RATHER THAN GLOSSED: this element was inert, so a
+    // rollback never stopped the driver, and PhantomSensor.sys is matched by
+    // kCriticalFileExtensions (".sys") - a loaded driver image cannot be overwritten,
+    // so restoring it could not have succeeded. With the real name the stop is attempted,
+    // which is what the surrounding code was written to do. NOT VERIFIED HERE: whether
+    // an SCM stop is sufficient to unload a minifilter (FilterUnload is the dedicated
+    // API), so driver rollback should be exercised before it is relied on.
     constexpr const wchar_t* kServiceNames[] = {
         L"ShadowStrikePhantomService",
-        L"ShadowStrikeSensor"
+        L"PhantomSensor"
     };
 
     // Critical file patterns to back up in a Full snapshot.

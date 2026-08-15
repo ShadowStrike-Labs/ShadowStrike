@@ -34,6 +34,14 @@ namespace {
 
 using namespace ShadowStrike::Core::System;
 
+// A service name that provably does not exist, used ONLY as an argument to calls made
+// before Initialize(). Those cases assert that the pre-init surface answers safely; the
+// name is incidental to what they test, and spelling our REAL service name there would
+// make them depend on whether ShadowStrike happens to be installed on the machine
+// running the suite. Deliberately shares no substring with either real service name so
+// a search for those names cannot land here.
+constexpr const wchar_t* kAbsentServiceName = L"NoSuchServiceForNegativeTests";
+
 class ServiceManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -59,7 +67,16 @@ TEST(ServiceManagerValueTests, ConfigPresetsAndStatisticsResetReflectProtectionI
     EXPECT_TRUE(defaults.autoRestartOnFailure);
     EXPECT_TRUE(defaults.validateSignatures);
     EXPECT_EQ(defaults.watchdogIntervalMs, 5000u);
-    EXPECT_EQ(defaults.mainServiceName, L"ShadowStrikeAV");
+    // ShadowStrikePhantomService, not ShadowStrikeAV. Nothing has ever registered a
+    // service called ShadowStrikeAV; packaging/installer/Components.wxs declares
+    // <ServiceInstall Name="ShadowStrikePhantomService"> and that is the only installer
+    // the deploy harness compiles. This assertion previously pinned "ShadowStrikeAV",
+    // so it asserted the defect AS THE CONTRACT: the watchdog, VerifyServiceIntegrity,
+    // recovery configuration and IsOwnServiceKey all resolve our identity through this
+    // field, and every one of them was querying a service that does not exist. Same
+    // defect class as driverServiceName below, and this assertion would put it back, so
+    // it tracks the installer.
+    EXPECT_EQ(defaults.mainServiceName, L"ShadowStrikePhantomService");
     // PhantomSensor, not ShadowStrikeDriver. Nothing has ever registered a service
     // called ShadowStrikeDriver: PhantomSensor.inf declares ServiceName =
     // "PhantomSensor", which is what the SCM creates, and the driver itself protects
@@ -99,9 +116,9 @@ TEST_F(ServiceManagerTest, UninitializedQuerySurfaceReturnsSafeDefaults) {
 
     EXPECT_TRUE(manager.EnumerateServices().empty());
     EXPECT_TRUE(manager.EnumerateDrivers().empty());
-    EXPECT_FALSE(manager.GetServiceInfo(L"ShadowStrikeAV").has_value());
-    EXPECT_FALSE(manager.ServiceExists(L"ShadowStrikeAV"));
-    EXPECT_EQ(manager.GetServiceState(L"ShadowStrikeAV"), ServiceState::Unknown);
+    EXPECT_FALSE(manager.GetServiceInfo(kAbsentServiceName).has_value());
+    EXPECT_FALSE(manager.ServiceExists(kAbsentServiceName));
+    EXPECT_EQ(manager.GetServiceState(kAbsentServiceName), ServiceState::Unknown);
     EXPECT_TRUE(manager.GetSuspiciousServices().empty());
 }
 
@@ -130,7 +147,7 @@ TEST_F(ServiceManagerTest, CallbackRegistrationAndWatchdogGuardsAreStableBeforeI
 TEST_F(ServiceManagerTest, VerifyServiceIntegrityFlagsNotInitializedAsTampering) {
     auto& manager = ServiceManager::Instance();
 
-    const auto result = manager.VerifyServiceIntegrity(L"ShadowStrikeAV");
+    const auto result = manager.VerifyServiceIntegrity(kAbsentServiceName);
     EXPECT_TRUE(result.isTampered);
     EXPECT_FALSE(result.binaryModified);
     EXPECT_FALSE(result.configModified);
@@ -142,11 +159,11 @@ TEST_F(ServiceManagerTest, VerifyServiceIntegrityFlagsNotInitializedAsTampering)
 TEST_F(ServiceManagerTest, PreInitLifecycleCallsAndInvalidCallbackIdsRemainSafe) {
     auto& manager = ServiceManager::Instance();
 
-    EXPECT_FALSE(manager.StartService(L"ShadowStrikeAV", {}, 1000));
-    EXPECT_FALSE(manager.StopService(L"ShadowStrikeAV", false, 1000));
-    EXPECT_FALSE(manager.RestartService(L"ShadowStrikeAV", 1000));
+    EXPECT_FALSE(manager.StartService(kAbsentServiceName, {}, 1000));
+    EXPECT_FALSE(manager.StopService(kAbsentServiceName, false, 1000));
+    EXPECT_FALSE(manager.RestartService(kAbsentServiceName, 1000));
     EXPECT_FALSE(manager.ConfigureRecovery(
-        L"ShadowStrikeAV",
+        kAbsentServiceName,
         FailureAction::Restart,
         FailureAction::None,
         FailureAction::None,

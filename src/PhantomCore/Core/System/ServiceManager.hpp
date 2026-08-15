@@ -327,8 +327,32 @@ struct alignas(32) ServiceManagerConfig {
     bool validateSignatures{ true };
     uint32_t watchdogIntervalMs{ 5000 };
     
-    // Our service names
-    std::wstring mainServiceName{ L"ShadowStrikeAV" };
+    // Our service names. BOTH must match what the SCM actually registers, because
+    // every use of them is an OpenServiceW or a ...\Services\<name> registry path,
+    // and a name nothing registers fails with ERROR_FILE_NOT_FOUND rather than
+    // reporting that self-protection is watching nothing.
+    //
+    // mainServiceName previously read L"ShadowStrikeAV". Nothing has ever registered
+    // that name: packaging/installer/Components.wxs declares
+    //   <ServiceInstall Name="ShadowStrikePhantomService">
+    // and that is the only ServiceInstall the deploy harness compiles
+    // (Invoke-PhantomDeploy.ps1 builds packaging/installer/*.wxs). Four other code
+    // sites already agreed with the installer - SelfDefenseConstants::SERVICE_NAME,
+    // ServiceConstants::SERVICE_NAME, ProgramUpdater's kServiceName and the tray's
+    // InstallProbe - so this field was the single outlier, and a repo-wide search for
+    // "ShadowStrikeAV" found it here plus its own unit-test expectation and nowhere else.
+    //
+    // What that cost: ServiceManager's watchdog, VerifyServiceIntegrity, recovery
+    // configuration and IsOwnServiceKey all resolve our identity through this field,
+    // so each of them was asking the SCM about a service that does not exist. This is
+    // the same defect class as DRIVER_SERVICE_NAME reading L"ShadowStrikeDriver"
+    // (see SelfDefense.hpp) - one wrong constant producing silent failures.
+    //
+    // The INSTALLER is the authority for both names. If either service is renamed,
+    // Components.wxs moves first and these follow; the cross-language contract test in
+    // tests/kernel_contracts requires every site to carry the same name, so a partial
+    // rename fails there rather than in the field.
+    std::wstring mainServiceName{ L"ShadowStrikePhantomService" };
     std::wstring driverServiceName{ L"PhantomSensor" };   // PhantomSensor.inf ServiceName
     
     static ServiceManagerConfig CreateDefault() noexcept;

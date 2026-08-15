@@ -35,6 +35,28 @@ PROCESS_NOTIFY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/Process/Pr
 IPC_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.cpp"
 IPC_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.hpp"
 
+# THE SCM SERVICE-NAME CONTRACT spans the WiX installer, five C++ modules across three
+# separate vcxproj targets, and operator documentation. No C++ test can read a .wxs file,
+# and the tray cannot include SelfDefense.hpp to share one constant because that header
+# pulls Utils/Logger.hpp, which needs C++23 while the tray project is stdcpp20 (task 96).
+# So the only place this invariant can be stated at all is here, cross-language, the same
+# way the process fan-out budget spans IPCManager.hpp and ProcessNotify.c.
+#
+# The installer is the AUTHORITY: whatever ServiceInstall/@Name says is what the SCM
+# creates, and every code site is a consumer of that name via OpenServiceW or a
+# ...\Services\<name> registry path. A site carrying a different name does not fail
+# loudly - OpenServiceW returns ERROR_SERVICE_DOES_NOT_EXIST and the caller reports
+# "not found", which is why ServiceManager watched a nonexistent service undetected.
+INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
+SELF_DEFENSE_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.hpp"
+ANTIVIRUS_SERVICE_HPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.hpp"
+PROGRAM_UPDATER_CPP_PATH = ROOT / "src/PhantomCore/Update/ProgramUpdater.cpp"
+ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
+INSTALL_PROBE_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
+)
+SERVICE_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Core/System/ServiceManager.hpp"
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -159,6 +181,13 @@ class SourceContractTests(unittest.TestCase):
         cls.process_notify_c = read_source(PROCESS_NOTIFY_C_PATH)
         cls.ipc_manager_cpp = read_source(IPC_MANAGER_CPP_PATH)
         cls.ipc_manager_hpp = read_source(IPC_MANAGER_HPP_PATH)
+        cls.installer_components_wxs = read_source(INSTALLER_COMPONENTS_WXS_PATH)
+        cls.self_defense_hpp = read_source(SELF_DEFENSE_HPP_PATH)
+        cls.antivirus_service_hpp = read_source(ANTIVIRUS_SERVICE_HPP_PATH)
+        cls.program_updater_cpp = read_source(PROGRAM_UPDATER_CPP_PATH)
+        cls.rollback_manager_cpp = read_source(ROLLBACK_MANAGER_CPP_PATH)
+        cls.install_probe_cpp = read_source(INSTALL_PROBE_CPP_PATH)
+        cls.service_manager_hpp = read_source(SERVICE_MANAGER_HPP_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1200,6 +1229,167 @@ class SourceContractTests(unittest.TestCase):
 
         # And the detection itself is never conditional - only the enforcement is.
         self.assertIn("EmitEvasionAlert", body)
+
+    def test_every_site_names_the_service_the_installer_actually_registers(self) -> None:
+        # THE INSTALLER IS THE AUTHORITY. packaging/installer/Components.wxs carries the
+        # ServiceInstall the deploy harness compiles, so whatever @Name says is the only
+        # name the SCM will answer to. Every other site is a CONSUMER of that name -
+        # either OpenServiceW or a ...\Services\<name> registry path - and a consumer
+        # carrying a different name does not fail loudly: OpenServiceW returns
+        # ERROR_SERVICE_DOES_NOT_EXIST and the caller reports "not present". That is how
+        # ServiceManagerConfig::mainServiceName sat on L"ShadowStrikeAV" - a name nothing
+        # has ever registered - while its watchdog, VerifyServiceIntegrity, recovery
+        # configuration and IsOwnServiceKey all reported an absent service, and how
+        # RollbackManager tried to stop a driver called L"ShadowStrikeSensor".
+        #
+        # This test exists because the name CANNOT be reduced to one shared constant
+        # today: the tray's InstallProbe.cpp cannot include SelfDefense.hpp (it pulls
+        # Utils/Logger.hpp, which needs C++23, and the tray project is stdcpp20 - task 96),
+        # and no C++ test can read a .wxs file at all. So the invariant is asserted here
+        # instead, and a rename must move every site together or fail right here.
+        wxs = self.installer_components_wxs
+
+        install = re.search(r'<ServiceInstall\b[^>]*?\bName="(?P<name>[^"]+)"', wxs)
+        self.assertIsNotNone(
+            install,
+            "packaging/installer/Components.wxs must declare a ServiceInstall with a "
+            "Name - it is the authority for the SCM service name",
+        )
+        assert install is not None
+        authoritative = install.group("name")
+
+        # The installer must agree with ITSELF first. ServiceControl decides what gets
+        # stopped and removed, util:ServiceConfig decides recovery actions, and the two
+        # RegistryValue keys write DelayedAutostart/AutoStartDelay under the service's own
+        # key. A rename that misses any of them leaves the new service with no recovery
+        # policy, no delayed start, and an old entry nothing removes.
+        self.assertEqual(
+            re.findall(r'<ServiceControl\b[^>]*?\bName="([^"]+)"', wxs),
+            [authoritative],
+            "ServiceControl must name the service ServiceInstall creates",
+        )
+        self.assertEqual(
+            re.findall(r'ServiceName="([^"]+)"', wxs),
+            [authoritative],
+            "util:ServiceConfig must name the service ServiceInstall creates",
+        )
+        registry_keys = re.findall(
+            r'Key="SYSTEM\\CurrentControlSet\\Services\\([^"\\]+)"', wxs
+        )
+        self.assertTrue(
+            registry_keys,
+            "the installer writes DelayedAutostart under the service key; if that "
+            "lookup found nothing the key path shape changed and this test is blind",
+        )
+        self.assertEqual(
+            set(registry_keys),
+            {authoritative},
+            "every ...\\Services\\<name> key the installer writes must be the service "
+            "it actually creates",
+        )
+
+        # THE DEPLOY HARNESS GATES ON THIS NAME AND DIES IF IT DOES NOT MATCH.
+        # Invoke-PhantomDeploy.ps1 asserts the ServiceInstall name before building the
+        # MSI, so a rename that skips the harness fails the deploy rather than the field -
+        # which is the right direction, but only if somebody knows to look here.
+        harness = read_source(ROOT / "tools/vm-harness/Invoke-PhantomDeploy.ps1")
+        self.assertIn(
+            f'Name="{authoritative}"',
+            harness,
+            "the deploy harness asserts the ServiceInstall name; renaming the service "
+            "without updating that assertion stops the deploy",
+        )
+
+        driver_match = re.search(
+            r'DRIVER_SERVICE_NAME\s*=\s*L"([^"]+)"', self.self_defense_hpp
+        )
+        self.assertIsNotNone(
+            driver_match,
+            "SelfDefenseConstants::DRIVER_SERVICE_NAME is the stated single source for "
+            "the driver's SCM name (it follows PhantomSensor.inf ServiceName)",
+        )
+        assert driver_match is not None
+        driver_name = driver_match.group(1)
+
+        # Each consumer, extracted by its own declaration rather than by substring, so a
+        # failure names the exact site instead of reporting that a string is missing.
+        main_name_sites = (
+            ("SelfDefense.hpp SERVICE_NAME", self.self_defense_hpp,
+             r'\bSERVICE_NAME\s*=\s*L"([^"]+)"'),
+            ("AntivirusService.hpp SERVICE_NAME", self.antivirus_service_hpp,
+             r'\bSERVICE_NAME\s*=\s*L"([^"]+)"'),
+            ("ProgramUpdater.cpp kServiceName", self.program_updater_cpp,
+             r'kServiceName\s*=\s*L"([^"]+)"'),
+            ("InstallProbe.cpp kServiceName (tray)", self.install_probe_cpp,
+             r'kServiceName\s*\[\s*\]\s*=\s*L"([^"]+)"'),
+            ("ServiceManager.hpp mainServiceName", self.service_manager_hpp,
+             r'mainServiceName\s*\{\s*L"([^"]+)"'),
+        )
+        for label, source, pattern in main_name_sites:
+            found = re.search(pattern, strip_c_comments(source))
+            self.assertIsNotNone(
+                found, f"{label}: declaration not found - the site or its shape moved"
+            )
+            assert found is not None
+            self.assertEqual(
+                found.group(1),
+                authoritative,
+                f"{label} names a service the installer does not create",
+            )
+
+        driver_name_sites = (
+            ("ServiceManager.hpp driverServiceName", self.service_manager_hpp,
+             r'driverServiceName\s*\{\s*L"([^"]+)"'),
+        )
+        for label, source, pattern in driver_name_sites:
+            found = re.search(pattern, strip_c_comments(source))
+            self.assertIsNotNone(found, f"{label}: declaration not found")
+            assert found is not None
+            self.assertEqual(
+                found.group(1),
+                driver_name,
+                f"{label} must follow DRIVER_SERVICE_NAME, which follows the INF",
+            )
+
+        # RollbackManager stops and restarts services around a file restore, so BOTH of
+        # its names must be real. PhantomSensor.sys is matched by kCriticalFileExtensions,
+        # and a loaded driver image cannot be overwritten, so a wrong driver name here
+        # meant driver rollback could not have worked.
+        array = re.search(
+            r"kServiceNames\s*\[\s*\]\s*=\s*\{(?P<body>[^}]*)\}",
+            strip_c_comments(self.rollback_manager_cpp),
+        )
+        self.assertIsNotNone(
+            array, "RollbackManager must still declare kServiceNames as an array"
+        )
+        assert array is not None
+        self.assertEqual(
+            re.findall(r'L"([^"]+)"', array.group("body")),
+            [authoritative, driver_name],
+            "RollbackManager must stop the service and the driver the product actually "
+            "registers, in that order",
+        )
+
+        # The retired names must not survive as live literals anywhere in these sources.
+        # Comments quoting them are the point - they record why the name is what it is -
+        # so comments are stripped before this check rather than the names being banned.
+        retired = ("ShadowStrikeAV", "ShadowStrikeSensor", "ShadowStrikeDriver")
+        for label, source in (
+            ("SelfDefense.hpp", self.self_defense_hpp),
+            ("AntivirusService.hpp", self.antivirus_service_hpp),
+            ("ProgramUpdater.cpp", self.program_updater_cpp),
+            ("RollbackManager.cpp", self.rollback_manager_cpp),
+            ("InstallProbe.cpp", self.install_probe_cpp),
+            ("ServiceManager.hpp", self.service_manager_hpp),
+        ):
+            stripped = strip_c_comments(source)
+            for dead in retired:
+                self.assertNotIn(
+                    f'L"{dead}"',
+                    stripped,
+                    f"{label} still uses the retired service name {dead}, which "
+                    f"nothing registers",
+                )
 
 
 @dataclass(frozen=True)
