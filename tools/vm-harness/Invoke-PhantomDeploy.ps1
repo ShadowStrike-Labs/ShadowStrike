@@ -924,13 +924,60 @@ foreach ($name in @('ShadowStrikePhantomService.exe',
     }
 }
 
+# THE LOOSE COPIES UNDER vm_shrd WENT STALE BECAUSE NOTHING REFRESHED THEM.
+#
+# Only the four executables above were ever re-copied, so artifacts\drivers and
+# data\signatures.sdb kept whatever they held the last time somebody put them
+# there by hand. On the 1.0.94 deploy that meant artifacts\drivers\PhantomSensor.sys
+# was 11 days old and carried NO version resource at all, sitting next to an MSI
+# whose driver was freshly built and stamped 1.0.94.0. Anyone loading the driver
+# by hand on the VM - which is the only reason these loose copies exist - would
+# have installed a different binary from the one under test and drawn conclusions
+# about it.
+#
+# This is the defect Sync-DriverStaging already documents for build\installer\staging
+# ("The staging directory and the shipped package disagreed, and staging is the one
+# a human looks at"). vm_shrd is looked at more often than staging is, so it earns
+# the same treatment.
+#
+# Copied from $StagingDir rather than rebuilt or re-signed, because $StagingDir
+# holds the exact bytes the MSI's CAB was built from. Deriving them any other way
+# reintroduces the possibility of disagreement that this block exists to remove.
+$VmDrivers = Join-Path $VmArtifacts 'drivers'
+New-Item -ItemType Directory -Force -Path $VmDrivers | Out-Null
+foreach ($name in @('PhantomSensor.sys', 'PhantomSensor.inf', 'PhantomSensor.cat')) {
+    $src = Join-Path (Join-Path $StagingDir 'drivers') $name
+    if (Test-Path $src -PathType Leaf) {
+        Copy-Item $src $VmDrivers -Force
+    } else {
+        Die "Driver artifact missing from staging: $src. The MSI was built from this directory, so a loose copy under vm_shrd cannot be made to agree with the installer."
+    }
+}
+
+$VmData = Join-Path $VmShared 'data'
+New-Item -ItemType Directory -Force -Path $VmData | Out-Null
+foreach ($name in @('signatures.sdb', 'THIRD-PARTY-RULES.md')) {
+    $src = Join-Path (Join-Path $StagingDir 'Content') $name
+    if (Test-Path $src -PathType Leaf) {
+        Copy-Item $src (Join-Path $VmData $name) -Force
+    }
+}
+
 $bundleHash = (Get-FileHash $BundleOut -Algorithm SHA256).Hash
 $msiHash    = (Get-FileHash $MsiOut    -Algorithm SHA256).Hash
 $hashLines = @("$bundleHash *ShadowStrikePhantom-Home-Setup.exe",
                "$msiHash *ShadowStrikePhantom-Home-Setup.msi")
-foreach ($artifact in Get-ChildItem $VmArtifacts -File -ErrorAction SilentlyContinue | Sort-Object Name) {
+# RECURSIVE, and relative to $VmShared. The old enumeration was non-recursive over
+# artifacts\ alone, so the manifest silently described six files while the share
+# held the driver and the 64 MB detection database as well - the two payloads whose
+# integrity matters most, and the two a reader would most want to check a hash for.
+foreach ($artifact in Get-ChildItem $VmShared -File -Recurse -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -ne 'SHA256SUMS.txt' -and $_.FullName -notmatch '\\diag' } |
+                          Sort-Object FullName) {
+    $rel = $artifact.FullName.Substring($VmShared.Length).TrimStart('\')
+    if ($rel -eq 'ShadowStrikePhantom-Home-Setup.exe' -or $rel -eq 'ShadowStrikePhantom-Home-Setup.msi') { continue }
     $hash = (Get-FileHash $artifact.FullName -Algorithm SHA256).Hash
-    $hashLines += "$hash *artifacts\$($artifact.Name)"
+    $hashLines += "$hash *$rel"
 }
 $hashLines | Out-File (Join-Path $VmShared 'SHA256SUMS.txt') -Encoding ascii -Force
 
