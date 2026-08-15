@@ -330,6 +330,96 @@ TEST(WireFormatContractTest, FileOperationEventIsFramedNotBare) {
 }
 
 // ============================================================================
+// THE BEHAVIOURAL ALERT MUST SATISFY A CONSUMER THAT ALREADY EXISTED
+// ============================================================================
+//
+// BehaviorBlocker::OnKernelBehavioralAlert reads a uint32 process id at offset 0
+// and a uint32 parent process id at offset 4, and refuses anything shorter than
+// those eight bytes. That consumer was written first and had never been reached:
+// the only producer of FilterMessageType_BehavioralAlert in the driver sent a bare
+// SHADOWSTRIKE_MESSAGE_HEADER with DataSize == 0, and RealTimeProtection gates the
+// call on `if (data && size > 0)`. So the contract existed and was unsatisfiable,
+// which is the shape these tests exist to catch.
+//
+TEST(WireFormatContractTest, BehavioralAlertFieldOffsetsAreFixed) {
+    EXPECT_EQ(56u, sizeof(SHADOWSTRIKE_BEHAVIORAL_ALERT));
+
+    EXPECT_EQ(0u,  offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, ProcessId));
+    EXPECT_EQ(4u,  offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, ParentProcessId));
+    EXPECT_EQ(8u,  offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, ThreadId));
+    EXPECT_EQ(12u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, SequenceNumber));
+    EXPECT_EQ(16u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Timestamp));
+    EXPECT_EQ(24u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Keywords));
+    EXPECT_EQ(32u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, CorrelationId));
+    EXPECT_EQ(40u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, EventId));
+    EXPECT_EQ(42u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Task));
+    EXPECT_EQ(44u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Level));
+    EXPECT_EQ(45u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Opcode));
+    EXPECT_EQ(46u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Priority));
+    EXPECT_EQ(47u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Source));
+    EXPECT_EQ(48u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, UserDataBytes));
+    EXPECT_EQ(52u, offsetof(SHADOWSTRIKE_BEHAVIORAL_ALERT, Reserved0));
+
+    // Every field fixed-width. An enum here would let the layout move silently
+    // between the kernel producer and this consumer.
+    static_assert(std::is_same_v<decltype(SHADOWSTRIKE_BEHAVIORAL_ALERT::Priority), uint8_t>,
+                  "Priority is narrowed from a kernel enum on purpose");
+    static_assert(std::is_same_v<decltype(SHADOWSTRIKE_BEHAVIORAL_ALERT::Source), uint8_t>,
+                  "Source is narrowed from a kernel enum on purpose");
+}
+
+// THE DISCRIMINATOR. This reads the payload byte-for-byte the way
+// BehaviorBlocker::OnKernelBehavioralAlert does - two memcpy's from offsets 0 and
+// 4 - rather than by naming the fields. A test that read alert.ProcessId would
+// pass even if the consumer and the producer disagreed about where the process id
+// lives, which is the only failure that matters here.
+TEST(WireFormatContractTest, BehavioralAlertIsReadableTheWayTheConsumerReadsIt) {
+    SHADOWSTRIKE_BEHAVIORAL_ALERT alert{};
+    alert.ProcessId       = 0xA1B2C3D4u;
+    alert.ParentProcessId = 0x11223344u;
+    alert.ThreadId        = 0x55667788u;
+
+    const auto* raw = reinterpret_cast<const uint8_t*>(&alert);
+
+    // Exactly the consumer's arithmetic.
+    constexpr size_t kMinPayload = sizeof(uint32_t) * 2;
+    ASSERT_GE(sizeof(alert), kMinPayload)
+        << "the payload must satisfy the consumer's documented minimum";
+
+    uint32_t pid = 0;
+    uint32_t parentPid = 0;
+    std::memcpy(&pid, raw, sizeof(uint32_t));
+    std::memcpy(&parentPid, raw + sizeof(uint32_t), sizeof(uint32_t));
+
+    EXPECT_EQ(0xA1B2C3D4u, pid);
+    EXPECT_EQ(0x11223344u, parentPid);
+
+    // And the next field must NOT be where the consumer looks for either of those,
+    // which is what catches a field inserted at the front.
+    EXPECT_NE(alert.ThreadId, pid);
+    EXPECT_NE(alert.ThreadId, parentPid);
+}
+
+// A header-only frame is what the producer used to emit. It cannot satisfy the
+// consumer and it cannot be encrypted, so it must remain distinguishable from a
+// real one by size alone - that is the property the kernel's three refusal checks
+// rely on.
+TEST(WireFormatContractTest, BehavioralAlertHeaderOnlyFrameIsDistinguishable) {
+    constexpr size_t kHeaderOnly = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+    constexpr size_t kFramed =
+        sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_BEHAVIORAL_ALERT);
+
+    EXPECT_EQ(40u, kHeaderOnly);
+    EXPECT_EQ(96u, kFramed);
+    EXPECT_GT(kFramed, kHeaderOnly)
+        << "the kernel refuses any frame whose size is <= one header, because such "
+           "a frame has no payload to encrypt and so cannot be authenticated";
+
+    // The payload the consumer needs cannot fit in a frame that carries none.
+    EXPECT_LT(kHeaderOnly, kHeaderOnly + (sizeof(uint32_t) * 2));
+}
+
+// ============================================================================
 // PER-TYPE STATISTICS MUST COVER EVERY TYPE ON THE WIRE
 // ============================================================================
 //

@@ -22,6 +22,7 @@ SCAN_BRIDGE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/ScanBridg
 SCAN_BRIDGE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/ScanBridge.h"
 COMM_PORT_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.c"
 COMM_PORT_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.h"
+DRIVER_ENTRY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/DriverEntry.c"
 
 
 def read_source(path: Path) -> str:
@@ -122,6 +123,7 @@ class SourceContractTests(unittest.TestCase):
         cls.scan_bridge_h = read_source(SCAN_BRIDGE_H_PATH)
         cls.comm_port_c = read_source(COMM_PORT_C_PATH)
         cls.comm_port_h = read_source(COMM_PORT_H_PATH)
+        cls.driver_entry_c = read_source(DRIVER_ENTRY_C_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -281,6 +283,80 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("SHADOWSTRIKE_INC_STAT(MessagesDropped)", body)
         # The plaintext refusal is absolute and must stay that way.
         self.assertIn("STATUS_ENCRYPTION_FAILED", body)
+
+    def test_no_send_path_transmits_a_payloadless_frame(self) -> None:
+        # Every one of these three used to gate its encryption block on
+        # `size > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)`, which meant a frame with no
+        # payload skipped encryption entirely and went out in cleartext. The
+        # notification funnel was actively producing them, from the ETW callback in
+        # DriverEntry.c; the other two were latent, which is worse rather than
+        # better, because "the callers happen to always supply a payload" is an
+        # assumption about future callers and not a property of the function.
+        #
+        # Refused rather than authenticated because EncEncrypt rejects a zero-length
+        # plaintext by documented contract (ENC_MIN_PLAINTEXT_SIZE == 1), so such a
+        # frame cannot be authenticated at all without changing the primitive every
+        # path shares and the user-mode receive path with it.
+        notify = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendNotification")
+        )
+        scan = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendScanRequest")
+        )
+        drain = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeDrainMessageQueue")
+        )
+
+        self.assertRegex(
+            notify, r"Size\s*<=\s*sizeof\(SHADOWSTRIKE_MESSAGE_HEADER\)"
+        )
+        self.assertRegex(
+            scan, r"RequestSize\s*<=\s*sizeof\(SHADOWSTRIKE_MESSAGE_HEADER\)"
+        )
+        self.assertRegex(
+            drain, r"sendSize\s*<=\s*sizeof\(SHADOWSTRIKE_MESSAGE_HEADER\)"
+        )
+
+        # In the funnel the refusal must precede the queue fallback: a frame that
+        # must not be transmitted must not be buffered for later transmission.
+        refusal_at = notify.index("Size <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)")
+        enqueue_at = notify.index("MqEnqueueMessage")
+        self.assertLess(refusal_at, enqueue_at)
+
+    def test_behavioural_alert_producer_carries_a_payload(self) -> None:
+        # The ETW consumer callback is the ONLY producer of
+        # FilterMessageType_BehavioralAlert in the driver (RegpSendBehavioralAlert is
+        # misnamed and sends FilterMessageType_RegistryNotify). It used to
+        # hand-assemble a bare header with DataSize = 0 and the process id stuffed
+        # into MessageId, so the user-mode consumer - which parses a pid/ppid pair
+        # and can block a process - was gated out by `if (data && size > 0)` and
+        # never ran once.
+        body = strip_c_comments(
+            extract_c_function(self.driver_entry_c, "ShadowStrikeEtwEventCallback")
+        )
+
+        self.assertIn("SHADOWSTRIKE_BEHAVIORAL_ALERT", body)
+        self.assertIn("ShadowStrikeBatchSendNotification", body)
+        self.assertIn("alert.ProcessId", body)
+
+        # It must not go back to hand-building a frame, and in particular must not
+        # overload MessageId to carry a process id.
+        self.assertNotIn("hdr.DataSize = 0", body)
+        self.assertNotIn("MessageId", body)
+        self.assertNotIn("ShadowStrikeSendNotification", body)
+
+    def test_batch_flush_delivers_through_the_encrypting_funnel(self) -> None:
+        # The producer above relies on this: ShadowStrikeBatchSendNotification queues
+        # via BpQueueEvent, and the flush callback is what actually sends. If that
+        # ever stopped using ShadowStrikeSendNotification, routing the alert through
+        # the batch path would silently move it back onto an unencrypted transport.
+        flush = strip_c_comments(
+            extract_c_function(self.driver_entry_c, "ShadowStrikeBatchFlushCallback")
+        )
+
+        self.assertIn("ShadowStrikeSendNotification(msg, totalSize)", flush)
+        self.assertIn("msg->DataSize = (UINT32)evt->DataSize;", flush)
+        self.assertNotIn("FltSendMessage", flush)
 
     def test_per_slot_identity_replaces_scalar_and_rejects_pid_zero(self) -> None:
         scanner_check = extract_c_function(

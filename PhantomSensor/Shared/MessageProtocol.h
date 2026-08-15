@@ -243,6 +243,77 @@ C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, Timestamp)      == 20);
 C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, FileNameBytes)  == 28);
 
 //
+// 1b. Behavioural Alert (FilterMessageType_BehavioralAlert)
+//
+// THE FIRST TWO FIELDS ARE NOT FREE CHOICES. BehaviorBlocker::
+// OnKernelBehavioralAlert already reads a UINT32 process id at offset 0 and a
+// UINT32 parent process id at offset 4, and refuses any payload shorter than
+// those eight bytes. That consumer predates this structure; it has simply never
+// been reached, because the only producer of this message type in the driver sent
+// a bare SHADOWSTRIKE_MESSAGE_HEADER with DataSize == 0 and the consumer is gated
+// behind `if (data && size > 0)`. So the wire contract already existed and was
+// unsatisfiable. Do not reorder these two fields.
+//
+// Every field is fixed-width. The kernel source of this event is EC_EVENT_RECORD,
+// whose Priority and Source members are C enumerations - their width is at the
+// compiler's discretion, so they are narrowed to UINT8 here on purpose rather
+// than being placed on the wire as enums. This is the same defect class as the
+// HANDLE and FILE_INFORMATION_CLASS members that used to sit on the file
+// operation payload above.
+//
+// ParentProcessId == 0 means NOT RESOLVED, not "parent is process 0". The ETW
+// record carries no parent, and resolving one per event would mean a
+// PASSIVE_LEVEL process lookup on a path the driver's own comments describe as
+// running at thousands of events per second - the class of per-event cost that
+// produced the multi-minute stalls this product has already had to remove. The
+// consumer uses parentPid for reporting only (BehaviorBlocker.cpp:795 assigns it
+// and :377 serialises it); no blocking decision reads it, so an unresolved value
+// costs a field in a report and nothing else.
+//
+typedef struct _SHADOWSTRIKE_BEHAVIORAL_ALERT {
+    UINT32 ProcessId;         // Originating process. Consumer reads this at 0.
+    UINT32 ParentProcessId;   // 0 == not resolved in kernel. Consumer reads at 4.
+    UINT32 ThreadId;          // Originating thread
+    UINT32 SequenceNumber;    // Monotonic per-record sequence from the consumer
+    INT64  Timestamp;         // KeQuerySystemTime, 100ns units
+    UINT64 Keywords;          // ETW provider keywords
+    UINT64 CorrelationId;     // Attack-chain correlation, 0 if uncorrelated
+    UINT16 EventId;           // ETW event id within the provider
+    UINT16 Task;              // ETW task
+    UINT8  Level;             // ETW level
+    UINT8  Opcode;            // ETW opcode
+    UINT8  Priority;          // EC_EVENT_PRIORITY, narrowed
+    UINT8  Source;            // EC_EVENT_SOURCE, narrowed
+    UINT32 UserDataBytes;     // Provider payload the kernel saw; NOT carried here
+    UINT32 Reserved0;         // Must be zero
+} SHADOWSTRIKE_BEHAVIORAL_ALERT, *PSHADOWSTRIKE_BEHAVIORAL_ALERT;
+
+C_ASSERT(sizeof(SHADOWSTRIKE_BEHAVIORAL_ALERT) == 56);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, ProcessId)       ==  0);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, ParentProcessId) ==  4);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, ThreadId)        ==  8);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, SequenceNumber)  == 12);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Timestamp)       == 16);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Keywords)        == 24);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, CorrelationId)   == 32);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, EventId)         == 40);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Task)            == 42);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Level)           == 44);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Opcode)          == 45);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Priority)        == 46);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Source)          == 47);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, UserDataBytes)   == 48);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_BEHAVIORAL_ALERT, Reserved0)       == 52);
+
+//
+// The consumer's minimum is eight bytes - one process id and one parent process
+// id. Asserting that here means a future edit cannot shrink this payload below
+// what BehaviorBlocker requires without failing the build, instead of producing a
+// payload the consumer logs as "too small" and then answers Allow to.
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_BEHAVIORAL_ALERT) >= (2 * sizeof(UINT32)));
+
+//
 // 2. Scan Verdict Reply (FilterMessageType_ScanVerdict)
 //
 typedef struct _SHADOWSTRIKE_SCAN_VERDICT_REPLY {

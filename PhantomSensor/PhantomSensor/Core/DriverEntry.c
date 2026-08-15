@@ -464,16 +464,69 @@ ShadowStrikeEtwEventCallback(
     // to avoid flooding the communication channel.
     //
     if (Record->Priority <= EcPriority_Normal) {
-        SHADOWSTRIKE_MESSAGE_HEADER hdr = { 0 };
-        hdr.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
-        hdr.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
-        hdr.MessageType = (UINT16)FilterMessageType_BehavioralAlert;
-        hdr.TotalSize = sizeof(hdr);
-        hdr.DataSize = 0;
-        hdr.MessageId = (UINT64)Record->Header.ProcessId;
-        KeQuerySystemTime((PLARGE_INTEGER)&hdr.Timestamp);
+        //
+        // Build a real payload. This used to hand-assemble a bare
+        // SHADOWSTRIKE_MESSAGE_HEADER with DataSize = 0, TotalSize = sizeof(hdr)
+        // and the ProcessId stuffed into MessageId, then call
+        // ShadowStrikeSendNotification directly. Three things were wrong with it.
+        //
+        // 1. IT CONVEYED NOTHING AND REACHED NOBODY. The user-mode consumer,
+        //    RealTimeProtection's FilterMessageType_BehavioralAlert case, is gated
+        //    on `if (data && size > 0)` before it calls
+        //    BehaviorBlocker::OnKernelBehavioralAlert - which parses a process id
+        //    and parent process id and can go on to BLOCK a process. With
+        //    DataSize == 0 that call never happened. This is the only producer of
+        //    this message type in the driver (RegpSendBehavioralAlert is misnamed
+        //    and actually sends FilterMessageType_RegistryNotify), so the kernel
+        //    behavioural path into BehaviorBlocker has never carried one event.
+        //    The alert also could not say WHICH behaviour fired.
+        //
+        // 2. IT WENT OUT IN CLEARTEXT. ShadowStrikeSendNotification gates its
+        //    encryption block on `sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)`,
+        //    so a header-only frame skipped encryption entirely and was sent
+        //    unauthenticated - directly contradicting that function's own
+        //    "never send plaintext" policy.
+        //
+        // 3. IT USED THE UNBATCHED PATH. This callback's own comments describe a
+        //    channel carrying thousands of events per second. Sixty lines above
+        //    this one, the same file defines ShadowStrikeBatchFlushCallback, and
+        //    ShadowStrikeBatchSendNotification exists precisely to route
+        //    high-throughput events through BpQueueEvent. That funnel builds the
+        //    header itself, keeps the payload, delivers via
+        //    ShadowStrikeSendNotification from the flush thread (so it is
+        //    encrypted), and drops rather than faulting above APC_LEVEL.
+        //
+        SHADOWSTRIKE_BEHAVIORAL_ALERT alert;
 
-        ShadowStrikeSendNotification(&hdr, sizeof(hdr));
+        RtlZeroMemory(&alert, sizeof(alert));
+
+        alert.ProcessId       = Record->Header.ProcessId;
+        alert.ParentProcessId = 0;  // Not resolved here - see the wire struct's comment
+        alert.ThreadId        = Record->Header.ThreadId;
+        alert.SequenceNumber  = Record->SequenceNumber;
+        alert.Timestamp       = Record->Header.Timestamp.QuadPart;
+        alert.Keywords        = Record->Header.Keywords;
+        alert.CorrelationId   = Record->IsCorrelated ? Record->CorrelationId : 0ULL;
+        alert.EventId         = Record->Header.EventId;
+        alert.Task            = Record->Header.Task;
+        alert.Level           = Record->Header.Level;
+        alert.Opcode          = Record->Header.Opcode;
+
+        //
+        // Priority and Source are C enumerations in EC_EVENT_RECORD, so their
+        // width is the compiler's choice. Narrowed explicitly rather than assigned
+        // through, because an enum on a wire structure is how field offsets drift
+        // between producer and consumer without any diagnostic.
+        //
+        alert.Priority        = (UINT8)Record->Priority;
+        alert.Source          = (UINT8)Record->Source;
+        alert.UserDataBytes   = Record->UserDataLength;
+
+        (VOID)ShadowStrikeBatchSendNotification(
+            (UINT16)FilterMessageType_BehavioralAlert,
+            &alert,
+            sizeof(alert)
+        );
     }
 
     return EcResult_Continue;

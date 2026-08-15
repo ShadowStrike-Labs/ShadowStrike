@@ -1224,16 +1224,37 @@ ShadowStrikeDrainMessageQueue(
 
             //
             // Encrypt the queued message before sending.
-            // If encryption fails, DROP the message — never send plaintext.
+            // If encryption fails, DROP the message - never send plaintext.
             //
-            if (sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+            // The `> sizeof(header)` test used to be the gate on this whole block,
+            // which meant a queued message with NO PAYLOAD skipped encryption
+            // entirely and was sent in cleartext - the exact opposite of the rule
+            // stated on the line above. It is now a drop, for the reason recorded
+            // at the equivalent check in ShadowStrikeSendNotification: EncEncrypt
+            // refuses a zero-length plaintext by documented contract
+            // (ENC_MIN_PLAINTEXT_SIZE == 1), so a payload-less frame cannot be
+            // authenticated, and the fix belongs at whatever produced it.
+            //
+            if (sendSize <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                           "[ShadowStrike/CommPort] Dropping queued message with no "
+                           "payload (type=%u, size=%lu): cannot be encrypted, so "
+                           "cannot be authenticated\n",
+                           (unsigned)messages[i]->MessageType,
+                           (unsigned long)sendSize);
+                dropMessage = TRUE;
+            } else {
                 ULONG dataSize = sendSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
                 ULONG encryptedSize = 0;
                 NTSTATUS encSizeStatus;
 
-                if (!canEncrypt) {
-                    dropMessage = TRUE;
-                } else {
+                //
+                // canEncrypt was already required non-FALSE at :1208 - this
+                // function returns early otherwise - so the inner re-test that
+                // used to sit here could never fire and has been removed rather
+                // than left to imply a branch that does not exist.
+                //
+                {
                     encSizeStatus = EncGetEncryptedSize(dataSize, TRUE, &encryptedSize);
                     if (!NT_SUCCESS(encSizeStatus) || encryptedSize == 0) {
                         dropMessage = TRUE;
@@ -3694,7 +3715,30 @@ ShadowStrikeSendScanRequest(
     ULONG encryptedSendSize = 0;
     BOOLEAN encryptionAllocated = FALSE;
 
-    if (RequestSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+    //
+    // A scan request with no payload is refused, not sent.
+    //
+    // This block used to be gated on `RequestSize > sizeof(header)`, so a
+    // header-only request would have skipped encryption and gone out in cleartext
+    // while this function's contract is to return STATUS_ENCRYPTION_FAILED rather
+    // than transmit plaintext. In practice a scan request always carries a
+    // FILE_SCAN_REQUEST, so this was latent here rather than active - but "the
+    // callers happen to always supply a payload" is an assumption about every
+    // present and future caller, not a property of this function, and it is the
+    // same gate that was actively producing cleartext on the notification path.
+    //
+    if (RequestSize <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Refusing scan request with no payload "
+                   "(size=%lu): cannot be encrypted, so cannot be authenticated\n",
+                   (unsigned long)RequestSize);
+        ShadowStrikeReleaseClientPort(clientRef);
+        InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
         BOOLEAN encryptionReady =
             ShadowStrikeIsClientEncryptionEstablished(clientRef);
@@ -3928,6 +3972,48 @@ ShadowStrikeSendNotification(
     }
 
     //
+    // A HEADER-ONLY FRAME IS REFUSED HERE, BEFORE ANYTHING ELSE.
+    //
+    // The encryption block below is gated on sendSize being strictly greater than
+    // the header, because it encrypts the payload and uses the header as AAD. A
+    // frame with no payload therefore skipped that block entirely and went out in
+    // cleartext, unauthenticated - contradicting this function's own policy, stated
+    // a few lines further down, of dropping rather than downgrading.
+    //
+    // Refused rather than authenticated, and the reason is measured rather than
+    // preferred: AES-GCM over an empty plaintext is well defined and would produce
+    // a tag over the header alone, but EncEncrypt rejects PlaintextSize == 0
+    // outright (Encryption.c:1674) and ENC_MIN_PLAINTEXT_SIZE is 1
+    // (Encryption.h:86). That is a deliberate, documented contract of the crypto
+    // module, not an oversight. Honouring an empty payload would mean changing the
+    // primitive every path in this driver shares AND the user-mode receive path,
+    // in order to reliably deliver a message that by construction carries no
+    // information.
+    //
+    // The correct fix is at the producer, and it was applied in the same change:
+    // the ETW consumer callback in DriverEntry.c was the only caller that produced
+    // one of these, and it now sends a populated SHADOWSTRIKE_BEHAVIORAL_ALERT. So
+    // this check should never fire. If it does, something is emitting a message
+    // that says nothing, and that is worth a log line and a counter rather than a
+    // silent cleartext send.
+    //
+    // Placed BEFORE the port acquisition and the MqEnqueueMessage fallback on
+    // purpose: a frame that must not be transmitted must not be queued for later
+    // transmission either.
+    //
+    if (Size <= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Refusing notification with no payload "
+                   "(type=%u, size=%lu, header=%lu): it cannot be encrypted and so "
+                   "cannot be authenticated\n",
+                   (unsigned)Notification->MessageType,
+                   (unsigned long)Size,
+                   (unsigned long)sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
     // NO PAYLOAD COMPRESSION HERE, DELIBERATELY.
     //
     // This path used to LZ4-compress the notification payload whenever that
@@ -4015,7 +4101,11 @@ ShadowStrikeSendNotification(
     clientPort = clientRef->ClientPort;
 
     //
-    // Encrypt notification if session key is established
+    // Encrypt the notification. The entry check above guarantees a payload exists,
+    // so this test is now a defensive floor rather than a branch that decides
+    // whether to encrypt: there is no path through this function that transmits an
+    // unencrypted frame. Kept as a test rather than removed so the arithmetic below
+    // cannot underflow if that entry check is ever weakened.
     //
     if (sendSize > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
         PENC_MANAGER encMgr = ShadowStrikeGetEncryptionManager();
