@@ -118,6 +118,45 @@ template<typename Func>
     return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 }
 
+/**
+ * @brief Measure the FASTEST of several runs, after a discarded warm-up.
+ * @return Best observed duration in nanoseconds.
+ *
+ * Every test here that compares two timings against a ratio needs this rather
+ * than a single measurement, and the reason is not fussiness.
+ *
+ * A single timing of a short loop is the true cost PLUS whatever the machine did
+ * to it - a scheduler preemption, a page fault on first touch, a cache eviction
+ * by another test's data, a frequency change. Interference can only ever ADD
+ * time, never remove it, so the minimum of several runs converges on the real
+ * cost while a single run is an upper bound of unknown looseness. Comparing two
+ * such upper bounds against a 1.5x or 2x threshold is a coin toss whenever the
+ * true ratio is near 1, which for these particular pairs it is by design.
+ *
+ * That is not hypothetical: MemoryMappedQuery_ComparableToBuilt failed in a full
+ * 4,931-test run and passed five times out of five when run alone, with the two
+ * loops doing identical work over identical data. A test that cannot tell a real
+ * 2x regression from a scheduling hiccup does not measure performance, and in a
+ * suite this size an intermittent failure costs more than the test is worth
+ * because it teaches the reader to disregard a red run.
+ *
+ * The thresholds are deliberately left exactly as they were. This changes only
+ * the quality of the estimate, so a genuine regression is now MORE likely to be
+ * caught, not less - noise previously cut both ways.
+ */
+template<typename Func>
+[[nodiscard]] int64_t MeasureBestOfNanoseconds(Func&& func, int runs = 5) {
+    // Discarded: pays first-touch page faults and cache warming so they are not
+    // charged to whichever side happens to run first.
+    func();
+
+    int64_t best = std::numeric_limits<int64_t>::max();
+    for (int i = 0; i < runs; ++i) {
+        best = std::min(best, MeasureNanoseconds(func));
+    }
+    return best;
+}
+
 /// @brief Default test parameters
 constexpr size_t DEFAULT_TEST_ELEMENTS = 10'000;
 constexpr double DEFAULT_TEST_FPR = 0.01;  // 1%
@@ -1331,8 +1370,19 @@ TEST(BloomFilter_Performance, BatchQuery_FasterThanSingleQuery) {
     
     const auto queryHashes = GenerateTestHashes(10000, 1000000);
     
-    // Single query timing
-    const int64_t singleNs = MeasureNanoseconds([&]() {
+    // Single query timing. Best-of for the same reason as
+    // MemoryMappedQuery_ComparableToBuilt: both sides are pure reads, so
+    // repetition is free of side effects, and the threshold is close enough to
+    // the true ratio that a single sample is dominated by interference.
+    //
+    // NOTE: BatchAdd_FasterThanSingleAdd is deliberately NOT converted. Its loops
+    // MUTATE the filters, so repeating them would keep adding the same hashes -
+    // inflating the element count and eventually running into the configured
+    // capacity, at which point a refused BatchAdd would time as nearly free and
+    // the test would pass for the wrong reason. Making a test pass by letting it
+    // measure less is worse than leaving it single-shot; it has ample margin
+    // because BatchAdd genuinely avoids 10,000 separate calls.
+    const int64_t singleNs = MeasureBestOfNanoseconds([&]() {
         for (uint64_t h : queryHashes) {
             (void)filter.MightContain(h);
         }
@@ -1342,7 +1392,7 @@ TEST(BloomFilter_Performance, BatchQuery_FasterThanSingleQuery) {
     auto results_buf = std::make_unique<bool[]>(queryHashes.size());
     std::span<bool> results(results_buf.get(), queryHashes.size());
     
-    const int64_t batchNs = MeasureNanoseconds([&]() {
+    const int64_t batchNs = MeasureBestOfNanoseconds([&]() {
         [[maybe_unused]] const size_t positives = filter.BatchQuery(queryHashes, results);
     });
     
@@ -1369,14 +1419,19 @@ TEST(BloomFilter_Performance, MemoryMappedQuery_ComparableToBuilt) {
     const auto queryHashes = GenerateTestHashes(10000, 1000000);
     
     // Built filter query time
-    const int64_t builtNs = MeasureNanoseconds([&]() {
+    //
+    // Best-of, because both loops here do IDENTICAL work over IDENTICAL data, so
+    // the true ratio is ~1.0 and a single sample of each cannot distinguish a
+    // real regression from one scheduling hiccup. Repetition is safe: both loops
+    // are pure reads with no side effects.
+    const int64_t builtNs = MeasureBestOfNanoseconds([&]() {
         for (uint64_t h : queryHashes) {
             (void)builder.MightContain(h);
         }
     });
     
     // Memory-mapped filter query time
-    const int64_t mappedNs = MeasureNanoseconds([&]() {
+    const int64_t mappedNs = MeasureBestOfNanoseconds([&]() {
         for (uint64_t h : queryHashes) {
             (void)reader.MightContain(h);
         }
