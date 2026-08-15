@@ -1266,15 +1266,50 @@ private:
      * @return true if no encryption flag set, or if decryption succeeded
      */
     bool DecryptReceivedMessage(uint8_t* buffer, size_t& actualBytes) {
-        if (!m_encryptionEstablished.load(std::memory_order_acquire)) return true;
-
-        // The filter message starts with FILTER_MESSAGE_HEADER, followed by
-        // our SHADOWSTRIKE_MESSAGE_HEADER and payload.
+        // The transform check below must run for EVERY frame, so the size test
+        // and the header pointer come first. Returning early on the encryption
+        // state (as this function used to do) would let a frame carrying an
+        // unhandled payload transform straight through to the parser.
         if (actualBytes < sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_MESSAGE_HEADER))
-            return true;  // Too small to contain encrypted data
+            return true;  // Too small to contain a header we could inspect
 
         auto* ssHeader = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(
             buffer + sizeof(FILTER_MESSAGE_HEADER));
+
+        // ── Refuse any payload transform this build cannot reverse ──────────
+        //
+        // Only ENCRYPTED is reversed here. Anything else named in
+        // SHADOWSTRIKE_MSG_FLAG_PAYLOAD_TRANSFORMS changes the payload bytes
+        // and we have no inverse for it, so the frame is refused rather than
+        // parsed.
+        //
+        // COMPRESSED is the reason this check exists. The driver compressed
+        // notification payloads whenever that saved at least 10% and set this
+        // bit; no user-mode reader has ever tested for it. The frame decrypted
+        // cleanly, so nothing reported a failure - the consumer simply read
+        // compressed bytes as a structure. On a path that carries rename and
+        // delete notifications, that means the file a decision is made about is
+        // not the file the kernel named.
+        //
+        // Refusing is correct rather than conservative: the caller already
+        // treats a false return as "frame unusable" and answers the kernel
+        // fail-open, which is a known, counted, visible outcome. Parsing
+        // transformed bytes is an invisible wrong answer.
+        constexpr uint32_t kReversibleTransforms = SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+        const uint32_t unhandledTransforms =
+            ssHeader->Flags & SHADOWSTRIKE_MSG_FLAG_PAYLOAD_TRANSFORMS &
+            ~kReversibleTransforms;
+        if (unhandledTransforms != 0) {
+            Utils::Logger::Error(
+                "[FilterConnection] Frame carries payload transform(s) this build "
+                "cannot reverse (flags=0x{:08X}, unhandled=0x{:08X}, type={}); "
+                "refusing it rather than parsing transformed bytes as a structure",
+                ssHeader->Flags, unhandledTransforms,
+                static_cast<unsigned>(ssHeader->MessageType));
+            return false;
+        }
+
+        if (!m_encryptionEstablished.load(std::memory_order_acquire)) return true;
 
         if (!(ssHeader->Flags & SHADOWSTRIKE_MSG_FLAG_ENCRYPTED))
             return true;  // Not encrypted

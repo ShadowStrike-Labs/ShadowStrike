@@ -34,6 +34,37 @@
 #define SHADOWSTRIKE_MSG_FLAG_NO_ACK            0x00000008  // Fire-and-forget, no acknowledgment needed
 #define SHADOWSTRIKE_MSG_FLAG_ENCRYPTED         0x00000010  // Payload encrypted with per-session AES-256-GCM key
 
+//
+// Flags that TRANSFORM the payload bytes, as opposed to merely describing how
+// the frame should be delivered.
+//
+// The distinction is load-bearing, which is why it is stated here in the one
+// header both the driver and the service include rather than being re-derived
+// on each side. PRIORITY_HIGH and NO_ACK are delivery hints: a receiver that
+// ignores them still parses the payload correctly. COMPRESSED and ENCRYPTED
+// change the bytes, so a receiver that ignores either one parses transformed
+// data as though it were a structure - which yields plausible-looking garbage,
+// not an error.
+//
+// THE CONTRACT: a receiver MUST reverse every transform named here, or REFUSE
+// the frame. It must never pass a frame upward with one of these bits still
+// set, and it must never ignore a bit it does not recognise.
+//
+// This exists because that rule was broken. The driver compressed notification
+// payloads whenever compression saved at least 10% and set COMPRESSED, and no
+// user-mode reader ever tested for that bit or decompressed anything - measured
+// as zero references to this flag anywhere in the service. The frame decrypted
+// cleanly, the flag was left set, and the consumer read compressed bytes as a
+// struct. Nothing failed; the values were simply wrong, which is the worst
+// available outcome on a detection path.
+//
+// Adding a new transform flag therefore also means adding it here, so every
+// receiver that has not implemented it fails closed instead of silently
+// misreading the payload.
+//
+#define SHADOWSTRIKE_MSG_FLAG_PAYLOAD_TRANSFORMS \
+    (SHADOWSTRIKE_MSG_FLAG_COMPRESSED | SHADOWSTRIKE_MSG_FLAG_ENCRYPTED)
+
 // Ensure structure packing is consistent
 #pragma pack(push, 1)
 

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -3912,9 +3912,6 @@ ShadowStrikeSendNotification(
     LARGE_INTEGER timeout;
     PVOID sendBuffer = Notification;
     ULONG sendSize = Size;
-    PVOID compressedPayload = NULL;
-    PVOID compressedSendBuffer = NULL;  // Track compressed allocation separately
-    BOOLEAN usedCompression = FALSE;
 
     if (!g_DriverData.Config.NotificationsEnabled) {
         return STATUS_SUCCESS;
@@ -3922,8 +3919,8 @@ ShadowStrikeSendNotification(
 
     //
     // Fast-path bail when no user-mode client has connected yet. Avoids
-    // allocating compression / encryption buffers and walking the port
-    // list during early boot before the service registers.
+    // allocating encryption buffers and walking the port list during early
+    // boot before the service registers.
     //
     if (g_DriverData.ConnectedClients == 0) {
         SHADOWSTRIKE_INC_STAT(MessagesDropped);
@@ -3931,83 +3928,42 @@ ShadowStrikeSendNotification(
     }
 
     //
-    // Attempt payload compression for messages exceeding threshold.
-    // Data portion starts after the header; compress only the data.
+    // NO PAYLOAD COMPRESSION HERE, DELIBERATELY.
     //
-    if (Notification->DataSize > COMP_MIN_INPUT_SIZE) {
-        PVOID dataStart = (PUCHAR)Notification + sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
-        ULONG dataSize = Notification->DataSize;
-        //
-        // Compression can expand incompressible data; allocate margin.
-        // LZ4 worst case is input + input/255 + 16; we use input + input/128 + 64
-        // as a conservative upper bound for any algorithm.
-        //
-        ULONG compBufSize = dataSize + (dataSize >> 7) + 64;
-        ULONG compressedSize = 0;
-
-        compressedPayload = ExAllocatePool2(POOL_FLAG_NON_PAGED, compBufSize, 'cmCP');
-        if (compressedPayload != NULL) {
-            status = CompCompress(
-                dataStart,
-                dataSize,
-                compressedPayload,
-                compBufSize,
-                &compressedSize,
-                NULL
-            );
-
-            //
-            // Verify compressed data integrity before sending.
-            // Catches silent LZ4 corruption from memory errors or bugs.
-            //
-            if (NT_SUCCESS(status) && compressedSize > 0) {
-                NTSTATUS verifyStatus = CompVerify(compressedPayload, compressedSize);
-                if (!NT_SUCCESS(verifyStatus)) {
-                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                               "[ShadowStrike/CommPort] Compressed data verification failed: 0x%08X, sending uncompressed\n",
-                               verifyStatus);
-                    status = verifyStatus;  // fall through to send uncompressed
-                }
-            }
-
-            //
-            // Only use compressed form if it saves at least 10% space
-            //
-            if (NT_SUCCESS(status) &&
-                compressedSize > 0 &&
-                compressedSize < (dataSize - dataSize / 10))
-            {
-                ULONG newTotal = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + compressedSize;
-                PSHADOWSTRIKE_MESSAGE_HEADER compMsg =
-                    (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
-                        POOL_FLAG_NON_PAGED, newTotal, 'cmCP');
-                if (compMsg != NULL) {
-                    RtlCopyMemory(compMsg, Notification, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
-                    RtlCopyMemory(
-                        (PUCHAR)compMsg + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
-                        compressedPayload,
-                        compressedSize
-                    );
-                    compMsg->Flags |= SHADOWSTRIKE_MSG_FLAG_COMPRESSED;
-                    compMsg->Reserved = dataSize;   // original uncompressed size
-                    compMsg->DataSize = compressedSize;
-                    compMsg->TotalSize = newTotal;
-                    sendBuffer = compMsg;
-                    sendSize = newTotal;
-                    compressedSendBuffer = compMsg;  // Track for cleanup
-                    usedCompression = TRUE;
-                }
-            }
-
-            ExFreePoolWithTag(compressedPayload, 'cmCP');
-            compressedPayload = NULL;
-        }
-    }
+    // This path used to LZ4-compress the notification payload whenever that
+    // saved at least 10%, and set SHADOWSTRIKE_MSG_FLAG_COMPRESSED. Nothing in
+    // user mode has ever read that flag or decompressed anything - measured as
+    // zero references to it anywhere in the service - so the receiver decrypted
+    // the frame successfully and then parsed COMPRESSED BYTES as a structure.
+    // Nothing failed and nothing was logged; the fields were simply wrong. On
+    // this path, which carries rename and delete notifications, that means the
+    // file a decision is made about need not be the file the kernel named.
+    //
+    // The missing half was NOT implemented instead, and the reason is worth
+    // keeping: the encoder here was a hand-written in-kernel LZ4 with its own
+    // COMP_HEADER, while user mode has only Xpress. Supplying the inverse would
+    // mean matching a bespoke kernel encoder byte-for-byte on the frame-receive
+    // path - a new and much larger opportunity for precisely the silent misread
+    // this removal eliminates.
+    //
+    // Nor is anything given up. This is a local kernel-to-user filter port with
+    // no bandwidth constraint, the payload is a file scan request whose largest
+    // field is a path, and the compressed result was then encrypted anyway.
+    // Removing it also takes one non-paged allocation and one LZ4 pass off a
+    // filter post-operation callback, so this path is now cheaper as well as
+    // correct.
+    //
+    // The receiver enforces the other half: FilterConnection refuses any frame
+    // still carrying a transform named by SHADOWSTRIKE_MSG_FLAG_PAYLOAD_TRANSFORMS
+    // that it cannot reverse, so a future producer cannot reintroduce this
+    // silently.
+    //
 
     //
     // Per-session AES-256-GCM encryption of the notification payload.
-    // At this point sendBuffer/sendSize may contain compressed data.
-    // We encrypt the data portion (after header), using the header as AAD.
+    // sendBuffer/sendSize are the caller's message verbatim - no transform is
+    // applied before this point. We encrypt the data portion (after header),
+    // using the header as AAD.
     //
     PVOID encryptedNotifBuffer = NULL;
     BOOLEAN notifEncrypted = FALSE;
@@ -4053,9 +4009,6 @@ ShadowStrikeSendNotification(
             }
         }
 
-        if (usedCompression) {
-            ExFreePoolWithTag(sendBuffer, 'cmCP');
-        }
         return status;
     }
 
@@ -4073,9 +4026,6 @@ ShadowStrikeSendNotification(
                        "[ShadowStrike] Notification transport unavailable: slot=%ld, encReady=%d\n",
                        clientRef->SlotIndex, encryptionReady);
             ShadowStrikeReleaseClientPort(clientRef);
-            if (usedCompression) {
-                ExFreePoolWithTag(sendBuffer, 'cmCP');
-            }
             SHADOWSTRIKE_INC_STAT(MessagesDropped);
             return STATUS_ENCRYPTION_FAILED;
         }
@@ -4129,9 +4079,6 @@ ShadowStrikeSendNotification(
                                        "[ShadowStrike] Notification encryption failed: 0x%08X, "
                                        "DROPPING message (no plaintext fallback)\n", encStatus);
                             ShadowStrikeReleaseClientPort(clientRef);
-                            if (usedCompression) {
-                                ExFreePoolWithTag(sendBuffer, 'cmCP');
-                            }
                             SHADOWSTRIKE_INC_STAT(MessagesDropped);
                             return STATUS_ENCRYPTION_FAILED;
                         }
@@ -4142,9 +4089,6 @@ ShadowStrikeSendNotification(
                                    "DROPPING message (no plaintext fallback)\n",
                                    clientRef->SlotIndex);
                         ShadowStrikeReleaseClientPort(clientRef);
-                        if (usedCompression) {
-                            ExFreePoolWithTag(sendBuffer, 'cmCP');
-                        }
                         SHADOWSTRIKE_INC_STAT(MessagesDropped);
                         return STATUS_ENCRYPTION_FAILED;
                     }
@@ -4153,9 +4097,6 @@ ShadowStrikeSendNotification(
                     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                                "[ShadowStrike] Notification encryption allocation failed\n");
                     ShadowStrikeReleaseClientPort(clientRef);
-                    if (usedCompression) {
-                        ExFreePoolWithTag(sendBuffer, 'cmCP');
-                    }
                     SHADOWSTRIKE_INC_STAT(MessagesDropped);
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
@@ -4165,9 +4106,6 @@ ShadowStrikeSendNotification(
                            "[ShadowStrike] Notification encrypted size calculation failed: 0x%08X\n",
                            encSizeStatus);
                 ShadowStrikeReleaseClientPort(clientRef);
-                if (usedCompression) {
-                    ExFreePoolWithTag(sendBuffer, 'cmCP');
-                }
                 SHADOWSTRIKE_INC_STAT(MessagesDropped);
                 return STATUS_ENCRYPTION_FAILED;
             }
@@ -4199,9 +4137,6 @@ ShadowStrikeSendNotification(
 
     if (notifEncrypted) {
         ExFreePoolWithTag(encryptedNotifBuffer, 'enCP');
-    }
-    if (usedCompression && compressedSendBuffer != NULL) {
-        ExFreePoolWithTag(compressedSendBuffer, 'cmCP');
     }
 
     if (NT_SUCCESS(status)) {
