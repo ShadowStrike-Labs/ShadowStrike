@@ -275,6 +275,30 @@ PsGetProcessSignatureLevel(
     );
 #endif
 #define PN_USER_MODE_TIMEOUT_MS         5000    // 5 second timeout for user-mode
+//
+// How long a process creation may block waiting for a user-mode verdict.
+//
+// This is NOT PN_USER_MODE_TIMEOUT_MS: that constant is assigned to
+// g_ProcessMonitor.Config.AnalysisTimeoutMs, which no code reads, so its stated
+// intent has never been enforced anywhere - and conflating an "analysis timeout"
+// with the reply wait is the naming drift that let the real budget come from the
+// wrong place for so long.
+//
+// Before this constant existed the wait was g_DriverData.Config.ScanTimeoutMs: a
+// FILE-scan policy value, 30000 ms by default and settable up to 300000 ms. This
+// callback blocks the thread that called CreateProcess, so that was a 30-second
+// stall per suspicious process creation, and five minutes if an administrator
+// raised the file-scan timeout.
+//
+// 500 ms matches PC_SCAN_TIMEOUT_EXECUTE_MS, which is what the file create path
+// allows for the same class of decision - a pre-execution allow/deny where
+// something is waiting to run. It is a chosen value, and the honest reason it can
+// be chosen freely today is that nothing depends on the old one: no user-mode
+// path replies to a process notification at all (see the ALLOW-on-timeout comment
+// at the send site), so every one of these waits currently expires. Revisit with
+// measurement in the change that wires the reply, not before.
+//
+#define PN_VERDICT_REPLY_TIMEOUT_MS     500
 #define PN_MAX_NOTIFICATIONS_PER_SECOND 1000    // Rate limit
 #define PN_RATE_LIMIT_WINDOW_MS         1000    // 1 second window
 #define PN_MAX_PENDING_POOL_BYTES       (4 * 1024 * 1024)  // 4MB max pending
@@ -3800,6 +3824,24 @@ PnpSendProcessNotification(
             RequireReply = FALSE;
         } else {
             PnpTrackPoolAllocation(ReplySize);
+            //
+            // MUST be zeroed explicitly. ShadowStrikeAllocateMessageBuffer serves
+            // any request that fits from ExAllocateFromNPagedLookasideList, which
+            // hands back recycled blocks VERBATIM - unlike the ExAllocatePool2
+            // fallback below it, which zeroes. The notification buffer above is
+            // zeroed; this one was not, so Reply->Verdict was whatever the last
+            // user of that block left at offset 8. A lookaside list is LIFO and
+            // these replies are allocated and freed around a single send, so the
+            // block handed to one process creation is very often the one the
+            // PREVIOUS process creation just released - meaning the byte read was
+            // typically the previous process's verdict.
+            //
+            // Verdict_Malicious is 2 and the read is a single byte, so a genuine
+            // block could propagate to the next suspicious creation that timed
+            // out. This zeroing is defence in depth only: the real fix is that the
+            // verdict is no longer read at all unless a reply arrived (below).
+            //
+            RtlZeroMemory(Reply, ReplySize);
         }
     }
 
@@ -3811,8 +3853,29 @@ PnpSendProcessNotification(
         (ULONG)NotificationSize,
         RequireReply,
         Reply,
-        RequireReply ? &ReplySizeUlong : NULL
+        RequireReply ? &ReplySizeUlong : NULL,
+        RequireReply ? PN_VERDICT_REPLY_TIMEOUT_MS : 0
         );
+
+    //
+    // Whether a verdict actually arrived, which is NOT the same question as
+    // whether the send succeeded. FltSendMessage documents STATUS_TIMEOUT as a
+    // success code, and the timeout handler below deliberately converts it to
+    // STATUS_SUCCESS to express the fail-open policy - so by the time the verdict
+    // branch runs, NT_SUCCESS(Status) is true for both "user mode said allow" and
+    // "nobody answered". Reading Reply->Verdict on the strength of NT_SUCCESS
+    // alone is what made an unanswered request read a recycled buffer.
+    //
+    // The length test covers the other way a verdict can be absent from a
+    // buffer that was nonetheless touched: a reply shorter than the field. The
+    // kernel writes *ReplySize back only when a reply genuinely arrived, so this
+    // reflects the delivered length rather than the capacity we asked for.
+    //
+    BOOLEAN ReplyReceived =
+        (RequireReply && Reply != NULL &&
+         Status != STATUS_TIMEOUT && NT_SUCCESS(Status) &&
+         ReplySizeUlong >= (FIELD_OFFSET(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, Verdict) +
+                            sizeof(UINT8)));
 
     //
     // Handle timeout
@@ -3826,16 +3889,19 @@ PnpSendProcessNotification(
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_WARNING_LEVEL,
-            "[ShadowStrike/ProcessNotify] User-mode timeout for PID %lu, defaulting to ALLOW\n",
+            "[ShadowStrike/ProcessNotify] No user-mode verdict within %lu ms for PID %lu, "
+            "defaulting to ALLOW\n",
+            (ULONG)PN_VERDICT_REPLY_TIMEOUT_MS,
             HandleToULong(Context->ProcessId)
             );
         Status = STATUS_SUCCESS;
     }
 
     //
-    // Handle verdict
+    // Handle verdict. Gated on a verdict having been RECEIVED, not on the call
+    // having returned a success code.
     //
-    if (RequireReply && NT_SUCCESS(Status) && Reply != NULL) {
+    if (ReplyReceived) {
         if (Reply->Verdict == Verdict_Malicious) {
             Status = STATUS_ACCESS_DENIED;
         }

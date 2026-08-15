@@ -4553,7 +4553,8 @@ ShadowStrikeSendProcessNotification(
     _In_ ULONG Size,
     _In_ BOOLEAN RequireReply,
     _Out_writes_bytes_opt_(*ReplySize) PSHADOWSTRIKE_PROCESS_VERDICT_REPLY Reply,
-    _Inout_opt_ PULONG ReplySize
+    _Inout_opt_ PULONG ReplySize,
+    _In_ ULONG ReplyTimeoutMs
     )
 {
     NTSTATUS status;
@@ -4573,6 +4574,16 @@ ShadowStrikeSendProcessNotification(
     }
 
     if (RequireReply && (Reply == NULL || ReplySize == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // A caller that wants a verdict must state how long its callback can afford
+    // to wait. Refused rather than defaulted: the defect this replaces was
+    // exactly a silent inherited budget (Config.ScanTimeoutMs, a file-scan
+    // policy value), and "0 means use the default" is how that survives review.
+    //
+    if (RequireReply && ReplyTimeoutMs == 0) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -4794,7 +4805,27 @@ ShadowStrikeSendProcessNotification(
 
         replyBufferSize = *ReplySize;
         {
-            ULONG _toMs = g_DriverData.Config.ScanTimeoutMs;
+            //
+            // The budget comes from the CALLER, which is the only code that knows
+            // what its callback owes the kernel. It used to come from
+            // g_DriverData.Config.ScanTimeoutMs - a FILE-scan policy value,
+            // default 30000 ms and settable up to 300000 ms - so a suspicious
+            // process creation blocked the thread that called CreateProcess for
+            // thirty seconds by default and up to five minutes by policy. That
+            // value describes how long a file scan may take; it says nothing
+            // about what a process-creation callback can afford, and the file
+            // create path never used it either (it passes
+            // PC_SCAN_TIMEOUT_{EXECUTE,WRITE,READ}_MS per operation).
+            //
+            // Clamped twice: to the ceiling above, so this chokepoint bounds the
+            // callback no matter what a caller asks for, and to 250 ms during
+            // boot phase, where process creation is on the critical path to a
+            // usable desktop.
+            //
+            ULONG _toMs = ReplyTimeoutMs;
+            if (_toMs > SHADOWSTRIKE_PROCESS_REPLY_TIMEOUT_MAX_MS) {
+                _toMs = SHADOWSTRIKE_PROCESS_REPLY_TIMEOUT_MAX_MS;
+            }
             if (ShadowFsIsBootPhase() && _toMs > 250) _toMs = 250;
             timeout.QuadPart = -(LONGLONG)_toMs * 10000LL;
         }

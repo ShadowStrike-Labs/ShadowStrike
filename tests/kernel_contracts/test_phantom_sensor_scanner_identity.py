@@ -24,6 +24,7 @@ COMM_PORT_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.c"
 COMM_PORT_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.h"
 DRIVER_ENTRY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/DriverEntry.c"
 ERROR_CODES_H_PATH = ROOT / "PhantomSensor/Shared/ErrorCodes.h"
+PROCESS_NOTIFY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/Process/ProcessNotify.c"
 
 
 def read_source(path: Path) -> str:
@@ -146,6 +147,7 @@ class SourceContractTests(unittest.TestCase):
         cls.comm_port_h = read_source(COMM_PORT_H_PATH)
         cls.driver_entry_c = read_source(DRIVER_ENTRY_C_PATH)
         cls.error_codes_h = read_source(ERROR_CODES_H_PATH)
+        cls.process_notify_c = read_source(PROCESS_NOTIFY_C_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -934,6 +936,90 @@ class SourceContractTests(unittest.TestCase):
         )
         self.assertTrue(used)
         self.assertEqual(used - set(defines), set())
+
+    def test_a_process_verdict_is_read_only_when_one_actually_arrived(self) -> None:
+        # The reply buffer comes from ShadowStrikeAllocateMessageBuffer, which
+        # serves small requests from a non-paged LOOKASIDE list and therefore
+        # hands back recycled bytes verbatim. The notification buffer beside it
+        # was zeroed; the reply buffer was not. And the verdict branch was gated
+        # on NT_SUCCESS(Status), which the timeout handler had just made true by
+        # converting STATUS_TIMEOUT to STATUS_SUCCESS to express fail-open. So an
+        # unanswered request read Verdict out of a recycled block - byte 8, which
+        # in the previous occupant of that block is typically the previous
+        # process's verdict. Verdict_Malicious is 2, so a genuine block could
+        # propagate to the next suspicious creation that timed out.
+        send = strip_c_comments(
+            extract_c_function(self.process_notify_c, "PnpSendProcessNotification")
+        )
+
+        # Defence in depth: the buffer must be zeroed at allocation.
+        self.assertRegex(send, r"RtlZeroMemory\s*\(\s*Reply\s*,\s*ReplySize\s*\)")
+
+        # The real fix: arrival is tracked separately from the status, and it must
+        # exclude STATUS_TIMEOUT by name rather than relying on NT_SUCCESS.
+        self.assertIn("BOOLEAN ReplyReceived", send)
+        arrival = send[send.index("BOOLEAN ReplyReceived") :]
+        arrival = arrival[: arrival.index(";")]
+        for required in ("Status != STATUS_TIMEOUT", "NT_SUCCESS(Status)", "Reply != NULL"):
+            self.assertIn(required, arrival)
+        # A reply too short to contain the field is not a verdict either.
+        self.assertIn("FIELD_OFFSET(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, Verdict)", arrival)
+
+        # The verdict read must be reached only through that flag, and there must
+        # be exactly one such read so a future edit cannot add an unguarded one.
+        reads = re.findall(r"Reply->Verdict\s*==\s*Verdict_Malicious", send)
+        self.assertEqual(len(reads), 1)
+        self.assertRegex(
+            send,
+            r"if\s*\(\s*ReplyReceived\s*\)\s*\{\s*"
+            r"if\s*\(\s*Reply->Verdict\s*==\s*Verdict_Malicious\s*\)",
+        )
+        # The old gate must be gone: NT_SUCCESS is true on timeout by the time the
+        # verdict branch runs, because the handler above converts STATUS_TIMEOUT to
+        # STATUS_SUCCESS to express fail-open.
+        self.assertNotRegex(
+            send, r"RequireReply\s*&&\s*NT_SUCCESS\s*\(\s*Status\s*\)\s*&&\s*Reply\s*!=\s*NULL"
+        )
+
+    def test_the_process_verdict_wait_is_bounded_by_its_caller(self) -> None:
+        # The wait used to be g_DriverData.Config.ScanTimeoutMs: a FILE-scan
+        # policy value, 30000 ms by default and accepted up to 300000 ms, applied
+        # to a callback that blocks the thread calling CreateProcess. The budget
+        # now comes from the caller, which is the only code that knows what its
+        # own callback owes the kernel - the same shape the file create path
+        # already uses with PC_SCAN_TIMEOUT_{EXECUTE,WRITE,READ}_MS.
+        proc = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendProcessNotification")
+        )
+
+        self.assertNotIn("Config.ScanTimeoutMs", proc)
+        self.assertIn("ReplyTimeoutMs", proc)
+        # A caller that states no budget is refused, not silently defaulted.
+        self.assertRegex(
+            proc, r"RequireReply\s*&&\s*ReplyTimeoutMs\s*==\s*0"
+        )
+        # The chokepoint clamps regardless of what the caller asks for, and the
+        # boot-phase tightening survives.
+        self.assertIn("SHADOWSTRIKE_PROCESS_REPLY_TIMEOUT_MAX_MS", proc)
+        self.assertIn("ShadowFsIsBootPhase()", proc)
+
+        ceiling = re.search(
+            r"#define\s+SHADOWSTRIKE_PROCESS_REPLY_TIMEOUT_MAX_MS\s+(\d+)",
+            self.comm_port_h,
+        )
+        self.assertIsNotNone(ceiling)
+        assert ceiling is not None
+        self.assertLessEqual(int(ceiling.group(1)), 1000)
+
+        # And the caller supplies a budget sized for a process-creation callback,
+        # not one borrowed from file scanning.
+        budget = re.search(
+            r"#define\s+PN_VERDICT_REPLY_TIMEOUT_MS\s+(\d+)", self.process_notify_c
+        )
+        self.assertIsNotNone(budget)
+        assert budget is not None
+        self.assertLessEqual(int(budget.group(1)), int(ceiling.group(1)))
+        self.assertIn("PN_VERDICT_REPLY_TIMEOUT_MS", self.process_notify_c)
 
     def test_legacy_builder_uses_operation_requestor(self) -> None:
         legacy = extract_c_function(

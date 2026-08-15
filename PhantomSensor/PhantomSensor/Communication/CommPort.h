@@ -368,14 +368,49 @@ ShadowStrikeSendNotification(
     );
 
 /**
+ * @brief Hard ceiling on how long a process notification may wait for a verdict.
+ *
+ * The caller supplies the budget (see ReplyTimeoutMs below) because only the
+ * caller knows what its callback owes the kernel. This ceiling exists because
+ * the previous implementation did NOT take a budget: it read
+ * g_DriverData.Config.ScanTimeoutMs, a FILE-scan timeout that user mode sets by
+ * policy, defaulting to 30000 ms and accepted up to
+ * SHADOWSTRIKE_MAX_SCAN_TIMEOUT_MS (300000 ms). A process-creation callback
+ * blocks the thread that called CreateProcess, so inheriting a five-minute
+ * file-scan budget there is not a tuning question but a freeze.
+ *
+ * 1000 ms is a chosen bound, not a measured one, and it is deliberately looser
+ * than any caller should ask for: PC_SCAN_TIMEOUT_EXECUTE_MS (500) is what the
+ * file pre-execution gate allows for the same class of decision. The ceiling is
+ * enforced here, at the single chokepoint, so a future caller cannot reintroduce
+ * an unbounded wait by picking the wrong constant.
+ */
+#define SHADOWSTRIKE_PROCESS_REPLY_TIMEOUT_MAX_MS   1000
+
+/**
  * @brief Send process notification to user-mode.
  *
- * @param Notification  Pre-built notification buffer.
- * @param Size          Total size of notification in bytes.
- * @param RequireReply  If TRUE, wait for verdict reply.
- * @param Reply         Output verdict reply buffer (optional).
- * @param ReplySize     In/out reply buffer size (optional).
- * @return STATUS_SUCCESS if sent successfully.
+ * @param Notification    Pre-built notification buffer.
+ * @param Size            Total size of notification in bytes.
+ * @param RequireReply    If TRUE, wait for verdict reply.
+ * @param Reply           Output verdict reply buffer (optional).
+ * @param ReplySize       In/out reply buffer size (optional). On return it holds
+ *                        the number of bytes a reply actually delivered, and it
+ *                        is written ONLY when a reply genuinely arrived - so the
+ *                        caller must not read the verdict without checking both
+ *                        the returned status and this length.
+ * @param ReplyTimeoutMs  How long to wait for the verdict, in milliseconds.
+ *                        Required (must be non-zero) when RequireReply is TRUE
+ *                        and ignored otherwise; there is deliberately no
+ *                        "0 means default" behaviour, because a caller that
+ *                        forgets to state its budget must fail loudly rather
+ *                        than silently inherit someone else's. Clamped to
+ *                        SHADOWSTRIKE_PROCESS_REPLY_TIMEOUT_MAX_MS, and further
+ *                        to 250 ms during boot phase.
+ * @return STATUS_SUCCESS if sent successfully. STATUS_TIMEOUT if no reply
+ *         arrived within the budget - a documented FltSendMessage success code,
+ *         so callers must test for it by name and must NOT treat NT_SUCCESS as
+ *         proof that Reply was written.
  *
  * @irql PASSIVE_LEVEL
  */
@@ -385,7 +420,8 @@ ShadowStrikeSendProcessNotification(
     _In_ ULONG Size,
     _In_ BOOLEAN RequireReply,
     _Out_writes_bytes_opt_(*ReplySize) PSHADOWSTRIKE_PROCESS_VERDICT_REPLY Reply,
-    _Inout_opt_ PULONG ReplySize
+    _Inout_opt_ PULONG ReplySize,
+    _In_ ULONG ReplyTimeoutMs
     );
 
 // ============================================================================
