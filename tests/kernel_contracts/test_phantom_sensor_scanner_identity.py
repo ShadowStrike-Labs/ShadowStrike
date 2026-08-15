@@ -194,22 +194,93 @@ class SourceContractTests(unittest.TestCase):
 
     def test_scan_bridge_requires_ready_primary_and_no_fallback(self) -> None:
         ready = extract_c_function(self.scan_bridge_c, "ShadowStrikeScanBridgeIsReady")
-        retry = extract_c_function(self.scan_bridge_c, "SbpSendWithRetry")
         comm_send = extract_c_function(self.comm_port_c, "ShadowStrikeSendScanRequest")
 
         self.assertIn("return ShadowStrikeIsPrimaryScannerConnected();", ready)
         self.assertNotIn("ShadowStrikeIsUserModeConnected", ready)
-        self.assertGreaterEqual(
-            len(re.findall(
-                r"ShadowStrikeAcquirePrimaryScannerPort\s*\(\s*&clientRef,\s*FALSE\s*\)",
-                retry,
-            )),
-            2,
-        )
         self.assertRegex(
             comm_send,
             r"ShadowStrikeAcquirePrimaryScannerPort\s*\(\s*&clientRef,\s*FALSE\s*\)",
         )
+
+    def test_scan_bridge_never_sends_to_the_port_itself(self) -> None:
+        # This replaces an assertion that SbpSendWithRetry acquired the port with
+        # AllowFallback == FALSE.
+        #
+        # The invariant being protected is that the verdict-blocking scan transport
+        # must never route to a non-scanner client, because a non-scanner never
+        # replies and FltSendMessage then blocks for the whole timeout budget on
+        # every create, which froze boots. That invariant is UNCHANGED and is still
+        # asserted, in the test above, against ShadowStrikeSendScanRequest - which is
+        # where the scan path actually sends. ScanBridge calls it and supplies only
+        # the surrounding retry loop.
+        #
+        # SbpSendWithRetry was the wrong function to assert it on. Measured: its only
+        # callers were four fire-and-forget notification senders, so it carried no
+        # scan traffic at all, despite its own comment describing it as "scan
+        # transport". It also handed the caller's buffer to FltSendMessage with no
+        # encryption and mapped a NULL timeout onto the 30-second SCAN timeout with
+        # three retries. It is deleted.
+        #
+        # What is asserted instead is strictly stronger than what was removed:
+        # ScanBridge cannot reach the filter port at all, so it cannot choose the
+        # wrong fallback policy and cannot emit unauthenticated bytes - by
+        # construction, not by inspection. CommPort is the single chokepoint and
+        # every send there either encrypts or refuses.
+        executable = strip_c_comments(self.scan_bridge_c)
+
+        self.assertNotIn("FltSendMessage", executable)
+        self.assertNotIn("SbpSendWithRetry", executable)
+        self.assertNotIn("ShadowStrikeSendMessage", executable)
+        self.assertNotIn("ShadowStrikeSendMessage", strip_c_comments(self.scan_bridge_h))
+
+    def test_scan_bridge_notifications_use_the_encrypting_funnel(self) -> None:
+        # Every notification ScanBridge emits must go through
+        # ShadowStrikeSendNotification, which encrypts under the per-session key,
+        # binds the header as AAD, and returns STATUS_ENCRYPTION_FAILED rather than
+        # sending plaintext. All four previously used the unencrypted transport, so
+        # the receiver had no way to bind these frames to the authenticated session
+        # - and these are the frames that drive ProcessInjectionDetector,
+        # AtomBombingDetector, RegistryProtection and RealTimeProtection.
+        senders = (
+            "ShadowStrikeSendProcessEvent",
+            "ShadowStrikeSendThreadNotification",
+            "ShadowStrikeSendImageNotification",
+            "ShadowStrikeSendRegistryNotification",
+        )
+        for name in senders:
+            body = strip_c_comments(extract_c_function(self.scan_bridge_c, name))
+            with self.subTest(sender=name):
+                self.assertIn("ShadowStrikeSendNotification(header, totalSize)", body)
+                self.assertIn("SbpAccountNotificationResult(status,", body)
+
+    def test_notification_accounting_separates_undelivered_from_sent(self) -> None:
+        executable = strip_c_comments(
+            extract_c_function(self.scan_bridge_c, "SbpAccountNotificationResult")
+        )
+
+        # STATUS_TIMEOUT must be tested BEFORE NT_SUCCESS. FltSendMessage documents
+        # STATUS_TIMEOUT as a SUCCESS code meaning the message could not be
+        # delivered, so NT_SUCCESS(STATUS_TIMEOUT) is true and testing NT_SUCCESS
+        # first counts an undelivered notification as a delivered one.
+        timeout_at = executable.index("STATUS_TIMEOUT")
+        success_at = executable.index("NT_SUCCESS(Status)")
+        self.assertLess(timeout_at, success_at)
+
+        # The two counters the deleted transport was the sole writer of must still be
+        # written here, or they would read zero forever whatever happened.
+        self.assertIn("g_ScanBridge.Stats.ConnectionErrors", executable)
+        self.assertIn("g_ScanBridge.Stats.MessageErrors", executable)
+
+    def test_notification_funnel_does_not_count_undelivered_as_sent(self) -> None:
+        body = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendNotification")
+        )
+
+        self.assertIn("(status != STATUS_TIMEOUT) && NT_SUCCESS(status)", body)
+        self.assertIn("SHADOWSTRIKE_INC_STAT(MessagesDropped)", body)
+        # The plaintext refusal is absolute and must stay that way.
+        self.assertIn("STATUS_ENCRYPTION_FAILED", body)
 
     def test_per_slot_identity_replaces_scalar_and_rejects_pid_zero(self) -> None:
         scanner_check = extract_c_function(

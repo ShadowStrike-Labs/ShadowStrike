@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -684,60 +684,23 @@ ShadowStrikeSendRegistryNotification(
 );
 
 // ============================================================================
-// GENERIC MESSAGE OPERATIONS
+// GENERIC MESSAGE OPERATIONS - REMOVED, DELIBERATELY
 // ============================================================================
-
-/**
- * @brief Send a message to user-mode with optional reply.
- *
- * Low-level message sending function used by higher-level APIs.
- *
- * @param InputBuffer       Message to send
- * @param InputBufferSize   Size of message
- * @param OutputBuffer      Reply buffer (optional)
- * @param OutputBufferSize  On input, size of output buffer. On output, actual size
- * @param Timeout           Wait timeout (NULL = default)
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql PASSIVE_LEVEL
- */
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeSendMessage(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_opt_ PLARGE_INTEGER Timeout
-);
-
-/**
- * @brief Send message with priority and retry options.
- *
- * @param InputBuffer       Message to send
- * @param InputBufferSize   Size of message
- * @param OutputBuffer      Reply buffer (optional)
- * @param OutputBufferSize  On input/output, size of output buffer
- * @param Priority          Message priority
- * @param MaxRetries        Maximum retry count
- * @param TimeoutMs         Timeout in milliseconds
- *
- * @return STATUS_SUCCESS on success
- *
- * @irql PASSIVE_LEVEL
- */
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeSendMessageEx(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_ SB_MESSAGE_PRIORITY Priority,
-    _In_ ULONG MaxRetries,
-    _In_ ULONG TimeoutMs
-);
+//
+// ShadowStrikeSendMessage and ShadowStrikeSendMessageEx were declared here and
+// are gone. They were the only transport in this driver that handed a caller
+// buffer to FltSendMessage without encrypting it, and they mapped a NULL Timeout
+// onto the 30-second SCAN timeout with three retries - on notification paths
+// documented above as fire-and-forget. The full reasoning is recorded at the
+// corresponding point in ScanBridge.c.
+//
+// To send a notification, use ShadowStrikeSendNotification (CommPort.h): it
+// encrypts under the per-session key, refuses to send if it cannot, and returns
+// immediately. For a synchronous scan with a reply, use
+// ShadowStrikeSendScanRequest (CommPort.h).
+//
+// Do not reintroduce a general-purpose unencrypted send here.
+//
 
 // ============================================================================
 // BUFFER MANAGEMENT

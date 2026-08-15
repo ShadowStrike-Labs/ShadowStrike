@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -257,14 +257,10 @@ SbpFreePendingRequest(
     _In_ PSB_PENDING_REQUEST Request
 );
 
-static NTSTATUS
-SbpSendWithRetry(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_ ULONG TimeoutMs,
-    _In_ ULONG MaxRetries
+static VOID
+SbpAccountNotificationResult(
+    _In_ NTSTATUS Status,
+    _Inout_ volatile LONG64* SuccessCounter
 );
 
 static VOID
@@ -306,8 +302,6 @@ SbpSafeAddUlong(
 #pragma alloc_text(PAGE, ShadowStrikeSendThreadNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendImageNotification)
 #pragma alloc_text(PAGE, ShadowStrikeSendRegistryNotification)
-#pragma alloc_text(PAGE, ShadowStrikeSendMessage)
-#pragma alloc_text(PAGE, ShadowStrikeSendMessageEx)
 #endif
 
 // ============================================================================
@@ -1487,20 +1481,12 @@ ShadowStrikeSendProcessEvent(
     //
     // Send fire-and-forget notification (no reply expected)
     //
-    status = ShadowStrikeSendMessage(
-        header,
-        totalSize,
-        NULL,
-        NULL,
-        NULL
-    );
+    status = ShadowStrikeSendNotification(header, totalSize);
 
     //
-    // Update statistics
+    // Account for the outcome. A refused notification is counted, not ignored.
     //
-    if (NT_SUCCESS(status)) {
-        InterlockedIncrement64(&g_ScanBridge.Stats.ProcessNotifications);
-    }
+    SbpAccountNotificationResult(status, &g_ScanBridge.Stats.ProcessNotifications);
 
 ProcessEventCleanup:
     if (header != NULL) {
@@ -1590,20 +1576,12 @@ ShadowStrikeSendThreadNotification(
     //
     // Send notification
     //
-    status = ShadowStrikeSendMessage(
-        header,
-        totalSize,
-        NULL,
-        NULL,
-        NULL
-    );
+    status = ShadowStrikeSendNotification(header, totalSize);
 
     //
-    // Update statistics
+    // Account for the outcome. A refused notification is counted, not ignored.
     //
-    if (NT_SUCCESS(status)) {
-        InterlockedIncrement64(&g_ScanBridge.Stats.ThreadNotifications);
-    }
+    SbpAccountNotificationResult(status, &g_ScanBridge.Stats.ThreadNotifications);
 
 ThreadCleanup:
     if (header != NULL) {
@@ -1766,20 +1744,12 @@ ShadowStrikeSendImageNotification(
     //
     // Send notification
     //
-    status = ShadowStrikeSendMessage(
-        header,
-        totalSize,
-        NULL,
-        NULL,
-        NULL
-    );
+    status = ShadowStrikeSendNotification(header, totalSize);
 
     //
-    // Update statistics
+    // Account for the outcome. A refused notification is counted, not ignored.
     //
-    if (NT_SUCCESS(status)) {
-        InterlockedIncrement64(&g_ScanBridge.Stats.ImageNotifications);
-    }
+    SbpAccountNotificationResult(status, &g_ScanBridge.Stats.ImageNotifications);
 
 ImageCleanup:
     if (header != NULL) {
@@ -1991,20 +1961,12 @@ ShadowStrikeSendRegistryNotification(
     //
     // Send notification
     //
-    status = ShadowStrikeSendMessage(
-        header,
-        totalSize,
-        NULL,
-        NULL,
-        NULL
-    );
+    status = ShadowStrikeSendNotification(header, totalSize);
 
     //
-    // Update statistics
+    // Account for the outcome. A refused notification is counted, not ignored.
     //
-    if (NT_SUCCESS(status)) {
-        InterlockedIncrement64(&g_ScanBridge.Stats.RegistryNotifications);
-    }
+    SbpAccountNotificationResult(status, &g_ScanBridge.Stats.RegistryNotifications);
 
 RegistryCleanup:
     if (header != NULL) {
@@ -2016,100 +1978,57 @@ RegistryCleanup:
 }
 
 // ============================================================================
-// GENERIC MESSAGE OPERATIONS
+// GENERIC MESSAGE OPERATIONS - REMOVED, DELIBERATELY
 // ============================================================================
-
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeSendMessage(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_opt_ PLARGE_INTEGER Timeout
-)
-{
-    ULONG timeoutMs;
-
-    PAGED_CODE();
-
-    //
-    // Convert timeout to milliseconds
-    //
-    if (Timeout == NULL) {
-        timeoutMs = SB_DEFAULT_SCAN_TIMEOUT_MS;
-    } else if (Timeout->QuadPart == 0) {
-        timeoutMs = 0;  // No wait
-    } else {
-        // Timeout is negative relative time in 100ns units
-        timeoutMs = (ULONG)((-Timeout->QuadPart) / 10000);
-    }
-
-    return ShadowStrikeSendMessageEx(
-        InputBuffer,
-        InputBufferSize,
-        OutputBuffer,
-        OutputBufferSize,
-        SbPriorityNormal,
-        SB_MAX_RETRY_COUNT,
-        timeoutMs
-    );
-}
-
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeSendMessageEx(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_ SB_MESSAGE_PRIORITY Priority,
-    _In_ ULONG MaxRetries,
-    _In_ ULONG TimeoutMs
-)
-{
-    NTSTATUS status;
-
-    PAGED_CODE();
-
-    //
-    // Priority is reserved for future priority-based queue routing.
-    //
-    UNREFERENCED_PARAMETER(Priority);
-
-    //
-    // Validate parameters
-    //
-    if (InputBuffer == NULL || InputBufferSize == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if (InputBufferSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
-        return SHADOWSTRIKE_ERROR_MESSAGE_TOO_LARGE;
-    }
-
-    //
-    // Check connection before entering retry logic
-    //
-    if (!ShadowStrikeIsUserModeConnected()) {
-        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
-    }
-
-    //
-    // Send with retry logic (SbpSendWithRetry handles
-    // reference-counted port acquisition internally)
-    //
-    status = SbpSendWithRetry(
-        InputBuffer,
-        InputBufferSize,
-        OutputBuffer,
-        OutputBufferSize,
-        TimeoutMs,
-        MaxRetries
-    );
-
-    return status;
-}
+//
+// ShadowStrikeSendMessage, ShadowStrikeSendMessageEx and SbpSendWithRetry used to
+// live here. They were this driver's only unencrypted transport to user mode: the
+// caller's buffer reached FltSendMessage verbatim, with no
+// SHADOWSTRIKE_MSG_FLAG_ENCRYPTED and no HMAC, so the receiver had no way to bind
+// the frame to the authenticated session. Measured before removal: this file
+// contained zero occurrences of EncEncrypt, EncGetEncryptedSize,
+// ShadowStrikePrepareEncryptedMessageHeader, g_ClientSessionEncKeys and
+// SHADOWSTRIKE_MSG_FLAG_ENCRYPTED.
+//
+// Their only callers were the four notification senders above, which now use
+// ShadowStrikeSendNotification (CommPort.c). That funnel encrypts with the
+// per-session key, uses the message header as AAD, and returns
+// STATUS_ENCRYPTION_FAILED rather than sending plaintext - the same policy the
+// scan-request and queue-drain paths already followed.
+//
+// Two further defects went with them, both more costly day to day than the
+// missing encryption:
+//
+//   1. BLOCKING. ShadowStrikeSendMessage mapped a NULL Timeout onto
+//      SB_DEFAULT_SCAN_TIMEOUT_MS (30 s) with SB_MAX_RETRY_COUNT (3) retries and
+//      exponential backoff. FltSendMessage waits for DELIVERY whether or not a
+//      reply buffer is supplied - the reply buffer governs only a SECOND wait -
+//      so each of these documented "fire-and-forget" notifications could park its
+//      calling thread for up to 30 s per attempt whenever user mode was not
+//      sitting in FilterGetMessage. The callers are the process, thread,
+//      image-load and registry callbacks. Every genuine fire-and-forget path in
+//      CommPort.c passes a zero timeout for exactly this reason, and this file's
+//      own comment about non-scanner ports "which never reply, blocking
+//      FltSendMessage for the full timeout budget ... and freezing the system"
+//      records the hazard in the product's own words.
+//
+//   2. PORT SELECTION. SbpSendWithRetry acquired the port with AllowFallback ==
+//      FALSE, documented in place as "scan transport". That is the right policy
+//      for a verdict-blocking scan and the wrong one for telemetry, which should
+//      reach any verified client and otherwise buffer in MessageQueue across the
+//      reconnect window. These notifications were instead dropped outright
+//      whenever the primary scanner slot was momentarily unavailable.
+//
+// Deleted rather than left in place behind a warning comment. A callerless public
+// API that sends unauthenticated frames is an invitation to reintroduce precisely
+// this: PreSetInfo.c reached this one by hand-copying its declaration instead of
+// including a header, which is how a bare payload came to be framed as a message
+// (409a978e). The strongest guarantee that the wrong transport is not chosen again
+// is that it no longer exists.
+//
+// If ScanBridge ever needs a synchronous request/reply again, the encrypting path
+// is ShadowStrikeSendScanRequest in CommPort.c.
+//
 
 // ============================================================================
 // BUFFER MANAGEMENT
@@ -2755,132 +2674,69 @@ SbpFreePendingRequest(
 }
 
 // ============================================================================
-// PRIVATE IMPLEMENTATION - SEND WITH RETRY
+// PRIVATE IMPLEMENTATION - NOTIFICATION OUTCOME ACCOUNTING
 // ============================================================================
 
-static NTSTATUS
-SbpSendWithRetry(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_ ULONG TimeoutMs,
-    _In_ ULONG MaxRetries
+//
+// Account for the outcome of a fire-and-forget notification send.
+//
+// Each of the four notification senders above used to do this inline as
+//
+//     if (NT_SUCCESS(status)) { InterlockedIncrement64(&...Notifications); }
+//
+// with no else, which was wrong twice over.
+//
+// First, failure was counted nowhere at all, so a notification the transport
+// refused left no trace. That matters more now than it did: these senders route
+// through ShadowStrikeSendNotification, which DROPS a message it cannot encrypt
+// rather than downgrading it, so a refusal is a real event and has to be visible.
+//
+// Second, and worse, STATUS_TIMEOUT IS A SUCCESS CODE. FltSendMessage documents
+// it as "the Timeout interval expired before the message could be delivered ...
+// This is a success code", so NT_SUCCESS(STATUS_TIMEOUT) is TRUE and an
+// UNDELIVERED notification was counted as a delivered one. A counter that cannot
+// tell delivered from dropped answers the one question it exists to answer
+// incorrectly, so the case is now split out by name.
+//
+// ConnectionErrors and MessageErrors were written only by SbpSendWithRetry, which
+// this change removed along with the rest of the unencrypted transport. Writing
+// them here keeps both counters meaningful; leaving them alone would have
+// produced two statistics that read zero forever regardless of the truth.
+//
+static VOID
+SbpAccountNotificationResult(
+    _In_ NTSTATUS Status,
+    _Inout_ volatile LONG64* SuccessCounter
 )
 {
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-    PSHADOWSTRIKE_CLIENT_PORT_REF clientRef = NULL;
-    PFLT_PORT clientPort;
-    LARGE_INTEGER timeout;
-    ULONG attempt;
-    ULONG delayMs = SB_RETRY_DELAY_BASE_MS;
-    LARGE_INTEGER delayInterval;
+    if (Status == STATUS_TIMEOUT) {
+        //
+        // Sent but NOT delivered: no user-mode thread was waiting in
+        // FilterGetMessage, so the notification is gone. Counted as a transport
+        // fault and never as a delivered notification.
+        //
+        InterlockedIncrement64(&g_ScanBridge.Stats.MessageErrors);
+        return;
+    }
+
+    if (NT_SUCCESS(Status)) {
+        InterlockedIncrement64(SuccessCounter);
+        return;
+    }
 
     //
-    // Acquire reference-counted scanner port.  This prevents
-    // use-after-free if the client disconnects between acquire
-    // and FltSendMessage â€” the reference keeps the slot alive.
+    // Split the failures by cause, because the two are read differently. No
+    // client, or a client whose session key is not established yet, is a
+    // start-up or reconnect window that resolves itself. Anything else is a
+    // delivery fault against a connected, keyed client.
     //
-    // AllowFallback == FALSE: scan transport. Only a real primary scanner is
-    // acceptable; never route a synchronous scan to a non-scanner client.
-    //
-    status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, FALSE);
-    if (!NT_SUCCESS(status)) {
+    if (Status == SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED ||
+        Status == STATUS_PORT_DISCONNECTED ||
+        Status == STATUS_ENCRYPTION_FAILED) {
         InterlockedIncrement64(&g_ScanBridge.Stats.ConnectionErrors);
-        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
-    }
-
-    clientPort = clientRef->ClientPort;
-
-    //
-    // Set up timeout
-    //
-    if (TimeoutMs > 0) {
-        timeout.QuadPart = -((LONGLONG)TimeoutMs * 10000);
     } else {
-        timeout.QuadPart = 0;
+        InterlockedIncrement64(&g_ScanBridge.Stats.MessageErrors);
     }
-
-    //
-    // Retry loop
-    //
-    for (attempt = 0; attempt <= MaxRetries; attempt++) {
-        //
-        // Send message via filter manager
-        //
-        status = FltSendMessage(
-            g_DriverData.FilterHandle,
-            &clientPort,
-            InputBuffer,
-            InputBufferSize,
-            OutputBuffer,
-            OutputBufferSize,
-            TimeoutMs > 0 ? &timeout : NULL
-        );
-
-        if (NT_SUCCESS(status)) {
-            ShadowStrikeReleaseClientPort(clientRef);
-            return status;
-        }
-
-        //
-        // Check if we should retry
-        //
-        if (status == STATUS_TIMEOUT ||
-            status == STATUS_PORT_DISCONNECTED ||
-            status == STATUS_DEVICE_NOT_READY) {
-
-            if (attempt < MaxRetries) {
-                //
-                // Release reference before delay â€” holding a reference
-                // across a long sleep blocks port cleanup on disconnect.
-                //
-                ShadowStrikeReleaseClientPort(clientRef);
-                clientRef = NULL;
-
-                //
-                // Exponential backoff delay
-                //
-                InterlockedIncrement64(&g_ScanBridge.Stats.RetryCount);
-
-                delayInterval.QuadPart = -((LONGLONG)delayMs * 10000);
-                KeDelayExecutionThread(KernelMode, FALSE, &delayInterval);
-
-                //
-                // Double delay for next attempt (capped at SB_MAX_RETRY_DELAY_MS)
-                //
-                delayMs = delayMs * 2;
-                if (delayMs > SB_MAX_RETRY_DELAY_MS) {
-                    delayMs = SB_MAX_RETRY_DELAY_MS;
-                }
-
-                //
-                // Re-acquire port with reference count for next attempt
-                //
-                status = ShadowStrikeAcquirePrimaryScannerPort(&clientRef, FALSE);
-                if (!NT_SUCCESS(status)) {
-                    InterlockedIncrement64(&g_ScanBridge.Stats.ConnectionErrors);
-                    return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
-                }
-                clientPort = clientRef->ClientPort;
-
-                continue;
-            }
-        }
-
-        //
-        // Non-retriable error or max retries reached
-        //
-        break;
-    }
-
-    if (clientRef != NULL) {
-        ShadowStrikeReleaseClientPort(clientRef);
-    }
-
-    InterlockedIncrement64(&g_ScanBridge.Stats.MessageErrors);
-
-    return status;
 }
 
 // ============================================================================

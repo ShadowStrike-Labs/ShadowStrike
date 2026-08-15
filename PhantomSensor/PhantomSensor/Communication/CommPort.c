@@ -4127,9 +4127,21 @@ ShadowStrikeSendNotification(
     );
 
     //
-    // Update per-client stats BEFORE releasing reference
+    // Update per-client stats BEFORE releasing reference.
     //
-    if (NT_SUCCESS(status)) {
+    // STATUS_TIMEOUT is excluded explicitly. FltSendMessage documents it as "the
+    // Timeout interval expired before the message could be delivered ... This is a
+    // success code", and this path passes a zero timeout, so it is precisely the
+    // return value for "no user-mode thread was waiting in FilterGetMessage".
+    // NT_SUCCESS(STATUS_TIMEOUT) is TRUE, so testing NT_SUCCESS alone recorded an
+    // UNDELIVERED notification as a sent one. This is the funnel every notification
+    // in the driver now uses, and MessagesSent is the number a field log is read to
+    // answer "is the kernel reporting anything at all" - it must not say yes for
+    // messages that were thrown away.
+    //
+    const BOOLEAN notifDelivered = (status != STATUS_TIMEOUT) && NT_SUCCESS(status);
+
+    if (notifDelivered) {
         InterlockedIncrement64(&clientRef->MessagesSent);
     }
 
@@ -4139,8 +4151,14 @@ ShadowStrikeSendNotification(
         ExFreePoolWithTag(encryptedNotifBuffer, 'enCP');
     }
 
-    if (NT_SUCCESS(status)) {
+    if (notifDelivered) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
+    } else {
+        //
+        // Previously counted nowhere: neither a delivery timeout nor an outright
+        // FltSendMessage failure incremented anything here.
+        //
+        SHADOWSTRIKE_INC_STAT(MessagesDropped);
     }
 
     return status;
