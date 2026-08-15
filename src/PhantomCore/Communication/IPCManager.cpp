@@ -1773,6 +1773,23 @@ void IPCManager::WorkerRoutine() {
         // raw path. A return of 0 means shutdown/cancel, a dropped message that
         // failed integrity/decryption, or a torn-down channel — in every case
         // we re-evaluate the loop guard (and reconnect on the next iteration).
+        // Clear the two-header region before every receive.
+        //
+        // This buffer is allocated once per worker and reused for the life of the
+        // thread, and the kernel writes only as many bytes as the frame holds.
+        // Without this, a frame shorter than both headers leaves the remaining
+        // header bytes holding the tail of the PREVIOUS, larger message - so a
+        // runt frame can present a valid Magic and Version it never carried. The
+        // length check below is the primary guard; this makes the failure mode
+        // deterministic rather than dependent on what happened to be here before.
+        //
+        // FileSystemFilter's reader already does exactly this, deliberately, with
+        // the same reasoning recorded at the memset. This path had the reasoning
+        // written down - "the buffer is pooled/reused and NOT zeroed" - without
+        // the corresponding clear.
+        std::memset(buffer.data(), 0,
+                    sizeof(FILTER_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
         const auto recv = conn->GetMessage(
             std::span<uint8_t>(buffer.data(), buffer.size()), 0);
 
@@ -1891,11 +1908,11 @@ void IPCManager::WorkerRoutine() {
         }
         badReceiveStreak = 0;  // healthy frame -> reset the bad-receive streak
 
-        if (received < sizeof(FILTER_MESSAGE_HEADER)) {
-            Utils::Logger::Warn("[IPCManager] Worker: truncated message ({} bytes)", received);
-            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
+        // The single length guard for this frame is the two-header check below.
+        // A separate `received < sizeof(FILTER_MESSAGE_HEADER)` test used to sit
+        // here; it is subsumed, and having two thresholds with two different
+        // messages for one condition only made it harder to tell which fired.
+        // pWdkHeader is a cast, not a dereference, so forming it here is safe.
 
         // FILTER_MESSAGE_HEADER (carries the WDK MessageId used for the reply)
         // sits at the start of the decrypted buffer.
@@ -1907,8 +1924,27 @@ void IPCManager::WorkerRoutine() {
         constexpr size_t kWdkHeaderSize = sizeof(FILTER_MESSAGE_HEADER);
         constexpr size_t kAppHeaderSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
 
-        if (buffer.size() < kWdkHeaderSize + kAppHeaderSize) {
-            Utils::Logger::Error("[IPCManager] Buffer too small for dual-header parse");
+        // Bound the RECEIVED byte count, not the allocation.
+        //
+        // This test used to read `buffer.size() < kWdkHeaderSize + kAppHeaderSize`,
+        // which compares against MAX_MESSAGE_SIZE and therefore could never fail -
+        // it did not bound the frame at all. Four header fields (Magic, Version,
+        // TotalSize, DataSize) were then read unconditionally, so for any frame
+        // shorter than both headers some or all of those 40 bytes came from
+        // whatever the previous, larger message left in this buffer. The boot log
+        // records kernel messages of 1796, 136 and 48 bytes; 48 is short of the 56
+        // needed. FilterConnection also returns such a frame unexamined, because a
+        // frame that cannot hold a header is not one it can inspect.
+        //
+        // Getting this wrong does not fail loudly: a stale Magic can make a runt
+        // frame look valid, and a valid short frame gets rejected. On this path a
+        // rejected frame is a file answered fail-open.
+        if (received < kWdkHeaderSize + kAppHeaderSize) {
+            Utils::Logger::Warn(
+                "[IPCManager] Runt frame: {} bytes received, {} needed for the transport "
+                "and application headers; discarding without reading header fields",
+                received, static_cast<uint32_t>(kWdkHeaderSize + kAppHeaderSize));
+            m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
@@ -2266,6 +2302,44 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                 }
             }
             auto idx = static_cast<size_t>(FilterMessageType_BehavioralAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        // =====================================================================
+        // FILE OPERATION EVENTS (rename/delete evaluated by PreSetInformation)
+        // =====================================================================
+        //
+        // These carry the driver's own verdict on a rename or delete, including
+        // operations it BLOCKED - which never reach a post-operation callback, so
+        // no other path can report them.
+        //
+        // The payload is SHADOWSTRIKE_FILE_OPERATION_EVENT. It is bounded below
+        // because a handler must not be handed a DataSize that cannot contain the
+        // fixed part of the structure: the driver frames it correctly now, but a
+        // consumer that trusts DataSize blindly reads past the payload for any
+        // frame that does not, and this is the one message class where a
+        // malformed frame has actually shipped.
+        case FilterMessageType_FileOperationEvent: {
+            if (pAppHeader->DataSize < sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT)) {
+                Utils::Logger::Warn(
+                    "[IPCManager] FileOperationEvent payload too small ({} bytes, need at "
+                    "least {}); discarding rather than parsing a short structure",
+                    pAppHeader->DataSize,
+                    static_cast<uint32_t>(sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT)));
+                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_FileOperationEvent, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] FileOperationEvent handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_FileOperationEvent);
             if (idx < m_impl->stats.byMessageType.size()) {
                 m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
             }
@@ -2749,6 +2823,7 @@ std::string_view GetMessageTypeName(SHADOWSTRIKE_MESSAGE_TYPE type) noexcept {
         case FilterMessageType_NetworkAlert:  return "NetworkAlert";
         case FilterMessageType_HandleAlert:   return "HandleAlert";
         case FilterMessageType_RansomwareAlert: return "RansomwareAlert";
+        case FilterMessageType_FileOperationEvent: return "FileOperationEvent";
         default: return "Unknown";
     }
 }

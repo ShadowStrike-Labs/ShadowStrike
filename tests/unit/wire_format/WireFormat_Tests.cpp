@@ -65,6 +65,14 @@
 #include "PhantomCore/Communication/Communication.hpp"
 #include "PhantomCore/RealTime/FileSystemFilter.hpp"
 
+// IPCManager.hpp is deliberately NOT included here, and that is a finding rather
+// than a preference: it declares ShadowStrike::Communication::FileScanCallback
+// and ::ProcessNotifyCallback with DIFFERENT types from the ones Communication.hpp
+// declares under the same fully-qualified names, so a translation unit that
+// includes both fails to compile (C2371). The per-message-type statistics
+// assertions therefore live in IpcStatistics_Tests.cpp, which includes
+// IPCManager.hpp and not Communication.hpp.
+
 #include "../../../PhantomSensor/Shared/MessageProtocol.h"
 
 namespace {
@@ -280,3 +288,51 @@ TEST(WireFormatContractTest, PayloadTransformMaskNamesEveryByteChangingFlag) {
     EXPECT_EQ(0u, SHADOWSTRIKE_MSG_FLAG_PAYLOAD_TRANSFORMS &
                   SHADOWSTRIKE_MSG_FLAG_NO_ACK);
 }
+
+// ============================================================================
+// FILE OPERATION EVENT - the payload that shipped with no header in front of it
+// ============================================================================
+
+TEST(WireFormatContractTest, FileOperationEventFieldOffsetsAreFixed) {
+    // Absolute offsets, because this payload is what a displaced read exposed in
+    // the field. The driver used to send this structure with NO frame header, so
+    // the service read its first field where Magic belongs; that field was a
+    // kernel HANDLE process id, and the process performing the operation was the
+    // scanner itself, so the reported magic was our own pid.
+    EXPECT_EQ(0u,  offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, ProcessId));
+    EXPECT_EQ(4u,  offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, InfoClass));
+    EXPECT_EQ(8u,  offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, BlockReason));
+    EXPECT_EQ(12u, offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, SuspicionScore));
+    EXPECT_EQ(16u, offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, WasBlocked));
+    EXPECT_EQ(20u, offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, Timestamp));
+    EXPECT_EQ(28u, offsetof(SHADOWSTRIKE_FILE_OPERATION_EVENT, FileNameBytes));
+    EXPECT_EQ(30u, sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT));
+
+    // No trailing array member, deliberately. A WCHAR Name[1] would make sizeof()
+    // carry one phantom character and every size calculation downstream would
+    // inherit it.
+    EXPECT_EQ(30u, sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT))
+        << "a trailing array member would show up here";
+}
+
+TEST(WireFormatContractTest, FileOperationEventIsFramedNotBare) {
+    // The defect was structural: a payload sent where a frame belongs. This pins
+    // the arithmetic that distinguishes the two, so the framed size can never
+    // silently collapse back to the payload size.
+    constexpr size_t kBarePayload = sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT);
+    constexpr size_t kFramedMinimum =
+        sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + kBarePayload;
+
+    EXPECT_EQ(70u, kFramedMinimum);
+    EXPECT_NE(kBarePayload, kFramedMinimum)
+        << "a framed event must be larger than its payload by exactly one header";
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_MESSAGE_HEADER), kFramedMinimum - kBarePayload);
+}
+
+// ============================================================================
+// PER-TYPE STATISTICS MUST COVER EVERY TYPE ON THE WIRE
+// ============================================================================
+//
+// These assertions live in IpcStatistics_Tests.cpp. They need IPCManager.hpp,
+// which cannot be included in this translation unit alongside Communication.hpp
+// (see the note at the top of this file).

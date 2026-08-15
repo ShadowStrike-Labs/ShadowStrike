@@ -126,6 +126,17 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_ExclusionQuery,         // Query current exclusion state
     FilterMessageType_ThreatScoreNotify,      // Composite threat score update
 
+    //
+    // File Operation Events (0xA0 - 0xAF)
+    //
+    // Appended here deliberately. This enum has no explicit values, so a new
+    // enumerator inserted anywhere except immediately before _Max renumbers
+    // every type after it - and the type number is on the wire, so that would
+    // silently re-label every subsequent message class between a driver and a
+    // service built at different times. Append only.
+    //
+    FilterMessageType_FileOperationEvent,     // Rename/delete evaluated by PreSetInformation
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 

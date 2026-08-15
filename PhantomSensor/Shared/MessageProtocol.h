@@ -185,6 +185,64 @@ typedef struct _FILE_SCAN_REQUEST {
 } FILE_SCAN_REQUEST, *PFILE_SCAN_REQUEST;
 
 //
+// 1b. File Operation Event (FilterMessageType_FileOperationEvent)
+//
+// Emitted by the PreSetInformation callback when a rename or delete has been
+// evaluated - including operations the driver BLOCKED, which by definition never
+// reach a post-operation callback and so cannot be reported by any other path.
+//
+// THIS STRUCTURE EXISTS BECAUSE ITS ABSENCE CAUSED A SILENT WIRE DEFECT.
+// The callback used to allocate a private struct declared inside PreSetInfo.c
+// and hand it to the send API *with no SHADOWSTRIKE_MESSAGE_HEADER in front of
+// it*. The service therefore read the payload's first field where the frame's
+// Magic belongs. That field was a kernel HANDLE ProcessId, so the reported magic
+// was the low half of a process id - and because the operation being reported
+// was performed by the scanner itself, it was OUR OWN process id. Field logs
+// show exactly that: "[IPCManager] Invalid message magic: 0x00002CA4", where
+// 0x2CA4 is 11428, the only pid in the run.
+//
+// It was worse than a rejected frame. Read at the header's offsets, the payload
+// also supplied the Flags field from its FileNameBytes member, so whether the
+// receiver took the encrypted path, the HMAC path, or refused on magic depended
+// on THE BYTE LENGTH OF THE FILE NAME - which is why the failures arrived in
+// groups of three (one per rename/delete on a decoy file) with the mode constant
+// within a group and varying between files.
+//
+// Two properties are therefore deliberate here:
+//   - It lives in the header BOTH SIDES include, so the payload cannot be a type
+//     only one side can name.
+//   - Every field is fixed-width. The original used HANDLE (8 bytes, and a
+//     kernel type) and FILE_INFORMATION_CLASS (an enum, whose width is the
+//     compiler's choice) in a structure that crosses a process boundary.
+//
+typedef struct _SHADOWSTRIKE_FILE_OPERATION_EVENT {
+    UINT32 ProcessId;          // Process that issued the operation
+    UINT32 InfoClass;          // FILE_INFORMATION_CLASS value, as a number
+    UINT32 BlockReason;        // Driver's reason code; 0 when not blocked
+    UINT32 SuspicionScore;     // Driver's score for the operation
+    UINT8  WasBlocked;         // Non-zero if the operation was refused
+    UINT8  Reserved0[3];       // Explicit padding - never implicit on the wire
+    INT64  Timestamp;          // KeQuerySystemTime value
+    UINT16 FileNameBytes;      // Length of FileName in BYTES, not characters
+    // Followed by:
+    // WCHAR FileName[FileNameBytes / sizeof(WCHAR)]  (NUL-terminated)
+} SHADOWSTRIKE_FILE_OPERATION_EVENT, *PSHADOWSTRIKE_FILE_OPERATION_EVENT;
+
+//
+// Pinned for the same reason as the frame header: this crosses the boundary, and
+// a field that moves on one side only reads back as a plausible value rather
+// than as an error.
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT) == 30);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, ProcessId)      ==  0);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, InfoClass)      ==  4);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, BlockReason)    ==  8);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, SuspicionScore) == 12);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, WasBlocked)     == 16);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, Timestamp)      == 20);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, FileNameBytes)  == 28);
+
+//
 // 2. Scan Verdict Reply (FilterMessageType_ScanVerdict)
 //
 typedef struct _SHADOWSTRIKE_SCAN_VERDICT_REPLY {

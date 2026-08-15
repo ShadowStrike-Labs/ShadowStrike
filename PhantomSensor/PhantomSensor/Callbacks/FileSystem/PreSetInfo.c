@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -99,18 +99,21 @@
 #include <ntstrsafe.h>
 
 //
-// Forward declaration for ScanBridge send API. Cannot include ScanBridge.h
-// directly because it has conflicting declarations with CommPort.h.
+// The send API used by this file is ShadowStrikeSendNotification, declared in
+// Communication/CommPort.h which is included above.
 //
-_IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS
-ShadowStrikeSendMessage(
-    _In_ PVOID InputBuffer,
-    _In_ ULONG InputBufferSize,
-    _Out_opt_ PVOID OutputBuffer,
-    _Inout_opt_ PULONG OutputBufferSize,
-    _In_opt_ PLARGE_INTEGER Timeout
-);
+// A hand-copied forward declaration of ScanBridge's ShadowStrikeSendMessage used
+// to sit here, with a comment explaining that ScanBridge.h could not be included
+// because it conflicts with CommPort.h. That workaround is what allowed the
+// defect below it: with no shared header in play, nothing checked that the buffer
+// handed to the send API was actually a framed message, and it was not - the
+// callback passed a bare payload struct with no SHADOWSTRIKE_MESSAGE_HEADER in
+// front of it. Declaring another module's API by hand removes the one check that
+// would have caught it.
+//
+// If a caller here ever needs an API that genuinely lives only in ScanBridge.h,
+// fix the header conflict rather than copying the declaration.
+//
 
 // ============================================================================
 // PRIVATE CONSTANTS
@@ -357,17 +360,14 @@ typedef struct _PSI_PROCESS_CONTEXT {
 
 /**
  * @brief Telemetry event structure for user-mode notification
+ *
+ * REMOVED. The payload contract now lives in Shared/MessageProtocol.h as
+ * SHADOWSTRIKE_FILE_OPERATION_EVENT, because a structure that crosses the
+ * kernel/user boundary cannot be declared privately in one .c file - the service
+ * could not name the type, so it could not parse the message, and nothing on
+ * either side could detect that the frame was malformed. See the commentary on
+ * that structure for what it cost.
  */
-typedef struct _PSI_TELEMETRY_EVENT {
-    HANDLE ProcessId;
-    FILE_INFORMATION_CLASS InfoClass;
-    ULONG BlockReason;
-    ULONG SuspicionScore;
-    BOOLEAN WasBlocked;
-    LARGE_INTEGER Timestamp;
-    USHORT FileNameLength;
-    WCHAR FileName[1];  // Variable length
-} PSI_TELEMETRY_EVENT, *PPSI_TELEMETRY_EVENT;
 
 /**
  * @brief Global PreSetInfo state
@@ -2451,8 +2451,9 @@ PsipSendTelemetryEvent(
     )
 {
     NTSTATUS status;
-    PPSI_TELEMETRY_EVENT event = NULL;
-    ULONG eventSize;
+    PSHADOWSTRIKE_MESSAGE_HEADER event = NULL;
+    PSHADOWSTRIKE_FILE_OPERATION_EVENT payload = NULL;
+    ULONG totalSize;
     USHORT fileNameLength;
 
     if (!PsipIsInitialized()) {
@@ -2468,14 +2469,24 @@ PsipSendTelemetryEvent(
         fileNameLength = 0;
     }
 
-    eventSize = FIELD_OFFSET(PSI_TELEMETRY_EVENT, FileName) + fileNameLength + sizeof(WCHAR);
+    //
+    // A FRAMED message: [SHADOWSTRIKE_MESSAGE_HEADER][payload][name][NUL].
+    //
+    // The header is not optional and its absence is the whole reason this code
+    // is being read. Without it the service parses the payload's first field as
+    // the frame magic, and every frame is refused - see the commentary on
+    // SHADOWSTRIKE_FILE_OPERATION_EVENT.
+    //
+    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT) +
+                fileNameLength + sizeof(WCHAR);
 
     //
     // Allocate event structure (paged â€” runs at PASSIVE_LEVEL context)
     //
-    event = (PPSI_TELEMETRY_EVENT)ExAllocatePool2(
+    event = (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
         POOL_FLAG_PAGED,
-        eventSize,
+        totalSize,
         PSI_POOL_TAG
         );
 
@@ -2484,34 +2495,61 @@ PsipSendTelemetryEvent(
         return;
     }
 
-    RtlZeroMemory(event, eventSize);
+    RtlZeroMemory(event, totalSize);
 
     //
     // Populate event
     //
-    event->ProcessId = ProcessId;
-    event->InfoClass = InfoClass;
-    event->BlockReason = BlockReason;
-    event->SuspicionScore = SuspicionScore;
-    event->WasBlocked = WasBlocked;
-    KeQuerySystemTime(&event->Timestamp);
-    event->FileNameLength = fileNameLength;
-
-    if (fileNameLength > 0) {
-        RtlCopyMemory(event->FileName, FileName->Buffer, fileNameLength);
-    }
-    event->FileName[fileNameLength / sizeof(WCHAR)] = L'\0';
-
-    //
-    // Send via communication port (ScanBridge).
-    // Non-blocking â€” if the port is not connected, the event is dropped.
-    //
-    status = ShadowStrikeSendMessage(
+    ShadowStrikeInitMessageHeader(
         event,
-        eventSize,
-        NULL,
-        NULL,
-        NULL
+        FilterMessageType_FileOperationEvent,
+        totalSize - (ULONG)sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+        );
+
+    payload = (PSHADOWSTRIKE_FILE_OPERATION_EVENT)(event + 1);
+
+    payload->ProcessId = HandleToULong(ProcessId);
+    payload->InfoClass = (UINT32)InfoClass;
+    payload->BlockReason = BlockReason;
+    payload->SuspicionScore = SuspicionScore;
+    payload->WasBlocked = WasBlocked ? 1u : 0u;
+    KeQuerySystemTime((PLARGE_INTEGER)&payload->Timestamp);
+    payload->FileNameBytes = fileNameLength;
+
+    //
+    // The name follows the payload structure. It is written through a byte
+    // cursor rather than a trailing array member, because the shared structure
+    // deliberately declares no array: a [1]-element member makes sizeof() carry
+    // one phantom character and every size calculation downstream inherits it.
+    //
+    {
+        PUCHAR nameStart = (PUCHAR)payload + sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT);
+
+        if (fileNameLength > 0) {
+            RtlCopyMemory(nameStart, FileName->Buffer, fileNameLength);
+        }
+
+        //
+        // Terminator written explicitly. RtlZeroMemory above already cleared it,
+        // but relying on that makes the NUL an accident of the allocator rather
+        // than part of the contract the reader is promised.
+        //
+        *(WCHAR UNALIGNED *)(nameStart + fileNameLength) = L'\0';
+    }
+
+    //
+    // Send through the CommPort notification funnel, which frames, encrypts
+    // and delivers it. This used to call ScanBridge's ShadowStrikeSendMessage,
+    // which transmits the caller's buffer verbatim - no header, no encryption,
+    // no authentication. Zero timeout, so it never blocks the callback.
+    //
+    // If no client is connected the funnel BUFFERS the message for delivery on
+    // reconnect rather than dropping it, which is why the old comment saying it
+    // is dropped no longer holds.
+    //
+    status = ShadowStrikeSendNotification(
+        event,
+        totalSize
         );
 
     if (NT_SUCCESS(status)) {

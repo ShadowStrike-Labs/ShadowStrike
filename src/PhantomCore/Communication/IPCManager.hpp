@@ -194,6 +194,27 @@ namespace IPCConstants {
 
     /// @brief Filter port name
     inline constexpr const wchar_t* FILTER_PORT_NAME = L"\\ShadowStrikePort";
+
+    /// @brief Number of per-message-type statistic slots.
+    ///
+    /// DERIVED FROM THE ENUM, NOT CHOSEN. This was the literal 16 while
+    /// SHADOWSTRIKE_MESSAGE_TYPE already ran well past 40, and every counting
+    /// site guards with `if (idx < byMessageType.size())` - so every type with an
+    /// ordinal of 16 or more was silently not counted, and the guard is exactly
+    /// what made that invisible. That set was not arbitrary: it was all of the
+    /// alerts. HandleAlert, RansomwareAlert, BehavioralAlert, MemoryAlert,
+    /// NetworkAlert, SyscallAlert and SelfProtectAlert each reported zero
+    /// received, permanently, no matter how many arrived.
+    ///
+    /// A statistic that is structurally always zero is worse than an absent one,
+    /// because it argues against the symptom someone is investigating.
+    inline constexpr size_t MESSAGE_TYPE_SLOTS =
+        static_cast<size_t>(FilterMessageType_Max);
+
+    static_assert(MESSAGE_TYPE_SLOTS > 16,
+                  "Sanity check on the derivation: the enum is known to exceed the old "
+                  "hardcoded 16 slots. If this fails, the enum shrank and the note above "
+                  "needs revisiting.");
     
     // The service pipe name is deliberately NOT declared here.
     //
@@ -570,7 +591,7 @@ struct IPCStatistics {
     std::atomic<uint64_t> reconnects{0};
     std::atomic<uint64_t> avgLatencyUs{0};
     std::atomic<uint64_t> maxLatencyUs{0};
-    std::array<std::atomic<uint64_t>, 16> byMessageType{};
+    std::array<std::atomic<uint64_t>, IPCConstants::MESSAGE_TYPE_SLOTS> byMessageType{};
     std::array<std::atomic<uint64_t>, 8> byVerdict{};
     TimePoint startTime = Clock::now();
     
@@ -593,7 +614,7 @@ struct IPCStatisticsSnapshot {
     uint64_t reconnects{0};
     uint64_t avgLatencyUs{0};
     uint64_t maxLatencyUs{0};
-    std::array<uint64_t, 16> byMessageType{};
+    std::array<uint64_t, IPCConstants::MESSAGE_TYPE_SLOTS> byMessageType{};
     std::array<uint64_t, 8> byVerdict{};
     TimePoint startTime{};
     
