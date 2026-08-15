@@ -1112,7 +1112,17 @@ private:
     
     template<typename ResultType>
     bool EnqueueTask(Task<ResultType> task);
-    
+
+    /**
+     * @brief Refuse work this pool cannot possibly run, before accepting it.
+     * @throws std::runtime_error if the pool is shut down, or was never started.
+     *
+     * Called by every Submit* entry point so the two unusable states are
+     * rejected in ONE place. They were previously checked in four copies of the
+     * same two lines, and only one of the two states was checked at all.
+     */
+    void RequireAcceptingWork() const;
+
     void LogETWEvent(ETWEventId eventId, const std::wstring& message, 
                     ETWLevel level = ETWLevel::Information);
     
@@ -1185,9 +1195,7 @@ auto ThreadPool::Submit(
 {
     using ResultType = std::invoke_result_t<Func, const TaskContext&>;
 
-    if (shutdown_.load(std::memory_order_acquire)) {
-        throw std::runtime_error("ThreadPool is shut down");
-    }
+    RequireAcceptingWork();
 
     TaskContext context(priority, std::move(description), location);
     context.taskId = nextTaskId_.fetch_add(1, std::memory_order_relaxed);
@@ -1214,9 +1222,7 @@ auto ThreadPool::Submit(
 {
     using ResultType = std::invoke_result_t<Func, const TaskContext&, Args...>;
 
-    if (shutdown_.load(std::memory_order_acquire)) {
-        throw std::runtime_error("ThreadPool is shut down");
-    }
+    RequireAcceptingWork();
 
     // Args'l� versiyonda default priority/description
     TaskContext context(TaskPriority::Normal, "");
@@ -1250,9 +1256,7 @@ auto ThreadPool::SubmitWithTimeout(
     
     using ResultType = std::invoke_result_t<Func, TaskContext, Args...>;
     
-    if (shutdown_.load(std::memory_order_acquire)) {
-        throw std::runtime_error("ThreadPool is shut down");
-    }
+    RequireAcceptingWork();
     
     // Create task context with timeout
     TaskContext context(priority, std::move(description), location);
@@ -1311,9 +1315,7 @@ auto ThreadPool::SubmitCancellable(
     
     using ResultType = std::invoke_result_t<Func, TaskContext, Args...>;
     
-    if (shutdown_.load(std::memory_order_acquire)) {
-        throw std::runtime_error("ThreadPool is shut down");
-    }
+    RequireAcceptingWork();
     if (!cancellationToken) {
         cancellationToken = CreateCancellationToken();
     }

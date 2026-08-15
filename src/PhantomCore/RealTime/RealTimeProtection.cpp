@@ -360,6 +360,12 @@ public:
     // Configuration & State
     RTPConfig m_config;
     std::atomic<ProtectionState> m_state{ ProtectionState::UNINITIALIZED };
+
+    // Deadline at which a timed Pause() must re-enable protection, as a raw
+    // steady_clock::rep; 0 means "no auto-resume pending". Checked by
+    // StatsUpdateLoop. Deliberately not a sleeping task on the scan pool - see
+    // Pause() for why that was both inert and, once fixed, wasteful.
+    std::atomic<std::chrono::steady_clock::rep> m_pauseAutoResumeAt{ 0 };
     std::atomic<ProtectionMode> m_mode{ ProtectionMode::BLOCK_KNOWN };
     std::atomic<bool> m_initialized{ false };
 
@@ -647,6 +653,25 @@ public:
                 tpConfig.minThreads = std::min(std::thread::hardware_concurrency(), 8u);
                 tpConfig.maxThreads = std::min(std::thread::hardware_concurrency() * 2u, 16u);
                 m_threadPool = std::make_shared<Utils::ThreadPool>(std::move(tpConfig));
+
+                // START the pool. The ThreadPool constructor only validates its
+                // configuration; worker threads are created by Initialize().
+                // This call was missing, so the pool below had ZERO workers and
+                // was then handed to eight protection modules, while Submit()
+                // still accepted work onto it and returned futures that could
+                // never complete. Two consequences were live: a timed Pause()
+                // never auto-resumed (protection stayed off indefinitely), and
+                // ExploitPrevention::Stop() blocked forever joining a
+                // verification task that had never been given a thread to run on.
+                if (!m_threadPool->Initialize()) {
+                    Utils::Logger::Error(
+                        "RealTimeProtection: thread pool failed to start; "
+                        "refusing to continue because a pool with no workers "
+                        "accepts work it can never run");
+                    m_threadPool.reset();
+                    SetState(ProtectionState::ERROR);
+                    return false;
+                }
             }
 
             try {
@@ -718,6 +743,25 @@ public:
                 tpConfig.minThreads = std::min(std::thread::hardware_concurrency(), 8u);
                 tpConfig.maxThreads = std::min(std::thread::hardware_concurrency() * 2u, 16u);
                 m_threadPool = std::make_shared<Utils::ThreadPool>(std::move(tpConfig));
+
+                // START the pool. The ThreadPool constructor only validates its
+                // configuration; worker threads are created by Initialize().
+                // This call was missing, so the pool below had ZERO workers and
+                // was then handed to eight protection modules, while Submit()
+                // still accepted work onto it and returned futures that could
+                // never complete. Two consequences were live: a timed Pause()
+                // never auto-resumed (protection stayed off indefinitely), and
+                // ExploitPrevention::Stop() blocked forever joining a
+                // verification task that had never been given a thread to run on.
+                if (!m_threadPool->Initialize()) {
+                    Utils::Logger::Error(
+                        "RealTimeProtection: thread pool failed to start; "
+                        "refusing to continue because a pool with no workers "
+                        "accepts work it can never run");
+                    m_threadPool.reset();
+                    SetState(ProtectionState::ERROR);
+                    return false;
+                }
             }
 
             // 1.5. Initialize CacheManager for shared verdict/result caching
@@ -1205,14 +1249,38 @@ public:
 
         m_protectionStatus.isProtected = false;
 
-        // Set up auto-resume if duration specified
+        // Set up auto-resume if duration specified.
+        //
+        // Recorded as a DEADLINE the stats loop checks, not as a sleeping task.
+        // This used to submit a task to the scan pool that slept for the whole
+        // pause duration, which is wrong in two independent ways.
+        //
+        // First, it never ran: the pool it was submitted to had no worker threads
+        // (see Start()), so a "pause for 30 minutes" disabled protection
+        // PERMANENTLY, with nothing logged. That is the most serious form this
+        // defect could take - the product turns itself off and stays off.
+        //
+        // Second, once the pool is started correctly, a task that sleeps for the
+        // pause duration OCCUPIES A SCAN WORKER for that entire time. The pool
+        // has a floor of four precisely so that a couple of stalled operations
+        // cannot take scanning capacity to zero; parking one of those four on a
+        // 30-minute sleep spends a quarter of that headroom doing nothing.
+        //
+        // A deadline costs no thread and no slot. The stats loop already runs
+        // every few seconds regardless of pause state, so its granularity is
+        // irrelevant against pauses measured in minutes, and the resume still
+        // happens even if the pool is saturated or unavailable.
         if (durationMs > 0) {
-            (void)m_threadPool->Submit([this, durationMs](const Utils::TaskContext&) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(durationMs));
-                if (m_state == ProtectionState::PAUSED) {
-                    (void)Resume();
-                }
-            });
+            const auto resumeAt = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(durationMs);
+            m_pauseAutoResumeAt.store(resumeAt.time_since_epoch().count(),
+                                      std::memory_order_release);
+            Utils::Logger::Info(
+                "RealTimeProtection: protection will resume automatically in {} ms",
+                durationMs);
+        } else {
+            // Indefinite pause: nothing may silently re-enable protection.
+            m_pauseAutoResumeAt.store(0, std::memory_order_release);
         }
 
         return true;
@@ -1222,6 +1290,10 @@ public:
         if (m_state != ProtectionState::PAUSED) {
             return false;
         }
+
+        // Cancel any pending auto-resume deadline first, so a manual Resume
+        // cannot be followed by a second one firing from the stats loop.
+        m_pauseAutoResumeAt.store(0, std::memory_order_release);
 
         Utils::Logger::Info("RealTimeProtection: Resuming protection...");
 
@@ -6058,6 +6130,33 @@ public:
             }
 
             ReportCapacity();
+
+            // Honour a timed Pause(). Protection that was switched off for a
+            // stated duration must come back on by itself; if this check is
+            // missing or its deadline is never reached, the product stays
+            // unprotected indefinitely while reporting that it is merely paused.
+            const auto resumeAtRep =
+                m_pauseAutoResumeAt.load(std::memory_order_acquire);
+            if (resumeAtRep != 0 && m_state == ProtectionState::PAUSED) {
+                const std::chrono::steady_clock::time_point resumeAt{
+                    std::chrono::steady_clock::duration{resumeAtRep}};
+                if (std::chrono::steady_clock::now() >= resumeAt) {
+                    Utils::Logger::Info(
+                        "RealTimeProtection: pause duration elapsed - resuming "
+                        "protection automatically");
+                    if (!Resume()) {
+                        // Resume() clears the deadline on success. Clearing it
+                        // here too stops a failure from re-attempting every few
+                        // seconds forever, and the WARN says protection is still
+                        // off - which is the part that must not be silent.
+                        m_pauseAutoResumeAt.store(0, std::memory_order_release);
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: automatic resume FAILED - "
+                            "protection remains paused and will not re-enable "
+                            "itself; a manual Resume is required");
+                    }
+                }
+            }
         }
 
         Utils::Logger::Info("RealTimeProtection: Stats update thread exiting");

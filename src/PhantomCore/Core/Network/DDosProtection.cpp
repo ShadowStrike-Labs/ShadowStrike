@@ -448,7 +448,6 @@ public:
     std::unordered_map<uint64_t, SeverityCallback> m_severityCallbacks;
 
     // Worker threads
-    std::shared_ptr<ThreadPool> m_threadPool;
     std::vector<std::jthread> m_workerThreads;
 
     // Timing
@@ -480,19 +479,16 @@ public:
             // Store configuration
             m_config = config;
 
-            // Create thread pool
-            constexpr size_t kThreadPoolConcurrency = 4;
-            ThreadPoolConfig threadPoolConfig;
-            threadPoolConfig.minThreads = std::max(
-                ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
-                kThreadPoolConcurrency
-            );
-            threadPoolConfig.maxThreads = std::max(
-                threadPoolConfig.minThreads,
-                kThreadPoolConcurrency
-            );
-            threadPoolConfig.threadNamePrefix = L"ShadowStrike-DDos";
-            m_threadPool = std::make_shared<ThreadPool>(threadPoolConfig);
+            // NO THREAD POOL HERE, DELIBERATELY.
+            //
+            // This module used to construct a 4-thread ThreadPool and never
+            // Initialize() it and never Submit() to it - the member had exactly
+            // two references in the whole file, its declaration and its
+            // construction. Since the constructor does not create threads, it
+            // cost nothing at runtime and did nothing; "fixing" it by adding the
+            // missing Initialize() call would have spawned four permanent worker
+            // threads on every endpoint to serve a queue nothing ever posts to.
+            // The work this module actually does runs on m_workerThreads below.
 
             // Initialize whitelists from config under their owning mutex to
             // preserve the documented lock order (m_ipTrackingMutex guards

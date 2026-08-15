@@ -464,11 +464,44 @@ public:
             threadPoolConfig.threadNamePrefix = L"ShadowStrike-Scan";
 
             m_threadPool = std::make_shared<ThreadPool>(threadPoolConfig);
+
+            // START the pool. The constructor only validates the configuration -
+            // CreateWorkerThreads runs from Initialize() - so a pool that is
+            // merely constructed has ZERO worker threads.
+            //
+            // This call was missing, and nothing said so. Submit() gated only on
+            // the shutdown flag, so every asynchronous scan job, every cloud
+            // upload, every HeuristicAnalyzer async analysis and every
+            // EmulationEngine submission was enqueued onto a pool with no
+            // workers: accepted, counted, never executed, and never reported.
+            // The line below used to print desiredThreadCount - the number we
+            // WANTED - which is why the field log read "Thread pool initialized
+            // with 4 threads" while the capacity report on the same run read
+            // pool=0/0. A log statement that prints the intent instead of the
+            // result cannot detect the case where the two differ, which is the
+            // only case worth logging.
+            //
+            // Fatal on failure. This pool serves the scan engine's asynchronous
+            // work and is handed to both the heuristic analyzer and the emulation
+            // engine; continuing without it means those paths silently accept
+            // work they cannot run, which is the defect this call fixes.
+            if (!m_threadPool->Initialize()) {
+                SS_LOG_ERROR(L"ScanEngine",
+                    L"Thread pool failed to start (%zu threads requested); "
+                    L"asynchronous scanning, heuristics and emulation would all "
+                    L"accept work they could never run",
+                    desiredThreadCount);
+                m_threadPool.reset();
+                return false;
+            }
+
+            // Report what the pool ACTUALLY has, not what was asked for.
             SS_LOG_INFO(L"ScanEngine",
-                        L"Thread pool initialized with %zu threads "
-                        L"(logical processors=%zu, configured scanThreads=%u)",
-                        desiredThreadCount, hwThreads,
-                        static_cast<unsigned>(config.scanThreads));
+                        L"Thread pool started with %zu worker thread(s) "
+                        L"(requested=%zu, logical processors=%zu, "
+                        L"configured scanThreads=%u)",
+                        m_threadPool->GetThreadCount(), desiredThreadCount,
+                        hwThreads, static_cast<unsigned>(config.scanThreads));
 
             // The detection stores live in one hardened directory. Create it
             // before opening anything so first run works without the installer

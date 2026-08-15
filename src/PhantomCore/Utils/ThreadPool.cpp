@@ -1642,6 +1642,45 @@ bool ThreadPool::IsInitialized() const noexcept {
 }
 
 /**
+ * @brief Refuse work this pool cannot possibly run, before accepting it.
+ *
+ * Two states make a pool unable to run anything. Only the first was ever
+ * checked, and the second is the one that actually shipped.
+ *
+ * A pool that was CONSTRUCTED BUT NEVER Initialize()d has no worker threads at
+ * all: the constructor only validates the configuration (see its own note) and
+ * CreateWorkerThreads runs from Initialize(). Submit used to gate on shutdown_
+ * alone, so submitting to such a pool SUCCEEDED - the task was enqueued, the
+ * queue counter rose, a future was handed back, and no thread existed to ever
+ * dequeue it. The work was not delayed, it was permanently lost, and every
+ * observable signal said the pool was fine: GetQueueSize() reported the backlog
+ * as ordinary pending work, and busy/idle counts stayed at zero because
+ * MonitoringLoop is also started by Initialize().
+ *
+ * That is not a hypothetical. Five of this codebase's nine pools were built this
+ * way, including the one serving the scan engine, and the defect was invisible
+ * for the product's entire history because submitting to a dead pool looked
+ * exactly like submitting to a working one.
+ *
+ * Refusing THROWS rather than returning a failure, deliberately: this is a
+ * programming error at the call site - a pool the caller owns and did not start
+ * - not a runtime condition any caller can recover from. A caller cannot make
+ * the work run by trying again. Submit already throws for the other two
+ * unacceptable inputs (shut down, queue full), so this adds no new obligation.
+ */
+void ThreadPool::RequireAcceptingWork() const {
+    if (shutdown_.load(std::memory_order_acquire)) {
+        throw std::runtime_error("ThreadPool is shut down");
+    }
+
+    if (!initialized_.load(std::memory_order_acquire)) {
+        throw std::runtime_error(
+            "ThreadPool::Initialize() was never called on this pool, so it has "
+            "no worker threads and submitted work could never run");
+    }
+}
+
+/**
  * @brief Check if the thread pool is shutting down or has shut down.
  * @return true if shutdown initiated, false otherwise.
  */
@@ -2139,6 +2178,24 @@ void ThreadPool::CreateWorkerThreads(size_t count) {
             threadStats_.currentThreadCount.fetch_add(1, std::memory_order_relaxed);
             threadStats_.totalThreadsCreated.fetch_add(1, std::memory_order_relaxed);
 
+            // A worker that has just been created holds no task, so it is idle by
+            // definition. Account for it HERE, where that is known exactly,
+            // instead of waiting for MonitoringLoop to discover it.
+            //
+            // Without this, active and idle both read zero for up to a second
+            // after the pool starts while currentThreadCount already reports the
+            // full width - so busy + idle did not account for the workers that
+            // demonstrably existed. That is not only a reporting gap:
+            // OptimizeThreadCount and HandleOverflow both branch on the idle
+            // count, and "no idle workers" is precisely the condition that argues
+            // for creating more, so a pool could grow at startup on the strength
+            // of a number that had not been populated yet.
+            //
+            // UpdateMetrics still recomputes both counts from the workers
+            // themselves once per second and remains the owner of steady state;
+            // this only makes the value correct from the first instant.
+            threadStats_.idleThreadCount.fetch_add(1, std::memory_order_relaxed);
+
             // Update peak thread count atomically
             const size_t current = threadStats_.currentThreadCount.load(std::memory_order_relaxed);
             size_t expected = threadStats_.peakThreadCount.load(std::memory_order_relaxed);
@@ -2194,6 +2251,20 @@ void ThreadPool::DestroyWorkerThreads(size_t count) {
         // Update statistics
         threadStats_.currentThreadCount.fetch_sub(1, std::memory_order_relaxed);
         threadStats_.totalThreadsDestroyed.fetch_add(1, std::memory_order_relaxed);
+
+        // Mirror of the idle accounting in CreateWorkerThreads. Whether this
+        // particular worker was idle or busy is not knowable here, so the count
+        // is only decremented when there is one to give up - an unsigned
+        // underflow would report billions of idle threads to the scaling logic,
+        // which is a far worse answer than being one out for under a second.
+        // UpdateMetrics recomputes both counts from the workers each second and
+        // corrects any skew this leaves behind.
+        size_t idleNow = threadStats_.idleThreadCount.load(std::memory_order_relaxed);
+        while (idleNow > 0 &&
+               !threadStats_.idleThreadCount.compare_exchange_weak(
+                   idleNow, idleNow - 1, std::memory_order_relaxed)) {
+            // idleNow refreshed by compare_exchange_weak on failure.
+        }
     }
 
     // Workers are stopped and joined when unique_ptr destructs

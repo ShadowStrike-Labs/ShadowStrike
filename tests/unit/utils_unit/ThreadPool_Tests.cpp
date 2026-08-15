@@ -164,6 +164,74 @@ TEST_F(ThreadPoolTest, ShutdownWithoutInitializeIsNoop) {
     EXPECT_NO_THROW(pool.Shutdown());
 }
 
+// ============================================================================
+//  A pool that was never started must REFUSE work, not accept it.
+//
+//  This is the root cause of the pool=0/0 field defect. ThreadPool is a
+//  two-phase class: the constructor only validates the configuration, and
+//  Initialize() is what calls CreateWorkerThreads and starts MonitoringLoop.
+//  Submit() used to gate on the shutdown flag ALONE, so submitting to a
+//  constructed-but-unstarted pool SUCCEEDED - the task was enqueued, the queue
+//  counter rose, a future was returned, and no thread existed that could ever
+//  run it. The work was not delayed, it was permanently lost, and every
+//  observable signal looked normal.
+//
+//  Five of this codebase's nine pools were built that way, including the one
+//  serving the scan engine, which is why this must be enforced by the class
+//  rather than remembered by nine call sites.
+//
+//  These two cases FAIL against the pre-fix code: the first because Submit
+//  returned a future instead of throwing, the second because the task was
+//  accepted and counted.
+// ============================================================================
+
+TEST_F(ThreadPoolTest, SubmitToUnstartedPoolIsRefused) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[SubmitToUnstartedPoolIsRefused] Testing...");
+    ThreadPool pool(config_);
+    ASSERT_FALSE(pool.IsInitialized())
+        << "precondition: this case is about a pool nobody started";
+
+    std::atomic<bool> ran{false};
+    EXPECT_THROW(
+        {
+            auto f = pool.Submit([&ran](const TaskContext&) { ran = true; return 1; });
+            (void)f;
+        },
+        std::runtime_error);
+
+    // The decisive part. Accepting the task would have been survivable; running
+    // it was never possible, so silently keeping it is the actual defect.
+    std::this_thread::sleep_for(150ms);
+    EXPECT_FALSE(ran.load())
+        << "a pool with no worker threads cannot have executed anything";
+    EXPECT_EQ(pool.GetQueueSize(), 0u)
+        << "refused work must not be left sitting in the queue, where it is "
+           "indistinguishable from ordinary pending work";
+}
+
+TEST_F(ThreadPoolTest, UnstartedPoolHasNoWorkersAndSaysSo) {
+    SS_LOG_INFO(L"ThreadPool_Tests", L"[UnstartedPoolHasNoWorkersAndSaysSo] Testing...");
+    ThreadPool pool(config_);
+
+    // The property the product's log line contradicted for its whole history:
+    // a configured minThreads is a request, not a worker count.
+    EXPECT_EQ(pool.GetThreadCount(), 0u);
+    EXPECT_FALSE(pool.IsInitialized());
+
+    ASSERT_TRUE(pool.Initialize());
+    EXPECT_TRUE(pool.IsInitialized());
+    EXPECT_GT(pool.GetThreadCount(), 0u)
+        << "Initialize() must actually create the workers it reports";
+
+    // No regression: a started pool still accepts and runs work.
+    std::atomic<bool> ran{false};
+    auto f = pool.Submit([&ran](const TaskContext&) { ran = true; return 7; });
+    EXPECT_EQ(f.get(), 7);
+    EXPECT_TRUE(ran.load());
+
+    pool.Shutdown();
+}
+
 TEST_F(ThreadPoolTest, ShutdownSetsFlags) {
     SS_LOG_INFO(L"ThreadPool_Tests", L"[ShutdownSetsFlags] Testing...");
     ThreadPool pool(config_);
