@@ -3379,10 +3379,14 @@ void BootTimeAnalyzer::RegisterBCDChangeCallback() {
     try {
         // Wire into RegistryMonitor for real-time BCD store change alerts
         auto& regMon = Registry::RegistryMonitor::Instance();
-        if (!regMon.IsRunning()) {
-            SS_LOG_WARN(LOG_CATEGORY, L"RegistryMonitor not running — BCD change monitoring deferred");
-            return;
-        }
+        // NO IsRunning() GATE. The one removed here logged "BCD change
+        // monitoring deferred" and returned, and nothing ever retried, so
+        // this observation-only callback was never registered in any run and
+        // BCD store change monitoring has never operated. RegisterEventCallback
+        // is order-independent by construction - it inserts into the callback
+        // map under the monitor mutex and does not require a started monitor -
+        // so registering before the kernel feed goes live is correct and the
+        // callback simply starts receiving events when it does.
 
         // Register an observation-only event callback.  The RegistryMonitor
         // policy-callback slot is global and single-instance; using it here

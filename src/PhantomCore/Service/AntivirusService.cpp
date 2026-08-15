@@ -69,6 +69,12 @@
 #include "../Update/SignatureUpdater.hpp"
 #include "../Update/ProgramUpdater.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
+
+// Live registry event monitoring. This module supplies the event stream that
+// RegistryAnalyzer's DKOM detection, StartupAnalyzer's persistence-key
+// monitoring and BootTimeAnalyzer's BCD change monitoring all consume. Nothing
+// in production started it before, so all three ran with no data.
+#include "../Core/Registry/RegistryMonitor.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Config/ConfigManager.hpp"
@@ -459,6 +465,41 @@ public:
             }
             SS_LOG_INFO(LOG_CATEGORY, L"RegistryProtection init returned");
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-RegistryProtection-leave");
+
+            // Registry Monitor (live kernel registry event feed).
+            //
+            // This is the event SOURCE, not a duplicate of RegistryProtection.
+            // RegistryProtection is self-defence for our own keys; this module
+            // supplies the general registry event stream that three detectors
+            // consume - RegistryAnalyzer's DKOM detection, StartupAnalyzer's
+            // persistence-key (T1547) monitoring and BootTimeAnalyzer's BCD
+            // store monitoring. Nothing in production started it before, so all
+            // three have run with no data on every single release.
+            //
+            // Both modules subscribe to the same kernel registry fan-out and
+            // coexist by design; the fan-out combines subscriber verdicts
+            // most-severe-wins, so neither displaces the other.
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-RegistryMonitor-enter");
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing RegistryMonitor...");
+            {
+                auto& regMon = Core::Registry::RegistryMonitor::Instance();
+                if (!regMon.Initialize(Core::Registry::RegistryMonitorConfig::CreateDefault())) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Failed to initialize RegistryMonitor - DKOM, persistence-key and "
+                        L"BCD monitoring will have no event source");
+                    // Non-fatal: those three detectors degrade to inactive, which
+                    // is the state they were already in before this was wired.
+                } else if (!regMon.Start()) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"RegistryMonitor could not subscribe to the kernel registry feed - "
+                        L"DKOM, persistence-key and BCD monitoring will have no event source");
+                } else {
+                    SS_LOG_INFO(LOG_CATEGORY,
+                        L"RegistryMonitor started on the kernel registry fan-out");
+                }
+            }
+            SS_LOG_INFO(LOG_CATEGORY, L"RegistryMonitor init returned");
+            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-RegistryMonitor-leave");
 
             // File Protection (protect installation directory and databases
             // before Real-Time Protection opens its signature/pattern files)
@@ -870,6 +911,14 @@ public:
             Security::FileProtection::Instance().Shutdown(
                 Security::FileProtection::Instance().GenerateAuthorizationToken());
         }
+
+        // RegistryMonitor shutdown - releases its registry fan-out subscription.
+        // Order relative to RegistryProtection is NOT load-bearing: each
+        // subscriber is removed BY NAME, so neither teardown can disturb the
+        // other. That property is the fix from commit c65d6fc2, where a
+        // teardown passed nullptr and cleared the entire feed, disabling kernel
+        // registry dispatch for every remaining module.
+        Core::Registry::RegistryMonitor::Instance().Shutdown();
 
         // RegistryProtection shutdown (before ProcessProtection so registry
         // tamper detection is still active during process handle cleanup)

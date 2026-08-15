@@ -451,4 +451,71 @@ TEST_F(RegistryMonitorTest, RulePriorityAndProtectedKeyBoundariesRemainDetermini
         << "truncation must keep enough of the path to identify the target";
 }
 
+// ============================================================================
+// LIFECYCLE HONESTY
+// ============================================================================
+//
+// These tests exist because m_running used to be assigned true UNCONDITIONALLY,
+// after the connect attempt and regardless of its outcome. Start() therefore
+// reported success even when the module had no way to receive a single event.
+//
+// That is not cosmetic. THREE detectors gate on these two accessors before
+// wiring themselves up - RegistryAnalyzer::DetectDKOMImpl on IsKernelConnected(),
+// StartupAnalyzer's persistence-key (T1547) wiring and BootTimeAnalyzer's BCD
+// wiring on IsRunning(). A false "running" makes all three believe they are
+// watching a live feed while receiving nothing, which is strictly worse than
+// refusing to start, because a refusal is visible and silence is not.
+
+TEST_F(RegistryMonitorTest, StartRefusesWhenThereIsNoWayToReceiveEvents) {
+    auto cfg = RegistryMonitorConfig::CreateDefault();
+    cfg.useKernelCallback = false;  // the ONLY event source this module has
+
+    ASSERT_TRUE(monitor.Initialize(cfg));
+
+    // This module contains no user-mode registry monitoring whatsoever - no
+    // RegNotifyChangeKeyValue, no RegOpenKeyEx, no polling thread anywhere in
+    // its ~2,600 lines - so with the kernel feed disabled it cannot deliver any
+    // event at all. The old code logged "running in user-mode only" here, which
+    // described a mode that has never existed.
+    EXPECT_FALSE(monitor.Start())
+        << "Start() must refuse when no event source is available";
+    EXPECT_FALSE(monitor.IsRunning())
+        << "IsRunning() must never report a monitor that cannot deliver events";
+    EXPECT_FALSE(monitor.IsKernelConnected())
+        << "IsKernelConnected() must not claim a feed that was never subscribed";
+}
+
+TEST_F(RegistryMonitorTest, AnInitializedButUnstartedMonitorReportsNeitherRunningNorConnected) {
+    ASSERT_TRUE(monitor.Initialize(RegistryMonitorConfig::CreateDefault()));
+
+    EXPECT_FALSE(monitor.IsRunning())
+        << "Initialize() alone must not imply a running monitor";
+    EXPECT_FALSE(monitor.IsKernelConnected())
+        << "Initialize() alone must not imply a subscribed kernel feed";
+}
+
+TEST_F(RegistryMonitorTest, EventCallbacksRegisterOnAStoppedMonitorSoWiringIsOrderIndependent) {
+    // The three consumers above used to bail out with "deferring wiring" when
+    // the monitor was not yet running, and nothing ever retried, so their
+    // callbacks were never registered on any run in the product's history.
+    //
+    // Removing those gates is only correct if registration genuinely does not
+    // require a started monitor. This test pins that property, so a future
+    // change that makes RegisterEventCallback depend on m_running fails here
+    // rather than silently restoring three permanently-deferred detectors.
+    ASSERT_TRUE(monitor.Initialize(RegistryMonitorConfig::CreateDefault()));
+    ASSERT_FALSE(monitor.IsRunning());
+
+    bool invoked = false;
+    const uint64_t id = monitor.RegisterEventCallback(
+        [&invoked](const RegistryEvent&, RegistryVerdict) { invoked = true; });
+
+    EXPECT_NE(id, 0u)
+        << "RegisterEventCallback must succeed on a stopped monitor";
+    EXPECT_FALSE(invoked)
+        << "registration alone must not invoke the callback";
+    EXPECT_TRUE(monitor.UnregisterCallback(id))
+        << "a callback registered while stopped must also be removable";
+}
+
 }  // namespace ShadowStrike::Core::Registry::Test

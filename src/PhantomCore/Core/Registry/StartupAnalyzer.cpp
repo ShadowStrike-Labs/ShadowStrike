@@ -2182,11 +2182,16 @@ void StartupAnalyzer::WireRegistryMonitor() {
         }
 
         auto& regMon = RegistryMonitor::Instance();
-        if (!regMon.IsRunning()) {
-            SS_LOG_WARN(L"StartupAnalyzer",
-                L"RegistryMonitor not running, deferring wiring");
-            return;
-        }
+
+        // NO IsRunning() GATE. There used to be one here that logged
+        // "RegistryMonitor not running, deferring wiring" and returned - and
+        // nothing ever retried, so "deferring" was untrue and this callback was
+        // never registered in any run. RegisterEventCallback is deliberately
+        // order-independent: it takes the monitor's mutex and inserts into the
+        // callback map, with no dependency on the monitor being started, so a
+        // subscriber registered before the feed goes live simply begins
+        // receiving events when it does. Requiring a start order between two
+        // singletons is what created the defect; not requiring one removes it.
 
         // Register callback for registry events on autostart keys
         m_impl->m_registryMonitorCallbackId = regMon.RegisterEventCallback(

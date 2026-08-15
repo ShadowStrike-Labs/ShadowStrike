@@ -39,6 +39,7 @@
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/RegistryUtils.hpp"
+#include "../../Utils/ProcessUtils.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Process/ProcessMonitor.hpp"
@@ -1981,37 +1982,103 @@ public:
      */
     [[nodiscard]] bool DetectDKOMImpl() {
         try {
-            // Query RegistryMonitor for kernel connection status
             auto& regMon = ShadowStrike::Core::Registry::RegistryMonitor::Instance();
             if (!regMon.IsKernelConnected()) {
-                SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: DKOM detection unavailable - kernel not connected");
+                // Not an error condition: the registry feed is simply not up.
+                // Demoted from WARN because it would otherwise be printed on
+                // every rootkit scan for a state that is normal before start.
+                SS_LOG_DEBUG(L"Registry",
+                    L"RegistryAnalyzer: DKOM detection needs the kernel registry feed, not connected yet");
                 return false;
             }
 
-            // Cross-reference recent registry events with our analysis.
-            // If events come from processes that don't exist in ProcessMonitor,
-            // or the kernel reports callback list modifications, that's DKOM evidence.
             auto recentEvents = regMon.GetRecentEvents(50);
+            if (recentEvents.empty()) {
+                return false;
+            }
+
+            // ================================================================
+            // CORROBORATED AGAINST THE OS, NOT AGAINST OUR OWN CACHE
+            // ================================================================
+            // This detector used to conclude DKOM from one fact: the PID that
+            // performed a registry operation was absent from ProcessMonitor.
+            // That is unsound, and one direction of it was about to become
+            // catastrophic.
+            //
+            // ProcessMonitor IS NOT INITIALIZED IN PRODUCTION - nothing outside
+            // tests calls ProcessMonitor::Initialize (tracked as task 130). Its
+            // table is therefore empty and GetProcessInfo returns nullopt for
+            // EVERY pid. Registry events arrive in real time, so the five-second
+            // recency filter below is satisfied by essentially every event. The
+            // moment the registry feed went live, this function would have raised
+            // a CRITICAL DKOM anomaly for the first registry write performed by
+            // any ordinary process on the machine.
+            //
+            // AN EMPTY CACHE IS SILENCE, NOT EVIDENCE. Absence of a record in a
+            // store that was never populated carries no information, and reading
+            // it as an indicator is how a detector becomes a random number
+            // generator.
+            //
+            // The replacement is an actual DKOM signature rather than a proxy
+            // for one. A process hidden by direct kernel object manipulation is
+            // unlinked from the ActiveProcessLinks list that process enumeration
+            // walks, but its PspCidTable entry survives, so the kernel still
+            // resolves the PID directly. The discrepancy between "absent from
+            // enumeration" and "still resolvable" IS the tell, and it needs no
+            // help from our own bookkeeping.
+            std::vector<ProcessUtils::ProcessId> livePids;
+            if (!ProcessUtils::EnumerateProcesses(livePids)) {
+                // Cannot corroborate, so do not guess. A detector that reports
+                // on evidence it could not gather is worse than one that stays
+                // quiet and says why.
+                SS_LOG_WARN(L"Registry",
+                    L"RegistryAnalyzer: DKOM check skipped, process enumeration failed");
+                return false;
+            }
+            const std::unordered_set<ProcessUtils::ProcessId> enumerated(
+                livePids.begin(), livePids.end());
+
             auto& procMon = ShadowStrike::Core::Process::ProcessMonitor::Instance();
+            const bool procMonUsable = procMon.IsInitialized();
 
             for (const auto& event : recentEvents) {
-                if (event.processId == 0 || event.processId == 4) continue;  // skip System/idle
+                if (event.processId == 0 || event.processId == 4) continue;  // Idle / System
 
-                auto procInfo = procMon.GetProcessInfo(event.processId);
-                if (procInfo.has_value()) continue;
+                // Cheap acquittal: our own tracker recognises the process. Only
+                // consulted when it is actually initialized, precisely so an
+                // empty tracker cannot contribute a signal.
+                if (procMonUsable &&
+                    procMon.GetProcessInfo(event.processId).has_value()) {
+                    continue;
+                }
 
-                // Process performed a registry op but is absent from the
-                // process table. To avoid false positives for legitimately
-                // exited short-lived processes, only flag when the event is
-                // RECENT (under five seconds) — a still-live attacker — or
-                // when many phantom events come from the same PID.
+                // AGE BOUND, WITH ITS REAL JUSTIFICATION. Windows recycles PIDs,
+                // so an old event's PID may already belong to a different
+                // process and every check below would be evaluating the wrong
+                // one. The bound keeps the correlation SOUND. It is not a
+                // false-positive suppressor - that is what the corroboration
+                // below is for, and conflating the two is what hid the defect.
                 const auto now = std::chrono::system_clock::now();
-                const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - event.timestamp);
+                const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - event.timestamp);
                 if (age.count() < 0 || age.count() > 5) continue;
 
+                // Listed by the OS: an ordinary process, nothing hidden.
+                if (enumerated.contains(event.processId)) continue;
+
+                // Not listed. Either it exited between the event and this check,
+                // or it is unlinked from the list while still alive.
+                if (!ProcessUtils::IsProcessRunning(event.processId)) {
+                    continue;  // exited - the benign short-lived case
+                }
+
+                // Absent from enumeration, still resolvable by the kernel, and
+                // it performed a registry operation seconds ago. Hidden process.
                 RecordAnomaly(AnomalyType::DKOMEvidence, AnomalySeverity::Critical,
                     L"KERNEL", event.keyPath, event.valueName, {},
-                    std::format("Registry operation from phantom PID {} (age {}s) - possible DKOM",
+                    std::format("Registry operation from PID {} that is absent from process "
+                                "enumeration but still resolvable by the kernel (age {}s) - "
+                                "hidden process, possible DKOM",
                                 event.processId, age.count()));
                 m_stats.rootkitIndicators.fetch_add(1, std::memory_order_relaxed);
                 return true;

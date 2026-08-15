@@ -77,9 +77,22 @@
 // ============================================================================
 #include <Windows.h>
 #include <winternl.h>
-#include "../../Communication/FilterConnection.hpp"
-#include "../../Communication/MessageDispatcher.hpp"
-#include "../../Communication/Communication.hpp"
+
+// IPCManager MUST precede any other Communication header. Communication.hpp
+// declares ShadowStrike::Communication::FileScanCallback / ProcessNotifyCallback
+// guarded by SS_IPC_CALLBACK_TYPES_DEFINED, and IPCManager.hpp is what defines
+// that macro before declaring the ACTIVE versions of those typedefs. Including
+// Communication.hpp first therefore gives C2371 on a later IPCManager include
+// (task 117 - the conflict is include-ORDER dependent, not absolute).
+#include "../../Communication/IPCManager.hpp"
+
+// NOTE ON THE THREE HEADERS THAT USED TO BE HERE. This module previously
+// included FilterConnection.hpp, MessageDispatcher.hpp and Communication.hpp to
+// run its own kernel receive loop over its own filter-port connection. All
+// three are gone because that loop is gone: registry notifications now arrive
+// through IPCManager's named registry fan-out, which owns the one port the
+// driver actually creates. See SubscribeToKernelRegistryFeed below for why the
+// private connection could never have worked.
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -827,19 +840,39 @@ public:
                 return true;
             }
 
-            if (m_config.useKernelCallback) {
-                m_kernelConnected = ConnectToKernelDriver();
-                if (!m_kernelConnected) {
-                    SS_LOG_WARN(L"Registry", L"Kernel connection failed, running in user-mode only");
-                }
+            // m_running MUST REFLECT CAPABILITY, NOT INTENT. It used to be set
+            // unconditionally below the connect attempt, so a failed connect
+            // still reported the monitor as running. That matters because THREE
+            // LIVE CONSUMERS gate on this state before registering their
+            // callbacks - RegistryAnalyzer::DetectDKOMImpl on IsKernelConnected()
+            // and StartupAnalyzer's autostart wiring plus BootTimeAnalyzer's BCD
+            // wiring on IsRunning(). Reporting true with no feed would make all
+            // three believe they were monitoring while receiving nothing, which
+            // is strictly worse than refusing to start. Same defect class as
+            // ScanEngine printing desiredThreadCount while the pool held zero
+            // workers (task 102): a status that reports intent cannot detect the
+            // one case worth reporting.
+            if (!m_config.useKernelCallback) {
+                SS_LOG_ERROR(L"Registry",
+                    L"useKernelCallback is disabled and this module has NO user-mode "
+                    L"registry monitoring - there is no RegNotifyChangeKeyValue path "
+                    L"here - so no event could ever be delivered. Refusing to start "
+                    L"rather than reporting a monitor that monitors nothing.");
+                return false;
             }
 
-            StartWorkerThreads();
+            m_kernelConnected = SubscribeToKernelRegistryFeed();
+            if (!m_kernelConnected) {
+                SS_LOG_ERROR(L"Registry",
+                    L"Registry fan-out subscription failed; refusing to report a "
+                    L"running monitor that cannot deliver events");
+                return false;
+            }
 
             m_running = true;
 
-            SS_LOG_INFO(L"Registry", L"RegistryMonitor started (kernel=%d, workers=%u)",
-                m_kernelConnected ? 1 : 0, m_config.workerThreads);
+            SS_LOG_INFO(L"Registry",
+                L"RegistryMonitor started on the kernel registry fan-out");
 
             return true;
 
@@ -855,31 +888,18 @@ public:
         try {
             if (!m_running) return;
 
-            // Order matters: signal the worker loop to exit BEFORE tearing down
-            // the FilterConnection. Disconnect() unblocks GetMessage but the
-            // worker may then race back into the loop and re-observe the
-            // connection pointer; setting m_stopRequested first ensures the
-            // post-Disconnect iteration is the last one.
-            m_stopRequested = true;
+            // Close the handler gate BEFORE leaving the fan-out. A notification
+            // already dispatched must see the gate shut and return without
+            // entering a module that is mid-teardown; unregistering first would
+            // leave a window where the gate is still open.
+            m_feedSubscribed.store(false, std::memory_order_release);
 
-            // Disconnect kernel filter port via RAII connection wrapper. Keep
-            // the pointer alive until the workers join so any final reply on
-            // a delayed verdict path does not chase a dangling handle.
-            if (m_kernelConnected && m_connection) {
-                m_connection->Disconnect();
-                m_kernelConnected = false;
-            }
-
-            // Must release lock before joining worker threads — workers
-            // re-acquire it via IsRunning()/IsKernelConnected() observers
-            // and via ProcessEvent's snapshot path.
-            lock.unlock();
-            StopWorkerThreads();
-            lock.lock();
-
-            // Now it is safe to drop the connection object; no worker can
-            // resurface to call into it.
-            m_connection.reset();
+            // Unregister BY NAME. Holding m_mutex across this is safe: the
+            // fan-out unregister only swaps a copy-on-write vector and never
+            // waits for an in-flight handler, so it cannot deadlock against a
+            // handler that is itself blocked on this mutex.
+            UnsubscribeFromKernelRegistryFeed();
+            m_kernelConnected = false;
 
             m_running = false;
 
@@ -896,17 +916,11 @@ public:
 
         try {
             if (m_running) {
-                m_stopRequested = true;
-                if (m_connection) {
-                    m_connection->Disconnect();
-                    m_kernelConnected = false;
-                }
-                lock.unlock();
-                StopWorkerThreads();
-                lock.lock();
+                m_feedSubscribed.store(false, std::memory_order_release);
+                UnsubscribeFromKernelRegistryFeed();
+                m_kernelConnected = false;
+                m_running = false;
             }
-
-            m_connection.reset();
 
             m_rules.clear();
             m_protectedKeys.clear();
@@ -934,9 +948,37 @@ public:
         return m_running;
     }
 
+    /**
+     * @brief Can kernel registry events actually reach this module right now?
+     *
+     * TWO CONDITIONS, BOTH REQUIRED, AND THE SECOND ONE IS THE POINT.
+     * m_kernelConnected records that our fan-out subscription succeeded - but a
+     * subscription is only half the answer, because IPCManager can be holding
+     * zero connection to the driver. Returning true on the subscription alone
+     * would repeat the exact defect this rewiring exists to remove: a status
+     * that reports intent instead of capability.
+     *
+     * This matters concretely. RegistryAnalyzer::DetectDKOMImpl gates its entire
+     * rootkit check on this accessor, and the UI/report paths print it as
+     * "Kernel connected". Both must see the real channel state.
+     */
     [[nodiscard]] bool IsKernelConnected() const noexcept {
-        std::shared_lock lock(m_mutex);
-        return m_kernelConnected;
+        bool subscribed = false;
+        {
+            std::shared_lock lock(m_mutex);
+            subscribed = m_kernelConnected;
+        }
+        if (!subscribed) {
+            return false;
+        }
+        try {
+            // Authoritative source: the module that owns the filter port. We do
+            // not keep a second copy of this fact - a cached duplicate of
+            // someone else's state is how status reports start lying.
+            return Communication::IPCManager::Instance().IsConnected();
+        } catch (...) {
+            return false;
+        }
     }
 
     // ========================================================================
@@ -1685,7 +1727,18 @@ public:
             SS_LOG_INFO(L"Registry", L"=== RegistryMonitor Diagnostics ===");
             SS_LOG_INFO(L"Registry", L"Initialized: %d", m_initialized ? 1 : 0);
             SS_LOG_INFO(L"Registry", L"Running: %d", m_running ? 1 : 0);
-            SS_LOG_INFO(L"Registry", L"Kernel connected: %d", m_kernelConnected ? 1 : 0);
+            // TWO SEPARATE FACTS, REPORTED SEPARATELY ON PURPOSE. Collapsing
+            // them into one "Kernel connected" line left this diagnostic unable
+            // to distinguish "never subscribed" from "subscribed but the driver
+            // channel is down" - two failures with completely different causes
+            // and different fixes.
+            //
+            // IsKernelConnected() is deliberately NOT called here: it acquires
+            // m_mutex, which this function already holds as a shared_lock, and
+            // std::shared_mutex is not recursive.
+            SS_LOG_INFO(L"Registry", L"Registry feed subscribed: %d", m_kernelConnected ? 1 : 0);
+            SS_LOG_INFO(L"Registry", L"IPC kernel channel connected: %d",
+                Communication::IPCManager::Instance().IsConnected() ? 1 : 0);
             SS_LOG_INFO(L"Registry", L"Rules: %zu", m_rules.size());
             SS_LOG_INFO(L"Registry", L"Protected keys: %zu", m_protectedKeys.size());
             SS_LOG_INFO(L"Registry", L"Total events: %llu",
@@ -1726,7 +1779,13 @@ public:
             out << "=== ShadowStrike RegistryMonitor Diagnostics ===\n";
             out << "Initialized: " << m_initialized << "\n";
             out << "Running: " << m_running << "\n";
-            out << "Kernel connected: " << m_kernelConnected << "\n";
+            // Same two-fact split as the log diagnostic above, and for the same
+            // reason: one combined flag cannot tell an operator which half is
+            // broken. IsKernelConnected() is not called here because this
+            // function already holds m_mutex.
+            out << "Registry feed subscribed: " << m_kernelConnected << "\n";
+            out << "IPC kernel channel connected: "
+                << Communication::IPCManager::Instance().IsConnected() << "\n";
             out << "Rules: " << m_rules.size() << "\n";
             out << "Protected keys: " << m_protectedKeys.size() << "\n";
             out << "Total events: " << m_stats.totalEvents.load() << "\n";
@@ -1801,277 +1860,167 @@ private:
             m_protectedKeys.size());
     }
 
-    [[nodiscard]] bool ConnectToKernelDriver() {
+    // ========================================================================
+    // KERNEL REGISTRY FEED
+    // ========================================================================
+    //
+    // WHY THIS IS A SUBSCRIPTION AND NOT A CONNECTION. This function replaces
+    // ConnectToKernelDriver(), which opened a private FilterConnection on
+    // RegistryMonitorConstants::COMMUNICATION_PORT (L"\\ShadowStrikeRegPort").
+    // THREE INDEPENDENT DEFECTS made that unable to work, and any one of them
+    // alone was sufficient:
+    //
+    //  (1) THE PORT DOES NOT EXIST. Grepped the whole repository:
+    //      "ShadowStrikeRegPort" appeared exactly once, in its own declaration.
+    //      The driver creates only \ShadowStrikePort (CommPort.c:961/:974,
+    //      SharedDefs.h:88, Shared/PortName.h:21) and \ShadowStrikeKtmPort
+    //      (KtmMonitor.c:81). So FilterConnectCommunicationPort could only ever
+    //      return ERROR_FILE_NOT_FOUND.
+    //
+    //  (2) NOTHING STARTED THE MODULE. Initialize/Start had zero callers in the
+    //      entire repository, tests included.
+    //
+    //  (3) THE PARSER READ A STRUCT THE DRIVER DOES NOT SEND, so even a working
+    //      port would have produced garbage. The receive loop parsed
+    //      Communication::RegistryNotificationData, which opens with a uint64
+    //      messageId and carries `flags`, `requiresReply` and `valueType`
+    //      fields. The kernel sends SHADOWSTRIKE_REGISTRY_NOTIFICATION
+    //      (MessageProtocol.h:384), which is 21 packed bytes opening directly
+    //      with ProcessId and has NO messageId, NO flags and NO requiresReply.
+    //      So processId was read from offset 8 (on the wire: Operation plus part
+    //      of KeyPathLength), keyPathLength was read as a CHAR count from offset
+    //      28 when the wire declares BYTES at offset 9, and isPreOperation /
+    //      isTransacted / the entire reply gate were derived from fields that do
+    //      not exist on the wire at all.
+    //
+    // RegistryOpRequest is the layout with a static_assert pinning it to the
+    // kernel's 21 bytes (IPCManager.hpp:438), which is why this path uses it.
+    [[nodiscard]] bool SubscribeToKernelRegistryFeed() {
         try {
-            SS_LOG_INFO(L"Registry", L"Connecting to ShadowStrike Registry Filter port: %ls",
-                RegistryMonitorConstants::COMMUNICATION_PORT);
+            auto& ipc = Communication::IPCManager::Instance();
 
-            m_connection = std::make_unique<Communication::FilterConnection>(
-                RegistryMonitorConstants::COMMUNICATION_PORT);
+            // NAMED SUBSCRIBER, not a slot assignment. The registry feed is a
+            // fan-out (commit c65d6fc2): RealTimeProtection carries the
+            // persistence-key and defense-evasion-key detection,
+            // RegistryProtection carries self-defence, and this module carries
+            // the event history plus the DKOM / autostart / BCD consumers. All
+            // three coexist and their verdicts combine most-severe-wins.
+            ipc.RegisterRegistryHandler("RegistryMonitor",
+                [this](const Communication::RegistryOpRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                    return OnKernelRegistryNotification(req);
+                });
 
-            if (m_connection->Connect()) {
-                SS_LOG_INFO(L"Registry", L"Successfully connected to kernel registry filter");
-                return true;
+            const size_t subscribers = ipc.RegistrySubscriberCount();
+            SS_LOG_INFO(L"Registry",
+                L"Subscribed to the kernel registry fan-out (%zu registry subscriber(s) total)",
+                subscribers);
+
+            // The subscription IS the capability. Report it as such rather than
+            // reporting the intent to have one - see Start(), where m_running
+            // used to be set unconditionally.
+            if (subscribers == 0) {
+                return false;
             }
 
-            SS_LOG_ERROR(L"Registry", L"Failed to connect to kernel registry filter: %hs",
-                m_connection->GetLastErrorMessage().c_str());
-            return false;
+            // Open the handler gate only once the subscription is confirmed, so
+            // the gate can never be open while there is no feed behind it.
+            m_feedSubscribed.store(true, std::memory_order_release);
+            return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"ConnectToKernelDriver exception: %hs",
+            SS_LOG_ERROR(L"Registry", L"Registry fan-out subscription failed: %hs",
                 SanitizeForLog(e.what()).c_str());
             return false;
         }
     }
 
-    void StartWorkerThreads() {
-        m_stopRequested = false;
-
-        for (uint32_t i = 0; i < m_config.workerThreads; ++i) {
-            m_workerThreads.emplace_back([this]() {
-                WorkerThreadProc();
-            });
+    void UnsubscribeFromKernelRegistryFeed() noexcept {
+        try {
+            // BY NAME. Passing nullptr would clear the whole feed and take
+            // RealTimeProtection and RegistryProtection down with us - exactly
+            // the teardown defect fixed in c65d6fc2, where self-defence
+            // shutting down disabled kernel registry dispatch for every module.
+            Communication::IPCManager::Instance().UnregisterRegistryHandler("RegistryMonitor");
+        } catch (...) {
+            // Teardown must not throw.
         }
     }
 
-    void StopWorkerThreads() {
-        for (auto& thread : m_workerThreads) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
-        m_workerThreads.clear();
-    }
-
-    void WorkerThreadProc() {
-        SS_LOG_DEBUG(L"Registry", L"Registry worker thread started (tid=%u)",
-            ::GetCurrentThreadId());
-
-        std::vector<uint8_t> messageBuffer(Communication::MAX_MESSAGE_SIZE);
-
-        // Reconnect backoff state. We start at 500 ms and cap at 30 s so a
-        // permanent kernel-side fault does not pin a CPU. Only one worker
-        // performs the reconnect attempt at a time, gated by m_mutex.
-        std::chrono::milliseconds reconnectDelay{ 500 };
-        constexpr std::chrono::milliseconds kReconnectMin{ 500 };
-        constexpr std::chrono::milliseconds kReconnectMax{ 30000 };
-
-        while (!m_stopRequested) {
-            // Connection liveness gate. If the kernel filter port has dropped
-            // (driver unload, FltSendMessage failure, etc.), attempt to
-            // reconnect under unique_lock so multiple workers do not race on
-            // m_connection. Reads of m_connection are otherwise safe because
-            // the pointer itself is only replaced under unique_lock and the
-            // FilterConnection object is internally thread-safe.
-            bool connected = false;
-            {
-                std::shared_lock lock(m_mutex);
-                connected = (m_connection && m_connection->IsConnected());
+    /**
+     * @brief Convert one kernel registry notification into a RegistryEvent and
+     *        run it through the analysis pipeline.
+     *
+     * Field mapping is stated explicitly because the previous parser got every
+     * offset wrong (see SubscribeToKernelRegistryFeed). Lengths on the wire are
+     * BYTE counts; RegistryOpRequest's accessors convert to characters.
+     */
+    [[nodiscard]] SHADOWSTRIKE_SCAN_VERDICT OnKernelRegistryNotification(
+        const Communication::RegistryOpRequest& req) {
+        try {
+            // Gate first, and lock-free. See m_feedSubscribed for why this is a
+            // separate atomic rather than a read of m_running, and for the
+            // honest statement of what it does and does not close.
+            if (!m_feedSubscribed.load(std::memory_order_acquire)) {
+                return Verdict_Clean;
             }
 
-            if (!connected) {
-                if (m_stopRequested) break;
-
-                // Attempt reconnect — bounded, single-flight.
-                bool didReconnect = false;
-                {
-                    std::unique_lock lock(m_mutex);
-                    if (!m_stopRequested && m_connection &&
-                        !m_connection->IsConnected()) {
-                        if (m_connection->Connect()) {
-                            m_kernelConnected = true;
-                            didReconnect = true;
-                        }
-                    } else if (m_connection && m_connection->IsConnected()) {
-                        didReconnect = true;
-                    }
-                }
-
-                if (didReconnect) {
-                    SS_LOG_INFO(L"Registry",
-                        L"Reconnected to kernel registry filter (worker tid=%u)",
-                        ::GetCurrentThreadId());
-                    reconnectDelay = kReconnectMin;
-                    continue;
-                }
-
-                std::this_thread::sleep_for(reconnectDelay);
-                reconnectDelay = std::min(reconnectDelay * 2, kReconnectMax);
-                continue;
-            }
-            reconnectDelay = kReconnectMin;
-
-            size_t bytesReceived = 0;
-            try {
-                std::shared_lock lock(m_mutex);
-                if (!m_connection) {
-                    lock.unlock();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
-                }
-                const auto recv = m_connection->GetMessage(messageBuffer, 1000);
-                bytesReceived = recv.payloadBytes;
-
-                // A frame we could not decrypt still has a kernel thread waiting
-                // on it, and its Filter Manager MessageId survives in cleartext.
-                // Release the waiter with a Clean verdict rather than letting it
-                // time out: the driver treats an unanswered scan as "not scanned,
-                // allowed" anyway, but each timeout also feeds the scan-bridge
-                // circuit breaker, which stops scanning altogether once it trips.
-                if (recv.ReplyOwed()) {
-                    Communication::ScanVerdictReply failOpen{};
-                    failOpen.messageId      = recv.replyOwedId;
-                    failOpen.verdict        = Communication::ScanVerdict::Clean;
-                    failOpen.threatDetected = false;
-                    auto foBuf = Communication::MessageDispatcher::SerializeVerdictReply(failOpen);
-                    if (!foBuf.empty() && m_connection) {
-                        (void)m_connection->ReplyMessage(foBuf, recv.replyOwedId);
-                    }
-                    SS_LOG_WARN(L"Registry", L"Undecryptable frame answered fail-open "
-                        L"to release kernel waiter msgId=%llu",
-                        static_cast<unsigned long long>(recv.replyOwedId));
-                }
-            } catch (const std::exception& e) {
-                SS_LOG_WARN(L"Registry", L"GetMessage threw: %hs",
-                    SanitizeForLog(e.what()).c_str());
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            } catch (...) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-
-            if (bytesReceived < sizeof(Communication::MessageHeader)) {
-                continue;
-            }
-            if (bytesReceived > messageBuffer.size()) {
-                // Filter-driver protocol violation; drop and resync.
-                m_stats.droppedEvents++;
-                continue;
-            }
-
-            auto* header = reinterpret_cast<const Communication::MessageHeader*>(messageBuffer.data());
-            if (!header->IsValid()) {
-                m_stats.droppedEvents++;
-                continue;
-            }
-
-            if (header->messageType != static_cast<uint16_t>(Communication::MessageType::RegistryNotify)) {
-                continue;
-            }
-
-            // Authoritative payload size comes from the header's declared
-            // dataSize, NOT from bytesReceived. An attacker who somehow
-            // injected trailing bytes (or a buggy driver) must not be able
-            // to feed us data beyond the header's contract. We clamp to the
-            // minimum of received-bytes-minus-header and declared dataSize.
-            if (header->dataSize < sizeof(Communication::RegistryNotificationData)) {
-                m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry", L"Undersized registry notification (dataSize=%u)",
-                    static_cast<unsigned>(header->dataSize));
-                continue;
-            }
-            const size_t headerSize = sizeof(Communication::MessageHeader);
-            if (bytesReceived < headerSize + sizeof(Communication::RegistryNotificationData)) {
-                m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry", L"Truncated registry notification (bytes=%zu)",
-                    bytesReceived);
-                continue;
-            }
-
-            const size_t declaredPayload = header->dataSize;
-            const size_t receivedPayload = bytesReceived - headerSize;
-            const size_t payloadSize = std::min(declaredPayload, receivedPayload);
-
-            const auto* regData = reinterpret_cast<const Communication::RegistryNotificationData*>(
-                messageBuffer.data() + headerSize);
-
-            // Strict enum validation: refuse to dispatch unknown operation
-            // codes. RegistryOp values are sparse (gaps between 5-10, 13-20,
-            // etc.). We accept anything in the declared upper bound and let
-            // downstream code use Unknown for unmapped gaps.
-            const uint32_t rawOp = regData->operationType;
+            const uint32_t rawOp = req.operation;
             if (rawOp > static_cast<uint32_t>(RegistryOp::RollbackTransaction)) {
                 m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry", L"Rejected unknown operationType=%u msgId=%llu",
-                    rawOp,
-                    static_cast<unsigned long long>(header->messageId));
-                continue;
+                SS_LOG_WARN(L"Registry", L"Rejected unknown registry operation=%u pid=%u",
+                    rawOp, req.processId);
+                return Verdict_Clean;
             }
 
             RegistryEvent event;
-            event.eventId = header->messageId;
+
+            // eventId is OURS, not the kernel's. The wire format carries no
+            // message id, so the previous code's event.eventId = header->messageId
+            // was reading a field that does not exist. A locally monotonic id is
+            // honest and still unique within a run.
+            event.eventId   = ++m_nextLocalEventId;
             event.timestamp = std::chrono::system_clock::now();
-            event.processId = regData->processId;
-            event.threadId = regData->threadId;
+            event.processId = req.processId;
+            event.threadId  = req.threadId;
             event.operation = static_cast<RegistryOp>(rawOp);
-            event.isPreOperation = (regData->flags & 0x01) != 0;
-            event.isTransacted = (regData->flags & 0x02) != 0;
-            event.valueType = static_cast<RegistryValueType>(regData->valueType);
+            event.valueType = static_cast<RegistryValueType>(req.dataType);
 
-            const uint8_t* varData = messageBuffer.data() +
-                headerSize + sizeof(Communication::RegistryNotificationData);
-            const size_t varAvailable = payloadSize -
-                sizeof(Communication::RegistryNotificationData);
+            // isPreOperation and isTransacted are DELIBERATELY LEFT AT THEIR
+            // DEFAULTS. SHADOWSTRIKE_REGISTRY_NOTIFICATION has no flags field,
+            // so there is no wire source for either. The old parser synthesised
+            // both from offset 20 of a struct the driver never sends. Inventing
+            // them here would be the same defect with better spelling; if these
+            // become needed they must be added to the wire contract on both
+            // sides, with the offsets asserted the way the other payloads are.
 
-            size_t offset = 0;
-
-            // keyPathLength and valueNameLength are uint16 (chars), so the
-            // multiplication by sizeof(wchar_t)=2 cannot overflow size_t.
-            // We still cap to MAX_KEY_PATH_LENGTH to prevent allocation
-            // amplification from a 65535-char attacker-supplied path.
-            const size_t keyPathBytes =
-                static_cast<size_t>(regData->keyPathLength) * sizeof(wchar_t);
-            if (keyPathBytes > 0 && offset + keyPathBytes <= varAvailable &&
-                regData->keyPathLength <= RegistryMonitorConstants::MAX_KEY_PATH_LENGTH) {
-                event.keyPath.assign(
-                    reinterpret_cast<const wchar_t*>(varData + offset),
-                    regData->keyPathLength);
-                offset += keyPathBytes;
-            } else if (keyPathBytes > 0) {
-                m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry", L"Rejected oversized keyPath chars=%u msgId=%llu",
-                    static_cast<unsigned>(regData->keyPathLength),
-                    static_cast<unsigned long long>(header->messageId));
-                continue;
+            const size_t keyPathChars = std::min<size_t>(
+                req.keyPathCharLen(), RegistryMonitorConstants::MAX_KEY_PATH_LENGTH);
+            if (keyPathChars > 0) {
+                event.keyPath.assign(req.keyPathData(), keyPathChars);
             }
 
-            const size_t valueNameBytes =
-                static_cast<size_t>(regData->valueNameLength) * sizeof(wchar_t);
-            if (valueNameBytes > 0 && offset + valueNameBytes <= varAvailable &&
-                regData->valueNameLength <= RegistryMonitorConstants::MAX_VALUE_NAME_LENGTH) {
-                event.valueName.assign(
-                    reinterpret_cast<const wchar_t*>(varData + offset),
-                    regData->valueNameLength);
-                offset += valueNameBytes;
-            } else if (valueNameBytes > 0) {
-                m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry", L"Rejected oversized valueName chars=%u msgId=%llu",
-                    static_cast<unsigned>(regData->valueNameLength),
-                    static_cast<unsigned long long>(header->messageId));
-                continue;
+            const size_t valueNameChars = std::min<size_t>(
+                req.valueNameCharLen(), RegistryMonitorConstants::MAX_VALUE_NAME_LENGTH);
+            if (valueNameChars > 0) {
+                event.valueName.assign(req.valueNameData(), valueNameChars);
             }
 
-            if (regData->valueDataLength > 0 &&
-                offset + regData->valueDataLength <= varAvailable &&
-                regData->valueDataLength <= RegistryMonitorConstants::MAX_VALUE_DATA_SIZE) {
-                event.data.assign(
-                    varData + offset,
-                    varData + offset + regData->valueDataLength);
-                offset += regData->valueDataLength;
-            } else if (regData->valueDataLength > 0) {
-                m_stats.droppedEvents++;
-                SS_LOG_WARN(L"Registry",
-                    L"Rejected oversized valueData bytes=%u msgId=%llu",
-                    static_cast<unsigned>(regData->valueDataLength),
-                    static_cast<unsigned long long>(header->messageId));
-                continue;
+            const size_t dataBytes = std::min<size_t>(
+                req.dataSize, RegistryMonitorConstants::MAX_VALUE_DATA_SIZE);
+            if (dataBytes > 0) {
+                const uint8_t* payload = req.registryData();
+                event.data.assign(payload, payload + dataBytes);
             }
 
-            // Enrich with process context (best-effort, non-blocking).
-            // GetProcessName returns just the basename — what UIs expect —
-            // so we use it instead of narrowing the full process path.
+            // Every length above is clamped to its documented maximum BEFORE
+            // being used to read, so this handler's reads are bounded by its own
+            // arithmetic and do not depend on the dispatcher having validated
+            // the frame first. Truncation is preferable to trusting a declared
+            // length: an over-long field is still analysable from its prefix.
+
+            // Process context enrichment, best-effort and non-blocking. A
+            // process that has already exited leaves the PID-only event, which
+            // is still a usable record.
             try {
                 auto procPath = ProcessUtils::GetProcessPath(event.processId);
                 if (procPath.has_value()) {
@@ -2095,69 +2044,48 @@ private:
                 // Process may have exited; proceed with PID only.
             }
 
-            RegistryVerdict verdict = ProcessEvent(event);
+            const RegistryVerdict verdict = ProcessEvent(event);
 
-            // Reply gate: only pre-operations can be blocked. The kernel must
-            // not be told to apply a post-op verdict (the change is already
-            // committed) and must not be left waiting if it did not request
-            // a reply. requiresReply is the authoritative flag.
-            if (regData->requiresReply && event.isPreOperation) {
-                Communication::ScanVerdictReply reply{};
-                reply.messageId = header->messageId;
-                reply.shouldCache = false;
-                reply.cacheTTL = 0;
-                reply.threatScore = 0;
-
-                switch (verdict) {
-                    case RegistryVerdict::Block:
-                        reply.verdict = Communication::ScanVerdict::Malicious;
-                        reply.threatDetected = true;
-                        reply.threatScore = 100;
-                        break;
-                    case RegistryVerdict::SilentDrop:
-                        reply.verdict = Communication::ScanVerdict::Clean;
-                        reply.threatDetected = false;
-                        break;
-                    case RegistryVerdict::Alert:
-                        reply.verdict = Communication::ScanVerdict::Suspicious;
-                        reply.threatDetected = true;
-                        reply.threatScore = 50;
-                        break;
-                    default:
-                        reply.verdict = Communication::ScanVerdict::Clean;
-                        reply.threatDetected = false;
-                        break;
-                }
-
-                auto replyBuf = Communication::MessageDispatcher::SerializeVerdictReply(reply);
-                if (!replyBuf.empty()) {
-                    std::shared_lock lock(m_mutex);
-                    if (m_connection &&
-                        !m_connection->ReplyMessage(replyBuf, header->messageId)) {
-                        SS_LOG_WARN(L"Registry", L"Failed to reply verdict for msgId=%llu",
-                            static_cast<unsigned long long>(header->messageId));
-                    }
-                }
-            } else if (regData->requiresReply) {
-                // Post-op required a reply: send Clean to release the kernel
-                // without blocking. Verdict was used only for telemetry.
-                Communication::ScanVerdictReply reply{};
-                reply.messageId = header->messageId;
-                reply.verdict = Communication::ScanVerdict::Clean;
-                reply.threatDetected = false;
-                auto replyBuf = Communication::MessageDispatcher::SerializeVerdictReply(reply);
-                if (!replyBuf.empty()) {
-                    std::shared_lock lock(m_mutex);
-                    if (m_connection) {
-                        (void)m_connection->ReplyMessage(replyBuf, header->messageId);
-                    }
-                }
+            // NO REPLY IS SENT, and that is not a gap. Registry notifications
+            // reach user mode through ShadowStrikeSendNotification
+            // (CommPort.h:365), which takes no reply buffer and is documented
+            // "no reply expected ... uses zero-timeout to avoid blocking", and
+            // IPCManager's RegistryNotify case never sets needsReply. The
+            // kernel enforces protected-key policy itself, unconditionally and
+            // before notifying anyone (RegistryCallback.c:2007/:2074, denying at
+            // :2435 with STATUS_ACCESS_DENIED). The verdict below is this
+            // module's VOTE, combined most-severe-wins with the other
+            // subscribers by IPCManager::CombineKernelVerdicts.
+            switch (verdict) {
+                case RegistryVerdict::Block:      return Verdict_Malicious;
+                case RegistryVerdict::Alert:      return Verdict_Suspicious;
+                case RegistryVerdict::SilentDrop: return Verdict_Clean;
+                default:                          return Verdict_Clean;
             }
-        }
 
-        SS_LOG_DEBUG(L"Registry", L"Registry worker thread stopped (tid=%u)",
-            ::GetCurrentThreadId());
+        } catch (const std::exception& e) {
+            m_stats.droppedEvents++;
+            SS_LOG_WARN(L"Registry", L"Registry notification handler threw: %hs",
+                SanitizeForLog(e.what()).c_str());
+            return Verdict_Error;
+        } catch (...) {
+            m_stats.droppedEvents++;
+            return Verdict_Error;
+        }
     }
+
+    // The kernel receive loop that lived here is deleted, not disabled.
+    // Its only job was polling a private FilterConnection on a port the
+    // driver never creates, parsing a struct the driver never sends, and
+    // replying to a notification that owes no reply. Registry events now
+    // arrive on IPCManager's dispatch thread through the named fan-out
+    // subscription in SubscribeToKernelRegistryFeed - the same path
+    // RealTimeProtection and RegistryProtection already use.
+    //
+    // CONSEQUENCE RECORDED RATHER THAN LEFT SILENT: RegistryMonitorConfig::
+    // workerThreads now has no reader. It is documented as inapplicable at
+    // its declaration, because a field silently wired to nothing is the
+    // defect class this codebase has already produced fourteen times.
 
     // Lock-free variant operating on a pre-snapshotted rule set (used by ProcessEvent)
     [[nodiscard]] RegistryVerdict ApplyRulesSnapshot(
@@ -2551,16 +2479,37 @@ private:
     bool m_initialized{ false };
     bool m_running{ false };
     bool m_kernelConnected{ false };
-    std::atomic<bool> m_stopRequested{ false };
+
+    // Lock-free gate read by OnKernelRegistryNotification. m_running and
+    // m_kernelConnected are guarded by m_mutex, and the handler runs on
+    // IPCManager's dispatch thread, so it needs a state it can read without
+    // contending on the mutex its own analysis will later take. Cleared BEFORE
+    // the fan-out unregister in Stop()/Shutdown() so a notification already in
+    // flight returns immediately instead of entering a module being torn down.
+    //
+    // HONEST LIMIT: this NARROWS the shutdown window, it does not close it. The
+    // fan-out is copy-on-write, so a dispatch that already copied the subscriber
+    // vector still holds this lambda and will still call through `this`. That is
+    // acceptable here only because RegistryMonitor is a process-lifetime
+    // singleton, so the object outlives every dispatch; it would NOT be
+    // acceptable for a shorter-lived subscriber. Same posture, stated the same
+    // way, as RegistryProtection's m_kernelHandlerRegistered gate.
+    std::atomic<bool> m_feedSubscribed{ false };
+
+    // Event ids are OURS. SHADOWSTRIKE_REGISTRY_NOTIFICATION carries no message
+    // id, so there is nothing on the wire to correlate against - the previous
+    // parser read one from a struct the driver does not send.
+    std::atomic<uint64_t> m_nextLocalEventId{ 0 };
 
     RegistryMonitorConfig m_config;
     RegistryMonitorStatistics m_stats;
 
-    // Kernel communication
-    std::unique_ptr<Communication::FilterConnection> m_connection;
-
-    // Worker threads
-    std::vector<std::thread> m_workerThreads;
+    // NO PRIVATE KERNEL CONNECTION AND NO WORKER THREADS. Both are deliberately
+    // absent: this module subscribes to IPCManager's registry fan-out, which
+    // owns the single filter port the driver actually creates, and events are
+    // delivered on that dispatcher's thread. The unique_ptr<FilterConnection>
+    // and vector<std::thread> that used to live here served a receive loop over
+    // a port name that appears nowhere else in the repository.
 
     // Policy
     RegistryPolicyCallback m_policyCallback;

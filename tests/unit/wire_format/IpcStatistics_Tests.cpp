@@ -41,6 +41,11 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstring>
+#include <algorithm>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "PhantomCore/Communication/IPCManager.hpp"
 
@@ -739,4 +744,138 @@ TEST(SubscriberFeedsAreIndependent, RegisteringOnOneFeedDoesNotDisturbTheOthers)
     EXPECT_EQ(imgBase, Ipc().ImageLoadSubscriberCount());
     EXPECT_EQ(regBase, Ipc().RegistrySubscriberCount());
     EXPECT_EQ(genBase, Ipc().GenericSubscriberCount());
+}
+
+// ============================================================================
+// REGISTRY NOTIFICATION WIRE CONTRACT
+// ============================================================================
+//
+// WHY THIS SUITE EXISTS. RegistryMonitor spent its entire existence parsing a
+// DIFFERENT struct than the driver sends. It read Communication::
+// RegistryNotificationData - which opens with a uint64 messageId and carries
+// flags, requiresReply and a CHARACTER-count keyPathLength - while the kernel
+// sends SHADOWSTRIKE_REGISTRY_NOTIFICATION (MessageProtocol.h:384), 21 packed
+// bytes that open directly with ProcessId and declare BYTE counts.
+//
+// Every field was therefore wrong: processId was read from offset 8, where the
+// wire carries Operation plus half of KeyPathLength, and isPreOperation /
+// isTransacted / the whole reply gate were synthesised from fields that do not
+// exist on the wire at all. A struct-size assertion alone did not catch this,
+// because the two structs were never compared - so these tests pin the layout,
+// the BYTE-vs-CHARACTER meaning of the length fields, and the payload ordering.
+//
+// A mapping test is what would have caught the original defect, which is why
+// this suite is written against the frame bytes rather than against a mock.
+
+namespace {
+
+// Build one registry notification frame exactly as the driver lays it out: the
+// 21-byte header, then keyPath, then valueName, then the value data.
+std::vector<uint8_t> BuildRegistryFrame(std::wstring_view keyPath,
+                                        std::wstring_view valueName,
+                                        const std::vector<uint8_t>& data,
+                                        uint8_t operation = 10 /* SetValue */,
+                                        uint32_t dataType = 1 /* REG_SZ */) {
+    using Req = ::ShadowStrike::Communication::RegistryOpRequest;
+
+    const auto keyBytes   = static_cast<uint16_t>(keyPath.size() * sizeof(wchar_t));
+    const auto valueBytes = static_cast<uint16_t>(valueName.size() * sizeof(wchar_t));
+
+    std::vector<uint8_t> frame(sizeof(Req) + keyBytes + valueBytes + data.size(), 0);
+
+    auto* req = reinterpret_cast<Req*>(frame.data());
+    req->processId       = 4242;
+    req->threadId        = 777;
+    req->operation       = operation;
+    req->keyPathLength   = keyBytes;
+    req->valueNameLength = valueBytes;
+    req->dataSize        = static_cast<uint32_t>(data.size());
+    req->dataType        = dataType;
+
+    size_t off = sizeof(Req);
+    if (keyBytes)   { std::memcpy(frame.data() + off, keyPath.data(), keyBytes);     off += keyBytes; }
+    if (valueBytes) { std::memcpy(frame.data() + off, valueName.data(), valueBytes); off += valueBytes; }
+    if (!data.empty()) { std::memcpy(frame.data() + off, data.data(), data.size()); }
+    return frame;
+}
+
+}  // namespace
+
+TEST(RegistryNotificationWireContract, TheStructIsExactlyTheDriversTwentyOneBytes) {
+    using Req = ::ShadowStrike::Communication::RegistryOpRequest;
+
+    // 21 is not a round number and that is the point: any field added on either
+    // side - a messageId, a flags word, a requiresReply bit - changes it, and
+    // this fails before the mismatch can be parsed as garbage.
+    EXPECT_EQ(sizeof(Req), 21u);
+}
+
+TEST(RegistryNotificationWireContract, FieldOffsetsMatchTheDriverLayout) {
+    using Req = ::ShadowStrike::Communication::RegistryOpRequest;
+
+    EXPECT_EQ(offsetof(Req, processId),       0u);
+    EXPECT_EQ(offsetof(Req, threadId),        4u);
+    EXPECT_EQ(offsetof(Req, operation),       8u);
+    EXPECT_EQ(offsetof(Req, keyPathLength),   9u);
+    EXPECT_EQ(offsetof(Req, valueNameLength), 11u);
+    EXPECT_EQ(offsetof(Req, dataSize),        13u);
+    EXPECT_EQ(offsetof(Req, dataType),        17u);
+
+    // The old parser believed processId lived at offset 8. Offset 8 is the
+    // operation byte. This assertion is the one that names that mistake.
+    EXPECT_NE(offsetof(Req, processId), offsetof(Req, operation));
+}
+
+TEST(RegistryNotificationWireContract, DeclaredLengthsAreByteCountsNotCharacterCounts) {
+    // THE EXACT CONFUSION THAT MADE THE OLD PARSER WRONG. It read the length as
+    // a character count, so on a real frame it would have consumed twice the
+    // intended number of characters and run off the end of every string.
+    const std::wstring key   = L"\\REGISTRY\\MACHINE\\SOFTWARE\\Foo";  // 30 chars
+    const std::wstring value = L"Debugger";                            //  8 chars
+
+    const auto frame = BuildRegistryFrame(key, value, {});
+    const auto* req  =
+        reinterpret_cast<const ::ShadowStrike::Communication::RegistryOpRequest*>(frame.data());
+
+    EXPECT_EQ(req->keyPathLength, key.size() * sizeof(wchar_t));
+    EXPECT_EQ(req->valueNameLength, value.size() * sizeof(wchar_t));
+
+    // The accessors are what callers must use, and they must divide by the
+    // character width. If someone "simplifies" them to return the raw field,
+    // these two lines fail.
+    EXPECT_EQ(req->keyPathCharLen(), key.size());
+    EXPECT_EQ(req->valueNameCharLen(), value.size());
+    EXPECT_NE(req->keyPathCharLen(), static_cast<size_t>(req->keyPathLength));
+}
+
+TEST(RegistryNotificationWireContract, VariableLengthFieldsFollowTheHeaderInKeyValueDataOrder) {
+    const std::vector<uint8_t> payload{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const std::wstring key   = L"HKLM\\Run";
+    const std::wstring value = L"Evil";
+
+    const auto frame = BuildRegistryFrame(key, value, payload);
+    const auto* req  =
+        reinterpret_cast<const ::ShadowStrike::Communication::RegistryOpRequest*>(frame.data());
+
+    EXPECT_EQ(std::wstring(req->keyPathData(), req->keyPathCharLen()), key);
+    EXPECT_EQ(std::wstring(req->valueNameData(), req->valueNameCharLen()), value);
+
+    ASSERT_EQ(req->dataSize, payload.size());
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), req->registryData()))
+        << "value data must begin immediately after keyPath and valueName";
+}
+
+TEST(RegistryNotificationWireContract, AnEmptyValueNameStillLocatesTheDataCorrectly) {
+    // Key-level operations (CreateKey, DeleteKey) carry no value name. The
+    // offset arithmetic must still land on the data, which is the case a
+    // hardcoded stride would break.
+    const std::vector<uint8_t> payload{ 0x01, 0x02 };
+    const auto frame = BuildRegistryFrame(L"HKLM\\Foo", L"", payload, 1 /* CreateKey */);
+    const auto* req  =
+        reinterpret_cast<const ::ShadowStrike::Communication::RegistryOpRequest*>(frame.data());
+
+    EXPECT_EQ(req->valueNameLength, 0u);
+    EXPECT_EQ(req->valueNameCharLen(), 0u);
+    ASSERT_EQ(req->dataSize, payload.size());
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), req->registryData()));
 }

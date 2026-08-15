@@ -196,8 +196,13 @@ namespace RegistryMonitorConstants {
     constexpr size_t MAX_PROTECTED_KEYS = 1000;
     constexpr size_t MAX_RULES = 10000;
 
-    // Kernel communication
-    constexpr wchar_t COMMUNICATION_PORT[] = L"\\ShadowStrikeRegPort";
+    // NO COMMUNICATION_PORT CONSTANT. There was one here,
+    // L"\\ShadowStrikeRegPort", and the driver has never created a port by that
+    // name - grepping the whole repository for it found exactly one hit, the
+    // declaration itself. The driver creates \ShadowStrikePort and
+    // \ShadowStrikeKtmPort only. Registry notifications reach this module
+    // through IPCManager's registry fan-out over the real port; see
+    // SubscribeToKernelRegistryFeed in RegistryMonitor.cpp.
 
 }  // namespace RegistryMonitorConstants
 
@@ -595,6 +600,25 @@ struct alignas(64) RegistryMonitorConfig {
     DeceptionConfig deception;
 
     // Performance
+    //
+    // HONEST STATUS OF THE NEXT TWO FIELDS - both are currently INERT, and that
+    // is recorded here rather than left for the next reader to discover.
+    //
+    // eventQueueSize has NEVER had a reader. The retained-event ring is bounded
+    // by RegistryMonitor's own static MAX_RECENT_EVENTS (1000), not by this
+    // value, so setting it changes nothing. This predates the fan-out rewiring.
+    //
+    // workerThreads lost its reader when the module's private kernel receive
+    // loop was deleted. Registry notifications now arrive on IPCManager's
+    // dispatch thread through the named registry fan-out, so this module owns no
+    // threads of its own.
+    //
+    // Both are kept rather than deleted for one reason: they are the natural
+    // knobs for decoupling analysis from the dispatch thread, which is filed as
+    // a performance task (per-event process enrichment currently runs inline on
+    // the IPC dispatcher). They are NOT deleted quietly and NOT pretended to
+    // work - a control that silently governs nothing is a defect this codebase
+    // has produced more than a dozen times.
     uint32_t eventQueueSize{ RegistryMonitorConstants::EVENT_QUEUE_SIZE };
     uint32_t workerThreads{ 2 };
     uint32_t callbackTimeoutMs{ RegistryMonitorConstants::CALLBACK_TIMEOUT_MS };
