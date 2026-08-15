@@ -238,6 +238,20 @@
          real Win32 mapping code and the header check; a mock reproduces
          neither. -->
     <ClCompile Include="tests\unit\scan_target_mapping\ScanTargetMapping_Tests.cpp" />
+    <!-- Cloud placeholder handling. In the 1.0.94 field run eicar.com and
+         eicar_com.zip were both on the user's Desktop inside OneDrive and every
+         read returned WinError 395, so a known-malicious file was present and
+         unexaminable while looking identical to a clean scan. The platform half
+         is not our defect - a service in session 0 cannot hydrate a placeholder
+         at all - but three things on top of it were: an unreadable file counted
+         as clean, a doomed open attempted anyway, and a blanket reparse-point
+         refusal that made EVERY file in a sync root unhashable even when its
+         content was fully local. These cases pin the decisions rather than the
+         platform interaction, which cannot be reproduced without a registered
+         Cloud Filter provider AND a session-0 caller; the file says so at the
+         top. DataVirtualisingTagsAreAllowed is the discriminator - it fails if
+         the reparse check is ever simplified back to refusing everything. -->
+    <ClCompile Include="tests\unit\cloud_placeholder\CloudPlaceholder_Tests.cpp" />
     <!-- RE-ENABLED together with the ownership fix that made it pass. This suite is
          what found the defect: on a first add the store kept the LOCAL compiler's
          YR_RULES singleton, so m_rules dangled as soon as the call returned, and the

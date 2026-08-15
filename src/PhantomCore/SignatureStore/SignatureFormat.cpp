@@ -33,6 +33,7 @@
  */
 #include "SignatureFormat.hpp"
 #include "../Utils/Logger.hpp"
+#include "../Utils/FileUtils.hpp"   // GetContentLocality: a cloud placeholder cannot be mapped
 
 #include <algorithm>
 #include <sstream>
@@ -888,6 +889,21 @@ HANDLE OpenFileForMapping(const std::wstring& path, bool readOnly, DWORD& outErr
     DWORD shareMode = readOnly ? FILE_SHARE_READ : 0;
     DWORD creationDisposition = OPEN_EXISTING;
     DWORD flagsAndAttributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS;
+
+    // A cloud placeholder whose content is not resident cannot be opened by a
+    // service, and mapping it could not work even if it could be opened - a
+    // mapped view has no way to surface a fetch failure, so a read through the
+    // view would raise an in-page error rather than return an error code.
+    // Refusing here converts an unhandleable fault into an ordinary error the
+    // caller can report as NOT EXAMINED.
+    if (Utils::FileUtils::GetContentLocality(path) ==
+        Utils::FileUtils::ContentLocality::NotLocal) {
+        outError = ERROR_CLOUD_FILE_ACCESS_DENIED;
+        SS_LOG_DEBUG(L"SignatureStore",
+                     L"Not mapping a file whose content is not resident locally: %s",
+                     path.c_str());
+        return INVALID_HANDLE_VALUE;
+    }
 
     HANDLE hFile = CreateFileW(
         path.c_str(),

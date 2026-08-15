@@ -1075,7 +1075,25 @@ std::vector<DetectionResult> PatternStore::ScanFile(
     // rather than MAX_DATABASE_SIZE, which is 16 GB and is not a scan bound.
     constexpr uint64_t kMaxScanFileSize = 100ULL * 1024 * 1024;
     if (!MemoryMapping::OpenFileView(filePath, fileView, err, kMaxScanFileSize)) {
-        SS_LOG_ERROR(L"PatternStore", L"ScanFile: Failed to map file for scanning: %S", err.message.c_str());
+        // A cloud placeholder that is not resident is the NORMAL state of most
+        // documents on a machine with Files On-Demand enabled, so it must not be
+        // reported at ERROR - it would bury the genuine mapping failures this
+        // line exists to surface, and our own log writes traverse our own
+        // minifilter, so volume here is not free.
+        //
+        // HONEST LIMIT: ScanFile returns a match vector, which has no way to say
+        // "not examined". The caller therefore cannot distinguish this from a
+        // clean scan through the return value alone. SignatureStore::ScanFile
+        // carries that state properly in its ScanResult; propagating it out of
+        // this function and YaraRuleStore::ScanFile needs a return-type change
+        // and is tracked separately, NOT fixed here.
+        if (Utils::FileUtils::IsContentNotLocalError(err.win32Error)) {
+            SS_LOG_DEBUG(L"PatternStore",
+                L"ScanFile: content not resident locally, not examined: %S", err.message.c_str());
+        }
+        else {
+            SS_LOG_ERROR(L"PatternStore", L"ScanFile: Failed to map file for scanning: %S", err.message.c_str());
+        }
         return results;
     }
 

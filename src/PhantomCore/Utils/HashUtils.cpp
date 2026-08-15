@@ -1053,17 +1053,78 @@ namespace ShadowStrike {
 					return false;
 				}
 
-				// Open file with sequential scan hint and reparse-point handling.
-				// FILE_FLAG_OPEN_REPARSE_POINT prevents a symlink/junction at
-				// `path` from silently redirecting the hash to an
-				// attacker-chosen file; we then refuse to compute over a
-				// reparse point body itself (its on-disk contents do not
-				// represent what the caller asked us to hash). Callers that
-				// genuinely want to follow a link must resolve it themselves.
+				// A cloud placeholder whose content is not resident cannot be read
+				// by a service at all, so the open below cannot succeed. Settle
+				// that first: it removes a doomed syscall from the hash path and
+				// returns a code the caller can tell apart from a real
+				// permissions failure.
+				//
+				// THIS MATTERS MORE HERE THAN ANYWHERE ELSE ON THE SCAN PATH. A
+				// hash is an IDENTIFICATION signal, and identification is the only
+				// detection class allowed to remediate a signed file. A file we
+				// cannot hash cannot be convicted by its hash however well known
+				// it is - which is precisely what happened to eicar.com sitting on
+				// the user's Desktop in the 1.0.94 field run.
+				if (FileUtils::GetContentLocality(path) == FileUtils::ContentLocality::NotLocal) {
+					if (err) err->win32 = ERROR_CLOUD_FILE_ACCESS_DENIED;
+					SS_LOG_DEBUG(L"HashUtils",
+					             L"ComputeFile: content is not resident locally, cannot hash: %ls",
+					             pathStr.c_str());
+					return false;
+				}
+
+				// Decide whether to bypass the reparse point, which requires
+				// knowing WHICH KIND of reparse point it is. Two entirely
+				// different things wear the same attribute:
+				//
+				//   NAME SURROGATES - symlinks (0xA000000C), junctions and mount
+				//   points (0xA0000003). These REDIRECT to another object, so
+				//   following one hashes a file the caller never named. That is
+				//   the attack this function was written to stop, and it is still
+				//   stopped, by exactly the same mechanism as before.
+				//
+				//   DATA VIRTUALISERS - cloud placeholders (0x9000_01A family),
+				//   WOF compression (0x80000017), dedup (0x80000013). These
+				//   redirect NOWHERE. The path is the file; the tag only says the
+				//   bytes are produced by a filter instead of lying directly in
+				//   the volume. There is no second target to be tricked into.
+				//
+				// Refusing both meant no file carrying ANY reparse tag could be
+				// hashed. Every file in a OneDrive sync root carries a cloud tag
+				// whether or not its content is resident, so hash identification
+				// was structurally unavailable across the user's whole Desktop and
+				// Documents tree - independently of the service-hydration limit
+				// above, and still true for files that ARE fully local.
+				//
+				// IsReparseTagNameSurrogate is the documented test for this (bit
+				// 29 of the tag) and is used in preference to a hand-written tag
+				// list, which would silently go stale as new tags are defined.
+				bool bypassReparsePoint = true;   // default = the old, stricter behaviour
+				{
+					WIN32_FIND_DATAW find{};
+					const HANDLE hFind = FindFirstFileW(pathStr.c_str(), &find);
+					if (hFind != INVALID_HANDLE_VALUE) {
+						if ((find.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
+						    !IsReparseTagNameSurrogate(find.dwReserved0)) {
+							bypassReparsePoint = false;   // follow it: hash the real content
+						}
+						::FindClose(hFind);
+					}
+					// A probe that failed leaves the flag TRUE, i.e. the strict
+					// path. An undetermined answer must never relax a control.
+					// FindFirstFileW is metadata-only, so it cannot itself
+					// trigger a hydration.
+				}
+
+				DWORD openFlags = FILE_FLAG_SEQUENTIAL_SCAN;
+				if (bypassReparsePoint) {
+					openFlags |= FILE_FLAG_OPEN_REPARSE_POINT;
+				}
+
 				HANDLE h = CreateFileW(pathStr.c_str(), GENERIC_READ,
 				                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				                       nullptr, OPEN_EXISTING,
-				                       FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT,
+				                       openFlags,
 				                       nullptr);
 				if (h == INVALID_HANDLE_VALUE) {
 					if (err) err->win32 = GetLastError();
@@ -1093,11 +1154,51 @@ namespace ShadowStrike {
 					return false;
 				}
 				if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-					if (err) err->win32 = ERROR_CANT_ACCESS_FILE;
-					SS_LOG_WARN(L"HashUtils",
-					            L"ComputeFile: refusing reparse point target: %ls",
-					            pathStr.c_str());
-					return false;
+					// Decided from the OPENED HANDLE, which is what makes it
+					// TOCTOU-safe: we already own the kernel object, unlike the
+					// path-based probe that only chose the open flags.
+					//
+					// The probe and this check must AGREE. Disagreement means the
+					// object changed between the two calls, and BOTH directions are
+					// refused:
+					//   bypassed but not a surrogate -> the handle reads a reparse
+					//     body, so hashing it would digest the wrong bytes
+					//   followed but IS a surrogate  -> exactly the redirection
+					//     this function exists to prevent
+					// Refusing either closes the race without needing a lock.
+					FILE_ATTRIBUTE_TAG_INFO tagInfo{};
+					if (!::GetFileInformationByHandleEx(h, FileAttributeTagInfo,
+					                                    &tagInfo, sizeof(tagInfo))) {
+						// The kind could not be established, so apply the strict
+						// rule. An unreadable tag must never buy access.
+						if (err) err->win32 = ERROR_CANT_ACCESS_FILE;
+						SS_LOG_WARN(L"HashUtils",
+						            L"ComputeFile: reparse point whose tag could not be read, refusing: %ls",
+						            pathStr.c_str());
+						return false;
+					}
+
+					if (IsReparseTagNameSurrogate(tagInfo.ReparseTag) != 0) {
+						if (err) err->win32 = ERROR_CANT_ACCESS_FILE;
+						SS_LOG_WARN(L"HashUtils",
+						            L"ComputeFile: refusing name-surrogate reparse point (tag 0x%08X); "
+						            L"following it would hash a file other than the one named: %ls",
+						            tagInfo.ReparseTag, pathStr.c_str());
+						return false;
+					}
+
+					if (bypassReparsePoint) {
+						if (err) err->win32 = ERROR_CANT_ACCESS_FILE;
+						SS_LOG_WARN(L"HashUtils",
+						            L"ComputeFile: reparse state changed between probe and open (tag 0x%08X); "
+						            L"refusing rather than hashing a reparse body: %ls",
+						            tagInfo.ReparseTag, pathStr.c_str());
+						return false;
+					}
+
+					// A data virtualiser, opened WITHOUT the bypass flag, so reads
+					// return the file's real content and hashing it is correct.
+					// This is the case that used to be refused outright.
 				}
 
 				// Check file size against maximum limit to prevent DoS

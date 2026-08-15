@@ -17,6 +17,7 @@
  */
 #include"pch.h"
 #include "FileUtils.hpp"
+#include "StringUtils.hpp"   // ToNarrow, so an Error can name the path it failed on
 #include <algorithm>
 #include <memory>
 #include<string>
@@ -609,6 +610,80 @@ namespace ShadowStrike {
                 return (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             }
 
+            ContentLocality GetContentLocality(std::wstring_view path) noexcept {
+                if (!ValidatePath(path)) {
+                    return ContentLocality::Unknown;
+                }
+
+                std::wstring longp;
+                try {
+                    longp = AddLongPathPrefix(path);
+                }
+                catch (...) {
+                    // Allocation failure while building the path. Undetermined,
+                    // which means "attempt the read" - never "skip the file".
+                    return ContentLocality::Unknown;
+                }
+                if (longp.empty()) {
+                    return ContentLocality::Unknown;
+                }
+
+                WIN32_FILE_ATTRIBUTE_DATA fad{};
+                if (!GetFileAttributesExW(longp.c_str(), GetFileExInfoStandard, &fad)) {
+                    // Could not even read attributes. Do not conclude anything
+                    // about locality from that - the caller's own open will
+                    // produce a far more specific error than we could invent.
+                    return ContentLocality::Unknown;
+                }
+
+                // The two attributes that specifically mean "the data is not
+                // here yet, and touching it fetches it".
+                //
+                // FILE_ATTRIBUTE_OFFLINE IS DELIBERATELY NOT IN THIS SET, and the
+                // asymmetry is the whole point. Legacy hierarchical-storage and
+                // some backup products set OFFLINE on files whose content IS
+                // resident. Acting on it would skip files we can read perfectly
+                // well, which is a coverage loss - the one outcome that is never
+                // acceptable. Excluding it costs at worst one failed open, and
+                // IsContentNotLocalError below still classifies the result
+                // correctly, so the conservative choice loses nothing.
+                constexpr DWORD kContentNotResident =
+                    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+                    FILE_ATTRIBUTE_RECALL_ON_OPEN;
+
+                if ((fad.dwFileAttributes & kContentNotResident) != 0) {
+                    return ContentLocality::NotLocal;
+                }
+
+                return ContentLocality::Local;
+            }
+
+            bool IsContentNotLocalError(DWORD win32Error) noexcept {
+                // Every code here means the same actionable thing: the cloud
+                // filter did not give us the bytes, so the file was NOT examined.
+                //
+                // The rest of the ERROR_CLOUD_FILE_* family is deliberately
+                // excluded. Metadata corruption, property-blob and
+                // configuration failures are genuine faults that deserve to
+                // surface as errors in their own right; folding them in here
+                // would relabel a broken sync root as a routine "not downloaded
+                // yet" and lose the only signal that something is actually wrong.
+                switch (win32Error) {
+                    case ERROR_CLOUD_FILE_ACCESS_DENIED:          // 395 - the 1.0.94 field error
+                    case ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING:   // 362
+                    case ERROR_CLOUD_FILE_PROVIDER_TERMINATED:    // 404
+                    case ERROR_CLOUD_FILE_NOT_IN_SYNC:            // 377
+                    case ERROR_CLOUD_FILE_NETWORK_UNAVAILABLE:    // 388
+                    case ERROR_CLOUD_FILE_REQUEST_ABORTED:        // 393
+                    case ERROR_CLOUD_FILE_REQUEST_CANCELED:       // 398
+                    case ERROR_CLOUD_FILE_REQUEST_TIMEOUT:        // 426
+                    case ERROR_CLOUD_FILE_HYDRATION_NOT_AVAILABLE:// 523
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+
 
             bool Stat(std::wstring_view path, FileStat& out, Error* err) {
                 // Initialize output
@@ -720,13 +795,41 @@ namespace ShadowStrike {
                 out.clear();
 
                 if (!ValidatePath(path)) {
-                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                    if (err) {
+                        err->win32 = ERROR_INVALID_PARAMETER;
+                        err->message = "ReadAllBytes: path rejected by validation";
+                    }
                     return false;
                 }
 
                 const std::wstring longp = AddLongPathPrefix(path);
                 if (longp.empty()) {
-                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                    if (err) {
+                        err->win32 = ERROR_INVALID_PARAMETER;
+                        err->message = "ReadAllBytes: could not form a long-path version of the path";
+                    }
+                    return false;
+                }
+
+                // Establish content locality BEFORE opening. A cloud placeholder
+                // whose data is not resident cannot be read by a service at all
+                // (see ContentLocality in the header for why that is a platform
+                // constraint rather than something we can flag our way around).
+                //
+                // Checking first is not merely tidy. The open cannot succeed, so
+                // skipping it removes a syscall per file from a path that ran
+                // 7,213 times in 29 seconds in the field; and it lets the caller
+                // be told the specific reason, which is what allows an unreadable
+                // file to be recorded as NOT EXAMINED instead of silently joining
+                // the files that were scanned and found clean.
+                if (GetContentLocality(path) == ContentLocality::NotLocal) {
+                    if (err) {
+                        err->win32 = ERROR_CLOUD_FILE_ACCESS_DENIED;
+                        err->message =
+                            "ReadAllBytes: content is not resident on this machine "
+                            "(cloud placeholder, not hydrated; a service cannot hydrate one): " +
+                            StringUtils::ToNarrow(path);
+                    }
                     return false;
                 }
 
@@ -742,7 +845,26 @@ namespace ShadowStrike {
 
                 if (h == INVALID_HANDLE_VALUE) {
                     const DWORD lastError = GetLastError();
-                    if (err) err->win32 = lastError;
+                    if (err) {
+                        err->win32 = lastError;
+                        // THE MESSAGE MUST BE POPULATED HERE. It was not, and
+                        // ExecutableAnalyzer::Analyze prints this message and
+                        // nothing else - so 53 errors in the 1.0.94 field run read
+                        // "Failed to read file: " and named neither the file nor
+                        // the reason. They were the only errors that run counted.
+                        // An error object that carries a code but no description
+                        // is how a diagnosable failure becomes an undiagnosable one.
+                        if (IsContentNotLocalError(lastError)) {
+                            err->message =
+                                "ReadAllBytes: cloud filter refused to supply content (win32 " +
+                                std::to_string(lastError) + "): " + StringUtils::ToNarrow(path);
+                        }
+                        else {
+                            err->message =
+                                "ReadAllBytes: CreateFileW failed (win32 " +
+                                std::to_string(lastError) + "): " + StringUtils::ToNarrow(path);
+                        }
+                    }
                     // Don't log for expected errors (file not found)
                     if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
                         SS_LOG_LAST_ERROR(L"FileUtils", L"ReadAllBytes: CreateFileW failed: %s", longp.c_str());

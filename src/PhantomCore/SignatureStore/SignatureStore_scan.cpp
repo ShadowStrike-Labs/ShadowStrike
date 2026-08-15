@@ -17,6 +17,7 @@
  */
 #include"pch.h"
 #include"SignatureStore.hpp"
+#include "../Utils/FileUtils.hpp"   // IsContentNotLocalError: tell a cloud placeholder apart from a permissions failure
 
 namespace ShadowStrike {
 	namespace SignatureStore {
@@ -321,13 +322,35 @@ namespace ShadowStrike {
                 // The size ceiling is passed explicitly so the limit enforced here
                 // is the SCAN limit checked above, not MAX_DATABASE_SIZE.
                 if (!MemoryMapping::OpenFileView(canonicalPath.wstring(), fileView, err, MAX_FILE_SIZE)) {
-                    SS_LOG_ERROR(L"SignatureStore", L"Failed to map file for scanning: %s (%S)",
-                        filePath.c_str(), err.message.c_str());
                     ScanResult result{};
-                    result.examinedState = NotExaminedReason::AccessDenied;
-                    result.notExaminedDetail = err.message;
+
+                    // A cloud placeholder that has never been hydrated is NOT the
+                    // same condition as being refused access, and reporting them
+                    // alike hides the one that needs a different remedy. This one
+                    // cannot be retried into success from a service; it needs the
+                    // examination to be triggered at a moment when the content is
+                    // resident. Logged at DEBUG rather than ERROR because on a
+                    // machine with Files On-Demand enabled it is the NORMAL state
+                    // of most of the user's documents - at ERROR it would bury the
+                    // real failures, which is how the deferred-queue-drop warning
+                    // once amplified the very condition it reported.
+                    if (Utils::FileUtils::IsContentNotLocalError(err.win32Error)) {
+                        SS_LOG_DEBUG(L"SignatureStore",
+                            L"Not examined, content not resident locally: %s (win32 %lu)",
+                            filePath.c_str(), static_cast<unsigned long>(err.win32Error));
+                        result.examinedState = NotExaminedReason::ContentNotLocal;
+                        result.notExaminedDetail =
+                            "content is not resident on this machine (cloud placeholder); " + err.message;
+                    }
+                    else {
+                        SS_LOG_ERROR(L"SignatureStore", L"Failed to map file for scanning: %s (%S)",
+                            filePath.c_str(), err.message.c_str());
+                        result.examinedState = NotExaminedReason::AccessDenied;
+                        result.notExaminedDetail = err.message;
+                    }
+
                     result.errorCount = 1;
-                    result.lastError = err.message;
+                    result.lastError = result.notExaminedDetail;
                     return result;
                 }
 

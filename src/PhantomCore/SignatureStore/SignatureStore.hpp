@@ -231,7 +231,21 @@ namespace ShadowStrike {
             EmptyFile,            // zero bytes; nothing to examine
             StoreNotReady,        // store was not initialised
             InvalidArgument,      // caller passed something unusable
-            InternalError         // an exception or an unexpected failure
+            InternalError,        // an exception or an unexpected failure
+            // The file exists and we are permitted to read it, but its CONTENT is
+            // not on this machine - a cloud placeholder (OneDrive Files
+            // On-Demand and similar) that has not been hydrated.
+            //
+            // Deliberately NOT folded into AccessDenied even though the Win32
+            // code is a flavour of access-denied, because the two demand
+            // different responses. AccessDenied is usually a permission or
+            // sharing problem, often ours to fix. This is neither: a service in
+            // session 0 cannot hydrate a placeholder at all, by platform design,
+            // so no amount of privilege or flag tuning changes it. Examining the
+            // file requires a different TRIGGER, not a different attempt.
+            //
+            // Appended rather than inserted so no existing enumerator renumbers.
+            ContentNotLocal
         };
 
         struct ScanResult {

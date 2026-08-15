@@ -105,6 +105,77 @@ namespace ShadowStrike {
 				DWORD attributes = 0;           ///< Raw Win32 attributes
 			};
 
+			/**
+			 * @brief Whether a file's CONTENT is resident on this machine.
+			 *
+			 * A cloud placeholder (OneDrive Files On-Demand, and any other
+			 * provider built on the Cloud Filter API) is a real directory entry
+			 * with a real size and real timestamps whose DATA may not be on this
+			 * volume at all. Reading it is what triggers the download.
+			 *
+			 * WHY THIS EXISTS AT ALL — this is a platform constraint, not a
+			 * defect we can code around. A process running as a SERVICE, in
+			 * session 0, cannot hydrate a placeholder: the open fails with
+			 * ERROR_CLOUD_FILE_ACCESS_DENIED (395) instead of fetching the
+			 * content. Microsoft reproduced this on their own CloudMirror sample
+			 * and it is unresolved. Admin rights do not change it and neither
+			 * does any CreateFileW flag combination. Our scan service is exactly
+			 * that kind of process, so for a dehydrated file the read cannot be
+			 * made to succeed from where we are standing.
+			 *
+			 * In the 1.0.94 field run this was not theoretical: eicar.com and
+			 * eicar_com.zip were both sitting on the user's Desktop, both inside
+			 * OneDrive, and every attempt to read either returned 395. A known
+			 * malicious file was physically present and could not be examined.
+			 *
+			 * DO NOT "FIX" THIS WITH FILE_FLAG_OPEN_NO_RECALL. That flag means
+			 * "do not fetch the data", so on a dehydrated file it leaves nothing
+			 * to read. The open would start succeeding while the scan examined no
+			 * real content, and the file would be reported clean. That converts a
+			 * visible failure into a silent false negative, which is strictly
+			 * worse than the error it replaces.
+			 *
+			 * Attributes, unlike content, ARE readable from a service — which is
+			 * what makes this probe possible.
+			 */
+			enum class ContentLocality : uint8_t {
+				/// Content is resident and can be read normally. DELIBERATELY the
+				/// zero value: an uninitialised or undetermined answer must lead
+				/// to a full read attempt, never to a skip.
+				Local = 0,
+				/// A placeholder whose data is not resident. Reading it from a
+				/// service cannot succeed, so attempting it wastes a syscall and
+				/// produces an error that means something quite specific.
+				NotLocal,
+				/// The state could not be determined. Callers MUST treat this
+				/// exactly like Local and attempt the read; it exists so the
+				/// undetermined case can be counted separately from the known-good
+				/// one rather than hidden inside it.
+				Unknown
+			};
+
+			/**
+			 * @brief Determine whether a file's content is resident locally.
+			 *
+			 * Uses GetFileAttributesExW, which takes NO handle. That matters
+			 * twice over: it cannot itself trigger a hydration, and it does not
+			 * re-enter our own minifilter, so it is safe to call from a thread
+			 * that owes the kernel a scan verdict. The trust-determination worker
+			 * already relies on the same property of the same API.
+			 *
+			 * @param path Absolute path to test. Long-path prefixed internally.
+			 * @return Local, NotLocal, or Unknown. Never throws.
+			 */
+			[[nodiscard]] ContentLocality GetContentLocality(std::wstring_view path) noexcept;
+
+			/**
+			 * @brief True if a Win32 error means "the content is not local".
+			 *
+			 * Centralised so the three read helpers and the scan-result mapping
+			 * cannot drift on which codes carry this meaning.
+			 */
+			[[nodiscard]] bool IsContentNotLocalError(DWORD win32Error) noexcept;
+
 
 			/**
 			 * @brief Alternate Data Stream (ADS) information.

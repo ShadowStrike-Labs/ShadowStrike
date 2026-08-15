@@ -43,6 +43,7 @@
 #include "YaraRuleStore.hpp"
 
 #include "../Utils/Logger.hpp"
+#include "../Utils/FileUtils.hpp"   // IsContentNotLocalError
 #include "../Utils/FileUtils.hpp"
 #include"../Utils/StringUtils.hpp"
 #include"../Utils/MemoryUtils.hpp"
@@ -1586,8 +1587,19 @@ std::vector<YaraMatch> YaraRuleStore::ScanFile(
     // MAX_DATABASE_SIZE.
     if (!ShadowStrike::SignatureStore::MemoryMapping::OpenFileView(
             filePath, fileView, err, options.maxFileSizeBytes)) {
-        SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to map file for scanning: %S",
-            err.message.c_str());
+        // Not at ERROR for a cloud placeholder: on a Files On-Demand machine
+        // that is the normal state of most documents, and at ERROR it would bury
+        // the real mapping failures. Same honest limit as PatternStore::ScanFile
+        // - this function returns a match vector, so it cannot report "not
+        // examined" to its caller. Tracked separately.
+        if (ShadowStrike::Utils::FileUtils::IsContentNotLocalError(err.win32Error)) {
+            SS_LOG_DEBUG(L"YaraRuleStore",
+                L"ScanFile: content not resident locally, not examined: %S", err.message.c_str());
+        }
+        else {
+            SS_LOG_ERROR(L"YaraRuleStore", L"ScanFile: Failed to map file for scanning: %S",
+                err.message.c_str());
+        }
         return {};
     }
     
