@@ -517,4 +517,48 @@ namespace {
         EXPECT_FALSE(RealTimeProtection::DetectionSourceIdentifiesThreat("PseudoHashStore"));
     }
 
+    // ========================================================================
+    // PROTECTION MODE ORDERING
+    // ========================================================================
+    //
+    // The process-creation handler now gates an inference-class block on
+    // `m_mode >= BLOCK_SUSPICIOUS`, which is the same expression the file-scan
+    // handler already uses for a Suspicious verdict. That gate is only correct if
+    // the enumerators are ordered by increasing aggressiveness, because it is a
+    // RELATIONAL test on the enum, not a set membership test. Renumbering or
+    // inserting an enumerator would silently change which modes enforce.
+    TEST(ProtectionModePolicy, ModesAreOrderedByIncreasingAggressiveness) {
+        using ShadowStrike::RealTime::ProtectionMode;
+
+        EXPECT_EQ(0, static_cast<int>(ProtectionMode::MONITOR_ONLY));
+        EXPECT_EQ(1, static_cast<int>(ProtectionMode::BLOCK_KNOWN));
+        EXPECT_EQ(2, static_cast<int>(ProtectionMode::BLOCK_SUSPICIOUS));
+        EXPECT_EQ(3, static_cast<int>(ProtectionMode::BLOCK_UNKNOWN));
+
+        // The two modes that must NOT enforce an inference-class process block.
+        EXPECT_LT(ProtectionMode::MONITOR_ONLY, ProtectionMode::BLOCK_SUSPICIOUS);
+        EXPECT_LT(ProtectionMode::BLOCK_KNOWN, ProtectionMode::BLOCK_SUSPICIOUS);
+
+        // The two that must.
+        EXPECT_GE(ProtectionMode::BLOCK_SUSPICIOUS, ProtectionMode::BLOCK_SUSPICIOUS);
+        EXPECT_GE(ProtectionMode::BLOCK_UNKNOWN, ProtectionMode::BLOCK_SUSPICIOUS);
+    }
+
+    // The shipped default decides what a normal endpoint does, so it is part of the
+    // safety argument rather than a detail. BLOCK_KNOWN means an identification
+    // (hash / signature / threat-intel match) blocks, while a score with no named
+    // referent is reported and not enforced.
+    TEST(ProtectionModePolicy, DefaultConfigurationDoesNotEnforceInferenceBlocks) {
+        using ShadowStrike::RealTime::ProtectionMode;
+        using ShadowStrike::RealTime::RTPConfig;
+
+        RTPConfig defaults{};
+        EXPECT_EQ(ProtectionMode::BLOCK_KNOWN, defaults.mode);
+        EXPECT_LT(defaults.mode, ProtectionMode::BLOCK_SUSPICIOUS)
+            << "the default must not enforce an inference-class process block: "
+               "until the verdict reply was wired no such block could take effect, "
+               "so there is no field measurement of how often the five evasion "
+               "detectors fire on legitimate software";
+    }
+
 }  // namespace

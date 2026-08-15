@@ -4242,16 +4242,63 @@ public:
             }
 
             if (evasionDetected) {
-                Utils::Logger::Warn("RealTimeProtection: Blocked evasion attempt: {} (PID: {}, Source: {})", 
+                Utils::Logger::Warn("RealTimeProtection: Evasion detected in process creation: {} (PID: {}, Source: {})", 
                     Utils::StringUtils::ToNarrow(imagePath), req.processId, Utils::StringUtils::ToNarrow(detectionSource));
-                m_stats.processesBlocked++;
-
-                // Emit consolidated SOC alert for blocked evasion
+                // THE DETECTION IS REPORTED EITHER WAY. Only the enforcement below
+                // is conditional, and it is conditional on a control this product
+                // already ships and documents - not on anything invented here.
                 EmitEvasionAlert(req.processId, imagePath, detectionSource,
                     Utils::StringUtils::ToNarrow(detectionSource.substr(0, 80)),
                     Communication::AlertSeverity::High);
 
-                return Communication::KernelVerdict::Block;
+                // HONOUR THE CONFIGURED PROTECTION MODE, WHICH THIS PATH IGNORED.
+                //
+                // The file-scan handler already does exactly this for a Suspicious
+                // verdict: block at BLOCK_SUSPICIOUS or above, otherwise Monitor.
+                // OnKernelImageLoad consults the mode too. This handler did not, so
+                // an endpoint configured MONITOR_ONLY would still have had process
+                // creations blocked - the master protection switch was honoured for
+                // files and modules and silently disregarded for processes.
+                //
+                // WHY THAT MATTERS NOW RATHER THAN BEFORE: until the reply was
+                // wired, returning Block here did nothing at all, so the omission
+                // was invisible. Wiring it turns this into real enforcement, and
+                // this particular decision is the OR of five evasion detectors -
+                // debugger, VM, process, network and environment - any single one
+                // of which sets evasionDetected. That is INFERENCE, a score with no
+                // named referent, which is the same evidence class the remediation
+                // guard already refuses to let take a destructive action against a
+                // signed OS binary. It is also completely unmeasured on this path:
+                // no block has ever taken effect, so there is no field data on how
+                // often these five fire on legitimate software. Enabling the reply
+                // and enforcing all five in one step would be turning on
+                // process-creation blocking with no evidence about its false
+                // positives, on the path where a wrong answer stops a program from
+                // starting.
+                //
+                // NO COVERAGE IS LOST: nothing on this path blocks today, so this
+                // cannot reduce detection. The detection still fires, still emits
+                // the SOC alert above, still counts, and still returns a verdict
+                // the kernel records. An IDENTIFICATION - the ScanEngine Infected
+                // result further down - still blocks under the default mode, which
+                // is the case where the evidence names a specific known-bad thing.
+                if (m_mode.load(std::memory_order_acquire) >= ProtectionMode::BLOCK_SUSPICIOUS) {
+                    m_stats.processesBlocked++;
+                    Utils::Logger::Warn("RealTimeProtection: returning BLOCK for process creation: "
+                        "{} (PID: {}, Source: {})",
+                        Utils::StringUtils::ToNarrow(imagePath), req.processId,
+                        Utils::StringUtils::ToNarrow(detectionSource));
+                    return Communication::KernelVerdict::Block;
+                }
+
+                m_stats.processBlocksWithheldByMode++;
+                Utils::Logger::Warn("RealTimeProtection: evasion detected in PID {} ({}) but NOT "
+                    "blocked - protection mode is below BLOCK_SUSPICIOUS and this evidence is "
+                    "inferential (Source: {}). The detection stands and is reported. Raise the "
+                    "protection mode to enforce process-creation blocking on evasion evidence.",
+                    req.processId, Utils::StringUtils::ToNarrow(imagePath),
+                    Utils::StringUtils::ToNarrow(detectionSource));
+                return Communication::KernelVerdict::Monitor;
             }
         }
         if (IsProcessExcluded(imagePath, req.processId)) {
@@ -5994,6 +6041,7 @@ public:
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
+        const uint64_t procWithheld = m_stats.processBlocksWithheldByMode.load(std::memory_order_relaxed);
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
 
         // Saturation is "no worker free AND work waiting". Busy-with-nothing-queued
@@ -6040,11 +6088,11 @@ public:
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
-            "processNotifyBudgetExceeded={}",
+            "processNotifyBudgetExceeded={} processBlocksWithheldByMode={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, oversize, notifyBudget);
+            cached, metaTrunc, packerDef, oversize, notifyBudget, procWithheld);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -6553,6 +6601,7 @@ void RTPStatistics::Reset() noexcept {
     filesCleaned = 0;
     processesTerminated = 0;
     signedFileRemediationWithheld = 0;
+    processBlocksWithheldByMode = 0;
     ownBinaryBlockWithheld = 0;
     excludedByPath = 0;
     excludedByExtension = 0;

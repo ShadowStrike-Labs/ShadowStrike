@@ -2097,10 +2097,30 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         }
 
         case FilterMessageType_ProcessNotify: {
+            // THE KERNEL MAY BE WAITING FOR THIS ANSWER, so every exit from this
+            // case owes it one. ProcessNotify.c asks for a reply whenever the
+            // process scored PN_SUSPICION_MEDIUM or above and then waits
+            // PN_VERDICT_REPLY_TIMEOUT_MS for it. Before this, needsReply was set
+            // in exactly one place in this whole function - inside the ScanRequest
+            // case - so this case computed a verdict, assigned it, and fell out of
+            // the switch with needsReply still false. The verdict was DISCARDED and
+            // every reply-bearing process notification timed out, which means
+            // process blocking at creation has never once taken effect.
+            //
+            // Set unconditionally and early, deliberately: it is safe BECAUSE of
+            // the kernelAwaitingReply gate below, which reads the authoritative
+            // FILTER_MESSAGE_HEADER.ReplyLength. A one-way notification still gets
+            // no reply, so this cannot reintroduce the STATUS_FLT_NO_WAITER_FOR_REPLY
+            // storm. Setting it early also covers the refusal paths: a malformed
+            // payload or a missing handler releases the waiter immediately with a
+            // non-blocking verdict instead of costing it the full timeout budget.
+            needsReply = true;
+
             if (processHandler) {
                 if (pAppHeader->DataSize < sizeof(ProcessNotifyRequest)) {
                     Utils::Logger::Error("[IPCManager] Truncated ProcessNotify payload: {} < {}",
                                          pAppHeader->DataSize, sizeof(ProcessNotifyRequest));
+                    verdict = Verdict_Error;
                     break;
                 }
                 auto* req = reinterpret_cast<ProcessNotifyRequest*>(pPayload);
@@ -2113,6 +2133,7 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                     Utils::Logger::Error("[IPCManager] ProcessNotify variable data exceeds buffer: "
                                          "imgPath={} cmdLine={} available={}",
                                          req->imagePathLength, req->commandLineLength, remaining);
+                    verdict = Verdict_Error;
                     break;
                 }
 
@@ -2120,7 +2141,17 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                     verdict = processHandler(*req);
                 } catch (const std::exception& e) {
                     Utils::Logger::Error("[IPCManager] Process handler exception: {}", e.what());
+                    verdict = Verdict_Error;
                 }
+            }
+
+            // This was the only handled message type that did not count itself, so
+            // byMessageType[ProcessNotify] read zero no matter how many process
+            // notifications arrived - the same shape of always-healthy-looking
+            // number as the 16-slot ceiling that silently dropped every alert type.
+            auto idxProc = static_cast<size_t>(FilterMessageType_ProcessNotify);
+            if (idxProc < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idxProc].fetch_add(1, std::memory_order_relaxed);
             }
             break;
         }
@@ -2538,15 +2569,43 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
     const bool kernelAwaitingReply = (pWdkHeader->ReplyLength > 0);
 
     if (needsReply && kernelAwaitingReply) {
-        SHADOWSTRIKE_SCAN_VERDICT_REPLY verdictReply = {};
-        verdictReply.MessageId  = pAppHeader->MessageId;
-        verdictReply.Verdict    = static_cast<UINT8>(verdict);
-        verdictReply.ThreatScore = (verdict == Verdict_Malicious) ? 100 : 0;
-        verdictReply.ResultCode = 0;
-        verdictReply.CacheResult = (verdict == Verdict_Clean) ? 1 : 0;
-        verdictReply.CacheTTL   = (verdict == Verdict_Clean) ? 300 : 0;
+        // THE REPLY SHAPE FOLLOWS THE MESSAGE TYPE, because the driver allocates a
+        // different reply buffer per path and the two sizes are NOT interchangeable.
+        // ProcessNotify.c supplies sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY) == 16;
+        // the file-create path supplies sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY) == 26.
+        // Getting this wrong is not a compile error and not a visible failure at
+        // runtime: Filter Manager refuses the oversized reply, the kernel waits out
+        // its entire budget and fails open, and the only trace is a single Debug
+        // line. Both structs happen to place Verdict at offset 8, so the verdict
+        // BYTE would have been correct - which is precisely why replying with the
+        // scan struct looks like it should work. Branch on what the kernel sent.
+        bool delivered = false;
 
-        if (!ReplyToKernel(messageId, verdictReply)) {
+        if (static_cast<SHADOWSTRIKE_MESSAGE_TYPE>(pAppHeader->MessageType) ==
+            FilterMessageType_ProcessNotify) {
+            SHADOWSTRIKE_PROCESS_VERDICT_REPLY processReply = {};
+            processReply.MessageId   = pAppHeader->MessageId;
+            processReply.Verdict     = static_cast<UINT8>(verdict);
+            processReply.ThreatScore = (verdict == Verdict_Malicious) ? 100 : 0;
+            processReply.Flags       = 0;
+            // Deliberately no cache fields: the driver's process reply declares
+            // none, and there is no process verdict cache to seed. Carrying the
+            // scan path's CacheResult/CacheTTL policy across to a decision about a
+            // PID is how a file-scan value came to govern process creation in the
+            // first place (see the ScanTimeoutMs finding).
+            delivered = ReplyToKernel(messageId, processReply);
+        } else {
+            SHADOWSTRIKE_SCAN_VERDICT_REPLY verdictReply = {};
+            verdictReply.MessageId  = pAppHeader->MessageId;
+            verdictReply.Verdict    = static_cast<UINT8>(verdict);
+            verdictReply.ThreatScore = (verdict == Verdict_Malicious) ? 100 : 0;
+            verdictReply.ResultCode = 0;
+            verdictReply.CacheResult = (verdict == Verdict_Clean) ? 1 : 0;
+            verdictReply.CacheTTL   = (verdict == Verdict_Clean) ? 300 : 0;
+            delivered = ReplyToKernel(messageId, verdictReply);
+        }
+
+        if (!delivered) {
             // Rare benign race: a blocking scan whose kernel waiter already timed
             // out before we finished. Not actionable, and must never be logged
             // per-message (that was part of the storm) — Debug only.
@@ -2572,24 +2631,26 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
     }
 }
 
-bool IPCManager::ReplyToKernel(
+bool IPCManager::DeliverKernelReply(
     uint64_t messageId,
-    const SHADOWSTRIKE_SCAN_VERDICT_REPLY& verdictReply) {
+    const void* reply,
+    size_t replySize,
+    const char* replyKind) {
 
     // Route through FilterConnection for encryption
     {
         std::lock_guard lock(m_primaryConnMutex);
         if (m_primaryConnection && m_primaryConnection->IsConnected()) {
             std::span<const uint8_t> replyBuf(
-                reinterpret_cast<const uint8_t*>(&verdictReply),
-                sizeof(verdictReply));
+                static_cast<const uint8_t*>(reply),
+                replySize);
             if (!m_primaryConnection->ReplyMessage(replyBuf, messageId)) {
                 // ReplyMessage already logs the precise cause at the right level
                 // (benign NO_WAITER at Debug; genuine encryption failure at Error
                 // with a stat bump). Keep this path quiet to avoid double-logging
                 // the storm we just fixed.
-                Utils::Logger::Debug("[IPCManager] ReplyToKernel: reply not delivered for msgId {}",
-                                     messageId);
+                Utils::Logger::Debug("[IPCManager] ReplyToKernel: {} reply not delivered "
+                                     "for msgId {}", replyKind, messageId);
                 return false;
             }
             return true;
@@ -2597,9 +2658,24 @@ bool IPCManager::ReplyToKernel(
     }
 
     Utils::Logger::Error("[IPCManager] ReplyToKernel: encrypted channel unavailable; "
-                         "refusing plaintext fallback for msgId {}", messageId);
+                         "refusing plaintext fallback for msgId {} ({} reply)",
+                         messageId, replyKind);
     m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
     return false;
+}
+
+bool IPCManager::ReplyToKernel(
+    uint64_t messageId,
+    const SHADOWSTRIKE_SCAN_VERDICT_REPLY& verdictReply) {
+    return DeliverKernelReply(messageId, &verdictReply, sizeof(verdictReply),
+                              "scan verdict");
+}
+
+bool IPCManager::ReplyToKernel(
+    uint64_t messageId,
+    const SHADOWSTRIKE_PROCESS_VERDICT_REPLY& verdictReply) {
+    return DeliverKernelReply(messageId, &verdictReply, sizeof(verdictReply),
+                              "process verdict");
 }
 
 // ============================================================================

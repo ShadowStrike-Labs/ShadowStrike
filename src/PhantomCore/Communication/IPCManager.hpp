@@ -774,6 +774,22 @@ public:
         uint64_t messageId,
         const SHADOWSTRIKE_SCAN_VERDICT_REPLY& verdictReply);
 
+    /// @brief Reply to a pending kernel PROCESS notification.
+    ///
+    /// THE REPLY TYPE IS NOT INTERCHANGEABLE WITH THE SCAN ONE, and that is the
+    /// whole reason this overload exists rather than reusing the scan reply.
+    /// ProcessNotify.c sizes its reply buffer as
+    /// sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY) - 16 bytes - while
+    /// SHADOWSTRIKE_SCAN_VERDICT_REPLY is 26 bytes packed. Replying with the scan
+    /// struct hands Filter Manager 10 bytes more than the driver allocated, so the
+    /// verdict never lands, the kernel waits out its full budget and fails open,
+    /// and the only trace is one Debug line. Both structs happen to place Verdict
+    /// at offset 8, so the byte itself would have been right - the SIZE is what
+    /// fails, which is exactly why this looked like a working change.
+    [[nodiscard]] bool ReplyToKernel(
+        uint64_t messageId,
+        const SHADOWSTRIKE_PROCESS_VERDICT_REPLY& verdictReply);
+
     // ========================================================================
     // NAMED PIPE OPERATIONS
     // ========================================================================
@@ -908,6 +924,19 @@ private:
     
     /// @brief Dispatch message to handler
     void DispatchMessage(uint8_t* buffer, uint64_t messageId);
+
+    /// @brief THE one place a reply reaches the kernel.
+    ///
+    /// Both ReplyToKernel overloads funnel through this, deliberately. The reply
+    /// path carries a channel-readiness check, a no-plaintext-fallback rule and a
+    /// benign-race logging policy; two copies of that drift, and this codebase has
+    /// already paid for exactly that twice (the two YARA metadata builders and the
+    /// two on-disk trie producers, where in both cases the WORSE copy was the one
+    /// that ran). The typed overloads exist only to fix the size and the label.
+    [[nodiscard]] bool DeliverKernelReply(uint64_t messageId,
+                                          const void* reply,
+                                          size_t replySize,
+                                          const char* replyKind);
     
     std::unique_ptr<IPCManagerImpl> m_impl;
     

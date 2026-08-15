@@ -114,3 +114,93 @@ TEST(IpcStatisticsContractTest, LiveAndSnapshotArraysAgreeInSize) {
     EXPECT_EQ(kSlots, snap.byMessageType.size());
     EXPECT_EQ(live.byVerdict.size(), snap.byVerdict.size());
 }
+
+
+// ============================================================================
+// THE PROCESS NOTIFICATION PAYLOAD LAYOUT
+// ============================================================================
+//
+// ProcessNotifyRequest is a REINTERPRET_CAST of bytes the kernel wrote, so its
+// layout is a wire contract, not an implementation detail -- and it had no test.
+// That matters more now than it did: while the verdict was being discarded, a
+// misparse here produced a wrong answer nobody acted on. Once the verdict actually
+// reaches the kernel, the same misparse decides whether a process runs.
+//
+// The kernel's SHADOWSTRIKE_PROCESS_NOTIFICATION opens with an SS_MESSAGE_HEADER
+// that PnpSendProcessNotification never populates -- it zeroes the whole buffer and
+// fills only the fields after it. The user-mode struct mirrors that dead header
+// deliberately, because dropping it would shift every field by 40 bytes and read
+// the process id out of the middle of nothing.
+TEST(IpcStatisticsContractTest, ProcessNotifyRequestMatchesTheKernelPayload) {
+    using ShadowStrike::Communication::ProcessNotifyRequest;
+
+    // Both sides must agree on the fixed part, because the kernel copies the
+    // variable-length image path and command line to exactly this offset
+    // (BufferPtr = Notification + 1) and user mode reads them from
+    // this + sizeof(ProcessNotifyRequest).
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION), sizeof(ProcessNotifyRequest))
+        << "the fixed part is the offset of the variable data; a disagreement here "
+           "makes the image path and command line unreadable while every field "
+           "still looks plausible";
+
+    // The dead inner header is 40 bytes and the real fields follow it. Pinned so a
+    // future 'cleanup' that removes it from one side only fails here rather than in
+    // the field.
+    EXPECT_EQ(40u, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    EXPECT_EQ(40u, offsetof(ProcessNotifyRequest, processId));
+    EXPECT_EQ(44u, offsetof(ProcessNotifyRequest, parentProcessId));
+    EXPECT_EQ(48u, offsetof(ProcessNotifyRequest, creatingProcessId));
+    EXPECT_EQ(52u, offsetof(ProcessNotifyRequest, creatingThreadId));
+    EXPECT_EQ(56u, offsetof(ProcessNotifyRequest, isCreation));
+    EXPECT_EQ(57u, offsetof(ProcessNotifyRequest, imagePathLength));
+    EXPECT_EQ(59u, offsetof(ProcessNotifyRequest, commandLineLength));
+    EXPECT_EQ(61u, sizeof(ProcessNotifyRequest));
+
+    // Field-by-field agreement with the kernel declaration, so the two cannot
+    // drift independently.
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, ProcessId),
+              offsetof(ProcessNotifyRequest, processId));
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, ParentProcessId),
+              offsetof(ProcessNotifyRequest, parentProcessId));
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, CreatingProcessId),
+              offsetof(ProcessNotifyRequest, creatingProcessId));
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, CreatingThreadId),
+              offsetof(ProcessNotifyRequest, creatingThreadId));
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, Create),
+              offsetof(ProcessNotifyRequest, isCreation));
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, ImagePathLength),
+              offsetof(ProcessNotifyRequest, imagePathLength));
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_PROCESS_NOTIFICATION, CommandLineLength),
+              offsetof(ProcessNotifyRequest, commandLineLength));
+}
+
+// The dispatcher validates the variable-length bounds by subtracting the fixed
+// size from DataSize. That subtraction is only safe because the fixed size is
+// checked first, and it is only meaningful because the lengths are byte counts of
+// wide characters rather than character counts.
+TEST(IpcStatisticsContractTest, ProcessNotifyVariableLengthsAreByteCounts) {
+    using ShadowStrike::Communication::ProcessNotifyRequest;
+
+    // Lengths are 16-bit, so the largest declarable path cannot exceed what the
+    // bounds check can represent after being widened to 32 bits.
+    EXPECT_EQ(2u, sizeof(decltype(ProcessNotifyRequest::imagePathLength)));
+    EXPECT_EQ(2u, sizeof(decltype(ProcessNotifyRequest::commandLineLength)));
+
+    // A byte count converts to a character count by dividing by sizeof(wchar_t).
+    // If these were character counts the accessors would read twice the data they
+    // should, straight off the end of the frame.
+    alignas(8) unsigned char raw[sizeof(ProcessNotifyRequest) + 16] = {};
+    auto* req = reinterpret_cast<ProcessNotifyRequest*>(raw);
+    req->imagePathLength = 8;      // 8 BYTES == 4 wide characters
+    req->commandLineLength = 6;    // 6 BYTES == 3 wide characters
+
+    EXPECT_EQ(4u, req->imagePathCharLen());
+    EXPECT_EQ(3u, req->commandLineCharLen());
+
+    // The command line begins after the image path, not after the struct.
+    const auto* base = reinterpret_cast<const unsigned char*>(req);
+    EXPECT_EQ(base + sizeof(ProcessNotifyRequest),
+              reinterpret_cast<const unsigned char*>(req->imagePathData()));
+    EXPECT_EQ(base + sizeof(ProcessNotifyRequest) + 8,
+              reinterpret_cast<const unsigned char*>(req->commandLineData()));
+}

@@ -913,6 +913,17 @@ struct alignas(64) RTPStatistics {
     /// System32\urlmon.dll.
     std::atomic<uint64_t> signedFileRemediationWithheld{ 0 };
 
+    /// Times a process-creation BLOCK was withheld because the configured
+    /// protection mode is below BLOCK_SUSPICIOUS and the evidence was inferential
+    /// (the OR of the five evasion detectors, which is a score with no named
+    /// referent). This is the measurement that does not exist yet: until the
+    /// verdict reply was wired, returning Block on that path did nothing, so no
+    /// block has ever taken effect and there is no field data on how often those
+    /// detectors fire on legitimate software. A high value on a real endpoint means
+    /// raising the mode would start blocking that many process creations, and is
+    /// the number to look at BEFORE recommending anyone raise it.
+    std::atomic<uint64_t> processBlocksWithheldByMode{ 0 };
+
     /// Times an inference-only BLOCK was withheld because the target was one of our
     /// own installed binaries. Separate from the remediation counter above because
     /// it is a different action on a different path: this one is the on-access

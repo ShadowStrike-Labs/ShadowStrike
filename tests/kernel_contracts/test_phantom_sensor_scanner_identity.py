@@ -25,6 +25,14 @@ COMM_PORT_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.h"
 DRIVER_ENTRY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/DriverEntry.c"
 ERROR_CODES_H_PATH = ROOT / "PhantomSensor/Shared/ErrorCodes.h"
 PROCESS_NOTIFY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/Process/ProcessNotify.c"
+# The USER-MODE half of the kernel reply contract. It lives here, beside the
+# driver half, deliberately: the invariant spans both sides of one exchange, and a
+# reader who finds the kernel's "read the verdict only when one arrived" test needs
+# to see the "actually send one" test next to it. It also cannot be expressed as a
+# C++ unit test - answering a notification needs a loaded driver and a live filter
+# port - which is the same reason the driver's own invariants are asserted here
+# against source text rather than behaviour.
+IPC_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.cpp"
 
 
 def read_source(path: Path) -> str:
@@ -148,6 +156,7 @@ class SourceContractTests(unittest.TestCase):
         cls.driver_entry_c = read_source(DRIVER_ENTRY_C_PATH)
         cls.error_codes_h = read_source(ERROR_CODES_H_PATH)
         cls.process_notify_c = read_source(PROCESS_NOTIFY_C_PATH)
+        cls.ipc_manager_cpp = read_source(IPC_MANAGER_CPP_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1030,6 +1039,109 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("PsGetThreadId(Data->Thread)", legacy)
         self.assertNotIn("PsGetCurrentProcessId()", legacy)
         self.assertNotIn("PsGetCurrentThreadId()", legacy)
+
+    def test_a_reply_bearing_process_notification_is_answered(self) -> None:
+        # THE KERNEL HALF OF THIS CONTRACT IS ASSERTED ABOVE, in
+        # test_a_process_verdict_is_read_only_when_one_actually_arrived. This is the
+        # half that was missing entirely: the driver allocated a reply buffer, asked
+        # for a verdict and waited, and nothing in user mode ever answered - so
+        # process blocking at creation could never take effect, and the only visible
+        # symptom was a timeout that looked like a slow scanner.
+        source = strip_c_comments(self.ipc_manager_cpp)
+
+        # Slice the ProcessNotify case from its own label to the next label.
+        # Anchoring on THIS case rather than searching the whole function is the
+        # point: the flag was already set three times elsewhere in that function,
+        # all three inside the ScanRequest case, so a file-wide search for
+        # "needsReply = true" passed while this path answered nothing.
+        start = source.find("case FilterMessageType_ProcessNotify:")
+        self.assertNotEqual(start, -1, "the ProcessNotify dispatch case is gone")
+        nxt = source.find("case FilterMessageType_", start + 1)
+        self.assertNotEqual(nxt, -1, "expected a further case label after ProcessNotify")
+        process_case = source[start:nxt]
+
+        self.assertIn(
+            "needsReply = true",
+            process_case,
+            "the ProcessNotify case must claim a reply; without it the verdict is "
+            "computed, assigned and then discarded when the switch falls through",
+        )
+
+        # The reply must be built as the PROCESS struct. The scan reply is 26 bytes
+        # and ProcessNotify.c allocates 16, so sending the scan struct is refused by
+        # Filter Manager and the kernel waits out its entire budget - a failure with
+        # no compile error, no wrong field value and a single Debug line.
+        self.assertIn("SHADOWSTRIKE_PROCESS_VERDICT_REPLY processReply", source)
+        self.assertIn("ReplyToKernel(messageId, processReply)", source)
+
+        # ...and the process struct must be confined to the ProcessNotify branch, so
+        # the file-create path keeps the reply shape ITS driver buffer expects.
+        branch = re.search(
+            r"FilterMessageType_ProcessNotify\s*\)\s*\{(?P<body>.*?)\}\s*else\s*\{",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            branch, "the reply site no longer branches on the message type"
+        )
+        assert branch is not None
+        body = branch.group("body")
+        self.assertIn("SHADOWSTRIKE_PROCESS_VERDICT_REPLY", body)
+        self.assertNotIn(
+            "SHADOWSTRIKE_SCAN_VERDICT_REPLY",
+            body,
+            "the process branch must not build the scan reply - that is the exact "
+            "substitution this whole contract exists to prevent",
+        )
+
+        # REGRESSION GUARD, not a discriminator, and it says so: replying without
+        # consulting the WDK ReplyLength previously produced
+        # STATUS_FLT_NO_WAITER_FOR_REPLY storms that pegged the CPU and starved the
+        # UI pipe. Setting needsReply unconditionally for this message type is only
+        # safe while this gate stands, so the two must be changed together.
+        self.assertIn("pWdkHeader->ReplyLength > 0", source)
+        self.assertIn("needsReply && kernelAwaitingReply", source)
+
+    def test_an_inference_class_process_block_honours_the_protection_mode(self) -> None:
+        # Wiring the reply turned "return Block" from a no-op into real enforcement,
+        # and the decision it enables is the OR of five evasion detectors, any one of
+        # which sets evasionDetected. The file-scan handler already gates a
+        # Suspicious verdict on the configured mode; this handler did not, so a
+        # MONITOR_ONLY endpoint would have had process creations blocked by a control
+        # it had explicitly turned down.
+        rtp = read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp")
+        source = strip_c_comments(rtp)
+
+        gate = re.search(
+            r"if\s*\(\s*evasionDetected\s*\)\s*\{(?P<body>.*?)return\s+"
+            r"Communication::KernelVerdict::Monitor\s*;",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            gate,
+            "the evasion decision must be able to end in Monitor; if it can only "
+            "return Block then the protection mode is being ignored again",
+        )
+        assert gate is not None
+        body = gate.group("body")
+
+        self.assertIn(
+            "ProtectionMode::BLOCK_SUSPICIOUS",
+            body,
+            "an inference-class process block must consult the configured mode, the "
+            "same way the file path does for a Suspicious verdict",
+        )
+        self.assertIn("processBlocksWithheldByMode", body)
+
+        # The withheld case must NOT be counted as a block. Counting it would
+        # recreate the defect this change removes: processesBlocked already read
+        # non-zero for blocks that never happened, because the verdict was discarded.
+        withheld = body[body.find("processBlocksWithheldByMode") :]
+        self.assertNotIn("processesBlocked++", withheld)
+
+        # And the detection itself is never conditional - only the enforcement is.
+        self.assertIn("EmitEvasionAlert", body)
 
 
 @dataclass(frozen=True)

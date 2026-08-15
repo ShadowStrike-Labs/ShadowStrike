@@ -420,6 +420,87 @@ TEST(WireFormatContractTest, BehavioralAlertHeaderOnlyFrameIsDistinguishable) {
 }
 
 // ============================================================================
+// THE TWO VERDICT REPLIES ARE NOT INTERCHANGEABLE
+// ============================================================================
+//
+// The kernel allocates a DIFFERENT reply buffer per path and user mode must reply
+// with the matching one. This is the trap that kept process blocking from ever
+// working: the dispatcher owned one reply builder, typed for the file-scan reply,
+// so the obvious way to answer a process notification was to send that struct --
+// and it is 10 bytes too long for the buffer ProcessNotify.c allocates.
+//
+// What makes it worth a permanent test is that the failure is INVISIBLE in every
+// way a developer would normally notice. It is not a compile error, because both
+// are plain structs. It is not a wrong verdict, because both place Verdict at the
+// same offset, so the byte would have been right. It is an oversized reply that
+// Filter Manager refuses, after which the kernel simply waits out its budget and
+// fails open, leaving one Debug-level line behind.
+TEST(WireFormatContractTest, ProcessAndScanVerdictRepliesAreDifferentSizes) {
+    // Sizes the two drivers' paths actually allocate.
+    EXPECT_EQ(16u, sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY));
+    EXPECT_EQ(26u, sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY));
+
+    // The property that matters: they are NOT the same size, so one cannot stand
+    // in for the other. If a future edit makes them equal, the distinction this
+    // test exists to protect has gone and the branch in DispatchMessage becomes
+    // untestable by size.
+    EXPECT_NE(sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY),
+              sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY));
+
+    // And the scan reply is the LARGER one, which is the direction that fails:
+    // sending it into the process path's buffer overruns what the driver allocated.
+    EXPECT_GT(sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY),
+              sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY))
+        << "the scan reply must remain the larger of the two, otherwise the "
+           "overflow direction this test documents has silently reversed";
+}
+
+// The coincidence that made the wrong struct look correct, pinned deliberately.
+// Both replies carry Verdict at offset 8. That is why swapping them produces a
+// correct verdict byte and an undeliverable reply -- the hardest kind of defect to
+// find, because every value you inspect is right.
+TEST(WireFormatContractTest, BothVerdictRepliesCarryVerdictAtOffsetEight) {
+    EXPECT_EQ(0u, offsetof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, MessageId));
+    EXPECT_EQ(8u, offsetof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, Verdict));
+    EXPECT_EQ(9u, offsetof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, ThreatScore));
+    EXPECT_EQ(12u, offsetof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, Flags));
+
+    EXPECT_EQ(offsetof(SHADOWSTRIKE_SCAN_VERDICT_REPLY, Verdict),
+              offsetof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, Verdict))
+        << "both replies place Verdict at the same offset; this is a coincidence "
+           "the code must not rely on, and it is recorded here so the next reader "
+           "understands why the size is the only thing that distinguishes them";
+
+    // The driver reads the verdict only when the delivered length reaches the
+    // field, so the minimum useful process reply is offset + one byte.
+    constexpr size_t kMinUsable =
+        offsetof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY, Verdict) + sizeof(UINT8);
+    EXPECT_EQ(9u, kMinUsable);
+    EXPECT_LE(kMinUsable, sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY));
+}
+
+// A blocking verdict must be the one value the driver acts on. Verdict_Malicious
+// is the only value ProcessNotify.c turns into STATUS_ACCESS_DENIED, so every
+// other verdict user mode can produce must be non-blocking by construction.
+TEST(WireFormatContractTest, OnlyMaliciousBlocksAProcessCreation) {
+    EXPECT_EQ(2, static_cast<int>(Verdict_Malicious));
+
+    // Everything the dispatcher can send on a refusal path must NOT equal it,
+    // otherwise a malformed payload or a handler exception would block a process.
+    EXPECT_NE(static_cast<int>(Verdict_Malicious), static_cast<int>(Verdict_Unknown));
+    EXPECT_NE(static_cast<int>(Verdict_Malicious), static_cast<int>(Verdict_Error));
+    EXPECT_NE(static_cast<int>(Verdict_Malicious), static_cast<int>(Verdict_Clean));
+    EXPECT_NE(static_cast<int>(Verdict_Malicious), static_cast<int>(Verdict_Suspicious));
+    EXPECT_NE(static_cast<int>(Verdict_Malicious), static_cast<int>(Verdict_Timeout));
+
+    // Verdict is a single byte on the wire, so every value must survive narrowing.
+    EXPECT_EQ(static_cast<int>(Verdict_Malicious),
+              static_cast<int>(static_cast<UINT8>(Verdict_Malicious)));
+    EXPECT_EQ(static_cast<int>(Verdict_Timeout),
+              static_cast<int>(static_cast<UINT8>(Verdict_Timeout)));
+}
+
+// ============================================================================
 // PER-TYPE STATISTICS MUST COVER EVERY TYPE ON THE WIRE
 // ============================================================================
 //
