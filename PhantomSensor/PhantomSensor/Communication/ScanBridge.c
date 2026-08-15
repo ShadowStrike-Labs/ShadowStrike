@@ -1060,6 +1060,13 @@ SbSendScanRequestEx(
     LARGE_INTEGER endTime;
     ULONG timeoutMs;
     ULONG maxRetries;
+    //
+    // Whether the scanner actually answered, as distinct from FltSendMessage
+    // returning a success code. STATUS_TIMEOUT is documented as a success code
+    // and NT_SUCCESS(STATUS_TIMEOUT) is TRUE, so this cannot be derived from
+    // NT_SUCCESS - see the assignment inside the retry loop below.
+    //
+    BOOLEAN replyReceived = FALSE;
 
     PAGED_CODE();
 
@@ -1169,7 +1176,26 @@ SbSendScanRequestEx(
                 timeoutMs
             );
 
-            if (NT_SUCCESS(status)) {
+            //
+            // THE SCANNER ANSWERED, as distinct from the send returning a success
+            // code. FltSendMessage documents STATUS_TIMEOUT as a success code, and
+            // NT_SUCCESS(STATUS_TIMEOUT) is TRUE, so `if (NT_SUCCESS(status))
+            // break;` treated an unanswered scan as a completed one and left the
+            // loop immediately - which is why STATUS_TIMEOUT, listed FIRST in the
+            // retriable set just below, could never be reached.
+            //
+            // CREATE-PATH LATENCY IS UNCHANGED BY THIS, and that was verified
+            // rather than assumed: SbSendScanRequestEx has exactly one caller in
+            // the driver and it sets MaxRetries = 0 deliberately (see the comment
+            // at that call site about multiplying the worst-case stall on a single
+            // IRP_MJ_CREATE). With maxRetries == 0 the `attempt < maxRetries` gate
+            // below is false on the first pass, so the loop still makes exactly one
+            // attempt and breaks. What changes is only that `status` now survives
+            // as STATUS_TIMEOUT to be classified correctly after the loop.
+            //
+            replyReceived = (BOOLEAN)((status != STATUS_TIMEOUT) && NT_SUCCESS(status));
+
+            if (replyReceived) {
                 break;
             }
 
@@ -1227,9 +1253,25 @@ SbSendScanRequestEx(
     //
     SbpUpdateLatencyStats(startTime);
 
-    if (NT_SUCCESS(status)) {
+    if (replyReceived) {
         //
         // Success - extract result
+        //
+        // Gated on an ACTUAL REPLY, not on NT_SUCCESS. Because
+        // NT_SUCCESS(STATUS_TIMEOUT) is TRUE, an unanswered scan used to take this
+        // branch and produce a confident outcome from a reply buffer nobody wrote:
+        // Result->Status = STATUS_SUCCESS, Verdict = Verdict_Unknown (the zeroed
+        // value), ThreatDetected = FALSE - and, worst of all, SbpRecordSuccess on
+        // the circuit breaker.
+        //
+        // That last call inverted the signal the breaker exists to collect.
+        // SbpRecordSuccess zeroes ConsecutiveFailures and, in the half-open state,
+        // closes the circuit and zeroes RecentTimeouts. SbpRecordTimeout is the
+        // ONLY code that increments RecentTimeouts, and it sits in the branch below
+        // that could never execute - so the windowed "scanner is slow" trip, whose
+        // whole stated purpose is to stop taxing every file open with the full scan
+        // timeout, could not fire, and a scanner timing out on every single request
+        // was recorded as one hundred percent successful.
         //
         Result->Status = STATUS_SUCCESS;
         Result->Verdict = (SHADOWSTRIKE_SCAN_VERDICT)reply.Verdict;

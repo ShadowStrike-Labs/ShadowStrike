@@ -1326,7 +1326,7 @@ ShadowStrikeDrainMessageQueue(
                 continue;
             }
 
-            (void)FltSendMessage(
+            status = FltSendMessage(
                 g_DriverData.FilterHandle,
                 &clientPort,
                 sendData,
@@ -1335,6 +1335,31 @@ ShadowStrikeDrainMessageQueue(
                 NULL,
                 &timeout
             );
+
+            //
+            // The result was previously discarded with (void). The message is
+            // freed immediately below either way, so an undelivered frame here is
+            // lost PERMANENTLY - which makes it the one outcome on this path worth
+            // counting. Note the asymmetry that removes: the encryption-failure
+            // branch above already counted MessagesDropped for a message it
+            // discarded itself, while a drop the transport reported counted
+            // nowhere at all.
+            //
+            // This drain passes a zero timeout, so STATUS_TIMEOUT is not an edge
+            // case but the ordinary report for "no user-mode thread was waiting in
+            // FilterGetMessage", and NT_SUCCESS(STATUS_TIMEOUT) is TRUE.
+            //
+            // NOT re-queued, deliberately: re-queueing into the queue currently
+            // being drained, from a loop that keeps going while a batch comes back
+            // full, is an unbounded redelivery loop against a peer that has just
+            // demonstrated it is not reading. That choice is also what the KEX fix
+            // above earns - readiness, and therefore this drain, is now only
+            // reached once the peer has provably collected its key, so a timeout
+            // here means it stopped reading mid-drain and is going away.
+            //
+            if ((status == STATUS_TIMEOUT) || !NT_SUCCESS(status)) {
+                SHADOWSTRIKE_INC_STAT(MessagesDropped);
+            }
 
             if (encBuf != NULL) {
                 ExFreePoolWithTag(encBuf, 'edCP');
@@ -1462,7 +1487,33 @@ ShadowStrikeDeliverKexWorker(
         &timeout
         );
 
-    if (NT_SUCCESS(status)) {
+    //
+    // DELIVERY, NOT MERELY A SUCCESS CODE.
+    //
+    // FltSendMessage documents STATUS_TIMEOUT as "The Timeout interval expired
+    // before the message could be delivered ... This is a success code", so
+    // NT_SUCCESS(STATUS_TIMEOUT) is TRUE. Testing NT_SUCCESS alone treated a
+    // KEX blob the peer NEVER RECEIVED as a completed key exchange.
+    //
+    // That is not a reporting defect. EncryptionEstablished, published below, is
+    // a ROUTING PRECONDITION: ShadowStrikeAcquirePrimaryScannerPort consults it
+    // both when selecting the primary scanner and when selecting a fallback
+    // telemetry target, and the kernel holds its own copy of the session key
+    // whether or not the peer ever received one. Publishing readiness for an
+    // undelivered KEX therefore makes this slot eligible to receive AES-GCM
+    // traffic its peer has no key to decrypt - and, for a primary scanner, also
+    // arms the queue drain below, spending buffered telemetry on it.
+    //
+    // The window is real and both sides already document it. The user-mode gate
+    // connection posts one overlapped FilterGetMessage and abandons it with
+    // CancelIoEx after 10 s ("Gate key-exchange drain timed out on liveness
+    // connection") while this send waits 30 s; in that 20 s remainder nobody can
+    // retrieve the message any more, and STATUS_TIMEOUT is exactly how the
+    // filter manager reports that.
+    //
+    const BOOLEAN kexDelivered = (status != STATUS_TIMEOUT) && NT_SUCCESS(status);
+
+    if (kexDelivered) {
         BOOLEAN becameReady = FALSE;
 
         //
@@ -1511,8 +1562,30 @@ ShadowStrikeDeliverKexWorker(
                 );
         }
     } else {
+        //
+        // An undelivered KEX is treated exactly like an outright send failure,
+        // and the response already written here was the correct one: tear the
+        // client down. No retry or re-arm is invented, because a peer that never
+        // collected its key cannot use this session at all, and disconnecting is
+        // what makes it build a new one - the user-mode receive loop observes
+        // !IsConnected(), and its coordinated single-claim reconnect (with
+        // exponential back-off, autoReconnect defaulting to true) issues a fresh
+        // ConnectNotify and therefore a fresh KEX.
+        //
+        // VERIFIED this cannot wedge protection permanently before relying on it:
+        // the user-mode side does have a state that suppresses all further
+        // reconnects, but it is entered only after a streak of ERROR_ACCESS_DENIED
+        // from FilterConnectCommunicationPort and is cleared on any successful
+        // connect, so a delivery timeout cannot reach it.
+        //
+        // The status is named in words as well as printed, because 0x00000102 is
+        // a documented SUCCESS code and a bare hex value on a line saying
+        // "failed" is exactly what made this defect easy to miss.
+        //
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                   "[ShadowStrike] Kex delivery failed on slot %ld: 0x%08X - disconnecting\n",
+                   "[ShadowStrike] Kex %s on slot %ld: 0x%08X - disconnecting\n",
+                   (status == STATUS_TIMEOUT) ? "was NOT DELIVERED (peer never collected it)"
+                                              : "delivery failed",
                    ctx->SlotIndex,
                    status);
 
@@ -3906,9 +3979,30 @@ ShadowStrikeSendScanRequest(
     );
 
     //
+    // A REPLY, NOT MERELY A SUCCESS CODE.
+    //
+    // This send supplies a reply buffer, and FltSendMessage documents
+    // STATUS_TIMEOUT - "This is a success code" - for both of its waits: the
+    // message was never delivered, or it was delivered and no reply arrived
+    // within the interval. NT_SUCCESS(STATUS_TIMEOUT) is TRUE, so testing
+    // NT_SUCCESS alone claimed a reply in every one of those cases.
+    //
+    // Three consequences, all of which this single distinction removes:
+    //   - RepliesReceived counted replies that were never received.
+    //   - *ReplySize was written back on a timeout, telling the caller a reply of
+    //     the full buffer length was present when the buffer holds whatever it
+    //     held before the call. The caller then reads a verdict nobody sent.
+    //   - the "else if (status == STATUS_TIMEOUT)" arm below was UNREACHABLE, so
+    //     ScanTimeouts could never be incremented and the scan-timeout warning
+    //     could never print. Absence of scan-timeout evidence in a field log was
+    //     therefore guaranteed by construction rather than by health.
+    //
+    const BOOLEAN replyReceived = (status != STATUS_TIMEOUT) && NT_SUCCESS(status);
+
+    //
     // Update per-client stats BEFORE releasing reference
     //
-    if (NT_SUCCESS(status)) {
+    if (replyReceived) {
         InterlockedIncrement64(&clientRef->MessagesSent);
         InterlockedIncrement64(&clientRef->RepliesReceived);
     }
@@ -3927,7 +4021,7 @@ ShadowStrikeSendScanRequest(
         ExFreePoolWithTag(encryptedBuffer, 'enCP');
     }
 
-    if (NT_SUCCESS(status)) {
+    if (replyReceived) {
         SHADOWSTRIKE_INC_STAT(MessagesSent);
         SHADOWSTRIKE_INC_STAT(RepliesReceived);
         *ReplySize = replySize;
@@ -4522,7 +4616,15 @@ ShadowStrikeSendProcessNotification(
 
         InterlockedDecrement(&g_DriverData.Stats.PendingRequests);
 
-        if (NT_SUCCESS(status)) {
+        //
+        // Same distinction as the scan-request path: STATUS_TIMEOUT is a
+        // documented success code and NT_SUCCESS(STATUS_TIMEOUT) is TRUE, so the
+        // "else if" below was UNREACHABLE and ScanTimeouts could never be
+        // incremented from here. *ReplySize is now written back only when a reply
+        // genuinely arrived - the caller decides a process verdict from that
+        // buffer, and it must not be told a verdict is present when none is.
+        //
+        if ((status != STATUS_TIMEOUT) && NT_SUCCESS(status)) {
             SHADOWSTRIKE_INC_STAT(MessagesSent);
             SHADOWSTRIKE_INC_STAT(RepliesReceived);
             *ReplySize = replyBufferSize;
@@ -4545,8 +4647,22 @@ ShadowStrikeSendProcessNotification(
             &timeout
         );
 
-        if (NT_SUCCESS(status)) {
+        //
+        // Same STATUS_TIMEOUT exclusion as the notification funnel, and this is
+        // the branch where it matters most: the timeout is ZERO, so STATUS_TIMEOUT
+        // is not an edge case but the ordinary report for "no user-mode thread was
+        // waiting in FilterGetMessage". NT_SUCCESS(STATUS_TIMEOUT) is TRUE, so this
+        // counted UNDELIVERED process notifications as sent, and counted a genuine
+        // failure nowhere.
+        //
+        // The reply branch above tests STATUS_TIMEOUT explicitly. The same function
+        // therefore handled the documented success-but-not-delivered case correctly
+        // when it asked for a reply and incorrectly when it did not.
+        //
+        if ((status != STATUS_TIMEOUT) && NT_SUCCESS(status)) {
             SHADOWSTRIKE_INC_STAT(MessagesSent);
+        } else {
+            SHADOWSTRIKE_INC_STAT(MessagesDropped);
         }
     }
 

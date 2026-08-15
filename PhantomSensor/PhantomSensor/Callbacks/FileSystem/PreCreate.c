@@ -1595,7 +1595,38 @@ Return Value:
                 }
             }
 
-            if (NT_SUCCESS(Status)) {
+            //
+            // THE SCANNER ANSWERED, as distinct from the send returning a success
+            // code. FltSendMessage documents STATUS_TIMEOUT as a success code, so
+            // NT_SUCCESS(STATUS_TIMEOUT) is TRUE and `if (NT_SUCCESS(Status))`
+            // sent an UNANSWERED scan into the verdict branch below, where
+            // ReplyMsg is still the zero-initialised declaration from the top of
+            // this function. Three things followed, and the correct handling for
+            // all three already existed in the else branch that could not run:
+            //
+            //   1. Verdict was 0 (Verdict_Unknown), which is not Verdict_Malicious,
+            //      so the ALLOW arm ran and called ShadowStrikeCacheInsert with a
+            //      HARDCODED Verdict_Clean. ScanCache deliberately REFUSES to cache
+            //      Unknown/Error/Timeout - its comment says caching one "would let a
+            //      hostile file that successfully induced one user-mode scanner
+            //      failure bypass scanning for the entire TTL window" - but the
+            //      literal Verdict_Clean meant that guard never saw a transient
+            //      verdict. The defence was defeated by the label, not by a hole.
+            //   2. The TTL passed was ReplyMsg.CacheTTL == 0, and a zero TTL means
+            //      the cache's DEFAULT window (300 s), not the deliberately short
+            //      PC_FAILOPEN_CACHE_TTL_SEC (15 s) the timeout path uses. So an
+            //      unscanned file was trusted for twenty times the intended window.
+            //   3. FailOpenOnTimeout was never consulted, so an administrator who
+            //      configured fail-CLOSED on timeout silently got fail-open.
+            //
+            // g_PcState.Stats.ScanTimeouts and the "Scan timeout" log line were
+            // also unreachable from here, which is why no field log has ever shown
+            // a create-path scan timeout.
+            //
+            const BOOLEAN ScanAnswered =
+                (Status != STATUS_TIMEOUT) && NT_SUCCESS(Status);
+
+            if (ScanAnswered) {
                 //
                 // Handle scan verdict
                 //

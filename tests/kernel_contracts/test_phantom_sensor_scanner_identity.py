@@ -115,6 +115,26 @@ def strip_c_comments(source: str) -> str:
     return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
 
 
+def enclosing_statement(source: str, position: int) -> str:
+    """Return the single C statement containing `position`.
+
+    Used to assert that a delivery decision and its STATUS_TIMEOUT exclusion live
+    in the SAME boolean expression. Checking only that both tokens appear
+    somewhere near each other would pass for code that tests NT_SUCCESS first and
+    mentions STATUS_TIMEOUT in an unreachable `else if` afterwards - which is
+    exactly the shape this guard exists to reject.
+    """
+    start = max(
+        source.rfind(";", 0, position),
+        source.rfind("{", 0, position),
+        source.rfind("}", 0, position),
+    )
+    candidates = [offset for offset in (source.find(";", position), source.find("{", position)) if offset >= 0]
+    if not candidates:
+        raise AssertionError(f"Unterminated statement at offset {position}")
+    return source[start + 1 : min(candidates)]
+
+
 class SourceContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -527,6 +547,156 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("ConnectionGeneration", drain)
         self.assertIn("ShadowStrikeAcquireClientPortBySlot(", drain)
         self.assertRegex(drain, r"if\s*\(!canEncrypt\)\s*\{")
+
+    def test_every_send_site_distinguishes_delivery_from_success(self) -> None:
+        # THE STRUCTURAL GUARD, and the reason this is expressed over every call
+        # site rather than over a list of function names: FltSendMessage documents
+        # STATUS_TIMEOUT as "The Timeout interval expired before the message could
+        # be delivered ... This is a success code". NT_SUCCESS(STATUS_TIMEOUT) is
+        # therefore TRUE, so `if (NT_SUCCESS(status))` after a send does not mean
+        # what it reads as, and six sites in this file got it wrong in five
+        # different ways - counting undelivered as sent, publishing client
+        # readiness, discarding the result entirely, writing back a reply length,
+        # and rendering an explicit `else if (status == STATUS_TIMEOUT)` arm
+        # unreachable.
+        #
+        # A new send site added later would reintroduce it, which is why the
+        # assertion walks the sites instead of naming the functions.
+        executable = strip_c_comments(self.comm_port_c)
+        sites = [match.start() for match in re.finditer(r"FltSendMessage\s*\(", executable)]
+
+        # Six today: queue drain, KEX delivery, scan request, notification funnel,
+        # and the process notification's reply and fire-and-forget branches.
+        self.assertEqual(len(sites), 6, "send-site count changed; review each one")
+
+        for index, start in enumerate(sites):
+            window = executable[start : start + 900]
+            probe = re.search(r"NT_SUCCESS\s*\(\s*status\s*\)", window)
+            with self.subTest(site=index):
+                self.assertIsNotNone(
+                    probe,
+                    "a send whose status is never examined cannot report a failure",
+                )
+                statement = enclosing_statement(window, probe.start())
+                self.assertIn(
+                    "STATUS_TIMEOUT",
+                    statement,
+                    "delivery must be decided in the same expression that excludes "
+                    "the documented not-delivered success code",
+                )
+
+    def test_kex_readiness_requires_actual_delivery(self) -> None:
+        worker = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeDeliverKexWorker")
+        )
+
+        # EncryptionEstablished is not a statistic. It is a ROUTING PRECONDITION -
+        # ShadowStrikeAcquirePrimaryScannerPort consults it for both primary and
+        # fallback selection - and the kernel keeps its own copy of the session key
+        # regardless of whether the peer received one. Publishing it for a KEX the
+        # peer never collected makes the slot eligible for AES-GCM traffic it cannot
+        # decrypt.
+        self.assertIn("(status != STATUS_TIMEOUT) && NT_SUCCESS(status)", worker)
+
+        gate_at = worker.index("kexDelivered")
+        publish_at = worker.index("&clientRef->EncryptionEstablished")
+        self.assertLess(gate_at, publish_at)
+
+        # An undelivered KEX must take the same route as an outright send failure.
+        # That response was already written and already correct; nothing about it
+        # needed inventing, only reaching.
+        self.assertIn("ShadowStrikeBeginClientDisconnect(", worker)
+        disconnect_at = worker.index("ShadowStrikeBeginClientDisconnect(")
+        self.assertLess(publish_at, disconnect_at)
+
+    def test_queue_drain_counts_a_message_it_could_not_deliver(self) -> None:
+        drain = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeDrainMessageQueue")
+        )
+
+        # The result used to be discarded with (void) while MqFreeMessage ran
+        # unconditionally, so a telemetry message buffered across a reconnect window
+        # was lost permanently with nothing counted - next to an encryption-failure
+        # path that did count its own drop.
+        self.assertNotIn("(void)FltSendMessage", drain)
+        self.assertIn("status = FltSendMessage(", drain)
+
+        send_at = drain.index("status = FltSendMessage(")
+        free_at = drain.index("MqFreeMessage(", send_at)
+        dropped_at = drain.index("SHADOWSTRIKE_INC_STAT(MessagesDropped)", send_at)
+        self.assertLess(dropped_at, free_at)
+
+    def test_scan_request_publishes_a_reply_length_only_when_a_reply_arrived(self) -> None:
+        body = strip_c_comments(
+            extract_c_function(self.comm_port_c, "ShadowStrikeSendScanRequest")
+        )
+
+        self.assertIn("(status != STATUS_TIMEOUT) && NT_SUCCESS(status)", body)
+
+        # *ReplySize is how the caller learns a verdict is present. Writing it back
+        # on a timeout told the caller a full-length reply had arrived in a buffer
+        # nobody wrote.
+        gate_at = body.index("replyReceived")
+        publish_at = body.index("*ReplySize = replySize;")
+        self.assertLess(gate_at, publish_at)
+
+        # With the success test no longer swallowing it, this arm is reachable and
+        # ScanTimeouts can be non-zero for the first time.
+        self.assertIn("SHADOWSTRIKE_INC_STAT(ScanTimeouts)", body)
+        self.assertIn("RepliesReceived", body)
+
+    def test_scan_bridge_records_a_timeout_as_a_timeout_not_a_success(self) -> None:
+        body = strip_c_comments(
+            extract_c_function(self.scan_bridge_c, "SbSendScanRequestEx")
+        )
+
+        self.assertIn("(status != STATUS_TIMEOUT) && NT_SUCCESS(status)", body)
+
+        # The circuit breaker was fed the INVERSE of what happened: SbpRecordSuccess
+        # zeroes ConsecutiveFailures and, half-open, closes the circuit and zeroes
+        # RecentTimeouts. SbpRecordTimeout is the only writer that increments
+        # RecentTimeouts and it sat in a branch that could never execute, so the
+        # windowed "scanner is slow" trip - the defence against taxing every file
+        # open with a full scan timeout - could not fire.
+        gate_at = body.index("if (replyReceived) {")
+        success_at = body.index("SbpRecordSuccess(")
+        timeout_at = body.index("SbpRecordTimeout(")
+        self.assertLess(gate_at, success_at)
+        self.assertLess(success_at, timeout_at)
+
+        # The dedicated verdict for this case exists and must actually be produced.
+        self.assertIn("Verdict_Timeout", body)
+        self.assertIn("SHADOWSTRIKE_ERROR_SCAN_TIMEOUT", body)
+
+    def test_create_path_never_caches_an_unanswered_scan_as_clean(self) -> None:
+        body = strip_c_comments(
+            extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
+        )
+
+        # ScanCache REFUSES to store Unknown/Error/Timeout, because caching one
+        # "would let a hostile file that successfully induced one user-mode scanner
+        # failure bypass scanning for the entire TTL window". That guard never saw a
+        # transient verdict: on a timeout this path took the allow arm and passed a
+        # HARDCODED Verdict_Clean, with ReplyMsg.CacheTTL == 0 meaning the cache's
+        # 300 s default rather than the 15 s fail-open window the timeout path uses.
+        self.assertIn("(Status != STATUS_TIMEOUT) && NT_SUCCESS(Status)", body)
+
+        gate_at = body.index("ScanAnswered")
+        branch_at = body.index("if (ScanAnswered) {")
+        clean_at = body.index("Verdict_Clean", branch_at)
+        self.assertLess(gate_at, branch_at)
+        self.assertLess(branch_at, clean_at)
+
+        # The timeout policy that could not run before: its own counter, the
+        # administrator's fail-closed choice, and the deliberately short TTL.
+        timeout_at = body.index("Status == STATUS_TIMEOUT", branch_at)
+        self.assertLess(clean_at, timeout_at)
+        for required in (
+            "g_PcState.Stats.ScanTimeouts",
+            "FailOpenOnTimeout",
+            "PC_FAILOPEN_CACHE_TTL_SEC",
+        ):
+            self.assertIn(required, body)
 
     def test_legacy_builder_uses_operation_requestor(self) -> None:
         legacy = extract_c_function(
