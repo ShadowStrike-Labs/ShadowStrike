@@ -2409,12 +2409,41 @@ public:
         event.valueName = std::move(valueName);
         event.sourceProcessId = req->processId;
         event.sourceProcessPath = GetProcessNameFromPid(req->processId);
-        event.wasBlocked = true;
-        event.description = "Blocked by kernel registry callback";
         event.timestamp = Clock::now();
 
+        // DID THE KERNEL ACTUALLY DENY THIS? Until now wasBlocked was hardcoded
+        // true and the description hardcoded "Blocked by kernel registry
+        // callback" for EVERY event, and totalBlocked was incremented
+        // unconditionally alongside totalOperations - so the two counters were
+        // always equal and neither could distinguish a denial from an
+        // observation. That was invisible while this handler was evicted; it
+        // becomes a live false-signal the moment the handler runs, which is why
+        // it is corrected in the same change that restores it.
+        //
+        // The driver reports registry activity it considers notable, not only
+        // activity it denied. It denies unconditionally, before notifying, when
+        // the target is a protected key and the operation writes
+        // (RegistryCallback.c:2007). That is the predicate reproduced here.
+        //
+        // STATED PRECISELY: this is our own view of the protected set, kept in
+        // step with the kernel's by SyncProtectedKeysToKernel. It is a faithful
+        // reading of the same rule, not an echo of the kernel's decision - the
+        // notification carries no "was denied" bit to read. Where they could
+        // disagree, this under-claims rather than over-claims.
+        bool denied = false;
+        if (!event.keyPath.empty() && IsKeyProtected(event.keyPath)) {
+            constexpr auto writeOps = static_cast<uint32_t>(RegistryOperation::AllWrite);
+            denied = (static_cast<uint32_t>(operation) & writeOps) != 0;
+        }
+        event.wasBlocked = denied;
+        event.description = denied
+            ? "Write to a protected key; denied by the kernel self-protection check"
+            : "Registry activity reported by the kernel callback (not denied)";
+
         m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
-        m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
+        if (denied) {
+            m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Add to history
         {
@@ -2427,8 +2456,12 @@ public:
         }
 
         // === Communication wiring: AlertSystem for kernel-blocked events ===
+        // Gated on `denied`. A Critical alert raised for every reported registry
+        // operation would train the reader to ignore Critical, which is the same
+        // harm as not alerting at all - and the driver reports far more activity
+        // than it denies.
         try {
-            if (Communication::AlertSystem::HasInstance()) {
+            if (denied && Communication::AlertSystem::HasInstance()) {
                 auto& alertSys = Communication::AlertSystem::Instance();
                 const std::string opName(GetRegistryOperationName(event.operation));
                 const std::string keyNarrow = WideToNarrow(event.keyPath);
@@ -2487,19 +2520,38 @@ public:
     void RegisterKernelHandler() {
         try {
             auto& ipc = Communication::IPCManager::Instance();
-            // Use the dedicated RegisterRegistryHandler (not RegisterGenericHandler)
-            // to avoid overwriting other modules' generic handlers.
-            // IPCManager dispatches FilterMessageType_RegistryNotify to this handler
-            // with validated RegistryOpRequest payload.
-            ipc.RegisterRegistryHandler(
+            // NAMED SUBSCRIPTION, not a slot assignment. Until this was fixed,
+            // RegisterRegistryHandler assigned a single member, and
+            // RealTimeProtection registered the same slot from Start() - which
+            // AntivirusService runs AFTER Impl::Initialize() at all three of its
+            // call sites. So this handler was evicted on every startup and
+            // everything below it, including the whole event pipeline in
+            // OnKernelRegistryEventInternal, never ran once in production.
+            ipc.RegisterRegistryHandler("RegistryProtection",
                 [this](const Communication::RegistryOpRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
                     if (!m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
                         return Verdict_Clean;
                     }
                     OnKernelRegistryEventInternal(&req, sizeof(req)
                         + req.keyPathLength + req.valueNameLength + req.dataSize);
-                    // Return Malicious verdict if the key is protected (blocked at kernel level)
-                    // The kernel will use this to deny the operation pre-notification
+
+                    // A protected-key WRITE returns Malicious as this module's
+                    // vote, and it is combined most-severe-wins with the other
+                    // subscribers' verdicts.
+                    //
+                    // HONEST LIMIT, corrected here: the previous comment claimed
+                    // "the kernel will use this to deny the operation
+                    // pre-notification". It does not and never did. This path is
+                    // reached from a notification the driver sends through
+                    // ShadowStrikeSendNotification (CommPort.h:365), which takes
+                    // no reply buffer, so the verdict is not transmitted.
+                    // ENFORCEMENT IS NOT LOST: the kernel blocks writes to
+                    // protected keys itself, unconditionally and before asking
+                    // anyone, at RegistryCallback.c:2007
+                    // (ShadowStrikeShouldBlockRegistryAccess, commented "not
+                    // configurable for security"). What this module contributes
+                    // is the user-mode record of the event, which is what the
+                    // eviction was actually costing.
                     std::wstring keyPath;
                     if (req.keyPathLength > 0 && req.keyPathCharLen() > 0) {
                         keyPath.assign(req.keyPathData(), req.keyPathCharLen());
@@ -2525,9 +2577,13 @@ public:
         if (m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
             m_kernelHandlerRegistered.store(false, std::memory_order_release);
             try {
-                // Clear the registry handler slot so IPCManager stops dispatching to us
+                // Remove ONLY our own subscription. This used to call
+                // RegisterRegistryHandler(nullptr), which cleared the whole slot -
+                // so this module's shutdown disabled kernel registry dispatch for
+                // every other module as a side effect, and self-protection
+                // shutdown is exactly what an attacker triggers first.
                 auto& ipc = Communication::IPCManager::Instance();
-                ipc.RegisterRegistryHandler(nullptr);
+                ipc.UnregisterRegistryHandler("RegistryProtection");
             } catch (...) {
                 // Best-effort during shutdown
             }

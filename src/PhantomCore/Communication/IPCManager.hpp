@@ -729,6 +729,29 @@ struct GenericSubscription {
     GenericMessageCallback handler;
 };
 
+/**
+ * @brief One named subscriber to the kernel registry-notification feed.
+ *
+ * SAME SHAPE AS GenericSubscription AND FOR THE SAME REASON, but it had to be
+ * argued separately because this feed carries a VERDICT-returning callback and
+ * the generic feed does not.
+ *
+ * WHY A FAN-OUT IS CORRECT HERE: the registry verdict has NO KERNEL WAITER.
+ * ShadowStrikeSendRegistryNotification (ScanBridge.c:1807) delivers through
+ * ShadowStrikeSendNotification, whose declaration (CommPort.h:365) takes no
+ * reply buffer at all and is documented "no reply expected ... Uses
+ * zero-timeout to avoid blocking". The registry callback DOES deny operations
+ * (RegistryCallback.c:2440 returns STATUS_ACCESS_DENIED) but only from
+ * kernel-side policy - ShadowStrikeShouldBlockRegistryAccess (:2007) and
+ * ShadowStrikeDetectRansomwareRegistryBehavior (:2074). Neither consults user
+ * mode. So no thread is blocked while these subscribers run, and there is no
+ * latency budget to negotiate the way the process-notify path needs one.
+ */
+struct RegistrySubscription {
+    std::string        name;
+    RegistryOpCallback handler;
+};
+
 // ============================================================================
 // IPC MANAGER CLASS
 // ============================================================================
@@ -892,8 +915,56 @@ public:
     /// @brief Register image load handler
     void RegisterImageLoadHandler(ImageLoadCallback handler);
     
-    /// @brief Register registry operation handler
-    void RegisterRegistryHandler(RegistryOpCallback handler);
+    /**
+     * @brief Subscribe to the kernel registry-notification feed.
+     *
+     * ADDITIVE, not a slot. This replaced a single-assignment
+     * `m_registryHandler` that two production modules registered against:
+     * RealTimeProtection (RealTimeProtection.cpp:1366, from Start()) and
+     * RegistryProtection (RegistryProtection.cpp:2494, from Initialize()).
+     * AntivirusService runs Impl::Initialize() before Impl::Start() at all
+     * three of its call sites, so RegistryProtection registered first and
+     * RealTimeProtection silently evicted it on EVERY startup - taking with it
+     * RegistryProtection's entire kernel-event pipeline (event history,
+     * totalOperations/totalBlocked, and every registered event callback).
+     *
+     * Registering twice under the same @p subscriber name REPLACES that
+     * subscriber's callback and leaves the others intact.
+     *
+     * @param subscriber Stable identity of the registering module. Must be
+     *                   non-empty: an unnamed subscriber cannot be removed and
+     *                   cannot be attributed in a log, which is precisely what
+     *                   made the eviction invisible.
+     * @param handler    Invoked OUTSIDE the handler mutex. Verdicts from all
+     *                   subscribers are combined most-severe-wins; see
+     *                   CombineRegistryVerdicts.
+     */
+    void RegisterRegistryHandler(std::string subscriber, RegistryOpCallback handler);
+
+    /// @brief Remove one named registry subscriber. Unknown names are ignored.
+    void UnregisterRegistryHandler(std::string_view subscriber);
+
+    /// @brief Number of live registry subscribers. Zero means no module sees kernel registry events.
+    [[nodiscard]] size_t RegistrySubscriberCount() const noexcept;
+
+    /**
+     * @brief Combine two registry verdicts, most severe wins.
+     *
+     * PUBLIC AND STATIC BECAUSE THE ORDERING IS A POLICY, NOT AN IMPLEMENTATION
+     * DETAIL, and a policy nobody can test is a policy nobody can verify.
+     *
+     * THE TRAP THIS EXISTS TO AVOID: SHADOWSTRIKE_SCAN_VERDICT is NOT ordered by
+     * severity. VerdictTypes.h:21 declares Unknown 0, Clean 1, Malicious 2,
+     * Suspicious 3, Error 4, Timeout 5 - so a naive std::max would rank Timeout
+     * and Error ABOVE Malicious and silently downgrade a conviction to a
+     * transient failure. The rank below is explicit for that reason.
+     *
+     * Malicious outranks everything: it is the only value the driver turns into
+     * STATUS_ACCESS_DENIED, so a subscriber asking to deny must never be
+     * overruled by another subscriber's "nothing to report".
+     */
+    [[nodiscard]] static SHADOWSTRIKE_SCAN_VERDICT CombineRegistryVerdicts(
+        SHADOWSTRIKE_SCAN_VERDICT a, SHADOWSTRIKE_SCAN_VERDICT b) noexcept;
     
     /**
      * @brief Subscribe to the generic (non-verdict) kernel message feed.
@@ -1053,7 +1124,13 @@ private:
     FileScanCallback m_fileScanHandler;
     ProcessNotifyCallback m_processHandler;
     ImageLoadCallback m_imageLoadHandler;
-    RegistryOpCallback m_registryHandler;
+
+    // Registry subscribers, same copy-on-write snapshot discipline as the
+    // generic feed below: rebuilt on registration (a startup event), copied by
+    // refcount on delivery. Never null once constructed, so the dispatch path
+    // does not have to defend against a null list.
+    std::shared_ptr<const std::vector<RegistrySubscription>> m_registrySubscribers{
+        std::make_shared<const std::vector<RegistrySubscription>>() };
 
     // Generic (non-verdict) subscribers, held as an immutable snapshot behind a
     // shared_ptr so the DISPATCH path copies one refcount instead of N

@@ -1463,10 +1463,92 @@ void IPCManager::RegisterImageLoadHandler(ImageLoadCallback handler) {
     Utils::Logger::Info("[IPCManager] Registered image load handler");
 }
 
-void IPCManager::RegisterRegistryHandler(RegistryOpCallback handler) {
+void IPCManager::RegisterRegistryHandler(std::string subscriber, RegistryOpCallback handler) {
+    // Same refusal as the generic feed, same reason: a subscriber nobody can
+    // name is one nobody can remove or attribute, and that is exactly the
+    // condition under which RegistryProtection's handler was evicted without
+    // a single log line naming either party.
+    if (subscriber.empty()) {
+        Utils::Logger::Error("[IPCManager] Refusing registry subscription with no subscriber name");
+        return;
+    }
+
     std::lock_guard lock(m_handlerMutex);
-    m_registryHandler = std::move(handler);
-    Utils::Logger::Info("[IPCManager] Registered registry handler");
+
+    auto updated = std::make_shared<std::vector<RegistrySubscription>>(*m_registrySubscribers);
+
+    auto existing = std::find_if(updated->begin(), updated->end(),
+        [&subscriber](const RegistrySubscription& s) { return s.name == subscriber; });
+
+    if (existing != updated->end()) {
+        if (handler) {
+            existing->handler = std::move(handler);
+            Utils::Logger::Info("[IPCManager] Registry subscriber '{}' re-registered ({} total)",
+                                subscriber, updated->size());
+        } else {
+            // Legacy RegisterRegistryHandler(nullptr) idiom, still honoured but
+            // now SCOPED TO ITS CALLER. It used to clear the whole slot, so
+            // RegistryProtection's shutdown disabled registry dispatch for
+            // every other module as a side effect.
+            updated->erase(existing);
+            Utils::Logger::Info("[IPCManager] Registry subscriber '{}' removed ({} remain)",
+                                subscriber, updated->size());
+        }
+    } else if (handler) {
+        updated->push_back(RegistrySubscription{ std::move(subscriber), std::move(handler) });
+        Utils::Logger::Info("[IPCManager] Registry subscriber '{}' registered ({} total)",
+                            updated->back().name, updated->size());
+    } else {
+        Utils::Logger::Debug("[IPCManager] Registry unsubscribe for unknown subscriber '{}'",
+                             subscriber);
+        return;
+    }
+
+    m_registrySubscribers = std::move(updated);
+}
+
+void IPCManager::UnregisterRegistryHandler(std::string_view subscriber) {
+    std::lock_guard lock(m_handlerMutex);
+
+    auto updated = std::make_shared<std::vector<RegistrySubscription>>(*m_registrySubscribers);
+    const size_t removed = std::erase_if(*updated,
+        [subscriber](const RegistrySubscription& s) { return s.name == subscriber; });
+
+    if (removed == 0) {
+        return;
+    }
+
+    Utils::Logger::Info("[IPCManager] Registry subscriber '{}' unregistered ({} remain)",
+                        std::string(subscriber), updated->size());
+    m_registrySubscribers = std::move(updated);
+}
+
+size_t IPCManager::RegistrySubscriberCount() const noexcept {
+    try {
+        std::lock_guard lock(m_handlerMutex);
+        return m_registrySubscribers ? m_registrySubscribers->size() : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+SHADOWSTRIKE_SCAN_VERDICT IPCManager::CombineRegistryVerdicts(
+    SHADOWSTRIKE_SCAN_VERDICT a, SHADOWSTRIKE_SCAN_VERDICT b) noexcept {
+    // Explicit severity rank. Do NOT replace with a comparison on the enum
+    // values: the enum is declared in detection-vocabulary order, not severity
+    // order, and Timeout(5)/Error(4) sort above Malicious(2).
+    const auto rank = [](SHADOWSTRIKE_SCAN_VERDICT v) noexcept -> int {
+        switch (v) {
+            case Verdict_Malicious:  return 5;   // only value that denies the operation
+            case Verdict_Suspicious: return 4;
+            case Verdict_Error:      return 3;   // a failed decision outranks a clean one
+            case Verdict_Timeout:    return 2;
+            case Verdict_Unknown:    return 1;
+            case Verdict_Clean:      return 0;
+            default:                 return 1;   // unrecognised is not evidence of cleanliness
+        }
+    };
+    return rank(b) > rank(a) ? b : a;
 }
 
 void IPCManager::RegisterGenericHandler(std::string subscriber, GenericMessageCallback handler) {
@@ -1555,7 +1637,7 @@ void IPCManager::UnregisterHandlers() {
     m_fileScanHandler = nullptr;
     m_processHandler = nullptr;
     m_imageLoadHandler = nullptr;
-    m_registryHandler = nullptr;
+    m_registrySubscribers = std::make_shared<const std::vector<RegistrySubscription>>();
     m_genericSubscribers = std::make_shared<const std::vector<GenericSubscription>>();
     m_messageCallback = nullptr;
     Utils::Logger::Info("[IPCManager] Unregistered all handlers");
@@ -2113,7 +2195,7 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
     FileScanCallback fileScanHandler;
     ProcessNotifyCallback processHandler;
     ImageLoadCallback imageLoadHandler;
-    RegistryOpCallback registryHandler;
+    std::shared_ptr<const std::vector<RegistrySubscription>> registrySubscribers;
     std::shared_ptr<const std::vector<GenericSubscription>> genericSubscribers;
 
     {
@@ -2121,8 +2203,44 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         fileScanHandler  = m_fileScanHandler;
         processHandler   = m_processHandler;
         imageLoadHandler = m_imageLoadHandler;
-        registryHandler  = m_registryHandler;
+        registrySubscribers = m_registrySubscribers; // one refcount, not N copies
         genericSubscribers = m_genericSubscribers;   // one refcount, not N copies
+    }
+
+    // Stand in for the old single registry handler so the dispatch site below
+    // keeps its shape: routing is deliberately unchanged, including the rule
+    // that RegistryNotify reaches the GENERIC feed only when no typed registry
+    // subscriber exists. Left EMPTY when nobody subscribes, because that site
+    // tests this callable for emptiness to decide whether to fall through.
+    //
+    // Verdicts are combined most-severe-wins rather than last-one-wins, so a
+    // subscriber asking to deny cannot be overruled by one reporting Clean.
+    // Each subscriber runs in its own try/catch: one throwing module must not
+    // stop delivery to the modules behind it, and an exception escaping into
+    // the IPC pump stops kernel message servicing process-wide.
+    RegistryOpCallback registryHandler;
+    if (registrySubscribers && !registrySubscribers->empty()) {
+        registryHandler = [&registrySubscribers](const RegistryOpRequest& req)
+                              -> SHADOWSTRIKE_SCAN_VERDICT {
+            SHADOWSTRIKE_SCAN_VERDICT combined = Verdict_Clean;
+            for (const auto& sub : *registrySubscribers) {
+                if (!sub.handler) {
+                    continue;
+                }
+                try {
+                    combined = CombineRegistryVerdicts(combined, sub.handler(req));
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] Registry subscriber '{}' threw: {}",
+                                         sub.name, e.what());
+                    combined = CombineRegistryVerdicts(combined, Verdict_Error);
+                } catch (...) {
+                    Utils::Logger::Error("[IPCManager] Registry subscriber '{}' threw a non-exception",
+                                         sub.name);
+                    combined = CombineRegistryVerdicts(combined, Verdict_Error);
+                }
+            }
+            return combined;
+        };
     }
 
     // Stand in for the old single generic handler so every dispatch site below
@@ -2300,6 +2418,26 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         // REGISTRY NOTIFICATIONS (persistence, defense evasion)
         // =====================================================================
         case FilterMessageType_RegistryNotify: {
+            // THE KERNEL IS NOT WAITING FOR THIS VERDICT, and that is measured,
+            // not assumed. ShadowStrikeSendRegistryNotification (ScanBridge.c:1807)
+            // delivers via ShadowStrikeSendNotification, declared at CommPort.h:365
+            // with NO reply-buffer parameter and documented "no reply expected ...
+            // Uses zero-timeout to avoid blocking". needsReply is therefore
+            // deliberately NOT set here: setting it would ask Filter Manager to
+            // answer a message with no waiter, which is the documented cause of the
+            // STATUS_FLT_NO_WAITER_FOR_REPLY storms recorded at IPCManager.cpp's
+            // reply contract.
+            //
+            // Registry operations ARE denied - RegistryCallback.c:2440 returns
+            // STATUS_ACCESS_DENIED - but only from kernel-side policy
+            // (ShadowStrikeShouldBlockRegistryAccess at :2007, unconditional
+            // self-protection, and ShadowStrikeDetectRansomwareRegistryBehavior at
+            // :2074). Enforcement does not depend on the value computed below.
+            //
+            // The verdict is still combined correctly rather than left arbitrary,
+            // because `verdict` is a real expression this dispatcher stores and
+            // because wiring a waiter later must not require inventing the
+            // combining rule under pressure.
             if (registryHandler) {
                 if (pAppHeader->DataSize < sizeof(RegistryOpRequest)) {
                     Utils::Logger::Error("[IPCManager] Truncated RegistryNotify payload: {} < {}",

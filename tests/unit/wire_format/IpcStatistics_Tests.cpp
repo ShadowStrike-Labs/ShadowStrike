@@ -336,3 +336,184 @@ TEST(GenericSubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
         << "A shutdown path whose name disagrees with its registration path must "
            "not be able to damage the feed.";
 }
+
+// ============================================================================
+// REGISTRY SUBSCRIBER FAN-OUT
+// ============================================================================
+//
+// RegisterRegistryHandler used to assign a single member, and TWO production
+// modules registered against it: RealTimeProtection (from Start()) and
+// RegistryProtection (from Initialize()). AntivirusService runs
+// Impl::Initialize() before Impl::Start() at all three of its call sites, so
+// RegistryProtection registered first and was silently evicted on every single
+// startup, taking its whole kernel-event pipeline with it.
+//
+// SAME HONEST LIMIT AS THE GENERIC SUITE: delivery runs inside DispatchMessage,
+// which needs a loaded driver and a live filter port, so these cases assert
+// MEMBERSHIP. That is where the defect lived - "the last caller wins" is a
+// statement about the subscriber list, not about the dispatch loop.
+
+namespace {
+
+auto NoopRegistrySubscriber() {
+    return [](const ShadowStrike::Communication::RegistryOpRequest&) -> SHADOWSTRIKE_SCAN_VERDICT {
+        return Verdict_Clean;
+    };
+}
+
+}  // namespace
+
+TEST(RegistrySubscriberFanOut, EverySubscriberSurvivesTheNextRegistration) {
+    const size_t baseline = Ipc().RegistrySubscriberCount();
+
+    Ipc().RegisterRegistryHandler("regfanout.test.first", NoopRegistrySubscriber());
+    Ipc().RegisterRegistryHandler("regfanout.test.second", NoopRegistrySubscriber());
+
+    // THE FIELD SYMPTOM, stated as an assertion: two registrations must produce
+    // two subscribers. Before this change the second call overwrote the first
+    // and the count could never exceed one.
+    EXPECT_EQ(baseline + 2, Ipc().RegistrySubscriberCount());
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.first");
+    Ipc().UnregisterRegistryHandler("regfanout.test.second");
+    EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
+}
+
+TEST(RegistrySubscriberFanOut, ReRegisteringOneNameReplacesRatherThanDuplicates) {
+    const size_t baseline = Ipc().RegistrySubscriberCount();
+
+    Ipc().RegisterRegistryHandler("regfanout.test.repeat", NoopRegistrySubscriber());
+    Ipc().RegisterRegistryHandler("regfanout.test.repeat", NoopRegistrySubscriber());
+
+    // A module that re-initializes must not accumulate duplicate deliveries.
+    EXPECT_EQ(baseline + 1, Ipc().RegistrySubscriberCount());
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.repeat");
+    EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
+}
+
+TEST(RegistrySubscriberFanOut, RemovingOneSubscriberLeavesTheOthers) {
+    const size_t baseline = Ipc().RegistrySubscriberCount();
+
+    Ipc().RegisterRegistryHandler("regfanout.test.keep", NoopRegistrySubscriber());
+    Ipc().RegisterRegistryHandler("regfanout.test.drop", NoopRegistrySubscriber());
+    ASSERT_EQ(baseline + 2, Ipc().RegistrySubscriberCount());
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.drop");
+
+    // RegistryProtection's teardown used to call RegisterRegistryHandler(nullptr),
+    // which cleared the SLOT - so self-protection shutting down disabled kernel
+    // registry dispatch for every other module. Self-protection shutdown is
+    // exactly what an attacker triggers first.
+    EXPECT_EQ(baseline + 1, Ipc().RegistrySubscriberCount());
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.keep");
+    EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
+}
+
+TEST(RegistrySubscriberFanOut, ANullHandlerFromAKnownSubscriberRemovesOnlyItself) {
+    const size_t baseline = Ipc().RegistrySubscriberCount();
+
+    Ipc().RegisterRegistryHandler("regfanout.test.legacyA", NoopRegistrySubscriber());
+    Ipc().RegisterRegistryHandler("regfanout.test.legacyB", NoopRegistrySubscriber());
+    ASSERT_EQ(baseline + 2, Ipc().RegistrySubscriberCount());
+
+    // The legacy idiom is still honoured, but scoped to its caller.
+    Ipc().RegisterRegistryHandler("regfanout.test.legacyA", nullptr);
+
+    EXPECT_EQ(baseline + 1, Ipc().RegistrySubscriberCount());
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.legacyB");
+    EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
+}
+
+TEST(RegistrySubscriberFanOut, AnUnnamedSubscriptionIsRefused) {
+    const size_t baseline = Ipc().RegistrySubscriberCount();
+
+    Ipc().RegisterRegistryHandler("", NoopRegistrySubscriber());
+
+    EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
+}
+
+TEST(RegistrySubscriberFanOut, UnregisteringAnUnknownNameIsHarmless) {
+    const size_t baseline = Ipc().RegistrySubscriberCount();
+
+    Ipc().UnregisterRegistryHandler("regfanout.test.neverRegistered");
+
+    EXPECT_EQ(baseline, Ipc().RegistrySubscriberCount());
+}
+
+// ============================================================================
+// REGISTRY VERDICT COMBINATION
+// ============================================================================
+//
+// Fanning out a VERDICT-returning callback needs a combining rule, and the
+// obvious implementation is wrong. These cases pin the rule and, more
+// importantly, pin the reason it cannot be simplified.
+
+TEST(RegistryVerdictCombination, TheEnumsOwnOrderWouldGiveTheWrongAnswer) {
+    // THIS CASE EXISTS TO DOCUMENT THE TRAP, so a future reader who wants to
+    // replace CombineRegistryVerdicts with std::max can see why that fails
+    // before they try it. SHADOWSTRIKE_SCAN_VERDICT is declared in
+    // detection-vocabulary order, NOT severity order.
+    EXPECT_GT(static_cast<int>(Verdict_Timeout), static_cast<int>(Verdict_Malicious));
+    EXPECT_GT(static_cast<int>(Verdict_Error), static_cast<int>(Verdict_Malicious));
+    EXPECT_GT(static_cast<int>(Verdict_Suspicious), static_cast<int>(Verdict_Malicious));
+
+    // So a numeric maximum would rank a transient failure above a conviction.
+    // The combiner must not.
+    EXPECT_EQ(Verdict_Malicious,
+              ShadowStrike::Communication::IPCManager::CombineRegistryVerdicts(
+                  Verdict_Malicious, Verdict_Timeout));
+}
+
+TEST(RegistryVerdictCombination, MaliciousOutranksEveryOtherVerdict) {
+    using Ipc_ = ShadowStrike::Communication::IPCManager;
+
+    // Malicious is the only value the driver turns into STATUS_ACCESS_DENIED, so
+    // a subscriber asking to deny must never be overruled by another subscriber
+    // reporting that it saw nothing.
+    for (const auto other : { Verdict_Unknown, Verdict_Clean, Verdict_Suspicious,
+                              Verdict_Error, Verdict_Timeout }) {
+        EXPECT_EQ(Verdict_Malicious, Ipc_::CombineRegistryVerdicts(Verdict_Malicious, other))
+            << "Malicious lost to verdict " << static_cast<int>(other);
+        EXPECT_EQ(Verdict_Malicious, Ipc_::CombineRegistryVerdicts(other, Verdict_Malicious))
+            << "Malicious lost to verdict " << static_cast<int>(other) << " (reversed)";
+    }
+}
+
+TEST(RegistryVerdictCombination, CombinationIsOrderIndependent) {
+    using Ipc_ = ShadowStrike::Communication::IPCManager;
+
+    // A subscriber list is a set, not a sequence. If the combined verdict
+    // depended on registration order it would reintroduce exactly the property
+    // being removed: an answer decided by who happened to register last.
+    constexpr SHADOWSTRIKE_SCAN_VERDICT all[] = {
+        Verdict_Unknown, Verdict_Clean, Verdict_Malicious,
+        Verdict_Suspicious, Verdict_Error, Verdict_Timeout
+    };
+    for (const auto a : all) {
+        for (const auto b : all) {
+            EXPECT_EQ(Ipc_::CombineRegistryVerdicts(a, b),
+                      Ipc_::CombineRegistryVerdicts(b, a))
+                << "Asymmetric for a=" << static_cast<int>(a)
+                << " b=" << static_cast<int>(b);
+        }
+    }
+}
+
+TEST(RegistryVerdictCombination, CleanIsTheIdentityAndUnknownIsNotDiscarded) {
+    using Ipc_ = ShadowStrike::Communication::IPCManager;
+
+    // Clean is the seed the fan-out starts from, so it must be the identity:
+    // otherwise a single quiet subscriber would set a floor on the result.
+    for (const auto other : { Verdict_Unknown, Verdict_Malicious, Verdict_Suspicious,
+                              Verdict_Error, Verdict_Timeout }) {
+        EXPECT_EQ(other, Ipc_::CombineRegistryVerdicts(Verdict_Clean, other))
+            << "Clean altered verdict " << static_cast<int>(other);
+    }
+
+    // And an undetermined answer must outrank a clean one - "I could not tell"
+    // is not evidence of cleanliness, the same rule the trust path follows.
+    EXPECT_EQ(Verdict_Unknown, Ipc_::CombineRegistryVerdicts(Verdict_Clean, Verdict_Unknown));
+}

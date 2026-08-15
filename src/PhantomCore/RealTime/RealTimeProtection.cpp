@@ -1362,7 +1362,8 @@ public:
                 return MapKernelVerdictToScanVerdict(OnKernelImageLoad(req));
             });
 
-            ipc.RegisterRegistryHandler([this](const Communication::RegistryOpRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+            ipc.RegisterRegistryHandler("RealTimeProtection",
+                                        [this](const Communication::RegistryOpRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
                 return MapKernelVerdictToScanVerdict(OnKernelRegistryOp(req));
             });
 
