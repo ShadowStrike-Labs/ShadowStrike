@@ -102,4 +102,52 @@ TEST(WannaCryDetectorValueContractTests, ConfigStatisticsHelpersAndVersionRemain
     EXPECT_EQ(WannaCryDetector::GetVersionString(), "3.2.0");
 }
 
+TEST(WannaCryDetectorValueContractTests, AnEternalBlueIndicatorClaimsNothingByDefault) {
+    // The DEFAULT is the contract here, and a default cannot be found by grepping for an
+    // assignment - which is precisely how a wrong one survives review. AnalyzeSMBTraffic
+    // receives a std::span<const uint8_t> and holds no transport, so it can never prevent
+    // an exploit; an indicator that arrives claiming otherwise is a false report.
+    EternalBlueIndicator indicator;
+    EXPECT_FALSE(indicator.wasBlocked)
+        << "a default-constructed EternalBlue indicator must not claim the exploit was blocked";
+    EXPECT_FALSE(indicator.blockRequested)
+        << "a default-constructed EternalBlue indicator must not claim policy asked for a block";
+    EXPECT_FALSE(indicator.signatureMatched);
+    EXPECT_EQ(indicator.exploitStage, 0u);
+}
+
+TEST(WannaCryDetectorValueContractTests, TheSmbDetectionCounterSurvivesCopyAndReset) {
+    // WannaCryStatistics hand-writes BOTH copy operators so its atomics load safely, and
+    // GetStatistics() copies. A member added to the declaration alone is therefore dropped
+    // on every copy and reads as a structural zero forever, while the declaration looks
+    // correct to a reader. That is task 102's defect reached by another route.
+    WannaCryStatistics stats;
+    stats.smbExploitsDetected.store(11, std::memory_order_relaxed);
+    stats.smbExploitsBlocked.store(0, std::memory_order_relaxed);
+
+    WannaCryStatistics copied(stats);
+    EXPECT_EQ(copied.smbExploitsDetected.load(std::memory_order_relaxed), 11u)
+        << "the hand-written copy constructor dropped the SMB detection counter";
+
+    WannaCryStatistics assigned;
+    assigned = stats;
+    EXPECT_EQ(assigned.smbExploitsDetected.load(std::memory_order_relaxed), 11u)
+        << "the hand-written assignment operator dropped the SMB detection counter";
+
+    // Detections and preventions must be separately readable, or the gap between "we saw
+    // EternalBlue" and "we stopped it" cannot be recovered from the numbers at all.
+    EXPECT_THAT(stats.ToJson(), HasSubstr("\"smbExploitsDetected\":11"));
+    EXPECT_THAT(stats.ToJson(), HasSubstr("\"smbExploitsBlocked\":0"));
+
+    stats.Reset();
+    EXPECT_EQ(stats.smbExploitsDetected.load(std::memory_order_relaxed), 0u)
+        << "Reset() left the SMB detection counter holding a pre-reset value";
+
+    WannaCryStatisticsSnapshot snapshot;
+    snapshot.smbExploitsDetected = 7;
+    snapshot.smbExploitsBlocked = 0;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"smbExploitsDetected\":7"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"smbExploitsBlocked\":0"));
+}
+
 }  // namespace

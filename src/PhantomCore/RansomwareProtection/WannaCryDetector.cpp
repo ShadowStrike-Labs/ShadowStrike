@@ -886,16 +886,28 @@ bool WannaCryDetector::AnalyzeSMBTraffic(std::span<const uint8_t> packet,
         const auto config = m_impl->GetConfig();
         if (!config.monitorSMB) return false;
         if (m_impl->CheckEternalBlueSignature(packet)) {
-            ++m_impl->m_stats.smbExploitsBlocked;
+            // DETECTION count. This function inspects a std::span<const uint8_t> and holds
+            // no transport, so reaching here proves an exploit attempt was SEEN, not stopped.
+            ++m_impl->m_stats.smbExploitsDetected;
+
             EternalBlueIndicator indicator;
             indicator.sourceIP = std::string(sourceIP);
             indicator.destIP = std::string(destIP);
             indicator.timestamp = std::chrono::system_clock::now();
             indicator.signatureMatched = true;
-            indicator.wasBlocked = config.blockSMBExploit;
+
+            // INTENT ONLY. blockSMBExploit states what policy wants; it cannot make this
+            // function drop a frame it received by const reference. wasBlocked is left false
+            // so nobody is told an EternalBlue attempt was stopped when nothing stopped it.
+            indicator.blockRequested = config.blockSMBExploit;
+
             m_impl->FireEternalBlueCallback(indicator);
-            SS_LOG_FATAL(L"WannaCryDetector", L"EternalBlue exploit detected %hs -> %hs",
-                         std::string(sourceIP).c_str(), std::string(destIP).c_str());
+
+            const wchar_t* outcome = indicator.blockRequested
+                ? L"DETECTED BUT NOT BLOCKED (policy requested a block; nothing in this build drops SMB frames)"
+                : L"DETECTED (policy did not request blocking)";
+            SS_LOG_FATAL(L"WannaCryDetector", L"EternalBlue exploit %ls: %hs -> %hs",
+                         outcome, std::string(sourceIP).c_str(), std::string(destIP).c_str());
             return true;
         }
         return false;
@@ -1494,6 +1506,7 @@ WannaCryStatisticsSnapshot WannaCryDetector::GetStatistics() const {
     snap.totalDetections    = m_impl->m_stats.totalDetections.load(std::memory_order_relaxed);
     for (size_t i = 0; i < snap.byVariant.size() && i < m_impl->m_stats.byVariant.size(); ++i)
         snap.byVariant[i] = m_impl->m_stats.byVariant[i].load(std::memory_order_relaxed);
+    snap.smbExploitsDetected = m_impl->m_stats.smbExploitsDetected.load(std::memory_order_relaxed);
     snap.smbExploitsBlocked = m_impl->m_stats.smbExploitsBlocked.load(std::memory_order_relaxed);
     snap.killSwitchQueries  = m_impl->m_stats.killSwitchQueries.load(std::memory_order_relaxed);
     snap.processesTerminated = m_impl->m_stats.processesTerminated.load(std::memory_order_relaxed);
@@ -1668,6 +1681,7 @@ std::string WannaCryDetectionResult::ToJson() const {
 void WannaCryStatistics::Reset() noexcept {
     totalDetections.store(0);
     for (auto& c : byVariant) c.store(0);
+    smbExploitsDetected.store(0);
     smbExploitsBlocked.store(0);
     killSwitchQueries.store(0);
     processesTerminated.store(0);
@@ -1682,6 +1696,7 @@ std::string WannaCryStatistics::ToJson() const {
     try {
         nlohmann::json j;
         j["totalDetections"] = totalDetections.load();
+        j["smbExploitsDetected"] = smbExploitsDetected.load();
         j["smbExploitsBlocked"] = smbExploitsBlocked.load();
         j["killSwitchQueries"] = killSwitchQueries.load();
         j["processesTerminated"] = processesTerminated.load();
@@ -1699,6 +1714,7 @@ std::string WannaCryStatisticsSnapshot::ToJson() const {
     try {
         nlohmann::json j;
         j["totalDetections"] = totalDetections;
+        j["smbExploitsDetected"] = smbExploitsDetected;
         j["smbExploitsBlocked"] = smbExploitsBlocked;
         j["killSwitchQueries"] = killSwitchQueries;
         j["processesTerminated"] = processesTerminated;
@@ -1835,11 +1851,24 @@ bool WannaCryDetector::RequestKernelProcessBlock(uint32_t processId, const std::
         wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(), _TRUNCATE);
         req.reason[_countof(req.reason) - 1] = L'\0';  // belt-and-suspenders for kernel safety
 
+        // MEASURED LIMITATION, stated here because the log used to overclaim it.
+        // SendToKernel reports whether bytes were TRANSMITTED, not whether the driver
+        // accepted or acted on them, and this request cannot currently be honoured:
+        // KERNEL_MSG_BLOCK_PROCESS is 0x30 (48), which sits outside the real
+        // FilterMessageType range, and the payload above carries no
+        // SHADOWSTRIKE_MESSAGE_HEADER while SendToKernel does not frame one - so the
+        // driver reads its header out of the first bytes of this struct. The request is
+        // therefore best-effort only. It is KEPT rather than removed because it is the
+        // seam a real kernel block plugs into; correcting the wire contract is tracked
+        // separately. Enforcement that actually happens is the TerminateProcess call at
+        // the caller, which is why this return value is not what any block is claimed on.
         bool result = IPCManager::Instance().SendToKernel(&req, sizeof(req));
         if (result)
-            SS_LOG_INFO(L"WannaCryDetector", L"Kernel block requested for PID=%u", processId);
+            SS_LOG_INFO(L"WannaCryDetector",
+                        L"Kernel block request transmitted for PID=%u (delivery unconfirmed; "
+                        L"the kernel cannot parse this frame yet)", processId);
         else
-            SS_LOG_WARN(L"WannaCryDetector", L"Kernel block request failed for PID=%u", processId);
+            SS_LOG_WARN(L"WannaCryDetector", L"Kernel block request could not be sent for PID=%u", processId);
         return result;
     } catch (const std::exception& ex) {
         SS_LOG_ERROR(L"WannaCryDetector", L"RequestKernelProcessBlock error: %hs", ex.what());

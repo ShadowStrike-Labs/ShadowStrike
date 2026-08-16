@@ -97,6 +97,14 @@ BAD_USB_DETECTOR_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.hpp"
 )
 
+# The EternalBlue/SMB inspector, whose block claim was corrected in the same sweep.
+WANNACRY_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/RansomwareProtection/WannaCryDetector.cpp"
+)
+WANNACRY_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/RansomwareProtection/WannaCryDetector.hpp"
+)
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -629,6 +637,87 @@ class SourceContractTests(unittest.TestCase):
             offenders.append(
                 f"blockRequestedNotPerformed appears {gap_hpp} time(s) in the .hpp, "
                 "expected at least 2 (live struct, snapshot struct)"
+            )
+
+        self.assertEqual(offenders, [], "; ".join(offenders))
+
+    def test_the_smb_inspector_never_claims_a_block_it_cannot_perform(self) -> None:
+        """WannaCryDetector::AnalyzeSMBTraffic is a pure inspector.
+
+        It receives a std::span<const uint8_t> and holds no transport, so it can
+        neither alter nor drop the frame it is shown. It used to set
+        indicator.wasBlocked from config.blockSMBExploit - a policy flag - which
+        reported every EternalBlue sighting as a prevented attack.
+
+        This has to be a SOURCE contract rather than a behavioural one: the
+        function has ZERO production callers, so no test can reach the claim site
+        by running it. The residual claim count is the only enforceable invariant,
+        the same technique the exploit tier needed.
+
+        Comments are stripped FIRST and that is load-bearing: the explanatory
+        comments added with the fix necessarily quote the defect they describe, so
+        a comment-blind count is guaranteed to false-positive.
+        """
+        cpp = strip_c_comments(read_source(WANNACRY_DETECTOR_CPP_PATH))
+        hpp = strip_c_comments(read_source(WANNACRY_DETECTOR_HPP_PATH))
+        offenders: list[str] = []
+
+        # A policy flag can never be evidence that an exploit was stopped.
+        flag_derived = re.findall(r"wasBlocked\s*=\s*config\.", cpp)
+        if flag_derived:
+            offenders.append(
+                f"WannaCryDetector.cpp derives wasBlocked from a config flag "
+                f"{len(flag_derived)} time(s); a policy flag is intent, not an outcome"
+            )
+
+        # Nothing in this module prevents an SMB exploit, so nothing may claim one.
+        for label, src in (("cpp", cpp), ("hpp", hpp)):
+            claims = re.findall(r"wasBlocked\s*=\s*true", src)
+            if claims:
+                offenders.append(
+                    f"WannaCryDetector.{label} claims wasBlocked = true "
+                    f"{len(claims)} time(s); no code path here drops an SMB frame"
+                )
+
+        # The DEFAULT is the contract, and it is invisible to any grep for an
+        # assignment - which is exactly how ShadowCopyProtector's true default hid.
+        if not re.search(r"bool\s+wasBlocked\s*=\s*false\s*;", hpp):
+            offenders.append(
+                "EternalBlueIndicator::wasBlocked must default to false in the header"
+            )
+
+        # Deleting the intent record must fail as loudly as reintroducing the claim,
+        # or the fix degrades into simply losing what policy asked for.
+        if not re.search(r"blockRequested", cpp):
+            offenders.append("the blockRequested intent record was removed from the .cpp")
+        if not re.search(r"bool\s+blockRequested\s*=\s*false\s*;", hpp):
+            offenders.append(
+                "EternalBlueIndicator::blockRequested must be declared and default to false"
+            )
+
+        # WannaCryStatistics hand-writes BOTH copy operators, so a counter present
+        # in the declaration alone is dropped on every copy and becomes a structural
+        # zero. Require declaration + both copy operators + snapshot struct.
+        detected_hpp = len(re.findall(r"smbExploitsDetected", hpp))
+        if detected_hpp < 6:
+            offenders.append(
+                f"smbExploitsDetected appears {detected_hpp} time(s) in the .hpp, expected "
+                "at least 6 (declaration, both hand-written copy operators, snapshot struct)"
+            )
+        detected_cpp = len(re.findall(r"smbExploitsDetected", cpp))
+        if detected_cpp < 6:
+            offenders.append(
+                f"smbExploitsDetected appears {detected_cpp} time(s) in the .cpp, expected "
+                "at least 6 (increment, snapshot fill, Reset, both JSON serializers)"
+            )
+
+        # The prevention counter is deliberately kept with no producer so its zero
+        # reads as accurate. Removing it would delete the place a real packet-dropping
+        # path must report to.
+        if not re.search(r"smbExploitsBlocked", hpp):
+            offenders.append(
+                "smbExploitsBlocked must remain declared as the counter a real "
+                "SMB-blocking path reports to"
             )
 
         self.assertEqual(offenders, [], "; ".join(offenders))

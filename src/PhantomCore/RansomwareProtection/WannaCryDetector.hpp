@@ -171,6 +171,18 @@ struct EternalBlueIndicator {
     SystemTimePoint timestamp;
     bool signatureMatched = false;
     uint8_t exploitStage = 0;
+
+    /// @brief INTENT: policy asked for this exploit to be blocked (blockSMBExploit).
+    /// Records what was requested, never what happened.
+    bool blockRequested = false;
+
+    /// @brief OUTCOME: the exploit attempt was actually prevented from reaching the target.
+    ///
+    /// DEFAULT FALSE IS THE CONTRACT. AnalyzeSMBTraffic is a pure inspector: it receives
+    /// a std::span<const uint8_t>, so it cannot alter or drop the packet, and it holds no
+    /// transport that could reset the connection. It therefore must never set this true.
+    /// A caller that genuinely drops the frame (a WFP callout acting on the [[nodiscard]]
+    /// return value) is the only thing entitled to set it, and no such caller exists yet.
     bool wasBlocked = false;
 };
 
@@ -226,6 +238,17 @@ struct WannaCryDetectorConfiguration {
 struct WannaCryStatistics {
     std::atomic<uint64_t> totalDetections{0};
     std::array<std::atomic<uint64_t>, 8> byVariant{};
+    /// @brief EternalBlue signature matches observed. This is a DETECTION count.
+    std::atomic<uint64_t> smbExploitsDetected{0};
+
+    /// @brief EternalBlue attempts genuinely prevented from reaching the target.
+    ///
+    /// HAS NO PRODUCER TODAY, DELIBERATELY. Nothing in this build drops an SMB frame,
+    /// so this reads 0 and that zero is accurate rather than misleading. It is kept
+    /// because it is the correct counter for a real packet-dropping path; deleting it
+    /// would remove the place that path must report to. Read it against
+    /// smbExploitsDetected: the difference IS the unclosed enforcement gap, which is
+    /// why no separate "requested but not performed" counter is needed here.
     std::atomic<uint64_t> smbExploitsBlocked{0};
     std::atomic<uint64_t> killSwitchQueries{0};
     std::atomic<uint64_t> processesTerminated{0};
@@ -241,6 +264,7 @@ struct WannaCryStatistics {
         totalDetections.store(o.totalDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
         for (size_t i = 0; i < byVariant.size(); ++i)
             byVariant[i].store(o.byVariant[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        smbExploitsDetected.store(o.smbExploitsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
         smbExploitsBlocked.store(o.smbExploitsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
         killSwitchQueries.store(o.killSwitchQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
         processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -255,6 +279,7 @@ struct WannaCryStatistics {
             totalDetections.store(o.totalDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
             for (size_t i = 0; i < byVariant.size(); ++i)
                 byVariant[i].store(o.byVariant[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            smbExploitsDetected.store(o.smbExploitsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
             smbExploitsBlocked.store(o.smbExploitsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
             killSwitchQueries.store(o.killSwitchQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
             processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -275,6 +300,7 @@ struct WannaCryStatistics {
 struct WannaCryStatisticsSnapshot {
     uint64_t totalDetections{0};
     std::array<uint64_t, 8> byVariant{};
+    uint64_t smbExploitsDetected{0};
     uint64_t smbExploitsBlocked{0};
     uint64_t killSwitchQueries{0};
     uint64_t processesTerminated{0};
