@@ -105,6 +105,11 @@ WANNACRY_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/RansomwareProtection/WannaCryDetector.hpp"
 )
 
+# The test binary's entry point. It owns the temporary-file sandbox, and that
+# ownership is asserted here because the runtime guard inside it can be deleted
+# together with the thing it guards.
+TEST_MAIN_PATH = ROOT / "tests/test_main.cpp"
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -721,6 +726,172 @@ class SourceContractTests(unittest.TestCase):
             )
 
         self.assertEqual(offenders, [], "; ".join(offenders))
+
+    def test_the_test_binary_owns_and_reclaims_its_temporary_files(self) -> None:
+        """One clean run left 14,142 MB of temporary files that nothing deleted.
+
+        MEASURED before the sandbox existed: a single fully passing run of
+        phantom-tests.exe (5,016 tests from 518 suites, exit 0, zero skips) left
+        136 files and 14,142 MB in the system temporary directory. 133 of them
+        were ThreatIntel databases - 131 at 100 MB, one at 1 GB, one at 10 MB -
+        and they are not sparse, logical and allocated size both measured at
+        104,857,600 bytes. Ten runs is 138 GB of disk nobody reclaims.
+
+        THIS IS A SOURCE CONTRACT BECAUSE NO BEHAVIOURAL TEST CAN COVER IT. What
+        is being protected is main()'s ORDERING and its CHOICE OF REMOVAL CALL. A
+        test asserting either would have to run inside the process whose exit
+        path is the subject, and by the time disposal happens googletest has
+        already finished reporting. The binary does carry a runtime guard
+        (SandboxEnvironment), and that guard is stronger for what it covers - but
+        it can be deleted in the same edit that deletes the sandbox, which is
+        exactly the failure this external witness exists to catch.
+        """
+        src = strip_c_comments(read_source(TEST_MAIN_PATH))
+
+        # ------------------------------------------------------------------
+        # The redirect is what makes the sandbox cover PRODUCT code and not
+        # merely the test files. GetTempPathW reads the process environment
+        # block, so redirecting TMP/TEMP for this process relocates
+        # StoreConfig::CreateDefault() - the actual producer of those 133
+        # databases, which tests/test_main.cpp has no other way to reach.
+        # ------------------------------------------------------------------
+        for variable in ('L"TMP"', 'L"TEMP"'):
+            self.assertEqual(
+                src.count("SetEnvironmentVariableW(" + variable),
+                1,
+                "tests/test_main.cpp must redirect {} exactly once through "
+                "SetEnvironmentVariableW. That call is the entire mechanism: "
+                "without it every temporary file the run creates lands in the "
+                "real temporary directory and nothing reclaims it.".format(variable),
+            )
+
+        # ------------------------------------------------------------------
+        # Ordering. Establishing the sandbox after something has already run
+        # leaves whatever ran first writing outside it, and disposing before the
+        # tests finish deletes the working set out from under them.
+        # ------------------------------------------------------------------
+        offsets = {
+            "sandbox.Establish()": src.find("sandbox.Establish()"),
+            "RUN_ALL_TESTS()": src.find("RUN_ALL_TESTS()"),
+            "sandbox.Dispose()": src.find("sandbox.Dispose()"),
+        }
+        for name, offset in offsets.items():
+            self.assertNotEqual(
+                offset,
+                -1,
+                "tests/test_main.cpp no longer contains {} - the temporary file "
+                "sandbox has been removed or renamed.".format(name),
+            )
+        self.assertLess(
+            offsets["sandbox.Establish()"],
+            offsets["RUN_ALL_TESTS()"],
+            "The sandbox must be established BEFORE RUN_ALL_TESTS, at offset {} "
+            "rather than {}. Anything that runs first writes outside it.".format(
+                offsets["sandbox.Establish()"], offsets["RUN_ALL_TESTS()"]
+            ),
+        )
+        self.assertLess(
+            offsets["RUN_ALL_TESTS()"],
+            offsets["sandbox.Dispose()"],
+            "Disposal must happen AFTER RUN_ALL_TESTS, at offset {} rather than "
+            "{}.".format(offsets["sandbox.Dispose()"], offsets["RUN_ALL_TESTS()"]),
+        )
+
+        # ------------------------------------------------------------------
+        # remove_all is banned BY NAME, and this is the assertion that carries
+        # the measurement. It treats the whole tree as one operation and stops at
+        # its first error, so any entry it cannot delete protects everything it
+        # has not yet visited. Measured: a 654-byte forensic buffer that the
+        # product deliberately hardens to SYSTEM + BUILTIN\\Administrators - which
+        # is CORRECT tamper-resistance, not a defect - aborted the removal of
+        # 14,135 MB, because NTFS enumerated ShadowStrike_CoreSystem_UT_* before
+        # ShadowStrike_ThreatIntel_*.
+        # ------------------------------------------------------------------
+        self.assertEqual(
+            src.count("remove_all"),
+            0,
+            "tests/test_main.cpp must not use std::filesystem::remove_all. It "
+            "aborts at its first error, so one undeletable entry preserves the "
+            "rest of the tree - measured at 654 bytes protecting 14,135 MB. "
+            "Delete per entry and continue past failures instead.",
+        )
+        self.assertGreaterEqual(
+            src.count("RemoveTreeRobustly("),
+            2,
+            "Both the disposal path and the startup orphan sweep must go through "
+            "the per-entry removal helper, so neither can be defeated by a single "
+            "file it cannot delete.",
+        )
+
+        # ------------------------------------------------------------------
+        # The startup sweep is the half that survives a crash. Disposing at exit
+        # alone still leaks on every run that faults or is killed - and the
+        # bounded runner used against this binary calls Kill() on timeout, so
+        # that is a routine case, not an exotic one.
+        # ------------------------------------------------------------------
+        self.assertEqual(
+            src.count("SweepOrphans()"),
+            2,
+            "SweepOrphans must be defined and called exactly once each. Without "
+            "the startup sweep, every crashed or killed run leaks its whole "
+            "working set permanently, because no exit-time code runs at all.",
+        )
+
+        # ------------------------------------------------------------------
+        # The runtime guard must actually verify the redirect took effect rather
+        # than assume it. Same reasoning as LoggerEnvironment in the same file: a
+        # guard that silently stops guarding is worse than no guard.
+        # ------------------------------------------------------------------
+        env_at = src.find("class SandboxEnvironment")
+        self.assertNotEqual(
+            env_at, -1, "The SandboxEnvironment runtime guard has been removed."
+        )
+        env_body = src[env_at : env_at + 2400]
+        # Counted with >= rather than == deliberately: the failure messages inside
+        # this guard necessarily NAME temp_directory_path, and strip_c_comments
+        # removes comments but not string literals, so an equality assertion here
+        # would be measuring prose. What matters is that a real call exists and
+        # that its result is compared against the sandbox.
+        self.assertGreaterEqual(
+            env_body.count("temp_directory_path"),
+            1,
+            "SandboxEnvironment must resolve temp_directory_path() so a redirect "
+            "that stops working fails the whole binary loudly instead of quietly "
+            "resuming 14 GB per run.",
+        )
+        self.assertGreaterEqual(
+            env_body.count("sandbox.Run()"),
+            1,
+            "SandboxEnvironment must compare the resolved temporary directory "
+            "against the sandbox it established. Resolving it and not comparing "
+            "it would assert nothing.",
+        )
+        self.assertGreaterEqual(
+            env_body.count("ASSERT_"),
+            3,
+            "SandboxEnvironment must assert its own preconditions, not merely "
+            "compute them.",
+        )
+        self.assertEqual(
+            src.count("new SandboxEnvironment()"),
+            1,
+            "SandboxEnvironment must be registered with googletest, or its "
+            "assertions never run.",
+        )
+
+        # ------------------------------------------------------------------
+        # The log deliberately lives OUTSIDE the sandbox, in the location
+        # captured before the redirect: a diagnostic deleted along with the run
+        # it describes cannot be used to investigate that run. It is bounded
+        # separately by rotation (30 MB ceiling, measured at 15.22 MB across a
+        # full run), so it is not part of the growth this sandbox addresses.
+        # ------------------------------------------------------------------
+        self.assertEqual(
+            src.count("sandbox.SystemTemp()"),
+            1,
+            "The logger must be given the real temporary directory captured "
+            "before the redirect, so its output survives sandbox disposal.",
+        )
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
