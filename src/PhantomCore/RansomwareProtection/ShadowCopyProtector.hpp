@@ -619,11 +619,33 @@ public:
     // ========================================================================
 
     /**
-     * @brief Receive kernel process creation/termination notification
+     * @brief Receive kernel process creation notification.
      *
-     * Delegates to OnProcessCreation for create events, clears state on exit.
+     * THIS IS THE MODULE'S ONLY PRODUCTION FEED. Every pre-execution
+     * capability here - VSS attack-type classification, the whitelist, the
+     * decision callback, the attack-event history, the T1490 alert and the
+     * telemetry record - is reachable only through this entry point, so
+     * without a caller the whole command-line side of this module is inert.
+     * It is dispatched from Ransomware::Wiring::DispatchProcessNotify.
+     *
+     * Delegates to OnProcessCreation for create events. Termination events
+     * are ignored: this module keeps no per-process state to release (its
+     * only history is m_recentAttacks, which is an audit trail and must
+     * outlive the process it describes). An earlier version of this comment
+     * claimed it "clears state on exit", which was never true.
+     *
+     * @param processId       PID of the newly created process.
+     * @param parentProcessId PID of the creator, forwarded so the telemetry
+     *                        record carries a real value. It used to be
+     *                        hardcoded to 0 here, which published a
+     *                        fabricated parent for every event.
+     * @param imagePath       Full image path of the new process.
+     * @param commandLine     Full command line, which is what carries the
+     *                        VSS destruction intent.
+     * @param isCreate        False for termination; ignored.
      */
-    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+    void OnKernelProcessNotify(uint32_t processId, uint32_t parentProcessId,
+                               std::wstring_view imagePath,
                                std::wstring_view commandLine, bool isCreate);
 
     /**

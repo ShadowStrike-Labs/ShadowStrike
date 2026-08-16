@@ -105,6 +105,23 @@ WANNACRY_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/RansomwareProtection/WannaCryDetector.hpp"
 )
 
+# The VSS destruction analyzer and the ransomware subsystem's kernel event
+# aggregator. ShadowCopyProtector::OnKernelProcessNotify had ZERO callers while
+# the subsystem called its Initialize and Shutdown, so the module reported
+# itself online with no feed and its entire pre-execution analysis - attack-type
+# classification, whitelist, decision callback, event history, T1490 telemetry
+# and the Critical alert - had never executed. The dispatch is asserted here
+# because nothing in a build or a unit test can notice a missing fan-out entry.
+SHADOW_COPY_PROTECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/RansomwareProtection/ShadowCopyProtector.cpp"
+)
+SHADOW_COPY_PROTECTOR_WIRE_PATH = (
+    ROOT / "src/PhantomCore/RansomwareProtection/ShadowCopyProtectorWire.cpp"
+)
+RANSOMWARE_WIRING_CPP_PATH = (
+    ROOT / "src/PhantomCore/RansomwareProtection/RansomwareWiring.cpp"
+)
+
 # The test binary's entry point. It owns the temporary-file sandbox, and that
 # ownership is asserted here because the runtime guard inside it can be deleted
 # together with the thing it guards.
@@ -204,6 +221,22 @@ def extract_c_function(source: str, name: str) -> str:
         open_paren = source.find("(", match.start())
         close_paren = _matching_delimiter(source, open_paren, "(", ")")
         cursor = close_paren + 1
+
+        # Skip whitespace, routine-header comments, and any trailing specifier
+        # sitting between the parameter list and the body.
+        #
+        # `noexcept` was a real gap, not a nicety: every function in the
+        # ransomware wiring aggregator carries it, and this helper answered
+        # "Function definition not found" for definitions that were plainly
+        # present. That is the worse of the two possible failures, because the
+        # message reads as an ABSENT function - exactly the conclusion these
+        # coverage-gap tests exist to draw - when the truth was an unparsed one.
+        #
+        # Consuming these cannot promote a declaration or a call into a
+        # definition: once the specifiers are eaten a declaration still lands on
+        # ';' and a call still lands on ')' or ',', and only '{' is accepted
+        # below. `&&` is tried before `&` so a reference qualifier is not split.
+        trailing_specifiers = ("noexcept", "const", "override", "final", "&&", "&")
         while True:
             while cursor < len(source) and source[cursor].isspace():
                 cursor += 1
@@ -218,6 +251,29 @@ def extract_c_function(source: str, name: str) -> str:
                         f"Unterminated comment after {name} signature"
                     )
                 cursor = comment_end + 2
+                continue
+
+            consumed = False
+            for specifier in trailing_specifiers:
+                if not source.startswith(specifier, cursor):
+                    continue
+                after = cursor + len(specifier)
+                # Whole words only, so an identifier such as `constant` cannot
+                # be mistaken for the `const` specifier.
+                if specifier[0].isalpha() and after < len(source) and (
+                    source[after].isalnum() or source[after] == "_"
+                ):
+                    continue
+                cursor = after
+                if specifier == "noexcept":
+                    probe = cursor
+                    while probe < len(source) and source[probe].isspace():
+                        probe += 1
+                    if probe < len(source) and source[probe] == "(":
+                        cursor = _matching_delimiter(source, probe, "(", ")") + 1
+                consumed = True
+                break
+            if consumed:
                 continue
             break
 
@@ -1220,6 +1276,112 @@ class SourceContractTests(unittest.TestCase):
             1,
             "RegistryProtection's single claim lives in FireBlockedOperationEvent, "
             "reached only from the FilterOperation gate.",
+        )
+
+    def test_the_vss_destruction_analyzer_has_a_production_feed(self) -> None:
+        """ShadowCopyProtector's process-creation analyzer must be dispatched.
+
+        Everything this module can do before a VSS destruction command runs -
+        classify the attack by type, consult the whitelist and the decision
+        callback, record the event, move the per-type counters, attribute
+        MITRE T1490, raise the Critical alert - is reachable only through
+        OnKernelProcessNotify. That function had ZERO callers while the
+        subsystem happily called Initialize and Shutdown, so the module
+        reported itself online and was inert.
+
+        The overlap with BackupProtector is exactly why this is pinned rather
+        than assumed harmless to lose: BackupProtector IS wired and matches the
+        same vssadmin / wmic / PowerShell commands, but its handler writes one
+        warning line and stops, so with this feed absent a T1490 attempt was
+        visible nowhere an operator or the alert pipeline could see it.
+
+        Comments are stripped first because the explanatory comments added with
+        this wiring necessarily NAME the symbols asserted below, so a
+        comment-blind check would be satisfied by prose alone.
+        """
+        wire = strip_c_comments(read_source(SHADOW_COPY_PROTECTOR_WIRE_PATH))
+        wiring = strip_c_comments(read_source(RANSOMWARE_WIRING_CPP_PATH))
+        protector = strip_c_comments(read_source(SHADOW_COPY_PROTECTOR_CPP_PATH))
+
+        # 1. The shim exists and actually reaches the module.
+        self.assertEqual(
+            wire.count("void ShadowCopyProtector_OnProcessNotify("),
+            1,
+            "ShadowCopyProtectorWire.cpp must define the process-notify shim; "
+            "a lifecycle-only shim is what left this module without a feed.",
+        )
+        self.assertEqual(
+            wire.count("ShadowCopyProtector::Instance().OnKernelProcessNotify("),
+            1,
+            "the shim must forward to the module, not merely exist.",
+        )
+        self.assertEqual(
+            wire.count("if (!isCreation) return;"),
+            1,
+            "termination events must be dropped: the analysis is a "
+            "pre-execution command-line check and the module keeps no "
+            "per-process state to release.",
+        )
+
+        # 2. The aggregator declares it and calls it from the fan-out.
+        self.assertEqual(
+            wiring.count("void ShadowCopyProtector_OnProcessNotify("),
+            1,
+            "RansomwareWiring.cpp must forward-declare the shim.",
+        )
+
+        dispatch = extract_c_function(wiring, "DispatchProcessNotify")
+        self.assertGreater(
+            len(dispatch),
+            200,
+            "DispatchProcessNotify was not sliced, so nothing below is asserted.",
+        )
+        self.assertEqual(
+            dispatch.count(
+                "ShadowCopyProtector_OnProcessNotify(pid, parentPid, imagePath, "
+                "commandLine, isCreation)"
+            ),
+            1,
+            "the fan-out must call the VSS analyzer with the real parent pid "
+            "and the command line, which is what carries the attack intent.",
+        )
+
+        # 3. Regression guard: adding one module must not drop another. Each of
+        #    these was in the fan-out before this feed was added.
+        for sibling in (
+            "RansomwareDetector_OnProcessNotify(",
+            "LockyDetector_OnProcessNotify(",
+            "HoneypotManager_OnProcessNotify(",
+            "BackupProtector_OnProcessNotify(",
+            "FileBackupManager_OnProcessNotify(",
+            "WannaCryDetector_OnProcessCreated(",
+        ):
+            self.assertEqual(
+                dispatch.count(sibling),
+                1,
+                "process-notify fan-out lost a module: " + sibling,
+            )
+
+        # 4. The parent pid is forwarded, not fabricated. It was hardcoded to 0
+        #    here, so the telemetry record published a parent that was never
+        #    measured - a defaulted value that reads like a fact.
+        hook = extract_c_function(
+            protector, "ShadowCopyProtector::OnKernelProcessNotify"
+        )
+        self.assertGreater(
+            len(hook),
+            80,
+            "OnKernelProcessNotify was not sliced, so nothing below is asserted.",
+        )
+        self.assertEqual(
+            hook.count("OnProcessCreation(processId, parentProcessId,"),
+            1,
+            "the kernel hook must forward the creator pid it was given.",
+        )
+        self.assertEqual(
+            hook.count("OnProcessCreation(processId, 0,"),
+            0,
+            "the parent pid must not be hardcoded to 0 again.",
         )
 
     def test_precreate_captures_callback_requestor_once(self) -> None:

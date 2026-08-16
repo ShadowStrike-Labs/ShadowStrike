@@ -100,6 +100,12 @@ void BackupProtector_OnProcessNotify(std::uint32_t pid,
                                      const std::wstring& commandLine,
                                      bool isCreation) noexcept;
 
+void ShadowCopyProtector_OnProcessNotify(std::uint32_t pid,
+                                         std::uint32_t parentPid,
+                                         const std::wstring& imagePath,
+                                         const std::wstring& commandLine,
+                                         bool isCreation) noexcept;
+
 void FileBackupManager_OnProcessNotify(std::uint32_t pid,
                                        std::uint32_t parentPid,
                                        const std::wstring& imagePath,
@@ -233,6 +239,15 @@ void DispatchProcessNotify(std::uint32_t pid,
     // BackupProtector intercepts destructive backup-removal commands
     // (vssadmin delete shadows, wbadmin delete, etc.) at process creation.
     BackupProtector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
+
+    // ShadowCopyProtector is the module that classifies a VSS destruction
+    // attempt by type, records it, attributes it to MITRE T1490 and raises the
+    // Critical alert. It was absent from this fan-out while its Init and
+    // Shutdown were both called, so it reported itself as an online module
+    // with no feed - and BackupProtector, which matches overlapping commands,
+    // only writes a warning line on a hit. Without this call a T1490 attempt
+    // was visible nowhere but that one log line.
+    ShadowCopyProtector_OnProcessNotify(pid, parentPid, imagePath, commandLine, isCreation);
 
     // FileBackupManager commits any pending JIT backups when the source
     // process exits — must run on both creation and termination events so

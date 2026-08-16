@@ -2220,13 +2220,33 @@ void ShadowCopyStatistics::Reset() noexcept {
 // KERNEL BRIDGE
 // ============================================================================
 
-void ShadowCopyProtector::OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+void ShadowCopyProtector::OnKernelProcessNotify(uint32_t processId, uint32_t parentProcessId,
+                                                  std::wstring_view imagePath,
                                                   std::wstring_view commandLine, bool isCreate) {
     try {
         if (!isCreate || !IsInitialized()) return;
-        // Delegate to OnProcessCreation — the verdict is consumed by the kernel driver
-        // via the IPC return path, not here. This is for telemetry/logging only.
-        (void)OnProcessCreation(processId, 0, imagePath, commandLine);
+
+        // The verdict is DISCARDED HERE, and that is a known gap rather than a
+        // handoff. The comment this replaces said "the verdict is consumed by
+        // the kernel driver via the IPC return path, not here", which was
+        // false in three ways: this function returns void, the dispatcher that
+        // calls it (Ransomware::Wiring::DispatchProcessNotify) is void, and
+        // RealTimeProtection::OnKernelProcessNotify returns Allow on the
+        // statement immediately after that dispatch. No path carries a
+        // ransomware-module verdict to PhantomSensor.
+        //
+        // What running this DOES deliver, and what was missing entirely while
+        // this function had no caller: the attack is classified by VSSAttackType,
+        // recorded in the event history, counted, attributed to MITRE T1490,
+        // and raised to AlertSystem and TelemetryCollector. OnProcessCreation
+        // already states "DETECTED BUT NOT BLOCKED" in the event detail and
+        // charges the gap to blockRequestedNotPerformed, so nothing here
+        // claims an outcome it did not produce.
+        //
+        // Closing the enforcement half needs a real kernel transport;
+        // RequestKernelProcessBlock below is NOT it (bare struct, invented
+        // messageType 0x30, no message header).
+        (void)OnProcessCreation(processId, parentProcessId, imagePath, commandLine);
     } catch (const std::exception& e) {
         Utils::Logger::Error("ShadowCopyProtector: OnKernelProcessNotify error: {}", e.what());
     }
