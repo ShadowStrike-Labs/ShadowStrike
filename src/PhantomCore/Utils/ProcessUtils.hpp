@@ -391,7 +391,34 @@ namespace ShadowStrike {
             bool GetProcessMemoryInfo(ProcessId pid, ProcessMemoryInfo& info, Error* err = nullptr) noexcept;
             bool GetProcessCpuInfo(ProcessId pid, ProcessCpuInfo& info, Error* err = nullptr) noexcept;
             bool GetProcessIOCounters(ProcessId pid, ProcessIOCounters& info, Error* err = nullptr) noexcept;
-            bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& info, Error* err = nullptr) noexcept;
+            /**
+             * @brief Scope of a process security query.
+             *
+             * Every fact in ProcessSecurityInfo is derived locally from the
+             * process token EXCEPT userName. Turning a SID into "DOMAIN\\User"
+             * requires LookupAccountSidW, which is an RPC into LSASS and, for a
+             * domain SID, a NETWORK round trip to a domain controller that
+             * blocks until the RPC timeout when that controller is unreachable.
+             *
+             * A thread that owes the kernel an answer must therefore pass
+             * LocalOnly. The minifilter holds the originating file operation
+             * open while user mode decides, so a domain round trip on such a
+             * thread stalls every file operation on the machine - the same
+             * mechanism behind the multi-minute wedges removed by the
+             * no-cross-process-call-on-a-kernel-path rule.
+             */
+            enum class SecurityInfoScope {
+                LocalOnly = 0,  ///< Local token facts only. userName is left EMPTY.
+                Full            ///< Also resolve userName. MAY CONTACT A DOMAIN CONTROLLER.
+            };
+
+            /**
+             * @param scope Defaults to Full so that every pre-existing caller
+             *        keeps its exact behaviour. Pass LocalOnly from any path
+             *        that must not block on a name resolution.
+             */
+            bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& info, Error* err = nullptr,
+                                        SecurityInfoScope scope = SecurityInfoScope::Full) noexcept;
             bool GetProcessInfo(ProcessId pid, ProcessInfo& info, Error* err = nullptr) noexcept;
 
             // Process Path & Identity

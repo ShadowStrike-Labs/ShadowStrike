@@ -643,3 +643,93 @@ TEST_F(ProcessUtilsTest, Stress_ModuleEnumeration) {
         EXPECT_FALSE(modules.empty());
     }
 }
+
+// ============================================================================
+// SECURITY QUERY SCOPE
+//
+// LookupAccountSidW is the only call in GetProcessSecurityInfo that can leave
+// this machine: it turns a SID into "DOMAIN\User", and for a domain SID that is
+// a network round trip to a domain controller which blocks until the RPC
+// timeout when the controller is unreachable. The kernel registry feed used to
+// call it once per registry operation, on the thread that answers the kernel's
+// scan requests while the minifilter holds a file operation open.
+//
+// These cases pin the SCOPE CONTRACT, deliberately not timing. A timing
+// assertion would pass on any machine with a warm cache and no domain - which
+// is exactly this build host - so it could never discriminate. What does
+// discriminate is WHICH FIELDS each scope is allowed to produce.
+// ============================================================================
+TEST_F(ProcessUtilsTest, LocalOnlyScopeResolvesTheSidButNotTheAccountName) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[LocalOnlyScopeResolvesTheSidButNotTheAccountName] Testing...");
+    ProcessSecurityInfo sec;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, nullptr,
+                                       SecurityInfoScope::LocalOnly));
+
+    // userSid comes from ConvertSidToStringSidW, which is local formatting and
+    // runs before any lookup, so LocalOnly must still produce it. A scope that
+    // returned nothing usable would be a coverage loss, not an optimisation.
+    EXPECT_FALSE(sec.userSid.empty());
+    EXPECT_TRUE(sec.userSid.starts_with(L"S-1-")) << "not a SID string";
+
+    // THE DISCRIMINATOR. If the Full-scope gate around LookupAccountSidW is
+    // removed or inverted, the account lookup runs here and this fails.
+    EXPECT_TRUE(sec.userName.empty())
+        << "LocalOnly resolved an account name, so the call that may contact a "
+           "domain controller is no longer gated";
+}
+
+TEST_F(ProcessUtilsTest, FullScopeStillResolvesTheAccountName) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[FullScopeStillResolvesTheAccountName] Testing...");
+    ProcessSecurityInfo sec;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, nullptr,
+                                       SecurityInfoScope::Full));
+    EXPECT_FALSE(sec.userSid.empty());
+
+    // REGRESSION GUARD: scoping the query must not have removed the capability.
+    // A caller that genuinely wants the display name still gets it.
+    EXPECT_FALSE(sec.userName.empty())
+        << "Full scope no longer resolves an account name";
+    EXPECT_NE(sec.userName.find(L'\\'), std::wstring::npos)
+        << "expected DOMAIN\\User form";
+}
+
+TEST_F(ProcessUtilsTest, DefaultScopeIsFullSoExistingCallersAreUnchanged) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[DefaultScopeIsFullSoExistingCallersAreUnchanged] Testing...");
+    // The scope parameter was added with a Full default precisely so that no
+    // pre-existing three-argument caller changed behaviour on the day it landed.
+    // If that default is ever flipped, every such caller silently loses
+    // userName - a silent change of meaning - so pin the default explicitly.
+    ProcessSecurityInfo sec;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec));
+    EXPECT_FALSE(sec.userName.empty())
+        << "the default scope no longer resolves an account name";
+}
+
+TEST_F(ProcessUtilsTest, ElevationAndSidProjectionsStillAnswerUnderLocalOnly) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[ElevationAndSidProjectionsStillAnswerUnderLocalOnly] Testing...");
+    // IsProcessElevated and GetProcessSID were both switched to LocalOnly.
+    // Neither has ever returned userName, so the switch must not change one bit
+    // of what they DO return.
+    auto sid = GetProcessSID(m_currentPid);
+    ASSERT_TRUE(sid.has_value());
+    EXPECT_TRUE(sid->starts_with(L"S-1-"));
+
+    ProcessSecurityInfo sec;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, nullptr,
+                                       SecurityInfoScope::LocalOnly));
+    EXPECT_EQ(IsProcessElevated(m_currentPid), sec.isElevated);
+}
+
+TEST_F(ProcessUtilsTest, SessionIdNeedsNoProcessHandle) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[SessionIdNeedsNoProcessHandle] Testing...");
+    // GetProcessSessionId had ZERO callers before the registry alert path used
+    // it, while that path paid a full GetProcessBasicInfo - which opens the
+    // process with PROCESS_VM_READ, and therefore fails outright on a protected
+    // process - to obtain this same number.
+    auto sess = GetProcessSessionId(m_currentPid);
+    ASSERT_TRUE(sess.has_value());
+
+    DWORD expected = 0;
+    ASSERT_TRUE(::ProcessIdToSessionId(m_currentPid, &expected));
+    EXPECT_EQ(*sess, expected);
+}

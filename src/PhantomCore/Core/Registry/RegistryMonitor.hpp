@@ -388,6 +388,16 @@ struct alignas(256) RegistryEvent {
     uint32_t threadId{ 0 };
     std::wstring processPath;
     std::string processName;
+
+    // Token context. NOT POPULATED BY THE KERNEL REGISTRY FEED, deliberately.
+    // That feed is delivered on the thread that answers the kernel's scan
+    // requests while the minifilter holds a file operation open, and opening a
+    // process token per registry operation puts several syscalls on that path.
+    // The kernel wire format (SHADOWSTRIKE_REGISTRY_NOTIFICATION) carries no
+    // token context either, so there is nothing to copy across. RegistryAlert
+    // resolves these when an alert is actually raised; other producers that call
+    // ProcessEvent directly may still fill them. Treat a default value here as
+    // "not determined", never as a measurement.
     std::wstring userSid;
     std::string userName;
     uint32_t sessionId{ 0 };
@@ -535,6 +545,23 @@ struct alignas(256) RegistryAlert {
     uint32_t processId{ 0 };
     std::wstring processPath;
     std::string userName;
+
+    // Token context.
+    //
+    // Resolved WHEN THE ALERT IS RAISED, not per event. Opening a process token
+    // costs several syscalls, and the kernel registry feed is delivered on the
+    // thread that answers the kernel's scan requests while the minifilter holds
+    // a file operation open - so this work belongs on the rare path (an alert)
+    // rather than the hot one (every registry operation on the machine).
+    //
+    // tokenContextResolved distinguishes "queried and the process is not
+    // elevated" from "could not be queried". Without it a defaulted false is
+    // indistinguishable from a measured false, which is the shape of defect
+    // that makes an unprotected resource look verified.
+    std::wstring userSid;
+    uint32_t sessionId{ 0 };
+    bool isElevated{ false };
+    bool tokenContextResolved{ false };
 
     // Action taken
     RegistryVerdict verdict{ RegistryVerdict::Allow };

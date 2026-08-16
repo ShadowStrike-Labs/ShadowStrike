@@ -66,6 +66,8 @@ SERVICE_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Core/System/ServiceManager.hp
 # and ProcessNotify.c.
 FILTER_CONNECTION_CPP_PATH = ROOT / "src/PhantomCore/Communication/FilterConnection.cpp"
 MESSAGE_PROTOCOL_H_PATH = ROOT / "PhantomSensor/Shared/MessageProtocol.h"
+REGISTRY_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Registry/RegistryMonitor.cpp"
+PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
 
 
 def read_source(path: Path) -> str:
@@ -200,6 +202,8 @@ class SourceContractTests(unittest.TestCase):
         cls.service_manager_hpp = read_source(SERVICE_MANAGER_HPP_PATH)
         cls.filter_connection_cpp = read_source(FILTER_CONNECTION_CPP_PATH)
         cls.message_protocol_h = read_source(MESSAGE_PROTOCOL_H_PATH)
+        cls.registry_monitor_cpp = read_source(REGISTRY_MONITOR_CPP_PATH)
+        cls.process_utils_cpp = read_source(PROCESS_UTILS_CPP_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1600,6 +1604,129 @@ class SourceContractTests(unittest.TestCase):
         self.assertRegex(
             protocol, r"C_ASSERT\(\s*sizeof\(SHADOWSTRIKE_SCAN_VERDICT_REPLY\)\s*==\s*26\s*\);"
         )
+
+
+    def test_the_kernel_registry_feed_does_not_block_on_a_name_lookup(self):
+        """The kernel registry feed is delivered on IPCManager's worker thread -
+        the one it names SS-KernelScanReply - which answers the kernel's scan
+        requests while the minifilter holds the originating file operation open.
+
+        Two rules apply to that path. It may make no call that leaves this
+        machine, and anything it does is paid by every registry operation on the
+        system. Enrichment there previously performed four process-opening
+        queries per event, one of which resolved an account name through
+        LookupAccountSidW.
+
+        Comments are stripped FIRST. The explanatory comments now in the handler
+        necessarily NAME the calls that were removed, so a comment-blind
+        assertion would be satisfied - or broken - by prose rather than by code.
+        """
+        src = self.registry_monitor_cpp
+
+        start_anchor = "SHADOWSTRIKE_SCAN_VERDICT OnKernelRegistryNotification("
+        end_anchor = "RegistryVerdict ApplyRulesSnapshot("
+        self.assertEqual(
+            src.count(start_anchor), 1,
+            "expected exactly one kernel registry handler to slice on",
+        )
+        self.assertEqual(
+            src.count(end_anchor), 1,
+            "the slice end anchor is no longer unique; re-pick it",
+        )
+        start = src.index(start_anchor)
+        end = src.index(end_anchor)
+        self.assertLess(start, end, "slice anchors are in the wrong order")
+
+        body = strip_c_comments(src[start:end])
+
+        banned = (
+            (
+                "GetProcessSecurityInfo",
+                "opens the process token and, at Full scope, resolves an account "
+                "name via LookupAccountSidW - an LSASS RPC that becomes a domain "
+                "controller round trip for a domain SID",
+            ),
+            (
+                "GetProcessBasicInfo",
+                "opens the process with PROCESS_VM_READ and resolves the image "
+                "path and process times merely to obtain a session id",
+            ),
+            (
+                "GetProcessName",
+                "is GetProcessPath plus a basename, so calling it resolves the "
+                "full image path a second time for one string",
+            ),
+        )
+        for symbol, why in banned:
+            offenders = [ln.strip() for ln in body.splitlines() if symbol in ln]
+            self.assertEqual(
+                offenders, [],
+                "%s is called on the kernel registry feed path; it %s"
+                % (symbol, why),
+            )
+
+        # Exactly one image-path resolution. That is the single fact with a
+        # genuine per-event consumer: RegistryRule::processPathPattern matches on
+        # it, and StartupAnalyzer's subscriber forwards it for every
+        # persistence-key write. More than one means the duplicate resolution is
+        # back; zero means a rule that filters on process path silently stopped
+        # matching, which would be a coverage loss.
+        self.assertEqual(
+            body.count("GetProcessPath"), 1,
+            "the feed path must resolve the process image path exactly once",
+        )
+
+    def test_the_account_name_lookup_is_reachable_only_by_explicit_opt_in(self):
+        """LookupAccountSidW is the only call in GetProcessSecurityInfo that can
+        leave this machine. It must stay behind an explicit scope so a caller
+        that owes the kernel an answer cannot reach it by accident, and the two
+        projections that never return a name must opt out of it.
+        """
+        src = strip_c_comments(self.process_utils_cpp)
+
+        sites = [ln.strip() for ln in src.splitlines() if "LookupAccountSidW" in ln]
+        self.assertEqual(
+            len(sites), 1,
+            "expected exactly one account-name lookup site, found: %r" % (sites,),
+        )
+
+        # Offsets only, never the haystack: an assertIn against a 5,000-line file
+        # prints the entire file on failure and buries the finding.
+        gate = "if (scope == SecurityInfoScope::Full)"
+        gate_count = src.count(gate)
+        self.assertEqual(
+            gate_count, 1,
+            "expected exactly one Full-scope gate around the account-name lookup, "
+            "found %d" % gate_count,
+        )
+        call_at = src.index("LookupAccountSidW")
+        gate_at = src.rfind(gate, 0, call_at)
+        self.assertNotEqual(
+            gate_at, -1,
+            "the account-name lookup at offset %d is not preceded by the Full-scope "
+            "gate, so it would run for every caller including those that owe the "
+            "kernel an answer" % call_at,
+        )
+        # Nothing may reopen the guard between the gate and the call.
+        between = src[gate_at:call_at]
+        reopened = [ln.strip() for ln in between.splitlines()
+                    if "SecurityInfoScope::LocalOnly" in ln]
+        self.assertEqual(
+            reopened, [],
+            "the scope is reassigned between the gate and the lookup: %r" % (reopened,),
+        )
+
+        # Both projections return a single local fact and must say so. Sliced
+        # from the signature to the first closing brace at column zero.
+        for fn in ("IsProcessElevated", "GetProcessSID"):
+            sig = src.index("%s(ProcessId pid, Error* err) noexcept {" % fn)
+            fn_end = src.index("\n}", sig)
+            fn_body = src[sig:fn_end]
+            self.assertIn(
+                "SecurityInfoScope::LocalOnly", fn_body,
+                "%s does not restrict its query, so it pays for an account name "
+                "it never returns" % fn,
+            )
 
 
 @dataclass(frozen=True)

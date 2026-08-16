@@ -1099,7 +1099,8 @@ namespace ShadowStrike {
 // Process Security Information
 // ==========================================================
 
-bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err) noexcept {
+bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err,
+                            SecurityInfoScope scope) noexcept {
     sec = {};
     
     ProcessHandle ph;
@@ -1149,16 +1150,24 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err)
             LocalFree(sidStr);
         }
 
-        WCHAR name[256] = {}, domain[256] = {};
-        DWORD cchName = static_cast<DWORD>(std::size(name));
-        DWORD cchDomain = static_cast<DWORD>(std::size(domain));
-        SID_NAME_USE use = SidTypeUnknown;
-        
-        if (LookupAccountSidW(nullptr, tu->User.Sid, name, &cchName, domain, &cchDomain, &use)) {
-            try {
-                sec.userName = std::wstring(domain) + L"\\" + std::wstring(name);
-            } catch (...) {
-                sec.userName.clear();
+        // ACCOUNT NAME RESOLUTION - THE ONLY CALL IN THIS FUNCTION THAT CAN
+        // LEAVE THIS MACHINE. LookupAccountSidW is an RPC into LSASS, and for a
+        // domain SID it contacts a domain controller and blocks until the RPC
+        // timeout if that controller is unreachable. Callers that owe the kernel
+        // an answer pass LocalOnly and read sec.userSid instead: the SID is the
+        // stable identity anyway, and naming it is a presentation concern.
+        if (scope == SecurityInfoScope::Full) {
+            WCHAR name[256] = {}, domain[256] = {};
+            DWORD cchName = static_cast<DWORD>(std::size(name));
+            DWORD cchDomain = static_cast<DWORD>(std::size(domain));
+            SID_NAME_USE use = SidTypeUnknown;
+
+            if (LookupAccountSidW(nullptr, tu->User.Sid, name, &cchName, domain, &cchDomain, &use)) {
+                try {
+                    sec.userName = std::wstring(domain) + L"\\" + std::wstring(name);
+                } catch (...) {
+                    sec.userName.clear();
+                }
             }
         }
     }
@@ -1742,7 +1751,9 @@ bool IsProcess64Bit(ProcessId pid, Error* err) noexcept {
 
 bool IsProcessElevated(ProcessId pid, Error* err) noexcept {
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) return false;
+    // LocalOnly: this projection returns one local token boolean, so resolving
+    // an account name for it would be pure cost with a domain round trip in it.
+    if (!GetProcessSecurityInfo(pid, sec, err, SecurityInfoScope::LocalOnly)) return false;
     return sec.isElevated;
 }
 
@@ -4019,7 +4030,10 @@ std::optional<std::wstring> GetProcessOwner(ProcessId pid, Error* err) noexcept 
 
 std::optional<std::wstring> GetProcessSID(ProcessId pid, Error* err) noexcept {
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) return std::nullopt;
+    // LocalOnly: userSid is produced by ConvertSidToStringSidW, which is pure
+    // local formatting and runs BEFORE any account lookup. Asking for the name
+    // would add a domain round trip this function never returns.
+    if (!GetProcessSecurityInfo(pid, sec, err, SecurityInfoScope::LocalOnly)) return std::nullopt;
     return sec.userSid;
 }
 

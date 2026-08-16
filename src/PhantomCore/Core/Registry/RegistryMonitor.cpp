@@ -2018,27 +2018,34 @@ private:
             // the frame first. Truncation is preferable to trusting a declared
             // length: an over-long field is still analysable from its prefix.
 
-            // Process context enrichment, best-effort and non-blocking. A
-            // process that has already exited leaves the PID-only event, which
-            // is still a usable record.
+            // Process context enrichment, MINIMAL BY DESIGN.
+            //
+            // This runs on IPCManager's worker thread - the one it names
+            // SS-KernelScanReply - which answers the kernel's scan requests
+            // while the minifilter holds the originating file operation open.
+            // Anything done here is paid by every registry operation on the
+            // machine and delays file opens that are already waiting.
+            //
+            // Only the image path is resolved, because only the image path has a
+            // per-event consumer: RegistryRule::processPathPattern matches on it
+            // in ApplyRulesSnapshot, and StartupAnalyzer's subscriber forwards it
+            // for every persistence-key write. The name is DERIVED from that same
+            // result instead of being re-queried - GetProcessName IS
+            // GetProcessPath plus a basename, so calling both opened the process
+            // and resolved the full image path twice to obtain one string.
+            //
+            // Session id, elevation and user SID are deliberately NOT gathered
+            // here. Nothing read them, and the call that produced elevation
+            // (GetProcessSecurityInfo at Full scope) resolves an account name via
+            // LookupAccountSidW - an RPC into LSASS that becomes a domain
+            // controller round trip for a domain SID, on the one thread that must
+            // never block on the network. They are resolved when an alert is
+            // actually raised, at LocalOnly scope. See GenerateAlert.
             try {
                 auto procPath = ProcessUtils::GetProcessPath(event.processId);
                 if (procPath.has_value()) {
                     event.processPath = procPath.value();
-                }
-                auto procName = ProcessUtils::GetProcessName(event.processId);
-                if (procName.has_value()) {
-                    event.processName = StringUtils::ToNarrow(procName.value());
-                } else if (procPath.has_value()) {
                     event.processName = ProcessBaseName(procPath.value());
-                }
-                ProcessUtils::ProcessBasicInfo basicInfo;
-                if (ProcessUtils::GetProcessBasicInfo(event.processId, basicInfo)) {
-                    event.sessionId = basicInfo.sessionId;
-                }
-                ProcessUtils::ProcessSecurityInfo secInfo;
-                if (ProcessUtils::GetProcessSecurityInfo(event.processId, secInfo)) {
-                    event.isElevated = secInfo.isElevated;
                 }
             } catch (...) {
                 // Process may have exited; proceed with PID only.
@@ -2341,6 +2348,42 @@ private:
         alert.processId = event.processId;
         alert.processPath = event.processPath;
         alert.userName = event.userName;
+
+        // Token context, resolved HERE rather than per event.
+        //
+        // An alert is the rare path - by definition the events worth looking at -
+        // so a few syscalls are affordable here where they are not on every
+        // registry operation on the machine.
+        //
+        // LocalOnly is REQUIRED, not merely preferable. The Full scope resolves an
+        // account name through LookupAccountSidW, an RPC into LSASS that becomes a
+        // domain controller round trip for a domain SID, and this code still runs
+        // on the thread answering the kernel's scan requests. alert.userName is
+        // therefore left exactly as the event supplied it (empty for the kernel
+        // feed, which carries no token context); userSid is the stable identity,
+        // and turning a SID into a display name belongs off this thread.
+        {
+            ProcessUtils::ProcessSecurityInfo secInfo;
+            if (ProcessUtils::GetProcessSecurityInfo(
+                    event.processId, secInfo, nullptr,
+                    ProcessUtils::SecurityInfoScope::LocalOnly)) {
+                alert.userSid = secInfo.userSid;
+                alert.isElevated = secInfo.isElevated;
+                alert.tokenContextResolved = true;
+            } else if (!event.userSid.empty()) {
+                // A non-kernel producer may already have supplied it; keep that
+                // rather than discarding it because the process has since exited.
+                alert.userSid = event.userSid;
+            }
+
+            // ProcessIdToSessionId needs no handle at all, which is why this is a
+            // separate call and not a by-product of a heavier query.
+            if (auto sess = ProcessUtils::GetProcessSessionId(event.processId)) {
+                alert.sessionId = *sess;
+            } else {
+                alert.sessionId = event.sessionId;
+            }
+        }
 
         switch (threat) {
             case RegistryThreatType::PERSISTENCE_RUN_KEY:
