@@ -301,10 +301,10 @@ void AppendHeaderOnlySchema(std::vector<KernelMessageSchema>& schemas,
             MakeField("ScanRequest.HasADS", offsetof(FILE_SCAN_REQUEST, HasADS), sizeof(UINT8),
                 KernelFieldEncoding::Boolean, "Alternate-data-stream indicator."),
             MakeField("ScanRequest.PathLength", offsetof(FILE_SCAN_REQUEST, PathLength), sizeof(UINT16),
-                KernelFieldEncoding::WideCharCount, "Length of the file path tail in WCHAR units.",
+                KernelFieldEncoding::ByteCount, "Byte length of the file path tail (not a WCHAR count).",
                 { "Must not describe bytes beyond the received payload." }),
             MakeField("ScanRequest.ProcessNameLength", offsetof(FILE_SCAN_REQUEST, ProcessNameLength), sizeof(UINT16),
-                KernelFieldEncoding::WideCharCount, "Length of the process name tail in WCHAR units.",
+                KernelFieldEncoding::ByteCount, "Byte length of the process name tail (not a WCHAR count).",
                 { "Must not describe bytes beyond the received payload after the file path segment." })
         });
 
@@ -324,9 +324,14 @@ void AppendHeaderOnlySchema(std::vector<KernelMessageSchema>& schemas,
             std::move(fields),
             {
                 MakeSegment("FilePath", "ScanRequest.PathLength", sizeof(WCHAR), "utf16-path",
-                    "Variable-length file path copied immediately after FILE_SCAN_REQUEST."),
+                    "Variable-length file path copied immediately after FILE_SCAN_REQUEST. "
+                    "elementWidth describes the UTF-16 content; the governing length field "
+                    "ScanRequest.PathLength is a BYTE count, not a count of these elements."),
                 MakeSegment("ProcessName", "ScanRequest.ProcessNameLength", sizeof(WCHAR), "utf16-process-name",
-                    "Variable-length process image name copied after FilePath.")
+                    "Variable-length process image name copied after FilePath. Its length field "
+                    "is likewise a BYTE count. Note that one of the three kernel builders writes "
+                    "a NUL WCHAR between the two strings and the others do not, so this segment's "
+                    "offset is builder-dependent and must be derived from the delivered size.")
             }
         });
     }

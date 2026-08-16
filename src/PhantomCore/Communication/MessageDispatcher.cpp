@@ -500,10 +500,16 @@ public:
         const FileScanRequestData* raw =
             reinterpret_cast<const FileScanRequestData*>(data.data());
 
-        // Validate variable-length fields don't exceed buffer
+        // Validate variable-length fields don't exceed buffer.
+        //
+        // pathLength and processNameLength are BYTE counts (see FILE_SCAN_REQUEST
+        // in MessageProtocol.h). This used to multiply each by sizeof(wchar_t),
+        // i.e. read them as CHARACTER counts, which made the bound twice as
+        // strict as the contract AND paired with a decode step below that then
+        // read only half of each string. Both halves are now byte-based.
         size_t requiredSize = sizeof(FileScanRequestData) +
-                             (raw->pathLength * sizeof(wchar_t)) +
-                             (raw->processNameLength * sizeof(wchar_t));
+                             static_cast<size_t>(raw->pathLength) +
+                             static_cast<size_t>(raw->processNameLength);
 
         if (data.size() < requiredSize) {
             Utils::Logger::Warn("[MessageDispatcher] FileScanRequest buffer too small "
@@ -534,14 +540,17 @@ public:
         request.requiresReply = raw->requiresReply != 0;
         request.timestamp = std::chrono::system_clock::now();
 
-        // Extract file path
+        // Extract file path. Byte counts divided down to character counts at the
+        // point of use, matching RealTimeProtection::OnKernelFileScan.
         const wchar_t* pathPtr = reinterpret_cast<const wchar_t*>(
             data.data() + sizeof(FileScanRequestData));
-        request.filePath = std::wstring(pathPtr, raw->pathLength);
+        request.filePath = std::wstring(pathPtr, raw->pathLength / sizeof(wchar_t));
 
-        // Extract process name
-        const wchar_t* procNamePtr = pathPtr + raw->pathLength;
-        request.processName = std::wstring(procNamePtr, raw->processNameLength);
+        // Extract process name. The offset advances by CHARACTERS because pathPtr
+        // is a wchar_t*, so the byte length must be converted here too.
+        const wchar_t* procNamePtr = pathPtr + (raw->pathLength / sizeof(wchar_t));
+        request.processName =
+            std::wstring(procNamePtr, raw->processNameLength / sizeof(wchar_t));
 
         return request;
     }

@@ -125,12 +125,18 @@ namespace {
             return false;
         }
 
-        const size_t availableChars = (bodySize - fixedSize) / sizeof(wchar_t);
-        const size_t requiredChars =
+        // The declared lengths are BYTE counts, matching every variable-length
+        // field in this protocol (see FILE_SCAN_REQUEST in MessageProtocol.h).
+        // This used to divide the available space by sizeof(wchar_t) and compare
+        // against the raw field values, i.e. it read them as CHARACTER counts -
+        // which made it twice as permissive as it should be AND paired with a
+        // decode step that then read half the string.
+        const size_t availableBytes = bodySize - fixedSize;
+        const size_t requiredBytes =
             static_cast<size_t>(firstLength) +
             static_cast<size_t>(secondLength) +
             static_cast<size_t>(thirdLength);
-        return requiredChars <= availableChars;
+        return requiredBytes <= availableBytes;
     }
 
 } // namespace
@@ -921,7 +927,9 @@ struct FileSystemFilter::Impl {
             reinterpret_cast<const uint8_t*>(request) + sizeof(FileScanRequest));
 
         if (request->pathLength > 0) {
-            event.filePath = std::wstring(strings, request->pathLength);
+            // pathLength is a BYTE count. See FILE_SCAN_REQUEST in
+            // MessageProtocol.h for why this protocol counts bytes everywhere.
+            event.filePath = std::wstring(strings, request->pathLength / sizeof(wchar_t));
             // The kernel delivers NT device paths (\Device\HarddiskVolumeN\...).
             // This filesystem-filter route feeds event.filePath straight to
             // ScanEngine / DigitalSignatureValidator / hashing, all of which open
@@ -933,8 +941,9 @@ struct FileSystemFilter::Impl {
         }
 
         if (request->processNameLength > 0) {
-            const wchar_t* procName = strings + request->pathLength;
-            event.processName = std::wstring(procName, request->processNameLength);
+            const wchar_t* procName = strings + (request->pathLength / sizeof(wchar_t));
+            event.processName = std::wstring(procName,
+                                             request->processNameLength / sizeof(wchar_t));
         }
 
         return event;
@@ -1180,13 +1189,15 @@ struct FileSystemFilter::Impl {
         const wchar_t* strings = reinterpret_cast<const wchar_t*>(
             reinterpret_cast<const uint8_t*>(notification) + sizeof(FileNotification));
 
+        // Both lengths are BYTE counts, as everywhere else in this protocol.
         if (notification->pathLength > 0) {
-            event.filePath = std::wstring(strings, notification->pathLength);
+            event.filePath = std::wstring(strings, notification->pathLength / sizeof(wchar_t));
         }
 
         if (notification->newPathLength > 0) {
-            const wchar_t* newPath = strings + notification->pathLength;
-            event.newPath = std::wstring(newPath, notification->newPathLength);
+            const wchar_t* newPath = strings + (notification->pathLength / sizeof(wchar_t));
+            event.newPath = std::wstring(newPath,
+                                         notification->newPathLength / sizeof(wchar_t));
         }
 
         // Invoke callbacks

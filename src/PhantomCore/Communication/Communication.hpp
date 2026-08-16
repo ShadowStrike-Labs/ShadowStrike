@@ -271,36 +271,52 @@ static_assert(offsetof(FileScanRequestData, pathLength) == 68,
 static_assert(offsetof(FileScanRequestData, processNameLength) == 70,
               "processNameLength offset pins the packed layout");
 
-// LENGTH UNITS ARE NOT UNIFORM ACROSS THIS PROTOCOL, and the difference is not
-// visible from the field names. Measured, all four sites:
+// LENGTH UNITS ARE UNIFORM ACROSS THIS PROTOCOL: EVERY VARIABLE-LENGTH FIELD IS
+// A BYTE COUNT. That is now true; it was not, and the disagreement was invisible
+// from the field names. Recorded here because the shape of the defect matters
+// more than the fix.
 //
-//   DECLARED CONTRACT (both headers): CHARACTERS. FILE_SCAN_REQUEST
-//     (MessageProtocol.h:159) and SHADOWSTRIKE_FILE_SCAN_REQUEST (SharedDefs.h:539)
-//     are byte-identical 72-byte declarations of one layout under two names, and
-//     both document "WCHAR FilePath[PathLength]". SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE
-//     (SharedDefs.h:576) budgets pathLen * sizeof(WCHAR), which only makes sense
-//     for a character count.
+// THREE kernel builders fill this one layout, and they did not agree:
 //
-//   PIPELINE A - CommPort.c:5380 ShadowStrikeBuildFileScanRequest writes
-//     Name.Length / sizeof(WCHAR) = CHARACTERS. Its consumer,
-//     FileSystemFilter.cpp:924, does std::wstring(strings, request->pathLength)
-//     = reads CHARACTERS. Agrees with the declared contract.
+//   ScanBridge.c  SbBuildFileScanRequestEx  wrote Name.Length = BYTES.
+//     Live on every IRP_MJ_CREATE via PreCreate.c. Correct.
 //
-//   PIPELINE B - ScanBridge.c:723 SbBuildFileScanRequestEx writes Name.Length
-//     = BYTES (this is the live IRP_MJ_CREATE path, via PreCreate.c:1494). Its
-//     consumer, RealTimeProtection.cpp:3223, does PathLength / sizeof(wchar_t)
-//     = reads BYTES. Self-consistent, and CONTRARY to the declared contract.
+//   CommPort.c  ShadowStrikeBuildFileScanRequest  wrote Name.Length /
+//     sizeof(WCHAR) = CHARACTERS. Live on every rename and delete via
+//     FilterRegistration.c's post-operation callback.
 //
-// Both pipelines therefore work today only because each builder happens to be
-// matched to its own reader. Nothing enforces that pairing, and the two structs
-// are mutually castable, so routing a pipeline B frame to a pipeline A reader
-// doubles the character count (a read past the declared payload) and the reverse
-// halves it (a silently truncated file path). Anything parsing this payload must
-// state which unit it is using and against which builder it was verified.
+//   FilterRegistration.c  ShadowStrikeQueueRescan  wrote copyLen /
+//     sizeof(WCHAR) = CHARACTERS. Live on IRP_MJ_CLEANUP for modified files.
 //
-// This header cannot resolve the disagreement on its own - changing either side
-// in isolation breaks the pipeline that currently works - so it is recorded
-// rather than silently picked.
+// All three stamp FilterMessageType_ScanRequest and all three route to the
+// primary scanner connection, so all three arrive at ONE reader:
+// RealTimeProtection::OnKernelFileScan, which divides by sizeof(wchar_t) and
+// therefore reads BYTES. The create path agreed with it; the rename, delete and
+// rescan paths did not, and delivered a path the service truncated to HALF its
+// length. That failure is silent - a halved path is not an error, it is a path
+// that cannot be opened, and an unopenable path is an unexamined file.
+//
+// The earlier note here concluded this was latent because "each builder happens
+// to be matched to its own reader". That was wrong, and it was wrong because it
+// traced only the create path. The reader it credited to the character-count
+// builders - FileSystemFilter::DecodeEvent - is field-proven never to run: its
+// message-type enum numbers scan requests 1..4 while the kernel sends 6, and the
+// 1.0.94 log contains exactly one line from it, "Unknown message type: 5".
+//
+// BYTES rather than characters, for four reasons, in order of weight:
+//   1. Every sibling notification already uses bytes and says so -
+//      ProcessNotifyRequest::imagePathLength, ImageLoadRequest::imagePathLength,
+//      RegistryOpRequest::keyPathLength. Making file scan the exception is drift.
+//   2. UNICODE_STRING::Length, which every builder already holds, is bytes.
+//      Characters need a division per producer, and that division is exactly
+//      where the three builders diverged.
+//   3. A receiver must bound these against a delivered size expressed in bytes.
+//      One unit means one comparison with nothing to round or overflow.
+//   4. It corrects the two broken producers instead of changing the producer and
+//      the reader that demonstrably work on the highest-volume path.
+//
+// Pinned by tests/kernel_contracts (every builder writes a byte count, no
+// consumer multiplies one by sizeof(wchar_t)) and by the wire-format suite.
 
 //=============================================================================
 // Process Notification / Registry Notification - REMOVED, NOT RELOCATED
@@ -412,36 +428,44 @@ static_assert(offsetof(ScanVerdictReplyData, threatNameLength) == 24,
 // Driver Statistics
 //=============================================================================
 //
-// UNVERIFIED AGAINST THE KERNEL. DriverStatisticsData below has ZERO consumers
-// repo-wide, and the nearest kernel declaration is SHADOWSTRIKE_DRIVER_STATUS
-// (SharedDefs.h:301), which was NOT compared field by field. It is therefore left
-// in place rather than deleted alongside the three structs above: three of them
-// were measured and proven wrong, this one was not measured, and removing an
-// unmeasured declaration on the strength of its neighbours would be guessing.
-// Anyone wiring driver statistics must compare it against the kernel struct FIRST
-// and pin the result, exactly as FileScanRequestData and ScanVerdictReplyData now
-// are.
-
-struct DriverStatisticsData {
-    uint64_t uptimeSeconds;
-    uint64_t filesScanned;
-    uint64_t filesBlocked;
-    uint64_t filesQuarantined;
-    uint64_t processesScanned;
-    uint64_t processesBlocked;
-    uint64_t registryOpsScanned;
-    uint64_t registryOpsBlocked;
-    uint64_t cacheHits;
-    uint64_t cacheMisses;
-    uint64_t messagesReceived;
-    uint64_t messagesSent;
-    uint64_t timeoutsOccurred;
-    uint64_t errorsOccurred;
-    uint32_t currentPendingRequests;
-    uint32_t peakPendingRequests;
-    uint32_t currentConnections;
-    uint32_t cacheEntries;
-};
+// MEASURED AND REMOVED. struct DriverStatisticsData described a layout the driver
+// has never sent, exactly like the three notification structs above. Task 134
+// deliberately left it in place because it had NOT been compared field by field,
+// and removing an unmeasured declaration on the strength of its neighbours would
+// have been guessing. It has now been compared.
+//
+//   It was 128 bytes: uptimeSeconds, filesScanned, filesBlocked,
+//   filesQuarantined, processesScanned, processesBlocked, registryOpsScanned,
+//   registryOpsBlocked, cacheHits, cacheMisses, messagesReceived, messagesSent,
+//   timeoutsOccurred, errorsOccurred (14 x uint64) then currentPendingRequests,
+//   peakPendingRequests, currentConnections, cacheEntries (4 x uint32).
+//
+//   The wire truth is SHADOWSTRIKE_DRIVER_STATUS (SharedDefs.h:301). It opens
+//   with VersionMajor / VersionMinor / VersionBuild / Reserved1, then five
+//   BOOLEAN feature flags and padding, and only then reaches TotalFilesScanned /
+//   FilesBlocked / CacheHits / CacheMisses. After those it carries PendingRequests
+//   / PeakPendingRequests / ConnectedClients as LONG, a compression block
+//   (CompressedMessages, CompressionBytesSaved, CompressionAvgRatio,
+//   CompressionErrors) and a message-queue block (MqTotalEnqueued, MqTotalDequeued,
+//   MqTotalDropped, MqCurrentDepth, MqPeakDepth, MqFlowControlActive).
+//
+//   ELEVEN of the declared fields do not exist on the wire at all (uptimeSeconds,
+//   filesQuarantined, processesScanned, processesBlocked, registryOpsScanned,
+//   registryOpsBlocked, messagesReceived, messagesSent, timeoutsOccurred,
+//   errorsOccurred, cacheEntries) and every wire field describing the driver's
+//   configuration, compression transport and queue health is absent from it.
+//   The seven that overlap semantically sit at different offsets, because the
+//   16 bytes of version and flags that open the real struct have no counterpart
+//   here, so nothing lines up.
+//
+// NO CAPABILITY IS LOST. It had zero consumers repo-wide, and being a wrong
+// layout it could not have parsed a driver status message if one had been wired
+// to it - it would have reported whatever the version fields and feature flags
+// happened to look like as an uptime and a scan count. Driver statistics remain
+// fully available: consume SHADOWSTRIKE_DRIVER_STATUS directly, the way
+// IPCManager.hpp consumes FILE_SCAN_REQUEST and FILTER_MESSAGE_HEADER, and pin
+// the size and key offsets against the kernel declaration as the two survivors
+// in this header now are. Do not reintroduce a hand-written mirror.
 
 #pragma pack(pop)
 

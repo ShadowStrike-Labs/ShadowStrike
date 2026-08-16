@@ -131,8 +131,13 @@ TEST(CommunicationProtocolTest, ParseFileScanRequestParsesFixedAndVariableFields
     raw.isNetworkFile = 1;
     raw.isRemovableMedia = 0;
     raw.hasADS = 1;
-    raw.pathLength = static_cast<uint16_t>(filePath.size());
-    raw.processNameLength = static_cast<uint16_t>(processName.size());
+    // BYTES, not characters. FILE_SCAN_REQUEST declares both lengths as byte
+    // counts, like every other variable-length field in this protocol - see the
+    // ImagePathLength and KeyPathLength cases below, which already did this. The
+    // file-scan case was the one that still built a character count, matching two
+    // of the three kernel builders and neither of the live ones.
+    raw.pathLength = static_cast<uint16_t>(filePath.size() * sizeof(wchar_t));
+    raw.processNameLength = static_cast<uint16_t>(processName.size() * sizeof(wchar_t));
 
     std::vector<uint8_t> buffer;
     AppendPod(buffer, raw);

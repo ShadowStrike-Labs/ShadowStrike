@@ -5280,11 +5280,16 @@ ShadowStrikeBuildFileScanRequest(
     }
 
     //
-    // Calculate total message size
+    // Calculate total message size.
+    //
+    // Both arguments are BYTE counts, matching the PathLength and
+    // ProcessNameLength fields they describe. This used to divide the path by
+    // sizeof(WCHAR) to feed a macro that multiplied it straight back - a
+    // round trip whose only effect was to state the character contract twice.
     //
     totalSize = SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE(
-        nameInfo->Name.Length / sizeof(WCHAR),
-        processNameLength
+        nameInfo->Name.Length,
+        processNameLength * sizeof(WCHAR)
     );
 
     //
@@ -5377,8 +5382,18 @@ ShadowStrikeBuildFileScanRequest(
     scanRequest->IsNetworkFile = FALSE;
     scanRequest->IsRemovableMedia = FALSE;
     scanRequest->HasADS = FALSE;
-    scanRequest->PathLength = (UINT16)(nameInfo->Name.Length / sizeof(WCHAR));
-    scanRequest->ProcessNameLength = (UINT16)processNameLength;
+    //
+    // BYTE counts. See FILE_SCAN_REQUEST in MessageProtocol.h.
+    //
+    // Name.Length is already a byte count and is what the RtlCopyMemory below
+    // copies, so the declared length and the copied length are now the same
+    // expression. Before this, both fields carried character counts while the
+    // only user-mode consumer divided by sizeof(WCHAR) - so every rename and
+    // every delete asked the service to scan a path halved in length, which
+    // does not fail loudly; it produces a path that cannot be opened.
+    //
+    scanRequest->PathLength = (UINT16)nameInfo->Name.Length;
+    scanRequest->ProcessNameLength = (UINT16)(processNameLength * sizeof(WCHAR));
 
     //
     // Copy variable-length data

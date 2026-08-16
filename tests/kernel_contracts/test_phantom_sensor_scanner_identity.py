@@ -73,6 +73,8 @@ REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtect
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
+FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
+SHARED_DEFS_H_PATH = ROOT / "PhantomSensor/Shared/SharedDefs.h"
 
 
 def read_source(path: Path) -> str:
@@ -214,6 +216,8 @@ class SourceContractTests(unittest.TestCase):
         cls.communication_hpp = read_source(COMMUNICATION_HPP_PATH)
         cls.message_dispatcher_cpp = read_source(MESSAGE_DISPATCHER_CPP_PATH)
         cls.fuzzer_vcxproj = read_source(FUZZER_VCXPROJ_PATH)
+        cls.filter_registration_c = read_source(FILTER_REGISTRATION_C_PATH)
+        cls.shared_defs_h = read_source(SHARED_DEFS_H_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -2111,6 +2115,194 @@ class SourceContractTests(unittest.TestCase):
             f"no file testing {macro} is compiled by the fuzzer any more; if "
             "that is deliberate the per-file macro should be removed from "
             "the project as well, so the two cannot drift apart",
+        )
+
+
+    def test_every_file_scan_builder_declares_a_byte_length(self) -> None:
+        """Every kernel builder of the file-scan layout must declare BYTE lengths.
+
+        THREE builders fill FILE_SCAN_REQUEST and they did not agree.
+        SbBuildFileScanRequestEx (ScanBridge.c) wrote UNICODE_STRING::Length, i.e.
+        bytes, on the IRP_MJ_CREATE path. ShadowStrikeBuildFileScanRequest
+        (CommPort.c, every rename and delete) and ShadowStrikeQueueRescan
+        (FilterRegistration.c, cleanup rescan of modified files) divided by
+        sizeof(WCHAR) and wrote characters. All three stamp
+        FilterMessageType_ScanRequest and all three route to the primary scanner
+        connection, so all three arrive at ONE reader - OnKernelFileScan - which
+        divides by sizeof(wchar_t). The create path agreed with it; the other two
+        delivered a path the service truncated to half its length.
+
+        That failure mode is why this is a contract test rather than a unit test:
+        a halved path raises nothing. It is simply a path that cannot be opened,
+        and an unopenable path is an unexamined file.
+        """
+        builders = {
+            "ScanBridge.c": self.scan_bridge_c,
+            "CommPort.c": self.comm_port_c,
+            "FilterRegistration.c": self.filter_registration_c,
+        }
+
+        assignment = re.compile(r"\b(?:PathLength|ProcessNameLength)\s*=")
+        offenders: list[str] = []
+        sites = 0
+
+        for name, raw in builders.items():
+            # COMMENTS STRIPPED FIRST. The explanatory comments added with this
+            # change necessarily quote "sizeof(WCHAR)" while describing the
+            # division that was removed, so a comment-blind scan would report
+            # this file's own documentation as the defect.
+            for line in strip_c_comments(raw).splitlines():
+                if not assignment.search(line):
+                    continue
+                # ImagePathLength / KeyPathLength belong to the image-load and
+                # registry notifications, which were already byte counts.
+                if "ImagePathLength" in line or "KeyPathLength" in line:
+                    continue
+                sites += 1
+                if "sizeof(WCHAR)" in line and "/" in line:
+                    offenders.append(f"{name}: {line.strip()}")
+
+        self.assertGreaterEqual(
+            sites,
+            3,
+            "fewer than three file-scan length assignments were found across the "
+            "three builders, so this test has stopped inspecting what it exists "
+            "to inspect",
+        )
+        self.assertEqual(
+            [],
+            offenders,
+            "a file-scan builder divides a length by sizeof(WCHAR), i.e. declares "
+            "CHARACTERS where every reader expects BYTES:\n  " + "\n  ".join(offenders),
+        )
+
+        # The exact surviving expressions, so a revert fails here by name rather
+        # than by absence of a pattern. Counted, not assertIn: these haystacks are
+        # whole driver sources and assertIn would print them.
+        for label, source, expected in (
+            ("ScanBridge.c", self.scan_bridge_c,
+             "scanRequest->PathLength = (UINT16)filePathLen;"),
+            ("CommPort.c", self.comm_port_c,
+             "scanRequest->PathLength = (UINT16)nameInfo->Name.Length;"),
+            ("FilterRegistration.c", self.filter_registration_c,
+             "req->PathLength = copyLen;"),
+        ):
+            found = strip_c_comments(source).count(expected)
+            self.assertEqual(
+                found,
+                1,
+                f"{label} no longer contains the byte-count assignment "
+                f"{expected!r} (found {found} occurrences)",
+            )
+
+        # The frame-size macro was the third statement of the character contract:
+        # it multiplied both arguments by sizeof(WCHAR) while its one caller
+        # divided a byte count to compensate.
+        defs = self.shared_defs_h
+        macro_start = defs.index("#define SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE")
+        macro_end = defs.index("#define SHADOWSTRIKE_VALID_MESSAGE_HEADER")
+        macro_body = defs[macro_start:macro_end]
+        self.assertNotIn(
+            "sizeof(WCHAR)",
+            macro_body,
+            "SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE multiplies by sizeof(WCHAR) again; "
+            "its arguments are byte counts taken straight from the wire fields",
+        )
+
+        # And the two declarations of the layout are tied together at compile
+        # time, which is what makes the duplication safe rather than documented.
+        tie = "C_ASSERT(sizeof(FILE_SCAN_REQUEST) == sizeof(SHADOWSTRIKE_FILE_SCAN_REQUEST));"
+        self.assertEqual(
+            self.message_protocol_h.count(tie),
+            1,
+            "nothing ties FILE_SCAN_REQUEST to its duplicate "
+            "SHADOWSTRIKE_FILE_SCAN_REQUEST, so the two can drift into different "
+            "wire formats under two names with no build failure anywhere",
+        )
+
+    def test_the_scan_request_case_bounds_its_variable_lengths(self) -> None:
+        """The scan-request dispatcher must bound its tail and answer every exit.
+
+        Two defects, both in the one switch case the kernel blocks a file
+        operation on:
+
+        (1) NO BOUND. The case checked that the FIXED part of the payload fits and
+            then handed it to a consumer that builds a wstring of
+            PathLength / sizeof(wchar_t) characters from the bytes after the
+            struct. PathLength is a uint16, so an over-claiming frame read up to
+            ~64 KB past the delivered data, out of a buffer IPCManager documents
+            as pooled and NOT zeroed. The three sibling cases in the same switch
+            (ProcessNotify, ImageLoad, RegistryNotify) each bound their lengths.
+
+        (2) A NON-DECISION WAS CACHED AS CLEAN. The readiness gate replied
+            Verdict_Clean. ScanCache.c refuses to cache transient verdicts and
+            says why, but Clean is not transient, so the driver cached it for the
+            default 300 seconds - every file touched during warm-up recorded
+            clean WITHOUT HAVING BEEN SCANNED. Verdict_Error fails open just the
+            same (only Verdict_Malicious blocks) and is refused by the cache.
+        """
+        src = self.ipc_manager_cpp
+        open_anchor = "case FilterMessageType_ScanRequest: {"
+        close_anchor = "case FilterMessageType_ProcessNotify: {"
+
+        self.assertEqual(
+            src.count(open_anchor), 1, "scan-request case anchor is not unique"
+        )
+        self.assertEqual(
+            src.count(close_anchor), 1, "process-notify case anchor is not unique"
+        )
+
+        body = strip_c_comments(src[src.index(open_anchor) : src.index(close_anchor)])
+        self.assertGreater(len(body), 200, "sliced scan-request case is implausibly short")
+
+        for needle in (
+            "req->PathLength > remaining",
+            "req->ProcessNameLength > (remaining - req->PathLength)",
+        ):
+            # COUNT, never assertIn. assertIn prints the entire haystack on
+            # failure, and the haystack here is a whole switch case - so the one
+            # line that matters arrives buried under eighty that do not. This is
+            # the fourth time that has cost a debugging cycle in this suite.
+            self.assertEqual(
+                body.count(needle),
+                1,
+                f"the scan-request case does not bound its variable-length tail: "
+                f"expected exactly one occurrence of {needle!r}, found "
+                f"{body.count(needle)}. Without it a declared length may exceed "
+                f"the delivered payload and the consumer reads past the frame.",
+            )
+
+        # The subtraction form matters: summing two uint16 lengths and comparing
+        # the total is the version that can wrap.
+        self.assertEqual(
+            body.count("req->PathLength + req->ProcessNameLength"),
+            0,
+            "the bound sums the two lengths instead of subtracting from what "
+            "remains, which is the form that can wrap",
+        )
+
+        clean_replies = body.count("Verdict_Clean")
+        self.assertEqual(
+            clean_replies,
+            0,
+            f"the scan-request case replies Verdict_Clean in {clean_replies} place(s). "
+            "Clean is not a transient verdict, so ScanCache stores it for the "
+            "default 300 s TTL and a file that was never scanned is remembered as "
+            "clean. Verdict_Error fails open identically and is refused by the cache.",
+        )
+
+        # Every exit that the kernel is waiting on must answer it. Ready gate,
+        # truncated payload, over-claimed length, success and the catch block.
+        self.assertGreaterEqual(
+            body.count("needsReply = true;"),
+            5,
+            "a refusal path in the scan-request case returns without replying; the "
+            "kernel then waits out its full budget for a verdict that never comes",
+        )
+        self.assertGreaterEqual(
+            body.count("Verdict_Error"),
+            4,
+            "the refusal paths do not all report a non-decision as Verdict_Error",
         )
 
 

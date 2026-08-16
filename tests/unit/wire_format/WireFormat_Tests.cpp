@@ -56,6 +56,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <type_traits>
 
 // Deliberately included in this order, and deliberately NOT ordered around
@@ -249,6 +250,132 @@ TEST(WireFormatContractTest, BothScanRequestDeclarationsAgreeOnProcessIdentity) 
     EXPECT_EQ(driverView.SessionId,       consumerView.sessionId);
     EXPECT_EQ(driverView.FileSize,        consumerView.fileSize);
     EXPECT_EQ(driverView.PathLength,      consumerView.pathLength);
+}
+
+// ============================================================================
+// THE VARIABLE-LENGTH TAIL IS MEASURED IN BYTES
+// ============================================================================
+//
+// Three kernel builders fill FILE_SCAN_REQUEST and they did not agree on the unit
+// of PathLength. ScanBridge.c wrote bytes on the IRP_MJ_CREATE path; CommPort.c
+// (rename/delete) and FilterRegistration.c (cleanup rescan) wrote characters. All
+// three stamp FilterMessageType_ScanRequest and all three reach ONE reader,
+// RealTimeProtection::OnKernelFileScan, which divides by sizeof(wchar_t) - so the
+// create path was right and the other two delivered a path truncated to half its
+// length. A halved path is not an error; it is a path that cannot be opened, and
+// an unopenable path is an unexamined file.
+//
+TEST(WireFormatContractTest, ScanRequestLengthsAreByteCountsNotCharacterCounts) {
+    const std::wstring path        = L"\\Device\\HarddiskVolume3\\Users\\Shado\\eicar.com";
+    const std::wstring processName = L"explorer.exe";
+
+    const uint16_t pathBytes = static_cast<uint16_t>(path.size() * sizeof(wchar_t));
+    const uint16_t procBytes = static_cast<uint16_t>(processName.size() * sizeof(wchar_t));
+
+    alignas(8) uint8_t frame[sizeof(FILE_SCAN_REQUEST) + 256] = {};
+    ASSERT_LE(sizeof(FILE_SCAN_REQUEST) + pathBytes + procBytes, sizeof(frame));
+
+    auto* req = reinterpret_cast<FILE_SCAN_REQUEST*>(frame);
+    req->PathLength        = pathBytes;
+    req->ProcessNameLength = procBytes;
+    std::memcpy(frame + sizeof(FILE_SCAN_REQUEST), path.data(), pathBytes);
+    std::memcpy(frame + sizeof(FILE_SCAN_REQUEST) + pathBytes, processName.data(), procBytes);
+
+    // The reader's arithmetic, verbatim from OnKernelFileScan.
+    const auto* strings = reinterpret_cast<const wchar_t*>(frame + sizeof(FILE_SCAN_REQUEST));
+    EXPECT_EQ(path, std::wstring(strings, req->PathLength / sizeof(wchar_t)));
+
+    // The process name is located from the byte offset, not a character offset.
+    const auto* procPtr = strings + (req->PathLength / sizeof(wchar_t));
+    EXPECT_EQ(processName, std::wstring(procPtr, req->ProcessNameLength / sizeof(wchar_t)));
+
+    // THE DISCRIMINATOR. Had a builder kept writing a character count, this is
+    // precisely what the reader would have produced: the first half of the path,
+    // silently, with no error anywhere.
+    const uint16_t asCharacterCount = static_cast<uint16_t>(path.size());
+    EXPECT_EQ(pathBytes, asCharacterCount * sizeof(wchar_t));
+
+    const std::wstring halved(strings, asCharacterCount / sizeof(wchar_t));
+    EXPECT_NE(path, halved);
+    EXPECT_EQ(path.size() / 2, halved.size());
+    EXPECT_TRUE(path.starts_with(halved));
+}
+
+TEST(WireFormatContractTest, TheFrameSizeMacroBudgetsBytesNotCharacters) {
+    // SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE was the third statement of the
+    // character contract: it multiplied both arguments by sizeof(WCHAR), and its
+    // one caller compensated by dividing a byte count it already held. Passing
+    // the field values straight through means the frame size and the declared
+    // lengths can no longer disagree by a factor of two.
+    constexpr uint16_t pathBytes = 104;
+    constexpr uint16_t procBytes = 24;
+
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+                  + sizeof(SHADOWSTRIKE_FILE_SCAN_REQUEST)
+                  + pathBytes + procBytes,
+              SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE(pathBytes, procBytes));
+
+    // The retired form would have budgeted for twice the variable data. Stated so
+    // that reintroducing the multiply fails here with a recognisable number.
+    EXPECT_NE(sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+                  + sizeof(SHADOWSTRIKE_FILE_SCAN_REQUEST)
+                  + (pathBytes * sizeof(WCHAR)) + (procBytes * sizeof(WCHAR)),
+              SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE(pathBytes, procBytes));
+}
+
+TEST(WireFormatContractTest, TheTwoDeclarationsOfTheScanRequestAgreeFieldByField) {
+    // FILE_SCAN_REQUEST (MessageProtocol.h) and SHADOWSTRIKE_FILE_SCAN_REQUEST
+    // (SharedDefs.h) are one layout under two names, mutually castable, and until
+    // MessageProtocol.h gained C_ASSERTs nothing checked that they stayed
+    // identical. These duplicate those assertions at run time so that a failure
+    // NAMES the field instead of pointing at a header line.
+    EXPECT_EQ(sizeof(FILE_SCAN_REQUEST), sizeof(SHADOWSTRIKE_FILE_SCAN_REQUEST));
+    EXPECT_EQ(72u, sizeof(FILE_SCAN_REQUEST));
+
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, MessageId),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, MessageId));
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, AccessType),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, AccessType));
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, ProcessId),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, ProcessId));
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, FileSize),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, FileSize));
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, FileId),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, FileId));
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, PathLength),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, PathLength));
+    EXPECT_EQ(offsetof(FILE_SCAN_REQUEST, ProcessNameLength),
+              offsetof(SHADOWSTRIKE_FILE_SCAN_REQUEST, ProcessNameLength));
+
+    // 68 and 70 absolutely, so moving BOTH declarations together still fails.
+    EXPECT_EQ(68u, offsetof(FILE_SCAN_REQUEST, PathLength));
+    EXPECT_EQ(70u, offsetof(FILE_SCAN_REQUEST, ProcessNameLength));
+}
+
+TEST(WireFormatContractTest, AnOverclaimingScanLengthIsRejectableFromTheDeliveredSize) {
+    // Quantifies what the absent bound allowed. A minimal well-formed frame
+    // carries the fixed struct and no tail at all, while PathLength is a uint16
+    // and may declare up to 65,535 bytes of one. The consumer built a wstring of
+    // PathLength / 2 characters from that tail, so an over-claiming frame read up
+    // to ~64 KB past the end of the received data - out of a buffer IPCManager
+    // documents as pooled and NOT zeroed. The three sibling cases in the same
+    // switch (ProcessNotify, ImageLoad, RegistryNotify) each bounded their
+    // lengths; this one, the only case the kernel blocks a file operation on,
+    // did not. The production bound is pinned by the cross-language suite.
+    constexpr uint32_t deliveredDataSize = static_cast<uint32_t>(sizeof(FILE_SCAN_REQUEST));
+    constexpr uint32_t tailBytes =
+        deliveredDataSize - static_cast<uint32_t>(sizeof(FILE_SCAN_REQUEST));
+    EXPECT_EQ(0u, tailBytes);
+    EXPECT_GT(0xFFFFu, tailBytes);
+
+    // The bound subtracts from what remains rather than summing the two lengths,
+    // so no addition can wrap before the comparison happens.
+    constexpr uint32_t remaining  = 128u;
+    constexpr uint16_t pathLength = 100u;
+    constexpr uint16_t procLength = 40u;
+    EXPECT_LE(pathLength, remaining);
+    EXPECT_GT(procLength, remaining - pathLength);
+    EXPECT_EQ(28u, remaining - pathLength);
 }
 
 // ============================================================================

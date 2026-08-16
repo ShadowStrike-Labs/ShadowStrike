@@ -261,8 +261,13 @@ namespace {
     fsr.processId         = pid;
     fsr.fileSize          = 0x10000;
     fsr.requiresReply     = requiresReply;
-    fsr.pathLength        = pathLen;
-    fsr.processNameLength = procLen;
+    // The pathLen / procLen PARAMETERS are CHARACTER counts, because that is what
+    // every call site below passes and what the sibling process-notification
+    // helper does. The WIRE FIELDS are BYTE counts, because that is what
+    // FILE_SCAN_REQUEST declares and what all three kernel builders now write.
+    // The conversion happens here, once, so no call site has to know.
+    fsr.pathLength        = static_cast<uint16_t>(pathLen * sizeof(wchar_t));
+    fsr.processNameLength = static_cast<uint16_t>(procLen * sizeof(wchar_t));
 
     const size_t pathBytes = static_cast<size_t>(pathLen)  * sizeof(wchar_t);
     const size_t procBytes = static_cast<size_t>(procLen)  * sizeof(wchar_t);

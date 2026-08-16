@@ -559,9 +559,23 @@ typedef struct _SHADOWSTRIKE_FILE_SCAN_REQUEST {
     UINT8  HasADS;
     UINT16 PathLength;
     UINT16 ProcessNameLength;
+    //
+    // BYTE COUNTS. See the FILE_SCAN_REQUEST declaration in MessageProtocol.h
+    // for why, and for the history of the three builders that disagreed.
+    //
+    // THIS STRUCTURE IS A SECOND NAME FOR THAT ONE. It is byte-for-byte
+    // identical to FILE_SCAN_REQUEST (MessageProtocol.h), which makes the two
+    // mutually castable while nothing enforces the pairing - so a change to
+    // either declaration alone silently produces two different wire formats
+    // under two names. That is the mechanism that let three fabricated
+    // user-mode structs drift out of existence-in-the-driver undetected.
+    // MessageProtocol.h is the authority; this one exists because CommPort.c
+    // was written against it. Do not edit one without the other, and note that
+    // tests/kernel_contracts asserts they stay identical.
+    //
     // Followed by variable data:
-    // WCHAR FilePath[PathLength]
-    // WCHAR ProcessName[ProcessNameLength]
+    // WCHAR FilePath[PathLength / sizeof(WCHAR)]
+    // WCHAR ProcessName[ProcessNameLength / sizeof(WCHAR)]
 } SHADOWSTRIKE_FILE_SCAN_REQUEST, *PSHADOWSTRIKE_FILE_SCAN_REQUEST;
 
 #pragma pack(pop)
@@ -572,12 +586,19 @@ typedef struct _SHADOWSTRIKE_FILE_SCAN_REQUEST {
 
 /**
  * @brief Calculate file scan request size including variable data.
+ *
+ * BOTH ARGUMENTS ARE BYTE COUNTS, matching PathLength / ProcessNameLength on
+ * the wire. This macro used to multiply each argument by sizeof(WCHAR), which
+ * is what made it the third statement of the character-count contract; its one
+ * caller compensated by dividing a byte count it already held. Passing the
+ * field values straight through means the frame size and the declared lengths
+ * can no longer disagree by a factor of two.
  */
-#define SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE(pathLen, procNameLen) \
+#define SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE(pathBytes, procNameBytes) \
     (sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + \
      sizeof(SHADOWSTRIKE_FILE_SCAN_REQUEST) + \
-     ((pathLen) * sizeof(WCHAR)) + \
-     ((procNameLen) * sizeof(WCHAR)))
+     (pathBytes) + \
+     (procNameBytes))
 
 /**
  * @brief Validate message header magic and version.

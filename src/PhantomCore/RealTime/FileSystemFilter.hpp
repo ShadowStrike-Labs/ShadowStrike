@@ -609,6 +609,36 @@ struct FilterMessageHeader {
 
 /**
  * @brief File scan request from kernel.
+ *
+ * LAYOUT IS PINNED against the driver's FILE_SCAN_REQUEST by static_asserts in
+ * tests/unit/wire_format/WireFormat_Tests.cpp. pathLength and processNameLength
+ * are BYTE counts, as they are everywhere in this protocol - see the
+ * FILE_SCAN_REQUEST declaration in MessageProtocol.h for the reasoning and for
+ * the three kernel builders that once disagreed about it.
+ *
+ * THIS READER DOES NOT CURRENTLY RECEIVE SCAN REQUESTS, and that is stated here
+ * so nobody concludes otherwise from the fact that its arithmetic is correct.
+ * Two independent reasons, both measured:
+ *
+ *   1. FilterMessageType (this header) numbers scan requests 1..4. The driver's
+ *      SHADOWSTRIKE_MESSAGE_TYPE puts FilterMessageType_ScanRequest at 6. The
+ *      two enums are unrelated vocabularies over one wire field, so a genuine
+ *      scan request lands in ProcessMessage's default arm. The 1.0.94 field log
+ *      contains the proof and nothing else from this path: a single line,
+ *      "FileSystemFilter: Unknown message type: 5" - 5 being the driver's
+ *      FilterMessageType_KeyExchange, the one frame it did receive.
+ *
+ *   2. Its port handle comes from FilterPortGate::Connect with a null connection
+ *      context, so the driver sees no SHADOWSTRIKE_CONNECTION_CONTEXT and this
+ *      handle is not the primary scanner. Scan requests are routed only to the
+ *      primary scanner connection, which IPCManager owns.
+ *
+ * So the on-access scan orchestration in this module - the LRU verdict cache, the
+ * hash-store and whitelist integration, PerformScan - has never run from a kernel
+ * event. Whether it should is an ownership question, not a bug to be patched
+ * here: IPCManager's file-scan slot is deliberately single-registrant and
+ * RealTimeProtection holds it. Tracked as its own task; do not wire this up as a
+ * second answerer without resolving who owns the verdict.
  */
 struct FileScanRequest {
     /// @brief Request message ID

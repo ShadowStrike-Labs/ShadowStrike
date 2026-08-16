@@ -278,8 +278,15 @@ template <typename T, typename Mutator>
     request.IsNetworkFile = 0u;
     request.IsRemovableMedia = 1u;
     request.HasADS = 0u;
-    request.PathLength = static_cast<UINT16>(filePath.size());
-    request.ProcessNameLength = static_cast<UINT16>(processName.size());
+    // BYTE counts, matching the wire contract in MessageProtocol.h.
+    //
+    // These were std::wstring::size(), i.e. CHARACTER counts, so every generated
+    // scan-request frame declared exactly half the bytes it actually carried. The
+    // seed corpus was therefore self-consistent but described a contract the
+    // product does not implement, which means the boundary that matters - a length
+    // that runs off the end of the delivered payload - was never actually reached.
+    request.PathLength = static_cast<UINT16>(filePath.size() * sizeof(wchar_t));
+    request.ProcessNameLength = static_cast<UINT16>(processName.size() * sizeof(wchar_t));
 
     std::vector<std::uint8_t> payload;
     payload.reserve(sizeof(request) + ((filePath.size() + processName.size()) * sizeof(wchar_t)));

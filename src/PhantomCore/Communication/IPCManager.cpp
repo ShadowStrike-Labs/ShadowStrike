@@ -2414,12 +2414,26 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         case FilterMessageType_ScanRequest: {
             // READY-GATE: until RealTimeProtection has fully initialized, do not
             // route file-create scans into the still-warming-up engine. Reply
-            // immediately with a fail-open Verdict_Clean so the kernel gets a
-            // fast verdict instead of timing out. This removes the cold-boot
-            // scan storm (reply-timeout flood -> login I/O stall) and shrinks
-            // the window that drives the concurrent-logging heap corruption.
+            // immediately with a fail-open verdict so the kernel gets a fast
+            // answer instead of timing out. This removes the cold-boot scan
+            // storm (reply-timeout flood -> login I/O stall) and shrinks the
+            // window that drives the concurrent-logging heap corruption.
+            //
+            // THE VERDICT IS Verdict_Error AND NOT Verdict_Clean, DELIBERATELY.
+            // Both fail open - the driver blocks only on Verdict_Malicious - so
+            // this changes nothing about whether the create proceeds. What it
+            // changes is what the driver REMEMBERS. ScanCache.c refuses to cache
+            // transient verdicts (Unknown / Error) and explains why: caching one
+            // "would let a hostile file that successfully induced one user-mode
+            // scanner failure bypass scanning for the entire TTL window". A
+            // Clean reply is not transient, so it was cached, and the default
+            // TTL is 300 seconds - meaning every file touched during warm-up was
+            // recorded clean for five minutes WITHOUT HAVING BEEN SCANNED. That
+            // is the same hole task 119 closed on the timeout path, re-entered
+            // through the reply instead of through the cache insert. Error says
+            // "no decision", which is the truth, and the driver re-asks.
             if (!m_scanServicingReady.load(std::memory_order_acquire)) {
-                verdict = Verdict_Clean;
+                verdict = Verdict_Error;
                 needsReply = true;
                 auto idxGated = static_cast<size_t>(FilterMessageType_ScanRequest);
                 if (idxGated < m_impl->stats.byMessageType.size()) {
@@ -2428,13 +2442,56 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                 break;
             }
             if (fileScanHandler) {
+                // EVERY EXIT FROM HERE OWES THE KERNEL AN ANSWER. PreCreate.c
+                // parks the thread that issued IRP_MJ_CREATE until this reply
+                // arrives or its budget expires, so a silent `break` costs a
+                // real file operation the full timeout. The refusals below
+                // therefore reply Verdict_Error rather than returning quietly.
                 if (pAppHeader->DataSize < sizeof(FILE_SCAN_REQUEST)) {
                     Utils::Logger::Error("[IPCManager] Truncated FileScanRequest: {} < {}",
                                          pAppHeader->DataSize, sizeof(FILE_SCAN_REQUEST));
+                    verdict = Verdict_Error;
+                    needsReply = true;
                     break;
                 }
 
                 auto* req = reinterpret_cast<PFILE_SCAN_REQUEST>(pPayload);
+
+                // BOUND THE VARIABLE-LENGTH TAIL AGAINST WHAT WAS DELIVERED.
+                //
+                // The three sibling cases in this switch (ProcessNotify,
+                // ImageLoad, RegistryNotify) each bound their declared string
+                // lengths against DataSize. This case - the highest-volume one,
+                // and the only one the kernel blocks a file operation on - did
+                // not. It checked that the FIXED part fits and then handed the
+                // payload to a consumer that builds a std::wstring of
+                // PathLength / sizeof(wchar_t) characters from the bytes
+                // following the struct. PathLength is attacker-influenced in the
+                // sense that any frame reaching this port can carry any value up
+                // to 65535, so an over-claiming length read up to ~64 KB past the
+                // end of the received frame, out of a receive buffer this file
+                // documents as pooled and NOT zeroed. That is an out-of-bounds
+                // read on the busiest path in the product.
+                //
+                // Both lengths are BYTE counts (see FILE_SCAN_REQUEST), so this
+                // is a direct comparison against the remaining byte count with
+                // no conversion that could round or overflow. The second test is
+                // written as a subtraction from `remaining` rather than as
+                // (PathLength + ProcessNameLength) so the sum cannot wrap.
+                const uint32_t varOffset = static_cast<uint32_t>(sizeof(FILE_SCAN_REQUEST));
+                const uint32_t remaining = pAppHeader->DataSize - varOffset;
+                if (req->PathLength > remaining ||
+                    req->ProcessNameLength > (remaining - req->PathLength)) {
+                    Utils::Logger::Error(
+                        "[IPCManager] FileScanRequest string lengths exceed the delivered "
+                        "payload: PathLength={} ProcessNameLength={} remaining={} DataSize={} pid={}",
+                        req->PathLength, req->ProcessNameLength, remaining,
+                        pAppHeader->DataSize, req->ProcessId);
+                    verdict = Verdict_Error;
+                    needsReply = true;
+                    break;
+                }
+
                 try {
                     verdict = fileScanHandler(*req);
                     needsReply = true;

@@ -177,12 +177,129 @@ typedef struct _FILE_SCAN_REQUEST {
     UINT8  IsNetworkFile;
     UINT8  IsRemovableMedia;
     UINT8  HasADS;
-    UINT16 PathLength;
-    UINT16 ProcessNameLength;
+    //
+    // BOTH LENGTHS ARE BYTE COUNTS, NOT CHARACTER COUNTS.
+    //
+    // This is stated in capitals because the two were not always the same thing
+    // here, and the disagreement was invisible. Three kernel builders fill this
+    // structure and they did not agree:
+    //
+    //   ScanBridge.c   SbBuildFileScanRequestEx      wrote BYTES  (IRP_MJ_CREATE)
+    //   CommPort.c     ShadowStrikeBuildFileScanRequest  wrote CHARACTERS (rename/delete)
+    //   FilterRegistration.c  ShadowStrikeQueueRescan     wrote CHARACTERS (cleanup rescan)
+    //
+    // while the single user-mode consumer that actually receives these frames
+    // (RealTimeProtection::OnKernelFileScan) divides by sizeof(WCHAR), i.e. reads
+    // BYTES. So the create path was correct and the rename, delete and rescan
+    // paths delivered a path the service silently truncated to HALF its length -
+    // which does not fail loudly, it just produces a path that cannot be opened,
+    // and an unopenable path is an unexamined file.
+    //
+    // BYTES is the resolution rather than characters for four reasons:
+    //   1. Every other variable-length notification in this protocol already
+    //      uses bytes and says so: SHADOWSTRIKE_PROCESS_NOTIFICATION's
+    //      ImagePathLength / CommandLineLength, SHADOWSTRIKE_IMAGE_NOTIFICATION's
+    //      ImageNameLength, and SHADOWSTRIKE_REGISTRY_NOTIFICATION's
+    //      KeyPathLength / ValueNameLength. Making file scan the one exception
+    //      is the drift, not the fix.
+    //   2. UNICODE_STRING::Length - what every builder here already holds - is a
+    //      byte count. Characters require a division at each producer, and that
+    //      division is precisely where the three builders diverged.
+    //   3. A receiver must bound these against the delivered payload size, which
+    //      is in bytes. Same unit means the bound is a direct comparison with no
+    //      conversion that can overflow or round.
+    //   4. It is what the highest-volume path (every IRP_MJ_CREATE) and the only
+    //      live reader already do, so choosing it corrects the broken producers
+    //      instead of changing the two components that demonstrably work.
+    //
+    // An odd value is therefore malformed: a UTF-16 path cannot occupy an odd
+    // number of bytes. Receivers may reject on that alone.
+    //
+    UINT16 PathLength;          // BYTES of FilePath, excluding any terminator
+    UINT16 ProcessNameLength;   // BYTES of ProcessName, excluding any terminator
     // Followed by:
-    // WCHAR FilePath[PathLength]
-    // WCHAR ProcessName[ProcessNameLength]
+    // WCHAR FilePath[PathLength / sizeof(WCHAR)]
+    // WCHAR ProcessName[ProcessNameLength / sizeof(WCHAR)]
+    //
+    // NOTE ON TRAILING NULs: SbBuildFileScanRequestEx writes a NUL WCHAR after
+    // each string and accounts for it in the frame size; the other two builders
+    // do not. Nothing reads ProcessName in production today, so no consumer
+    // depends on its offset. Any future consumer must locate ProcessName from
+    // the DELIVERED size rather than assuming (path + terminator), because the
+    // terminator is builder-dependent. PathLength is unaffected either way.
 } FILE_SCAN_REQUEST, *PFILE_SCAN_REQUEST;
+
+//
+// THIS LAYOUT IS DECLARED TWICE AND THE TWO ARE NOW TIED TOGETHER.
+//
+// SHADOWSTRIKE_FILE_SCAN_REQUEST (SharedDefs.h) is a second, byte-identical
+// declaration of the structure above. CommPort.c fills that one; ScanBridge.c and
+// FilterRegistration.c fill this one; user mode reads this one. Being identical
+// they are mutually castable, and until these assertions existed NOTHING checked
+// that they stayed identical - so editing either alone produced two different
+// wire formats under two names, silently, with the mismatch appearing only as
+// misparsed fields at run time. That is exactly how three user-mode structs in
+// Communication.hpp drifted into describing layouts the driver never sent.
+//
+// SharedDefs.h is included by this header, so both types are in scope here and
+// these fire in every translation unit that touches the protocol - driver and
+// service alike. A field added, removed, reordered or retyped on one side and
+// not the other is now a build failure at the point of the mistake.
+//
+C_ASSERT(sizeof(FILE_SCAN_REQUEST) == 72);
+C_ASSERT(sizeof(FILE_SCAN_REQUEST) == sizeof(SHADOWSTRIKE_FILE_SCAN_REQUEST));
+
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, MessageId)         ==  0);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, AccessType)        ==  8);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, Disposition)       ==  9);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, Priority)          == 10);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, RequiresReply)     == 11);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ProcessId)         == 12);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ThreadId)          == 16);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ParentProcessId)   == 20);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, SessionId)         == 24);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, FileSize)          == 28);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, FileAttributes)    == 36);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, DesiredAccess)     == 40);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ShareAccess)       == 44);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, CreateOptions)     == 48);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, VolumeSerial)      == 52);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, FileId)            == 56);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, IsDirectory)       == 64);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, IsNetworkFile)     == 65);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, IsRemovableMedia)  == 66);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, HasADS)            == 67);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, PathLength)        == 68);
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ProcessNameLength) == 70);
+
+//
+// Every field, against the duplicate. Stated field by field rather than as a
+// size comparison alone because two structures of equal size can still disagree
+// about where their fields are, and a displaced field is the harder failure to
+// diagnose - it produces plausible-looking wrong values instead of a refusal.
+//
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, MessageId)         == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, MessageId));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, AccessType)        == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, AccessType));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, Disposition)       == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, Disposition));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, Priority)          == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, Priority));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, RequiresReply)     == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, RequiresReply));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ProcessId)         == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, ProcessId));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ThreadId)          == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, ThreadId));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ParentProcessId)   == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, ParentProcessId));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, SessionId)         == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, SessionId));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, FileSize)          == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, FileSize));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, FileAttributes)    == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, FileAttributes));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, DesiredAccess)     == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, DesiredAccess));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ShareAccess)       == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, ShareAccess));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, CreateOptions)     == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, CreateOptions));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, VolumeSerial)      == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, VolumeSerial));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, FileId)            == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, FileId));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, IsDirectory)       == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, IsDirectory));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, IsNetworkFile)     == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, IsNetworkFile));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, IsRemovableMedia)  == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, IsRemovableMedia));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, HasADS)            == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, HasADS));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, PathLength)        == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, PathLength));
+C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ProcessNameLength) == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, ProcessNameLength));
 
 //
 // 1b. File Operation Event (FilterMessageType_FileOperationEvent)

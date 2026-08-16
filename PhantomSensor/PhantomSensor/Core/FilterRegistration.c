@@ -700,7 +700,6 @@ ShadowStrikeQueueRescan(
     PFILE_SCAN_REQUEST req = NULL;
     ULONG reqSize;
     USHORT copyLen;
-    USHORT pathChars;
     NTSTATUS status;
 
     PAGED_CODE();
@@ -721,10 +720,10 @@ ShadowStrikeQueueRescan(
 
     //
     // Cap path length to MAX_PATH (260 WCHARs = 520 bytes) to prevent
-    // excessive allocation from untrusted file names.
+    // excessive allocation from untrusted file names. The cap is even, so it
+    // cannot split a UTF-16 code unit.
     //
     copyLen = (FileName->Length > 520) ? 520 : FileName->Length;
-    pathChars = copyLen / sizeof(WCHAR);
 
     //
     // Build a FILE_SCAN_REQUEST with the variable-length file path appended.
@@ -744,7 +743,14 @@ ShadowStrikeQueueRescan(
     req->Priority = 1;
     req->RequiresReply = 0;
     req->ProcessId = HandleToULong(PsGetCurrentProcessId());
-    req->PathLength = pathChars;
+    //
+    // PathLength is a BYTE count (see FILE_SCAN_REQUEST in MessageProtocol.h).
+    // copyLen is already the byte length that is about to be copied, so the two
+    // cannot disagree. This previously assigned a character count, which the
+    // service - which divides by sizeof(WCHAR) - then halved, so every rescan
+    // requested a scan of a path truncated to half its length.
+    //
+    req->PathLength = copyLen;
 
     RtlCopyMemory(
         (PUCHAR)req + sizeof(FILE_SCAN_REQUEST),
