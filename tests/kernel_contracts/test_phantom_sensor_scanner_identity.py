@@ -68,6 +68,8 @@ FILTER_CONNECTION_CPP_PATH = ROOT / "src/PhantomCore/Communication/FilterConnect
 MESSAGE_PROTOCOL_H_PATH = ROOT / "PhantomSensor/Shared/MessageProtocol.h"
 REGISTRY_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Registry/RegistryMonitor.cpp"
 PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
+BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
+REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 
 
 def read_source(path: Path) -> str:
@@ -204,6 +206,8 @@ class SourceContractTests(unittest.TestCase):
         cls.message_protocol_h = read_source(MESSAGE_PROTOCOL_H_PATH)
         cls.registry_monitor_cpp = read_source(REGISTRY_MONITOR_CPP_PATH)
         cls.process_utils_cpp = read_source(PROCESS_UTILS_CPP_PATH)
+        cls.behavior_analyzer_cpp = read_source(BEHAVIOR_ANALYZER_CPP_PATH)
+        cls.real_time_protection_cpp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1728,6 +1732,153 @@ class SourceContractTests(unittest.TestCase):
                 "it never returns" % fn,
             )
 
+
+    def test_a_suspend_verdict_is_never_carried_out_as_a_termination(self):
+        """A deliberately reversible action must not execute as an irreversible one.
+
+        PerformAction routed RecommendedAction::Suspend to the SAME callback it
+        used for Terminate, and that callback received only (pid, reason), so a
+        responder could not tell the two apart. Any responder that terminated
+        would therefore have killed a process the verdict only asked to suspend,
+        and the only available signal was a human-readable prefix inside a log
+        string. This pins the action into the signature and pins the statistic.
+        """
+        src = self.behavior_analyzer_cpp
+
+        start_anchor = (
+            "void BehaviorAnalyzer::PerformAction(const BehaviorVerdict& verdict) {"
+        )
+        self.assertEqual(
+            src.count(start_anchor),
+            1,
+            "PerformAction anchor is not unique, so the slice below would be "
+            "measuring the wrong region",
+        )
+        start = src.index(start_anchor)
+        end = src.index("\nvoid BehaviorAnalyzer::", start + len(start_anchor))
+        # Strip comments: the explanatory comments in this function necessarily
+        # name Suspend and Terminate, so a comment-blind assertion would be
+        # satisfied by prose instead of by code.
+        body = strip_c_comments(src[start:end])
+
+        self.assertEqual(
+            body.count("responder(verdict.processId, verdict.action, verdict.description)"),
+            1,
+            "PerformAction must hand the decided action to the responder, "
+            "otherwise the responder cannot honour it",
+        )
+
+        self.assertEqual(
+            body.count("terminateCb(verdict.processId, verdict.description)"),
+            0,
+            "the retired two-argument invocation is back, so Suspend and "
+            "Terminate are indistinguishable to a responder again",
+        )
+
+        suspend_guard = "verdict.action != RecommendedAction::Suspend"
+        self.assertEqual(
+            body.count(suspend_guard),
+            1,
+            "the processesTerminated increment must be guarded by an explicit "
+            "Suspend exclusion",
+        )
+        self.assertEqual(
+            body.count("processesTerminated.fetch_add"),
+            1,
+            "expected exactly one processesTerminated increment in PerformAction",
+        )
+        self.assertLess(
+            body.index(suspend_guard),
+            body.index("processesTerminated.fetch_add"),
+            "the Suspend exclusion must precede the processesTerminated "
+            "increment, or a suspended process is reported as terminated",
+        )
+
+        # A response that did not happen must be counted, not dropped in silence.
+        self.assertGreaterEqual(
+            body.count("responseActionsNotCarriedOut.fetch_add"),
+            2,
+            "both the no-responder case and the responder-declined case must be "
+            "counted; before this they were a log line and total silence",
+        )
+
+    def test_a_behavioural_response_is_gated_before_it_can_destroy_anything(self):
+        """Every guard must sit BEFORE the call that ends a process.
+
+        A guard placed after the destructive call is not a guard. No behavioural
+        termination has ever taken effect in this product, so there is no field
+        data on how often these verdicts fire on legitimate software; the
+        responder is therefore gated on the protection mode, refuses our own
+        binaries, and refuses a Microsoft-signed or not-yet-determined image
+        because the evidence is inference-class.
+        """
+        src = self.real_time_protection_cpp
+
+        start_anchor = "ba.SetTerminationCallback("
+        self.assertEqual(
+            src.count(start_anchor),
+            1,
+            "expected exactly one behavioural responder registration",
+        )
+        start = src.index(start_anchor)
+        end_anchor = "// Wire BA into ThreatDetector"
+        self.assertEqual(
+            src.count(end_anchor), 1, "responder slice end anchor is not unique"
+        )
+        end = src.index(end_anchor, start)
+        self.assertGreater(end, start, "responder slice is inverted")
+        body = strip_c_comments(src[start:end])
+
+        first_kill = body.find("ProcessUtils::TerminateProcess(")
+        self.assertNotEqual(
+            first_kill,
+            -1,
+            "the responder must actually be able to terminate, otherwise the "
+            "engine's response half is still inert",
+        )
+
+        # Each guard, and the offset it must precede.
+        for label, needle in (
+            ("own-process refusal", "::GetCurrentProcessId()"),
+            ("own-install-directory refusal", "GetModuleFileNameW"),
+            ("protection-mode gate", "ProtectionMode::BLOCK_SUSPICIOUS"),
+            ("Microsoft-signed check", "TryGetCachedMicrosoftSigned"),
+            ("undetermined-signature withhold", "msTrust.has_value()"),
+        ):
+            at = body.find(needle)
+            self.assertNotEqual(
+                at, -1, "the responder is missing its {0}".format(label)
+            )
+            self.assertLess(
+                at,
+                first_kill,
+                "the {0} appears at offset {1}, after the termination call at "
+                "offset {2} - a guard after the destructive step is not a "
+                "guard".format(label, at, first_kill),
+            )
+
+        # Suspend must be handled by suspending, on its own explicit branch,
+        # and that branch must be reached before the termination path.
+        suspend_gate = body.find("RecommendedAction::Suspend")
+        suspend_call = body.find("SuspendProcess(")
+        self.assertNotEqual(
+            suspend_call,
+            -1,
+            "the responder must honour a Suspend by suspending; routing it to "
+            "the termination path is what this change exists to prevent",
+        )
+        self.assertNotEqual(suspend_gate, -1, "no explicit Suspend test found")
+        self.assertLess(
+            suspend_gate,
+            suspend_call,
+            "SuspendProcess must be reachable only under an explicit Suspend test",
+        )
+        self.assertLess(
+            suspend_call,
+            first_kill,
+            "the Suspend branch must precede and return before the termination "
+            "path, or a suspend falls through into a kill",
+        )
 
 @dataclass(frozen=True)
 class Cookie:

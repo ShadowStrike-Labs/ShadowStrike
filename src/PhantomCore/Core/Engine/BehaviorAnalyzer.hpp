@@ -1731,6 +1731,18 @@ struct BehaviorAnalyzerStats {
     
     /// @brief Processes terminated
     std::atomic<uint64_t> processesTerminated{ 0 };
+
+    /// @brief Response actions withheld because the subject process was trusted.
+    /// Detection still ran, the verdict was still produced and the verdict
+    /// callbacks still fired - only the action on the process was withheld.
+    std::atomic<uint64_t> responseActionsWithheldByTrust{ 0 };
+
+    /// @brief Response actions that were asked for and did not happen, either
+    /// because no responder was registered or because the responder declined.
+    /// Counted separately from the trust case on purpose: "nobody was
+    /// listening" and "the owner's policy refused" are different states, and a
+    /// single number cannot tell an operator which one occurred.
+    std::atomic<uint64_t> responseActionsNotCarriedOut{ 0 };
     
     /// @brief Average processing time (microseconds)
     std::atomic<uint64_t> avgProcessingTimeUs{ 0 };
@@ -1756,6 +1768,8 @@ struct BehaviorAnalyzerStats {
         persistenceDetections.store(o.persistenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
         credentialTheftDetections.store(o.credentialTheftDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
         processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        responseActionsWithheldByTrust.store(o.responseActionsWithheldByTrust.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        responseActionsNotCarriedOut.store(o.responseActionsNotCarriedOut.load(std::memory_order_relaxed), std::memory_order_relaxed);
         avgProcessingTimeUs.store(o.avgProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
         eventsDropped.store(o.eventsDropped.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
@@ -1776,6 +1790,8 @@ struct BehaviorAnalyzerStats {
             persistenceDetections.store(o.persistenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
             credentialTheftDetections.store(o.credentialTheftDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
             processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            responseActionsWithheldByTrust.store(o.responseActionsWithheldByTrust.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            responseActionsNotCarriedOut.store(o.responseActionsNotCarriedOut.load(std::memory_order_relaxed), std::memory_order_relaxed);
             avgProcessingTimeUs.store(o.avgProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
             eventsDropped.store(o.eventsDropped.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
@@ -1798,6 +1814,8 @@ struct BehaviorAnalyzerStats {
         persistenceDetections.store(0, std::memory_order_relaxed);
         credentialTheftDetections.store(0, std::memory_order_relaxed);
         processesTerminated.store(0, std::memory_order_relaxed);
+        responseActionsWithheldByTrust.store(0, std::memory_order_relaxed);
+        responseActionsNotCarriedOut.store(0, std::memory_order_relaxed);
         avgProcessingTimeUs.store(0, std::memory_order_relaxed);
         eventsDropped.store(0, std::memory_order_relaxed);
     }
@@ -1808,7 +1826,31 @@ struct BehaviorAnalyzerStats {
  */
 using BehaviorVerdictCallback = std::function<void(const BehaviorVerdict&)>;
 using BehaviorAttackChainCallback = std::function<void(const BehaviorAttackChain&)>;
-using ProcessTerminateCallback = std::function<bool(uint32_t pid, const std::wstring& reason)>;
+/**
+ * @brief Carries out a behavioural verdict's RecommendedAction against a process.
+ *
+ * THE ACTION IS PART OF THE SIGNATURE ON PURPOSE. The previous two-argument
+ * form could not tell a responder WHICH action had been decided, so a
+ * RecommendedAction::Suspend - deliberately reversible - was indistinguishable
+ * from a Terminate. PerformAction routed both to this one callback, so any
+ * responder that terminated would have escalated a suspend into a kill, and
+ * the only signal available to it was a human-readable prefix inside the
+ * reason string. Sniffing a log message is not a contract.
+ *
+ * @param pid     Subject process.
+ * @param action  The action decided by the verdict. A responder MUST NOT take a
+ *                more destructive step than the one named here.
+ * @param reason  Human-readable justification, for logging only.
+ *
+ * @return true ONLY if the action was actually carried out. The caller records
+ *         statistics from this value, so returning true without acting makes
+ *         the engine report work it did not do.
+ *
+ * @note The name is kept as-is for now; renaming belongs with the naming rehaul
+ *       rather than with this correctness fix.
+ */
+using ProcessTerminateCallback =
+    std::function<bool(uint32_t pid, RecommendedAction action, const std::wstring& reason)>;
 
 // ============================================================================
 // MAIN BEHAVIOR ANALYZER CLASS
@@ -2308,7 +2350,25 @@ private:
     /**
      * @brief Check if process is trusted.
      */
-    bool IsProcessTrusted(const ProcessBehaviorState& state) const;
+    /**
+     * @brief Whether a process is trusted enough that a destructive response
+     *        should be withheld from it.
+     *
+     * PURE PREDICATE - TAKES NO LOCKS. The caller passes the policy flags it has
+     * already snapshotted, so this can be evaluated while holding m_statesMutex
+     * without nesting m_configMutex inside it, and there is still exactly one
+     * implementation of the rule.
+     *
+     * @warning state.isSignedByMicrosoft and state.isSignedByTrustedVendor are
+     *          NOT populated by anything in this engine today, so those two arms
+     *          cannot currently fire. Signature-based trust for destructive
+     *          actions is enforced by the registered responder, which is the
+     *          component that already owns that policy. The arms are kept
+     *          because the fields are public state a future producer may fill.
+     */
+    [[nodiscard]] bool IsProcessTrusted(const ProcessBehaviorState& state,
+                                        bool trustMicrosoftSigned,
+                                        bool trustVendorSigned) const noexcept;
 
     /**
      * @brief Invoke verdict callbacks.

@@ -2201,6 +2201,161 @@ public:
             }
 
             if (ba.IsInitialized()) {
+                // Give the behavioural engine a way to actually carry out a
+                // verdict. Until now SetTerminationCallback had no production
+                // caller at all, so every Terminate / BlockAndQuarantine /
+                // IsolateEndpoint verdict logged "no termination callback" and
+                // the process kept running, and a Suspend verdict returned in
+                // silence. The engine's whole response half was inert.
+                //
+                // THIS RESPONDER IS DELIBERATELY CONSERVATIVE. No behavioural
+                // termination has ever taken effect in this product, so there
+                // is no field data on how often these verdicts fire on
+                // legitimate software - exactly the position the process-block
+                // path was in before it was gated on the protection mode. Every
+                // refusal below returns false, which the engine counts and
+                // logs, so a withheld action is visible rather than assumed.
+                try {
+                    ba.SetTerminationCallback(
+                        [this](uint32_t pid,
+                               Core::Engine::RecommendedAction action,
+                               const std::wstring& reason) -> bool {
+                        // 1. Never act on ourselves. Self-protection is the one
+                        //    case where a false positive disables the product.
+                        if (pid == 0 || pid == 4 || pid == ::GetCurrentProcessId()) {
+                            Utils::Logger::Warn(
+                                "RealTimeProtection: behavioural response refused for "
+                                "PID {} - own or system-critical process", pid);
+                            return false;
+                        }
+
+                        std::wstring imagePath;
+                        try {
+                            auto p = Utils::ProcessUtils::GetProcessPath(pid);
+                            if (p.has_value()) imagePath = *p;
+                        } catch (...) {}
+
+                        // 2. Never act on anything shipped alongside us. Killing
+                        //    our own service, tray or UI on a behavioural score
+                        //    would be self-sabotage.
+                        if (!imagePath.empty()) {
+                            static const std::wstring ownDir = []() -> std::wstring {
+                                wchar_t buf[MAX_PATH]{};
+                                if (::GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0)
+                                    return std::wstring();
+                                std::wstring full(buf);
+                                const auto slash = full.find_last_of(L'\\');
+                                return (slash == std::wstring::npos)
+                                           ? std::wstring()
+                                           : full.substr(0, slash + 1);
+                            }();
+                            if (!ownDir.empty() &&
+                                Utils::StringUtils::ToLowerCopy(imagePath).starts_with(
+                                    Utils::StringUtils::ToLowerCopy(ownDir))) {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: behavioural response refused for "
+                                    "PID {} - image lives in our own install directory", pid);
+                                return false;
+                            }
+                        }
+
+                        // 3. A behavioural score is INFERENCE, not identification.
+                        //    Acting destructively on it is at least as aggressive
+                        //    as blocking a process creation, so it answers to the
+                        //    same control.
+                        if (m_mode.load(std::memory_order_relaxed) <
+                            ProtectionMode::BLOCK_SUSPICIOUS) {
+                            m_stats.processBlocksWithheldByMode++;
+                            Utils::Logger::Warn(
+                                "RealTimeProtection: behavioural response withheld for "
+                                "PID {} (action={}) - protection mode does not enforce "
+                                "inference-class blocks: {}",
+                                pid, static_cast<uint32_t>(action),
+                                Utils::StringUtils::ToNarrow(reason));
+                            return false;
+                        }
+
+                        // 4. Never destroy a Microsoft-signed process on inference.
+                        //    Task 89's field run convicted 14 Microsoft binaries in
+                        //    29 seconds; the same mistake at process granularity
+                        //    means terminating a live OS component. The cache-only
+                        //    accessor is used because this may run on a thread that
+                        //    owes the kernel an answer, and an UNDETERMINED verdict
+                        //    withholds too - unknown must never authorise an
+                        //    irreversible action.
+                        if (!imagePath.empty()) {
+                            const std::optional<bool> msTrust =
+                                Security::DigitalSignatureValidator::Instance()
+                                    .TryGetCachedMicrosoftSigned(imagePath);
+                            if (!msTrust.has_value()) {
+                                QueueSignatureDetermination(imagePath, std::wstring());
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: behavioural response withheld for "
+                                    "PID {} - Microsoft-signed status not yet determined",
+                                    pid);
+                                return false;
+                            }
+                            if (*msTrust) {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: behavioural response withheld for "
+                                    "PID {} - Microsoft-signed image and the evidence is "
+                                    "inference-class: {}",
+                                    pid, Utils::StringUtils::ToNarrow(reason));
+                                return false;
+                            }
+                        }
+
+                        // 5. Honour the action as decided - never more.
+                        Utils::ProcessUtils::Error opErr;
+                        if (action == Core::Engine::RecommendedAction::Suspend) {
+                            if (Utils::ProcessUtils::SuspendProcess(pid, &opErr)) {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: suspended PID {} on behavioural "
+                                    "verdict: {}", pid,
+                                    Utils::StringUtils::ToNarrow(reason));
+                                return true;
+                            }
+                            return false;
+                        }
+
+                        // Terminate, BlockAndQuarantine and IsolateEndpoint all
+                        // require at minimum that the process stops. Stopping it
+                        // is a faithful PARTIAL execution of the latter two: no
+                        // image is quarantined and no network isolation is
+                        // performed here, and that is stated rather than implied.
+                        if (Utils::ProcessUtils::TerminateProcess(pid, 1, &opErr)) {
+                            if (action != Core::Engine::RecommendedAction::Terminate) {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: terminated PID {} on behavioural "
+                                    "verdict (action={} requested more than termination; "
+                                    "quarantine/isolation are not implemented here): {}",
+                                    pid, static_cast<uint32_t>(action),
+                                    Utils::StringUtils::ToNarrow(reason));
+                            } else {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: terminated PID {} on behavioural "
+                                    "verdict: {}", pid,
+                                    Utils::StringUtils::ToNarrow(reason));
+                            }
+                            return true;
+                        }
+                        return false;
+                    });
+
+                    // Say plainly what is registered and what still gates it, so
+                    // a capability that is present but switched off cannot be
+                    // mistaken for one that is missing - or for one that is live.
+                    Utils::Logger::Info(
+                        "RealTimeProtection: behavioural response callback registered "
+                        "(auto-action still requires BehaviorAnalyzerConfig::"
+                        "autoTerminateOnCritical or autoSuspendOnBlock, both false by "
+                        "default, AND protection mode >= BLOCK_SUSPICIOUS)");
+                } catch (const std::exception& ex) {
+                    Utils::Logger::Error(
+                        "RealTimeProtection: failed to register behavioural response "
+                        "callback: {}", ex.what());
+                }
+
                 // Wire BA into ThreatDetector (TD uses BA for behavioral scoring during scans)
                 try {
                     Core::Engine::ThreatDetector::Instance().SetBehaviorAnalyzer(&ba);

@@ -1820,59 +1820,118 @@ void BehaviorAnalyzer::CorrelateWithAttackChains(
 // ============================================================================
 
 void BehaviorAnalyzer::PerformAction(const BehaviorVerdict& verdict) {
-    switch (verdict.action) {
-        case RecommendedAction::Terminate:
-        case RecommendedAction::BlockAndQuarantine:
-        case RecommendedAction::IsolateEndpoint: {
-            std::shared_lock cbLock(m_impl->m_callbackMutex);
-            auto terminateCb = m_impl->m_terminationCallback;
-            cbLock.unlock();
+    // Detection is already complete and already reported by the time control
+    // reaches here: ProcessEvent fires the verdict callbacks BEFORE calling
+    // this, and the verdict is already counted. Everything below decides only
+    // whether to ACT on the process, so anything withheld here costs a
+    // response and never a detection.
 
-            if (terminateCb) {
-                bool terminated = terminateCb(verdict.processId, verdict.description);
-                if (terminated) {
-                    m_impl->m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_WARN(L"BehaviorAnalyzer", L"Process %u terminated: %ls",
-                                verdict.processId, verdict.threatName.c_str());
-
-                    std::unique_lock stateLock(m_impl->m_statesMutex);
-                    auto it = m_impl->m_processStates.find(verdict.processId);
-                    if (it != m_impl->m_processStates.end()) {
-                        it->second.hasBeenTerminated = true;
-                    }
-                }
-            } else {
-                SS_LOG_WARN(L"BehaviorAnalyzer", L"No termination callback for PID %u (action=%u)",
-                            verdict.processId, static_cast<uint32_t>(verdict.action));
-            }
-            break;
-        }
-
-        case RecommendedAction::Suspend: {
-            std::shared_lock cbLock(m_impl->m_callbackMutex);
-            auto terminateCb = m_impl->m_terminationCallback;
-            cbLock.unlock();
-
-            if (terminateCb) {
-                terminateCb(verdict.processId,
-                    L"Suspended: " + verdict.threatName);
-            }
-            break;
-        }
-
-        case RecommendedAction::Alert:
-            SS_LOG_WARN(L"BehaviorAnalyzer", L"ALERT: %ls (PID %u, score %.1f)",
-                        verdict.threatName.c_str(), verdict.processId, verdict.maliceScore);
-            break;
-
-        case RecommendedAction::Log:
-            SS_LOG_INFO(L"BehaviorAnalyzer", L"Suspicious: %ls (PID %u, score %.1f)",
-                        verdict.threatName.c_str(), verdict.processId, verdict.maliceScore);
-            break;
-
-        default:
-            break;
+    // Reporting-only actions need no responder.
+    if (verdict.action == RecommendedAction::None) {
+        return;
     }
+    if (verdict.action == RecommendedAction::Log) {
+        SS_LOG_INFO(L"BehaviorAnalyzer", L"Suspicious: %ls (PID %u, score %.1f)",
+                    verdict.threatName.c_str(), verdict.processId, verdict.maliceScore);
+        return;
+    }
+    if (verdict.action == RecommendedAction::Alert) {
+        SS_LOG_WARN(L"BehaviorAnalyzer", L"ALERT: %ls (PID %u, score %.1f)",
+                    verdict.threatName.c_str(), verdict.processId, verdict.maliceScore);
+        return;
+    }
+
+    // Everything from Suspend upwards acts on a live process.
+    //
+    // Snapshot the trust policy BEFORE taking the states lock. IsProcessTrusted
+    // is a pure predicate precisely so this function never nests m_configMutex
+    // inside m_statesMutex.
+    bool trustMicrosoftSigned = true;
+    bool trustVendorSigned = true;
+    {
+        std::shared_lock cfgLock(m_impl->m_configMutex);
+        trustMicrosoftSigned = m_impl->m_config.trustMicrosoftSigned;
+        trustVendorSigned = m_impl->m_config.trustVendorSigned;
+    }
+
+    {
+        std::shared_lock stateLock(m_impl->m_statesMutex);
+        auto it = m_impl->m_processStates.find(verdict.processId);
+        if (it != m_impl->m_processStates.end() &&
+            IsProcessTrusted(it->second, trustMicrosoftSigned, trustVendorSigned)) {
+            m_impl->m_stats.responseActionsWithheldByTrust.fetch_add(
+                1, std::memory_order_relaxed);
+            SS_LOG_WARN(L"BehaviorAnalyzer",
+                        L"Response withheld for trusted PID %u (action=%u): %ls",
+                        verdict.processId,
+                        static_cast<uint32_t>(verdict.action),
+                        verdict.threatName.c_str());
+            return;
+        }
+    }
+
+    std::shared_lock cbLock(m_impl->m_callbackMutex);
+    auto responder = m_impl->m_terminationCallback;
+    cbLock.unlock();
+
+    if (!responder) {
+        // Counted and stated, not silent. Before this, a Suspend verdict
+        // reached this point and returned without a word, so an engine with no
+        // responder at all was indistinguishable from one that had acted.
+        m_impl->m_stats.responseActionsNotCarriedOut.fetch_add(
+            1, std::memory_order_relaxed);
+        SS_LOG_WARN(L"BehaviorAnalyzer",
+                    L"No response callback registered - PID %u keeps running "
+                    L"(action=%u): %ls",
+                    verdict.processId,
+                    static_cast<uint32_t>(verdict.action),
+                    verdict.threatName.c_str());
+        return;
+    }
+
+    // The action is handed over so the responder can honour a reversible
+    // Suspend without escalating it into a kill. Both cases previously arrived
+    // through this same callback with no way to tell them apart.
+    bool carriedOut = false;
+    try {
+        carriedOut = responder(verdict.processId, verdict.action, verdict.description);
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"BehaviorAnalyzer", L"Response callback threw: %hs", e.what());
+    } catch (...) {
+        SS_LOG_ERROR(L"BehaviorAnalyzer", L"Response callback threw unknown exception");
+    }
+
+    if (!carriedOut) {
+        m_impl->m_stats.responseActionsNotCarriedOut.fetch_add(
+            1, std::memory_order_relaxed);
+        SS_LOG_WARN(L"BehaviorAnalyzer",
+                    L"Response declined for PID %u (action=%u): %ls",
+                    verdict.processId,
+                    static_cast<uint32_t>(verdict.action),
+                    verdict.threatName.c_str());
+        return;
+    }
+
+    // Only a Terminate-class action removes the process. A Suspend leaves it
+    // alive, so counting it as terminated would put a false number in the one
+    // statistic an operator reads to learn whether anything was actually
+    // stopped - and would mark the state hasBeenTerminated while the process
+    // is still there to generate more events.
+    if (verdict.action != RecommendedAction::Suspend) {
+        m_impl->m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
+
+        std::unique_lock stateLock(m_impl->m_statesMutex);
+        auto it = m_impl->m_processStates.find(verdict.processId);
+        if (it != m_impl->m_processStates.end()) {
+            it->second.hasBeenTerminated = true;
+        }
+    }
+
+    SS_LOG_WARN(L"BehaviorAnalyzer",
+                L"Response carried out on PID %u (action=%u): %ls",
+                verdict.processId,
+                static_cast<uint32_t>(verdict.action),
+                verdict.threatName.c_str());
 }
 
 // ============================================================================
@@ -1932,12 +1991,19 @@ bool BehaviorAnalyzer::IsSensitiveTarget(const BehaviorEvent& event) const {
     return false;
 }
 
-bool BehaviorAnalyzer::IsProcessTrusted(const ProcessBehaviorState& state) const {
+bool BehaviorAnalyzer::IsProcessTrusted(const ProcessBehaviorState& state,
+                                       bool trustMicrosoftSigned,
+                                       bool trustVendorSigned) const noexcept {
     if (state.isWhitelisted) return true;
 
-    std::shared_lock cfgLock(m_impl->m_configMutex);
-    if (m_impl->m_config.trustMicrosoftSigned && state.isSignedByMicrosoft) return true;
-    if (m_impl->m_config.trustVendorSigned && state.isSignedByTrustedVendor) return true;
+    // These two arms cannot fire today: nothing in this engine writes
+    // isSignedByMicrosoft or isSignedByTrustedVendor, so both are always false.
+    // They are kept rather than removed because the fields are public process
+    // state a future producer may legitimately fill, and because deleting them
+    // would silently drop the policy the configuration still advertises.
+    // Signature trust for destructive actions is enforced by the responder.
+    if (trustMicrosoftSigned && state.isSignedByMicrosoft) return true;
+    if (trustVendorSigned && state.isSignedByTrustedVendor) return true;
 
     return state.isSystemProcess;
 }

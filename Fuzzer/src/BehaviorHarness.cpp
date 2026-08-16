@@ -295,7 +295,12 @@ SSBehavior::BehaviorEvent FinalizeEvent(
     analyzer.SetRansomwareDetector(&ShadowStrike::Ransomware::RansomwareDetector::Instance());
     analyzer.SetInjectionDetector(&ShadowStrike::Core::Process::ProcessInjectionDetector::Instance());
     analyzer.SetPersistenceDetector(&ShadowStrike::Core::Registry::PersistenceDetector::Instance());
-    analyzer.SetTerminationCallback([](uint32_t, const std::wstring&) { return true; });
+    // Reports success without touching any process: a fuzz target must never
+    // actually terminate anything. Exercises the carried-out branch only.
+    analyzer.SetTerminationCallback(
+        [](uint32_t, ShadowStrike::Core::Engine::RecommendedAction, const std::wstring&) {
+            return true;
+        });
     analyzer.ResetStats();
     analyzer.ClearAllStates();
     return true;
