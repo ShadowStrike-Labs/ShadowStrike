@@ -273,6 +273,7 @@ void TorDetectorStatistics::Reset() noexcept {
     processMatches.store(0, std::memory_order_relaxed);
     tlsFingerprintMatches.store(0, std::memory_order_relaxed);
     connectionsBlocked.store(0, std::memory_order_relaxed);
+    blockRequestedNotPerformed.store(0, std::memory_order_relaxed);
     alertsGenerated.store(0, std::memory_order_relaxed);
     knownExitNodes.store(0, std::memory_order_relaxed);
     knownRelays.store(0, std::memory_order_relaxed);
@@ -933,8 +934,23 @@ void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, TorDetection
             alert.nodeFingerprint = conn.nodeInfo->fingerprint;
         }
 
-        // Determine if blocked
-        alert.wasBlocked = ShouldBlock(conn);
+        // INTENT vs OUTCOME.
+        //
+        // ShouldBlock() is a pure policy predicate: it snapshots the configured
+        // TorPolicy and the process-exception list under a shared lock and then
+        // returns a decision. It opens no handle, installs no filter and sends
+        // nothing to the kernel. Assigning its result to wasBlocked therefore
+        // reported "this connection was blocked" whenever blocking was merely
+        // CONFIGURED, on a module that has no mechanism to drop a connection.
+        //
+        // The request is recorded, the outcome is recorded as what actually
+        // happened, and the shortfall is counted where an operator can see it.
+        alert.blockRequested = ShouldBlock(conn);
+        alert.wasBlocked = false;
+
+        if (alert.blockRequested) {
+            m_statistics.blockRequestedNotPerformed.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Build description.
         // Method enum is small and fully internal — switch on it for the
@@ -966,6 +982,14 @@ void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, TorDetection
             default:
                 desc << "combined methods";
                 break;
+        }
+
+        // Make the enforcement gap visible in the text an operator actually
+        // reads. Without this, the only thing separating "we stopped this
+        // connection" from "we watched it happen" is a boolean nothing prints.
+        if (alert.blockRequested && !alert.wasBlocked) {
+            desc << " | BLOCK REQUESTED BUT NOT PERFORMED (policy asked for a block; "
+                    "nothing in this build drops a Tor connection)";
         }
 
         alert.description = desc.str();
@@ -2043,6 +2067,8 @@ bool TorDetector::ExportDiagnostics(const std::wstring& outputPath) const {
 
         out << "[Policy Statistics]\n";
         out << "Connections Blocked: " << stats.connectionsBlocked.load() << "\n";
+        out << "Block Requested But Not Performed: "
+            << stats.blockRequestedNotPerformed.load() << "\n";
         out << "Alerts Generated: " << stats.alertsGenerated.load() << "\n\n";
 
         // Node counts

@@ -571,6 +571,25 @@ struct alignas(256) VPNAlert {
 
     // Policy
     VPNPolicy appliedPolicy{ VPNPolicy::MONITOR };
+
+    /// @brief INTENT: the applied policy asked for this connection to be blocked.
+    ///
+    /// Set from the configured VPNPolicy (BLOCK_ALL / BLOCK_CONSUMER) after the
+    /// allowed-adapter exceptions are applied. It says what policy WANTED.
+    bool blockRequested{ false };
+
+    /// @brief OUTCOME: the connection was actually prevented.
+    ///
+    /// DEFAULT FALSE IS THE CONTRACT, and today nothing may set it true.
+    /// Measured: ApplyPolicy() - the function under this module's own
+    /// "POLICY ENFORCEMENT" banner - logs a line, increments a counter and
+    /// raises an alert. It does not disable the adapter, install a WFP filter,
+    /// add a firewall rule or terminate the owning process. There is no
+    /// mechanism in this module capable of stopping a VPN connection.
+    ///
+    /// Kept rather than removed because it is the correct field for a real
+    /// enforcement path to set, and because an operator must be able to tell
+    /// "policy wanted this blocked" apart from "this was blocked".
     bool wasBlocked{ false };
 
     // Leaks detected
@@ -669,7 +688,22 @@ struct alignas(128) VPNDetectorStatistics {
     std::atomic<uint64_t> ipRangeDetections{ 0 };
 
     // Policy statistics
+
+    /// @brief Connections this module actually prevented.
+    ///
+    /// NO PRODUCER TODAY, and its zero is therefore accurate. Until this
+    /// change ApplyPolicy() incremented it for every connection the POLICY
+    /// selected, so it counted decisions rather than blocks and could never
+    /// read zero on a machine running a VPN under a blocking policy - which
+    /// is precisely why the gap was invisible. Kept because it is the right
+    /// counter for a real enforcement path to feed.
     std::atomic<uint64_t> connectionsBlocked{ 0 };
+
+    /// @brief Detections where the policy asked for a block this build did not
+    ///        perform. This carries exactly what connectionsBlocked used to
+    ///        hold, under a name that is true.
+    std::atomic<uint64_t> blockRequestedNotPerformed{ 0 };
+
     std::atomic<uint64_t> alertsGenerated{ 0 };
 
     // Current state

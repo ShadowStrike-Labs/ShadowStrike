@@ -110,6 +110,15 @@ WANNACRY_DETECTOR_HPP_PATH = (
 # together with the thing it guards.
 TEST_MAIN_PATH = ROOT / "tests/test_main.cpp"
 
+# Two network detectors that reported a CONFIGURED policy as a PERFORMED block.
+# Neither module contains any mechanism capable of stopping a connection - no
+# WFP filter, no SetTcpEntry, no firewall rule, no process termination - so the
+# separation between what policy asked for and what happened is enforced here.
+TOR_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/TorDetector.cpp"
+TOR_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/TorDetector.hpp"
+VPN_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.cpp"
+VPN_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.hpp"
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -892,6 +901,124 @@ class SourceContractTests(unittest.TestCase):
             "The logger must be given the real temporary directory captured "
             "before the redirect, so its output survives sandbox disposal.",
         )
+
+    def test_the_network_detectors_never_report_policy_as_enforcement(self) -> None:
+        # Comments are stripped FIRST and that is load-bearing: the explanatory
+        # comments added with this fix necessarily QUOTE the old defect
+        # ("wasBlocked = ShouldBlock", the counter name, the false description
+        # string), so a comment-blind count is guaranteed to false-positive.
+        tor_cpp = strip_c_comments(read_source(TOR_DETECTOR_CPP_PATH))
+        tor_hpp = strip_c_comments(read_source(TOR_DETECTOR_HPP_PATH))
+        vpn_cpp = strip_c_comments(read_source(VPN_DETECTOR_CPP_PATH))
+        vpn_hpp = strip_c_comments(read_source(VPN_DETECTOR_HPP_PATH))
+
+        # --- TorDetector: the outcome may not be derived from the predicate ---
+        self.assertEqual(
+            tor_cpp.count("wasBlocked = ShouldBlock("),
+            0,
+            "TorDetector assigned a pure policy predicate to wasBlocked, so an "
+            "alert claimed a block whenever blocking was merely configured. "
+            "ShouldBlock() performs no I/O and this module has no mechanism to "
+            "drop a connection.",
+        )
+        self.assertEqual(
+            tor_cpp.count("blockRequested = ShouldBlock("),
+            1,
+            "The policy REQUEST must still be recorded exactly once, so deleting "
+            "the intent record fails as loudly as reintroducing the false claim.",
+        )
+        self.assertEqual(
+            tor_cpp.count("wasBlocked = true"),
+            0,
+            "Nothing in TorDetector performs enforcement, so nothing in it may "
+            "claim a performed block.",
+        )
+        self.assertGreaterEqual(
+            tor_cpp.count("alert.wasBlocked = false"),
+            1,
+            "TorDetector must state the outcome explicitly rather than leaving "
+            "it to a default a later edit could change.",
+        )
+
+        # --- VPNDetector: ApplyPolicy performs nothing, so it claims nothing ---
+        self.assertEqual(
+            vpn_cpp.count("m_stats.connectionsBlocked++"),
+            0,
+            "VPNDetector::ApplyPolicy incremented connectionsBlocked for every "
+            "connection the POLICY selected, so the counter measured decisions "
+            "rather than blocks and could never read zero under a blocking "
+            "policy - which is why the gap was invisible.",
+        )
+        self.assertEqual(
+            vpn_cpp.count('"VPN connection blocked"'),
+            0,
+            "The alert description asserted a block that never occurred. "
+            "A detection whose requested block was not performed must not be "
+            "rendered with the same words as a performed block.",
+        )
+        self.assertEqual(
+            vpn_cpp.count("wasBlocked = true"),
+            0,
+            "Nothing in VPNDetector disables an adapter, installs a WFP filter, "
+            "adds a firewall rule or terminates a process.",
+        )
+        self.assertEqual(
+            vpn_cpp.count("alert.wasBlocked = false"),
+            1,
+            "The VPN alert must record the outcome explicitly, exactly once.",
+        )
+        self.assertGreaterEqual(
+            vpn_cpp.count("alert.blockRequested = blockRequested"),
+            1,
+            "The policy request must still reach the alert.",
+        )
+
+        # --- Both counters must be plumbed, or they become structural zeros ---
+        # A counter added to a declaration but never incremented, or never
+        # cleared by Reset(), reads as permanently healthy - the same defect
+        # class as pool=0/0 (task 102).
+        for name, cpp, incr, reset in (
+            (
+                "TorDetector.cpp",
+                tor_cpp,
+                "m_statistics.blockRequestedNotPerformed.fetch_add(1",
+                "blockRequestedNotPerformed.store(0",
+            ),
+            (
+                "VPNDetector.cpp",
+                vpn_cpp,
+                "m_stats.blockRequestedNotPerformed++",
+                "blockRequestedNotPerformed = 0",
+            ),
+        ):
+            self.assertGreaterEqual(
+                cpp.count(incr),
+                1,
+                f"{name}: the enforcement-gap counter has no producer, so its "
+                f"zero would be structural rather than accurate.",
+            )
+            self.assertGreaterEqual(
+                cpp.count(reset),
+                1,
+                f"{name}: the enforcement-gap counter is not cleared by Reset(), "
+                f"so ResetStatistics() would leave a stale value behind.",
+            )
+
+        for name, hpp in (("TorDetector.hpp", tor_hpp), ("VPNDetector.hpp", vpn_hpp)):
+            self.assertGreaterEqual(
+                hpp.count("blockRequested"),
+                2,
+                f"{name}: the alert must declare the request separately from the "
+                f"outcome, and the statistics must name the gap.",
+            )
+            self.assertGreaterEqual(
+                hpp.count("wasBlocked"),
+                1,
+                f"{name}: the outcome field is kept deliberately - it is the "
+                f"correct field for a real enforcement path to set. Removing it "
+                f"would delete the only written statement of what such a path "
+                f"owes.",
+            )
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")

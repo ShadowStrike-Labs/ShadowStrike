@@ -497,6 +497,25 @@ struct alignas(256) TorAlert {
 
     // Policy
     TorPolicy appliedPolicy{ TorPolicy::MONITOR };
+
+    /// @brief INTENT: the applied policy asked for this connection to be blocked.
+    ///
+    /// Derived from ShouldBlock(), which is a pure policy predicate - it reads
+    /// the configured TorPolicy and the process-exception list under a shared
+    /// lock and performs no I/O whatsoever. A true value here therefore says
+    /// only what policy WANTED, never what happened to the connection.
+    bool blockRequested{ false };
+
+    /// @brief OUTCOME: the connection was actually prevented.
+    ///
+    /// DEFAULT FALSE IS THE CONTRACT, and today nothing may set it true.
+    /// Measured: TorDetector contains no WFP filter, no SetTcpEntry call, no
+    /// process termination and no FirewallManager call - there is no mechanism
+    /// in this module capable of dropping a TCP connection. The field is kept
+    /// rather than removed because it is the correct field for a real
+    /// enforcement path to set, and because an operator reading an alert must
+    /// be able to tell "policy wanted this blocked" apart from "this was
+    /// blocked". Reporting the former as the latter is what this split fixes.
     bool wasBlocked{ false };
 
     // Context
@@ -583,7 +602,22 @@ struct alignas(128) TorDetectorStatistics {
     std::atomic<uint64_t> tlsFingerprintMatches{ 0 };
 
     // Policy statistics
+
+    /// @brief Connections this module actually prevented.
+    ///
+    /// NO PRODUCER TODAY, and its zero is therefore accurate rather than
+    /// broken: nothing in TorDetector performs enforcement, so nothing is
+    /// permitted to increment this. Kept rather than deleted because it is the
+    /// right counter for a real enforcement path to feed, and deleting it
+    /// would remove the only written statement of what such a path owes
+    /// (same reasoning as TamperProtection::totalTamperingBlocked).
     std::atomic<uint64_t> connectionsBlocked{ 0 };
+
+    /// @brief Detections where the policy asked for a block this build did not
+    ///        perform. This is the named size of the enforcement gap, and it
+    ///        carries what connectionsBlocked used to imply.
+    std::atomic<uint64_t> blockRequestedNotPerformed{ 0 };
+
     std::atomic<uint64_t> alertsGenerated{ 0 };
 
     // Node list

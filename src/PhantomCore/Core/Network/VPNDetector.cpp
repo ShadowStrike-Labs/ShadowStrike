@@ -498,6 +498,7 @@ void VPNDetectorStatistics::Reset() noexcept {
     ipRangeDetections = 0;
 
     connectionsBlocked = 0;
+    blockRequestedNotPerformed = 0;
     alertsGenerated = 0;
 
     activeVPNConnections = 0;
@@ -1651,14 +1652,24 @@ public:
             }
 
             if (shouldBlock) {
-                SS_LOG_WARN(L"Network", L"Blocking VPN connection: %ls (policy=%d)",
+                // POLICY SELECTED THIS CONNECTION, AND THAT IS ALL THAT HAPPENS
+                // HERE. Nothing below disables the adapter, installs a WFP
+                // filter, adds a firewall rule or terminates the owning
+                // process, so the connection continues. The previous version of
+                // this branch logged "Blocking VPN connection", incremented a
+                // counter named connectionsBlocked and raised an alert whose
+                // description read "VPN connection blocked" - three statements
+                // of an outcome that never occurred.
+                SS_LOG_WARN(L"Network",
+                    L"VPN connection DETECTED BUT NOT BLOCKED (policy asked for a block; "
+                    L"nothing in this build stops a VPN connection): %ls (policy=%d)",
                     connection.providerName.c_str(),
                     static_cast<int>(currentPolicy));
 
-                m_stats.connectionsBlocked++;
+                m_stats.blockRequestedNotPerformed++;
 
-                // Generate alert
-                GenerateAlert(connection, true);
+                // Generate alert, recording the request rather than an outcome
+                GenerateAlert(connection, /*blockRequested=*/true);
 
             } else if (currentPolicy == VPNPolicy::MONITOR ||
                       currentPolicy == VPNPolicy::ALERT_ONLY) {
@@ -1677,7 +1688,11 @@ public:
         }
     }
 
-    void GenerateAlert(const VPNConnection& connection, bool wasBlocked) {
+    // The second parameter is the policy's REQUEST, not an outcome. It was
+    // previously named wasBlocked and assigned straight to alert.wasBlocked,
+    // which is how a configured policy came to be reported as a performed
+    // block on a module that performs none.
+    void GenerateAlert(const VPNConnection& connection, bool blockRequested) {
         VPNAlert alert;
         alert.alertId = ++m_nextAlertId;
         alert.timestamp = std::chrono::system_clock::now();
@@ -1696,13 +1711,24 @@ public:
         alert.processPath = connection.processPath;
         alert.processName = connection.processName;
 
-        alert.description = wasBlocked ? "VPN connection blocked" : "VPN connection detected";
+        // Three states, not two: a plain detection, a detection whose requested
+        // block was not carried out, and - once a real enforcement path exists -
+        // an actual block. Collapsing the middle state into the last is exactly
+        // the defect being removed, so it is spelled out here.
+        if (blockRequested) {
+            alert.description = "VPN connection DETECTED BUT NOT BLOCKED "
+                                "(policy asked for a block; nothing in this build "
+                                "stops a VPN connection)";
+        } else {
+            alert.description = "VPN connection detected";
+        }
 
         {
             std::shared_lock lock(m_mutex);
             alert.appliedPolicy = m_config.policy;
         }
-        alert.wasBlocked = wasBlocked;
+        alert.blockRequested = blockRequested;
+        alert.wasBlocked = false;
 
         alert.leaks = connection.detectedLeaks;
 
@@ -1848,6 +1874,8 @@ public:
             SS_LOG_INFO(L"Network", L"Active VPN connections: %u", m_stats.activeVPNConnections.load());
             SS_LOG_INFO(L"Network", L"Virtual adapters: %u", m_stats.virtualAdapters.load());
             SS_LOG_INFO(L"Network", L"Connections blocked: %llu", m_stats.connectionsBlocked.load());
+            SS_LOG_INFO(L"Network", L"Block requested but not performed: %llu",
+                        m_stats.blockRequestedNotPerformed.load());
             SS_LOG_INFO(L"Network", L"DNS leaks: %llu", m_stats.dnsLeaksDetected.load());
             SS_LOG_INFO(L"Network", L"IPv6 leaks: %llu", m_stats.ipv6LeaksDetected.load());
 
@@ -2396,6 +2424,7 @@ bool VPNDetector::ExportDiagnostics(const std::wstring& outputPath) const {
         uint32_t activeVPN;
         uint32_t virtualAdapt;
         uint64_t blocked;
+        uint64_t blockNotPerformed;
         uint64_t dnsLeaks;
         uint64_t ipv6Leaks;
         uint64_t alertsGen;
@@ -2413,6 +2442,7 @@ bool VPNDetector::ExportDiagnostics(const std::wstring& outputPath) const {
             activeVPN = stats.activeVPNConnections.load();
             virtualAdapt = stats.virtualAdapters.load();
             blocked = stats.connectionsBlocked.load();
+            blockNotPerformed = stats.blockRequestedNotPerformed.load();
             dnsLeaks = stats.dnsLeaksDetected.load();
             ipv6Leaks = stats.ipv6LeaksDetected.load();
             alertsGen = stats.alertsGenerated.load();
@@ -2439,6 +2469,7 @@ bool VPNDetector::ExportDiagnostics(const std::wstring& outputPath) const {
         file << L"Active VPN connections: " << activeVPN << L"\n";
         file << L"Virtual adapters: " << virtualAdapt << L"\n";
         file << L"Connections blocked: " << blocked << L"\n";
+        file << L"Block requested but not performed: " << blockNotPerformed << L"\n";
         file << L"DNS leaks: " << dnsLeaks << L"\n";
         file << L"IPv6 leaks: " << ipv6Leaks << L"\n";
         file << L"Alerts generated: " << alertsGen << L"\n";
