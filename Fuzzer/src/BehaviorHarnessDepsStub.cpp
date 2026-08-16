@@ -33,6 +33,26 @@ IndexLookupResult ThreatIntelIndex::LookupDomain(
 
 }  // namespace ShadowStrike::ThreatIntel
 
+namespace ShadowStrike::Utils::ProcessUtils {
+
+// SUBSTITUTED FOR SAFETY, NOT FOR CONVENIENCE.
+//
+// BehaviorBlocker reaches this when its analysis decides to stop a process, and
+// in this target that decision is driven by MUTATED INPUT. Linking the real
+// implementation would let a fuzz iteration terminate a real process tree on
+// the host machine, chosen by whatever pid the mutator happened to produce.
+// A fuzzer must never be able to do that, so this returns false: the blocker
+// records "termination failed" and the harness keeps running.
+//
+// Consequence stated plainly: the real TerminateProcessTree is therefore NOT
+// covered by this target. Covering it needs a harness that owns a disposable
+// child process of its own, which is a separate piece of work.
+bool TerminateProcessTree(ProcessId, DWORD, Error*) noexcept {
+    return false;
+}
+
+}  // namespace ShadowStrike::Utils::ProcessUtils
+
 namespace ShadowStrike::Whitelist {
 
 HashIndex::~HashIndex() = default;

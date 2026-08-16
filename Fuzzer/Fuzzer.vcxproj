@@ -59,7 +59,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\src\PhantomCore;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;SHADOWSTRIKE_FUZZING=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;SHADOWSTRIKE_FUZZING=1;SHADOWSTRIKE_DIAG_TRACE=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 /wd4005 /wd4458 /wd4324 /wd4459 /wd4456 /wd4244 /wd4359 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -76,7 +76,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\src\PhantomCore;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;SHADOWSTRIKE_FUZZING=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;SHADOWSTRIKE_FUZZING=1;SHADOWSTRIKE_DIAG_TRACE=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 /wd4005 /wd4458 /wd4324 /wd4459 /wd4456 /wd4244 /wd4359 %(AdditionalOptions)</AdditionalOptions>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
@@ -278,6 +278,30 @@
     <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_private_key.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\FileUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\HashUtils.cpp" />
+    <!-- ====================================================================
+         Infrastructure the harnesses reach through product code.
+
+         These are compiled REAL rather than substituted in the stub layer,
+         because each is cheap, deterministic and mutates nothing that a
+         mutated input could steer:
+
+           DataStorePaths.cpp   resolves paths and is what ScanEngine asks for
+                                its own self exclusion set, so a fake would
+                                make the exclusion harness vacuous.
+           DiagTrace.cpp        compiles to empty bodies here because this
+                                project sets SHADOWSTRIKE_DIAG_TRACE=0; the
+                                symbols must still exist for ScanEngine.
+           FilterPortGate.cpp   100 lines, no conditional compilation. Linking
+                                the real one means an absent driver reports a
+                                real failure HRESULT instead of a stub
+                                pretending the kernel channel came up.
+
+         Anything DESTRUCTIVE or environment coupled stays in the stub layer
+         on purpose. See TerminateProcessTree in BehaviorHarnessDepsStub.cpp.
+         ==================================================================== -->
+    <ClCompile Include="..\src\PhantomCore\Utils\DataStorePaths.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Diagnostics\DiagTrace.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Communication\FilterPortGate.cpp" />
     <ClCompile Include="..\src\PhantomCore\SignatureStore\SignatureFormat.cpp" />
     <ClCompile Include="..\src\PhantomCore\PatternStore\PatternStore.cpp" />
     <ClCompile Include="..\src\PhantomCore\PatternStore\PatternIndex.cpp" />

@@ -168,6 +168,32 @@ LookupResult WhitelistStore::IsHashWhitelisted(
     return result;
 }
 
+// ScanEngine::Initialize seeds a whitelist, which on the real store means
+// WhitelistStore::Create allocating its database file up front. The real
+// default is 100 MB (WhiteListStore.hpp: initialSizeBytes = 100 * 1024 * 1024),
+// so linking the real implementation would write 100 MB per fuzz iteration that
+// re-initialises the engine. Substituted here for that reason alone; the
+// lookup behaviour above is what the harness actually exercises.
+StoreError WhitelistStore::Create(const std::wstring&, uint64_t) noexcept {
+    m_initialized.store(true, std::memory_order_release);
+    m_readOnly.store(false, std::memory_order_release);
+    return {};
+}
+
+StoreError WhitelistStore::Save() noexcept {
+    return {};
+}
+
+StoreError WhitelistStore::AddPublisher(
+    std::wstring_view,
+    WhitelistReason,
+    std::wstring_view,
+    uint64_t,
+    uint32_t) noexcept
+{
+    return {};
+}
+
 }  // namespace ShadowStrike::Whitelist
 
 namespace ShadowStrike::ThreatIntel {
@@ -197,10 +223,26 @@ ThreatIntelStore::ThreatIntelStore() = default;
 ThreatIntelStore::~ThreatIntelStore() = default;
 
 bool ThreatIntelStore::Initialize(const StoreConfig&) {
+    m_isInitialized.store(true, std::memory_order_release);
     return true;
 }
 
 void ThreatIntelStore::Shutdown() {
+    m_isInitialized.store(false, std::memory_order_release);
+}
+
+// ScanEngine consults Shared()/IsInitialized() before using the store. The two
+// must agree with Initialize above: a stub that reported "initialized" without
+// anything having initialised it would let the harness take the store-backed
+// path while every lookup answered from nothing, which is indistinguishable
+// from a clean verdict.
+std::shared_ptr<ThreatIntelStore> ThreatIntelStore::Shared() {
+    static std::shared_ptr<ThreatIntelStore> instance = std::make_shared<ThreatIntelStore>();
+    return instance;
+}
+
+bool ThreatIntelStore::IsInitialized() const noexcept {
+    return m_isInitialized.load(std::memory_order_acquire);
 }
 
 StoreLookupResult ThreatIntelStore::LookupHash(
@@ -754,6 +796,15 @@ int64_t LogDB::LogDetailed(const LogEntry&, DatabaseError*) {
     return 1;
 }
 
+// Deliberately answers TRUE. Callers use WouldLog to decide whether to build a
+// log message at all, and those messages are formatted FROM the mutated input,
+// so answering false would quietly remove that formatting code from everything
+// the fuzzer reaches. LogDetailed above discards the entry, so saying yes costs
+// nothing and keeps the coverage.
+bool LogDB::WouldLog(LogLevel) const {
+    return true;
+}
+
 }  // namespace ShadowStrike::Database
 
 namespace ShadowStrike::SignatureStore::Store {
@@ -767,6 +818,10 @@ std::string GetVersion() noexcept {
 namespace ShadowStrike::Core::FileSystem {
 
 AnalysisOptions AnalysisOptions::CreateFull() noexcept {
+    return AnalysisOptions{};
+}
+
+AnalysisOptions AnalysisOptions::CreateQuick() noexcept {
     return AnalysisOptions{};
 }
 

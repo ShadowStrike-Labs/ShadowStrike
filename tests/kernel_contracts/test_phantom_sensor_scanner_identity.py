@@ -72,6 +72,7 @@ BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyze
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
+FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 
 
 def read_source(path: Path) -> str:
@@ -212,6 +213,7 @@ class SourceContractTests(unittest.TestCase):
         cls.real_time_protection_cpp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
         cls.communication_hpp = read_source(COMMUNICATION_HPP_PATH)
         cls.message_dispatcher_cpp = read_source(MESSAGE_DISPATCHER_CPP_PATH)
+        cls.fuzzer_vcxproj = read_source(FUZZER_VCXPROJ_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -2003,6 +2005,113 @@ class SourceContractTests(unittest.TestCase):
                 f"{name} must bound the variable region against the delivered payload "
                 f"size, both for the fixed part and for the variable part",
             )
+
+
+    # ------------------------------------------------------------------
+    # The fuzz target is built by nothing on a normal day, so anything that
+    # rots in its project file stays invisible until somebody builds it. It
+    # went four months and eighteen unresolved externals before anyone did.
+    # These two pin the invariants that CANNOT be recovered from a link
+    # error, because they fail as missing capability rather than as a
+    # missing symbol.
+    # ------------------------------------------------------------------
+
+    def _fuzzer_listed_name(self, path: Path) -> str:
+        """The spelling Fuzzer.vcxproj uses for a repo-relative source."""
+        return "..\\" + str(path.relative_to(ROOT)).replace("/", "\\")
+
+    def _product_sources_mentioning(self, macro: str) -> list[Path]:
+        found = [
+            candidate
+            for candidate in sorted((ROOT / "src").rglob("*.cpp"))
+            if macro in read_source(candidate)
+        ]
+        # A guard that silently stops guarding is worse than no guard: if the
+        # walk ever stops finding anything, say so instead of passing.
+        self.assertNotEqual(
+            found, [],
+            f"no product source mentions {macro}; this test has stopped "
+            f"checking anything and must be repaired or removed",
+        )
+        return found
+
+    def test_every_fuzzing_only_product_hook_is_compiled_by_the_fuzzer(self):
+        project = self.fuzzer_vcxproj
+
+        self.assertIn(
+            "SHADOWSTRIKE_FUZZING=1", project,
+            "Fuzzer.vcxproj must define SHADOWSTRIKE_FUZZING or every "
+            "fuzzing-only hook in the product compiles away",
+        )
+
+        # A hook guarded by SHADOWSTRIKE_FUZZING only exists in the binary if
+        # the file declaring it is compiled BY THIS PROJECT. Today that is
+        # NetworkTrafficFilter::ResetFuzzingState, which TrafficHarness.cpp
+        # calls to isolate one iteration from the next. Add the guard to a
+        # file the project does not list and the hook silently is not there.
+        missing = [
+            str(source.relative_to(ROOT))
+            for source in self._product_sources_mentioning("SHADOWSTRIKE_FUZZING")
+            if self._fuzzer_listed_name(source) not in project
+        ]
+
+        self.assertEqual(
+            missing, [],
+            "these product sources are compiled conditionally on "
+            "SHADOWSTRIKE_FUZZING but are not listed in Fuzzer.vcxproj, so "
+            "whatever they define under that macro does not exist in the "
+            "fuzzer binary: " + ", ".join(missing),
+        )
+
+    def test_the_focused_build_macro_is_applied_to_every_listed_file_that_tests_it(self):
+        project = self.fuzzer_vcxproj
+        macro = "SHADOWSTRIKE_RTP_FOCUSED_BUILD"
+
+        def element_for(listed: str) -> Optional[str]:
+            marker = f'<ClCompile Include="{listed}"'
+            start = project.find(marker)
+            if start < 0:
+                return None
+            tail = project[start:]
+            self_closing = tail.find("/>")
+            closing = tail.find("</ClCompile>")
+            if closing < 0 or (0 <= self_closing < closing):
+                return tail[: self_closing + 2]
+            return tail[: closing + len("</ClCompile>")]
+
+        # This macro selects a REDUCED view of the product. It is applied
+        # per file, not project wide, so two translation units in one binary
+        # can disagree about what the same class provides. Three product
+        # sources test it; the project lists one and gives it the macro.
+        # Adding a second WITHOUT the macro compiles the full branch beside
+        # the reduced one - the divergent-view defect that produced the ODR
+        # heap corruption in the test suite, and it would not show up as a
+        # link error.
+        covered = 0
+        offenders = []
+        for source in self._product_sources_mentioning(macro):
+            listed = self._fuzzer_listed_name(source)
+            element = element_for(listed)
+            if element is None:
+                continue  # not compiled here, so it cannot diverge
+            covered += 1
+            if macro not in element:
+                offenders.append(str(source.relative_to(ROOT)))
+
+        self.assertEqual(
+            offenders, [],
+            "Fuzzer.vcxproj compiles these sources without "
+            f"{macro} while they test it, so this binary would hold both the "
+            "reduced and the full view of the same product: "
+            + ", ".join(offenders),
+        )
+
+        self.assertGreaterEqual(
+            covered, 1,
+            f"no file testing {macro} is compiled by the fuzzer any more; if "
+            "that is deliberate the per-file macro should be removed from "
+            "the project as well, so the two cannot drift apart",
+        )
 
 
 @dataclass(frozen=True)
