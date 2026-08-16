@@ -1670,9 +1670,28 @@ void ShadowCopyProtector::Shutdown() {
         event.commandLine = std::wstring(commandLine);
         event.blockRequested = true;
         event.wasBlocked = false;
-        event.details = L"DETECTED BUT NOT BLOCKED: VSS destruction attempt at process creation; "
-                        L"a Block verdict was returned but this build has no path that delivers "
-                        L"it to the kernel, so the process was allowed to start";
+        // The claim is scoped to THIS MODULE on purpose. It used to end "so the
+        // process was allowed to start", which asserts a product-wide outcome
+        // this module cannot observe - and MEASURED, it is frequently false:
+        // BackupProtector is wired to the same process-creation event, matches
+        // the same vssadmin / wmic / PowerShell shadow-deletion commands, and
+        // its AnalyzeProcess raises its own alert, moves vssDeletesBlocked and
+        // calls ExecuteTermination when the action is BlockKill. So the process
+        // may well have been terminated by the backup guard while this text
+        // announced that it started.
+        //
+        // Two Critical alerts for one command are tolerable when they are
+        // complementary; two that disagree about the outcome are not, and the
+        // one that cannot see the enforcement is the one that must stop
+        // narrating it. What this module uniquely contributes is the VSS
+        // classification (attack TYPE, T1490 attribution, snapshot
+        // correlation), so that is what it reports.
+        event.details = L"VSS destruction attempt classified at process creation. "
+                        L"ShadowCopyProtector returned a Block verdict but delivered no "
+                        L"kernel block: this build has no transport that carries a "
+                        L"ransomware-module verdict to PhantomSensor. Whether the process "
+                        L"was stopped depends on another module's response, which this "
+                        L"module cannot observe.";
 
         m_impl->RecordAttackEvent(event);
         m_impl->IncrementAttackStats(attackType.value(), /*blockRequested=*/true,
@@ -1685,8 +1704,14 @@ void ShadowCopyProtector::Shutdown() {
             if (AlertSystem::HasInstance()) {
                 // Severity stays Critical: a VSS destruction attempt this build
                 // did NOT stop is at least as urgent as one it did.
-                std::string subject = "VSS Attack DETECTED BUT NOT BLOCKED (PID " +
-                                      std::to_string(pid) + ")";
+                //
+                // The subject names the CLASSIFICATION, not a product-wide
+                // outcome. BackupProtector co-detects this command on the same
+                // event and can terminate the process, so a subject asserting
+                // "NOT BLOCKED" could contradict the alert raised beside it.
+                std::string subject = "VSS destruction attempt classified: " +
+                                      std::string(GetVSSAttackTypeName(attackType.value())) +
+                                      " (PID " + std::to_string(pid) + ")";
                 (void)AlertSystem::Instance().RaiseAlert(
                     AlertSeverity::Critical, AlertType::ThreatDetection,
                     subject, event.ToJson(), "ShadowCopyProtector");
@@ -1702,14 +1727,22 @@ void ShadowCopyProtector::Shutdown() {
                 data["parent_pid"] = std::to_string(parentPid);
                 data["attack_type"] = std::string(GetVSSAttackTypeName(attackType.value()));
                 data["image"] = Utils::StringUtils::ToNarrow(filename);
-                data["action"] = "kernel_blocked";
+                // Neither the key nor this field may name a block. They read
+                // "vss_attack_blocked" and "kernel_blocked" before, which is
+                // the over-claimed-outcome defect in the one channel a SOC
+                // ingests: 9c4daf96 corrected the event flags and the alert but
+                // left the telemetry asserting an enforcement that never
+                // happened, so a pipeline aggregating on this key counted
+                // blocks that do not exist.
+                data["action"] = "classified_no_kernel_block_delivered";
                 data["mitre_technique"] = "T1490";
-                TelemetryCollector::Instance().RecordCustom("vss_attack_blocked", data);
+                TelemetryCollector::Instance().RecordCustom("vss_attack_detected", data);
             }
         } catch (...) {}
 
         Utils::Logger::Fatal(
-            "ShadowCopyProtector: KERNEL BLOCKED process creation [Type={}] [PID={}] [Image={}] [ParentPID={}]",
+            "ShadowCopyProtector: VSS destruction attempt classified, NO kernel block delivered "
+            "[Type={}] [PID={}] [Image={}] [ParentPID={}]",
             static_cast<int>(attackType.value()), pid,
             Utils::StringUtils::ToNarrow(filename), parentPid);
 
