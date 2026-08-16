@@ -80,6 +80,15 @@ BACKUP_PROTECTOR_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/BackupP
 TAMPER_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/TamperProtection.hpp"
 TAMPER_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/SelfProtection/TamperProtection.cpp"
 
+# The exploit tier, split into blockRequested / wasBlocked by 9971ef9e.
+ROP_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/Exploits/ROPProtection.cpp"
+STACK_PIVOT_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/StackPivotDetector.cpp"
+JIT_SPRAY_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/JITSprayDetector.cpp"
+JIT_SPRAY_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Exploits/JITSprayDetector.hpp"
+KERNEL_EXPLOIT_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/KernelExploitDetector.cpp"
+ATOM_BOMBING_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombingDetector.cpp"
+ATOM_BOMBING_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombingDetector.hpp"
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -383,6 +392,120 @@ class SourceContractTests(unittest.TestCase):
         # accurate rather than as a broken metric.
         self.assertEqual(cpp.count("snap.totalTamperingBlocked"), 1)
         self.assertEqual(cpp.count("m_stats.totalTamperingBlocked.store(0"), 1)
+
+    def test_the_exploit_tier_never_claims_a_block_it_did_not_perform(self) -> None:
+        """wasBlocked may only be set where enforcement ran AND reported success.
+
+        9971ef9e split blockRequested (configured INTENT) from wasBlocked
+        (enforcement carried out) across five exploit-tier modules, after finding
+        seven sites that answered "attack blocked" whenever blocking was merely
+        CONFIGURED - and one that discarded TerminateProcess's return value.
+
+        This is a source-text contract because four of the five modules have no
+        behavioural test that could catch a regression: reaching their claim
+        sites needs a live kernel memory alert or a real stack pivot. The
+        residual claim COUNT is therefore the enforceable invariant, and it is
+        measured here rather than trusted from a commit message.
+
+        Comments are stripped FIRST. The explanatory comments added by that
+        commit necessarily QUOTE the old defect, so a comment-blind count is
+        guaranteed to produce false positives - that has now happened five times.
+        """
+        claim = re.compile(r"\bwasBlocked\s*=\s*true\b")
+
+        # Measured after 9971ef9e. The two permitted sites are the only places in
+        # the tier where a process was actually terminated and the call reported
+        # success; the three zeros are modules that perform no enforcement at all,
+        # because user mode cannot un-queue an APC, un-spray a JIT page or
+        # un-execute a ROP chain that has already run.
+        expected = (
+            ("ROPProtection.cpp", ROP_PROTECTION_CPP_PATH, 1),
+            ("StackPivotDetector.cpp", STACK_PIVOT_DETECTOR_CPP_PATH, 1),
+            ("JITSprayDetector.cpp", JIT_SPRAY_DETECTOR_CPP_PATH, 0),
+            ("KernelExploitDetector.cpp", KERNEL_EXPLOIT_DETECTOR_CPP_PATH, 0),
+            ("AtomBombingDetector.cpp", ATOM_BOMBING_DETECTOR_CPP_PATH, 0),
+        )
+
+        stripped: dict[str, str] = {}
+        offenders: list[str] = []
+        for name, path, allowed in expected:
+            body = strip_c_comments(read_source(path))
+            stripped[name] = body
+            found = len(claim.findall(body))
+            if found != allowed:
+                offenders.append(
+                    f"{name}: {found} wasBlocked=true site(s), expected {allowed}"
+                )
+        # Report only the mismatch, never the haystack.
+        self.assertEqual(
+            offenders,
+            [],
+            "an exploit-tier module claims a block it does not perform: "
+            + "; ".join(offenders),
+        )
+
+        # The count alone would accept MOVING a claim into a blockOn* branch, so
+        # each surviving claim must sit downstream of a checked enforcement call.
+        rop = stripped["ROPProtection.cpp"]
+        rop_claim = claim.search(rop)
+        self.assertIsNotNone(rop_claim, "ROPProtection must still be able to block")
+        assert rop_claim is not None  # narrow for type checkers
+        window = rop[max(0, rop_claim.start() - 800) : rop_claim.start()]
+        self.assertIn(
+            "::TerminateProcess(",
+            window,
+            "ROPProtection's only block claim must follow a TerminateProcess call "
+            f"whose result was tested (claim at offset {rop_claim.start()})",
+        )
+
+        pivot = stripped["StackPivotDetector.cpp"]
+        pivot_claim = claim.search(pivot)
+        self.assertIsNotNone(pivot_claim, "StackPivotDetector must still be able to block")
+        assert pivot_claim is not None
+        guard = pivot.find("if (terminated)")
+        self.assertNotEqual(
+            guard,
+            -1,
+            "StackPivotDetector must test TerminateProcess's return value; the "
+            "defect fixed by 9971ef9e was discarding it",
+        )
+        self.assertGreater(
+            pivot_claim.start(),
+            guard,
+            "StackPivotDetector's block claim must sit INSIDE the success branch "
+            f"(guard at {guard}, claim at {pivot_claim.start()})",
+        )
+
+        # The gap counter must survive a copy. JITSprayStatistics and
+        # AtomBombingStatistics both carry HAND-WRITTEN copy constructors and
+        # assignment operators, so a member added to the declaration alone is
+        # silently dropped on every copy - which is exactly how a counter rots
+        # into a structural zero (task 102).
+        jit_hpp = strip_c_comments(read_source(JIT_SPRAY_DETECTOR_HPP_PATH))
+        self.assertGreaterEqual(
+            jit_hpp.count("blockRequestedNotPerformed"),
+            3,
+            "JITSprayDetector.hpp must carry the gap counter in its declaration "
+            "AND in both hand-written copy operations",
+        )
+        atom_hpp = strip_c_comments(read_source(ATOM_BOMBING_DETECTOR_HPP_PATH))
+        self.assertGreaterEqual(
+            atom_hpp.count("blockRequestedNotPerformed"),
+            2,
+            "AtomBombingDetector.hpp must carry the gap counter in its "
+            "declaration AND in its hand-written copy assignment",
+        )
+
+        # Every module must record the INTENT it used to claim as an outcome,
+        # otherwise the policy flag becomes unobservable rather than honest.
+        missing = [
+            name for name, body in stripped.items() if "blockRequested" not in body
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "these modules dropped the configured-intent record: " + ", ".join(missing),
+        )
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
