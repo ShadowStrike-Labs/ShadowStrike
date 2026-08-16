@@ -501,6 +501,78 @@ TEST(WireFormatContractTest, OnlyMaliciousBlocksAProcessCreation) {
 }
 
 // ============================================================================
+// A KERNEL REPLY IS BOUNDED BY THE KERNEL'S OWN BUFFER, NOT BY A FRAME HEADER
+// ============================================================================
+//
+// The driver's reply buffer is a stack struct sized EXACTLY sizeof(struct) at all
+// three sites (PreCreate.c:705, ScanBridge.c:1159, ProcessNotify.c:3687), and the
+// reply path performs NO decryption -- the only EncDecrypt in CommPort.c (:2947)
+// is the user->kernel MESSAGE path. So this carrier accepts exactly one shape: a
+// bare, plaintext, fixed-size verdict struct. These cases pin that shape.
+
+TEST(WireFormatContractTest, BothVerdictRepliesFitTheKernelReplyBuffer) {
+    EXPECT_LE(sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY),
+              SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+    EXPECT_LE(sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY),
+              SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+
+    // The bound is the LARGER of the two rather than an arbitrary ceiling: it is
+    // exactly what the biggest reply buffer in the driver can receive.
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY),
+              SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+    EXPECT_EQ(size_t{ 26 }, SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+}
+
+// THE DISCRIMINATOR against the retired gate, which encrypted a reply above
+// sizeof(SHADOWSTRIKE_MESSAGE_HEADER) == 40. The real ceiling is 26, so there were
+// TWO broken regions and not one:
+//   27..40 bytes -> sent as plaintext and then REFUSED by Filter Manager for its
+//                   length; the kernel waits out its whole budget and fails open.
+//   41+   bytes -> silently ENCRYPTED, after which the driver parses
+//                   [ENC_HEADER][ciphertext] as the verdict struct and reads
+//                   Verdict out of an ENC_HEADER byte.
+// A test asserting only "under 40" would have passed throughout both regions.
+TEST(WireFormatContractTest, TheRetiredFortyByteGateWasFourteenBytesTooPermissive) {
+    EXPECT_LT(SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE,
+              sizeof(SHADOWSTRIKE_MESSAGE_HEADER))
+        << "the retired gate compared a bare reply struct against the size of a "
+           "frame header the reply does not contain; the difference is the width "
+           "of the silent-failure window";
+    EXPECT_EQ(size_t{ 40 }, sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    EXPECT_EQ(size_t{ 14 },
+              sizeof(SHADOWSTRIKE_MESSAGE_HEADER) - SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+}
+
+// A THREAT NAME CANNOT TRAVEL ON THE REPLY CARRIER AT ALL -- not merely "only if
+// it is short". MessageDispatcher::SerializeVerdictReply sizes its buffer
+// sizeof(ScanVerdictReplyData) + threatName.length() * sizeof(wchar_t) and hands
+// the result to ReplyMessage, so ONE character already overruns the kernel buffer.
+// The variable-length form belongs on the MESSAGE carrier
+// (FilterMessageType_ScanVerdict -> MhpHandleScanVerdict, MessageHandler.c:2234),
+// which accepts PayloadSize >= sizeof(struct), forwards the full length, and is
+// decrypted. This case exists so that fact is stated rather than rediscovered.
+TEST(WireFormatContractTest, AnyThreatNameAtAllOverrunsTheReplyCarrier) {
+    using ShadowStrike::Communication::ScanVerdictReplyData;
+
+    // The user-mode serialiser's fixed part must match the kernel struct byte for
+    // byte, or the offsets asserted above describe a different layout than the one
+    // actually sent.
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY), sizeof(ScanVerdictReplyData));
+
+    constexpr size_t kFixed = sizeof(ScanVerdictReplyData);
+    EXPECT_LE(kFixed, SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+
+    // One wide character is already one too many.
+    EXPECT_GT(kFixed + sizeof(wchar_t), SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+
+    // ... while the retired gate tolerated SEVEN of them in plaintext and only
+    // switched to ciphertext at the eighth. Both behaviours are wrong, differently,
+    // which is why the fix refuses instead of re-choosing a threshold.
+    EXPECT_LE(kFixed + 7 * sizeof(wchar_t), sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+    EXPECT_GT(kFixed + 8 * sizeof(wchar_t), sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+}
+
+// ============================================================================
 // PER-TYPE STATISTICS MUST COVER EVERY TYPE ON THE WIRE
 // ============================================================================
 //

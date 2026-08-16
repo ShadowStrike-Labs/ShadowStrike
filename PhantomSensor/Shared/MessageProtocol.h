@@ -331,6 +331,75 @@ typedef struct _SHADOWSTRIKE_SCAN_VERDICT_REPLY {
 } SHADOWSTRIKE_SCAN_VERDICT_REPLY, *PSHADOWSTRIKE_SCAN_VERDICT_REPLY;
 
 //
+// FIELD OFFSETS PINNED, BECAUSE THE VERDICT BYTE IS LOAD-BEARING FOR A BLOCKING
+// FILE CREATE. PreCreate reads Verdict to decide STATUS_ACCESS_DENIED and
+// Verdict_Malicious is the only value that denies. Verdict sits at offset 8 -
+// the SAME offset it occupies in SHADOWSTRIKE_PROCESS_VERDICT_REPLY - so replying
+// with the wrong one of the two reply structs yields a correct-looking verdict
+// byte and a reply Filter Manager rejects only for its length. Pinning the layout
+// means a future field insertion fails the build instead of silently shifting the
+// verdict under its reader.
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY) == 26);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, MessageId)        ==  0);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, Verdict)          ==  8);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, ResultCode)       ==  9);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, ThreatDetected)   == 13);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, ThreatScore)      == 14);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, CacheResult)      == 15);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, CacheTTL)         == 16);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, Reserved)         == 20);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_SCAN_VERDICT_REPLY, ThreatNameLength) == 24);
+
+//
+// ==========================================================================
+// A VERDICT STRUCT HAS TWO CARRIERS AND ONLY ONE OF THEM IS VARIABLE-LENGTH
+// ==========================================================================
+//
+// CARRIER 1 - THE FILTER MANAGER REPLY. The driver calls FltSendMessage supplying
+// a reply buffer; user mode answers with FilterReplyMessage. Every reply buffer in
+// this driver is a stack object sized EXACTLY sizeof(struct):
+//     PreCreate.c:705       ULONG  ReplySize = sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY)
+//     ScanBridge.c:1159     replySize = sizeof(reply)          // same struct
+//     ProcessNotify.c:3687  SIZE_T ReplySize = sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY)
+// Two consequences follow, and both are contracts rather than accidents:
+//   (a) the ThreatName declared above CANNOT be delivered on this carrier, and a
+//       reply longer than the struct is refused by Filter Manager - after which
+//       the kernel waits out its whole budget and fails open, leaving a single
+//       Debug line as the only evidence that a verdict was computed and lost;
+//   (b) this carrier is NOT DECRYPTED. The sole EncDecrypt in CommPort.c (:2947)
+//       is on the user->kernel MESSAGE path; nothing on the reply path examines an
+//       ENC_HEADER. Ciphertext arriving here is parsed as the struct itself, which
+//       would read Verdict out of an ENC_HEADER byte.
+//
+// CARRIER 2 - AN ORDINARY MESSAGE. FilterMessageType_ScanVerdict sent as a normal
+// message reaches MhpHandleScanVerdict (MessageHandler.c:2234), which accepts
+// PayloadSize >= sizeof(struct) and forwards the FULL PayloadSize to
+// MqCompleteMessage. That path IS decrypted and DOES carry ThreatName.
+//
+// The bound below governs CARRIER 1 ONLY. Carrier 2 keeps its variable-length
+// capability untouched - a threat name is still deliverable there, and that is
+// where a caller wanting one must send it.
+//
+#define SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE                                     \
+    (sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY) >                                 \
+     sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY)                                \
+        ? sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY)                              \
+        : sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY))
+
+C_ASSERT(sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY)    <= SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+C_ASSERT(sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY) <= SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE);
+
+//
+// The literal is deliberate and is a REVIEW PROMPT, not a duplicate of the
+// expression above. The driver's three reply buffers are sized from the structs so
+// they grow automatically; the user-mode sender's refusal threshold and the tests
+// that pin it do not. Failing here is how a struct change is made to visit both
+// sides of the carrier instead of one.
+//
+C_ASSERT(SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE == 26);
+
+//
 // 3. Process Notification (FilterMessageType_ProcessNotify)
 //
 typedef struct _SHADOWSTRIKE_PROCESS_NOTIFICATION {

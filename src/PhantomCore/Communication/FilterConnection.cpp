@@ -730,19 +730,60 @@ public:
             return false;
         }
 
-        // Encrypt reply payload if session key established — NEVER fall back to plaintext
+        // A REPLY IS NEVER ENCRYPTED, AND THAT IS NOW A CONTRACT RATHER THAN A
+        // COINCIDENCE.
+        //
+        // The gate here used to be
+        //     m_encryptionEstablished && replyBuffer.size() > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+        // copied verbatim from the SEND paths (SendMessageWithReply, SendMessage),
+        // where sendBuffer is a framed [SHADOWSTRIKE_MESSAGE_HEADER][payload]
+        // message and "> 40" correctly means "there is a payload to encrypt". On
+        // THIS path replyBuffer is a BARE STRUCT, not a framed message - the
+        // comment immediately below says exactly that - so testing its length
+        // against the size of a header it does not contain is a category error,
+        // not a badly chosen threshold.
+        //
+        // It never fired only because both reply structs are under 40 bytes (scan
+        // verdict 26, process verdict 16). Had either crossed it, the reply would
+        // have been silently encrypted and the driver - which performs NO
+        // decryption on the reply path, the sole EncDecrypt in CommPort.c (:2947)
+        // being the user->kernel message path - would have parsed
+        // [ENC_HEADER][ciphertext] as the verdict struct. Verdict lives at offset 8
+        // and Verdict_Malicious is 2, so an arbitrary byte inside ENC_HEADER would
+        // have decided whether a file was blocked: the same defect as reading a
+        // verdict out of recycled pool memory (73061389), and wrong in both
+        // directions - a false block and a false allow are equally reachable.
+        //
+        // Encrypting a reply cannot protect it, because the peer never decrypts it;
+        // it can only corrupt it. Authenticity on this path comes from the port and
+        // not from the payload: only a client ShadowStrikeVerifyClient accepted
+        // holds a handle able to reply at all.
         std::span<const uint8_t> actualReply = replyBuffer;
-        std::vector<uint8_t> encryptedReply;
-        if (m_encryptionEstablished.load(std::memory_order_acquire) &&
-            replyBuffer.size() > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
-            if (EncryptSendMessage(replyBuffer, encryptedReply)) {
-                actualReply = std::span<const uint8_t>(encryptedReply);
-            } else {
-                Utils::Logger::Error("[FilterConnection] ReplyMessage: Encryption failed, "
-                                     "dropping reply (no plaintext fallback)");
-                m_stats.errors++;
-                return false;
-            }
+
+        // REFUSE WHAT THE KERNEL CANNOT RECEIVE, HERE, WHERE THE CALLER IS KNOWN.
+        //
+        // Every driver reply buffer is a stack struct sized EXACTLY sizeof(struct)
+        // (PreCreate.c:705, ScanBridge.c:1159, ProcessNotify.c:3687). Filter Manager
+        // already rejects anything longer, but silently: the kernel then waits out
+        // its entire budget and fails open, leaving one Debug line as the only
+        // trace that a verdict was computed and thrown away.
+        //
+        // A variable-length verdict is not wrong in general, it is wrong on THIS
+        // CARRIER. FilterMessageType_ScanVerdict sent as an ordinary message reaches
+        // MhpHandleScanVerdict (MessageHandler.c:2234), which accepts
+        // PayloadSize >= sizeof(struct), forwards the full length to
+        // MqCompleteMessage, and IS decrypted. A threat name belongs there.
+        if (replyBuffer.size() > SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE) {
+            Utils::Logger::Error(
+                "[FilterConnection] ReplyMessage: refusing a {}-byte reply for msgId {}; "
+                "the kernel reply buffer holds at most {} bytes, so Filter Manager would "
+                "reject it and the waiter would time out and fail open. Send a "
+                "variable-length verdict as a ScanVerdict MESSAGE instead - that carrier "
+                "is decrypted and length-aware.",
+                replyBuffer.size(), originalMessageId,
+                static_cast<size_t>(SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE));
+            m_stats.errors++;
+            return false;
         }
 
         // FIX [BUG #4 HIGH]: The old check demanded payload >= sizeof(FILTER_REPLY_HEADER)

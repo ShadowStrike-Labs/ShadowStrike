@@ -57,6 +57,16 @@ INSTALL_PROBE_CPP_PATH = (
 )
 SERVICE_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Core/System/ServiceManager.hpp"
 
+# THE REPLY CARRIER spans user-mode C++ (which builds the reply) and driver C (which
+# receives it into a fixed-size stack struct and never decrypts it). Neither side can
+# see the other's constraint on its own: no C++ test can read the driver's reply-buffer
+# declarations, and no C test can read FilterConnection's refusal. So the invariant
+# "a kernel reply is bare, plaintext, and no larger than the kernel's own buffer" is
+# only expressible here, the same way the process fan-out budget spans IPCManager.hpp
+# and ProcessNotify.c.
+FILTER_CONNECTION_CPP_PATH = ROOT / "src/PhantomCore/Communication/FilterConnection.cpp"
+MESSAGE_PROTOCOL_H_PATH = ROOT / "PhantomSensor/Shared/MessageProtocol.h"
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -188,6 +198,8 @@ class SourceContractTests(unittest.TestCase):
         cls.rollback_manager_cpp = read_source(ROLLBACK_MANAGER_CPP_PATH)
         cls.install_probe_cpp = read_source(INSTALL_PROBE_CPP_PATH)
         cls.service_manager_hpp = read_source(SERVICE_MANAGER_HPP_PATH)
+        cls.filter_connection_cpp = read_source(FILTER_CONNECTION_CPP_PATH)
+        cls.message_protocol_h = read_source(MESSAGE_PROTOCOL_H_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1461,6 +1473,133 @@ class SourceContractTests(unittest.TestCase):
                     f"{label} still uses the retired service name {dead}, which "
                     f"nothing registers",
                 )
+
+    def test_a_kernel_reply_is_plaintext_and_bounded_by_the_kernel_buffer(self) -> None:
+        """A reply must be a bare, plaintext, fixed-size verdict struct.
+
+        THE RETIRED DEFECT. FilterConnection::ReplyMessage gated encryption on
+        `replyBuffer.size() > sizeof(SHADOWSTRIKE_MESSAGE_HEADER)` - an expression
+        copied from the SEND paths, where the buffer really is a framed
+        [header][payload] message and "> 40" correctly means "there is a payload".
+        On the reply path the buffer is a BARE STRUCT, so the comparison tested a
+        payload length against the size of a header the reply does not contain. It
+        never fired only because both reply structs are under 40 bytes, which made
+        the plaintext reply path a coincidence rather than a rule.
+
+        Two facts make an encrypted or oversized reply unusable, and they live on
+        opposite sides of the boundary, which is why this test is here:
+          - the driver performs NO decryption on the reply path (the sole
+            EncDecrypt in CommPort.c is the user->kernel MESSAGE path), so
+            ciphertext would be parsed as the verdict struct itself, reading
+            Verdict out of an ENC_HEADER byte; and
+          - every driver reply buffer is a stack struct sized EXACTLY
+            sizeof(struct), so anything longer is refused by Filter Manager, after
+            which the kernel waits out its budget and fails open with one Debug
+            line as the only evidence.
+        """
+        source = self.filter_connection_cpp
+
+        marker = "bool ReplyMessage(std::span<const uint8_t> replyBuffer,"
+        following = "size_t SendMessage(std::span<const uint8_t> sendBuffer,"
+        self.assertEqual(
+            source.count(marker), 1, "expected exactly one ReplyMessage body to slice"
+        )
+        self.assertEqual(
+            source.count(following), 1, "the slice end anchor must be unambiguous"
+        )
+
+        start = source.index(marker)
+        body = source[start : source.index(following, start)]
+        stripped = strip_c_comments(body)
+
+        # 1. The reply path cannot encrypt. Asserted on COMMENT-STRIPPED source: the
+        #    explanatory comment above the fix necessarily names both the retired
+        #    expression and the function it came from, and a comment-blind assertion
+        #    would be satisfied - or broken - by prose rather than by code.
+        #
+        #    Reported per LINE rather than with assertNotIn, which prints the entire
+        #    function body on failure and buries the one line that matters.
+        for forbidden, why in (
+            (
+                "EncryptSendMessage",
+                "ReplyMessage must not encrypt - the driver never decrypts a reply, "
+                "so ciphertext here would be parsed as the verdict struct itself",
+            ),
+            (
+                "sizeof(SHADOWSTRIKE_MESSAGE_HEADER)",
+                "the retired frame-header comparison must not survive in live code",
+            ),
+        ):
+            offenders = [
+                line.strip() for line in stripped.splitlines() if forbidden in line
+            ]
+            self.assertEqual([], offenders, f"{why}; offending line(s): {offenders}")
+
+        # 2. It refuses what the kernel cannot receive, and refuses it by returning
+        #    false rather than truncating it or sending it anyway.
+        self.assertIn("SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE", stripped)
+        self.assertRegex(
+            stripped,
+            r"if\s*\(\s*replyBuffer\.size\(\)\s*>\s*"
+            r"SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE\s*\)\s*\{",
+        )
+        refusal = stripped[stripped.index("SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE") :]
+        self.assertIn("return false;", refusal)
+
+        # 3. REGRESSION GUARD, deliberately not a discriminator: the SEND paths must
+        #    still encrypt. Removing encryption from the reply carrier must never be
+        #    mistaken for permission to remove it from the transport.
+        self.assertEqual(
+            source.count("EncryptSendMessage(sendBuffer, encryptedBuf)"),
+            2,
+            "both send paths must continue to encrypt",
+        )
+
+        # 4. The driver half of the same contract: exactly one decrypt site, and it
+        #    is the message path. A second one means the reply path may now decrypt,
+        #    in which case the refusal above has to be revisited in that change.
+        self.assertEqual(
+            self.comm_port_c.count("EncDecrypt("),
+            1,
+            "CommPort.c must have exactly one decrypt site (the message path)",
+        )
+
+        # 5. Every reply buffer is exactly sizeof(struct). This is what makes the
+        #    bound the real ceiling rather than a chosen number.
+        self.assertIn(
+            "ULONG ReplySize = sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY);",
+            self.precreate_source,
+        )
+        self.assertIn("replySize = sizeof(reply);", self.scan_bridge_c)
+        self.assertIn(
+            "SIZE_T ReplySize = sizeof(SHADOWSTRIKE_PROCESS_VERDICT_REPLY);",
+            self.process_notify_c,
+        )
+
+        # 6. The bound is DERIVED from both reply structs, so growing either moves it
+        #    automatically; the pinned literal is the review prompt that forces the
+        #    same change to visit the user-mode sender and these tests.
+        protocol = self.message_protocol_h
+        self.assertIn("#define SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE", protocol)
+        for struct_name in (
+            "SHADOWSTRIKE_SCAN_VERDICT_REPLY",
+            "SHADOWSTRIKE_PROCESS_VERDICT_REPLY",
+        ):
+            self.assertRegex(
+                protocol,
+                r"C_ASSERT\(\s*sizeof\("
+                + struct_name
+                + r"\)\s*<=\s*SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE\s*\);",
+                f"{struct_name} must be pinned against the reply-carrier bound",
+            )
+        self.assertRegex(
+            protocol,
+            r"C_ASSERT\(\s*FIELD_OFFSET\(SHADOWSTRIKE_SCAN_VERDICT_REPLY,\s*"
+            r"Verdict\)\s*==\s*8\s*\);",
+        )
+        self.assertRegex(
+            protocol, r"C_ASSERT\(\s*sizeof\(SHADOWSTRIKE_SCAN_VERDICT_REPLY\)\s*==\s*26\s*\);"
+        )
 
 
 @dataclass(frozen=True)
