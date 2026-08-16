@@ -630,6 +630,8 @@ public:
         snap.suspiciousDevicesDetected= m_stats.suspiciousDevicesDetected.load(std::memory_order_relaxed);
         snap.attacksDetected          = m_stats.attacksDetected.load(std::memory_order_relaxed);
         snap.attacksBlocked           = m_stats.attacksBlocked.load(std::memory_order_relaxed);
+        snap.blockRequestedNotPerformed =
+            m_stats.blockRequestedNotPerformed.load(std::memory_order_relaxed);
         snap.superhumanInputDetected  = m_stats.superhumanInputDetected.load(std::memory_order_relaxed);
         snap.commandInjectionDetected = m_stats.commandInjectionDetected.load(std::memory_order_relaxed);
         snap.totalKeystrokesAnalyzed  = m_stats.totalKeystrokesAnalyzed.load(std::memory_order_relaxed);
@@ -795,7 +797,12 @@ private:
         SetupDiDestroyDeviceInfoList(devInfo);
 
         if (success) {
-            m_stats.attacksBlocked++;
+            // Deliberately does NOT touch m_stats.attacksBlocked. This helper
+            // is also reachable from the public BlockDevice() API, where a
+            // block is an administrative action rather than an attack
+            // response, and ExecuteResponse_Locked already counts the response
+            // it carried out. Incrementing in both places double-counted every
+            // successful attack response, so the counter could not be read.
             SS_LOG_INFO(LOG_CATEGORY, L"Device blocked successfully");
         } else {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to block device: %lu", finalErr);
@@ -1549,8 +1556,9 @@ private:
         pattern.detectionTime = Clock::now();
         event.detectedPatterns.push_back(pattern);
 
+        event.device = ResolveDeviceDescriptor_Locked(deviceId);
         event.riskScore = CalculateRiskScore(event, devState);
-        event.responseTaken = DetermineResponse(event);
+        event.responseRequested = DetermineResponse(event);
 
         m_currentAttackEvent = event;
 
@@ -1601,7 +1609,11 @@ private:
         devState.detectedPatterns.push_back(pattern);
         m_currentAttackEvent->riskScore = CalculateRiskScore(
             *m_currentAttackEvent, devState);
-        m_currentAttackEvent->responseTaken = DetermineResponse(*m_currentAttackEvent);
+        if (m_currentAttackEvent->device.devicePath.empty() &&
+            m_currentAttackEvent->device.instanceId.empty()) {
+            m_currentAttackEvent->device = ResolveDeviceDescriptor_Locked(deviceId);
+        }
+        m_currentAttackEvent->responseRequested = DetermineResponse(*m_currentAttackEvent);
         m_currentAttackEvent->detectionReason = "Command pattern: " +
             std::string(GetInputPatternTypeName(pattern.patternType));
 
@@ -1655,55 +1667,154 @@ private:
         return BadUSBResponse::Allow;
     }
 
-    void ExecuteResponse_Locked(const BadUSBAttackEvent& event) {
+    // Resolves the descriptor of the device an attack was observed on.
+    //
+    // The response executor needs event.device.devicePath to eject or disable
+    // anything. BadUSBAttackEvent::device was previously never assigned at
+    // EITHER construction site, so devicePath was ALWAYS empty, every
+    // enforcement guard failed, and no response ever executed - while
+    // attacksBlocked rose regardless. The descriptors were already available:
+    // AnalyzeDeviceDescriptor stores each one in m_trackedDevices.
+    //
+    // m_trackedDevices is keyed by device path, while the input-analysis path
+    // is keyed by whatever identifier its caller supplies, so a hit is not
+    // guaranteed. When no descriptor is known the identifier is still recorded
+    // in instanceId, so the event names its device even when this build cannot
+    // act on it - and AccountEnforcement_Locked reports that plainly instead of
+    // counting a block that never happened.
+    [[nodiscard]] HIDDeviceDescriptor ResolveDeviceDescriptor_Locked(
+            const std::string& deviceKey) const {
+        if (const auto it = m_trackedDevices.find(deviceKey);
+                it != m_trackedDevices.end()) {
+            return it->second;
+        }
+
+        HIDDeviceDescriptor unresolved;
+        unresolved.instanceId = deviceKey;
+        return unresolved;
+    }
+
+    // Performs the response for an attack event.
+    //
+    // The event is taken by NON-CONST reference because what was actually
+    // CARRIED OUT is recorded back into it. Every attack callback receives
+    // this event, so a consumer must be able to tell an executed response
+    // from a merely requested one.
+    //
+    // Enforcement needs a device to act on. event.device is resolved at
+    // detection time from the descriptors this module has analysed; when it
+    // could not be resolved there is nothing to eject or disable. That case is
+    // now counted and logged rather than skipped in silence while the headline
+    // counter rose anyway.
+    void ExecuteResponse_Locked(BadUSBAttackEvent& event) {
         SS_LOG_WARN(LOG_CATEGORY, L"Executing response: %hs (Risk: %d)",
-            std::string(GetBadUSBResponseName(event.responseTaken)).c_str(),
+            std::string(GetBadUSBResponseName(event.responseRequested)).c_str(),
             event.riskScore);
 
-        switch (event.responseTaken) {
-            case BadUSBResponse::BlockAndEject:
+        const std::string targetPath = event.device.devicePath;
+        const bool        haveTarget = !targetPath.empty();
+
+        switch (event.responseRequested) {
+            case BadUSBResponse::BlockAndEject: {
                 ClearInputBuffer_Locked();
-                if (!event.device.devicePath.empty()) {
-                    EjectDevice_Locked(event.device.devicePath);
-                }
+                // The BOOL is CAPTURED. Discarding it is what allowed a failed
+                // eject to be reported as a completed block.
+                const bool ejected = haveTarget && EjectDevice_Locked(targetPath);
                 if (m_config.terminateLaunchedProcesses) {
                     TerminateLaunchedProcesses_Locked();
                 }
-                m_stats.attacksBlocked++;
+                AccountEnforcement_Locked(event, ejected, haveTarget, L"eject");
                 break;
+            }
 
             case BadUSBResponse::BlockAndAlert:
-            case BadUSBResponse::Block:
+            case BadUSBResponse::Block: {
                 ClearInputBuffer_Locked();
-                if (!event.device.devicePath.empty()) {
-                    BlockDevice_Locked(event.device.devicePath);
-                }
+                const bool blocked = haveTarget && BlockDevice_Locked(targetPath);
                 if (m_config.terminateLaunchedProcesses) {
                     TerminateLaunchedProcesses_Locked();
                 }
-                m_stats.attacksBlocked++;
+                AccountEnforcement_Locked(event, blocked, haveTarget, L"block");
                 break;
+            }
 
             case BadUSBResponse::Monitor:
+                // Observation only: nothing is enforced, so nothing is
+                // claimed as blocked. Recorded as carried out because
+                // monitoring is precisely what happened.
+                event.responseTaken = BadUSBResponse::Monitor;
                 break;
 
-            case BadUSBResponse::Quarantine:
-                // HID-based attacks have no file to quarantine directly.
-                // Clear input buffer and escalate to USBDeviceMonitor for
-                // device-level quarantine.
+            case BadUSBResponse::Quarantine: {
+                // A HID attack has no file to quarantine, so the device itself
+                // is the unit: disable it at PnP level here, then hand its
+                // identifier to USBDeviceMonitor so that module's policy state
+                // denies it too. Before this change the escalation was a log
+                // line only - no code anywhere performed it.
+                //
+                // The escalation is QUEUED, not called. We hold m_mutex, and
+                // USBDeviceMonitor acquires its own lock while its
+                // device-arrival path calls back into this module
+                // (USBDeviceMonitor.cpp ProcessNewDevice -> IsKnownBadDevice /
+                // AnalyzeDevice). Calling into it from under our lock would
+                // create the one acquisition order that can deadlock. The
+                // queue is drained after the lock is released, beside the
+                // attack callbacks.
+                //
+                // NOTE: DetermineResponse does not return Quarantine today, so
+                // this arm runs only if a future policy selects it. It is kept
+                // and made correct rather than removed - it is the seam a
+                // device-level quarantine policy plugs into.
                 ClearInputBuffer_Locked();
-                if (!event.device.devicePath.empty()) {
-                    BlockDevice_Locked(event.device.devicePath);
+                const bool blocked = haveTarget && BlockDevice_Locked(targetPath);
+                AccountEnforcement_Locked(event, blocked, haveTarget, L"quarantine");
+
+                const std::string escalationId =
+                    !event.device.instanceId.empty() ? event.device.instanceId
+                                                     : targetPath;
+                if (!escalationId.empty()) {
+                    m_pendingDeviceEscalations.push_back(escalationId);
+                } else {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Quarantine requested but the device was never identified, "
+                        L"so there is no identifier to escalate to USBDeviceMonitor");
                 }
-                SS_LOG_WARN(LOG_CATEGORY,
-                    L"Quarantine requested for HID device — "
-                    L"escalating to USBDeviceMonitor for device-level quarantine");
-                m_stats.attacksBlocked++;
                 break;
+            }
 
             case BadUSBResponse::Allow:
             default:
                 break;
+        }
+    }
+
+    // The ONLY place m_stats.attacksBlocked is incremented.
+    //
+    // It was previously incremented here AND inside BlockDevice_Locked, and
+    // outside the guard deciding whether any enforcement ran at all - so a
+    // successful block counted twice, and a response that did nothing counted
+    // once. Now: one response, at most one increment, and only when an
+    // enforcement call actually ran and reported success.
+    void AccountEnforcement_Locked(BadUSBAttackEvent& event, bool enforced,
+                                   bool haveTarget, const wchar_t* what) {
+        if (enforced) {
+            event.responseTaken = event.responseRequested;
+            m_stats.attacksBlocked++;
+            return;
+        }
+
+        m_stats.blockRequestedNotPerformed++;
+
+        if (haveTarget) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DETECTED BUT NOT BLOCKED: %ls failed for device %hs, so this "
+                L"response is not counted as a block",
+                what, RedactDeviceIdentifier(event.device.devicePath).c_str());
+        } else {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DETECTED BUT NOT BLOCKED: %ls requested but the attacking "
+                L"device was never identified, so there was nothing to act on",
+                what);
         }
     }
 
@@ -1753,6 +1864,13 @@ private:
     // Deferred callback invocation storage
     std::vector<BadUSBAttackEvent> m_pendingAttackEvents;
     std::vector<AttackEventCallback> m_pendingAttackCallbacks;
+
+    /// @brief Device identifiers awaiting escalation to USBDeviceMonitor.
+    /// @note Drained by the public ProcessKeyboardEvent AFTER m_mutex is
+    ///       released. USBDeviceMonitor takes its own lock and its
+    ///       device-arrival path calls back into this module, so escalating
+    ///       from under our lock would be a lock-order inversion.
+    std::vector<std::string> m_pendingDeviceEscalations;
 
     // Grant outer ProcessKeyboardEvent access to flush pending callbacks
     friend class BadUSBDetector;
@@ -1845,13 +1963,46 @@ void BadUSBDetector::ProcessKeyboardEvent(uint16_t virtualKey, bool isKeyDown,
                                            TimePoint timestamp, const std::string& deviceId) {
     m_impl->ProcessKeyboardEvent(virtualKey, isKeyDown, timestamp, deviceId);
 
-    // Flush any pending attack callbacks OUTSIDE the lock
+    // Flush pending attack callbacks AND device escalations OUTSIDE the lock
     std::vector<BadUSBAttackEvent> pendingEvents;
     std::vector<AttackEventCallback> pendingCallbacks;
+    std::vector<std::string> pendingEscalations;
     {
         std::unique_lock lock(m_impl->m_mutex);
         pendingEvents.swap(m_impl->m_pendingAttackEvents);
         pendingCallbacks.swap(m_impl->m_pendingAttackCallbacks);
+        pendingEscalations.swap(m_impl->m_pendingDeviceEscalations);
+    }
+
+    // Device-level quarantine escalation. This is the code that makes the
+    // Quarantine arm's claim true: before this, the arm logged "escalating to
+    // USBDeviceMonitor" and no code anywhere performed an escalation.
+    //
+    // Performed HERE, with m_mutex released, because USBDeviceMonitor acquires
+    // its own lock while its device-arrival path calls back into this module.
+    // HasInstance() is used rather than Instance() so a quarantine can never
+    // force the monitor singleton into existence - if the monitor is not
+    // running, the escalation did not happen and that is said out loud.
+    if (!pendingEscalations.empty()) {
+        if (USBDeviceMonitor::HasInstance()) {
+            auto& monitor = USBDeviceMonitor::Instance();
+            for (const auto& escalationTarget : pendingEscalations) {
+                try {
+                    monitor.EmergencyBlockDevice(escalationTarget);
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Device-level quarantine escalated to USBDeviceMonitor");
+                } catch (...) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"USBDeviceMonitor::EmergencyBlockDevice threw, so the "
+                        L"device-level quarantine was NOT applied");
+                }
+            }
+        } else {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Device-level quarantine requested for %llu device(s) but "
+                L"USBDeviceMonitor is not running, so it was NOT applied",
+                static_cast<unsigned long long>(pendingEscalations.size()));
+        }
     }
     for (const auto& event : pendingEvents) {
         for (const auto& cb : pendingCallbacks) {
@@ -2018,6 +2169,8 @@ std::string BadUSBAttackEvent::ToJson() const {
         json["detectedPatterns"].push_back(patternJson);
     }
 
+    json["responseRequested"] = static_cast<uint8_t>(responseRequested);
+    json["responseRequestedName"] = std::string(GetBadUSBResponseName(responseRequested));
     json["responseTaken"] = static_cast<uint8_t>(responseTaken);
     json["responseName"] = std::string(GetBadUSBResponseName(responseTaken));
     json["reconstructedBuffer"] = RedactSensitiveBuffer(reconstructedBuffer);
@@ -2038,6 +2191,7 @@ void BadUSBStatistics::Reset() noexcept {
     suspiciousDevicesDetected.store(0);
     attacksDetected.store(0);
     attacksBlocked.store(0);
+    blockRequestedNotPerformed.store(0);
     superhumanInputDetected.store(0);
     commandInjectionDetected.store(0);
     totalKeystrokesAnalyzed.store(0);
@@ -2060,6 +2214,7 @@ std::string BadUSBStatisticsSnapshot::ToJson() const {
     json["suspiciousDevicesDetected"] = suspiciousDevicesDetected;
     json["attacksDetected"] = attacksDetected;
     json["attacksBlocked"] = attacksBlocked;
+    json["blockRequestedNotPerformed"] = blockRequestedNotPerformed;
     json["superhumanInputDetected"] = superhumanInputDetected;
     json["commandInjectionDetected"] = commandInjectionDetected;
     json["totalKeystrokesAnalyzed"] = totalKeystrokesAnalyzed;

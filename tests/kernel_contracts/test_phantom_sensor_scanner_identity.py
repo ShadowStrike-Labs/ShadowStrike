@@ -89,6 +89,14 @@ KERNEL_EXPLOIT_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/KernelExploi
 ATOM_BOMBING_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombingDetector.cpp"
 ATOM_BOMBING_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombingDetector.hpp"
 
+# The USB responder, whose accounting was corrected alongside the exploit tier.
+BAD_USB_DETECTOR_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.cpp"
+)
+BAD_USB_DETECTOR_HPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.hpp"
+)
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -506,6 +514,124 @@ class SourceContractTests(unittest.TestCase):
             [],
             "these modules dropped the configured-intent record: " + ", ".join(missing),
         )
+
+    def test_the_badusb_responder_counts_only_enforcement_it_performed(self) -> None:
+        """BadUSBDetector claimed a block whenever a response ran, not when it worked.
+
+        Measured before the fix: the response executor DISCARDED the bool from
+        both EjectDevice_Locked and BlockDevice_Locked (each declared
+        [[nodiscard]] bool), incremented attacksBlocked OUTSIDE the guard that
+        decided whether any enforcement ran at all, and BlockDevice_Locked
+        incremented that same counter itself - so one successful block counted
+        twice while a response that enforced nothing still counted once.
+
+        Underneath all of that, BadUSBAttackEvent::device was never assigned at
+        either attack-event construction site, so devicePath was ALWAYS empty,
+        every enforcement guard failed, and no response had ever executed.
+
+        Comments are stripped first, and that is load-bearing: the explanatory
+        comments necessarily quote the old defect, so a comment-blind count is
+        guaranteed to false-positive.
+        """
+        cpp = strip_c_comments(read_source(BAD_USB_DETECTOR_CPP_PATH))
+        hpp = strip_c_comments(read_source(BAD_USB_DETECTOR_HPP_PATH))
+
+        offenders: list[str] = []
+
+        # attacksBlocked is incremented in EXACTLY ONE place. That single number
+        # carries two invariants at once: two sites is how the double count
+        # returns, and a site outside the accounting helper is how an unenforced
+        # response starts claiming a block again.
+        increments = len(re.findall(r"\battacksBlocked\+\+", cpp))
+        if increments != 1:
+            offenders.append(
+                f"attacksBlocked incremented at {increments} site(s), expected 1"
+            )
+
+        # Slice the executor by its definition. The two CALL sites appear
+        # earlier in the file than the definition, so a name-only search would
+        # extract a call; "void ExecuteResponse_Locked(" is unique to the
+        # definition. Offsets only are reported, never the text.
+        start = cpp.find("void ExecuteResponse_Locked(")
+        end = cpp.find("void AccountEnforcement_Locked(")
+        executor = ""
+        if start < 0 or end < 0 or end <= start:
+            offenders.append(
+                f"could not slice the response executor (start={start}, end={end})"
+            )
+        else:
+            executor = cpp[start:end]
+
+        # Every enforcement call inside the executor must have its return
+        # CAPTURED. A bare call statement is a discarded [[nodiscard]] bool,
+        # which is precisely how StackPivotDetector reported a failed
+        # TerminateProcess as a successful one.
+        for name, expected in (("EjectDevice_Locked", 1), ("BlockDevice_Locked", 2)):
+            total = len(re.findall(re.escape(name) + r"\s*\(", executor))
+            captured = len(
+                re.findall(r"haveTarget\s*&&\s*" + re.escape(name) + r"\s*\(", executor)
+            )
+            if total != expected or captured != expected:
+                offenders.append(
+                    f"{name}: {total} call(s) in the executor, {captured} with the "
+                    f"return captured, expected {expected}/{expected}"
+                )
+
+        # The Quarantine arm's escalation must be PERFORMED, not merely logged.
+        # Before the fix the arm logged "escalating to USBDeviceMonitor" and no
+        # code anywhere called into that module.
+        if "EmergencyBlockDevice" not in cpp:
+            offenders.append(
+                "the Quarantine escalation to USBDeviceMonitor is absent again"
+            )
+
+        # ...and it must run with m_mutex RELEASED. USBDeviceMonitor acquires
+        # its own lock while its device-arrival path calls back into this module
+        # (ProcessNewDevice -> IsKnownBadDevice / AnalyzeDevice), so escalating
+        # from inside the locked executor is a lock-order inversion. The queue
+        # is the seam: the executor may only push, the drain may only call.
+        if executor and "EmergencyBlockDevice" in executor:
+            offenders.append(
+                "the escalation is called from inside the locked response executor"
+            )
+        if executor and "m_pendingDeviceEscalations" not in executor:
+            offenders.append("the locked executor no longer queues the escalation")
+
+        # event.device must be resolved at BOTH construction sites. Without it
+        # devicePath is always empty, every guard fails, and no response can
+        # ever run - the silent state this change ended.
+        resolved = len(re.findall(r"device = ResolveDeviceDescriptor_Locked", cpp))
+        if resolved != 2:
+            offenders.append(
+                f"device descriptor resolved at {resolved} site(s), expected 2"
+            )
+
+        # The intent record must survive: deleting responseRequested would make
+        # the policy decision unobservable rather than honest, so losing it
+        # fails as loudly as reintroducing the false claim.
+        for label, body in (("cpp", cpp), ("hpp", hpp)):
+            if "responseRequested" not in body:
+                offenders.append(
+                    f"the responseRequested intent record was removed from the {label}"
+                )
+
+        # The gap counter must stay plumbed through the live struct, the
+        # snapshot, Reset() and the JSON. Present in only some of those is task
+        # 102's structural zero arrived at by another route.
+        gap_cpp = len(re.findall(r"blockRequestedNotPerformed", cpp))
+        gap_hpp = len(re.findall(r"blockRequestedNotPerformed", hpp))
+        if gap_cpp < 4:
+            offenders.append(
+                f"blockRequestedNotPerformed appears {gap_cpp} time(s) in the .cpp, "
+                "expected at least 4 (increment, snapshot, reset, json)"
+            )
+        if gap_hpp < 2:
+            offenders.append(
+                f"blockRequestedNotPerformed appears {gap_hpp} time(s) in the .hpp, "
+                "expected at least 2 (live struct, snapshot struct)"
+            )
+
+        self.assertEqual(offenders, [], "; ".join(offenders))
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")

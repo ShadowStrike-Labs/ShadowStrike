@@ -453,7 +453,17 @@ struct BadUSBAttackEvent {
     /// @brief Detected patterns
     std::vector<DetectedCommandPattern> detectedPatterns;
     
-    /// @brief Response taken
+    /// @brief Response the policy DECIDED on. INTENT, never outcome.
+    /// @note DetermineResponse() writes this. It states what should happen;
+    ///       it is not evidence that anything did.
+    BadUSBResponse responseRequested = BadUSBResponse::Allow;
+
+    /// @brief Response actually CARRIED OUT.
+    /// @note Only ExecuteResponse_Locked() writes this, and only for a step
+    ///       that ran AND reported success. It stays Allow when a requested
+    ///       block could not be performed - that case is counted by
+    ///       BadUSBStatistics::blockRequestedNotPerformed instead of being
+    ///       absorbed into attacksBlocked.
     BadUSBResponse responseTaken = BadUSBResponse::Allow;
     
     /// @brief Reconstructed command buffer
@@ -485,7 +495,21 @@ struct BadUSBStatistics {
     std::atomic<uint64_t> knownBadDevicesDetected{0};
     std::atomic<uint64_t> suspiciousDevicesDetected{0};
     std::atomic<uint64_t> attacksDetected{0};
+    /// @brief Attack responses whose enforcement RAN and reported success.
+    /// @note Incremented in exactly ONE place (ExecuteResponse_Locked), so one
+    ///       response can never be counted twice. It was previously
+    ///       incremented both there and inside BlockDevice_Locked, which
+    ///       double-counted every successful block. Never derived from a
+    ///       config flag, and never incremented when the target device could
+    ///       not be identified.
     std::atomic<uint64_t> attacksBlocked{0};
+
+    /// @brief Responses that REQUESTED enforcement this build did not perform
+    ///        - device unidentified, or the OS refused the operation.
+    /// @note The named gap between intent and outcome. attacksBlocked used to
+    ///       absorb these silently, so it rose on detections where nothing had
+    ///       been enforced.
+    std::atomic<uint64_t> blockRequestedNotPerformed{0};
     std::atomic<uint64_t> superhumanInputDetected{0};
     std::atomic<uint64_t> commandInjectionDetected{0};
     std::atomic<uint64_t> totalKeystrokesAnalyzed{0};
@@ -506,6 +530,7 @@ struct BadUSBStatisticsSnapshot {
     uint64_t suspiciousDevicesDetected = 0;
     uint64_t attacksDetected = 0;
     uint64_t attacksBlocked = 0;
+    uint64_t blockRequestedNotPerformed = 0;
     uint64_t superhumanInputDetected = 0;
     uint64_t commandInjectionDetected = 0;
     uint64_t totalKeystrokesAnalyzed = 0;
