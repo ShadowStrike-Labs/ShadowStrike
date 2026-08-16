@@ -872,8 +872,33 @@ public:
         }
     }
 
-    void IncrementAttackStats(VSSAttackType type) noexcept {
-        m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
+    /**
+     * @brief Record one attack in the statistics, keyed on what actually happened.
+     *
+     * The outcome is a REQUIRED parameter rather than an assumption. This
+     * helper previously incremented attacksBlocked unconditionally under a
+     * neutral name, so every detection counted as a block regardless of
+     * whether anything was stopped - and both call sites reached it on paths
+     * that perform no enforcement at all.
+     *
+     * byAttackType counts DETECTIONS and is therefore incremented on every
+     * call: it is a breakdown of what was seen, not a claim about what was done.
+     *
+     * The two flags mirror VSSAttackEvent::blockRequested and ::wasBlocked
+     * exactly, so an event and the counters cannot disagree about the same
+     * occurrence. A post-hoc observation - the monitoring thread noticing
+     * snapshots that are already gone - passes blockRequested=false and must
+     * NOT land in blockRequestedNotPerformed: nothing was ever requested, so
+     * counting it as an unperformed block would overstate the gap.
+     */
+    void IncrementAttackStats(VSSAttackType type, bool blockRequested, bool enforced) noexcept {
+        if (blockRequested) {
+            if (enforced) {
+                m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                m_stats.blockRequestedNotPerformed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         size_t idx = static_cast<size_t>(type);
         if (idx < m_stats.byAttackType.size()) {
             m_stats.byAttackType[idx].fetch_add(1, std::memory_order_relaxed);
@@ -1210,13 +1235,20 @@ public:
                     event.eventId = GenerateEventId();
                     event.timestamp = std::chrono::system_clock::now();
                     event.attackType = VSSAttackType::APIDelete;
+                    // Purely POST-HOC: the snapshots are already gone by the time
+                    // this thread counts them, so there is nothing to request and
+                    // nothing to enforce. Both flags explicit rather than relying
+                    // on defaults, because this is the one site where "not
+                    // blocked" is a statement about physics, not about a gap.
+                    event.blockRequested = false;
                     event.wasBlocked = false;
                     event.details = L"Shadow copy count decreased from " +
                                     std::to_wstring(previousCount) + L" to " +
                                     std::to_wstring(currentCount);
 
                     RecordAttackEvent(event);
-                    IncrementAttackStats(VSSAttackType::APIDelete);
+                    IncrementAttackStats(VSSAttackType::APIDelete,
+                                         /*blockRequested=*/false, /*enforced=*/false);
                     NotifyAttack(event);
                 }
 
@@ -1467,6 +1499,19 @@ void ShadowCopyProtector::Shutdown() {
             return false;
         }
 
+        // === Attempt enforcement FIRST, then report what actually happened ===
+        //
+        // This block previously built the event with wasBlocked = true, recorded
+        // it, notified callbacks and logged "BLOCKED" at Fatal, and only then
+        // attempted termination - with the [[nodiscard]] result DISCARDED via
+        // (void) and the whole attempt gated behind a config flag. So a build
+        // with killAttacker disabled, and every failed termination, reported a
+        // block that never happened. Ordering is the fix: nothing may claim an
+        // outcome before the outcome exists.
+        const bool terminationRequested = m_impl->m_config.killAttacker;
+        const bool terminated =
+            terminationRequested && m_impl->TerminateAttacker(pid, L"VSS destruction attempt");
+
         // Build and record attack event
         VSSAttackEvent event;
         event.eventId = GenerateEventId();
@@ -1475,26 +1520,41 @@ void ShadowCopyProtector::Shutdown() {
         event.pid = pid;
         event.processPath = processPathStr;
         event.commandLine = std::wstring(cmdLine);
-        event.wasBlocked = true;
-        event.details = L"VSS destruction attempt blocked (user-mode)";
+        event.blockRequested = true;
+        event.wasBlocked = terminated;
+        event.details = terminated
+            ? L"VSS destruction attempt stopped: attacking process terminated (user-mode)"
+            : (terminationRequested
+                ? L"DETECTED BUT NOT BLOCKED: VSS destruction attempt detected; terminating the "
+                  L"attacking process was requested and did not succeed"
+                : L"DETECTED BUT NOT BLOCKED: VSS destruction attempt detected; this build is "
+                  L"configured not to terminate the attacker (killAttacker=false)");
         event.processName = ExtractFilename(processPathStr);
 
         m_impl->RecordAttackEvent(event);
-        m_impl->IncrementAttackStats(attackType.value());
+        m_impl->IncrementAttackStats(attackType.value(), /*blockRequested=*/true, terminated);
 
         // Notify callback
         m_impl->NotifyAttack(event);
 
-        // Terminate process if configured
-        if (m_impl->m_config.killAttacker) {
-            (void)m_impl->TerminateAttacker(pid, L"VSS destruction attempt");
+        if (terminated) {
+            Utils::Logger::Fatal(
+                "ShadowCopyProtector: BLOCKED VSS attack [Type={}] [PID={}] [Process={}]",
+                static_cast<int>(attackType.value()), pid,
+                Utils::StringUtils::ToNarrow(event.processName));
+        } else {
+            // Still Fatal: the attack is real and this build did not stop it,
+            // which is strictly more urgent than one it did stop.
+            Utils::Logger::Fatal(
+                "ShadowCopyProtector: DETECTED BUT NOT BLOCKED VSS attack [Type={}] [PID={}] "
+                "[Process={}] [terminationRequested={}]",
+                static_cast<int>(attackType.value()), pid,
+                Utils::StringUtils::ToNarrow(event.processName), terminationRequested);
         }
 
-        Utils::Logger::Fatal(
-            "ShadowCopyProtector: BLOCKED VSS attack [Type={}] [PID={}] [Process={}]",
-            static_cast<int>(attackType.value()), pid,
-            Utils::StringUtils::ToNarrow(event.processName));
-
+        // The return value is this function's real effect: it tells the caller
+        // the operation should be blocked. It is unchanged and deliberately
+        // still true - the detection stands whether or not we killed anything.
         return true;
 
     } catch (const std::exception& e) {
@@ -1574,7 +1634,30 @@ void ShadowCopyProtector::Shutdown() {
             return ProcessCreationVerdict::Monitor;
         }
 
-        // === BLOCK at kernel level (pre-execution) ===
+        // === Decide BLOCK at the kernel seam (pre-execution) ===
+        //
+        // MEASURED, and it is why wasBlocked is false here: this function's
+        // Block verdict is returned to its caller, and its ONLY caller in the
+        // repository is OnKernelProcessNotify, which discards it with (void)
+        // under a comment claiming "the verdict is consumed by the kernel
+        // driver via the IPC return path". There is no such path -
+        // OnKernelProcessNotify returns void. Nothing carries this decision to
+        // PhantomSensor, so the process starts. The detail string here used to
+        // read "KERNEL BLOCKED: Process creation denied by PhantomSensor
+        // callback", which was false in operator-visible text and in the JSON.
+        //
+        // RequestKernelProcessBlock() exists and is the seam this should use,
+        // but it is NOT usable as-is (zero callers, a locally declared wire
+        // struct, a hardcoded messageType of 0x30 that is outside the real
+        // FilterMessageType range, and no SHADOWSTRIKE_MESSAGE_HEADER), so
+        // calling it here would swap a false claim for a silent no-op. Tracked
+        // as its own finding; the verdict below is deliberately unchanged so
+        // the decision is preserved for whoever wires the transport.
+        //
+        // processesBlockedKernel counts BLOCK VERDICTS RETURNED, not kernel
+        // denials. Kept and incremented because the decision is real; the
+        // distance between deciding and enforcing is carried by
+        // blockRequestedNotPerformed.
         m_impl->m_stats.processesBlockedKernel.fetch_add(1, std::memory_order_relaxed);
 
         VSSAttackEvent event;
@@ -1585,18 +1668,25 @@ void ShadowCopyProtector::Shutdown() {
         event.processPath = std::wstring(imagePath);
         event.processName = filename;
         event.commandLine = std::wstring(commandLine);
-        event.wasBlocked = true;
-        event.details = L"KERNEL BLOCKED: Process creation denied by PhantomSensor callback";
+        event.blockRequested = true;
+        event.wasBlocked = false;
+        event.details = L"DETECTED BUT NOT BLOCKED: VSS destruction attempt at process creation; "
+                        L"a Block verdict was returned but this build has no path that delivers "
+                        L"it to the kernel, so the process was allowed to start";
 
         m_impl->RecordAttackEvent(event);
-        m_impl->IncrementAttackStats(attackType.value());
+        m_impl->IncrementAttackStats(attackType.value(), /*blockRequested=*/true,
+                                     /*enforced=*/false);
         m_impl->NotifyAttack(event);
 
         // ── Direct AlertSystem wiring ──
         try {
             using namespace Communication;
             if (AlertSystem::HasInstance()) {
-                std::string subject = "VSS Attack Blocked (PID " + std::to_string(pid) + ")";
+                // Severity stays Critical: a VSS destruction attempt this build
+                // did NOT stop is at least as urgent as one it did.
+                std::string subject = "VSS Attack DETECTED BUT NOT BLOCKED (PID " +
+                                      std::to_string(pid) + ")";
                 (void)AlertSystem::Instance().RaiseAlert(
                     AlertSeverity::Critical, AlertType::ThreatDetection,
                     subject, event.ToJson(), "ShadowCopyProtector");
@@ -1849,6 +1939,8 @@ void ShadowCopyProtector::SetDecisionCallback(DecisionCallback callback) {
 [[nodiscard]] ShadowCopyStatisticsSnapshot ShadowCopyProtector::GetStatistics() const {
     ShadowCopyStatisticsSnapshot snap;
     snap.attacksBlocked         = m_impl->m_stats.attacksBlocked.load(std::memory_order_relaxed);
+    snap.blockRequestedNotPerformed =
+        m_impl->m_stats.blockRequestedNotPerformed.load(std::memory_order_relaxed);
     snap.processesKilled        = m_impl->m_stats.processesKilled.load(std::memory_order_relaxed);
     snap.processesBlockedKernel = m_impl->m_stats.processesBlockedKernel.load(std::memory_order_relaxed);
     snap.snapshotDecreaseAlerts = m_impl->m_stats.snapshotDecreaseAlerts.load(std::memory_order_relaxed);
@@ -2011,6 +2103,7 @@ void ShadowCopyProtector::ResetStatistics() {
     j["processName"] = Utils::StringUtils::ToNarrow(processName);
     j["processPath"] = Utils::StringUtils::ToNarrow(processPath);
     j["commandLine"] = Utils::StringUtils::ToNarrow(commandLine);
+    j["blockRequested"] = blockRequested;
     j["wasBlocked"] = wasBlocked;
     j["details"] = Utils::StringUtils::ToNarrow(details);
 
@@ -2019,6 +2112,7 @@ void ShadowCopyProtector::ResetStatistics() {
 
 void ShadowCopyStatistics::Reset() noexcept {
     attacksBlocked.store(0, std::memory_order_relaxed);
+    blockRequestedNotPerformed.store(0, std::memory_order_relaxed);
     processesKilled.store(0, std::memory_order_relaxed);
     processesBlockedKernel.store(0, std::memory_order_relaxed);
     snapshotDecreaseAlerts.store(0, std::memory_order_relaxed);
@@ -2036,6 +2130,7 @@ void ShadowCopyStatistics::Reset() noexcept {
     Json j = Json::object();
 
     j["attacksBlocked"] = attacksBlocked.load(std::memory_order_relaxed);
+    j["blockRequestedNotPerformed"] = blockRequestedNotPerformed.load(std::memory_order_relaxed);
     j["processesKilled"] = processesKilled.load(std::memory_order_relaxed);
     j["processesBlockedKernel"] = processesBlockedKernel.load(std::memory_order_relaxed);
     j["snapshotDecreaseAlerts"] = snapshotDecreaseAlerts.load(std::memory_order_relaxed);
@@ -2103,6 +2198,7 @@ void ShadowCopyStatistics::Reset() noexcept {
 
     Json j = Json::object();
     j["attacksBlocked"] = attacksBlocked;
+    j["blockRequestedNotPerformed"] = blockRequestedNotPerformed;
     j["processesKilled"] = processesKilled;
     j["processesBlockedKernel"] = processesBlockedKernel;
     j["snapshotDecreaseAlerts"] = snapshotDecreaseAlerts;
@@ -2179,9 +2275,21 @@ void ShadowCopyProtector::ReportThreatToAlertSystem(const VSSAttackEvent& event)
         using namespace Communication;
         if (!AlertSystem::HasInstance()) return;
 
-        auto severity = event.wasBlocked ? AlertSeverity::Critical : AlertSeverity::High;
+        // Severity is keyed on what is still OUTSTANDING, not on what happened.
+        // Before the wasBlocked default was corrected this expression read
+        // `wasBlocked ? Critical : High`, and because wasBlocked was true by
+        // default and set true at both block sites, in practice every alert was
+        // Critical. Keying an unstopped attack as Critical therefore preserves
+        // the severity operators actually see today, while a genuinely stopped
+        // attack - which needs no further action - drops to High. Inverting it
+        // the other way would have made the honest flag quieter than the lie.
+        const bool stillOutstanding = !event.wasBlocked;
+        auto severity = stillOutstanding ? AlertSeverity::Critical : AlertSeverity::High;
+        const char* outcomeWord =
+            event.wasBlocked ? "Blocked"
+                             : (event.blockRequested ? "DETECTED BUT NOT BLOCKED" : "Detected");
         std::string subject = "VSS Attack " +
-            std::string(event.wasBlocked ? "Blocked" : "Detected") +
+            std::string(outcomeWord) +
             " — " + std::string(GetVSSAttackTypeName(event.attackType)) +
             " (PID " + std::to_string(event.pid) + ")";
 
@@ -2203,6 +2311,7 @@ void ShadowCopyProtector::ReportDetectionTelemetry(const VSSAttackEvent& event) 
         data["pid"] = std::to_string(event.pid);
         data["attack_type"] = std::string(GetVSSAttackTypeName(event.attackType));
         data["process_name"] = Utils::StringUtils::ToNarrow(event.processName);
+        data["block_requested"] = event.blockRequested ? "true" : "false";
         data["was_blocked"] = event.wasBlocked ? "true" : "false";
         data["mitre_technique"] = "T1490";
 

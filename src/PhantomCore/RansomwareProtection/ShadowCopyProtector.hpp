@@ -275,8 +275,22 @@ struct VSSAttackEvent {
     /// @brief Command line
     std::wstring commandLine;
     
-    /// @brief Was blocked
-    bool wasBlocked = true;
+    /// @brief Whether this build DECIDED the attack should be blocked (intent).
+    ///
+    /// Set by the paths that reach a block decision. It records what policy
+    /// asked for, never what happened - see wasBlocked for that.
+    bool blockRequested = false;
+
+    /// @brief Whether enforcement was actually carried out AND reported success.
+    ///
+    /// DEFAULTS TO FALSE DELIBERATELY, and that default is the contract.
+    /// This field previously defaulted to TRUE, so any event that simply
+    /// forgot to assign it claimed a block - and ReportThreatToAlertSystem
+    /// turns a true value into an AlertSeverity::Critical alert titled
+    /// "Blocked". A default cannot be found by grepping for an assignment,
+    /// which is exactly what hid it. Only assign true where an enforcement
+    /// call returned success on this event's own path.
+    bool wasBlocked = false;
     
     /// @brief Details
     std::wstring details;
@@ -331,8 +345,20 @@ struct ShadowCopyProtectorConfiguration {
  * Custom copy operations load atomics safely.
  */
 struct ShadowCopyStatistics {
-    /// @brief Attacks blocked
+    /// @brief Attacks where enforcement was CARRIED OUT and reported success.
+    ///
+    /// Not "attacks detected". A VSS destruction attempt this build observed
+    /// but did not stop must not appear here - it belongs in
+    /// blockRequestedNotPerformed below. The only real enforcement this
+    /// module performs today is terminating the attacking process.
     std::atomic<uint64_t> attacksBlocked{0};
+
+    /// @brief Detections whose requested block this build did not perform.
+    ///
+    /// The named gap. Non-zero is not a fault: it is the pre-existing
+    /// distance between what policy asked for and what the code can do,
+    /// made visible instead of being reported as a block.
+    std::atomic<uint64_t> blockRequestedNotPerformed{0};
     
     /// @brief Processes killed
     std::atomic<uint64_t> processesKilled{0};
@@ -356,6 +382,7 @@ struct ShadowCopyStatistics {
 
     ShadowCopyStatistics(const ShadowCopyStatistics& other) noexcept
         : attacksBlocked(other.attacksBlocked.load(std::memory_order_relaxed))
+        , blockRequestedNotPerformed(other.blockRequestedNotPerformed.load(std::memory_order_relaxed))
         , processesKilled(other.processesKilled.load(std::memory_order_relaxed))
         , processesBlockedKernel(other.processesBlockedKernel.load(std::memory_order_relaxed))
         , snapshotDecreaseAlerts(other.snapshotDecreaseAlerts.load(std::memory_order_relaxed))
@@ -371,6 +398,9 @@ struct ShadowCopyStatistics {
         if (this != &other) {
             attacksBlocked.store(other.attacksBlocked.load(std::memory_order_relaxed),
                                 std::memory_order_relaxed);
+            blockRequestedNotPerformed.store(
+                other.blockRequestedNotPerformed.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
             processesKilled.store(other.processesKilled.load(std::memory_order_relaxed),
                                   std::memory_order_relaxed);
             processesBlockedKernel.store(other.processesBlockedKernel.load(std::memory_order_relaxed),
@@ -399,6 +429,7 @@ struct ShadowCopyStatistics {
  */
 struct ShadowCopyStatisticsSnapshot {
     uint64_t attacksBlocked         = 0;
+    uint64_t blockRequestedNotPerformed = 0;
     uint64_t processesKilled        = 0;
     uint64_t processesBlockedKernel = 0;
     uint64_t snapshotDecreaseAlerts = 0;

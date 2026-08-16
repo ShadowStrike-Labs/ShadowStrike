@@ -100,4 +100,61 @@ TEST(ShadowCopyProtectorValueContractTests, ConfigStatisticsSerializationHelpers
     EXPECT_EQ(ShadowCopyProtector::GetVersionString(), "3.1.0");
 }
 
+// ============================================================================
+// Outcome-reporting contract
+//
+// VSSAttackEvent::wasBlocked used to default to TRUE, so any event that simply
+// forgot to assign it claimed a block - and ReportThreatToAlertSystem turns a
+// true value into a Critical alert titled "Blocked". A default cannot be found
+// by grepping for an assignment, which is precisely what hid it, so the default
+// itself is asserted here.
+// ============================================================================
+TEST(ShadowCopyProtectorValueContractTests, ADefaultConstructedEventClaimsNothing) {
+    VSSAttackEvent event;
+
+    // THE DISCRIMINATOR: fails against the previous header, where wasBlocked
+    // defaulted to true.
+    EXPECT_FALSE(event.wasBlocked)
+        << "a default-constructed VSS attack event must not claim a block";
+    EXPECT_FALSE(event.blockRequested)
+        << "a default-constructed VSS attack event must not claim a block was requested";
+
+    // Both flags must reach the JSON, because that payload is what an operator
+    // and the alert pipeline actually read.
+    const std::string json = event.ToJson();
+    EXPECT_THAT(json, HasSubstr("\"blockRequested\""));
+    EXPECT_THAT(json, HasSubstr("\"wasBlocked\""));
+}
+
+// The gap counter must survive a COPY, not merely exist. ShadowCopyStatistics
+// hand-writes its copy constructor and assignment operator to load atomics
+// safely, so a member added to the declaration alone is silently dropped on
+// every copy - and GetStatistics() copies. That turns the counter into a
+// structural zero that looks healthy from outside, which is the same failure
+// mode as a saturation metric nothing ever writes.
+TEST(ShadowCopyProtectorValueContractTests, TheUnperformedBlockCounterSurvivesCopyAndReset) {
+    ShadowCopyStatistics stats;
+    stats.attacksBlocked.store(2, std::memory_order_relaxed);
+    stats.blockRequestedNotPerformed.store(9, std::memory_order_relaxed);
+
+    const ShadowCopyStatistics copied(stats);
+    EXPECT_EQ(copied.blockRequestedNotPerformed.load(std::memory_order_relaxed), 9u)
+        << "the hand-written copy constructor dropped the counter";
+
+    ShadowCopyStatistics assigned;
+    assigned = stats;
+    EXPECT_EQ(assigned.blockRequestedNotPerformed.load(std::memory_order_relaxed), 9u)
+        << "the hand-written assignment operator dropped the counter";
+
+    EXPECT_THAT(stats.ToJson(), HasSubstr("blockRequestedNotPerformed"));
+
+    stats.Reset();
+    EXPECT_EQ(stats.blockRequestedNotPerformed.load(std::memory_order_relaxed), 0u)
+        << "Reset() must clear the counter or it becomes a stale delta baseline";
+
+    ShadowCopyStatisticsSnapshot snapshot;
+    snapshot.blockRequestedNotPerformed = 4;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("blockRequestedNotPerformed"));
+}
+
 }  // namespace
