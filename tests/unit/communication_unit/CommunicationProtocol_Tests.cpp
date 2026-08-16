@@ -189,24 +189,39 @@ TEST(CommunicationProtocolTest, ParseFileScanRequestAcceptsHeaderOnlyBuffersWhen
     EXPECT_EQ(request->priority, Comm::ScanPriority::Low);
 }
 
-TEST(CommunicationProtocolTest, ParseProcessNotificationParsesImagePathAndCommandLine) {
+// ============================================================================
+// Process / registry notification parsing.
+//
+// THESE TESTS WERE REWRITTEN AND THE REASON MATTERS MORE THAN THE TESTS.
+// They previously built their payloads from Communication::ProcessNotificationData
+// and Communication::RegistryNotificationData - structs that described a layout the
+// driver has never emitted - and then parsed them back with a parser built on the
+// same structs. Serializing and deserializing through one wrong definition agrees
+// with itself perfectly, so all six cases passed while proving nothing whatsoever
+// about the wire. That is why the fabrication survived long enough for
+// RegistryMonitor to ship a parser that never processed a single registry event
+// (fixed in 5fe45d55).
+//
+// Every case below now builds the payload from the KERNEL struct in
+// PhantomSensor/Shared/MessageProtocol.h - the same declaration the driver writes
+// through - so a divergence on either side fails here instead of being ratified.
+// MessageProtocol.h arrives transitively via Communication.hpp, which includes it
+// precisely so this comparison is possible.
+// ============================================================================
+
+TEST(CommunicationProtocolTest, ParseProcessNotificationReadsTheLayoutTheDriverWrites) {
     const std::wstring imagePath = LR"(C:\Windows\System32\cmd.exe)";
     const std::wstring commandLine = LR"("C:\Windows\System32\cmd.exe" /c whoami)";
 
-    Comm::ProcessNotificationData raw{};
-    raw.messageId = 77;
-    raw.processId = 9001;
-    raw.parentProcessId = 1337;
-    raw.creatingProcessId = 100;
-    raw.creatingThreadId = 101;
-    raw.sessionId = 1;
-    raw.isWow64 = 1;
-    raw.isElevated = 0;
-    raw.integrityLevel = 3;
-    raw.requiresReply = 1;
-    raw.flags = 0x1234;
-    raw.imagePathLength = static_cast<uint16_t>(imagePath.size());
-    raw.commandLineLength = static_cast<uint16_t>(commandLine.size());
+    SHADOWSTRIKE_PROCESS_NOTIFICATION raw{};
+    raw.ProcessId = 9001;
+    raw.ParentProcessId = 1337;
+    raw.CreatingProcessId = 100;
+    raw.CreatingThreadId = 101;
+    raw.Create = TRUE;
+    // BYTE counts, exactly as ProcessNotify.c:3798 and ScanBridge.c:1491 write them.
+    raw.ImagePathLength = static_cast<uint16_t>(imagePath.size() * sizeof(wchar_t));
+    raw.CommandLineLength = static_cast<uint16_t>(commandLine.size() * sizeof(wchar_t));
 
     std::vector<uint8_t> buffer;
     AppendPod(buffer, raw);
@@ -214,36 +229,113 @@ TEST(CommunicationProtocolTest, ParseProcessNotificationParsesImagePathAndComman
     AppendWideString(buffer, commandLine);
 
     const auto notification = Comm::MessageDispatcher::ParseProcessNotification(buffer);
-    ASSERT_TRUE(notification.has_value());
+    ASSERT_TRUE(notification.has_value())
+        << "the parser must accept a payload built from the kernel's own struct";
 
-    EXPECT_EQ(notification->messageId, raw.messageId);
-    EXPECT_EQ(notification->processId, raw.processId);
-    EXPECT_EQ(notification->parentProcessId, raw.parentProcessId);
-    EXPECT_EQ(notification->creatingProcessId, raw.creatingProcessId);
-    EXPECT_EQ(notification->creatingThreadId, raw.creatingThreadId);
+    EXPECT_EQ(notification->processId, 9001u);
+    EXPECT_EQ(notification->parentProcessId, 1337u);
+    EXPECT_EQ(notification->creatingProcessId, 100u);
+    EXPECT_EQ(notification->creatingThreadId, 101u);
     EXPECT_EQ(notification->imagePath, imagePath);
     EXPECT_EQ(notification->commandLine, commandLine);
-    EXPECT_TRUE(notification->isWow64);
-    EXPECT_FALSE(notification->isElevated);
-    EXPECT_TRUE(notification->requiresReply);
-    EXPECT_EQ(notification->flags, raw.flags);
+    EXPECT_TRUE(notification->isCreation);
+}
+
+// The kernel struct opens with a 40-byte SS_MESSAGE_HEADER that the driver zeroes
+// and never fills. It is redundant with the outer frame header, which is exactly
+// what makes it easy to "optimise" away - and every field offset depends on it.
+// Fill it with a recognisable pattern: a parser that reads ProcessId from offset 0
+// instead of offset 40 recovers 0xEEEEEEEE and this test names it.
+TEST(CommunicationProtocolTest, ParseProcessNotificationAccountsForTheDeadInnerHeader) {
+    SHADOWSTRIKE_PROCESS_NOTIFICATION raw{};
+    std::memset(&raw.Header, 0xEE, sizeof(raw.Header));
+    raw.ProcessId = 4242;
+    raw.ParentProcessId = 24;
+    raw.Create = TRUE;
+    raw.ImagePathLength = 0;
+    raw.CommandLineLength = 0;
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
+
+    const auto notification = Comm::MessageDispatcher::ParseProcessNotification(buffer);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_EQ(notification->processId, 4242u)
+        << "processId must be read from offset 40, past the dead inner header";
+    EXPECT_NE(notification->processId, 0xEEEEEEEEu)
+        << "the parser is reading the inner header as if it were the payload fields";
+    EXPECT_EQ(notification->parentProcessId, 24u);
+}
+
+// The unit of the length fields is not visible from their names, and getting it
+// wrong is not a cosmetic error: reading a byte count as a character count walks
+// twice as far as the payload extends. Give the parser a path whose byte length is
+// unambiguous and require the exact string back - a character-count reading returns
+// double the characters, a halving returns half the path.
+TEST(CommunicationProtocolTest, ParseProcessNotificationTreatsLengthsAsBytesNotCharacters) {
+    const std::wstring imagePath = L"C:\\a\\b.exe";   // 10 chars, 20 bytes
+    ASSERT_EQ(imagePath.size(), 10u);
+
+    SHADOWSTRIKE_PROCESS_NOTIFICATION raw{};
+    raw.ProcessId = 7;
+    raw.Create = TRUE;
+    raw.ImagePathLength = 20;   // BYTES
+    raw.CommandLineLength = 0;
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
+    AppendWideString(buffer, imagePath);
+
+    const auto notification = Comm::MessageDispatcher::ParseProcessNotification(buffer);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_EQ(notification->imagePath.size(), 10u)
+        << "20 wire bytes is 10 wide characters; a character-count reading would "
+           "produce 20 and run past the payload";
+    EXPECT_EQ(notification->imagePath, imagePath);
+}
+
+// Create versus exit is the single most consequential bit in this payload, and the
+// parsed type had no field for it at all while the fabricated struct was in use.
+TEST(CommunicationProtocolTest, ParseProcessNotificationDistinguishesCreationFromExit) {
+    SHADOWSTRIKE_PROCESS_NOTIFICATION raw{};
+    raw.ProcessId = 31337;
+    raw.Create = FALSE;
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
+
+    const auto notification = Comm::MessageDispatcher::ParseProcessNotification(buffer);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_FALSE(notification->isCreation)
+        << "a process exit must not be reported as a creation";
 }
 
 TEST(CommunicationProtocolTest, ParseProcessNotificationRejectsShortBuffer) {
-    std::vector<uint8_t> buffer(sizeof(Comm::ProcessNotificationData) - 1, 0xAB);
+    std::vector<uint8_t> buffer(sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) - 1, 0xAB);
     EXPECT_FALSE(Comm::MessageDispatcher::ParseProcessNotification(buffer).has_value());
 }
 
-TEST(CommunicationProtocolTest, ParseProcessNotificationAcceptsHeaderOnlyBuffersWhenStringsAreEmpty) {
-    Comm::ProcessNotificationData raw{};
-    raw.messageId = 17;
-    raw.processId = 500;
-    raw.parentProcessId = 400;
-    raw.requiresReply = 0;
-    raw.flags = 0x99;
+TEST(CommunicationProtocolTest, ParseProcessNotificationRejectsOverlongVariableLengths) {
+    SHADOWSTRIKE_PROCESS_NOTIFICATION raw{};
+    raw.ProcessId = 1;
+    raw.ImagePathLength = 64;      // claims 64 bytes that are not present
+    raw.CommandLineLength = 0;
 
-    std::vector<uint8_t> buffer(sizeof(raw));
-    std::memcpy(buffer.data(), &raw, sizeof(raw));
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);        // fixed part only
+
+    EXPECT_FALSE(Comm::MessageDispatcher::ParseProcessNotification(buffer).has_value())
+        << "a declared length beyond the delivered payload must be refused, not read";
+}
+
+TEST(CommunicationProtocolTest, ParseProcessNotificationAcceptsFixedPartWhenStringsAreEmpty) {
+    SHADOWSTRIKE_PROCESS_NOTIFICATION raw{};
+    raw.ProcessId = 500;
+    raw.ParentProcessId = 400;
+    raw.Create = TRUE;
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
 
     const auto notification = Comm::MessageDispatcher::ParseProcessNotification(buffer);
     ASSERT_TRUE(notification.has_value());
@@ -251,25 +343,22 @@ TEST(CommunicationProtocolTest, ParseProcessNotificationAcceptsHeaderOnlyBuffers
     EXPECT_TRUE(notification->commandLine.empty());
     EXPECT_EQ(notification->processId, 500u);
     EXPECT_EQ(notification->parentProcessId, 400u);
-    EXPECT_EQ(notification->flags, 0x99u);
-    EXPECT_FALSE(notification->requiresReply);
 }
 
-TEST(CommunicationProtocolTest, ParseRegistryNotificationParsesKeyNameAndValueBytes) {
+TEST(CommunicationProtocolTest, ParseRegistryNotificationReadsTheLayoutTheDriverWrites) {
     const std::wstring keyPath = LR"(HKCU\Software\ShadowStrike)";
     const std::wstring valueName = LR"(PolicyState)";
     const std::array<uint8_t, 4> valueData{0x10, 0x20, 0x30, 0x40};
 
-    Comm::RegistryNotificationData raw{};
-    raw.messageId = 501;
-    raw.processId = 777;
-    raw.threadId = 778;
-    raw.operationType = 2;
-    raw.valueType = 4;
-    raw.requiresReply = 1;
-    raw.keyPathLength = static_cast<uint16_t>(keyPath.size());
-    raw.valueNameLength = static_cast<uint16_t>(valueName.size());
-    raw.valueDataLength = static_cast<uint32_t>(valueData.size());
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION raw{};
+    raw.ProcessId = 777;
+    raw.ThreadId = 778;
+    raw.Operation = 2;
+    raw.DataType = 4;
+    // BYTE counts, exactly as ScanBridge.c:1952 writes them.
+    raw.KeyPathLength = static_cast<uint16_t>(keyPath.size() * sizeof(wchar_t));
+    raw.ValueNameLength = static_cast<uint16_t>(valueName.size() * sizeof(wchar_t));
+    raw.DataSize = static_cast<uint32_t>(valueData.size());
 
     std::vector<uint8_t> buffer;
     AppendPod(buffer, raw);
@@ -278,44 +367,77 @@ TEST(CommunicationProtocolTest, ParseRegistryNotificationParsesKeyNameAndValueBy
     buffer.insert(buffer.end(), valueData.begin(), valueData.end());
 
     const auto notification = Comm::MessageDispatcher::ParseRegistryNotification(buffer);
-    ASSERT_TRUE(notification.has_value());
+    ASSERT_TRUE(notification.has_value())
+        << "the parser must accept a payload built from the kernel's own struct";
 
-    EXPECT_EQ(notification->messageId, raw.messageId);
-    EXPECT_EQ(notification->processId, raw.processId);
-    EXPECT_EQ(notification->threadId, raw.threadId);
-    EXPECT_EQ(notification->operationType, raw.operationType);
-    EXPECT_EQ(notification->valueType, raw.valueType);
+    EXPECT_EQ(notification->processId, 777u);
+    EXPECT_EQ(notification->threadId, 778u);
+    EXPECT_EQ(notification->operationType, 2u);
+    EXPECT_EQ(notification->valueType, 4u);
     EXPECT_EQ(notification->keyPath, keyPath);
     EXPECT_EQ(notification->valueName, valueName);
-    EXPECT_EQ(notification->valueData.size(), valueData.size());
-    EXPECT_TRUE(notification->requiresReply);
+    ASSERT_EQ(notification->valueData.size(), valueData.size());
     EXPECT_EQ(notification->valueData[0], valueData[0]);
     EXPECT_EQ(notification->valueData[3], valueData[3]);
 }
 
-TEST(CommunicationProtocolTest, ParseRegistryNotificationRejectsTruncatedValueData) {
-    Comm::RegistryNotificationData raw{};
-    raw.keyPathLength = 4;
-    raw.valueNameLength = 4;
-    raw.valueDataLength = 16;
+TEST(CommunicationProtocolTest, ParseRegistryNotificationTreatsLengthsAsBytesNotCharacters) {
+    const std::wstring keyPath = L"HKCU\\Zz";   // 7 chars, 14 bytes
+    ASSERT_EQ(keyPath.size(), 7u);
 
-    std::vector<uint8_t> buffer(sizeof(raw), 0xCC);
-    std::memcpy(buffer.data(), &raw, sizeof(raw));
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION raw{};
+    raw.ProcessId = 5;
+    raw.KeyPathLength = 14;   // BYTES
+    raw.ValueNameLength = 0;
+    raw.DataSize = 0;
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
+    AppendWideString(buffer, keyPath);
+
+    const auto notification = Comm::MessageDispatcher::ParseRegistryNotification(buffer);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_EQ(notification->keyPath.size(), 7u)
+        << "14 wire bytes is 7 wide characters";
+    EXPECT_EQ(notification->keyPath, keyPath);
+}
+
+TEST(CommunicationProtocolTest, ParseRegistryNotificationRejectsTruncatedValueData) {
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION raw{};
+    raw.KeyPathLength = 4;
+    raw.ValueNameLength = 4;
+    raw.DataSize = 16;   // not present in the buffer
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
 
     EXPECT_FALSE(Comm::MessageDispatcher::ParseRegistryNotification(buffer).has_value());
 }
 
-TEST(CommunicationProtocolTest, ParseRegistryNotificationAcceptsHeaderOnlyBuffersWhenPayloadIsEmpty) {
-    Comm::RegistryNotificationData raw{};
-    raw.messageId = 21;
-    raw.processId = 701;
-    raw.threadId = 702;
-    raw.operationType = 5;
-    raw.valueType = 1;
-    raw.requiresReply = 0;
+// The overflow cap is the reason DataSize is checked on its own before being summed
+// with the two name lengths: it is a UINT32 straight off the wire.
+TEST(CommunicationProtocolTest, ParseRegistryNotificationRejectsAbsurdDataSizeBeforeSumming) {
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION raw{};
+    raw.KeyPathLength = 0;
+    raw.ValueNameLength = 0;
+    raw.DataSize = 0xFFFFFFFFu;
 
-    std::vector<uint8_t> buffer(sizeof(raw));
-    std::memcpy(buffer.data(), &raw, sizeof(raw));
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
+
+    EXPECT_FALSE(Comm::MessageDispatcher::ParseRegistryNotification(buffer).has_value())
+        << "a length that could wrap the bounds arithmetic must be refused up front";
+}
+
+TEST(CommunicationProtocolTest, ParseRegistryNotificationAcceptsFixedPartWhenPayloadIsEmpty) {
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION raw{};
+    raw.ProcessId = 701;
+    raw.ThreadId = 702;
+    raw.Operation = 5;
+    raw.DataType = 1;
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, raw);
 
     const auto notification = Comm::MessageDispatcher::ParseRegistryNotification(buffer);
     ASSERT_TRUE(notification.has_value());
@@ -323,7 +445,16 @@ TEST(CommunicationProtocolTest, ParseRegistryNotificationAcceptsHeaderOnlyBuffer
     EXPECT_TRUE(notification->valueName.empty());
     EXPECT_TRUE(notification->valueData.empty());
     EXPECT_EQ(notification->operationType, 5u);
-    EXPECT_FALSE(notification->requiresReply);
+}
+
+// Both parsers are declared to read the kernel's layout, so the sizes they bound
+// against are part of the contract. If either fires, a struct moved on one side of
+// the boundary only.
+TEST(CommunicationProtocolTest, TheParsedWireStructsAreTheSizesTheDriverWrites) {
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION), 61u)
+        << "40-byte dead header + 4 ids + Create + two 2-byte lengths";
+    EXPECT_EQ(sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION), 21u)
+        << "two ids + Operation + two 2-byte lengths + DataSize + DataType";
 }
 
 TEST(CommunicationProtocolTest, SerializeVerdictReplyProducesWireCompatibleLayout) {

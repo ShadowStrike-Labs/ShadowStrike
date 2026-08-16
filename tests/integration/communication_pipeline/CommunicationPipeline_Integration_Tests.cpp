@@ -148,8 +148,10 @@ using Comm::ProcessNotification;
 using Comm::RegistryNotification;
 using Comm::ScanVerdictReply;
 using Comm::FileScanRequestData;
-using Comm::ProcessNotificationData;
-using Comm::RegistryNotificationData;
+// ProcessNotificationData / RegistryNotificationData intentionally absent: both
+// described layouts the driver never emitted and were deleted from
+// Communication.hpp. The payload builders below use the kernel structs from
+// PhantomSensor/Shared/MessageProtocol.h, which arrive via Communication.hpp.
 using Comm::MESSAGE_MAGIC;
 using Comm::PROTOCOL_VERSION;
 
@@ -279,6 +281,12 @@ namespace {
 // Build a minimal, valid ProcessNotification payload.
 // ---------------------------------------------------------------------------
 
+// Builds a real SHADOWSTRIKE_PROCESS_NOTIFICATION payload. The imageLen / cmdLen
+// parameters remain CHARACTER counts because that is what every call site below
+// passes; they are converted to the BYTE counts the wire actually carries. The
+// previous version wrote character counts into the length fields of a fabricated
+// 48-byte struct, so the payload it produced could not be parsed by anything that
+// reads the driver's real format.
 [[nodiscard]] std::vector<uint8_t> BuildProcessNotifyPayload(
     uint64_t        messageId,
     const wchar_t*  imagePath,
@@ -287,21 +295,27 @@ namespace {
     uint16_t        cmdLen,
     uint32_t        pid = 1234)
 {
-    ProcessNotificationData pnd{};
-    pnd.messageId         = messageId;
-    pnd.processId         = pid;
-    pnd.imagePathLength   = imageLen;
-    pnd.commandLineLength = cmdLen;
+    // messageId has no home in this payload: SHADOWSTRIKE_PROCESS_NOTIFICATION does
+    // not carry one. Correlation lives in the outer frame header. Accepted and
+    // ignored so the call sites need not change.
+    (void)messageId;
 
     const size_t imageBytes = static_cast<size_t>(imageLen) * sizeof(wchar_t);
     const size_t cmdBytes   = static_cast<size_t>(cmdLen)   * sizeof(wchar_t);
-    std::vector<uint8_t> payload(sizeof(ProcessNotificationData) + imageBytes + cmdBytes, 0);
 
-    std::memcpy(payload.data(), &pnd, sizeof(ProcessNotificationData));
-    if (imageLen > 0)
-        std::memcpy(payload.data() + sizeof(ProcessNotificationData), imagePath, imageBytes);
-    if (cmdLen > 0)
-        std::memcpy(payload.data() + sizeof(ProcessNotificationData) + imageBytes, cmdLine, cmdBytes);
+    SHADOWSTRIKE_PROCESS_NOTIFICATION pnd{};
+    pnd.ProcessId         = pid;
+    pnd.Create            = TRUE;
+    pnd.ImagePathLength   = static_cast<uint16_t>(imageBytes);
+    pnd.CommandLineLength = static_cast<uint16_t>(cmdBytes);
+
+    std::vector<uint8_t> payload(sizeof(pnd) + imageBytes + cmdBytes, 0);
+
+    std::memcpy(payload.data(), &pnd, sizeof(pnd));
+    if (imageBytes > 0)
+        std::memcpy(payload.data() + sizeof(pnd), imagePath, imageBytes);
+    if (cmdBytes > 0)
+        std::memcpy(payload.data() + sizeof(pnd) + imageBytes, cmdLine, cmdBytes);
 
     return payload;
 }
@@ -310,6 +324,11 @@ namespace {
 // Build a minimal, valid RegistryNotification payload.
 // ---------------------------------------------------------------------------
 
+// Builds a real SHADOWSTRIKE_REGISTRY_NOTIFICATION payload. keyLen / valLen stay
+// CHARACTER counts for the call sites and are converted to the BYTE counts the wire
+// carries. This is the same wire format RegistryMonitor was corrected to in
+// 5fe45d55; the fabricated 40-byte struct this replaced is what made that defect
+// possible.
 [[nodiscard]] std::vector<uint8_t> BuildRegistryNotifyPayload(
     uint64_t        messageId,
     const wchar_t*  keyPath,
@@ -318,21 +337,25 @@ namespace {
     uint16_t        valLen,
     uint32_t        pid = 1234)
 {
-    RegistryNotificationData rnd{};
-    rnd.messageId      = messageId;
-    rnd.processId      = pid;
-    rnd.keyPathLength  = keyLen;
-    rnd.valueNameLength = valLen;
+    // No messageId on this payload either - correlation is in the outer header.
+    (void)messageId;
 
     const size_t keyBytes = static_cast<size_t>(keyLen) * sizeof(wchar_t);
     const size_t valBytes = static_cast<size_t>(valLen) * sizeof(wchar_t);
-    std::vector<uint8_t> payload(sizeof(RegistryNotificationData) + keyBytes + valBytes, 0);
 
-    std::memcpy(payload.data(), &rnd, sizeof(RegistryNotificationData));
-    if (keyLen > 0)
-        std::memcpy(payload.data() + sizeof(RegistryNotificationData), keyPath, keyBytes);
-    if (valLen > 0)
-        std::memcpy(payload.data() + sizeof(RegistryNotificationData) + keyBytes, valueName, valBytes);
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION rnd{};
+    rnd.ProcessId       = pid;
+    rnd.KeyPathLength   = static_cast<uint16_t>(keyBytes);
+    rnd.ValueNameLength = static_cast<uint16_t>(valBytes);
+    rnd.DataSize        = 0;
+
+    std::vector<uint8_t> payload(sizeof(rnd) + keyBytes + valBytes, 0);
+
+    std::memcpy(payload.data(), &rnd, sizeof(rnd));
+    if (keyBytes > 0)
+        std::memcpy(payload.data() + sizeof(rnd), keyPath, keyBytes);
+    if (valBytes > 0)
+        std::memcpy(payload.data() + sizeof(rnd) + keyBytes, valueName, valBytes);
 
     return payload;
 }
@@ -538,7 +561,16 @@ TEST_F(MessageDispatcher_Parse, ProcessNotify_MinimalValidPayload_Succeeds) {
         std::span<const uint8_t>(payload));
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->processId, 5555u);
-    EXPECT_EQ(result->messageId, 0xBEEF1ULL);
+
+    // This case previously required result->messageId == 0xBEEF1. It passed only
+    // because both the builder and the parser used a fabricated struct that had a
+    // messageId field; SHADOWSTRIKE_PROCESS_NOTIFICATION has none, and correlation
+    // is carried in the outer frame header instead. Asserting the absence keeps the
+    // contract honest: if a messageId ever appears here it came from somewhere other
+    // than this payload, which is exactly the confusion worth failing on.
+    EXPECT_EQ(result->messageId, 0ULL)
+        << "the process notification payload carries no message id; a non-zero value "
+           "means the parser invented one";
 }
 
 // 2.8 ParseProcessNotification correctly extracts image path and command line.
@@ -621,25 +653,25 @@ TEST_F(MessageDispatcher_Parse, SerializeVerdictReply_VerdictFieldCorrect) {
     EXPECT_GT(data->threatNameLength, 0u);
 }
 
-// 2.14 ParseProcessNotification with imagePathLength exceeding the buffer must return nullopt.
+// 2.14 ParseProcessNotification with ImagePathLength exceeding the buffer must return nullopt.
 // Ensures no out-of-bounds read when a kernel-crafted packet is malformed.
 TEST_F(MessageDispatcher_Parse, ProcessNotify_PathExceedsBuffer_ReturnsNullopt) {
     auto payload = BuildProcessNotifyPayload(0xFE00ULL, nullptr, 0, nullptr, 0);
-    auto* pnd = reinterpret_cast<ProcessNotificationData*>(payload.data());
-    pnd->imagePathLength = 32767;  // inflated length far exceeds buffer capacity
+    auto* pnd = reinterpret_cast<SHADOWSTRIKE_PROCESS_NOTIFICATION*>(payload.data());
+    pnd->ImagePathLength = 32767;  // inflated length far exceeds buffer capacity
     EXPECT_FALSE(MessageDispatcher::ParseProcessNotification(
         std::span<const uint8_t>(payload)).has_value())
-        << "An imagePathLength that overflows the buffer must yield nullopt (no over-read).";
+        << "An ImagePathLength that overflows the buffer must yield nullopt (no over-read).";
 }
 
-// 2.15 ParseRegistryNotification with valueNameLength exceeding the buffer must return nullopt.
+// 2.15 ParseRegistryNotification with ValueNameLength exceeding the buffer must return nullopt.
 TEST_F(MessageDispatcher_Parse, RegistryNotify_ValueNameExceedsBuffer_ReturnsNullopt) {
     auto payload = BuildRegistryNotifyPayload(0xFE01ULL, nullptr, 0, nullptr, 0);
-    auto* rnd = reinterpret_cast<RegistryNotificationData*>(payload.data());
-    rnd->valueNameLength = 32767;  // inflated length far exceeds buffer capacity
+    auto* rnd = reinterpret_cast<SHADOWSTRIKE_REGISTRY_NOTIFICATION*>(payload.data());
+    rnd->ValueNameLength = 32767;  // inflated length far exceeds buffer capacity
     EXPECT_FALSE(MessageDispatcher::ParseRegistryNotification(
         std::span<const uint8_t>(payload)).has_value())
-        << "A valueNameLength that overflows the buffer must yield nullopt (no over-read).";
+        << "A ValueNameLength that overflows the buffer must yield nullopt (no over-read).";
 }
 
 // ============================================================================
@@ -2256,24 +2288,31 @@ TEST_F(CrossPipeline_DispatchToAlert, ProcessNotify_ElevatedProcess_RaisesAlertA
             alertFired.store(true, std::memory_order_release);
         });
 
+    // WAS: this handler branched on n.isElevated and the payload below set an
+    // isElevated byte. SHADOWSTRIKE_PROCESS_NOTIFICATION CARRIES NO ELEVATION BIT -
+    // the field existed only in a fabricated user-mode struct - so the capability
+    // this asserted could never have worked against a real kernel notification.
+    // Re-expressed on Create, which the payload does carry, because what this
+    // integration case is actually for is the dispatch -> alert -> telemetry chain,
+    // not the elevation policy. Deciding elevation requires querying the pid in user
+    // mode, and that query must not happen on a thread owing the kernel a verdict.
     f.dispatcher.RegisterProcessNotifyHandler(
         [](const ProcessNotification& n) {
-            if (n.isElevated) {
+            if (n.isCreation) {
                 (void)AlertSystem::Instance().RaiseAlert(
                     AlertSeverity::High,
                     AlertType::Security,
-                    "Elevated Process Created",
-                    "A new process was created with elevated privileges.",
+                    "Process Created",
+                    "A new process creation was reported by the kernel.",
                     "MessageDispatcher");
             }
         });
 
-    // Build a ProcessNotification with isElevated = 1.
-    ProcessNotificationData pnd{};
-    pnd.messageId   = 0xF002ULL;
-    pnd.processId   = 999;
-    pnd.isElevated  = 1;
-    std::vector<uint8_t> pPayload(sizeof(ProcessNotificationData), 0);
+    // Build a real process-creation notification.
+    SHADOWSTRIKE_PROCESS_NOTIFICATION pnd{};
+    pnd.ProcessId = 999;
+    pnd.Create    = TRUE;
+    std::vector<uint8_t> pPayload(sizeof(pnd), 0);
     std::memcpy(pPayload.data(), &pnd, sizeof(pnd));
     const auto msg = BuildMessage(MessageType::ProcessNotify, 0xF002ULL,
                                    pPayload.data(), pPayload.size());
@@ -2287,7 +2326,7 @@ TEST_F(CrossPipeline_DispatchToAlert, ProcessNotify_ElevatedProcess_RaisesAlertA
     }
 
     EXPECT_TRUE(alertFired.load())
-        << "ProcessNotifyHandler must raise an alert for an elevated process.";
+        << "ProcessNotifyHandler must raise an alert for a reported process creation.";
 
     const auto deadline2 = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (TelemetryCollector::Instance().GetQueueSize() <= qBefore &&
@@ -2661,16 +2700,16 @@ TEST_F(MessageDispatcher_Parse, FileScan_ProcNameExceedsBuffer_ReturnsNullopt) {
         << "A processNameLength that overflows the buffer must yield nullopt.";
 }
 
-// 2.17 ParseProcessNotification: commandLineLength overflow must return nullopt.
+// 2.17 ParseProcessNotification: CommandLineLength overflow must return nullopt.
 //      Tests that both variable-length fields in the packed struct are bounds-checked.
 TEST_F(MessageDispatcher_Parse, ProcessNotify_CmdLineExceedsBuffer_ReturnsNullopt) {
     auto payload = BuildProcessNotifyPayload(0xFE03ULL, nullptr, 0, nullptr, 0);
-    auto* pnd    = reinterpret_cast<ProcessNotificationData*>(payload.data());
-    pnd->imagePathLength   = 0;
-    pnd->commandLineLength = 32767;  // inflated — no actual data appended
+    auto* pnd    = reinterpret_cast<SHADOWSTRIKE_PROCESS_NOTIFICATION*>(payload.data());
+    pnd->ImagePathLength   = 0;
+    pnd->CommandLineLength = 32767;  // inflated - no actual data appended
     EXPECT_FALSE(MessageDispatcher::ParseProcessNotification(
         std::span<const uint8_t>(payload)).has_value())
-        << "A commandLineLength overflowing the buffer must yield nullopt (no over-read).";
+        << "A CommandLineLength overflowing the buffer must yield nullopt (no over-read).";
 }
 
 // ============================================================================

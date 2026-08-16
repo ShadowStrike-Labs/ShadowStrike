@@ -37,6 +37,14 @@
 #include <string>
 #include <vector>
 
+// The kernel is the authority on every wire layout in this file. Including it
+// here is what allows the static_asserts below to exist at all: before this
+// include there was no compile-time relationship between the structs declared
+// in this header and the structs the driver actually writes, and two of them
+// had silently drifted into layouts the driver has never emitted (see the
+// note above ProcessNotificationData / RegistryNotificationData below).
+#include "../../../PhantomSensor/Shared/MessageProtocol.h"
+
 namespace ShadowStrike {
 namespace Communication {
 
@@ -243,46 +251,98 @@ struct FileScanRequestData {
     // WCHAR processName[processNameLength]
 };
 
-//=============================================================================
-// Process Notification
-//=============================================================================
+// This struct is a second declaration of FILE_SCAN_REQUEST (MessageProtocol.h).
+// It happens to be byte-identical today, field for field, which is precisely why
+// it survived while its two neighbours drifted into fiction unnoticed - nothing
+// checked either way. Pin it so a divergence is a build failure rather than a
+// misparsed file path on the hottest path in the product.
+static_assert(sizeof(FileScanRequestData) == sizeof(FILE_SCAN_REQUEST),
+              "FileScanRequestData must stay byte-identical to FILE_SCAN_REQUEST in "
+              "PhantomSensor/Shared/MessageProtocol.h. If this fires, the kernel and "
+              "user-mode views of the file scan request have diverged.");
+static_assert(sizeof(FileScanRequestData) == 72,
+              "FILE_SCAN_REQUEST is 72 bytes under pack(1); a change on either side "
+              "must be made deliberately and on both sides.");
+static_assert(offsetof(FileScanRequestData, processId) == 12,
+              "processId offset pins the packed layout against silent padding");
+static_assert(offsetof(FileScanRequestData, pathLength) == 68,
+              "pathLength offset pins the packed layout; the variable-length strings "
+              "are located from the end of this struct");
+static_assert(offsetof(FileScanRequestData, processNameLength) == 70,
+              "processNameLength offset pins the packed layout");
 
-struct ProcessNotificationData {
-    uint64_t messageId;
-    uint32_t processId;
-    uint32_t parentProcessId;
-    uint32_t creatingProcessId;
-    uint32_t creatingThreadId;
-    uint32_t sessionId;
-    uint8_t isWow64;
-    uint8_t isElevated;
-    uint8_t integrityLevel;
-    uint8_t requiresReply;
-    uint64_t createTime;
-    uint32_t flags;
-    uint16_t imagePathLength;
-    uint16_t commandLineLength;
-    // Variable length data follows
-};
+// LENGTH UNITS ARE NOT UNIFORM ACROSS THIS PROTOCOL, and the difference is not
+// visible from the field names. Measured, all four sites:
+//
+//   DECLARED CONTRACT (both headers): CHARACTERS. FILE_SCAN_REQUEST
+//     (MessageProtocol.h:159) and SHADOWSTRIKE_FILE_SCAN_REQUEST (SharedDefs.h:539)
+//     are byte-identical 72-byte declarations of one layout under two names, and
+//     both document "WCHAR FilePath[PathLength]". SHADOWSTRIKE_FILE_SCAN_REQUEST_SIZE
+//     (SharedDefs.h:576) budgets pathLen * sizeof(WCHAR), which only makes sense
+//     for a character count.
+//
+//   PIPELINE A - CommPort.c:5380 ShadowStrikeBuildFileScanRequest writes
+//     Name.Length / sizeof(WCHAR) = CHARACTERS. Its consumer,
+//     FileSystemFilter.cpp:924, does std::wstring(strings, request->pathLength)
+//     = reads CHARACTERS. Agrees with the declared contract.
+//
+//   PIPELINE B - ScanBridge.c:723 SbBuildFileScanRequestEx writes Name.Length
+//     = BYTES (this is the live IRP_MJ_CREATE path, via PreCreate.c:1494). Its
+//     consumer, RealTimeProtection.cpp:3223, does PathLength / sizeof(wchar_t)
+//     = reads BYTES. Self-consistent, and CONTRARY to the declared contract.
+//
+// Both pipelines therefore work today only because each builder happens to be
+// matched to its own reader. Nothing enforces that pairing, and the two structs
+// are mutually castable, so routing a pipeline B frame to a pipeline A reader
+// doubles the character count (a read past the declared payload) and the reverse
+// halves it (a silently truncated file path). Anything parsing this payload must
+// state which unit it is using and against which builder it was verified.
+//
+// This header cannot resolve the disagreement on its own - changing either side
+// in isolation breaks the pipeline that currently works - so it is recorded
+// rather than silently picked.
 
 //=============================================================================
-// Registry Notification
+// Process Notification / Registry Notification - REMOVED, NOT RELOCATED
 //=============================================================================
-
-struct RegistryNotificationData {
-    uint64_t messageId;
-    uint32_t processId;
-    uint32_t threadId;
-    uint32_t operationType;
-    uint32_t flags;
-    uint8_t requiresReply;
-    uint8_t reserved[3];
-    uint16_t keyPathLength;
-    uint16_t valueNameLength;
-    uint32_t valueType;
-    uint32_t valueDataLength;
-    // Variable length data follows
-};
+//
+// struct ProcessNotificationData  replaced by SHADOWSTRIKE_PROCESS_NOTIFICATION
+// struct RegistryNotificationData replaced by SHADOWSTRIKE_REGISTRY_NOTIFICATION
+//
+// Both structs described layouts THE DRIVER HAS NEVER SENT. Measured against
+// PhantomSensor/Shared/MessageProtocol.h:
+//
+//   ProcessNotificationData  was 48 bytes opening with a uint64 messageId and
+//     carrying sessionId / isWow64 / isElevated / integrityLevel / requiresReply
+//     / createTime / flags. The wire truth is SHADOWSTRIKE_PROCESS_NOTIFICATION:
+//     61 bytes opening with a 40-byte SS_MESSAGE_HEADER the driver zeroes and
+//     never fills, then ProcessId / ParentProcessId / CreatingProcessId /
+//     CreatingThreadId / Create / ImagePathLength / CommandLineLength. NONE of
+//     the seven fields listed above exists on the wire at all.
+//
+//   RegistryNotificationData was 40 bytes opening with a uint64 messageId and
+//     char-count lengths. The wire truth is SHADOWSTRIKE_REGISTRY_NOTIFICATION:
+//     21 bytes opening with ProcessId, with BYTE-count lengths.
+//
+// Because both fabricated structs were LARGER than the real payloads (48 > 21
+// and 40 > 21), every parser built on them rejected every genuine frame on its
+// minimum-size check and returned nullopt. They failed closed rather than
+// misparsing, which is the only reason this never corrupted a verdict - but it
+// also means no module built on them could ever read a kernel notification.
+//
+// THIS IS NOT A HYPOTHETICAL. RegistryMonitor shipped a parser built on
+// RegistryNotificationData and consequently never processed a single registry
+// event until commit 5fe45d55 replaced it with the kernel struct. Leaving these
+// declarations in a header that any module may include is what made that defect
+// reachable, so they are deleted rather than corrected: a second declaration of
+// the wire format is the defect, and adding a third correct copy would preserve
+// the mechanism while fixing only today's instance.
+//
+// The authoritative user-mode mirrors, which carry their own offset
+// static_asserts, are IPCManager::ProcessNotifyRequest and
+// IPCManager::RegistryOpRequest (IPCManager.hpp). Parse kernel notifications
+// with the kernel structs or with those mirrors - never by re-declaring a
+// layout here.
 
 //=============================================================================
 // Scan Verdict Reply
@@ -301,31 +361,66 @@ struct ScanVerdictReplyData {
     // Variable: WCHAR threatName[threatNameLength]
 };
 
-//=============================================================================
-// Policy Update
-//=============================================================================
+// Second declaration of SHADOWSTRIKE_SCAN_VERDICT_REPLY (MessageProtocol.h:319).
+// A unit test already compared the two sizes; asserting it here makes the
+// divergence a build failure in every translation unit that can produce a reply,
+// rather than a failure in one test that could be excluded from the build.
+// The verdict byte at offset 8 is load-bearing: it is what turns an
+// IRP_MJ_CREATE into STATUS_ACCESS_DENIED, so a shifted layout is a wrong
+// allow/block decision, not a cosmetic bug.
+static_assert(sizeof(ScanVerdictReplyData) == sizeof(SHADOWSTRIKE_SCAN_VERDICT_REPLY),
+              "ScanVerdictReplyData must stay byte-identical to "
+              "SHADOWSTRIKE_SCAN_VERDICT_REPLY in PhantomSensor/Shared/MessageProtocol.h.");
+static_assert(sizeof(ScanVerdictReplyData) == 26,
+              "SHADOWSTRIKE_SCAN_VERDICT_REPLY is 26 bytes under pack(1), and that number "
+              "is also the kernel's entire reply buffer - see "
+              "SHADOWSTRIKE_MAX_KERNEL_REPLY_SIZE.");
+static_assert(offsetof(ScanVerdictReplyData, verdict) == 8,
+              "the verdict byte is read from offset 8 by the driver's create path");
+static_assert(offsetof(ScanVerdictReplyData, threatNameLength) == 24,
+              "threatNameLength offset pins the packed layout");
 
-struct PolicyUpdateData {
-    uint32_t policyVersion;
-    uint32_t flags;
-    uint8_t scanOnOpen;
-    uint8_t scanOnExecute;
-    uint8_t scanOnWrite;
-    uint8_t scanOnClose;
-    uint8_t blockOnTimeout;
-    uint8_t blockOnError;
-    uint8_t enableSelfProtection;
-    uint8_t enableCaching;
-    uint32_t cacheMaxEntries;
-    uint32_t cacheTTLSeconds;
-    uint32_t replyTimeoutMs;
-    uint32_t maxPendingRequests;
-    uint32_t reserved[4];
-};
+//=============================================================================
+// Policy Update - REMOVED, NOT RELOCATED
+//=============================================================================
+//
+// struct PolicyUpdateData replaced by SHADOWSTRIKE_POLICY_UPDATE (SharedDefs.h:477)
+//
+// The third fabricated wire struct in this header, and it did not resemble the
+// kernel's policy message even loosely. Measured:
+//
+//   PolicyUpdateData        48 bytes. Opened with policyVersion + flags, neither of
+//                           which exists on the wire. Carried scanOnClose,
+//                           enableSelfProtection, enableCaching, cacheMaxEntries,
+//                           replyTimeoutMs and reserved[4].
+//   SHADOWSTRIKE_POLICY_UPDATE  44 bytes. Opens with eight BOOLEANs
+//                           (ScanOnOpen, ScanOnExecute, ScanOnWrite,
+//                           EnableNotifications, BlockOnTimeout, BlockOnError,
+//                           ScanNetworkFiles, ScanRemovableMedia), then
+//                           MaxScanFileSize, ScanTimeoutMs, CacheTTLSeconds,
+//                           MaxPendingRequests and four Mq* queue-tuning fields.
+//
+// Six fields the user-mode struct declared do not exist on the wire, and seven the
+// wire carries were absent from it - including MaxScanFileSize and the entire
+// message-queue tuning block. It had ZERO consumers repo-wide (declaration only),
+// so nothing was broken by it; it was purely a wrong answer waiting to be found by
+// whoever implemented policy push next.
+//
+// Send policy with SHADOWSTRIKE_POLICY_UPDATE.
 
 //=============================================================================
 // Driver Statistics
 //=============================================================================
+//
+// UNVERIFIED AGAINST THE KERNEL. DriverStatisticsData below has ZERO consumers
+// repo-wide, and the nearest kernel declaration is SHADOWSTRIKE_DRIVER_STATUS
+// (SharedDefs.h:301), which was NOT compared field by field. It is therefore left
+// in place rather than deleted alongside the three structs above: three of them
+// were measured and proven wrong, this one was not measured, and removing an
+// unmeasured declaration on the strength of its neighbours would be guessing.
+// Anyone wiring driver statistics must compare it against the kernel struct FIRST
+// and pin the result, exactly as FileScanRequestData and ScanVerdictReplyData now
+// are.
 
 struct DriverStatisticsData {
     uint64_t uptimeSeconds;
@@ -382,35 +477,64 @@ struct FileScanRequest {
 };
 
 struct ProcessNotification {
-    uint64_t messageId;
+    /// NOT CARRIED BY THE KERNEL PAYLOAD. See the block below.
+    uint64_t messageId = 0;
     std::wstring imagePath;
     std::wstring commandLine;
-    uint32_t processId;
-    uint32_t parentProcessId;
-    uint32_t creatingProcessId;
-    uint32_t creatingThreadId;
-    uint32_t sessionId;
-    bool isWow64;
-    bool isElevated;
-    uint8_t integrityLevel;
-    bool requiresReply;
-    std::chrono::system_clock::time_point createTime;
-    uint32_t flags;
+    uint32_t processId = 0;
+    uint32_t parentProcessId = 0;
+    uint32_t creatingProcessId = 0;
+    uint32_t creatingThreadId = 0;
+
+    /// TRUE for a process creation, FALSE for a process exit. This mirrors
+    /// SHADOWSTRIKE_PROCESS_NOTIFICATION::Create, and it is the only field in the
+    /// payload that says which of the two events this is. It was absent from this
+    /// struct entirely while the parser read a fabricated layout, so a caller had
+    /// no way to distinguish a launch from a termination.
+    bool isCreation = false;
+
+    /// FIELDS BELOW HAVE NO SOURCE IN THE KERNEL PAYLOAD.
+    /// SHADOWSTRIKE_PROCESS_NOTIFICATION carries only the four ids, Create, and the
+    /// two length fields. messageId (correlation lives in the outer frame header),
+    /// sessionId, isWow64, isElevated, integrityLevel, requiresReply, createTime and
+    /// flags are therefore whatever the producer chose to put here - they are NOT
+    /// reported by the driver. Resolving any of them means either a wire-format
+    /// change on both sides or a user-mode query against the pid, and such a query
+    /// must not be made on a thread that owes the kernel a verdict (see
+    /// ProcessUtils::SecurityInfoScope).
+    ///
+    /// EVERY ONE OF THESE IS EXPLICITLY INITIALISED. A parser that legitimately
+    /// leaves them alone must leave a determinate value behind: an indeterminate
+    /// read is undefined behaviour, and a garbage session id or elevation flag is
+    /// far worse than a zero, because it can be acted upon.
+    uint32_t sessionId = 0;
+    bool isWow64 = false;
+    bool isElevated = false;
+    uint8_t integrityLevel = 0;
+    bool requiresReply = false;
+    std::chrono::system_clock::time_point createTime{};
+    uint32_t flags = 0;
 
     [[nodiscard]] std::string ToJson() const;
 };
 
 struct RegistryNotification {
-    uint64_t messageId;
+    /// NOT CARRIED BY THE KERNEL PAYLOAD - correlation lives in the outer frame
+    /// header. Initialised so an unset value is a determinate zero, never garbage.
+    uint64_t messageId = 0;
     std::wstring keyPath;
     std::wstring valueName;
     std::vector<uint8_t> valueData;
-    uint32_t processId;
-    uint32_t threadId;
-    uint32_t operationType;
-    uint32_t valueType;
-    bool requiresReply;
-    std::chrono::system_clock::time_point timestamp;
+    uint32_t processId = 0;
+    uint32_t threadId = 0;
+    uint32_t operationType = 0;
+    uint32_t valueType = 0;
+
+    /// NOT CARRIED BY THE KERNEL PAYLOAD. The registry feed is fire-and-forget in
+    /// the driver (ShadowStrikeSendNotification, no reply buffer), so this could
+    /// only ever be false for a kernel-sourced event.
+    bool requiresReply = false;
+    std::chrono::system_clock::time_point timestamp{};
 
     [[nodiscard]] std::string ToJson() const;
 };

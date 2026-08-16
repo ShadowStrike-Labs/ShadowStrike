@@ -70,6 +70,8 @@ REGISTRY_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Registry/RegistryMonito
 PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
 BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
+COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
+MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 
 
 def read_source(path: Path) -> str:
@@ -208,6 +210,8 @@ class SourceContractTests(unittest.TestCase):
         cls.process_utils_cpp = read_source(PROCESS_UTILS_CPP_PATH)
         cls.behavior_analyzer_cpp = read_source(BEHAVIOR_ANALYZER_CPP_PATH)
         cls.real_time_protection_cpp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        cls.communication_hpp = read_source(COMMUNICATION_HPP_PATH)
+        cls.message_dispatcher_cpp = read_source(MESSAGE_DISPATCHER_CPP_PATH)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
@@ -1879,6 +1883,127 @@ class SourceContractTests(unittest.TestCase):
             "the Suspend branch must precede and return before the termination "
             "path, or a suspend falls through into a kill",
         )
+
+    def test_user_mode_does_not_redeclare_a_kernel_notification_layout(self) -> None:
+        """Communication.hpp must not hold a second, untied declaration of a kernel
+        wire struct.
+
+        Three of the five wire structs it declared had drifted into layouts the
+        driver has never emitted, and nothing could detect that because the header
+        included nothing from the kernel. ProcessNotificationData (48B vs a real
+        21B payload behind a 40B dead header) and RegistryNotificationData (40B vs
+        21B) both rejected every genuine frame on their minimum-size check;
+        PolicyUpdateData (48B vs 44B) disagreed on six fields in each direction.
+        RegistryMonitor shipped a parser built on the registry one and processed no
+        registry event at all until 5fe45d55.
+        """
+        code = strip_c_comments(self.communication_hpp)
+
+        # Count the include DIRECTIVE, not the bare path: the static_assert failure
+        # messages below deliberately name the header too, so a bare-path count is 3.
+        self.assertEqual(
+            code.count('#include "../../../PhantomSensor/Shared/MessageProtocol.h"'), 1,
+            "Communication.hpp must include the kernel wire header exactly once; "
+            "without it there is no compile-time relationship between the structs "
+            "declared here and the layouts the driver writes",
+        )
+
+        # Comments in this header necessarily NAME the removed structs to explain
+        # why they were removed, so the check must run on comment-stripped code.
+        for fabricated in (
+            "ProcessNotificationData",
+            "RegistryNotificationData",
+            "PolicyUpdateData",
+        ):
+            self.assertEqual(
+                code.count(fabricated), 0,
+                f"{fabricated} declared a layout the driver never emitted; "
+                f"re-declaring it here reintroduces the defect class that left "
+                f"RegistryMonitor unable to read a single registry event",
+            )
+
+        # Every surviving mirror of a kernel struct must be pinned to it.
+        for user_mode, kernel in (
+            ("FileScanRequestData", "FILE_SCAN_REQUEST"),
+            ("ScanVerdictReplyData", "SHADOWSTRIKE_SCAN_VERDICT_REPLY"),
+        ):
+            needle = f"sizeof({user_mode}) == sizeof({kernel})"
+            self.assertEqual(
+                code.count(needle), 1,
+                f"{user_mode} mirrors {kernel} and must static_assert that it stays "
+                f"byte-identical to it; expected exactly one '{needle}'",
+            )
+
+    def test_the_notification_parsers_read_the_kernel_structs_with_byte_lengths(self) -> None:
+        """The two notification parsers must read the kernel structs, and must treat
+        the variable-length fields as BYTE counts.
+
+        SHADOWSTRIKE_PROCESS_NOTIFICATION::ImagePathLength and
+        SHADOWSTRIKE_REGISTRY_NOTIFICATION::KeyPathLength are byte counts - the
+        driver RtlCopyMemory's exactly that many bytes (ProcessNotify.c:3798,
+        ScanBridge.c:1491, ScanBridge.c:1952). Multiplying one by sizeof(wchar_t),
+        which is what the previous parsers did, walks twice as far as the payload
+        extends.
+        """
+        src = self.message_dispatcher_cpp
+
+        anchors = (
+            "static std::optional<ProcessNotification> ParseProcessNotification(",
+            "static std::optional<RegistryNotification> ParseRegistryNotification(",
+            "static std::vector<uint8_t> SerializeVerdictReply(",
+        )
+        for anchor in anchors:
+            self.assertEqual(
+                src.count(anchor), 1,
+                f"slice anchor must occur exactly once: {anchor!r}",
+            )
+
+        process_body = strip_c_comments(
+            src[src.index(anchors[0]):src.index(anchors[1])])
+        registry_body = strip_c_comments(
+            src[src.index(anchors[1]):src.index(anchors[2])])
+
+        for name, body, kernel_struct, length_fields in (
+            ("ParseProcessNotification", process_body,
+             "SHADOWSTRIKE_PROCESS_NOTIFICATION",
+             ("ImagePathLength", "CommandLineLength")),
+            ("ParseRegistryNotification", registry_body,
+             "SHADOWSTRIKE_REGISTRY_NOTIFICATION",
+             ("KeyPathLength", "ValueNameLength")),
+        ):
+            self.assertGreaterEqual(
+                body.count(kernel_struct), 1,
+                f"{name} must parse {kernel_struct} - the layout the driver writes - "
+                f"not a user-mode re-declaration of it",
+            )
+
+            # A byte count multiplied by sizeof(wchar_t) is the over-read. Report the
+            # offending lines only, never the whole body.
+            offenders = [
+                line.strip()
+                for line in body.splitlines()
+                for field in length_fields
+                if field in line and "sizeof(wchar_t)" in line and "*" in line
+            ]
+            self.assertEqual(
+                offenders, [],
+                f"{name} multiplies a BYTE count by sizeof(wchar_t), which reads past "
+                f"the payload; it must divide instead",
+            )
+
+            self.assertGreaterEqual(
+                body.count("/ sizeof(wchar_t)"), 1,
+                f"{name} must convert byte counts to character counts by dividing",
+            )
+
+            # The bound has to be taken against what was delivered, not against a
+            # length the sender declared.
+            self.assertGreaterEqual(
+                body.count("data.size()"), 2,
+                f"{name} must bound the variable region against the delivered payload "
+                f"size, both for the fixed part and for the variable part",
+            )
+
 
 @dataclass(frozen=True)
 class Cookie:

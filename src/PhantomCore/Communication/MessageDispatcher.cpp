@@ -546,107 +546,165 @@ public:
         return request;
     }
 
+    // Parses SHADOWSTRIKE_PROCESS_NOTIFICATION (MessageProtocol.h) - the layout the
+    // driver actually writes, at PnpSendProcessNotification (ProcessNotify.c:3798)
+    // and SbBuildProcessEvent (ScanBridge.c:1491).
+    //
+    // This previously parsed Communication::ProcessNotificationData, a 48-byte
+    // struct opening with a uint64 messageId that the driver has never emitted.
+    // The real payload is 21 bytes of fields behind a 40-byte dead header, so the
+    // minimum-size check below rejected every genuine notification and this
+    // function returned nullopt for all real input. It failed closed, which is why
+    // it never produced a wrong answer - but it could never produce a right one.
+    //
+    // TWO PROPERTIES OF THIS WIRE FORMAT ARE EASY TO GET WRONG:
+    //  1. The struct OPENS WITH A 40-BYTE SS_MESSAGE_HEADER that the driver zeroes
+    //     and never fills (RtlZeroMemory over the whole buffer, then the fields are
+    //     written after it). It is redundant with the outer frame header the caller
+    //     has already parsed, but it occupies real wire space and every field
+    //     offset depends on it.
+    //  2. ImagePathLength and CommandLineLength are BYTE counts, not character
+    //     counts - the driver RtlCopyMemory's exactly that many bytes. Multiplying
+    //     them by sizeof(wchar_t) reads twice the payload.
     [[nodiscard]] static std::optional<ProcessNotification> ParseProcessNotification(
         std::span<const uint8_t> data) {
 
-        if (data.size() < sizeof(ProcessNotificationData)) {
+        if (data.size() < sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION)) {
+            Utils::Logger::Warn("[MessageDispatcher] ProcessNotification too small: {} < {}",
+                                data.size(), sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION));
             return std::nullopt;
         }
 
-        const ProcessNotificationData* raw =
-            reinterpret_cast<const ProcessNotificationData*>(data.data());
+        const auto* raw =
+            reinterpret_cast<const SHADOWSTRIKE_PROCESS_NOTIFICATION*>(data.data());
 
-        size_t requiredSize = sizeof(ProcessNotificationData) +
-                             (raw->imagePathLength * sizeof(wchar_t)) +
-                             (raw->commandLineLength * sizeof(wchar_t));
+        // Bound the variable region against the bytes actually delivered. Widen to
+        // size_t BEFORE summing: both lengths are uint16_t, so the sum cannot wrap
+        // a size_t here, but the widening is written explicitly so that changing
+        // either field to a wider type does not silently introduce a wrap.
+        const size_t imagePathBytes  = static_cast<size_t>(raw->ImagePathLength);
+        const size_t commandLineBytes = static_cast<size_t>(raw->CommandLineLength);
+        const size_t variableBytes = imagePathBytes + commandLineBytes;
 
-        if (data.size() < requiredSize) {
+        if (data.size() - sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION) < variableBytes) {
+            Utils::Logger::Warn("[MessageDispatcher] ProcessNotification variable data "
+                                "exceeds payload: image={} cmdline={} available={}",
+                                imagePathBytes, commandLineBytes,
+                                data.size() - sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION));
             return std::nullopt;
         }
 
         ProcessNotification notification;
-        notification.messageId = raw->messageId;
-        notification.processId = raw->processId;
-        notification.parentProcessId = raw->parentProcessId;
-        notification.creatingProcessId = raw->creatingProcessId;
-        notification.creatingThreadId = raw->creatingThreadId;
-        notification.sessionId = raw->sessionId;
-        notification.isWow64 = raw->isWow64 != 0;
-        notification.isElevated = raw->isElevated != 0;
-        notification.integrityLevel = raw->integrityLevel;
-        notification.requiresReply = raw->requiresReply != 0;
-        notification.flags = raw->flags;
+        notification.processId         = raw->ProcessId;
+        notification.parentProcessId   = raw->ParentProcessId;
+        notification.creatingProcessId = raw->CreatingProcessId;
+        notification.creatingThreadId  = raw->CreatingThreadId;
+        notification.isCreation        = raw->Create != 0;
 
-        // Convert FILETIME to time_point
-        notification.createTime = std::chrono::system_clock::now();
+        // FIELDS THE WIRE DOES NOT CARRY, LEFT AT THEIR DECLARED DEFAULTS.
+        // messageId, sessionId, isWow64, isElevated, integrityLevel, requiresReply,
+        // createTime and flags have no source in SHADOWSTRIKE_PROCESS_NOTIFICATION.
+        // They are deliberately NOT invented here: a fabricated zero that looks like
+        // a measurement is worse than an absent value, because a consumer cannot
+        // tell "session 0" from "nobody asked". If any of them is ever needed it has
+        // to be added to the wire format on both sides, not defaulted here.
 
-        // Extract paths
-        const wchar_t* imagePathPtr = reinterpret_cast<const wchar_t*>(
-            data.data() + sizeof(ProcessNotificationData));
-        notification.imagePath = std::wstring(imagePathPtr, raw->imagePathLength);
+        const auto* variable = data.data() + sizeof(SHADOWSTRIKE_PROCESS_NOTIFICATION);
 
-        const wchar_t* cmdLinePtr = imagePathPtr + raw->imagePathLength;
-        notification.commandLine = std::wstring(cmdLinePtr, raw->commandLineLength);
+        if (imagePathBytes > 0) {
+            notification.imagePath.assign(
+                reinterpret_cast<const wchar_t*>(variable),
+                imagePathBytes / sizeof(wchar_t));
+        }
+        if (commandLineBytes > 0) {
+            notification.commandLine.assign(
+                reinterpret_cast<const wchar_t*>(variable + imagePathBytes),
+                commandLineBytes / sizeof(wchar_t));
+        }
 
         return notification;
     }
 
+    // Parses SHADOWSTRIKE_REGISTRY_NOTIFICATION (MessageProtocol.h) - 21 bytes,
+    // opening with ProcessId, written by the driver at ScanBridge.c:1952.
+    //
+    // This previously parsed Communication::RegistryNotificationData, a 40-byte
+    // struct opening with a uint64 messageId. That is the SAME wrong struct that
+    // RegistryMonitor parsed until commit 5fe45d55, where it was proven that no
+    // registry event had ever been processed because of it. The defect is
+    // reproduced here because both modules read the same fabricated declaration;
+    // deleting the declaration is what prevents a third instance.
+    //
+    // KeyPathLength / ValueNameLength are BYTE counts and DataSize is a byte count
+    // of opaque registry data. There is no character count anywhere in this payload.
     [[nodiscard]] static std::optional<RegistryNotification> ParseRegistryNotification(
         std::span<const uint8_t> data) {
 
-        if (data.size() < sizeof(RegistryNotificationData)) {
+        if (data.size() < sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION)) {
+            Utils::Logger::Warn("[MessageDispatcher] RegistryNotification too small: {} < {}",
+                                data.size(), sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION));
             return std::nullopt;
         }
 
-        const RegistryNotificationData* raw =
-            reinterpret_cast<const RegistryNotificationData*>(data.data());
+        const auto* raw =
+            reinterpret_cast<const SHADOWSTRIKE_REGISTRY_NOTIFICATION*>(data.data());
 
-        // FIX [BUG #26]: Cap variable-length data sizes BEFORE size_t addition.
-        // valueDataLength is uint32_t and on 32-bit platforms (or even on x64
-        // with multiple variable fields) summing it with key/value-name lengths
-        // can wrap before the bounds check below. Reject obviously-bogus inputs
-        // up front, well below MAX_MESSAGE_SIZE.
-        if (raw->keyPathLength > MAX_MESSAGE_SIZE ||
-            raw->valueNameLength > MAX_MESSAGE_SIZE ||
-            raw->valueDataLength > MAX_MESSAGE_SIZE) {
+        // FIX [BUG #26] PRESERVED: cap each length independently BEFORE summing.
+        // DataSize is a UINT32 straight off the wire, so on a 32-bit build the sum
+        // of the three lengths can wrap and defeat the bounds check below. Reject
+        // implausible values up front, well under MAX_MESSAGE_SIZE, so the addition
+        // is provably safe on every target rather than only on x64.
+        if (raw->KeyPathLength > MAX_MESSAGE_SIZE ||
+            raw->ValueNameLength > MAX_MESSAGE_SIZE ||
+            raw->DataSize > MAX_MESSAGE_SIZE) {
             Utils::Logger::Warn("[MessageDispatcher] RegistryNotification field too large: "
-                               "key={} valueName={} valueData={}",
-                               raw->keyPathLength, raw->valueNameLength, raw->valueDataLength);
+                                "key={} valueName={} data={}",
+                                raw->KeyPathLength, raw->ValueNameLength, raw->DataSize);
             return std::nullopt;
         }
 
-        size_t requiredSize = sizeof(RegistryNotificationData) +
-                             (static_cast<size_t>(raw->keyPathLength) * sizeof(wchar_t)) +
-                             (static_cast<size_t>(raw->valueNameLength) * sizeof(wchar_t)) +
-                             static_cast<size_t>(raw->valueDataLength);
+        const size_t keyPathBytes   = static_cast<size_t>(raw->KeyPathLength);
+        const size_t valueNameBytes = static_cast<size_t>(raw->ValueNameLength);
+        const size_t dataBytes      = static_cast<size_t>(raw->DataSize);
+        const size_t variableBytes  = keyPathBytes + valueNameBytes + dataBytes;
 
-        if (data.size() < requiredSize) {
+        if (data.size() - sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION) < variableBytes) {
+            Utils::Logger::Warn("[MessageDispatcher] RegistryNotification variable data "
+                                "exceeds payload: key={} valueName={} data={} available={}",
+                                keyPathBytes, valueNameBytes, dataBytes,
+                                data.size() - sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION));
             return std::nullopt;
         }
 
         RegistryNotification notification;
-        notification.messageId = raw->messageId;
-        notification.processId = raw->processId;
-        notification.threadId = raw->threadId;
-        notification.operationType = raw->operationType;
-        notification.valueType = raw->valueType;
-        notification.requiresReply = raw->requiresReply != 0;
-        notification.timestamp = std::chrono::system_clock::now();
+        notification.processId     = raw->ProcessId;
+        notification.threadId      = raw->ThreadId;
+        notification.operationType = raw->Operation;
+        notification.valueType     = raw->DataType;
 
-        // Extract key path
-        const wchar_t* keyPathPtr = reinterpret_cast<const wchar_t*>(
-            data.data() + sizeof(RegistryNotificationData));
-        notification.keyPath = std::wstring(keyPathPtr, raw->keyPathLength);
+        // FIELDS THE WIRE DOES NOT CARRY, LEFT AT THEIR DECLARED DEFAULTS.
+        // messageId and requiresReply have no source in this payload, and the
+        // registry feed is fire-and-forget in the driver (ShadowStrikeSendNotification,
+        // no reply buffer), so requiresReply could only ever be false. Not invented
+        // here for the same reason as the process path: a defaulted value that looks
+        // measured is worse than an absent one.
 
-        // Extract value name
-        const wchar_t* valueNamePtr = keyPathPtr + raw->keyPathLength;
-        notification.valueName = std::wstring(valueNamePtr, raw->valueNameLength);
+        const auto* variable = data.data() + sizeof(SHADOWSTRIKE_REGISTRY_NOTIFICATION);
 
-        // Extract value data
-        const uint8_t* valueDataPtr = reinterpret_cast<const uint8_t*>(
-            valueNamePtr + raw->valueNameLength);
-        notification.valueData.assign(valueDataPtr,
-                                      valueDataPtr + raw->valueDataLength);
+        if (keyPathBytes > 0) {
+            notification.keyPath.assign(
+                reinterpret_cast<const wchar_t*>(variable),
+                keyPathBytes / sizeof(wchar_t));
+        }
+        if (valueNameBytes > 0) {
+            notification.valueName.assign(
+                reinterpret_cast<const wchar_t*>(variable + keyPathBytes),
+                valueNameBytes / sizeof(wchar_t));
+        }
+        if (dataBytes > 0) {
+            const auto* valueData = variable + keyPathBytes + valueNameBytes;
+            notification.valueData.assign(valueData, valueData + dataBytes);
+        }
 
         return notification;
     }
