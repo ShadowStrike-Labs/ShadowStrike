@@ -335,6 +335,17 @@ struct AtomBombingAttack {
     uint32_t riskScore = 0;                   ///< 0-100
     
     // Response
+    /// Blocking was REQUESTED by configuration (blockSuspiciousApcs plus an
+    /// Active/Aggressive mode). INTENT, not outcome.
+    bool blockRequested = false;
+    /// Enforcement was actually CARRIED OUT by this module.
+    ///
+    /// This module CANNOT block an atom-bombing APC from user mode - the code
+    /// that raises these events says so in its own comment, because an APC that
+    /// has already been queued cannot be cancelled from outside the kernel. The
+    /// event is handed to the attack callbacks so a kernel bridge or
+    /// BehaviorBlocker can act; whether any registrant does is not something
+    /// this module can observe, so it must not claim the block itself.
     bool wasBlocked = false;
     bool attackerTerminated = false;
     std::wstring mitigationAction;
@@ -456,7 +467,16 @@ struct alignas(64) AtomBombingStatistics {
     
     // Attack detection
     std::atomic<uint64_t> attacksDetected{0};
+    /// Attacks this module actually stopped. User-mode cannot cancel a queued
+    /// APC, so nothing in this module increments it today and that is why the
+    /// field is documented rather than deleted: it is the right counter for a
+    /// genuine kernel-assisted interception path, and a zero here is now an
+    /// accurate statement instead of a count of detections.
     std::atomic<uint64_t> attacksBlocked{0};
+
+    /// Detections where blocking was requested by configuration and no
+    /// enforcement was performed by this module.
+    std::atomic<uint64_t> blockRequestedNotPerformed{0};
     std::atomic<uint64_t> lowConfidenceDetections{0};
     std::atomic<uint64_t> mediumConfidenceDetections{0};
     std::atomic<uint64_t> highConfidenceDetections{0};
@@ -494,6 +514,7 @@ struct alignas(64) AtomBombingStatistics {
             atomTargetingApcs.store(other.atomTargetingApcs.load(std::memory_order_relaxed), std::memory_order_relaxed);
             attacksDetected.store(other.attacksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
             attacksBlocked.store(other.attacksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blockRequestedNotPerformed.store(other.blockRequestedNotPerformed.load(std::memory_order_relaxed), std::memory_order_relaxed);
             lowConfidenceDetections.store(other.lowConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
             mediumConfidenceDetections.store(other.mediumConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
             highConfidenceDetections.store(other.highConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);

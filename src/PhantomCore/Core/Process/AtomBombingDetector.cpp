@@ -316,6 +316,7 @@ void AtomBombingStatistics::Reset() noexcept {
 
     attacksDetected.store(0, std::memory_order_relaxed);
     attacksBlocked.store(0, std::memory_order_relaxed);
+    blockRequestedNotPerformed.store(0, std::memory_order_relaxed);
     lowConfidenceDetections.store(0, std::memory_order_relaxed);
     mediumConfidenceDetections.store(0, std::memory_order_relaxed);
     highConfidenceDetections.store(0, std::memory_order_relaxed);
@@ -1413,10 +1414,12 @@ public:
                     config.mode == MonitoringMode::Aggressive) {
 
                     SS_LOG_WARN(L"AtomBombing",
-                        L"Suspicious APC blocked: PID %u -> PID %u (TID %u), routine 0x%llX",
+                        L"Suspicious APC DETECTED (block requested; user mode cannot cancel a "
+                        L"queued APC, enforcement is left to the kernel bridge): "
+                        L"PID %u -> PID %u (TID %u), routine 0x%llX",
                         sourcePid, targetPid, targetTid,
                         static_cast<unsigned long long>(apcRoutine));
-                    m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
+                    m_stats.blockRequestedNotPerformed.fetch_add(1, std::memory_order_relaxed);
 
                     // Notify attack callbacks so the kernel bridge or BehaviorBlocker
                     // can enforce the block at the kernel level
@@ -1434,9 +1437,15 @@ public:
                     blockEvent.relatedApcs.push_back(apcEvent);
                     blockEvent.confidence = DetectionConfidence::High;
                     blockEvent.riskScore = apcEvent.riskScore;
-                    blockEvent.wasBlocked = true;
+                    // INTENT ONLY. The comment opening this branch already states
+                    // that user mode cannot retroactively cancel a queued APC.
+                    // The event is handed to the attack callbacks so a kernel
+                    // bridge or BehaviorBlocker can enforce; this module cannot
+                    // observe whether any registrant did, so it must not claim
+                    // the block.
+                    blockEvent.blockRequested = true;
                     blockEvent.mitreAttackId = "T1055.009";
-                    blockEvent.mitigationAction = L"APC blocked via kernel callback";
+                    blockEvent.mitigationAction = L"Reported to attack callbacks for kernel-level enforcement";
 
                     InvokeAttackCallbacks(blockEvent);
                 }
@@ -1899,12 +1908,13 @@ bool AtomBombingDetector::BlockAPC(const APCEvent& apc) {
     blockEvent.relatedApcs.push_back(apc);
     blockEvent.confidence = DetectionConfidence::High;
     blockEvent.riskScore = apc.riskScore;
-    blockEvent.wasBlocked = true;
+    // INTENT ONLY - see the comment above this function's event construction.
+    blockEvent.blockRequested = true;
     blockEvent.mitreAttackId = "T1055.009";
-    blockEvent.mitigationAction = L"APC blocked via detector policy";
+    blockEvent.mitigationAction = L"Reported via detector policy; no user-mode enforcement performed";
 
     m_impl->InvokeAttackCallbacks(blockEvent);
-    m_impl->m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.blockRequestedNotPerformed.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 

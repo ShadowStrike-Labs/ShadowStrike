@@ -5454,7 +5454,14 @@ public:
                                 }
 
                                 auto ioctlEvent = ked.AnalyzeIOCTL(pid, devicePath, ioctlCode, inputBuf);
-                                if (ioctlEvent.isSuspicious && ioctlEvent.wasBlocked) {
+                                // A DETECTION counter must never be gated on a
+                                // RESPONSE field. KernelExploitEvent::wasBlocked is
+                                // derived from the blockSuspiciousIOCTL policy flag,
+                                // so requiring it here meant an administrator who
+                                // turned blocking off also stopped suspicious IOCTLs
+                                // being COUNTED AS DETECTED - the detection vanished
+                                // along with the response.
+                                if (ioctlEvent.isSuspicious) {
                                     m_stats.threatsDetected++;
                                 }
                             }
