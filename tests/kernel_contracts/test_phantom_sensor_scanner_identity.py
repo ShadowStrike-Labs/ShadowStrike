@@ -130,6 +130,22 @@ IP_LEAK_PROTECTION_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/Privacy/IPLeakProtection.hpp"
 )
 
+# SelfDefense is the self-protection ORCHESTRATOR - the module an operator reads
+# to answer "did we defend ourselves?" - so a counter that overstates a defence
+# is more consequential here than anywhere else. Measuring found no fabricated
+# block claim, but its periodic code-integrity check incremented
+# memoryModificationBlocked for a change it recorded five lines later as
+# wasBlocked = false, and since every other writer of that counter sits in
+# unreachable code (the access gate has no callers, the kernel SelfProtect
+# message has no producer) that was the only way any *Blocked counter in the
+# module could ever read non-zero. RegistryProtection is registered alongside it
+# because its one remaining claim is a gate DECISION, which is honest only while
+# the caller enforces the decision it returns.
+SELF_DEFENSE_CPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.cpp"
+REGISTRY_PROTECTION_CPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
+)
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -1096,6 +1112,114 @@ class SourceContractTests(unittest.TestCase):
             2,
             "The counter must be carried by BOTH hand-written copy operators "
             "(copy constructor and assignment), or every snapshot drops it.",
+        )
+
+    def test_selfdefense_never_counts_an_observed_change_as_a_prevented_one(self) -> None:
+        """The self-protection orchestrator's integrity check observes; it cannot prevent.
+
+        VerifyMemoryIntegrity hashes our own code section and compares it against
+        a stored digest, so a mismatch means the write has ALREADY landed - and
+        the event it records states exactly that with wasBlocked = false. It used
+        to increment memoryModificationBlocked on that same path. Because every
+        other writer of that counter is unreachable (FilterAccessRequest and
+        IsAccessAllowed have zero callers anywhere in the repository, and the
+        kernel SelfProtect message it also fires from has no producer in the
+        driver), this was the ONLY way any *Blocked counter in SelfDefense could
+        ever read non-zero. So the single number an operator would consult to ask
+        "did we defend ourselves?" was reporting a modification that was not
+        defended against at all.
+
+        This is a source contract because reaching the live path needs our own
+        .text section to be modified in a running service.
+        """
+        raw_cpp = read_source(SELF_DEFENSE_CPP_PATH)
+        cpp = strip_c_comments(raw_cpp)
+        hpp = strip_c_comments(read_source(SELF_DEFENSE_HPP_PATH))
+        registry = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+
+        body = strip_c_comments(
+            extract_c_function(raw_cpp, "SelfDefenseImpl::VerifyMemoryIntegrity")
+        )
+        self.assertGreater(
+            len(body),
+            200,
+            "VerifyMemoryIntegrity was not sliced, so nothing below is asserted.",
+        )
+
+        # The integrity check must not touch ANY prevented-outcome counter. This
+        # is written as a pattern rather than a single name so that introducing a
+        # different *Blocked counter here fails too.
+        offenders = re.findall(r"m_stats\.\w*Blocked\.fetch_add", body)
+        self.assertEqual(
+            offenders,
+            [],
+            "VerifyMemoryIntegrity increments a prevented-outcome counter for a "
+            "change it can only observe after the fact: "
+            + ", ".join(sorted(set(offenders))),
+        )
+        self.assertEqual(
+            body.count("codeIntegrityViolationsDetected.fetch_add"),
+            1,
+            "The observed code-integrity violation is not counted at all, so a "
+            "modification of our own code section would now go unrecorded.",
+        )
+        self.assertEqual(
+            body.count("wasBlocked = false"),
+            1,
+            "The integrity event must keep stating that nothing was blocked.",
+        )
+
+        # The detection counter must be plumbed everywhere the struct is copied
+        # or cleared, or it becomes a structural zero that looks like health.
+        for needle, where in (
+            ("codeIntegrityViolationsDetected", "the public statistics struct"),
+        ):
+            self.assertGreaterEqual(
+                hpp.count(needle),
+                1,
+                f"The detection counter is missing from {where}.",
+            )
+        self.assertGreaterEqual(
+            cpp.count("codeIntegrityViolationsDetected.store(0"),
+            1,
+            "The detection counter is not cleared by InternalStats::Reset().",
+        )
+        self.assertGreaterEqual(
+            cpp.count("snap.codeIntegrityViolationsDetected"),
+            1,
+            "The detection counter never reaches the public snapshot, so no "
+            "caller of GetStatistics() can ever see it.",
+        )
+        self.assertGreaterEqual(
+            cpp.count("codeIntegrityViolationsDetected = 0"),
+            1,
+            "The detection counter is not cleared by SelfDefenseStatistics::Reset().",
+        )
+
+        # Residual claim sites, pinned by count. Both surviving sites are gates
+        # whose contract is that the CALLER enforces the returned decision, so
+        # the claim is correct there and must not be rewritten - but a new one
+        # must not appear either. memoryModificationBlocked keeps exactly its two
+        # unreachable writers so the reachable one cannot come back.
+        self.assertEqual(
+            cpp.count("wasBlocked = true"),
+            2,
+            "SelfDefense gained or lost a block claim. The two expected sites are "
+            "IsAccessAllowed (which returns false to deny) and the kernel "
+            "SelfProtect handler; both are gates, neither is flag-derived.",
+        )
+        self.assertEqual(
+            cpp.count("memoryModificationBlocked.fetch_add"),
+            2,
+            "memoryModificationBlocked must keep exactly its two writers inside "
+            "the access gate and the kernel handler; a third one means an "
+            "observation is being counted as a prevention again.",
+        )
+        self.assertEqual(
+            registry.count("wasBlocked = true"),
+            1,
+            "RegistryProtection's single claim lives in FireBlockedOperationEvent, "
+            "reached only from the FilterOperation gate.",
         )
 
     def test_precreate_captures_callback_requestor_once(self) -> None:

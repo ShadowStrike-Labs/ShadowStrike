@@ -910,8 +910,27 @@ struct SelfDefenseStatistics {
     /// @brief Thread termination attempts blocked
     uint64_t threadTerminationBlocked = 0;
     
-    /// @brief Memory modification attempts blocked
+    /// @brief Memory modification attempts PREVENTED.
+    ///
+    /// Counts only modifications this module actually stopped. It has NO
+    /// reachable producer today: every writer lives either in code with no
+    /// callers (FilterAccessRequest / IsAccessAllowed) or behind a kernel
+    /// message the driver never emits, so a zero here is accurate rather than
+    /// evidence of health. Kept because the counter becomes correct the moment
+    /// that gate is wired; see codeIntegrityViolationsDetected for what this
+    /// module does observe today.
     uint64_t memoryModificationBlocked = 0;
+
+    /// @brief Code-integrity violations DETECTED - our own code section changed.
+    ///
+    /// A DETECTION signal, not an outcome. VerifyMemoryIntegrity compares a
+    /// stored hash of our .text section, so it can only observe a modification
+    /// that has ALREADY happened; it cannot prevent one, and the event it
+    /// records says so explicitly (wasBlocked = false). This used to increment
+    /// memoryModificationBlocked instead, which made the only blocked-counter
+    /// SelfDefense could ever report non-zero a count of modifications it had
+    /// NOT blocked - the exact question an operator reads these numbers to ask.
+    uint64_t codeIntegrityViolationsDetected = 0;
     
     /// @brief File modification attempts blocked
     uint64_t fileModificationBlocked = 0;

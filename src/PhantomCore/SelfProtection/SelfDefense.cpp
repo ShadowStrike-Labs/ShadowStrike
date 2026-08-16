@@ -264,6 +264,7 @@ struct InternalStats {
     std::atomic<uint64_t> processTerminationBlocked{0};
     std::atomic<uint64_t> threadTerminationBlocked{0};
     std::atomic<uint64_t> memoryModificationBlocked{0};
+    std::atomic<uint64_t> codeIntegrityViolationsDetected{0};
     std::atomic<uint64_t> fileModificationBlocked{0};
     std::atomic<uint64_t> registryModificationBlocked{0};
     std::atomic<uint64_t> serviceControlBlocked{0};
@@ -279,6 +280,7 @@ struct InternalStats {
         processTerminationBlocked.store(0, std::memory_order_relaxed);
         threadTerminationBlocked.store(0, std::memory_order_relaxed);
         memoryModificationBlocked.store(0, std::memory_order_relaxed);
+        codeIntegrityViolationsDetected.store(0, std::memory_order_relaxed);
         fileModificationBlocked.store(0, std::memory_order_relaxed);
         registryModificationBlocked.store(0, std::memory_order_relaxed);
         serviceControlBlocked.store(0, std::memory_order_relaxed);
@@ -296,6 +298,8 @@ struct InternalStats {
         snap.processTerminationBlocked = processTerminationBlocked.load(std::memory_order_relaxed);
         snap.threadTerminationBlocked = threadTerminationBlocked.load(std::memory_order_relaxed);
         snap.memoryModificationBlocked = memoryModificationBlocked.load(std::memory_order_relaxed);
+        snap.codeIntegrityViolationsDetected =
+            codeIntegrityViolationsDetected.load(std::memory_order_relaxed);
         snap.fileModificationBlocked = fileModificationBlocked.load(std::memory_order_relaxed);
         snap.registryModificationBlocked = registryModificationBlocked.load(std::memory_order_relaxed);
         snap.serviceControlBlocked = serviceControlBlocked.load(std::memory_order_relaxed);
@@ -2408,7 +2412,17 @@ bool SelfDefenseImpl::VerifyMemoryIntegrity() {
 
     auto currentHash = ComputeSHA256(reinterpret_cast<const void*>(base), sz);
     if (currentHash != expectedHash) {
-        m_stats.memoryModificationBlocked.fetch_add(1, std::memory_order_relaxed);
+        // A DETECTION, not a prevention. This compares a stored hash against
+        // the live code section, so by the time the comparison fails the write
+        // has already landed - which is exactly what the event below records
+        // (wasBlocked = false). Until this change the counter incremented here
+        // was memoryModificationBlocked, and because every other writer of that
+        // counter is unreachable (the access gate has no callers and the kernel
+        // SelfProtect message has no producer), this was the ONLY way any
+        // *Blocked counter in SelfDefense could ever read non-zero. So the one
+        // number an operator would find here to answer "did we defend
+        // ourselves?" was counting a modification we did not defend against.
+        m_stats.codeIntegrityViolationsDetected.fetch_add(1, std::memory_order_relaxed);
         ThreatEvent evt;
         evt.type = ThreatType::MemoryModification;
         evt.targetType = ProtectedEntityType::MemoryRegion;
@@ -2791,6 +2805,7 @@ std::string SelfDefenseImpl::ExportReport() const {
          << "  \"processTerminationBlocked\": " << stats.processTerminationBlocked << ",\n"
          << "  \"threadTerminationBlocked\": " << stats.threadTerminationBlocked << ",\n"
          << "  \"memoryModificationBlocked\": " << stats.memoryModificationBlocked << ",\n"
+         << "  \"codeIntegrityViolationsDetected\": " << stats.codeIntegrityViolationsDetected << ",\n"
          << "  \"fileModificationBlocked\": " << stats.fileModificationBlocked << ",\n"
          << "  \"registryModificationBlocked\": " << stats.registryModificationBlocked << ",\n"
          << "  \"serviceControlBlocked\": " << stats.serviceControlBlocked << ",\n"
@@ -3228,6 +3243,7 @@ void SelfDefenseStatistics::Reset() noexcept {
     processTerminationBlocked = 0;
     threadTerminationBlocked = 0;
     memoryModificationBlocked = 0;
+    codeIntegrityViolationsDetected = 0;
     fileModificationBlocked = 0;
     registryModificationBlocked = 0;
     serviceControlBlocked = 0;
@@ -3239,6 +3255,11 @@ void SelfDefenseStatistics::Reset() noexcept {
 
 std::string SelfDefenseStatistics::ToJson() const {
     std::ostringstream json;
+    // Deliberately a THREE-FIELD SUMMARY. Per-category counters - including
+    // codeIntegrityViolationsDetected - belong in ExportReport(), which emits
+    // every one of them; SelfDefense_Tests pins both the field count and the
+    // absence of a category counter here, so widening this is a contract change
+    // and not a formatting choice.
     json << "{\"totalThreats\":" << totalThreatsDetected
          << ",\"blocked\":" << totalThreatsBlocked
          << ",\"recoveries\":" << successfulRecoveries << "}";
