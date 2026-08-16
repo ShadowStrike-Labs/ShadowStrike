@@ -163,6 +163,20 @@ REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
 )
 
+# MessageTypes.h declares the kernel<->user message type enum. Its section
+# headings used to advertise hex ranges the enum has never implemented, which is
+# the documented reason a set of user-mode enforcement senders invented 0x30 as
+# a "block this process" message type. MessageHandler.{c,h} hold the gates that
+# actually run: the magic check, the MH_MAX_HANDLERS bound, and the build-time
+# C_ASSERT tying that bound to this enum.
+MESSAGE_TYPES_PATH = ROOT / "PhantomSensor/Shared/MessageTypes.h"
+MESSAGE_HANDLER_C_PATH = (
+    ROOT / "PhantomSensor/PhantomSensor/Communication/MessageHandler.c"
+)
+MESSAGE_HANDLER_H_PATH = (
+    ROOT / "PhantomSensor/PhantomSensor/Communication/MessageHandler.h"
+)
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -3646,6 +3660,161 @@ class LifecycleModelTests(unittest.TestCase):
 
         model.passive_retry()
         self.assertTrue(model.finalized)
+
+
+class MessageTypeNumberingContractTests(unittest.TestCase):
+    """Pins how SHADOWSTRIKE_MESSAGE_TYPE assigns its values.
+
+    The enum carries no explicit initialisers, so its values are positional and
+    the number travels on the wire. Its section headings nevertheless advertised
+    hex ranges it has never implemented - nine of the eleven were arithmetically
+    false, and the two that held did so only because the enum starts at zero.
+    A set of user-mode enforcement senders consequently stamped a "block this
+    process" request with 0x30, the opening value of the range labelled Policy.
+
+    Those frames are refused today for a reason unrelated to the type number:
+    they carry no SHADOWSTRIKE_MESSAGE_HEADER at all, so MessageHandler.c reads
+    their first four bytes as Magic and rejects them. The type bound in the
+    driver is MH_MAX_HANDLERS (64), NOT FilterMessageType_Max, so 48 already
+    sits inside the handler table's index space.
+    """
+
+    def _enum_entries(self) -> list:
+        """Return the enum's entries with any initialiser text removed."""
+        source = strip_c_comments(
+            read_source(MESSAGE_TYPES_PATH).lstrip("\ufeff")
+        )
+        match = re.search(
+            r"typedef enum _SHADOWSTRIKE_MESSAGE_TYPE\s*\{(.*?)\}\s*"
+            r"SHADOWSTRIKE_MESSAGE_TYPE;",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(
+            match,
+            "The SHADOWSTRIKE_MESSAGE_TYPE enum could not be located in "
+            "MessageTypes.h, so its numbering contract cannot be checked. "
+            "Suspect this helper before concluding the enum is absent.",
+        )
+        return [entry.strip() for entry in match.group(1).split(",") if entry.strip()]
+
+    def test_the_message_type_enum_states_its_own_numbering_rule(self) -> None:
+        raw = read_source(MESSAGE_TYPES_PATH).lstrip("\ufeff")
+        entries = self._enum_entries()
+
+        initialised = [entry for entry in entries if "=" in entry]
+        self.assertEqual(
+            initialised,
+            ["FilterMessageType_None = 0"],
+            "SHADOWSTRIKE_MESSAGE_TYPE must carry exactly one initialiser, "
+            "None = 0, so every value stays positional. Giving enumerators "
+            "explicit values renumbers the wire, and a driver and a service "
+            "built either side of that change would disagree about the meaning "
+            "of every message type.",
+        )
+
+        # This assertion is ABOUT A COMMENT, so it reads the RAW source. Running
+        # it against strip_c_comments() output would make it vacuously true.
+        start = raw.index("typedef enum _SHADOWSTRIKE_MESSAGE_TYPE")
+        end = raw.index("} SHADOWSTRIKE_MESSAGE_TYPE;", start)
+        offenders = [
+            line.strip()
+            for line in raw[start:end].splitlines()
+            if re.match(
+                r"\s*//.*\(\s*0x[0-9A-Fa-f]{2}\s*-\s*0x[0-9A-Fa-f]{2}\s*\)",
+                line,
+            )
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "A section heading inside SHADOWSTRIKE_MESSAGE_TYPE advertises a "
+            "hex range the enum does not implement. That exact fiction is why "
+            "0x30 was invented as a message type by eleven modules. Group "
+            "headings are category labels and must carry no numbers.",
+        )
+
+        # The knowledge this cost us must stay written down next to the enum.
+        preamble = raw[: raw.index("typedef enum _SHADOWSTRIKE_MESSAGE_TYPE")]
+        missing = [
+            token
+            for token in ("APPEND ONLY", "MH_MAX_HANDLERS", "0x30", "0x31", "0x35", "0x36")
+            if preamble.count(token) == 0
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "MessageTypes.h no longer records the append-only rule, the real "
+            "dispatch bound, or the invented constants that are NOT message "
+            "types. That documentation is the fix for this defect class; "
+            "removing it invites the next module to guess a value again.",
+        )
+
+    def test_the_message_type_enum_cannot_reach_the_invented_block_constant(self) -> None:
+        entries = self._enum_entries()
+        names = [entry.split("=")[0].strip() for entry in entries]
+        self.assertEqual(
+            names.count("FilterMessageType_Max"),
+            1,
+            "FilterMessageType_Max must appear exactly once as the final "
+            "enumerator - it is the count this contract is derived from.",
+        )
+        max_value = names.index("FilterMessageType_Max")
+
+        self.assertLessEqual(
+            max_value,
+            0x30,
+            f"FilterMessageType_Max has reached {max_value}. Once it exceeds "
+            "0x30 (48) a real, REGISTERED message type occupies slot 48, and 48 "
+            "is the 0x30 that user-mode enforcement senders still stamp on an "
+            "unframed struct. Today those frames are refused only because they "
+            "carry no message header, so the magic check rejects them - not "
+            "because 48 is out of range. Replace those constants with a real "
+            "message type (task 158) before appending past this point.",
+        )
+
+        handler_header = read_source(MESSAGE_HANDLER_H_PATH).lstrip("\ufeff")
+        slots_match = re.search(r"#define\s+MH_MAX_HANDLERS\s+(\d+)", handler_header)
+        self.assertIsNotNone(
+            slots_match,
+            "MH_MAX_HANDLERS is no longer a plain integer #define in "
+            "MessageHandler.h, so the size of the dispatch table can no longer "
+            "be compared against this enum from here.",
+        )
+        self.assertGreaterEqual(
+            int(slots_match.group(1)),
+            max_value,
+            "The driver's dispatch table is smaller than this enum, so the "
+            "highest message types cannot be dispatched at all.",
+        )
+
+        handler = strip_c_comments(
+            read_source(MESSAGE_HANDLER_C_PATH).lstrip("\ufeff")
+        )
+        self.assertEqual(
+            handler.count("C_ASSERT(MH_MAX_HANDLERS >= FilterMessageType_Max)"),
+            1,
+            "MessageHandler.c has lost the C_ASSERT tying MH_MAX_HANDLERS to "
+            "FilterMessageType_Max. That assert is what turns 'this enum "
+            "outgrew the dispatch table' into a build failure instead of "
+            "silently undispatchable message types.",
+        )
+        # Word-boundary matched on purpose: a plain substring count would still
+        # be satisfied by a RENAMED, longer constant (SHADOWSTRIKE_MESSAGE_MAGIC_V2),
+        # which would leave the gate looking present while comparing against
+        # something else.
+        self.assertGreaterEqual(
+            len(
+                re.findall(
+                    r"Magic\s*!=\s*SHADOWSTRIKE_MESSAGE_MAGIC\b", handler
+                )
+            ),
+            1,
+            "MessageHandler.c no longer refuses an incoming frame whose Magic "
+            "is wrong. That check is the ONLY thing currently stopping the "
+            "unframed 0x30 enforcement requests from reaching the dispatch "
+            "table, where 48 is already a valid index.",
+        )
 
 
 if __name__ == "__main__":

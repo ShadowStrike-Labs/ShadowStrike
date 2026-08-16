@@ -37,11 +37,64 @@
 /**
  * @brief Message types for kernel<->user-mode communication.
  *
+/**
+ * @brief Message types for kernel<->user-mode communication.
+ *
  * These values are used in the MessageType field of SHADOWSTRIKE_MESSAGE_HEADER.
+ *
+ * ---------------------------------------------------------------------------
+ * HOW THESE VALUES ARE ASSIGNED - read this before adding a type
+ * ---------------------------------------------------------------------------
+ *
+ * There are NO explicit initialisers below except None = 0, so the values are
+ * SEQUENTIAL FROM ZERO in declaration order. FilterMessageType_Max is simply
+ * "one past the last type" and is 45 today. A test under tests/kernel_contracts
+ * pins both facts, so neither can drift silently.
+ *
+ * APPEND ONLY, immediately before FilterMessageType_Max. Two separate things
+ * depend on that: the type number travels on the wire, so an insertion anywhere
+ * else silently re-labels every later message class between a driver and a
+ * service built at different times; and SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE below
+ * is a RELATIONAL test over a contiguous run of enumerators, so an insertion
+ * inside that run changes what it classifies. Note the corollary: a new
+ * data-push type appended at the end lands OUTSIDE that run, so it must be
+ * added to that macro explicitly or it will not be recognised as a push.
+ *
+ * The group headings below are CATEGORY LABELS ONLY and carry no numeric
+ * meaning. They previously advertised hex ranges - "Policy Messages
+ * (0x30 - 0x3F)" and ten others - that this enum has never implemented. Nine
+ * of the eleven were arithmetically false; the two that held did so only
+ * because the enum happens to start at zero. That fiction is the documented
+ * reason several user-mode modules stamped a "block this process" request with
+ * 0x30, the opening value of the range labelled Policy. See task 158.
+ *
+ * 0x30, 0x31, 0x35 AND 0x36 ARE NOT MESSAGE TYPES. They are invented constants
+ * in user-mode enforcement-request senders that transmit a bare struct with no
+ * SHADOWSTRIKE_MESSAGE_HEADER at all. The driver refuses those frames at
+ * MessageHandler.c:1125, because the first four bytes are read as Magic and do
+ * not equal SHADOWSTRIKE_MESSAGE_MAGIC - NOT because the type is out of range.
+ * Do NOT "fix" such a sender by adding a header while keeping the constant:
+ * that removes the only gate currently stopping the frame. MhDispatchMessage
+ * bounds the type against MH_MAX_HANDLERS (64), not against
+ * FilterMessageType_Max, so 48 already sits inside the handler table's index
+ * space and is refused today only because no handler occupies that slot.
+ *
+ * The receive path is, in order: Magic, then type < MH_MAX_HANDLERS, then a
+ * registered handler in that slot. MessageHandler.c:122 carries
+ * C_ASSERT(MH_MAX_HANDLERS >= FilterMessageType_Max) - the build-time tie
+ * between this enum and that table. If this enum ever outgrows 64 the driver
+ * FAILS TO BUILD rather than silently truncating dispatch.
+ *
+ * Finally: SHADOWSTRIKE_VALID_MESSAGE_TYPE, IS_SCAN_MESSAGE,
+ * IS_NOTIFICATION_MESSAGE, IS_DATA_PUSH_MESSAGE and REQUIRES_REPLY at the foot
+ * of this file have NO CALLERS anywhere in the tree. They state intent; they do
+ * not gate anything. Do not assume a type has been validated because they
+ * exist - the gates that actually run are the three named above.
+ * ---------------------------------------------------------------------------
  */
 typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     //
-    // Control Messages (0x00 - 0x0F)
+    // Control
     //
     FilterMessageType_None = 0,
     FilterMessageType_Register,           // User-mode service registering
@@ -50,18 +103,18 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_ConfigUpdate,       // Configuration update
 
     //
-    // Security / Key Exchange (0x05 - 0x0F)
+    // Security / Key Exchange
     //
-    FilterMessageType_KeyExchange,         // Session key exchange (K→U after client verification)
+    FilterMessageType_KeyExchange,         // Session key exchange (K->U after client verification)
 
     //
-    // Scan Messages (0x10 - 0x1F)
+    // Scan
     //
     FilterMessageType_ScanRequest,        // File scan request (Pre-Create/Write)
     FilterMessageType_ScanVerdict,        // Verdict reply
 
     //
-    // Behavioral Notifications (0x20 - 0x2F)
+    // Behavioral Notifications
     //
     FilterMessageType_ProcessNotify,      // Process creation/termination
     FilterMessageType_ThreadNotify,       // Remote thread creation
@@ -72,7 +125,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_FileRollbackEvent,  // Files restored from ransomware backup
 
     //
-    // ALPC Notifications (0x40 - 0x4F)
+    // ALPC Notifications
     //
     FilterMessageType_AlpcPortCreated,        // ALPC port created
     FilterMessageType_AlpcPortConnected,      // ALPC connection established
@@ -83,7 +136,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_AlpcRateLimitExceeded,  // ALPC rate limit exceeded
 
     //
-    // Policy Messages (0x30 - 0x3F)
+    // Policy
     //
     FilterMessageType_QueryDriverStatus,  // Query driver status
     FilterMessageType_UpdatePolicy,       // Update driver policy
@@ -92,17 +145,17 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_RegisterProtectedProcess, // Register process for protection
 
     //
-    // Handle Alert Messages (0x50 - 0x5F)
+    // Handle Alert
     //
     FilterMessageType_HandleAlert,            // Suspicious handle operation detected
 
     //
-    // Ransomware Detection Messages (0x60 - 0x6F)
+    // Ransomware Detection
     //
     FilterMessageType_RansomwareAlert,        // Ransomware behavior detected (PostWrite)
 
     //
-    // User-Mode â†’ Kernel Data Push Messages (0x70 - 0x8F)
+    // User-Mode -> Kernel Data Push
     // These enable the user-mode agent to push updated threat intelligence,
     // behavioral rules, and configuration to the kernel driver at runtime.
     //
@@ -116,7 +169,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_ExclusionUpdate,        // Exclusion list add/remove/clear
 
     //
-    // Telemetry & Status Messages (0x90 - 0x9F)
+    // Telemetry & Status
     //
     FilterMessageType_BehavioralAlert,        // Behavioral detection event
     FilterMessageType_MemoryAlert,            // Memory anomaly detection
@@ -127,7 +180,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     FilterMessageType_ThreatScoreNotify,      // Composite threat score update
 
     //
-    // File Operation Events (0xA0 - 0xAF)
+    // File Operation Events
     //
     // Appended here deliberately. This enum has no explicit values, so a new
     // enumerator inserted anywhere except immediately before _Max renumbers
@@ -189,7 +242,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 // Ransomware alert alias
 #define ShadowStrikeMessageRansomwareAlert          FilterMessageType_RansomwareAlert
 
-// Data push aliases (user-mode â†’ kernel)
+// Data push aliases (user-mode -> kernel)
 #define ShadowStrikeMessagePushHashDB               FilterMessageType_PushHashDatabase
 #define ShadowStrikeMessagePushPatternDB            FilterMessageType_PushPatternDatabase
 #define ShadowStrikeMessagePushSignatureDB          FilterMessageType_PushSignatureDatabase
@@ -240,7 +293,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
      (type) == FilterMessageType_ThreatScoreNotify)
 
 /**
- * @brief Check if message type is a user-mode â†’ kernel data push.
+ * @brief Check if message type is a user-mode -> kernel data push.
  */
 #define SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE(type) \
     ((type) >= FilterMessageType_PushHashDatabase && \
