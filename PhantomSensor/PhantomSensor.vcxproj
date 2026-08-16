@@ -69,23 +69,62 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup />
+  <!--
+    ====================================================================
+    Inf2Cat time basis, and why this property is not cosmetic.
+
+    The WDK's StampInf task writes the [Version] DriverVer using the LOCAL
+    date. Inf2Cat validates DriverVer against UTC. Those two disagree for the
+    whole part of the local day that precedes the UTC date rollover: at
+    UTC+03:00, every build between 00:00 and 03:00 local time stamps what is
+    still tomorrow in UTC, so Inf2Cat refuses it with
+
+      22.9.7: DriverVer set to a date in the future
+              (postdated DriverVer not allowed)
+
+    exits with code 2, and produces NO catalog at all. The build then fails
+    late, after the driver itself has linked and been signed successfully.
+
+    Measured 2026 08 17 at 01:20 local / 22:20 UTC, four runs over identical
+    staged inputs, varying only the stamped date and this time basis:
+      DriverVer=today     + UTC basis   : FAIL 22.9.7, no catalog
+      DriverVer=today     + local basis : PASS, catalog produced
+      DriverVer=yesterday + UTC basis   : PASS
+      DriverVer=yesterday + local basis : PASS
+    Exactly one combination fails and it is the one the build occupies.
+
+    Aligning Inf2Cat with the stamp it is validating is the root cause fix.
+    Pinning DriverVer by hand would also silence it, but only by moving the
+    problem onto whoever forgets to bump the date, and it would make driver
+    ranking depend on a hand maintained constant.
+
+    Driver staging is NOT done by this project. The PostBuildEvent that used to
+    sit below was declared as raw text inside a PropertyGroup, which defines an
+    unused property rather than a build event, so it never ran: the fully
+    successful build of 2026 08 17 01:24 left build\installer\staging\drivers
+    untouched at its 2026 08 15 contents. Staging is owned by Sync-DriverStaging
+    in tools\vm-harness\Invoke-PhantomDeploy.ps1, which signs the .sys,
+    regenerates the catalog over the signed bytes, and refuses to continue if the
+    driver carries no VERSIONINFO, if its version does not match the deploy, if
+    the catalog is older than the .sys, or if the staged binary has no
+    Authenticode signer. That is strictly stronger than an unconditional copy, so
+    the dead event was removed rather than repaired.
+
+    Note also that the driver must be built with the 64 bit MSBuild
+    (MSBuild\Current\Bin\amd64\MSBuild.exe). Under the 32 bit host,
+    DPVerifierTask probes for x86\InfVerif.dll, which this WDK does not ship
+    (it carries bin\x64 and bin\arm64 only), and INF verification fails for a
+    reason unrelated to the package.
+    ====================================================================
+  -->
+  <PropertyGroup>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <!--
-      Post-build: stage driver artifacts to the installer staging directory.
-      The .cat copy is best-effort (inf2cat runs after the build, not during it;
-      the file will be present if signing was already performed).
-    -->
-    <PostBuildEvent>
-      if not exist "$(SolutionDir)build\installer\staging\drivers" mkdir "$(SolutionDir)build\installer\staging\drivers"
-      copy /Y "$(OutDir)PhantomSensor.sys" "$(SolutionDir)build\installer\staging\drivers\"
-      copy /Y "$(ProjectDir)PhantomSensor.inf" "$(SolutionDir)build\installer\staging\drivers\"
-      if exist "$(OutDir)PhantomSensor\phantomsensor.cat" copy /Y "$(OutDir)PhantomSensor\phantomsensor.cat" "$(SolutionDir)build\installer\staging\drivers\PhantomSensor.cat"
-      echo [OK] PhantomSensor artifacts staged to $(SolutionDir)build\installer\staging\drivers\
-    </PostBuildEvent>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>

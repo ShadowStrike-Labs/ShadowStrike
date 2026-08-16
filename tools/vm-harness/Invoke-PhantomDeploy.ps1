@@ -788,9 +788,24 @@ driver build fails inf2cat with an error that names nothing useful:
             Die "Inf2Cat.exe not found under Windows Kits\10\bin\*\x86. The catalog cannot be regenerated over the signed driver, and shipping the pre-signing catalog would describe bytes that no longer exist."
         }
         Log "Regenerating driver catalog over the signed binary..."
-        & $inf2cat /driver:"$driverOutDir" /os:10_X64 2>&1 | Out-Host
+        # /uselocaltime is REQUIRED here, not optional, and this is a SECOND
+        # independent Inf2Cat invocation - the driver project sets the equivalent
+        # Inf2CatUseLocalTime property for its own build, which does not reach
+        # this call.
+        #
+        # StampInf writes the [Version] DriverVer using the LOCAL date, while
+        # Inf2Cat validates DriverVer against UTC. Those disagree for the whole
+        # part of the local day preceding the UTC date rollover: at UTC+03:00
+        # every run between 00:00 and 03:00 local stamps what is still tomorrow
+        # in UTC, so Inf2Cat refuses it with "22.9.7: DriverVer set to a date in
+        # the future (postdated DriverVer not allowed)", exits 2, and writes no
+        # catalog. Measured 2026-08-17 at 01:20 local / 22:20 UTC over identical
+        # staged inputs: today+UTC fails, today+localtime passes, and a DriverVer
+        # one day earlier passes either way. Exactly one combination fails and it
+        # is the one an overnight deploy occupies.
+        & $inf2cat /driver:"$driverOutDir" /os:10_X64 /uselocaltime 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) {
-            Die ("Inf2Cat failed (exit {0}) for {1}. The catalog no longer covers the signed driver, so this package must not ship. An incremental driver build is the usual cause - rebuild with /t:Rebuild." -f `
+            Die ("Inf2Cat failed (exit {0}) for {1}. The catalog no longer covers the signed driver, so this package must not ship. Read the signability errors printed above: 22.9.7 (postdated DriverVer) means the stamp and Inf2Cat disagree about the time basis, which is NOT an incremental-build problem." -f `
                 $LASTEXITCODE, $driverOutDir)
         }
         if (-not (Test-Path $catSrc)) {
