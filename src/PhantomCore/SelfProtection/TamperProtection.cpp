@@ -317,6 +317,7 @@ TamperProtectionConfiguration TamperProtectionConfiguration::FromMode(TamperProt
     oss << "\"expectedHash\":\"" << BytesToHex(expectedHash.data(), expectedHash.size()) << "\",";
     oss << "\"actualHash\":\"" << BytesToHex(actualHash.data(), actualHash.size()) << "\",";
     oss << "\"changeDescription\":\"" << EscapeJsonString(changeDescription) << "\",";
+    oss << "\"responseRequested\":" << static_cast<uint32_t>(responseRequested) << ",";
     oss << "\"responseTaken\":" << static_cast<uint32_t>(responseTaken) << ",";
     oss << "\"wasBlocked\":" << (wasBlocked ? "true" : "false") << ",";
     oss << "\"wasRepaired\":" << (wasRepaired ? "true" : "false") << ",";
@@ -332,6 +333,7 @@ TamperProtectionConfiguration TamperProtectionConfiguration::FromMode(TamperProt
     oss << "\"totalIntegrityChecks\":" << totalIntegrityChecks << ",";
     oss << "\"totalTamperingDetected\":" << totalTamperingDetected << ",";
     oss << "\"totalTamperingBlocked\":" << totalTamperingBlocked << ",";
+    oss << "\"responsesNotCarriedOut\":" << responsesNotCarriedOut << ",";
     oss << "\"totalRepairsPerformed\":" << totalRepairsPerformed << ",";
     oss << "\"successfulRepairs\":" << successfulRepairs << ",";
     oss << "\"kernelTamperEvents\":" << kernelTamperEvents << ",";
@@ -1932,6 +1934,7 @@ public:
         snap.totalIntegrityChecks    = m_stats.totalIntegrityChecks.load(std::memory_order_relaxed);
         snap.totalTamperingDetected  = m_stats.totalTamperingDetected.load(std::memory_order_relaxed);
         snap.totalTamperingBlocked   = m_stats.totalTamperingBlocked.load(std::memory_order_relaxed);
+        snap.responsesNotCarriedOut  = m_stats.responsesNotCarriedOut.load(std::memory_order_relaxed);
         snap.totalRepairsPerformed   = m_stats.totalRepairsPerformed.load(std::memory_order_relaxed);
         snap.successfulRepairs       = m_stats.successfulRepairs.load(std::memory_order_relaxed);
         snap.kernelTamperEvents      = m_stats.kernelTamperEvents.load(std::memory_order_relaxed);
@@ -1948,6 +1951,7 @@ public:
         m_stats.totalIntegrityChecks.store(0, std::memory_order_relaxed);
         m_stats.totalTamperingDetected.store(0, std::memory_order_relaxed);
         m_stats.totalTamperingBlocked.store(0, std::memory_order_relaxed);
+        m_stats.responsesNotCarriedOut.store(0, std::memory_order_relaxed);
         m_stats.totalRepairsPerformed.store(0, std::memory_order_relaxed);
         m_stats.successfulRepairs.store(0, std::memory_order_relaxed);
         m_stats.kernelTamperEvents.store(0, std::memory_order_relaxed);
@@ -2426,9 +2430,28 @@ public:
         event.sourceProcessId = GetCurrentProcessId();
         event.severityLevel = severity;
         event.changeDescription = description;
-        event.responseTaken = TamperResponse::Alert;
 
         m_stats.totalTamperingDetected.fetch_add(1, std::memory_order_relaxed);
+
+        // Consult the response handler and the configured policy instead of
+        // hardcoding Alert. This path carries the APT detections that matter
+        // most - inline/IAT hook detection, parent-PID validation, handle
+        // stripping - and it was the ONE event path immune to configuration: an
+        // operator on Enforce or Lockdown got Alert regardless of what they had
+        // selected, and a registered response handler was never consulted here
+        // at all.
+        const TamperResponse requested = ResolveResponse(event);
+        event.responseRequested = requested;
+
+        // This helper files the event, alerts on it and logs it. It performs no
+        // repair, and it cannot block because the detection is after the fact,
+        // so those two actions are exactly what it reports as carried out.
+        const uint32_t carriedOut = static_cast<uint32_t>(TamperResponse::Log) |
+                                    static_cast<uint32_t>(TamperResponse::Alert);
+        event.responseTaken = static_cast<TamperResponse>(carriedOut);
+        event.wasBlocked = false;
+
+        AccountUnexecutedResponses(static_cast<uint32_t>(requested), carriedOut);
 
         {
             std::unique_lock lock(m_mutex);
@@ -2438,7 +2461,17 @@ public:
             }
         }
 
+        // The Alert action.
         InvokeEventCallbacks(event);
+
+        // The Log action. This path previously emitted no per-event line at all
+        // - its callers log only an aggregate sweep result - so an APT detection
+        // named neither the resource nor the reason anywhere in the log.
+        SS_LOG_WARN(LOG_CATEGORY, L"APT tamper detected: %ls [%hs] severity=%u - %hs",
+                    resourcePath.c_str(),
+                    std::string(GetEventTypeName(eventType)).c_str(),
+                    static_cast<unsigned>(severity),
+                    description.c_str());
     }
 
 private:
@@ -2787,6 +2820,123 @@ private:
         return status == ERROR_SUCCESS;
     }
 
+    // ------------------------------------------------------------------------
+    // RESPONSE RESOLUTION AND HONEST RESPONSE ACCOUNTING
+    //
+    // TamperResponse is a flag set and the shipped profiles select flags this
+    // module does not implement: the Enforce profile sets Aggressive
+    // (Log|Alert|Block|Revert|Terminate) and Lockdown sets Maximum (0xFFFFFFFF,
+    // i.e. every flag). Revert, Quarantine, Terminate, Escalate, Lockdown,
+    // CollectEvidence and NotifyUser have NO execution site anywhere in this
+    // module - their only other appearances are GetResponseName and the profile
+    // presets themselves. So "what was asked for" and "what was done" are
+    // different facts, and they are now recorded separately.
+    // ------------------------------------------------------------------------
+
+    /**
+     * @brief Name the individual flags present in a response set.
+     *
+     * GetResponseName() answers "Multiple" for any composite, so it cannot say
+     * which requested action was skipped. Diagnostics need that, hence this.
+     */
+    [[nodiscard]] static std::string DescribeResponseFlags(uint32_t flags) {
+        struct Entry { TamperResponse flag; const char* name; };
+        static constexpr Entry kAll[] = {
+            { TamperResponse::Log,             "Log" },
+            { TamperResponse::Alert,           "Alert" },
+            { TamperResponse::Block,           "Block" },
+            { TamperResponse::Revert,          "Revert" },
+            { TamperResponse::Repair,          "Repair" },
+            { TamperResponse::Quarantine,      "Quarantine" },
+            { TamperResponse::Terminate,       "Terminate" },
+            { TamperResponse::Escalate,        "Escalate" },
+            { TamperResponse::Lockdown,        "Lockdown" },
+            { TamperResponse::CollectEvidence, "CollectEvidence" },
+            { TamperResponse::NotifyUser,      "NotifyUser" },
+        };
+        std::string out;
+        for (const auto& entry : kAll) {
+            if ((flags & static_cast<uint32_t>(entry.flag)) != 0u) {
+                if (!out.empty()) { out += "|"; }
+                out += entry.name;
+            }
+        }
+        return out.empty() ? std::string("None") : out;
+    }
+
+    /**
+     * @brief Resolve the response for an event: registered handler first, then
+     *        the configured policy.
+     *
+     * A TamperResponseHandler may return std::nullopt to decline, in which case
+     * GetEventResponse (the per-event-type map falling back to
+     * defaultResponse) stands. An engaged value is honoured verbatim, including
+     * TamperResponse::None.
+     *
+     * The handler is copied under the lock and invoked OUTSIDE it, so it may
+     * safely call back into this module. A throwing handler is treated as
+     * std::nullopt: failing must not let a handler suppress our own policy.
+     *
+     * The event passed to the handler is fully populated EXCEPT for
+     * responseRequested / responseTaken / wasBlocked / wasRepaired, which
+     * describe the outcome and are not known yet.
+     */
+    [[nodiscard]] TamperResponse ResolveResponse(const TamperEvent& event) {
+        TamperResponseHandler handler;
+        {
+            std::shared_lock lock(m_mutex);
+            handler = m_responseHandler;
+        }
+        if (handler) {
+            try {
+                if (const auto overridden = handler(event)) {
+                    return *overridden;
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Tamper response handler threw: %hs", e.what());
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Tamper response handler threw an unknown exception");
+            }
+        }
+        return GetEventResponse(event.type);
+    }
+
+    /**
+     * @brief Count, and name at most once per interval, responses that were
+     *        requested and not carried out.
+     */
+    void AccountUnexecutedResponses(uint32_t requestedFlags, uint32_t carriedOutFlags) {
+        const uint32_t skipped = requestedFlags & ~carriedOutFlags;
+        if (skipped == 0u) {
+            return;
+        }
+
+        m_stats.responsesNotCarriedOut.fetch_add(1, std::memory_order_relaxed);
+
+        constexpr int64_t kReportIntervalMs = 30000;
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last = m_lastUnexecutedReportTick.load(std::memory_order_relaxed);
+
+        if (last != 0 && (nowMs - last) < kReportIntervalMs) {
+            m_unexecutedReportsSuppressed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        m_lastUnexecutedReportTick.store(nowMs, std::memory_order_relaxed);
+
+        const uint64_t suppressed =
+            m_unexecutedReportsSuppressed.exchange(0, std::memory_order_relaxed);
+
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Requested tamper response includes actions this build does not perform: %hs "
+            L"(carried out: %hs). These have no implementation in TamperProtection, so the "
+            L"event was recorded and reported and nothing further was done. "
+            L"%llu further occurrence(s) suppressed since the last report.",
+            DescribeResponseFlags(skipped).c_str(),
+            DescribeResponseFlags(carriedOutFlags).c_str(),
+            static_cast<unsigned long long>(suppressed));
+    }
+
     void HandleTamperEvent(const std::wstring& resourcePath, TamperEventType eventType,
                            const VerificationResult& verifyResult) {
         TamperEvent event;
@@ -2800,28 +2950,63 @@ private:
 
         m_stats.totalTamperingDetected.fetch_add(1, std::memory_order_relaxed);
 
-        // Determine response
-        TamperResponse response = GetEventResponse(eventType);
-        event.responseTaken = response;
-        const auto responseFlags = static_cast<uint32_t>(response);
+        // What the handler, or failing that the configured policy, asks for.
+        const TamperResponse requested = ResolveResponse(event);
+        event.responseRequested = requested;
+        const auto requestedFlags = static_cast<uint32_t>(requested);
 
-        // Execute response
-        if ((responseFlags & static_cast<uint32_t>(TamperResponse::Block)) != 0u) {
-            event.wasBlocked = true;
-            m_stats.totalTamperingBlocked.fetch_add(1, std::memory_order_relaxed);
+        // Log and Alert are UNCONDITIONAL here and are therefore always reported
+        // as carried out: the SS_LOG_WARN at the end of this function and
+        // InvokeEventCallbacks below both run for every detected event whatever
+        // the policy says. That is deliberate - no configuration should be able
+        // to silence a tamper detection - and recording them also makes visible
+        // that their policy bits are advisory on this path.
+        uint32_t carriedOut = static_cast<uint32_t>(TamperResponse::Log) |
+                              static_cast<uint32_t>(TamperResponse::Alert);
+
+        // Repair is the one requested action this path can genuinely perform.
+        // enableAutoRepair is snapshotted under the lock because
+        // UpdateConfiguration rewrites m_config under a unique_lock, so reading
+        // it unlocked - as this function previously did - is a data race.
+        bool autoRepairEnabled = false;
+        {
+            std::shared_lock lock(m_mutex);
+            autoRepairEnabled = m_config.enableAutoRepair;
         }
 
-        if ((responseFlags & static_cast<uint32_t>(TamperResponse::Repair)) != 0u &&
-            m_config.enableAutoRepair) {
-            // Attempt repair
-            std::shared_lock lock(m_mutex);
-            auto it = m_protectedFiles.find(resourcePath);
-            if (it != m_protectedFiles.end()) {
-                lock.unlock();
-                auto repairResult = RepairFileInternal(resourcePath);
+        if ((requestedFlags & static_cast<uint32_t>(TamperResponse::Repair)) != 0u &&
+            autoRepairEnabled) {
+            bool isTracked = false;
+            {
+                std::shared_lock lock(m_mutex);
+                isTracked = (m_protectedFiles.find(resourcePath) != m_protectedFiles.end());
+            }
+            if (isTracked) {
+                // RepairFileInternal acquires m_mutex itself, so it must be
+                // called with no lock held.
+                const auto repairResult = RepairFileInternal(resourcePath);
                 event.wasRepaired = repairResult.success;
+                if (repairResult.success) {
+                    carriedOut |= static_cast<uint32_t>(TamperResponse::Repair);
+                }
             }
         }
+
+        // wasBlocked stays FALSE here, unconditionally. Both callers of this
+        // function sit inside the periodic integrity verifier: one fires when a
+        // protected file no longer exists, the other when its hash already
+        // differs. The tampering has already happened; nothing was prevented.
+        // Until this change `requested & Block` set wasBlocked = true and
+        // incremented totalTamperingBlocked - and the default Protect profile
+        // requests Standard (Log|Alert|Block), so EVERY detection was reported
+        // as blocked, inverting the meaning of the headline counter.
+        // SelfDefense already states this rule correctly at its own post-hoc
+        // site, and RegistryProtection carried the identical defect until
+        // c65d6fc2.
+        event.wasBlocked = false;
+        event.responseTaken = static_cast<TamperResponse>(carriedOut);
+
+        AccountUnexecutedResponses(requestedFlags, carriedOut);
 
         // Store event
         {
@@ -2832,9 +3017,10 @@ private:
             }
         }
 
-        // Invoke callbacks
+        // The Alert action.
         InvokeEventCallbacks(event);
 
+        // The Log action.
         SS_LOG_WARN(LOG_CATEGORY, L"Tamper detected: %ls [%hs]",
                     resourcePath.c_str(), std::string(GetEventTypeName(eventType)).c_str());
     }
@@ -3069,12 +3255,22 @@ private:
     // Re-entrancy guard for Initialize — see Initialize() comment.
     std::atomic<bool> m_initializing{false};
 
+    // Rate limit for the "requested response was not carried out" report. The
+    // periodic verifier can produce one of these per protected file per sweep,
+    // and our own log writes traverse our own minifilter, so a per-event WARN
+    // would amplify exactly the condition it describes (the deferred-queue-drop
+    // mistake). Counted always; reported at most once per interval with the
+    // suppressed total carried forward.
+    std::atomic<int64_t>  m_lastUnexecutedReportTick{0};
+    std::atomic<uint64_t> m_unexecutedReportsSuppressed{0};
+
     // Internal statistics — atomic for thread safety, snapshot via GetStatistics()
     struct InternalStats {
         std::atomic<uint64_t> totalResourcesMonitored{0};
         std::atomic<uint64_t> totalIntegrityChecks{0};
         std::atomic<uint64_t> totalTamperingDetected{0};
         std::atomic<uint64_t> totalTamperingBlocked{0};
+        std::atomic<uint64_t> responsesNotCarriedOut{0};
         std::atomic<uint64_t> totalRepairsPerformed{0};
         std::atomic<uint64_t> successfulRepairs{0};
         std::atomic<uint64_t> kernelTamperEvents{0};

@@ -384,8 +384,8 @@ private:
     ProtectionAction DetermineAction(const BlockedAttempt& attempt);
     void RecordBlockedAttempt(const BlockedAttempt& attempt);
     void NotifyBlock(const BlockedAttempt& attempt);
-    ProtectionAction QueryDecision(uint32_t pid, const std::wstring& cmdLine,
-                                   BackupThreatType threatType);
+    std::optional<ProtectionAction> QueryDecision(uint32_t pid, const std::wstring& cmdLine,
+                                                  BackupThreatType threatType);
     bool IsFileProtectedExtension(std::wstring_view filePath);
     bool IsServiceProtected(std::wstring_view serviceName);
     bool IsRegistryKeyProtected(std::wstring_view keyPath);
@@ -631,10 +631,13 @@ std::optional<BlockedAttempt> BackupProtectorImpl::AnalyzeProcess(
     // Determine action
     attempt.action = DetermineAction(attempt);
 
-    // Allow external decision callback to override
-    ProtectionAction cbAction = QueryDecision(pid, attempt.commandLine, matchedPattern.threatType);
-    if (cbAction != ProtectionAction::Allow)
-        attempt.action = cbAction;
+    // Allow an external decision callback to override. An engaged optional is
+    // honoured VERBATIM, including ProtectionAction::Allow - that is how a
+    // registrant permits an operation DetermineAction would otherwise block.
+    // std::nullopt means no opinion (none registered, or it threw), and the
+    // built-in action stands.
+    if (const auto cbAction = QueryDecision(pid, attempt.commandLine, matchedPattern.threatType))
+        attempt.action = *cbAction;
 
     // Execute block / block+kill
     if (attempt.action == ProtectionAction::Block ||
@@ -1144,7 +1147,7 @@ void BackupProtectorImpl::NotifyBlock(const BlockedAttempt& attempt) {
     } catch (...) {}
 }
 
-ProtectionAction BackupProtectorImpl::QueryDecision(uint32_t pid,
+std::optional<ProtectionAction> BackupProtectorImpl::QueryDecision(uint32_t pid,
                                                      const std::wstring& cmdLine,
                                                      BackupThreatType threatType) {
     DecisionCallback cb;
@@ -1161,7 +1164,12 @@ ProtectionAction BackupProtectorImpl::QueryDecision(uint32_t pid,
             SS_LOG_ERROR(kLogCat, L"Decision callback threw unknown exception");
         }
     }
-    return ProtectionAction::Allow;
+    // No registrant, or the registrant threw: NO OPINION, so the built-in action
+    // from DetermineAction stands. Deliberately NOT ProtectionAction::Allow.
+    // Returning a permissive verdict here is what previously made a registrant's
+    // genuine "allow" indistinguishable from silence, and it would additionally
+    // turn a throwing callback into a bypass of this module's own policy.
+    return std::nullopt;
 }
 
 bool BackupProtectorImpl::IsFileProtectedExtension(std::wstring_view filePath) {

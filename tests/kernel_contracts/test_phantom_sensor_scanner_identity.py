@@ -75,6 +75,10 @@ MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispa
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
 SHARED_DEFS_H_PATH = ROOT / "PhantomSensor/Shared/SharedDefs.h"
+BACKUP_PROTECTOR_HPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/BackupProtector.hpp"
+BACKUP_PROTECTOR_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/BackupProtector.cpp"
+TAMPER_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/TamperProtection.hpp"
+TAMPER_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/SelfProtection/TamperProtection.cpp"
 
 
 def read_source(path: Path) -> str:
@@ -218,6 +222,167 @@ class SourceContractTests(unittest.TestCase):
         cls.fuzzer_vcxproj = read_source(FUZZER_VCXPROJ_PATH)
         cls.filter_registration_c = read_source(FILTER_REGISTRATION_C_PATH)
         cls.shared_defs_h = read_source(SHARED_DEFS_H_PATH)
+        cls.backup_protector_hpp = read_source(BACKUP_PROTECTOR_HPP_PATH)
+        cls.backup_protector_cpp = read_source(BACKUP_PROTECTOR_CPP_PATH)
+        cls.tamper_protection_hpp = read_source(TAMPER_PROTECTION_HPP_PATH)
+        cls.tamper_protection_cpp = read_source(TAMPER_PROTECTION_CPP_PATH)
+
+    def test_a_decision_hook_never_uses_a_permissive_sentinel(self) -> None:
+        """A decision hook must be able to express "permit" distinctly from silence.
+
+        BackupProtector::QueryDecision used to return a bare ProtectionAction and
+        answer Allow for all three of "no callback registered", "the callback
+        threw" and "the callback deliberately said allow", while its one consumer
+        applied the override only when the value was NOT Allow. So a registrant
+        could express every verdict except the one it most needed.
+
+        The three sibling decision hooks already return std::optional
+        (FileProtection, RegistryProtection, ProcessProtection) and are consumed
+        with has_value(); this pins that BackupProtector now agrees, and that its
+        no-opinion path answers nullopt rather than a verdict - so a throwing
+        callback can never become a bypass of the module's own policy.
+        """
+        hpp = strip_c_comments(self.backup_protector_hpp)
+        cpp = strip_c_comments(self.backup_protector_cpp)
+
+        self.assertEqual(
+            hpp.count("std::function<std::optional<ProtectionAction>("),
+            1,
+            "BackupProtector::DecisionCallback must return std::optional<ProtectionAction>",
+        )
+        self.assertEqual(
+            len(re.findall(r"using\s+DecisionCallback\s*=\s*std::function<ProtectionAction\(", hpp)),
+            0,
+            "DecisionCallback must not return a bare ProtectionAction - there is no spare "
+            "value left to mean 'no opinion'",
+        )
+
+        # The no-opinion path must say so explicitly, and must not answer a verdict.
+        # Scoped to QueryDecision: "return std::nullopt;" is ordinary elsewhere in
+        # this file (AnalyzeProcess and MatchCommandPattern both use it), so a
+        # whole-file count would assert nothing about the hook.
+        query = extract_c_function(cpp, "BackupProtectorImpl::QueryDecision")
+        self.assertGreater(len(query), 200, "failed to slice QueryDecision")
+        self.assertEqual(
+            query.count("return std::nullopt;"),
+            1,
+            "QueryDecision's no-callback / callback-threw path must return std::nullopt",
+        )
+        self.assertEqual(
+            query.count("return ProtectionAction::Allow;"),
+            0,
+            "QueryDecision must not answer a permissive verdict to mean 'no opinion'",
+        )
+        self.assertEqual(
+            query.count("cb = m_decisionCallback;"),
+            1,
+            "the callback must be copied under the lock and invoked outside it",
+        )
+
+        # The consumer must honour ANY engaged value instead of filtering out Allow.
+        offenders = [
+            line.strip()
+            for line in cpp.splitlines()
+            if "cbAction" in line and "ProtectionAction::Allow" in line
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "the decision consumer must not compare the override against Allow; that "
+            "comparison is what discarded a registrant's permit",
+        )
+
+    def test_the_tamper_response_hook_is_consulted_and_reports_only_what_it_did(self) -> None:
+        """TamperProtection::SetResponseHandler had zero invocation sites.
+
+        Two things are pinned. First, the handler must be consulted on BOTH event
+        paths: HandleTamperEvent (the periodic integrity verifier) and
+        RecordAPTEvent (hook / parent-PID / handle-strip detection, which
+        hardcoded Alert and was the one path immune to configuration). Wiring only
+        one is the same half-fix that let the file-scan length unit diverge.
+
+        Second, neither path may claim a block. Both are post-hoc: one fires when
+        a protected file is already gone, the other when its hash already differs.
+        The default Protect profile requests Standard (Log|Alert|Block), so taking
+        the Block flag as proof of a block reported EVERY detection as prevented
+        tampering and inverted the module's headline statistic.
+        """
+        hpp = strip_c_comments(self.tamper_protection_hpp)
+        cpp = strip_c_comments(self.tamper_protection_cpp)
+
+        self.assertEqual(
+            hpp.count("std::function<std::optional<TamperResponse>(const TamperEvent&)>"),
+            1,
+            "TamperResponseHandler must return std::optional<TamperResponse>: TamperResponse "
+            "is a flag set whose zero value None is itself meaningful, so it has no spare "
+            "value to mean 'no opinion'",
+        )
+
+        # Exactly one site reads the handler - the shared resolver - so the two
+        # event paths cannot drift apart in how they treat it.
+        self.assertEqual(
+            cpp.count("handler = m_responseHandler;"),
+            1,
+            "the response handler must be read in exactly one place (the resolver)",
+        )
+        self.assertEqual(
+            cpp.count("ResolveResponse(event)"),
+            2,
+            "both event paths (HandleTamperEvent and RecordAPTEvent) must resolve their "
+            "response through the handler-aware resolver",
+        )
+        self.assertEqual(
+            cpp.count("return GetEventResponse(event.type);"),
+            1,
+            "the resolver must fall back to the configured policy, so a handler that "
+            "declines or throws cannot suppress it",
+        )
+        self.assertEqual(
+            cpp.count("event.responseTaken = TamperResponse::Alert;"),
+            0,
+            "RecordAPTEvent must not hardcode its response and ignore the policy",
+        )
+
+        # No path in this module may assert a block, and both must say so plainly.
+        self.assertEqual(
+            cpp.count("wasBlocked = true"),
+            0,
+            "a post-hoc integrity finding must never be reported as blocked",
+        )
+        self.assertEqual(
+            cpp.count("event.wasBlocked = false;"),
+            2,
+            "both event paths must state explicitly that nothing was prevented",
+        )
+        self.assertEqual(
+            cpp.count("m_stats.totalTamperingBlocked.fetch_add"),
+            0,
+            "totalTamperingBlocked counts PREVENTED tampering and has no producer here",
+        )
+
+        # The gap between requested and carried out must be measurable, and the
+        # new counter must exist at all three sites a counter needs - increment,
+        # snapshot and reset - or a reset would leave a stale delta baseline.
+        self.assertGreaterEqual(
+            cpp.count("m_stats.responsesNotCarriedOut.fetch_add"),
+            1,
+            "requested-but-unperformed responses must be counted",
+        )
+        self.assertEqual(
+            cpp.count("snap.responsesNotCarriedOut"),
+            1,
+            "the new counter must be published in the statistics snapshot",
+        )
+        self.assertEqual(
+            cpp.count("m_stats.responsesNotCarriedOut.store(0"),
+            1,
+            "the new counter must be cleared by ResetStatistics",
+        )
+        # totalTamperingBlocked is kept, not deleted: it is the right counter for a
+        # genuine interception path. It must stay plumbed so its zero is read as
+        # accurate rather than as a broken metric.
+        self.assertEqual(cpp.count("snap.totalTamperingBlocked"), 1)
+        self.assertEqual(cpp.count("m_stats.totalTamperingBlocked.store(0"), 1)
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")

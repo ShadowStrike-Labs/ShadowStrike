@@ -527,8 +527,40 @@ struct BackupProtectorStatistics {
 /// @brief Block callback
 using BlockCallback = std::function<void(const BlockedAttempt&)>;
 
-/// @brief Decision callback (can override action)
-using DecisionCallback = std::function<ProtectionAction(
+/**
+ * @brief Decision callback - overrides the built-in action for a matched attempt.
+ *
+ * Return std::nullopt to express NO OPINION; the built-in policy decided by
+ * DetermineAction then stands. Any engaged value is honoured verbatim,
+ * INCLUDING ProtectionAction::Allow, which is how a registrant permits an
+ * operation this module would otherwise block.
+ *
+ * WHY THIS RETURNS std::optional RATHER THAN A BARE ProtectionAction.
+ * It previously returned ProtectionAction, and QueryDecision answered
+ * ProtectionAction::Allow for all three of "no callback registered",
+ * "the callback threw" and "the callback deliberately said allow". The one
+ * consumer resolved that ambiguity with `if (action != Allow) override`, so the
+ * single value a registrant most needs to express - permit this - was exactly
+ * the value read as silence and discarded. A decision hook whose only permit
+ * value is indistinguishable from its own absence cannot permit anything.
+ *
+ * This now matches FileOperationDecisionCallback (FileProtection.hpp),
+ * RegistryOperationDecisionCallback (RegistryProtection.hpp) and
+ * AccessDecisionCallback (ProcessProtection.hpp), all of which already return
+ * std::optional and are consumed with has_value() for this reason.
+ *
+ * ShadowCopyProtector's bool-returning DecisionCallback does NOT have this
+ * defect and was deliberately left alone: its sentinel is `true` (block) for
+ * both absence and error, so a callback returning false to permit is still
+ * honoured. The general rule is that a sentinel is safe only when the caller's
+ * treatment of that value matches what a callback returning it should mean.
+ *
+ * THREADING: the callback is copied under lock and invoked OUTSIDE it, so it
+ * must not assume any BackupProtector lock is held, and it may call back into
+ * this module. An exception escaping the callback is caught, logged, and
+ * treated as std::nullopt - never as a permit.
+ */
+using DecisionCallback = std::function<std::optional<ProtectionAction>(
     uint32_t pid, const std::wstring& commandLine, BackupThreatType threatType)>;
 
 // ============================================================================

@@ -33,6 +33,8 @@
 #include "../../../src/PhantomCore/RansomwareProtection/BackupProtector.hpp"
 
 #include <future>
+#include <optional>
+#include <stdexcept>
 
 namespace {
 
@@ -247,6 +249,123 @@ TEST_F(BackupProtectorTest, AnalyzeProcessBuildsBlockedAttemptUpdatesStatsAndInv
     ASSERT_EQ(newestOnly.size(), 1u);
     EXPECT_EQ(newestOnly.front().attemptId, secondResult->attemptId);
     EXPECT_TRUE(protector.GetRecentBlocks(0).empty());
+}
+
+// ============================================================================
+// DECISION CALLBACK CONTRACT
+//
+// DecisionCallback returns std::optional<ProtectionAction>. std::nullopt means
+// NO OPINION and the built-in DetermineAction result stands; an engaged value is
+// honoured verbatim, INCLUDING ProtectionAction::Allow.
+//
+// It previously returned a bare ProtectionAction, and QueryDecision answered
+// Allow for "no callback registered", "the callback threw" and "the callback
+// said allow" alike, while the one consumer applied the override only when the
+// value was NOT Allow. So a registrant could express every verdict except the
+// one it most needed - permit this - and that verdict was silently discarded.
+// ============================================================================
+
+TEST_F(BackupProtectorTest, DecisionCallbackCanPermitAnAttemptTheBuiltInPolicyWouldBlock) {
+    auto& protector = BackupProtector::Instance();
+    auto updated = protector.GetConfiguration();
+    updated.killOnDetection = false;
+    updated.defaultAction = ProtectionAction::Block;
+    ASSERT_TRUE(protector.UpdateConfiguration(updated));
+
+    const auto before = protector.GetStatistics();
+    const auto recentBefore = protector.GetRecentBlocks(64).size();
+
+    std::atomic<int> invocations{ 0 };
+    protector.SetDecisionCallback(
+        [&invocations](uint32_t, const std::wstring&, BackupThreatType)
+            -> std::optional<ProtectionAction> {
+            invocations.fetch_add(1, std::memory_order_relaxed);
+            return ProtectionAction::Allow;  // deliberately permit
+        });
+
+    const auto result = protector.AnalyzeProcess(
+        0x5150,
+        L"C:\\Windows\\System32\\vssadmin.exe",
+        L"vssadmin.exe delete shadows /all /quiet");
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(invocations.load(std::memory_order_relaxed), 1)
+        << "the decision callback must be consulted exactly once per matched attempt";
+
+    // THE DISCRIMINATOR. Against the previous signature the callback's Allow was
+    // read as silence, so the action stayed Block and the attempt was recorded.
+    EXPECT_EQ(result->action, ProtectionAction::Allow);
+
+    const auto after = protector.GetStatistics();
+    EXPECT_EQ(after.attemptsBlocked, before.attemptsBlocked)
+        << "a permitted attempt must not be counted as blocked";
+    EXPECT_EQ(protector.GetRecentBlocks(64).size(), recentBefore)
+        << "a permitted attempt must not be recorded as a blocked attempt";
+}
+
+TEST_F(BackupProtectorTest, DecisionCallbackNulloptAndThrowBothLeaveTheBuiltInActionStanding) {
+    auto& protector = BackupProtector::Instance();
+    auto updated = protector.GetConfiguration();
+    updated.killOnDetection = false;
+    updated.defaultAction = ProtectionAction::Block;
+    ASSERT_TRUE(protector.UpdateConfiguration(updated));
+
+    const std::wstring image = L"C:\\Windows\\System32\\vssadmin.exe";
+    const std::wstring cmd   = L"vssadmin.exe delete shadows /all /quiet";
+
+    // (a) An explicit "no opinion" leaves the built-in policy in charge.
+    std::atomic<int> declines{ 0 };
+    protector.SetDecisionCallback(
+        [&declines](uint32_t, const std::wstring&, BackupThreatType)
+            -> std::optional<ProtectionAction> {
+            declines.fetch_add(1, std::memory_order_relaxed);
+            return std::nullopt;
+        });
+
+    const auto declined = protector.AnalyzeProcess(0x5151, image, cmd);
+    ASSERT_TRUE(declined.has_value());
+    EXPECT_EQ(declines.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(declined->action, ProtectionAction::Block);
+
+    // (b) A THROWING callback must also fall back to the built-in policy and
+    // must never be mistaken for a permit. This is the direction that matters:
+    // a failing hook must not become a bypass of this module's own decision.
+    protector.SetDecisionCallback(
+        [](uint32_t, const std::wstring&, BackupThreatType)
+            -> std::optional<ProtectionAction> {
+            throw std::runtime_error("decision callback failure");
+        });
+
+    const auto threw = protector.AnalyzeProcess(0x5152, image, cmd);
+    ASSERT_TRUE(threw.has_value());
+    EXPECT_EQ(threw->action, ProtectionAction::Block)
+        << "a throwing decision callback must not permit the operation";
+}
+
+TEST_F(BackupProtectorTest, DecisionCallbackOverrideOfANonAllowVerdictIsStillHonoured) {
+    // REGRESSION GUARD, not a discriminator: overriding to a non-Allow verdict
+    // worked before this change and must keep working. Warn is used because the
+    // block-execution branch acts only on Block and BlockKill, so nothing
+    // destructive runs against the synthetic pid.
+    auto& protector = BackupProtector::Instance();
+    auto updated = protector.GetConfiguration();
+    updated.killOnDetection = false;
+    updated.defaultAction = ProtectionAction::Block;
+    ASSERT_TRUE(protector.UpdateConfiguration(updated));
+
+    protector.SetDecisionCallback(
+        [](uint32_t, const std::wstring&, BackupThreatType)
+            -> std::optional<ProtectionAction> {
+            return ProtectionAction::Warn;
+        });
+
+    const auto result = protector.AnalyzeProcess(
+        0x5153,
+        L"C:\\Windows\\System32\\vssadmin.exe",
+        L"vssadmin.exe delete shadows /all /quiet");
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->action, ProtectionAction::Warn);
 }
 
 }  // namespace

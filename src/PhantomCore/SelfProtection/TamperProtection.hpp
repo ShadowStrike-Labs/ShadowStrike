@@ -690,7 +690,27 @@ struct TamperEvent {
     /// @brief Change description
     std::string changeDescription;
     
-    /// @brief Response taken
+    /**
+     * @brief Response the policy or the response handler ASKED FOR.
+     *
+     * This is the intent, not the outcome. It may contain flags this module
+     * does not implement (Revert, Quarantine, Terminate, Escalate, Lockdown,
+     * CollectEvidence, NotifyUser have no execution site anywhere), and the
+     * shipped Enforce and Lockdown profiles do request some of them.
+     */
+    TamperResponse responseRequested = TamperResponse::None;
+
+    /**
+     * @brief Response actually CARRIED OUT - never more than that.
+     *
+     * Anything present in responseRequested and absent here was asked for and
+     * not done; that difference is counted in
+     * TamperProtectionStatistics::responsesNotCarriedOut and named in the log.
+     * Previously this field was assigned the requested response verbatim, so an
+     * operator on the Enforce profile (Aggressive = Log|Alert|Block|Revert|
+     * Terminate) was told a process had been terminated and a file reverted
+     * when neither action exists in this module.
+     */
     TamperResponse responseTaken = TamperResponse::None;
     
     /// @brief Was the tampering blocked
@@ -832,7 +852,36 @@ struct TamperProtectionStatistics {
     uint64_t totalResourcesMonitored = 0;
     uint64_t totalIntegrityChecks    = 0;
     uint64_t totalTamperingDetected  = 0;
+
+    /**
+     * @brief Tampering this module PREVENTED. Zero is the correct value today.
+     *
+     * The integrity verifier is post-hoc: it fires when a protected file is
+     * already missing or its hash already differs, so it cannot prevent
+     * anything. Until this change every such detection incremented this counter
+     * because the default Protect profile requests Standard (Log|Alert|Block)
+     * and the Block flag was taken as proof of a block. An operator reading
+     * "tampering blocked: 47" concluded self-protection was intercepting
+     * attacks when in fact 47 files had already been altered.
+     *
+     * It is kept, not deleted, because it is the right counter for a genuine
+     * interception path (a pre-operation hook, or enforcement delegated to
+     * FileProtection / RegistryProtection, both of which do block). It has no
+     * producer today, and that is stated here so a zero is read as accurate
+     * rather than as a broken metric.
+     */
     uint64_t totalTamperingBlocked   = 0;
+
+    /**
+     * @brief Events whose requested response was not fully carried out.
+     *
+     * Incremented once per event for which responseRequested contains any flag
+     * absent from responseTaken. A non-zero value means the configured profile
+     * is asking for actions this build does not implement; the log names them.
+     * This is the evidence for whether implementing them is worth doing, and it
+     * exists so that gap is measurable instead of silent.
+     */
+    uint64_t responsesNotCarriedOut  = 0;
     uint64_t totalRepairsPerformed   = 0;
     uint64_t successfulRepairs       = 0;
     uint64_t kernelTamperEvents      = 0;   ///< Tamper events from kernel driver
@@ -861,8 +910,35 @@ using RepairCallback = std::function<void(const RepairResult&)>;
 /// @brief Callback for subsystem status changes
 using SubsystemStatusCallback = std::function<void(TamperSubsystem, ModuleStatus)>;
 
-/// @brief Custom response handler (can override default response)
-using TamperResponseHandler = std::function<TamperResponse(const TamperEvent&)>;
+/**
+ * @brief Custom response handler - overrides the configured response policy.
+ *
+ * Return std::nullopt to express NO OPINION; the configured policy
+ * (GetEventResponse, i.e. the per-event-type map falling back to
+ * TamperProtectionConfiguration::defaultResponse) then stands. Any engaged
+ * value is honoured verbatim, INCLUDING TamperResponse::None, which is how a
+ * registrant says "observe only, take no action" for a specific event.
+ *
+ * THIS RETURNS std::optional FOR A CONCRETE REASON. TamperResponse is a flag
+ * set whose zero value None is itself meaningful, so a bare TamperResponse
+ * return has no spare value to mean "no opinion". Wiring the handler up with
+ * None as the sentinel would have made a deliberate "take no action" silently
+ * indistinguishable from having no handler at all - exactly the defect
+ * BackupProtector's DecisionCallback carried, where a permissive sentinel
+ * collided with a genuine verdict and the genuine verdict lost.
+ *
+ * THREADING: the handler is copied under lock and invoked OUTSIDE it, so it
+ * must not assume any TamperProtection lock is held, and it may call back into
+ * this module. An exception escaping the handler is caught, logged, and treated
+ * as std::nullopt - never as a response.
+ *
+ * NOTE ON WHAT A RESPONSE CAN ACHIEVE: several TamperResponse flags are
+ * declared and selectable from a shipped profile but are not implemented by
+ * this module. Requesting them - whether from the policy or from this handler -
+ * is counted in TamperProtectionStatistics::responsesNotCarriedOut and named in
+ * the log; it is never reported as done. See TamperEvent::responseTaken.
+ */
+using TamperResponseHandler = std::function<std::optional<TamperResponse>(const TamperEvent&)>;
 
 // ============================================================================
 // TAMPER PROTECTION ENGINE CLASS
