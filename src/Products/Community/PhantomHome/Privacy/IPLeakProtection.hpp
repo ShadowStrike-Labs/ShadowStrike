@@ -410,8 +410,31 @@ struct IPLeakEvent {
     /// @brief Severity (1-10)
     int severity = 5;
     
-    /// @brief Was blocked
+    /// @brief OUTCOME: this specific leak was PREVENTED.
+    ///
+    /// DEFAULT FALSE IS THE CONTRACT. This module's kill switch is real - it
+    /// installs WFP filters under a registered sublayer - so unlike the Tor and
+    /// VPN detectors this field CAN legitimately become true once a leak is
+    /// prevented rather than observed.
+    ///
+    /// What it must NOT be derived from is m_killSwitchActive, which is global,
+    /// temporal module state meaning "the switch is engaged right now". Two
+    /// reasons: the monitoring thread engages the switch on a VPN drop and only
+    /// THEN checks for leaks, so the flag describes the response and not this
+    /// leak; and a leak is DETECTED by observing that an external service saw a
+    /// non-VPN public IP, which is positive evidence that traffic left the
+    /// machine outside the tunnel. Recording an observed escape as blocked
+    /// asserts the opposite of what the detection proves.
     bool wasBlocked = false;
+
+    /// @brief STATE: the kill switch was engaged when this leak was detected.
+    ///
+    /// Recorded separately because it is genuinely useful and because it is a
+    /// different fact from wasBlocked. A leak detected while this is true is
+    /// worth more attention than one detected while it is false: it means
+    /// traffic escaped the tunnel while the WFP filters were supposed to be
+    /// holding it, which points at a path those filters do not cover.
+    bool killSwitchActiveAtDetection = false;
     
     /// @brief Timestamp
     SystemTimePoint timestamp;
@@ -455,7 +478,23 @@ struct KillSwitchEvent {
  */
 struct IPLeakStatistics {
     std::atomic<uint64_t> leaksDetected{0};
+
+    /// @brief Leaks this module actually PREVENTED.
+    ///
+    /// NO PRODUCER TODAY, and its zero is therefore accurate. It was previously
+    /// incremented whenever the kill switch happened to be engaged, so it
+    /// counted leaks that COINCIDED with an active switch rather than leaks
+    /// stopped. Kept because the kill switch is real and a genuine
+    /// prevention path can legitimately feed this.
     std::atomic<uint64_t> leaksBlocked{0};
+
+    /// @brief Leaks observed WHILE the kill switch was engaged.
+    ///
+    /// This is the number that carries what leaksBlocked used to hold, and it
+    /// is a detection signal rather than mere bookkeeping: traffic that reached
+    /// an external service outside the tunnel while WFP filters were installed
+    /// indicates those filters are not covering the path that leaked.
+    std::atomic<uint64_t> leaksEscapedWhileKillSwitchActive{0};
     std::atomic<uint64_t> webRTCBlocked{0};
     std::atomic<uint64_t> ipv6Blocked{0};
     std::atomic<uint64_t> killSwitchActivations{0};

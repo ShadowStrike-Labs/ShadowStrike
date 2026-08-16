@@ -1515,7 +1515,18 @@ public:
                     }
                     leak.detectionMethod = "Public IP vs VPN adapter comparison";
                     leak.severity = publicIPMatchesNonVPN ? 9 : 7;
-                    leak.wasBlocked = m_killSwitchActive.load(std::memory_order_acquire);
+                    // STATE, not outcome. This leak was OBSERVED: an external
+                    // service reported a public IP that is not the VPN's, which
+                    // is positive evidence that traffic left the machine outside
+                    // the tunnel. Nothing on this path prevented it, so the
+                    // outcome is false and the switch state is recorded apart
+                    // from it. Deriving wasBlocked from this flag also made the
+                    // answer depend on ordering, because the monitoring thread
+                    // engages the switch on a VPN drop and checks for leaks
+                    // afterwards.
+                    leak.killSwitchActiveAtDetection =
+                        m_killSwitchActive.load(std::memory_order_acquire);
+                    leak.wasBlocked = false;
                     leak.timestamp = std::chrono::system_clock::now();
 
                     leaks.push_back(leak);
@@ -1528,8 +1539,21 @@ public:
                         }
                     }
                     m_stats.leaksDetected.fetch_add(1, std::memory_order_relaxed);
-                    if (leak.wasBlocked) {
-                        m_stats.leaksBlocked.fetch_add(1, std::memory_order_relaxed);
+                    if (leak.killSwitchActiveAtDetection) {
+                        // Not a blocked leak - the opposite. Traffic reached an
+                        // external service while the WFP filters were installed,
+                        // so those filters do not cover the path that leaked.
+                        // That is an enforcement gap worth an operator's
+                        // attention, and it is exactly what the old
+                        // kill-switch-derived wasBlocked concealed by reporting
+                        // it as a success.
+                        m_stats.leaksEscapedWhileKillSwitchActive.fetch_add(
+                            1, std::memory_order_relaxed);
+                        ::ShadowStrike::Utils::Logger::Warn(
+                            "IP leak detected while the kill switch was ENGAGED - traffic "
+                            "reached an external service outside the tunnel, so the "
+                            "installed WFP filters do not cover this path (leaked IP {})",
+                            leak.leakedIP.address);
                     }
                     auto leakIdx = static_cast<size_t>(leak.leakType);
                     if (leakIdx < m_stats.byLeakType.size()) {
@@ -2278,6 +2302,7 @@ void IPLeakProtection::UnregisterCallbacks() {
     IPLeakStatistics snapshot;
     snapshot.leaksDetected.store(m_impl->m_stats.leaksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
     snapshot.leaksBlocked.store(m_impl->m_stats.leaksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.leaksEscapedWhileKillSwitchActive.store(m_impl->m_stats.leaksEscapedWhileKillSwitchActive.load(std::memory_order_relaxed), std::memory_order_relaxed);
     snapshot.webRTCBlocked.store(m_impl->m_stats.webRTCBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
     snapshot.ipv6Blocked.store(m_impl->m_stats.ipv6Blocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
     snapshot.killSwitchActivations.store(m_impl->m_stats.killSwitchActivations.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -2443,6 +2468,7 @@ void IPLeakProtection::ResetStatistics() {
     j["destination"] = destination;
     j["severity"] = severity;
     j["wasBlocked"] = wasBlocked;
+    j["killSwitchActiveAtDetection"] = killSwitchActiveAtDetection;
     j["timestamp"] = timestamp.time_since_epoch().count();
 
     return j.dump(2);
@@ -2481,6 +2507,7 @@ IPLeakStatistics::IPLeakStatistics(const IPLeakStatistics& other) noexcept
     vpnDisconnections.store(other.vpnDisconnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
     proxyBypassBlocked.store(other.proxyBypassBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
     connectionsBlocked.store(other.connectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    leaksEscapedWhileKillSwitchActive.store(other.leaksEscapedWhileKillSwitchActive.load(std::memory_order_relaxed), std::memory_order_relaxed);
     for (size_t i = 0; i < byLeakType.size(); ++i) {
         byLeakType[i].store(other.byLeakType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
@@ -2497,6 +2524,7 @@ IPLeakStatistics& IPLeakStatistics::operator=(const IPLeakStatistics& other) noe
         vpnDisconnections.store(other.vpnDisconnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
         proxyBypassBlocked.store(other.proxyBypassBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
         connectionsBlocked.store(other.connectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        leaksEscapedWhileKillSwitchActive.store(other.leaksEscapedWhileKillSwitchActive.load(std::memory_order_relaxed), std::memory_order_relaxed);
         for (size_t i = 0; i < byLeakType.size(); ++i) {
             byLeakType[i].store(other.byLeakType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
@@ -2515,6 +2543,7 @@ void IPLeakStatistics::Reset() noexcept {
     vpnDisconnections.store(0, std::memory_order_relaxed);
     proxyBypassBlocked.store(0, std::memory_order_relaxed);
     connectionsBlocked.store(0, std::memory_order_relaxed);
+    leaksEscapedWhileKillSwitchActive.store(0, std::memory_order_relaxed);
 
     for (auto& type : byLeakType) {
         type.store(0, std::memory_order_relaxed);
@@ -2536,6 +2565,7 @@ void IPLeakStatistics::Reset() noexcept {
     j["vpnDisconnections"] = vpnDisconnections.load(std::memory_order_relaxed);
     j["proxyBypassBlocked"] = proxyBypassBlocked.load(std::memory_order_relaxed);
     j["connectionsBlocked"] = connectionsBlocked.load(std::memory_order_relaxed);
+    j["leaksEscapedWhileKillSwitchActive"] = leaksEscapedWhileKillSwitchActive.load(std::memory_order_relaxed);
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - AtomicValueLoadRelaxed(startTime)).count();

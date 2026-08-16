@@ -119,6 +119,17 @@ TOR_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/TorDetector.hpp"
 VPN_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.cpp"
 VPN_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.hpp"
 
+# IPLeakProtection is the opposite case from Tor/VPN: its kill switch is REAL
+# (registered WFP sublayer, netsh via CreateProcessW, iphlpapi), so the defect
+# was attribution rather than fabrication. A global "switch is engaged" flag was
+# assigned to an individual leak's outcome.
+IP_LEAK_PROTECTION_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/Privacy/IPLeakProtection.cpp"
+)
+IP_LEAK_PROTECTION_HPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/Privacy/IPLeakProtection.hpp"
+)
+
 
 def read_source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -1019,6 +1030,73 @@ class SourceContractTests(unittest.TestCase):
                 f"would delete the only written statement of what such a path "
                 f"owes.",
             )
+
+    def test_an_observed_ip_leak_is_never_recorded_as_a_blocked_one(self) -> None:
+        cpp = strip_c_comments(read_source(IP_LEAK_PROTECTION_CPP_PATH))
+        hpp = strip_c_comments(read_source(IP_LEAK_PROTECTION_HPP_PATH))
+
+        # The exact defect: a global, temporal module flag assigned to one
+        # leak's outcome. The leak is detected by observing that an external
+        # service saw a non-VPN public IP, so it demonstrably escaped.
+        self.assertEqual(
+            cpp.count("wasBlocked = m_killSwitchActive"),
+            0,
+            "IPLeakProtection assigned the global kill-switch state to an "
+            "individual leak's outcome, so a leak that provably escaped the "
+            "tunnel was recorded as blocked - and which answer you got depended "
+            "on ordering, since the monitor engages the switch on a VPN drop and "
+            "checks for leaks afterwards.",
+        )
+        self.assertGreaterEqual(
+            cpp.count("killSwitchActiveAtDetection ="),
+            1,
+            "The kill-switch state is still worth recording - it must be kept as "
+            "its own field rather than deleted or overloaded onto the outcome.",
+        )
+        self.assertGreaterEqual(
+            cpp.count("leak.wasBlocked = false"),
+            1,
+            "An observed leak must state its outcome explicitly.",
+        )
+        self.assertEqual(
+            cpp.count("if (leak.wasBlocked)"),
+            0,
+            "The statistics counter must not be gated on the outcome field it "
+            "used to derive from the same flag.",
+        )
+
+        # This module CAN enforce, so the outcome field is not merely reserved -
+        # do not let a future edit delete it as unused.
+        self.assertGreaterEqual(
+            hpp.count("wasBlocked"),
+            1,
+            "IPLeakProtection's kill switch is real, so wasBlocked is the field "
+            "a genuine prevention path sets. It must not be removed.",
+        )
+
+        # The escaped-while-engaged counter is a DETECTION signal, not
+        # bookkeeping: it means the WFP filters did not cover the leaking path.
+        self.assertGreaterEqual(
+            cpp.count("leaksEscapedWhileKillSwitchActive.fetch_add("),
+            1,
+            "The enforcement-gap counter has no producer, so its zero would be "
+            "structural rather than accurate.",
+        )
+        self.assertGreaterEqual(
+            cpp.count("leaksEscapedWhileKillSwitchActive.store(0"),
+            1,
+            "The enforcement-gap counter is not cleared by Reset().",
+        )
+        # IPLeakStatistics hand-writes BOTH a copy constructor and an assignment
+        # operator to load its atomics safely, and GetStatistics() copies. A
+        # member added to the declaration alone is silently dropped on every
+        # copy and becomes a structural zero - task 102 by another route.
+        self.assertEqual(
+            cpp.count("other.leaksEscapedWhileKillSwitchActive.load("),
+            2,
+            "The counter must be carried by BOTH hand-written copy operators "
+            "(copy constructor and assignment), or every snapshot drops it.",
+        )
 
     def test_precreate_captures_callback_requestor_once(self) -> None:
         body = extract_c_function(self.precreate_source, "ShadowStrikePreCreate")
