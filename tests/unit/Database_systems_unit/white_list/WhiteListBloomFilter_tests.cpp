@@ -119,42 +119,62 @@ template<typename Func>
 }
 
 /**
- * @brief Measure the FASTEST of several runs, after a discarded warm-up.
- * @return Best observed duration in nanoseconds.
+ * @brief Best-of timing for TWO operations whose true cost ratio is ~1.0,
+ *        measured in INTERLEAVED windows rather than one after the other.
  *
- * Every test here that compares two timings against a ratio needs this rather
- * than a single measurement, and the reason is not fussiness.
+ * This REPLACES the sequential best-of helper it grew out of, which had no
+ * callers left once both comparisons moved here and is removed with it. The
+ * reasoning that helper carried is kept below rather than deleted with it.
  *
- * A single timing of a short loop is the true cost PLUS whatever the machine did
- * to it - a scheduler preemption, a page fault on first touch, a cache eviction
- * by another test's data, a frequency change. Interference can only ever ADD
- * time, never remove it, so the minimum of several runs converges on the real
- * cost while a single run is an upper bound of unknown looseness. Comparing two
- * such upper bounds against a 1.5x or 2x threshold is a coin toss whenever the
- * true ratio is near 1, which for these particular pairs it is by design.
+ * WHY BEST-OF ALONE WAS NOT ENOUGH, measured rather than assumed. Taking each
+ * side's best of five removed most of the flakiness from these comparisons but
+ * not all of it: BatchQuery_FasterThanSingleQuery still failed in a full-suite
+ * run and, more usefully, failed THREE TIMES OUT OF THREE inside its own
+ * six-test suite while passing five times out of five when run alone. The
+ * reported figures were 111,500 ns against 72,700 ns - a ratio of 1.53 against
+ * a 1.5x threshold, so the measurement was one part in fifty from passing.
  *
- * That is not hypothetical: MemoryMappedQuery_ComparableToBuilt failed in a full
- * 4,931-test run and passed five times out of five when run alone, with the two
- * loops doing identical work over identical data. A test that cannot tell a real
- * 2x regression from a scheduling hiccup does not measure performance, and in a
- * suite this size an intermittent failure costs more than the test is worth
- * because it teaches the reader to disregard a red run.
+ * THE ASYMMETRY IS THE DEFECT, NOT THE THRESHOLD. Two sequential best-of
+ * windows do not see the same machine. Whatever perturbs the process during the
+ * SECOND window - the residue of the tests before it, a heap allocation between
+ * the two, a scheduling decision - inflates one side of a ratio whose true value
+ * is 1.0. Interleaving the samples means a perturbation spanning an iteration is
+ * charged to BOTH sides, so it moves the two numerators together and leaves the
+ * ratio alone. Both sides are still warmed before any sample is kept.
  *
- * The thresholds are deliberately left exactly as they were. This changes only
- * the quality of the estimate, so a genuine regression is now MORE likely to be
- * caught, not less - noise previously cut both ways.
+ * NECESSARY BUT NOT SUFFICIENT, AND SAYING SO MATTERS. Interleaving alone took
+ * BatchQuery_FasterThanSingleQuery from failing three times out of three in its
+ * own suite to passing eight out of eight - and it STILL failed in the full
+ * 519-suite run. That residue was not noise at all: the two sides were being
+ * asked to do different amounts of work. See the comment at that call site. So
+ * this helper removes one cause of a false ratio and does not remove them all;
+ * a comparison also has to be FAIR before its ratio means anything.
+ *
+ * THE THRESHOLDS ARE DELIBERATELY UNCHANGED. Widening one would remove the only
+ * thing these comparisons exist to detect - a batch path that has stopped being
+ * competitive with the loop it replaces. This changes where the noise lands, not
+ * how much regression is tolerated.
+ *
+ * Safe for these callers and NOT safe in general: every operation compared here
+ * is a pure read, so repeating and interleaving them has no side effects.
+ * BatchAdd_FasterThanSingleAdd must stay single-shot for exactly that reason -
+ * its loops mutate the filters.
  */
-template<typename Func>
-[[nodiscard]] int64_t MeasureBestOfNanoseconds(Func&& func, int runs = 5) {
-    // Discarded: pays first-touch page faults and cache warming so they are not
-    // charged to whichever side happens to run first.
-    func();
+template<typename FuncA, typename FuncB>
+void MeasureBestOfInterleavedNanoseconds(FuncA&& funcA, FuncB&& funcB,
+                                         int64_t& bestA, int64_t& bestB,
+                                         int runs = 5) {
+    // Discarded: first-touch page faults and cache warming are paid by BOTH
+    // sides before either one is measured.
+    funcA();
+    funcB();
 
-    int64_t best = std::numeric_limits<int64_t>::max();
+    bestA = std::numeric_limits<int64_t>::max();
+    bestB = std::numeric_limits<int64_t>::max();
     for (int i = 0; i < runs; ++i) {
-        best = std::min(best, MeasureNanoseconds(func));
+        bestA = std::min(bestA, MeasureNanoseconds(funcA));
+        bestB = std::min(bestB, MeasureNanoseconds(funcB));
     }
-    return best;
 }
 
 /// @brief Default test parameters
@@ -1370,10 +1390,24 @@ TEST(BloomFilter_Performance, BatchQuery_FasterThanSingleQuery) {
     
     const auto queryHashes = GenerateTestHashes(10000, 1000000);
     
-    // Single query timing. Best-of for the same reason as
-    // MemoryMappedQuery_ComparableToBuilt: both sides are pure reads, so
-    // repetition is free of side effects, and the threshold is close enough to
-    // the true ratio that a single sample is dominated by interference.
+    // Single and batch query timing, INTERLEAVED so both sides see the same
+    // machine state, and doing the SAME WORK so the ratio measures the batch path
+    // rather than an inequality in what each side is asked to produce.
+    //
+    // THE ORIGINAL COMPARISON WAS UNFAIR, WHICH IS WHY INTERLEAVING ALONE DID NOT
+    // FIX IT. MEASURED: after interleaving, this case passed eight times out of
+    // eight in its own suite but STILL failed in the full 519-suite run. The
+    // reason is that the two sides were never equivalent. BatchQuery writes an
+    // answer for every hash - 10,000 bool stores, about 10 KB - while the loop it
+    // was compared against discarded each answer with a (void) cast and stored
+    // nothing. So batch was charged for strictly more work than its "equivalent"
+    // loop. In isolation that extra write is nearly free; after 517 other suites
+    // have churned the cache and heap it is not, and the ratio drifts past 1.5.
+    //
+    // A caller who replaced BatchQuery with a hand-written loop would have to
+    // store the results somewhere, so storing them is what makes the loop a
+    // genuine substitute and the ratio a genuine measurement of the batch path.
+    // Both sides now write into the same buffer.
     //
     // NOTE: BatchAdd_FasterThanSingleAdd is deliberately NOT converted. Its loops
     // MUTATE the filters, so repeating them would keep adding the same hashes -
@@ -1382,23 +1416,43 @@ TEST(BloomFilter_Performance, BatchQuery_FasterThanSingleQuery) {
     // the test would pass for the wrong reason. Making a test pass by letting it
     // measure less is worse than leaving it single-shot; it has ample margin
     // because BatchAdd genuinely avoids 10,000 separate calls.
-    const int64_t singleNs = MeasureBestOfNanoseconds([&]() {
-        for (uint64_t h : queryHashes) {
-            (void)filter.MightContain(h);
-        }
-    });
-    
-    // Batch query timing
+    //
+    // The output buffer is allocated BEFORE either window opens. It used to be
+    // allocated between them, so the batch side alone paid for a 10 KB heap
+    // allocation immediately before being timed - a third asymmetry.
     auto results_buf = std::make_unique<bool[]>(queryHashes.size());
     std::span<bool> results(results_buf.get(), queryHashes.size());
-    
-    const int64_t batchNs = MeasureBestOfNanoseconds([&]() {
-        [[maybe_unused]] const size_t positives = filter.BatchQuery(queryHashes, results);
-    });
-    
-    // Batch should be at least as fast
+
+    int64_t singleNs = 0;
+    int64_t batchNs = 0;
+    MeasureBestOfInterleavedNanoseconds(
+        [&]() {
+            for (size_t i = 0; i < queryHashes.size(); ++i) {
+                results[i] = filter.MightContain(queryHashes[i]);
+            }
+        },
+        [&]() {
+            [[maybe_unused]] const size_t positives = filter.BatchQuery(queryHashes, results);
+        },
+        singleNs, batchNs);
+
+    // Batch should be at least as fast. Threshold unchanged.
     EXPECT_LE(batchNs, singleNs * 1.5)
         << "BatchQuery (" << batchNs << "ns) should not be much slower than single queries (" << singleNs << "ns)";
+
+    // A SECOND CLAIM THAT DOES NOT DEPEND ON THE RATIO, because two operations of
+    // equal true cost can both regress together and leave the ratio at 1.0. A
+    // per-element ceiling catches the regressions that would actually matter here
+    // - an allocation or a lock per element, or an accidentally quadratic walk -
+    // and it is deliberately generous rather than tight: the measured cost on this
+    // host is about 11 ns per element, so 1 us per element is roughly ninety times
+    // the observed figure and cannot fail on a slow machine for that reason alone.
+    constexpr int64_t kMaxNsPerElement = 1000;
+    const int64_t nsPerElement = batchNs / static_cast<int64_t>(queryHashes.size());
+    EXPECT_LE(nsPerElement, kMaxNsPerElement)
+        << "BatchQuery cost " << nsPerElement << "ns per element over "
+        << queryHashes.size() << " elements, which is far outside the cost class of "
+        << "a bloom-filter probe and indicates per-element overhead";
 }
 
 TEST(BloomFilter_Performance, MemoryMappedQuery_ComparableToBuilt) {
@@ -1418,26 +1472,28 @@ TEST(BloomFilter_Performance, MemoryMappedQuery_ComparableToBuilt) {
     
     const auto queryHashes = GenerateTestHashes(10000, 1000000);
     
-    // Built filter query time
-    //
-    // Best-of, because both loops here do IDENTICAL work over IDENTICAL data, so
-    // the true ratio is ~1.0 and a single sample of each cannot distinguish a
-    // real regression from one scheduling hiccup. Repetition is safe: both loops
-    // are pure reads with no side effects.
-    const int64_t builtNs = MeasureBestOfNanoseconds([&]() {
-        for (uint64_t h : queryHashes) {
-            (void)builder.MightContain(h);
-        }
-    });
-    
-    // Memory-mapped filter query time
-    const int64_t mappedNs = MeasureBestOfNanoseconds([&]() {
-        for (uint64_t h : queryHashes) {
-            (void)reader.MightContain(h);
-        }
-    });
-    
-    // Memory-mapped should be comparable (within 2x)
+    // Built and memory-mapped query time, INTERLEAVED for the same reason as
+    // BatchQuery_FasterThanSingleQuery: both loops do identical work over
+    // identical data, so the true ratio is ~1.0 and the comparison is only
+    // meaningful if both sides see the same machine. Measuring them one after the
+    // other charged any perturbation to whichever ran second. Repetition and
+    // interleaving are safe because both loops are pure reads.
+    int64_t builtNs = 0;
+    int64_t mappedNs = 0;
+    MeasureBestOfInterleavedNanoseconds(
+        [&]() {
+            for (uint64_t h : queryHashes) {
+                (void)builder.MightContain(h);
+            }
+        },
+        [&]() {
+            for (uint64_t h : queryHashes) {
+                (void)reader.MightContain(h);
+            }
+        },
+        builtNs, mappedNs);
+
+    // Memory-mapped should be comparable (within 2x). Threshold unchanged.
     EXPECT_LT(mappedNs, builtNs * 2)
         << "Memory-mapped query (" << mappedNs << "ns) much slower than built (" << builtNs << "ns)";
 }
