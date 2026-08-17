@@ -5275,5 +5275,68 @@ class UsbAutoScanOutcomeContractTests(unittest.TestCase):
             self.assertTrue(needed in self.cpp, "missing sibling plumbing: %s" % needed)
 
 
+class ConnectionPoolConfigurationContractTests(unittest.TestCase):
+    """A pool must refuse what it cannot serve, and must not relabel why it failed.
+
+    Task 195, and this CORRECTS that task's own filed text. minConnections == 0 is NOT
+    the defect: Acquire creates on demand up to maxConnections, so a pool that starts
+    empty is lazy rather than broken. The configuration that genuinely cannot work is
+    maxConnections == 0 - the growth check in Acquire can then never be true, so every
+    caller finds nothing, cannot create anything, and waits out the whole busy timeout
+    before failing, which presents as contention rather than as a misconfiguration.
+    Separately, Acquire handed the CALLER's error object to createConnection and the
+    timeout arm then overwrote it with a generic SQLITE_BUSY, so a disk-full or
+    permission fault was reported as contention - and a later successful acquire could
+    still carry the stale error, the same uncleared out-parameter shape as task 83.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp = strip_c_comments(read_source(DATABASE_MANAGER_CPP_PATH))
+
+    def test_an_unservable_pool_configuration_is_refused_at_initialize(self):
+        body = extract_c_function(self.cpp, "ConnectionPool::Initialize")
+        self.assertTrue(
+            "m_config.maxConnections == 0" in body,
+            "ConnectionPool::Initialize accepts maxConnections == 0, a pool that can never "
+            "hand out a connection and instead fails at first use after a full timeout.",
+        )
+        self.assertTrue(
+            "m_config.minConnections > m_config.maxConnections" in body,
+            "Initialize accepts minConnections above maxConnections, which pre-warms past "
+            "the stated ceiling and leaves Acquire's growth check permanently false.",
+        )
+        self.assertGreaterEqual(
+            body.count("return false"),
+            3,
+            "each refused configuration must fail closed with its own return",
+        )
+
+    def test_a_creation_failure_is_not_relabelled_as_contention(self):
+        self.assertEqual(
+            self.cpp.count("createConnection(&createErr)"),
+            1,
+            "Acquire must capture the creation error in a local, not in the caller's object",
+        )
+        self.assertEqual(
+            self.cpp.count("createConnection(err)"),
+            1,
+            "only ConnectionPool::Initialize may pass the caller's error object to "
+            "createConnection; Acquire doing so is what let a later timeout overwrite the "
+            "specific cause and what left a stale error on a successful acquire",
+        )
+        self.assertEqual(
+            self.cpp.count("*err = firstCreateFailure;"),
+            1,
+            "the specific creation failure must be reported instead of the generic timeout",
+        )
+        self.assertEqual(
+            self.cpp.count('err->message = L"Connection acquisition timeout";'),
+            1,
+            "the generic timeout message must survive for the case where nothing actually "
+            "failed to be created - that case is real contention and should say so",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

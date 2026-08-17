@@ -705,6 +705,38 @@ namespace ShadowStrike {
         bool ConnectionPool::Initialize(DatabaseError* err) {
             std::lock_guard<std::mutex> lock(m_mutex);
             
+            // A configuration that can NEVER serve a connection is refused here rather
+            // than presenting as a stall at first use. With maxConnections == 0 the growth
+            // check in Acquire (m_connections.size() < m_config.maxConnections) can never
+            // be true, so every caller finds no free connection, cannot create one, and
+            // waits out the entire busy timeout before failing - a misconfiguration that
+            // presents as contention. Two sibling config types in this codebase already
+            // refuse exactly this value (HttpServer.cpp:1653, RESTServer.cpp:2302), so this
+            // follows an existing convention rather than inventing policy.
+            // REACHABLE, not theoretical: LogDB and QuarantineDB forward a caller-supplied
+            // maxConnections straight into this config (LogDB.cpp:853, QuarantineDB.cpp:1048).
+            if (m_config.maxConnections == 0) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Connection pool maxConnections is 0, so no connection could ever be served";
+                }
+                SS_LOG_ERROR(L"Database", L"Connection pool refused: maxConnections is 0");
+                return false;
+            }
+            if (m_config.minConnections > m_config.maxConnections) {
+                if (err) {
+                    err->sqliteCode = SQLITE_MISUSE;
+                    err->message = L"Connection pool minConnections exceeds maxConnections";
+                }
+                SS_LOG_ERROR(L"Database",
+                    L"Connection pool refused: minConnections %zu exceeds maxConnections %zu",
+                    m_config.minConnections, m_config.maxConnections);
+                return false;
+            }
+            // minConnections == 0 IS DELIBERATELY PERMITTED and is a different thing: the
+            // pool merely starts empty and Acquire creates on demand up to maxConnections,
+            // so it is lazy rather than broken. Do not "correct" it.
+
             // Pre-warm pool with minimum connections
             for (size_t i = 0; i < m_config.minConnections; ++i) {
                 if (!createConnection(err)) {
@@ -774,6 +806,11 @@ namespace ShadowStrike {
             std::unique_lock<std::mutex> lock(m_mutex);
             
             auto deadline = std::chrono::steady_clock::now() + timeout;
+
+            // Holds the FIRST specific reason a connection could not be created, so a later
+            // timeout can report that cause instead of overwriting it with generic
+            // contention. Written by the create arm, read by the timeout arm below.
+            DatabaseError firstCreateFailure{};
             
             while (true) {
                 if (m_shutdown.load(std::memory_order_acquire)) {
@@ -796,21 +833,49 @@ namespace ShadowStrike {
                 
                 // No available connection, try to create new one if possible
                 if (m_connections.size() < m_config.maxConnections) {
-                    if (createConnection(err)) {
+                    // createConnection used to write straight into the CALLER's err, which
+                    // had two consequences. On the path where creation failed and a
+                    // connection was then released to us, the caller received a SUCCESSFUL
+                    // acquire with a stale error still populated - the uncleared
+                    // out-parameter defect fixed for DatabaseManager::Initialize in
+                    // 8aebe53d. And on the timeout path the specific cause was overwritten
+                    // below by a generic SQLITE_BUSY, so a disk-full, permission or
+                    // corruption fault was reported to the caller as contention.
+                    DatabaseError createErr{};
+                    if (createConnection(&createErr)) {
                         auto& pooled = m_connections.back();
                         pooled.inUse = true;
                         m_activeCount.fetch_add(1, std::memory_order_relaxed);
                         return pooled.connection;
+                    }
+                    // DELIBERATELY NOT returning here. With connections already in use,
+                    // waiting for one to be released is a genuine recovery path and
+                    // returning early would discard it; only the REASON needed preserving.
+                    // The first failure is kept because it is closest to the original cause.
+                    if (!firstCreateFailure.HasError()) {
+                        firstCreateFailure = createErr;
                     }
                 }
                 
                 // Wait for a connection to become available
                 if (m_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
                     if (err) {
-                        err->sqliteCode = SQLITE_BUSY;
-                        err->message = L"Connection acquisition timeout";
+                        if (firstCreateFailure.HasError()) {
+                            // Report why a connection could not be CREATED, not the symptom
+                            // that we then waited and nobody released one.
+                            *err = firstCreateFailure;
+                        } else {
+                            err->sqliteCode = SQLITE_BUSY;
+                            err->message = L"Connection acquisition timeout";
+                        }
                     }
-                    SS_LOG_WARN(L"Database", L"Connection acquisition timeout after %lld ms", timeout.count());
+                    if (firstCreateFailure.HasError()) {
+                        SS_LOG_WARN(L"Database",
+                            L"Connection acquisition failed after %lld ms; creating a connection had failed with sqlite=%d: %ls",
+                            timeout.count(), firstCreateFailure.sqliteCode, firstCreateFailure.message.c_str());
+                    } else {
+                        SS_LOG_WARN(L"Database", L"Connection acquisition timeout after %lld ms", timeout.count());
+                    }
                     return nullptr;
                 }
             }
