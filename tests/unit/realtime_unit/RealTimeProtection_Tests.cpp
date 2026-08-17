@@ -147,14 +147,14 @@ TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterm
     EXPECT_FALSE(rtp.Resume());
 
     const uint64_t nullFileScanId = rtp.RegisterFileScanCallback({});
-    const uint64_t nullProcessId = rtp.RegisterProcessCreateCallback({});
+    const uint64_t nullProcessId = rtp.RegisterProcessNotifyCallback({});
     const uint64_t nullThreatId = rtp.RegisterThreatDetectionCallback({});
     const uint64_t nullStateId = rtp.RegisterStateChangeCallback({});
     const uint64_t nullComponentId = rtp.RegisterComponentStatusCallback({});
     const uint64_t nullNotificationId = rtp.RegisterNotificationCallback({});
     const uint64_t fileScanId = rtp.RegisterFileScanCallback(
         [](const RTPFileScanRequest&, ScanResult&) { return false; });
-    const uint64_t processId = rtp.RegisterProcessCreateCallback(
+    const uint64_t processId = rtp.RegisterProcessNotifyCallback(
         [](const RTPProcessNotifyRequest&, bool&) {});
     const uint64_t threatId = rtp.RegisterThreatDetectionCallback(
         [](const ThreatEvent&) {});

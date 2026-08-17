@@ -5024,5 +5024,95 @@ class DatabaseSecurityInitContractTests(unittest.TestCase):
         )
 
 
+class ProcessNotifyCallbackSemanticsContractTests(unittest.TestCase):
+    """A seam must not appear to offer enforcement it cannot perform.
+
+    RealTimeProtection's process callback is dispatched on creation AND
+    termination, but was named for creation only, and its shouldBlock
+    out-parameter was honoured on both branches. A block for a terminating
+    process cannot be delivered: the driver arms a verdict wait only inside its
+    IsCreation branch, so the verdict is discarded and the process is leaving
+    anyway. Returning Block there would also have moved processesBlocked for an
+    enforcement that never happened.
+
+    Every containment check below is written as a boolean rather than assertIn,
+    because the haystacks here run to hundreds of kilobytes and a failure that
+    prints one is unreadable.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp_raw = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        cls.hpp_raw = read_source(REAL_TIME_PROTECTION_HPP_PATH)
+        cls.cpp = strip_c_comments(cls.cpp_raw)
+        cls.hpp = strip_c_comments(cls.hpp_raw)
+        anchor = cls.cpp.find("std::vector<RTPProcessNotifyCallback> callbackSnapshot;")
+        assert anchor != -1, "process-notify dispatch not found in RealTimeProtection.cpp"
+        cls.dispatch = cls.cpp[anchor:anchor + 3000]
+
+    def test_the_api_is_named_for_both_branches_it_carries(self):
+        stale_found = []
+        for label, text in (
+            ("RealTimeProtection.cpp", self.cpp),
+            ("RealTimeProtection.hpp", self.hpp),
+        ):
+            for stale in (
+                "RegisterProcessCreateCallback",
+                "RTPProcessCreateCallback",
+                "m_processCreateCallbacks",
+            ):
+                if stale in text:
+                    stale_found.append("{}: {}".format(label, stale))
+        self.assertEqual(
+            stale_found,
+            [],
+            "these names say creation only while the callback is dispatched on "
+            "termination too: {}".format(stale_found),
+        )
+        for needed in ("RTPProcessNotifyCallback", "RegisterProcessNotifyCallback"):
+            self.assertTrue(
+                needed in self.hpp,
+                "RealTimeProtection.hpp must declare {}".format(needed),
+            )
+
+    def test_a_block_is_honoured_only_on_creation(self):
+        self.assertTrue(
+            "shouldBlock && req.isCreation" in self.dispatch,
+            "the block decision must be gated on the creation branch; the driver "
+            "waits for a verdict only there, so a block for a terminating process "
+            "is discarded while still being counted as an enforcement",
+        )
+        ungated = re.findall(r"if\s*\(\s*shouldBlock\s*\)", self.dispatch)
+        self.assertEqual(
+            ungated,
+            [],
+            "found an ungated 'if (shouldBlock)' in the dispatch, which honours a "
+            "block request for a terminating process",
+        )
+
+    def test_an_undeliverable_exit_block_is_counted_not_dropped(self):
+        self.assertTrue(
+            "processExitBlockRequestsIgnored" in self.dispatch,
+            "a block requested on the exit branch must be counted; discarding it "
+            "in silence lets a registrant keep believing it is enforcing something",
+        )
+        self.assertTrue(
+            "std::atomic<uint64_t> processExitBlockRequestsIgnored" in self.hpp,
+            "the counter must be declared in the statistics struct",
+        )
+
+    def test_the_counter_survives_a_statistics_reset(self):
+        # A counter absent from Reset() reports pre-reset values afterwards, which
+        # this struct's own comment records as worse than no reset at all.
+        sibling = self.cpp.find("processNotifyReplyHorizonExceeded = 0;")
+        self.assertNotEqual(sibling, -1, "sibling counter reset not found")
+        window = self.cpp[sibling:sibling + 300]
+        self.assertTrue(
+            "processExitBlockRequestsIgnored = 0;" in window,
+            "the new counter is not listed in the statistics reset beside its "
+            "sibling, so ResetStatistics would leave it holding a stale value",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

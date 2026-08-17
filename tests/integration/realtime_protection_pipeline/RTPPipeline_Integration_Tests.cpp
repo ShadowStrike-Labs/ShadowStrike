@@ -2390,8 +2390,8 @@ TEST_F(RTPFixture, RegisterFileScanCallback_ReturnsNonZeroId) {
     RT::RealTimeProtection::Instance().UnregisterCallback(id);
 }
 
-TEST_F(RTPFixture, RegisterProcessCreateCallback_ReturnsNonZeroId) {
-    uint64_t id = RT::RealTimeProtection::Instance().RegisterProcessCreateCallback(
+TEST_F(RTPFixture, RegisterProcessNotifyCallback_ReturnsNonZeroId) {
+    uint64_t id = RT::RealTimeProtection::Instance().RegisterProcessNotifyCallback(
         [](const RT::RTPProcessNotifyRequest&, bool&) {});
     EXPECT_NE(0u, id);
     RT::RealTimeProtection::Instance().UnregisterCallback(id);

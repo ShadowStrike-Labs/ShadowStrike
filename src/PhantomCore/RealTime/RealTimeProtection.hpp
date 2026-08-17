@@ -1007,6 +1007,18 @@ struct alignas(64) RTPStatistics {
     ///        question it exists for.
     std::atomic<uint64_t> processNotifyReplyHorizonExceeded{ 0 };
 
+    /**
+     * @brief Blocks a registrant asked for on process TERMINATION, which cannot
+     *        be honoured.
+     *
+     * Above zero means a registered process-notify callback set shouldBlock on
+     * the exit branch, where the driver arms no verdict wait and the process is
+     * already leaving. That is a defect in the registrant, not in this module,
+     * and it is counted because the alternative is discarding the request in
+     * silence - which is how a caller keeps believing it is enforcing something.
+     */
+    std::atomic<uint64_t> processExitBlockRequestsIgnored{ 0 };
+
     /// @brief Files whose content exceeded the configured real-time scan size
     ///        bound and were handed to the background deep-scan worker instead
     ///        of being read on the blocking path.
@@ -1063,11 +1075,26 @@ using RTPFileScanCallback = std::function<bool(
 )>;
 
 /**
- * @brief Callback for process creation events.
- * @param request The process notification
- * @param shouldBlock Set to true to block process creation
+ * @brief Callback for process creation AND termination events.
+ *
+ * NAMED FOR WHAT IT CARRIES. This is dispatched on both branches of the kernel
+ * process notification, not on creation alone, and the request already says which
+ * via RTPProcessNotifyRequest::isCreation. The former name said "Create", which
+ * made the termination dispatch read as an oversight when it is deliberate: an
+ * exit notification is genuinely useful to a registrant doing per-process state
+ * cleanup, and that is why the exit branch is not gated by the reply horizon.
+ *
+ * @param request The process notification; test request.isCreation to tell the
+ *        two apart, because the same callback receives both.
+ * @param shouldBlock Set to true to block process CREATION. IGNORED ON
+ *        TERMINATION, and that is a platform fact rather than a policy choice:
+ *        the driver arms a verdict wait only inside its IsCreation branch
+ *        (ProcessNotify.c), so a block requested for an exiting process cannot
+ *        be delivered anywhere, and the process it names is already leaving.
+ *        Such requests are counted and reported, never honoured, so this seam
+ *        cannot appear to offer enforcement it is unable to perform.
  */
-using RTPProcessCreateCallback = std::function<void(
+using RTPProcessNotifyCallback = std::function<void(
     const RTPProcessNotifyRequest& request,
     bool& shouldBlock
 )>;
@@ -1480,11 +1507,17 @@ public:
     [[nodiscard]] uint64_t RegisterFileScanCallback(RTPFileScanCallback callback);
 
     /**
-     * @brief Registers a callback for process creation events.
-     * @param callback The callback function.
-     * @return Callback ID for unregistration.
+     * @brief Registers a callback for process creation and termination events.
+     *
+     * The callback is invoked on BOTH branches of the kernel process
+     * notification; RTPProcessNotifyRequest::isCreation distinguishes them. A
+     * block requested on the termination branch is counted and discarded - see
+     * RTPProcessNotifyCallback for why it cannot be delivered.
+     *
+     * @param callback The callback function. An empty callback is refused.
+     * @return Callback ID for unregistration, or 0 if the callback was refused.
      */
-    [[nodiscard]] uint64_t RegisterProcessCreateCallback(RTPProcessCreateCallback callback);
+    [[nodiscard]] uint64_t RegisterProcessNotifyCallback(RTPProcessNotifyCallback callback);
 
     /**
      * @brief Registers a callback for threat detection events.

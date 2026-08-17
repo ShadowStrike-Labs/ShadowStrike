@@ -555,7 +555,7 @@ public:
 
     // Callbacks
     std::unordered_map<uint64_t, RTPFileScanCallback> m_fileScanCallbacks;
-    std::unordered_map<uint64_t, RTPProcessCreateCallback> m_processCreateCallbacks;
+    std::unordered_map<uint64_t, RTPProcessNotifyCallback> m_processNotifyCallbacks;
     std::unordered_map<uint64_t, ThreatDetectionCallback> m_threatDetectionCallbacks;
     std::unordered_map<uint64_t, StateChangeCallback> m_stateChangeCallbacks;
     std::unordered_map<uint64_t, ComponentStatusCallback> m_componentStatusCallbacks;
@@ -4630,23 +4630,32 @@ public:
         // stages, so measuring the horizon here is what stops a slow registrant
         // from consuming the window those stages need.
         //
-        // INERT TODAY, MEASURED NOT ASSUMED: RegisterProcessCreateCallback has
-        // exactly two references in the tree, its declaration and its definition.
-        // No production or test code registers anything, so callbackSnapshot is
-        // empty on every run and this gate changes no behaviour today. It is here
-        // so that wiring up the first registrant cannot silently reintroduce an
-        // unbounded stage on the callback the driver blocks CreateProcess on.
+        // NO PRODUCTION REGISTRANT - AND THE CLAIM THAT USED TO STAND HERE WAS STILL
+        // FALSE. It read "exactly two references in the tree, its declaration and its
+        // definition. No production or test code registers anything." Measured: there
+        // is no production caller, but TWO test files register a callback, and
+        // tests/unit/realtime_unit/RealTimeProtection_Tests.cpp is compiled into the
+        // test binary (PhantomTests.vcxproj:573). It registers at :157 and unregisters
+        // at :198 inside the same test body, so the map is non-empty for that window
+        // rather than empty on every run.
+        //
+        // THE CONCLUSION SURVIVES THE CORRECTION, WHICH IS WHY THIS IS WORTH STATING
+        // PRECISELY RATHER THAN QUIETLY REPAIRING: no test drives this handler while a
+        // callback is registered, so the dispatch below has still never run against a
+        // non-empty snapshot. The gate is here so that wiring up the first production
+        // registrant cannot silently reintroduce an unbounded stage on the callback
+        // the driver blocks CreateProcess on.
         //
         // THE EXIT BRANCH IS NEVER GATED. The driver does not wait for a verdict
         // on process exit, and a future registrant may well do state maintenance
         // there - the same reason the privilege-escalation erase above is
         // unconditional.
         bool shouldBlock = false;
-        std::vector<RTPProcessCreateCallback> callbackSnapshot;
+        std::vector<RTPProcessNotifyCallback> callbackSnapshot;
         if (!(req.isCreation && replyHorizonExceeded("external process-create callbacks"))) {
             std::shared_lock lock(m_callbackMutex);
-            callbackSnapshot.reserve(m_processCreateCallbacks.size());
-            for (const auto& [id, callback] : m_processCreateCallbacks) {
+            callbackSnapshot.reserve(m_processNotifyCallbacks.size());
+            for (const auto& [id, callback] : m_processNotifyCallbacks) {
                 callbackSnapshot.push_back(callback);
             }
         }
@@ -4665,11 +4674,34 @@ public:
             } catch (...) {}
         }
 
-        if (shouldBlock) {
+        if (shouldBlock && req.isCreation) {
             m_stats.processesBlocked++;
             Utils::Logger::Warn("RealTimeProtection: Blocked process creation: {} (PID: {})",
                 Utils::StringUtils::ToNarrow(imagePath), req.processId);
             return Communication::KernelVerdict::Block;
+        }
+
+        if (shouldBlock && !req.isCreation) {
+            // A BLOCK REQUESTED FOR A TERMINATION IS COUNTED, NEVER HONOURED, AND
+            // THE OLD CODE HONOURED IT. The test was `if (shouldBlock)` with no
+            // branch check, so a registrant could return Block for a process that
+            // was exiting. Nothing could act on that: the driver arms its verdict
+            // wait only inside `if (IsCreation && CreateInfo != NULL)`
+            // (ProcessNotify.c), so the verdict is discarded, and the process it
+            // named is already terminating. Returning Block there would also have
+            // moved processesBlocked for an enforcement that did not occur, which
+            // is the over-claimed-outcome defect this codebase has closed in eleven
+            // other modules.
+            //
+            // REPORTED RATHER THAN DROPPED, because a registrant that does this
+            // believes it is preventing something. Silence would let it keep
+            // believing that.
+            m_stats.processExitBlockRequestsIgnored++;
+            Utils::Logger::Warn(
+                "RealTimeProtection: a process-notify callback requested a block for "
+                "TERMINATING PID {} ({}); ignored, because the driver waits for a "
+                "verdict only on creation and the process is already exiting",
+                req.processId, Utils::StringUtils::ToNarrow(imagePath));
         }
 
         // If configured, scan the process image
@@ -6415,6 +6447,7 @@ public:
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
         const uint64_t replyHorizon = m_stats.processNotifyReplyHorizonExceeded.load(std::memory_order_relaxed);
+        const uint64_t exitBlockIgn = m_stats.processExitBlockRequestsIgnored.load(std::memory_order_relaxed);
         const uint64_t procWithheld = m_stats.processBlocksWithheldByMode.load(std::memory_order_relaxed);
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
 
@@ -6463,11 +6496,12 @@ public:
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
-            "processBlocksWithheldByMode={}",
+            "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld);
+            cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
+            exitBlockIgn);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -6995,6 +7029,7 @@ void RTPStatistics::Reset() noexcept {
     packerDeferred = 0;
     processNotifyBudgetExceeded = 0;
     processNotifyReplyHorizonExceeded = 0;
+    processExitBlockRequestsIgnored = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;
@@ -7369,14 +7404,14 @@ uint64_t RealTimeProtection::RegisterFileScanCallback(RTPFileScanCallback callba
     return id;
 }
 
-uint64_t RealTimeProtection::RegisterProcessCreateCallback(RTPProcessCreateCallback callback) {
+uint64_t RealTimeProtection::RegisterProcessNotifyCallback(RTPProcessNotifyCallback callback) {
     if (!callback) {
-        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty process create callback");
+        Utils::Logger::Warn("RealTimeProtection: Attempted to register empty process notify callback");
         return 0;
     }
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
-    m_impl->m_processCreateCallbacks[id] = std::move(callback);
+    m_impl->m_processNotifyCallbacks[id] = std::move(callback);
     return id;
 }
 
@@ -7428,7 +7463,7 @@ bool RealTimeProtection::UnregisterCallback(uint64_t callbackId) {
     std::unique_lock lock(m_impl->m_callbackMutex);
 
     if (m_impl->m_fileScanCallbacks.erase(callbackId)) return true;
-    if (m_impl->m_processCreateCallbacks.erase(callbackId)) return true;
+    if (m_impl->m_processNotifyCallbacks.erase(callbackId)) return true;
     if (m_impl->m_threatDetectionCallbacks.erase(callbackId)) return true;
     if (m_impl->m_stateChangeCallbacks.erase(callbackId)) return true;
     if (m_impl->m_componentStatusCallbacks.erase(callbackId)) return true;
