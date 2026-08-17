@@ -1031,7 +1031,7 @@ void NotificationManagerImpl::ShowThreatAlertSimple(const std::wstring& threatNa
     n.type = NotificationType::Toast;
     n.category = NotificationCategory::ThreatDetection;
     n.bypassQuietMode = true;
-    n.title = L"\u26A0\uFE0F Threat Detected — " + threatName;
+    n.title = L"\u26A0\uFE0F Threat Detected \u2014 " + threatName;
     n.message = L"Malicious file blocked:\n" + filePath;
     n.tag = "threat:" + ToNarrow(threatName);
     n.createdTime = std::chrono::system_clock::now();
@@ -1063,7 +1063,7 @@ std::string NotificationManagerImpl::ShowThreatAlertFull(const ThreatNotificatio
     n.bypassQuietMode = true;
     n.createdTime = std::chrono::system_clock::now();
 
-    n.title = L"\u26A0\uFE0F Threat Detected — " + threat.threatName;
+    n.title = L"\u26A0\uFE0F Threat Detected \u2014 " + threat.threatName;
 
     std::wstring body;
     body += L"File: " + threat.filePath + L"\n";
@@ -1820,14 +1820,19 @@ std::string_view GetQuietModeStateName(QuietModeState state) noexcept {
     }
 }
 
+// Returns the glyph a shell toast shows beside a notification. Every value is written as a
+// universal-character escape so this translation unit stays ASCII; the codepoint names in the
+// trailing comments are the documentation, because an escape cannot be read by eye. U+FE0F is
+// the variation selector that asks the shell for the emoji rendering rather than the monochrome
+// text rendering, and it is needed only on the two codepoints that have both forms.
 std::wstring GetLevelIcon(NotificationLevel level) {
     switch (level) {
-        case NotificationLevel::Info:     return L"\u2139\uFE0F";   // ℹ️
-        case NotificationLevel::Success:  return L"\u2705";          // ✅
-        case NotificationLevel::Warning:  return L"\u26A0\uFE0F";   // ⚠️
-        case NotificationLevel::Error:    return L"\u274C";          // ❌
-        case NotificationLevel::Critical: return L"\U0001F6A8";      // 🚨
-        default:                          return L"\u2753";          // ❓
+        case NotificationLevel::Info:     return L"\u2139\uFE0F";  // U+2139 information source
+        case NotificationLevel::Success:  return L"\u2705";        // U+2705 white heavy check mark
+        case NotificationLevel::Warning:  return L"\u26A0\uFE0F";  // U+26A0 warning sign
+        case NotificationLevel::Error:    return L"\u274C";        // U+274C cross mark
+        case NotificationLevel::Critical: return L"\U0001F6A8";    // U+1F6A8 police cars revolving light
+        default:                          return L"\u2753";        // U+2753 black question mark ornament
     }
 }
 
