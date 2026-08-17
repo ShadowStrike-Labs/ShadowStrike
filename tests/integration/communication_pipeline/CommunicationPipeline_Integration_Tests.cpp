@@ -2494,15 +2494,51 @@ TEST_F(TypeContracts, ConsentLevel_Ordinals) {
 }
 
 // 15.6 MessageType kernel wire ordinals must not drift from the protocol contract.
+//
+// This test used to compare the mirror against HARDCODED LITERALS - ScanRequest
+// 5, ProcessNotify 7, Max 43 - copied from the mirror itself. That made it
+// self-referential: it could never detect the divergence its own name warns
+// about, and it passed for the entire time the mirror was wrong. Those literals
+// WERE the drift. The kernel enum has ScanRequest 6, ProcessNotify 8 and Max 45,
+// because Communication::MessageType was missing KeyExchange and
+// FileOperationEvent, so 39 of 45 values were low by one and ProcessNotify
+// selected 7 on the wire - which is ScanVerdict, a type with a REGISTERED
+// driver handler.
+//
+// Compare against the kernel enumerators instead, so there is no number to copy
+// and nothing to keep in step by hand.
 TEST_F(TypeContracts, MessageType_KernelWireOrdinals) {
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::None),           0u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::ScanRequest),    5u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::ScanVerdictReply), 6u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::ProcessNotify),  7u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::RegistryNotify), 10u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::HandleAlert),    26u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::BehavioralAlert), 36u);
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::Max),            43u);
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::None),
+              static_cast<uint16_t>(FilterMessageType_None));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::KeyExchange),
+              static_cast<uint16_t>(FilterMessageType_KeyExchange));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::ScanRequest),
+              static_cast<uint16_t>(FilterMessageType_ScanRequest));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::ScanVerdictReply),
+              static_cast<uint16_t>(FilterMessageType_ScanVerdict));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::ProcessNotify),
+              static_cast<uint16_t>(FilterMessageType_ProcessNotify));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::RegistryNotify),
+              static_cast<uint16_t>(FilterMessageType_RegistryNotify));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::HandleAlert),
+              static_cast<uint16_t>(FilterMessageType_HandleAlert));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::BehavioralAlert),
+              static_cast<uint16_t>(FilterMessageType_BehavioralAlert));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::FileOperationEvent),
+              static_cast<uint16_t>(FilterMessageType_FileOperationEvent));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::Max),
+              static_cast<uint16_t>(FilterMessageType_Max));
+
+    // Deliberate second layer: the block above cannot fail while the two
+    // declarations agree, so it would stay silent if BOTH were changed together
+    // by mistake. These two absolute values are a review prompt for exactly
+    // that, and for an append (which must also visit the mirror).
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::ProcessNotify), 8u)
+        << "ProcessNotify is 8 on the wire. It read 7 while the mirror omitted "
+           "KeyExchange, and 7 is ScanVerdict.";
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::Max), 45u)
+        << "The kernel message enum grew. Confirm every new type was added to "
+           "Communication::MessageType, then update this count.";
 }
 
 // 15.7 ScanVerdict wire ordinals must not drift.

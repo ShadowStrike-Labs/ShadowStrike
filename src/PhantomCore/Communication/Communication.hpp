@@ -70,67 +70,80 @@ constexpr uint32_t MAX_CONCURRENT_CONNECTIONS = 8;
 //=============================================================================
 
 enum class MessageType : uint16_t {
-    // Control (0–4)
-    None                     = 0,
-    Register                 = 1,
-    Unregister               = 2,
-    Heartbeat                = 3,
-    ConfigUpdate             = 4,
+    // EVERY VALUE IS DERIVED from the kernel enum in
+    // PhantomSensor/Shared/MessageTypes.h, which is the single authority for what
+    // travels on the comm port. Do not restate a number here.
+    //
+    // This list previously carried explicit literals and they had DRIFTED. It was
+    // missing FilterMessageType_KeyExchange, so every value from ScanRequest
+    // onward was low by one, and it was missing FileOperationEvent, so Max was low
+    // by two: 39 of 45 enumerators named a different message class than the one
+    // they select on the wire. ProcessNotify read 7, which is ScanVerdict - a type
+    // with a registered driver handler. Nothing compared the two declarations,
+    // which is the only reason it survived.
+    //
+    // Deriving the values makes that drift UNREPRESENTABLE rather than merely
+    // detectable. Derivation cannot catch an enumerator being ABSENT, so the
+    // static_assert below fails the build when the kernel enum grows.
 
-    // Scan (5–6) — ScanRequest is the ONLY type requiring a verdict reply
-    ScanRequest              = 5,
-    ScanVerdictReply         = 6,
+    None                     = FilterMessageType_None,
+    Register                 = FilterMessageType_Register,
+    Unregister               = FilterMessageType_Unregister,
+    Heartbeat                = FilterMessageType_Heartbeat,
+    ConfigUpdate             = FilterMessageType_ConfigUpdate,
+    KeyExchange              = FilterMessageType_KeyExchange,
+    ScanRequest              = FilterMessageType_ScanRequest,
+    ScanVerdictReply         = FilterMessageType_ScanVerdict,
+    ProcessNotify            = FilterMessageType_ProcessNotify,
+    ThreadNotify             = FilterMessageType_ThreadNotify,
+    ImageLoad                = FilterMessageType_ImageLoad,
+    RegistryNotify           = FilterMessageType_RegistryNotify,
+    NamedPipeEvent           = FilterMessageType_NamedPipeEvent,
+    FileBackupEvent          = FilterMessageType_FileBackupEvent,
+    FileRollbackEvent        = FilterMessageType_FileRollbackEvent,
+    AlpcPortCreated          = FilterMessageType_AlpcPortCreated,
+    AlpcPortConnected        = FilterMessageType_AlpcPortConnected,
+    AlpcPortDisconnected     = FilterMessageType_AlpcPortDisconnected,
+    AlpcSuspiciousAccess     = FilterMessageType_AlpcSuspiciousAccess,
+    AlpcImpersonation        = FilterMessageType_AlpcImpersonation,
+    AlpcSandboxEscape        = FilterMessageType_AlpcSandboxEscape,
+    AlpcRateLimitExceeded    = FilterMessageType_AlpcRateLimitExceeded,
+    QueryDriverStatus        = FilterMessageType_QueryDriverStatus,
+    UpdatePolicy             = FilterMessageType_UpdatePolicy,
+    EnableFiltering          = FilterMessageType_EnableFiltering,
+    DisableFiltering         = FilterMessageType_DisableFiltering,
+    RegisterProtectedProcess = FilterMessageType_RegisterProtectedProcess,
+    HandleAlert              = FilterMessageType_HandleAlert,
+    RansomwareAlert          = FilterMessageType_RansomwareAlert,
+    PushHashDatabase         = FilterMessageType_PushHashDatabase,
+    PushPatternDatabase      = FilterMessageType_PushPatternDatabase,
+    PushSignatureDatabase    = FilterMessageType_PushSignatureDatabase,
+    PushIoCFeed              = FilterMessageType_PushIoCFeed,
+    PushWhitelist            = FilterMessageType_PushWhitelist,
+    UpdateBehavioralRules    = FilterMessageType_UpdateBehavioralRules,
+    PushNetworkIoC           = FilterMessageType_PushNetworkIoC,
+    ExclusionUpdate          = FilterMessageType_ExclusionUpdate,
+    BehavioralAlert          = FilterMessageType_BehavioralAlert,
+    MemoryAlert              = FilterMessageType_MemoryAlert,
+    NetworkAlert             = FilterMessageType_NetworkAlert,
+    SyscallAlert             = FilterMessageType_SyscallAlert,
+    SelfProtectAlert         = FilterMessageType_SelfProtectAlert,
+    ExclusionQuery           = FilterMessageType_ExclusionQuery,
+    ThreatScoreNotify        = FilterMessageType_ThreatScoreNotify,
+    FileOperationEvent       = FilterMessageType_FileOperationEvent,
 
-    // Behavioral notifications (7–13) — no reply required
-    ProcessNotify            = 7,
-    ThreadNotify             = 8,
-    ImageLoad                = 9,
-    RegistryNotify           = 10,
-    NamedPipeEvent           = 11,
-    FileBackupEvent          = 12,
-    FileRollbackEvent        = 13,
-
-    // ALPC notifications (14–20)
-    AlpcPortCreated          = 14,
-    AlpcPortConnected        = 15,
-    AlpcPortDisconnected     = 16,
-    AlpcSuspiciousAccess     = 17,
-    AlpcImpersonation        = 18,
-    AlpcSandboxEscape        = 19,
-    AlpcRateLimitExceeded    = 20,
-
-    // Policy (21–25)
-    QueryDriverStatus        = 21,
-    UpdatePolicy             = 22,
-    EnableFiltering          = 23,
-    DisableFiltering         = 24,
-    RegisterProtectedProcess = 25,
-
-    // Alerts (26–27)
-    HandleAlert              = 26,
-    RansomwareAlert          = 27,
-
-    // Data push: user → kernel (28–35)
-    PushHashDatabase         = 28,
-    PushPatternDatabase      = 29,
-    PushSignatureDatabase    = 30,
-    PushIoCFeed              = 31,
-    PushWhitelist            = 32,
-    UpdateBehavioralRules    = 33,
-    PushNetworkIoC           = 34,
-    ExclusionUpdate          = 35,
-
-    // Telemetry / status (36–42)
-    BehavioralAlert          = 36,
-    MemoryAlert              = 37,
-    NetworkAlert             = 38,
-    SyscallAlert             = 39,
-    SelfProtectAlert         = 40,
-    ExclusionQuery           = 41,
-    ThreatScoreNotify        = 42,
-
-    Max                      = 43
+    Max                      = FilterMessageType_Max
 };
+
+// REVIEW PROMPT, deliberately not a tautology. The values above cannot drift, but
+// an enumerator missing from this mirror still can - that is exactly how
+// KeyExchange and FileOperationEvent went absent. This fails the build when the
+// kernel enum grows, so whoever appends a type is forced to visit this list.
+static_assert(static_cast<uint16_t>(MessageType::Max) == 45,
+              "Kernel message enum grew: add the new type to Communication::MessageType, "
+              "then bump this count in the same change.");
+static_assert(sizeof(MessageType) == sizeof(uint16_t),
+              "MessageType must stay 16-bit to match SHADOWSTRIKE_MESSAGE_HEADER::MessageType.");
 
 //=============================================================================
 // Wire-protocol verdict — MUST match kernel SHADOWSTRIKE_SCAN_VERDICT

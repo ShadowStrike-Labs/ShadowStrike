@@ -3922,6 +3922,56 @@ class MessageTypeNumberingContractTests(unittest.TestCase):
         )
         self.assertIn("ProcessNotify", notify)
 
+    def test_the_user_mode_mirror_derives_every_value_from_this_enum(self):
+        names = self._message_type_names()
+        mirror_src = read_source(COMMUNICATION_HPP_PATH).lstrip("\ufeff")
+        start = mirror_src.index("enum class MessageType : uint16_t {")
+        end = mirror_src.index("};", start)
+        block = mirror_src[start:end]
+
+        restated = re.findall(r"(?m)^\s+(\w+)\s*=\s*\d+\s*,?\s*$", block)
+        self.assertEqual(
+            restated, [],
+            "Communication::MessageType restates numeric wire values for: "
+            + ", ".join(restated)
+            + ". Every value must be DERIVED from FilterMessageType_*; "
+            "restating them is how this mirror came to be low by one from "
+            "ScanRequest onward, so ProcessNotify read 7 - which is "
+            "ScanVerdict, a type with a registered driver handler.",
+        )
+
+        missing = [
+            n for n in names
+            if not re.search(r"=\s*FilterMessageType_" + n + r"\b", block)
+        ]
+        self.assertEqual(
+            missing, [],
+            "Communication::MessageType does not mirror these kernel "
+            "enumerators: " + ", ".join(missing)
+            + ". An ABSENT enumerator is the one drift deriving the values "
+            "cannot prevent, and it is exactly how KeyExchange and "
+            "FileOperationEvent went missing.",
+        )
+
+        # The review prompt must track the enum, so appending a type fails the
+        # build until this mirror is visited.
+        prompt = re.search(
+            r"static_assert\(\s*static_cast<uint16_t>\(MessageType::Max\)\s*==\s*(\d+)",
+            mirror_src,
+        )
+        self.assertIsNotNone(
+            prompt,
+            "Communication.hpp has lost the static_assert pinning "
+            "MessageType::Max to a literal count. That assert is what forces "
+            "whoever appends a kernel message type to visit this mirror.",
+        )
+        self.assertEqual(
+            int(prompt.group(1)), names.index("Max"),
+            f"The mirror's review prompt says {prompt.group(1)} but "
+            f"FilterMessageType_Max is {names.index('Max')}. Update the count "
+            "in the same change that adds the enumerator.",
+        )
+
     def test_the_validity_macro_is_enforced_not_merely_declared(self):
         handler = strip_c_comments(
             read_source(MESSAGE_HANDLER_C_PATH).lstrip("\ufeff")
