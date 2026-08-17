@@ -794,9 +794,30 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
 
         if (autoScan && access != AccessLevel::Blocked && USBScanner::HasInstance()) {
             auto& scanner = USBScanner::Instance();
-            scanner.ScanDriveAsync(device.driveLetter);
-            m_stats.scansTriggered.fetch_add(1, std::memory_order_relaxed);
-            SS_LOG_INFO(L"USBMonitor", L"Auto-scan started for drive %hs", device.driveLetter.c_str());
+
+            // ScanDriveAsync is [[nodiscard]] bool (USBScanner.hpp:664) and its result was
+            // DISCARDED here, while scansTriggered and the INFO line below both fired
+            // unconditionally. A refused submission therefore produced a freshly mounted
+            // removable volume that nothing would ever examine, reported as a scan in
+            // progress. Removable media is a primary infection vector, which makes a
+            // silently unexamined volume the worst place in this product to over-claim an
+            // outcome. Same shape as StackPivotDetector's discarded TerminateProcess
+            // (9971ef9e) and BadUSBDetector's unguarded attacksBlocked (bb48bf8a): capture
+            // the result, count and log only what actually happened, name the failure.
+            const bool scanStarted = scanner.ScanDriveAsync(device.driveLetter);
+            if (scanStarted) {
+                m_stats.scansTriggered.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_INFO(L"USBMonitor", L"Auto-scan started for drive %hs", device.driveLetter.c_str());
+            } else {
+                m_stats.autoScansNotStarted.fetch_add(1, std::memory_order_relaxed);
+                // ERROR rather than WARN: the volume is mounted and reachable by the user
+                // while nothing is going to look at it. Bounded by construction to one
+                // line per mount, so it cannot become the per-event log flood that the
+                // deferred-queue drop warning once was.
+                SS_LOG_ERROR(L"USBMonitor",
+                    L"Auto-scan was NOT started for drive %hs - the volume is mounted and will not be examined",
+                    device.driveLetter.c_str());
+            }
         }
     }
 
@@ -1300,6 +1321,7 @@ USBMonitorStatisticsSnapshot USBDeviceMonitorImpl::GetStatistics() const {
     snap.devicesAllowed = m_stats.devicesAllowed.load(std::memory_order_relaxed);
     snap.devicesReadOnly = m_stats.devicesReadOnly.load(std::memory_order_relaxed);
     snap.scansTriggered = m_stats.scansTriggered.load(std::memory_order_relaxed);
+    snap.autoScansNotStarted = m_stats.autoScansNotStarted.load(std::memory_order_relaxed);
     snap.malwareDetected = m_stats.malwareDetected.load(std::memory_order_relaxed);
     snap.autorunBlocked = m_stats.autorunBlocked.load(std::memory_order_relaxed);
     snap.badUSBDetected = m_stats.badUSBDetected.load(std::memory_order_relaxed);
@@ -1654,6 +1676,7 @@ void USBMonitorStatistics::Reset() noexcept {
     devicesAllowed.store(0, std::memory_order_relaxed);
     devicesReadOnly.store(0, std::memory_order_relaxed);
     scansTriggered.store(0, std::memory_order_relaxed);
+    autoScansNotStarted.store(0, std::memory_order_relaxed);
     malwareDetected.store(0, std::memory_order_relaxed);
     autorunBlocked.store(0, std::memory_order_relaxed);
     badUSBDetected.store(0, std::memory_order_relaxed);

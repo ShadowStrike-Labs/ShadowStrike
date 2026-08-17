@@ -113,6 +113,9 @@ BAD_USB_DETECTOR_CPP_PATH = (
 USB_DEVICE_MONITOR_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/USB_Protection/USBDeviceMonitor.cpp"
 )
+USB_DEVICE_MONITOR_HPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/USB_Protection/USBDeviceMonitor.hpp"
+)
 BAD_USB_DETECTOR_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.hpp"
 )
@@ -5198,6 +5201,78 @@ class LoggerSelfContainmentContractTests(unittest.TestCase):
             "These tray sources include <format> without naming std::format, which is the "
             "Logger.hpp ordering workaround returning: %s" % ", ".join(offenders),
         )
+
+
+class UsbAutoScanOutcomeContractTests(unittest.TestCase):
+    """A refused auto-scan must not be counted or logged as a scan that started.
+
+    Task 194. USBScanner::ScanDriveAsync is [[nodiscard]] bool (USBScanner.hpp:664) and
+    USBDeviceMonitor discarded it, then incremented scansTriggered and logged
+    "Auto-scan started" unconditionally - so a freshly mounted removable volume that
+    nothing would ever examine was reported as a scan in progress, on a primary
+    infection vector. USBDeviceMonitor.cpp is compiled by PhantomHome / ShadowStrike /
+    the service and NOT by PhantomTests, so no C++ test can reach this site and the
+    source contract is the only enforceable guard.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp = strip_c_comments(read_source(USB_DEVICE_MONITOR_CPP_PATH))
+        cls.hpp = strip_c_comments(read_source(USB_DEVICE_MONITOR_HPP_PATH))
+
+    def test_the_async_scan_result_is_captured(self):
+        total = self.cpp.count("scanner.ScanDriveAsync(")
+        self.assertEqual(
+            total, 1, "expected exactly one auto-scan submission site, found %d" % total
+        )
+        captured = self.cpp.count("= scanner.ScanDriveAsync(")
+        self.assertEqual(
+            captured,
+            1,
+            "the [[nodiscard]] result of ScanDriveAsync is discarded again, so a refused "
+            "submission would once more leave a mounted volume unexamined and unreported",
+        )
+
+    def test_only_an_accepted_submission_is_counted_and_logged(self):
+        start = self.cpp.find("= scanner.ScanDriveAsync(")
+        self.assertGreater(start, -1, "no captured ScanDriveAsync call found")
+        triggered = self.cpp.find("m_stats.scansTriggered.fetch_add", start)
+        gap = self.cpp.find("m_stats.autoScansNotStarted.fetch_add", start)
+        self.assertGreater(
+            triggered, start, "scansTriggered is incremented before the result is known"
+        )
+        self.assertGreater(
+            gap, triggered, "the refusal counter must sit in the branch after the success one"
+        )
+        between = self.cpp[start:triggered]
+        self.assertTrue(
+            "if (scanStarted)" in between,
+            "scansTriggered is no longer gated on the submission actually being accepted",
+        )
+
+    def test_the_refusal_counter_cannot_become_a_structural_zero(self):
+        # The live atomics and the copyable snapshot are separate declarations here and
+        # GetStatistics copies field by field, so a counter added to one and not the
+        # other reads zero forever - task 102's defect by another route.
+        self.assertGreaterEqual(
+            self.hpp.count("autoScansNotStarted"),
+            2,
+            "autoScansNotStarted must be declared in BOTH the live struct and the snapshot",
+        )
+        for needed in (
+            "autoScansNotStarted.store(0",
+            "snap.autoScansNotStarted =",
+            "autoScansNotStarted.fetch_add",
+        ):
+            self.assertTrue(needed in self.cpp, "missing plumbing: %s" % needed)
+        # Regression guard: the sibling counter it sits beside must stay plumbed too, so
+        # this change cannot be "simplified" by dropping the one that already worked.
+        for needed in (
+            "scansTriggered.store(0",
+            "snap.scansTriggered =",
+            "scansTriggered.fetch_add",
+        ):
+            self.assertTrue(needed in self.cpp, "missing sibling plumbing: %s" % needed)
 
 
 if __name__ == "__main__":

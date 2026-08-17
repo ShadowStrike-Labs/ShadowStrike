@@ -497,6 +497,12 @@ struct USBMonitorStatistics {
     std::atomic<uint64_t> devicesAllowed{0};
     std::atomic<uint64_t> devicesReadOnly{0};
     std::atomic<uint64_t> scansTriggered{0};
+    /// @brief Auto-scans the policy asked for that the scanner refused to start.
+    /// @note Counts the NAMED GAP: policy wanted the freshly mounted volume scanned,
+    ///       USBScanner::ScanDriveAsync returned false, so nothing will examine it.
+    ///       scansTriggered counts only submissions the scanner accepted, so the two
+    ///       never overlap and a non-zero value here means unexamined removable media.
+    std::atomic<uint64_t> autoScansNotStarted{0};
     std::atomic<uint64_t> malwareDetected{0};
     std::atomic<uint64_t> autorunBlocked{0};
     std::atomic<uint64_t> badUSBDetected{0};
@@ -520,6 +526,7 @@ struct USBMonitorStatisticsSnapshot {
     uint64_t devicesAllowed = 0;
     uint64_t devicesReadOnly = 0;
     uint64_t scansTriggered = 0;
+    uint64_t autoScansNotStarted = 0;
     uint64_t malwareDetected = 0;
     uint64_t autorunBlocked = 0;
     uint64_t badUSBDetected = 0;
