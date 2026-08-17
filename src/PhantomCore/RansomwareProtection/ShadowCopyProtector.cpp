@@ -432,27 +432,51 @@ namespace {
      *     which the Phase 12 comment has always claimed to catch and which the
      *     flag list did not contain.
      *
-     * RESIDUAL, STATED RATHER THAN LEFT TO BE REDISCOVERED: powershell.exe also
-     * accepts '/' as a parameter prefix, so "/EncodedCommand" is an equivalent
-     * spelling this list does not cover. Widening it is a detection-policy
-     * change and belongs in a change that can test it.
+     * (3) BOTH PARAMETER PREFIXES ARE ACCEPTED, AND THAT WAS MEASURED AGAINST
+     *     THE REAL INTERPRETER RATHER THAN INFERRED FROM ITS DOCUMENTATION.
+     *     Running powershell.exe -NoProfile <flag> <base64 of a UTF-16LE
+     *     command> executes the command and exits 0 for ALL TWELVE of
+     *     -EncodedCommand, -encodedcommand, -enc, -ec, -en, -e and the same six
+     *     spellings under '/'. So the '/' forms are live evasion spellings
+     *     rather than a theoretical gap, and the prefix is therefore matched as
+     *     a SET instead of being baked into each needle.
+     *
+     *     A prefix or abbreviation the interpreter would REJECT can never
+     *     appear in a command line that actually runs, so widening this list on
+     *     measured evidence adds coverage and cannot add false positives. The
+     *     worst cost of extracting a token that turns out not to be a payload
+     *     is one size-capped decode that matches no VSS keyword - not a false
+     *     detection.
      */
     [[nodiscard]] std::wstring ExtractEncodedCommandPayload(const std::wstring& cmd) {
+        // The PREFIX and the flag BODY are matched separately, so both spellings
+        // the interpreter accepts are covered without listing ten needles and
+        // without the ordering between them having to be reasoned about.
+        static constexpr std::wstring_view kFlagPrefixes = L"-/";
+
         // Longest first. Every entry after the first is a legal PowerShell
-        // abbreviation of -EncodedCommand, so the most specific spelling must be
+        // abbreviation of EncodedCommand, so the most specific spelling must be
         // able to claim the token before a shorter prefix of it does.
-        const std::wstring_view encodedFlags[] = {
-            L"-encodedcommand", L"-enc", L"-ec", L"-en", L"-e",
+        const std::wstring_view encodedFlagBodies[] = {
+            L"encodedcommand", L"enc", L"ec", L"en", L"e",
         };
 
-        for (auto flag : encodedFlags) {
-            for (size_t pos = WideIFind(cmd, flag);
-                 pos != std::wstring::npos;
-                 pos = WideIFind(cmd, flag, pos + 1)) {
+        for (auto body : encodedFlagBodies) {
+            for (size_t bodyPos = WideIFind(cmd, body);
+                 bodyPos != std::wstring::npos;
+                 bodyPos = WideIFind(cmd, body, bodyPos + 1)) {
 
-                const size_t afterFlag = pos + flag.size();
+                // The body must be immediately preceded by a parameter prefix,
+                // so the flag token begins one character before the match.
+                if (bodyPos == 0) continue;
+                const size_t pos = bodyPos - 1;
+                if (kFlagPrefixes.find(cmd[pos]) == std::wstring_view::npos) continue;
 
-                // Complete-token rule, both edges.
+                const size_t afterFlag = bodyPos + body.size();
+
+                // Complete-token rule, both edges. The leading edge is measured
+                // from the PREFIX rather than the body, so "--e" and "x/e" are
+                // refused for the same reason "-ExecutionPolicy" is.
                 const bool startsToken =
                     (pos == 0) || (std::iswspace(cmd[pos - 1]) != 0);
                 const bool endsToken =

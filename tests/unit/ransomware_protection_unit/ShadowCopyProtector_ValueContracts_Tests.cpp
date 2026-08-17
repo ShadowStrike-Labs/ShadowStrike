@@ -268,4 +268,53 @@ TEST(ShadowCopyProtectorEncodedCommandTests, ExecutionPolicyDoesNotShadowARealEn
            "encoded payload";
 }
 
+// ---------------------------------------------------------------------------
+// SLASH-PREFIXED SPELLINGS
+//
+// MEASURED against the real interpreter before these cases were written, which
+// is the whole point of the task that produced them: powershell.exe -NoProfile
+// <flag> <base64 of UTF-16LE> executes and exits 0 for -EncodedCommand,
+// -encodedcommand, -enc, -ec, -en, -e AND for all six of those under '/'. So
+// every case below describes a command line that genuinely runs on Windows.
+// ---------------------------------------------------------------------------
+
+TEST(ShadowCopyProtectorEncodedCommandTests, SlashPrefixedDocumentedFlagIsDecoded) {
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring cmd =
+        L"powershell.exe /EncodedCommand " + Base64OfUtf16(kInnerVssDelete);
+    EXPECT_TRUE(p.AnalyzeCommand(cmd).has_value())
+        << "'/' is a parameter prefix the interpreter accepts, so this is a "
+           "real encoded T1490 command line and must be classified";
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, SlashPrefixedShortFlagIsDecoded) {
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring cmd = L"powershell /e " + Base64OfUtf16(kInnerVssDelete);
+    EXPECT_TRUE(p.AnalyzeCommand(cmd).has_value())
+        << "the most compact spelling under either prefix must be classified";
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, SlashPrefixedExecutionPolicyIsNotMistakenForAFlag) {
+    // The safety property has to hold under BOTH prefixes, not just '-'.
+    // Without the complete-token rule the '/e' entry would collide with
+    // "/ExecutionPolicy" exactly as '-e' collided with "-ExecutionPolicy".
+    auto& p = ShadowCopyProtector::Instance();
+    EXPECT_FALSE(
+        p.AnalyzeCommand(L"powershell /ExecutionPolicy Bypass /File C:\\tmp\\x.ps1")
+            .has_value())
+        << "an ordinary /ExecutionPolicy invocation must not be classified as a "
+           "VSS attack";
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, APrefixCharacterInsideATokenIsNotAFlag) {
+    // The leading edge of the token rule is measured from the PREFIX, so a
+    // prefix character sitting mid-token cannot open a flag. Guards the one
+    // structural risk introduced by matching prefix and body separately.
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring payload = Base64OfUtf16(kInnerVssDelete);
+    EXPECT_FALSE(p.AnalyzeCommand(L"powershell -File C:\\tools\\wrap/enc " + payload)
+                     .has_value())
+        << "a '/' inside a path must not be read as the start of a flag";
+}
+
 }  // namespace
