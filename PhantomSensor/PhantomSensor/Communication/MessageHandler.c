@@ -798,7 +798,19 @@ MhRegisterHandler(
         return STATUS_INVALID_PARAMETER;
     }
 
-    if ((ULONG)MessageType >= MH_MAX_HANDLERS) {
+    //
+    // Bind only to a type this enum actually defines.
+    //
+    // MH_MAX_HANDLERS (64) is the table's PHYSICAL WIDTH, deliberately larger
+    // than FilterMessageType_Max (45) so the C_ASSERT above can prove the table
+    // cannot be outgrown. It was never the set of legal types, and using it as
+    // one meant a handler could be bound to any of the 19 slots above the enum
+    // - which is what would make an out-of-range type dispatchable. Both tests
+    // are kept: the first is the contract, the second keeps the array access
+    // provably in range.
+    //
+    if (!SHADOWSTRIKE_VALID_MESSAGE_TYPE(MessageType) ||
+        (ULONG)MessageType >= MH_MAX_HANDLERS) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1339,11 +1351,14 @@ ShadowStrikeProcessUserMessage(
     // Look up handler
     //
     slot = (ULONG)header->MessageType;
-    if (slot >= MH_MAX_HANDLERS) {
+    if (!SHADOWSTRIKE_VALID_MESSAGE_TYPE(header->MessageType) ||
+        slot >= MH_MAX_HANDLERS) {
         InterlockedIncrement64(&g_MhGlobals.TotalUnhandledMessages);
         MhpFreeKernelBuffer(kernelBuffer);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                   "[ShadowStrike/MH] Message type out of range: %u\n", header->MessageType);
+                   "[ShadowStrike/MH] Message type %u is not one this enum defines "
+                   "(valid range 1..%u); refusing before handler lookup\n",
+                   header->MessageType, (ULONG)FilterMessageType_Max - 1);
         ExReleaseRundownProtection(&g_MhGlobals.Rundown);
         return STATUS_INVALID_PARAMETER;
     }

@@ -74,22 +74,29 @@
  * MessageHandler.c:1125, because the first four bytes are read as Magic and do
  * not equal SHADOWSTRIKE_MESSAGE_MAGIC - NOT because the type is out of range.
  * Do NOT "fix" such a sender by adding a header while keeping the constant:
- * that removes the only gate currently stopping the frame. MhDispatchMessage
- * bounds the type against MH_MAX_HANDLERS (64), not against
- * FilterMessageType_Max, so 48 already sits inside the handler table's index
- * space and is refused today only because no handler occupies that slot.
+ * the magic check is the only gate that was stopping the frame, and adding a
+ * header removes it. The type check now refuses 48 as well, because
+ * ShadowStrikeProcessUserMessage tests SHADOWSTRIKE_VALID_MESSAGE_TYPE before
+ * the MH_MAX_HANDLERS bound, so an out-of-enum value is rejected by RANGE
+ * rather than merely by an empty handler slot. That closes the window only
+ * while _Max stays below 48: once _Max exceeds 48 the value becomes a real
+ * type again and the frame would dispatch to whatever occupies that slot.
  *
- * The receive path is, in order: Magic, then type < MH_MAX_HANDLERS, then a
+ * The receive path is, in order: Magic (MhpValidateAndCopyMessage), then
+ * SHADOWSTRIKE_VALID_MESSAGE_TYPE and the MH_MAX_HANDLERS bound, then a
  * registered handler in that slot. MessageHandler.c:122 carries
  * C_ASSERT(MH_MAX_HANDLERS >= FilterMessageType_Max) - the build-time tie
  * between this enum and that table. If this enum ever outgrows 64 the driver
  * FAILS TO BUILD rather than silently truncating dispatch.
  *
- * Finally: SHADOWSTRIKE_VALID_MESSAGE_TYPE, IS_SCAN_MESSAGE,
- * IS_NOTIFICATION_MESSAGE, IS_DATA_PUSH_MESSAGE and REQUIRES_REPLY at the foot
- * of this file have NO CALLERS anywhere in the tree. They state intent; they do
- * not gate anything. Do not assume a type has been validated because they
- * exist - the gates that actually run are the three named above.
+ * Finally, the classification macros at the foot of this file.
+ * SHADOWSTRIKE_VALID_MESSAGE_TYPE is now ENFORCED, at both MhRegisterHandler
+ * and ShadowStrikeProcessUserMessage, so the handler table can neither bind
+ * nor dispatch a type this enum does not define. The other five are CLASSIFIERS with no C caller;
+ * a contract test enumerates this enum and fails if any type is classified by
+ * none of them, which is what stops them rotting the way
+ * IS_NOTIFICATION_MESSAGE already had. Read the note beside them before using
+ * one: DIRECTION AND REPLY SEMANTICS ARE INDEPENDENT here.
  * ---------------------------------------------------------------------------
  */
 typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
@@ -262,46 +269,132 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
 #define ShadowStrikeMessageThreatScoreNotify        FilterMessageType_ThreatScoreNotify
 
 // ============================================================================
-// MESSAGE TYPE VALIDATION
+// MESSAGE TYPE CLASSIFICATION
 // ============================================================================
+//
+// These six macros are the only written statement of the protocol's
+// classification policy, which is why they are kept correct rather than
+// deleted. Two things about them are load-bearing:
+//
+//   SHADOWSTRIKE_VALID_MESSAGE_TYPE IS ENFORCED. MhRegisterHandler refuses to
+//   bind a handler to a type outside this enum, and ShadowStrikeProcessUserMessage refuses
+//   an incoming frame whose type is outside it. Together those two gates make
+//   the handler table's index space and this enum the same set, instead of the
+//   table being 64 wide while the enum defines 45 values.
+//
+//   THE OTHER FIVE ARE CLASSIFIERS, NOT GATES, and have no C caller. They are
+//   still not dead: a test under tests/kernel_contracts enumerates this enum
+//   and fails if any enumerator is left out of every category, so appending a
+//   type forces a decision here rather than letting it fall silently outside
+//   all of them. That test exists because IS_NOTIFICATION_MESSAGE had drifted
+//   to omit THIRTEEN real notification types - every ALPC type, both file
+//   backup events, the named-pipe event, the handle and ransomware alerts and
+//   the file-operation event - so anything wiring it to decide "is this a
+//   notification" would have misclassified all thirteen.
+//
+// DIRECTION AND REPLY SEMANTICS ARE INDEPENDENT. Do not infer either from the
+// other. FilterMessageType_ProcessNotify is BOTH a notification (the kernel
+// sends it unsolicited) AND reply-bearing (the driver waits for a verdict when
+// it sets RequireReply, which it does when the creation scored at or above
+// PN_SUSPICION_MEDIUM). Whether a reply is owed for a PARTICULAR frame is
+// therefore not a property of its type at all: it is decided per frame by
+// Filter Manager's ReplyLength, which is the gate IPCManager honours. Never
+// reply on the strength of a type test alone.
+//
 
 /**
- * @brief Check if message type is valid.
+ * @brief Is this a value this enum actually defines?
+ *
+ * ENFORCED - see MhRegisterHandler and ShadowStrikeProcessUserMessage. None is deliberately
+ * excluded: it means "no message", not "message number zero".
  */
 #define SHADOWSTRIKE_VALID_MESSAGE_TYPE(type) \
     ((type) > FilterMessageType_None && (type) < FilterMessageType_Max)
 
 /**
- * @brief Check if message type is a scan-related message.
+ * @brief Control and session establishment. User -> kernel.
  */
-#define SHADOWSTRIKE_IS_SCAN_MESSAGE(type) \
-    ((type) == FilterMessageType_ScanRequest || (type) == FilterMessageType_ScanVerdict)
+#define SHADOWSTRIKE_IS_CONTROL_MESSAGE(type) \
+    ((type) == FilterMessageType_Register || \
+     (type) == FilterMessageType_Unregister || \
+     (type) == FilterMessageType_Heartbeat || \
+     (type) == FilterMessageType_ConfigUpdate || \
+     (type) == FilterMessageType_KeyExchange)
 
 /**
- * @brief Check if message type is a notification (async, no reply needed).
+ * @brief The scan request / verdict pair.
+ */
+#define SHADOWSTRIKE_IS_SCAN_MESSAGE(type) \
+    ((type) == FilterMessageType_ScanRequest || \
+     (type) == FilterMessageType_ScanVerdict)
+
+/**
+ * @brief Policy and state queries. User -> kernel.
+ */
+#define SHADOWSTRIKE_IS_POLICY_MESSAGE(type) \
+    ((type) == FilterMessageType_QueryDriverStatus || \
+     (type) == FilterMessageType_UpdatePolicy || \
+     (type) == FilterMessageType_EnableFiltering || \
+     (type) == FilterMessageType_DisableFiltering || \
+     (type) == FilterMessageType_RegisterProtectedProcess || \
+     (type) == FilterMessageType_ExclusionQuery)
+
+/**
+ * @brief Kernel -> user, unsolicited.
+ *
+ * Says NOTHING about replies - see the note above. Complete as of
+ * FilterMessageType_Max == 45.
  */
 #define SHADOWSTRIKE_IS_NOTIFICATION_MESSAGE(type) \
     ((type) == FilterMessageType_ProcessNotify || \
      (type) == FilterMessageType_ThreadNotify || \
      (type) == FilterMessageType_ImageLoad || \
      (type) == FilterMessageType_RegistryNotify || \
+     (type) == FilterMessageType_NamedPipeEvent || \
+     (type) == FilterMessageType_FileBackupEvent || \
+     (type) == FilterMessageType_FileRollbackEvent || \
+     (type) == FilterMessageType_AlpcPortCreated || \
+     (type) == FilterMessageType_AlpcPortConnected || \
+     (type) == FilterMessageType_AlpcPortDisconnected || \
+     (type) == FilterMessageType_AlpcSuspiciousAccess || \
+     (type) == FilterMessageType_AlpcImpersonation || \
+     (type) == FilterMessageType_AlpcSandboxEscape || \
+     (type) == FilterMessageType_AlpcRateLimitExceeded || \
+     (type) == FilterMessageType_HandleAlert || \
+     (type) == FilterMessageType_RansomwareAlert || \
      (type) == FilterMessageType_BehavioralAlert || \
      (type) == FilterMessageType_MemoryAlert || \
      (type) == FilterMessageType_NetworkAlert || \
      (type) == FilterMessageType_SyscallAlert || \
      (type) == FilterMessageType_SelfProtectAlert || \
-     (type) == FilterMessageType_ThreatScoreNotify)
+     (type) == FilterMessageType_ThreatScoreNotify || \
+     (type) == FilterMessageType_FileOperationEvent)
 
 /**
- * @brief Check if message type is a user-mode -> kernel data push.
+ * @brief User -> kernel data push.
+ *
+ * RELATIONAL over a contiguous run, so it is in tension with the append-only
+ * rule: a new push type appended before _Max lands OUTSIDE this range and
+ * would not be recognised. The contract test catches exactly that, because an
+ * appended type classified by nothing fails it.
  */
 #define SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE(type) \
     ((type) >= FilterMessageType_PushHashDatabase && \
      (type) <= FilterMessageType_ExclusionUpdate)
 
 /**
- * @brief Check if message type requires a reply.
+ * @brief Types for which a reply is DEFINED by the protocol.
+ *
+ * Necessary, not sufficient - the per-frame gate is ReplyLength, see above.
+ * ProcessNotify is listed because the driver genuinely waits for a verdict on
+ * suspicious creations (PN_VERDICT_REPLY_TIMEOUT_MS); it was absent while user
+ * mode computed that verdict and discarded it.
+ *
+ * ExclusionQuery is deliberately ABSENT: it has no registered driver handler
+ * and no user-mode producer, so nothing can answer it. Add it here in the same
+ * change that gives it a handler, not before.
  */
 #define SHADOWSTRIKE_REQUIRES_REPLY(type) \
     ((type) == FilterMessageType_ScanRequest || \
+     (type) == FilterMessageType_ProcessNotify || \
      (type) == FilterMessageType_QueryDriverStatus)

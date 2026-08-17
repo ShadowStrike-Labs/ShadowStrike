@@ -3816,6 +3816,139 @@ class MessageTypeNumberingContractTests(unittest.TestCase):
             "table, where 48 is already a valid index.",
         )
 
+    # ------------------------------------------------------------------
+    # The classification macros must describe the enum they sit beside, and
+    # the user-mode mirror must not become a second source of truth for it.
+    #
+    # Both of these are source-text contracts on purpose. Reaching them at
+    # runtime needs a loaded driver and a live filter port, and the failure
+    # they guard is silent by construction: IS_NOTIFICATION_MESSAGE had
+    # drifted to omit thirteen real notification types, and the user-mode
+    # mirror had drifted so that 39 of 45 enumerators named a different
+    # message class than the one they select on the wire. Nothing in a build
+    # or a unit test noticed either.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _message_type_names():
+        """Enumerator suffixes in declaration order, from the enum body only."""
+        raw = read_source(MESSAGE_TYPES_PATH).lstrip("\ufeff")
+        start = raw.index("typedef enum _SHADOWSTRIKE_MESSAGE_TYPE")
+        end = raw.index("} SHADOWSTRIKE_MESSAGE_TYPE;", start)
+        body = strip_c_comments(raw[start:end])
+        return re.findall(r"\bFilterMessageType_(\w+)\b", body)
+
+    @staticmethod
+    def _classifier_members(macro):
+        """Types named inside one classification macro's definition."""
+        src = strip_c_comments(read_source(MESSAGE_TYPES_PATH).lstrip("\ufeff"))
+        marker = "#define " + macro + "(type)"
+        start = src.index(marker)
+        nxt = src.find("#define ", start + len(marker))
+        segment = src[start:] if nxt < 0 else src[start:nxt]
+        return re.findall(r"\bFilterMessageType_(\w+)\b", segment)
+
+    def test_every_message_type_is_classified_by_exactly_one_macro(self):
+        names = self._message_type_names()
+        self.assertGreater(len(names), 40, "enum body did not parse")
+        self.assertEqual(names[0], "None")
+        self.assertEqual(names[-1], "Max")
+
+        control = self._classifier_members("SHADOWSTRIKE_IS_CONTROL_MESSAGE")
+        scan = self._classifier_members("SHADOWSTRIKE_IS_SCAN_MESSAGE")
+        policy = self._classifier_members("SHADOWSTRIKE_IS_POLICY_MESSAGE")
+        notify = self._classifier_members("SHADOWSTRIKE_IS_NOTIFICATION_MESSAGE")
+
+        # The push macro is RELATIONAL over a contiguous run, so expand it from
+        # declaration order rather than from the two endpoints it names. That is
+        # also what makes an appended push type visible here: it would land
+        # outside this run and therefore outside every category.
+        push_bounds = self._classifier_members("SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE")
+        self.assertEqual(
+            len(push_bounds), 2,
+            "SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE is no longer a two-endpoint "
+            "range, so this test can no longer expand it.",
+        )
+        lo, hi = names.index(push_bounds[0]), names.index(push_bounds[1])
+        self.assertLess(lo, hi, "data-push range endpoints are inverted")
+        push = names[lo:hi + 1]
+
+        real = names[1:-1]  # every type except None and Max
+
+        buckets = {
+            "control": control, "scan": scan, "policy": policy,
+            "notification": notify, "data push": push,
+        }
+
+        seen = {}
+        duplicated = []
+        for bucket, members in buckets.items():
+            for member in members:
+                if member in seen:
+                    duplicated.append(f"{member} in both {seen[member]} and {bucket}")
+                seen[member] = bucket
+        self.assertEqual(
+            duplicated, [],
+            "A message type is classified by more than one macro, so the "
+            "categories no longer partition the enum: " + "; ".join(duplicated),
+        )
+
+        unclassified = [n for n in real if n not in seen]
+        self.assertEqual(
+            unclassified, [],
+            "These message types are classified by NO macro: "
+            + ", ".join(unclassified)
+            + ". Appending a type without classifying it is exactly how "
+            "IS_NOTIFICATION_MESSAGE came to omit thirteen real notification "
+            "types. Add each one to the macro that describes it.",
+        )
+
+        stray = [n for n in seen if n not in real]
+        self.assertEqual(
+            stray, [],
+            "These names are classified but are not enumerators of this enum: "
+            + ", ".join(stray),
+        )
+
+        # Reply semantics are INDEPENDENT of direction, so ProcessNotify is
+        # legitimately both a notification and reply-bearing. Pin that overlap
+        # deliberately, so nobody "fixes" it by removing one of the two.
+        replies = self._classifier_members("SHADOWSTRIKE_REQUIRES_REPLY")
+        self.assertIn(
+            "ProcessNotify", replies,
+            "SHADOWSTRIKE_REQUIRES_REPLY has lost ProcessNotify. The driver "
+            "waits PN_VERDICT_REPLY_TIMEOUT_MS for a verdict on a suspicious "
+            "process creation, so a reply IS defined for that type.",
+        )
+        self.assertIn("ProcessNotify", notify)
+
+    def test_the_validity_macro_is_enforced_not_merely_declared(self):
+        handler = strip_c_comments(
+            read_source(MESSAGE_HANDLER_C_PATH).lstrip("\ufeff")
+        )
+        uses = handler.count("SHADOWSTRIKE_VALID_MESSAGE_TYPE")
+        self.assertGreaterEqual(
+            uses, 2,
+            f"SHADOWSTRIKE_VALID_MESSAGE_TYPE is used {uses} time(s) in "
+            "MessageHandler.c, expected at least 2: once in MhRegisterHandler "
+            "so a handler cannot bind outside the enum, and once on the "
+            "receive path so an out-of-enum type is refused by name instead of "
+            "being lumped in with 'no handler registered'. A classification "
+            "macro that gates nothing is the defect this replaced.",
+        )
+        # The receive path's real name is ShadowStrikeProcessUserMessage. There
+        # is no MhDispatchMessage in this driver - earlier notes of mine claimed
+        # one, and asserting against the name I expected rather than the name
+        # that exists is what this test caught first.
+        for fn in ("MhRegisterHandler", "ShadowStrikeProcessUserMessage"):
+            body = extract_c_function(handler, fn)
+            self.assertIn(
+                "SHADOWSTRIKE_VALID_MESSAGE_TYPE", body,
+                f"{fn} no longer checks SHADOWSTRIKE_VALID_MESSAGE_TYPE, so "
+                "the dispatch table's 64 slots are once again a wider set than "
+                "the 45 types this enum defines.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
