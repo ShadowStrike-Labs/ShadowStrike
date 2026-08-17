@@ -1566,6 +1566,19 @@ namespace ShadowStrike {
          * @note Thread-safe, can be called multiple times (subsequent calls no-op)
          */
         bool DatabaseManager::Initialize(const DatabaseConfig& config, DatabaseError* err) {
+            // THE CALLER'S ERROR IS RESET BEFORE ANY PATH CAN RETURN, and that is the
+            // root of the "error reported on a successful Initialize" symptom. Every
+            // site in this function writes err only on failure, so an object arriving
+            // with anything in it kept it across a success - and DatabaseError::HasError
+            // tests sqliteCode != SQLITE_OK, so a caller that checks the error object
+            // instead of the return value then reads a failure out of a success.
+            //
+            // IT MUST PRECEDE THE DOUBLE-INITIALIZATION GUARD BELOW, which returns
+            // true. ConfigurationDB, LogDB and QuarantineDB all initialize this
+            // singleton, so every caller after the first takes that early success -
+            // the most likely path on which a stale error was observed.
+            if (err) *err = DatabaseError{};
+
             // FIX (Tier 1 - lifecycle race): serialize Initialize/Shutdown/Restore
             // so callers that hammer the singleton from multiple modules (as
             // ConfigurationDB/LogDB/QuarantineDB do) cannot interleave lifecycle
@@ -1664,6 +1677,53 @@ namespace ShadowStrike {
                         return false;
                     }
                     m_connectionPool->Release(secConn);
+                }
+                else {
+                    // THIS BRANCH DID NOT EXIST, AND ITS ABSENCE WAS THE DEFECT.
+                    // A failed Acquire left secConn null, so the entire security
+                    // block above was skipped, secErr was discarded, and Initialize
+                    // went on to return TRUE. The database then ran without its
+                    // application_id and without the integrity-relevant settings,
+                    // while every caller had been told initialization succeeded.
+                    // A security step that is silently skipped is worse than one
+                    // that fails, because nothing anywhere records that it did not
+                    // happen.
+                    //
+                    // IT FAILS CLOSED, and that cannot cause a spurious startup
+                    // failure: Initialize has just pre-warmed the pool with
+                    // minConnections connections, m_initialized is still false so
+                    // AcquireConnection cannot hand one out, and no other thread can
+                    // reach this pool yet - so a free connection provably exists.
+                    // Acquire returns nullptr only when the pool is shut down or the
+                    // full busyTimeoutMs elapses, neither of which is reachable here
+                    // without a genuine fault. Failing closed also matches the
+                    // enableSecurity failure directly above, which already tears the
+                    // pool down and returns false.
+                    //
+                    // secErr IS PROPAGATED rather than dropped. Acquire populates it
+                    // on both of its nullptr paths, so the caller learns whether the
+                    // pool was shut down or the acquisition timed out instead of
+                    // receiving a bare false.
+                    if (err) {
+                        if (secErr.HasError()) {
+                            *err = secErr;
+                            err->context = L"Initialize/enableSecurity";
+                        }
+                        else {
+                            setError(err, SQLITE_CANTOPEN,
+                                L"Could not acquire a connection to apply database "
+                                L"security settings",
+                                L"Initialize/enableSecurity");
+                        }
+                    }
+                    SS_LOG_ERROR(L"Database",
+                        L"Could not acquire a connection to apply security settings "
+                        L"(sqlite %d: %ls); refusing to initialize a database whose "
+                        L"security settings were never applied",
+                        secErr.sqliteCode, secErr.message.c_str());
+                    m_connectionPool->Shutdown();
+                    m_connectionPool.reset();
+                    return false;
                 }
             }
 

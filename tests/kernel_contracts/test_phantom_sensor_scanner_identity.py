@@ -75,6 +75,7 @@ REGISTRY_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Registry/RegistryMonito
 PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
 FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
+DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
@@ -4941,6 +4942,85 @@ class FileUtilsReadErrorContractTests(unittest.TestCase):
             "the header must say the contract is specific to ReadAllBytes; the "
             "rest of the module still has failure paths that set a code and no "
             "message, and claiming otherwise would be the defect being fixed",
+        )
+
+
+class DatabaseSecurityInitContractTests(unittest.TestCase):
+    """A database security step may not be skipped in silence.
+
+    DatabaseManager::Initialize acquires a connection to apply enableSecurity,
+    which sets application_id and the integrity-relevant settings. The acquire
+    result was tested, but there was no else branch: a failure left the
+    connection null, skipped the entire security block, discarded the error
+    Acquire had populated, and returned TRUE. Callers were told the database was
+    initialized while it ran without the settings that harden it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        raw = read_source(DATABASE_MANAGER_CPP_PATH)
+        start = raw.find("bool DatabaseManager::Initialize(const DatabaseConfig& config")
+        end = raw.find("m_statementCache = std::make_unique<PreparedStatementCache>", start)
+        assert start != -1, "DatabaseManager::Initialize not found"
+        assert end != -1, "expected landmark inside Initialize not found"
+        cls.code = strip_c_comments(raw[start:end])
+
+    def test_a_failed_acquire_refuses_to_report_success(self):
+        gate = self.code.find("if (secConn)")
+        self.assertNotEqual(gate, -1, "the enableSecurity acquire gate is gone")
+        else_at = self.code.find("else", gate)
+        self.assertNotEqual(
+            else_at,
+            -1,
+            "there is no else branch after the enableSecurity acquire gate, so a "
+            "failed acquire once again skips the security block and lets "
+            "Initialize return true",
+        )
+        tail = self.code[else_at:]
+        self.assertTrue(
+            "return false;" in tail,
+            "the acquire-failure branch does not fail initialization; a database "
+            "whose security settings were never applied must not report success",
+        )
+        self.assertTrue(
+            "Shutdown()" in tail,
+            "the acquire-failure branch must tear the pool down, as the sibling "
+            "enableSecurity failure directly above it already does",
+        )
+
+    def test_the_discarded_acquire_error_is_read(self):
+        # THE DISCRIMINATOR. Before the fix secErr was declared, handed to
+        # Acquire, and never read again - which is exactly why the skip was
+        # invisible. Requiring a READ of it cannot pass against that code.
+        self.assertTrue(
+            "secErr.HasError()" in self.code,
+            "secErr must be consulted, not just declared; Acquire populates it on "
+            "both of its null paths and dropping it leaves the caller a bare false",
+        )
+        self.assertTrue(
+            "secErr.sqliteCode" in self.code,
+            "the log line must name the acquire failure, or an operator cannot "
+            "tell a shut-down pool from an acquisition timeout",
+        )
+
+    def test_the_caller_error_is_reset_before_any_success(self):
+        reset_at = self.code.find("*err = DatabaseError{}")
+        self.assertNotEqual(
+            reset_at,
+            -1,
+            "Initialize must reset the caller's error; every site writes it only "
+            "on failure, so an object arriving with anything in it keeps that "
+            "across a success and HasError() then contradicts the return value",
+        )
+        guard_at = self.code.find("m_initialized.load(std::memory_order_acquire)")
+        self.assertNotEqual(guard_at, -1, "double-initialization guard not found")
+        self.assertLess(
+            reset_at,
+            guard_at,
+            "the reset must precede the double-initialization guard, which returns "
+            "TRUE - ConfigurationDB, LogDB and QuarantineDB all initialize this "
+            "singleton, so every caller after the first takes that early success "
+            "and is the most likely place a stale error was observed",
         )
 
 
