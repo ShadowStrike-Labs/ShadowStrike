@@ -4466,17 +4466,41 @@ public:
         }
 
         // PrivilegeEscalationDetector — feed kernel-enriched process creation events
-        // This enables immediate detection of potato binaries, token manipulation
-        // targets, and tracks elevation state from tamper-proof kernel data.
+        // This enables immediate detection of potato binaries and records a
+        // per-PID image path from tamper-proof kernel data. It does NOT track
+        // elevation state: the notification carries no elevation bit, which the
+        // previous wording asserted it did.
         if (req.isCreation) {
             try {
                 auto& ped = Exploits::PrivilegeEscalationDetector::Instance();
+                // NOT-DETERMINED, NOT FALSE. The kernel process notification
+                // carries no elevation bit, so there is nothing truthful to pass
+                // here. A literal false recorded a fabricated measurement: it
+                // made the module's per-PID elevation state read "not elevated"
+                // for every process on the machine, and its one consumer treated
+                // that as kernel-supplied evidence of a token-theft correlation.
                 ped.OnKernelProcessCreated(
                     req.processId,
                     req.parentProcessId,
                     imagePath,
                     commandLine,
-                    false);
+                    std::nullopt);
+            } catch (...) {}
+        } else {
+            // STATE MAINTENANCE ON EXIT, AND IT IS UNCONDITIONAL.
+            //
+            // OnKernelProcessCreated records a per-PID context. Without a
+            // matching erase that map grew by one entry per process creation for
+            // the entire life of the service, and because process ids are
+            // recycled, a new process could inherit a dead one's image path -
+            // which the module's monitoring loop matches against the whitelist to
+            // decide whether to skip token-manipulation checks.
+            //
+            // O(1), no I/O. It must never be skipped by a latency budget:
+            // skipping it is exactly what leaks.
+            try {
+                Exploits::PrivilegeEscalationDetector::Instance()
+                    .OnKernelProcessExited(req.processId);
             } catch (...) {}
         }
 

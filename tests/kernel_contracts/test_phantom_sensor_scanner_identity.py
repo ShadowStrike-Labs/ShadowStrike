@@ -132,6 +132,26 @@ RANSOMWARE_WIRING_CPP_PATH = (
 AMSI_INTEGRATION_CPP_PATH = ROOT / "src/PhantomCore/Scripts/AMSIIntegration.cpp"
 AMSI_INTEGRATION_HPP_PATH = ROOT / "src/PhantomCore/Scripts/AMSIIntegration.hpp"
 
+# The privilege-escalation detector. It recorded kernel-supplied facts about a
+# process in TWO parallel maps keyed by the same pid, written on adjacent lines,
+# with no erase, no bound, and - unlike their two sibling containers 33 lines
+# above, which have a cap AND an erase AND are cleared in both Initialize and
+# Shutdown - no presence in either lifecycle clear. Both maps are read by the
+# monitoring loop, and one of those reads decides whether to SKIP
+# token-manipulation checks for a pid whose recorded path is whitelisted, so a
+# record outliving its process is a detection gap and not merely a leak.
+#
+# The elevation value was also fabricated: the kernel process notification
+# carries no elevation bit, and the sole production caller passed a literal
+# false, which both disabled the only path that populates the monitored set and
+# made the correlation below read a made-up value as kernel evidence.
+PRIVESC_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/Exploits/PrivilegeEscalationDetector.cpp"
+)
+PRIVESC_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/Exploits/PrivilegeEscalationDetector.hpp"
+)
+
 # The test binary's entry point. It owns the temporary-file sandbox, and that
 # ownership is asserted here because the runtime guard inside it can be deleted
 # together with the thing it guards.
@@ -4153,6 +4173,208 @@ class AmsiBypassRetentionContractTests(unittest.TestCase):
             "established the process is gone. That is the only live path where "
             "liveness is known for free, so dropping it means a record can "
             "outlive its process and be inherited by a recycled PID.",
+        )
+
+
+class KernelProcessContextRetentionContractTests(unittest.TestCase):
+    """The privilege-escalation detector's per-PID kernel context: one home, one
+    writer, one bound, and a precise erase when the process dies.
+
+    SOURCE CONTRACTS RATHER THAN BEHAVIOUR, and that is forced rather than
+    chosen: reaching the write site needs a live kernel process notification,
+    and reaching the read site needs the monitoring thread running against a
+    populated monitored set. Nothing a unit test can arrange exercises either.
+    The shape is what regressed, so the shape is what is pinned.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp = read_source(PRIVESC_DETECTOR_CPP_PATH)
+        cls.hpp = read_source(PRIVESC_DETECTOR_HPP_PATH)
+        cls.rtp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        # COMMENTS STRIPPED FIRST. The change that introduced these guards
+        # necessarily describes the defect it prevents, naming the very symbols
+        # asserted below, so a comment-blind count is guaranteed to
+        # false-positive on the prose rather than on the code.
+        cls.cpp_code = strip_c_comments(cls.cpp)
+        cls.hpp_code = strip_c_comments(cls.hpp)
+        cls.rtp_code = strip_c_comments(cls.rtp)
+
+    def test_the_process_context_lives_in_exactly_one_structure(self):
+        for label, body in (("cpp", self.cpp_code), ("hpp", self.hpp_code)):
+            for stale in ("m_processCreationPaths", "m_processElevationState"):
+                self.assertEqual(
+                    body.count(stale),
+                    0,
+                    "%s: %s is back. Two containers holding one fact about one "
+                    "pid is how the image path and the elevation state came to "
+                    "be writable independently; they must stay one record."
+                    % (label, stale),
+                )
+        self.assertEqual(
+            self.cpp_code.count(
+                "std::unordered_map<uint32_t, KernelProcessContext> "
+                "m_kernelProcessContexts;"
+            ),
+            1,
+            "The unified per-PID context container is not declared exactly once.",
+        )
+
+    def test_the_context_map_has_exactly_one_writer(self):
+        # Subscript assignment is how the previous two containers were written,
+        # and it bypasses any bound by construction: `map[pid] = v` inserts
+        # without ever consulting a cap.
+        self.assertEqual(
+            self.cpp_code.count("m_kernelProcessContexts["),
+            0,
+            "A subscript write to the context map is back. Every insertion must "
+            "go through the funnel, because a cap checked at some write sites "
+            "and not others is not a cap.",
+        )
+        self.assertEqual(
+            self.cpp_code.count("m_kernelProcessContexts.emplace("),
+            1,
+            "The context map no longer has exactly one insertion site.",
+        )
+        funnel = strip_c_comments(
+            extract_c_function(
+                self.cpp,
+                "void PrivilegeEscalationDetectorImpl::"
+                "RecordKernelProcessContext_Locked",
+            )
+        )
+        self.assertEqual(
+            funnel.count("m_kernelProcessContexts.emplace("),
+            1,
+            "The single insertion no longer lives inside the recording funnel, "
+            "so it is no longer covered by the retention bound.",
+        )
+        self.assertEqual(
+            self.cpp_code.count("RecordKernelProcessContext_Locked("),
+            3,
+            "Expected exactly declaration, definition and one call site for the "
+            "recording funnel.",
+        )
+
+    def test_the_retention_bound_governs_the_size_comparison(self):
+        governs = re.search(
+            r"m_kernelProcessContexts\.size\(\)\s*>=\s*"
+            r"PrivEscConstants::MAX_TRACKED_PROCESS_CONTEXTS",
+            self.cpp_code,
+        )
+        self.assertTrue(
+            bool(governs),
+            "The retention bound no longer governs the size comparison. Naming "
+            "the constant is not enforcing it - the constant also appears in "
+            "the eviction log line, so a containment check would still pass "
+            "with the comparison deleted.",
+        )
+        self.assertEqual(
+            self.hpp_code.count("MAX_TRACKED_PROCESS_CONTEXTS"),
+            1,
+            "The bound must be declared exactly once, as a named constant.",
+        )
+        self.assertEqual(
+            self.cpp_code.count("processContextsEvicted.fetch_add"),
+            1,
+            "An eviction must be counted exactly once, at the one site that "
+            "discards a record.",
+        )
+
+    def test_the_eviction_counter_cannot_become_a_structural_zero(self):
+        # Declared in the live atomic struct AND the public snapshot. A member
+        # added to one only is dropped by the snapshot copy and then reads zero
+        # forever - a counter that looks healthy because nothing can write it.
+        self.assertEqual(
+            self.hpp_code.count("processContextsEvicted"),
+            2,
+            "The eviction counter must appear in both the atomic statistics "
+            "struct and the public snapshot.",
+        )
+        for label, needle in (
+            ("Reset()", "processContextsEvicted = 0;"),
+            ("ToJson()", 'j["processContextsEvicted"]'),
+            (
+                "the snapshot copy",
+                "s.processContextsEvicted = processContextsEvicted.load",
+            ),
+        ):
+            self.assertEqual(
+                self.cpp_code.count(needle),
+                1,
+                "The eviction counter is missing from %s, so it would report a "
+                "stale or permanently zero value." % label,
+            )
+
+    def test_a_dead_process_loses_its_context_record(self):
+        impl = strip_c_comments(
+            extract_c_function(
+                self.cpp,
+                "void PrivilegeEscalationDetectorImpl::OnKernelProcessExited",
+            )
+        )
+        self.assertEqual(
+            impl.count("m_kernelProcessContexts.erase("),
+            1,
+            "The exit handler no longer erases the per-PID record. Windows "
+            "recycles process ids, and the monitoring loop skips a pid whose "
+            "recorded path is whitelisted, so a surviving record hands a dead "
+            "process's whitelist decision to whatever inherits its id.",
+        )
+        # The feed must exist, on the NON-creation branch, unconditionally.
+        idx = self.rtp_code.find("ped.OnKernelProcessCreated(")
+        self.assertNotEqual(
+            idx, -1, "The kernel process-creation feed into the detector is gone."
+        )
+        window = self.rtp_code[max(0, idx - 200) : idx + 2200]
+        i_null = window.find("std::nullopt")
+        i_else = window.find("} else {")
+        i_exit = window.find("OnKernelProcessExited")
+        self.assertTrue(
+            i_null != -1 and i_else != -1 and i_exit != -1,
+            "The creation branch and its paired exit branch are no longer "
+            "adjacent in the process-notify handler (nullopt=%d else=%d "
+            "exit=%d)." % (i_null, i_else, i_exit),
+        )
+        self.assertTrue(
+            i_null < i_else < i_exit,
+            "The exit notification is no longer the else-branch of the creation "
+            "test, so a process exit may not erase its context.",
+        )
+
+    def test_the_elevation_state_is_never_fabricated(self):
+        idx = self.rtp_code.find("ped.OnKernelProcessCreated(")
+        self.assertNotEqual(idx, -1, "The detector feed is gone.")
+        call = self.rtp_code[idx : idx + 320]
+        self.assertIn(
+            "std::nullopt",
+            call,
+            "The elevation argument is no longer not-determined. The kernel "
+            "process notification carries no elevation bit, so any concrete "
+            "value passed here is invented.",
+        )
+        self.assertIsNone(
+            re.search(r",\s*false\s*\)\s*;", call),
+            "A literal false is being passed as the elevation state again. That "
+            "records a fabricated measurement AND disables the only branch that "
+            "populates the monitored set, so it hides itself.",
+        )
+        self.assertEqual(
+            self.cpp_code.count("elevated.has_value()"),
+            2,
+            "Both the auto-monitor gate and the token-theft correlation must "
+            "require a measured elevation state. Treating not-determined as "
+            "'not elevated' is what made the correlation fire on every "
+            "elevation-showing token change while claiming kernel evidence.",
+        )
+
+    def test_the_context_map_is_cleared_on_both_lifecycle_transitions(self):
+        self.assertEqual(
+            self.cpp_code.count("m_kernelProcessContexts.clear()"),
+            2,
+            "The context map must be cleared on BOTH initialize and shutdown, "
+            "as its two sibling containers already are. Surviving either "
+            "transition attributes a previous run's processes to current ids.",
         )
 
 
