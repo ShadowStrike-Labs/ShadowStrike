@@ -73,6 +73,8 @@ FILTER_CONNECTION_CPP_PATH = ROOT / "src/PhantomCore/Communication/FilterConnect
 MESSAGE_PROTOCOL_H_PATH = ROOT / "PhantomSensor/Shared/MessageProtocol.h"
 REGISTRY_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Registry/RegistryMonitor.cpp"
 PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
+FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
+FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
@@ -4832,6 +4834,113 @@ class UsbEmergencyBlockClaimContractTests(unittest.TestCase):
             "the real one was in hand, so it cannot name the vendor, product or "
             "serial it applied to - the same available-value-dropped-on-the-floor "
             "shape as the hardcoded parentPid 0 corrected in 47742cf5.",
+        )
+
+
+class FileUtilsReadErrorContractTests(unittest.TestCase):
+    """Every failure of the file read path must describe itself.
+
+    The 1.0.94 field run recorded 53 read failures whose log lines named neither
+    the file nor the reason, and they were the only errors that run counted. One
+    site - the CreateFileW failure - was corrected in an earlier session, which is
+    why the remaining three were easy to believe already fixed: they set a Win32
+    code and no message at all, and the public entry point never reset the
+    caller's Error, so a stale failure survived a success.
+
+    SOURCE CONTRACTS RATHER THAN BEHAVIOUR, deliberately. Reaching the interesting
+    paths needs a mid-read I/O error, a genuine allocation failure, or an
+    unhydrated cloud placeholder - none of which a unit test can arrange
+    reliably. What IS enforceable is that no failure path in these two functions
+    can return without recording a reason.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        raw = read_source(FILE_UTILS_CPP_PATH)
+        start = raw.find("static void RecordFailure")
+        end = raw.find("bool ReadAllTextUtf8")
+        assert start != -1, "RecordFailure helper missing from FileUtils.cpp"
+        assert end != -1, "ReadAllTextUtf8 missing from FileUtils.cpp"
+        assert start < end, "RecordFailure must precede ReadAllTextUtf8"
+        cls.raw_slice = raw[start:end]
+        cls.code = strip_c_comments(cls.raw_slice)
+        cls.header_raw = read_source(FILE_UTILS_HPP_PATH)
+
+    def test_every_failure_exit_records_a_reason(self):
+        # The invariant, expressed as a relation rather than a fixed number so
+        # that ADDING a legitimate failure path stays possible - it just has to
+        # bring its own RecordFailure with it.
+        exits = len(re.findall(r"return false;", self.code))
+        recorded = len(re.findall(r"RecordFailure\(err,", self.code))
+        self.assertGreater(exits, 0, "found no failure exits to check")
+        self.assertEqual(
+            exits,
+            recorded,
+            "the read path has {} failure exit(s) but records {} reason(s); every "
+            "return false must be accompanied by a RecordFailure or a caller gets "
+            "a bare false with nothing to log".format(exits, recorded),
+        )
+
+    def test_no_failure_path_sets_a_bare_win32_code(self):
+        # Comments are stripped FIRST because the explanatory text at these sites
+        # necessarily quotes the assignment being banned.
+        bare = re.findall(r"err->win32\s*=", self.code)
+        self.assertEqual(
+            len(bare),
+            1,
+            "expected exactly one err->win32 assignment in this region (the one "
+            "inside RecordFailure); found {}. A second means a failure path is "
+            "setting a code directly again, which is how a code without a "
+            "description gets shipped.".format(len(bare)),
+        )
+
+    def test_a_failure_can_never_report_success(self):
+        # Error::hasError() is win32 != 0, so a failure that recorded code 0 would
+        # produce an error object claiming success.
+        self.assertTrue(
+            "ERROR_INVALID_FUNCTION" in self.code,
+            "RecordFailure must substitute a non-zero code when the platform "
+            "reports none, or hasError() can contradict a returned false",
+        )
+
+    def test_the_error_is_reset_on_entry(self):
+        self.assertTrue(
+            "if (err) err->clear();" in self.code,
+            "ReadAllBytes must clear the caller's Error on entry; without it an "
+            "object written only on failure keeps a previous call's error across "
+            "a success",
+        )
+        reset_at = self.code.find("if (err) err->clear();")
+        first_record = self.code.find("RecordFailure(err,", self.code.find("bool ReadAllBytes("))
+        self.assertNotEqual(first_record, -1, "no RecordFailure inside ReadAllBytes")
+        self.assertLess(
+            reset_at,
+            first_record,
+            "the reset must precede every failure record, otherwise it erases the "
+            "reason it was meant to make trustworthy",
+        )
+
+    def test_the_read_implementation_can_name_the_file(self):
+        self.assertTrue(
+            "ReadAllBytesImpl(HANDLE h, std::wstring_view path" in self.code,
+            "the implementation needs the path, or its own failures (too large, "
+            "allocation, mid-read I/O) cannot say which file they concern",
+        )
+
+    def test_the_header_states_the_contract_without_overclaiming_it(self):
+        # Read RAW: the contract is documentation, so a stripped read would pass
+        # vacuously. It must ALSO be scoped to this one function, because the
+        # other error sites in this module do not honour it yet and a module-wide
+        # promise here would be false.
+        self.assertTrue(
+            "ERROR CONTRACT" in self.header_raw,
+            "FileUtils.hpp must state the error contract for ReadAllBytes",
+        )
+        self.assertTrue(
+            "not yet for the rest of this" in self.header_raw,
+            "the header must say the contract is specific to ReadAllBytes; the "
+            "rest of the module still has failure paths that set a code and no "
+            "message, and claiming otherwise would be the defect being fixed",
         )
 
 

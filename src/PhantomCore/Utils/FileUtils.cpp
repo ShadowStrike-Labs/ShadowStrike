@@ -733,24 +733,96 @@ namespace ShadowStrike {
             // ============================================================================
 
             /**
+             * @brief Records a failure onto an optional Error out-parameter.
+             *
+             * Guarantees the two properties every consumer of this module relies on,
+             * neither of which was previously guaranteed:
+             *
+             *  - win32 is NEVER left zero on a failure. Error::hasError() is defined
+             *    as win32 != 0, so a failure path that set no code produced an error
+             *    object reporting success while its function returned false. A caller
+             *    would then have to know to test the return value instead of the error
+             *    object, which is the mistake this type exists to prevent.
+             *
+             *  - message is NEVER left empty. A code on its own is not a diagnosis.
+             *    The 1.0.94 field run recorded 53 read failures whose log lines named
+             *    neither the file nor the reason, and they were the only errors that
+             *    run counted. Three failure paths in this module still set a code and
+             *    no description, which is how a diagnosable failure stays undiagnosed.
+             *
+             * The message is assembled inside a try block on purpose. Building it
+             * allocates, one caller is the out-of-memory path itself, and an allocation
+             * failure while describing an error must not also discard the code.
+             *
+             * @param err Optional error output; nothing happens when null
+             * @param win32Code Win32 code for the failure; 0 is replaced, never stored
+             * @param what Stable sentence describing the failure, no trailing punctuation
+             * @param path File the failure concerns; omitted from the message when empty
+             * @param sizeDetail Observed size in bytes, or 0 when not applicable
+             * @param limitDetail Governing limit in bytes, or 0 when not applicable
+             */
+            static void RecordFailure(Error* err,
+                                      DWORD win32Code,
+                                      std::string_view what,
+                                      std::wstring_view path,
+                                      uint64_t sizeDetail = 0,
+                                      uint64_t limitDetail = 0) {
+                if (!err) return;
+
+                // A failure must never present itself as success. ERROR_INVALID_FUNCTION
+                // is a deliberate stand-in for "the call failed but reported no code",
+                // which is rare but not impossible and would otherwise be invisible.
+                err->win32 = (win32Code != 0) ? win32Code
+                                              : static_cast<DWORD>(ERROR_INVALID_FUNCTION);
+
+                try {
+                    std::string msg(what);
+                    msg += " (win32 ";
+                    msg += std::to_string(err->win32);
+                    msg += ")";
+                    if (sizeDetail != 0 || limitDetail != 0) {
+                        msg += " [size ";
+                        msg += std::to_string(sizeDetail);
+                        msg += " of max ";
+                        msg += std::to_string(limitDetail);
+                        msg += "]";
+                    }
+                    if (!path.empty()) {
+                        msg += ": ";
+                        msg += StringUtils::ToNarrow(path);
+                    }
+                    err->message = std::move(msg);
+                }
+                catch (...) {
+                    // The code is already recorded. An error carrying a code but no
+                    // description is the defect this helper exists to remove, so it is
+                    // reported rather than passed over - but it is still strictly better
+                    // than losing the failure altogether.
+                    SS_LOG_ERROR(L"FileUtils",
+                        L"RecordFailure could not build an error description (win32 %lu)",
+                        static_cast<unsigned long>(err->win32));
+                }
+            }
+
+            /**
              * @brief Internal implementation to read file contents into vector.
              * 
              * Reads file in chunks to handle large files and avoid DWORD overflow.
              *
              * @param h Valid file handle opened for reading
+             * @param path Source path, used only to name the file in an error message
              * @param out Output vector to receive data
              * @param fileSize Expected file size
              * @param err Optional error output
              * @return true on success
              */
-            [[nodiscard]] static bool ReadAllBytesImpl(HANDLE h, std::vector<std::byte>& out, uint64_t fileSize, Error* err) {
+            [[nodiscard]] static bool ReadAllBytesImpl(HANDLE h, std::wstring_view path, std::vector<std::byte>& out, uint64_t fileSize, Error* err) {
                 out.clear();
 
                 if (fileSize > MAX_READ_FILE_SIZE) {
-                    if (err) {
-                        err->win32 = ERROR_FILE_TOO_LARGE;
-                        err->message = "File exceeds maximum allowed size for scanning";
-                    }
+                    RecordFailure(err, ERROR_FILE_TOO_LARGE,
+                        "ReadAllBytes: file is larger than the ceiling for a single read",
+                        path, fileSize, MAX_READ_FILE_SIZE);
                     return false;
                 }
 
@@ -758,7 +830,13 @@ namespace ShadowStrike {
                     out.resize(static_cast<size_t>(fileSize));
                 }
                 catch (const std::bad_alloc&) {
-                    if (err) err->win32 = ERROR_NOT_ENOUGH_MEMORY;
+                    // RecordFailure allocates to build its message, which is why it
+                    // guards that allocation internally: reporting the code without a
+                    // description is worse than reporting nothing, but losing the code
+                    // as well would be worse still.
+                    RecordFailure(err, ERROR_NOT_ENOUGH_MEMORY,
+                        "ReadAllBytes: could not allocate a buffer for the file contents",
+                        path, fileSize, MAX_READ_FILE_SIZE);
                     SS_LOG_ERROR(L"FileUtils", L"Memory allocation failed for size: %llu", fileSize);
                     return false;
                 }
@@ -775,7 +853,14 @@ namespace ShadowStrike {
                     const DWORD askSize = (toRead > MAX_CHUNK_SIZE) ? MAX_CHUNK_SIZE : static_cast<DWORD>(toRead);
                     
                     if (!ReadFile(h, ptr + offset, askSize, &thisRead, nullptr)) {
-                        if (err) err->win32 = GetLastError();
+                        // A failure PART-WAY THROUGH is the interesting one, and it was
+                        // the least describable: the file opened, so this is a sharing
+                        // violation, a device I/O error, or a cloud filter that stopped
+                        // supplying content mid-read. Recording how far the read got is
+                        // what separates it from a failure to open at all.
+                        RecordFailure(err, ::GetLastError(),
+                            "ReadAllBytes: ReadFile failed part-way through the file",
+                            path, static_cast<uint64_t>(offset), fileSize);
                         return false;
                     }
                     
@@ -794,20 +879,25 @@ namespace ShadowStrike {
             bool ReadAllBytes(std::wstring_view path, std::vector<std::byte>& out, Error* err) {
                 out.clear();
 
+                // THE ERROR OBJECT IS RESET HERE, and that is a contract not a courtesy.
+                // Error::hasError() tests win32 != 0, so an object that is only ever
+                // written on failure keeps whatever a previous call left in it - and a
+                // caller that reuses one Error across calls, or that checks the object
+                // instead of the return value, then reads a failure out of a success.
+                // Clearing on entry plus RecordFailure on every failure path is what
+                // makes hasError() exactly equivalent to "this call returned false".
+                if (err) err->clear();
+
                 if (!ValidatePath(path)) {
-                    if (err) {
-                        err->win32 = ERROR_INVALID_PARAMETER;
-                        err->message = "ReadAllBytes: path rejected by validation";
-                    }
+                    RecordFailure(err, ERROR_INVALID_PARAMETER,
+                        "ReadAllBytes: path rejected by validation", path);
                     return false;
                 }
 
                 const std::wstring longp = AddLongPathPrefix(path);
                 if (longp.empty()) {
-                    if (err) {
-                        err->win32 = ERROR_INVALID_PARAMETER;
-                        err->message = "ReadAllBytes: could not form a long-path version of the path";
-                    }
+                    RecordFailure(err, ERROR_INVALID_PARAMETER,
+                        "ReadAllBytes: could not form a long-path version of the path", path);
                     return false;
                 }
 
@@ -823,13 +913,10 @@ namespace ShadowStrike {
                 // file to be recorded as NOT EXAMINED instead of silently joining
                 // the files that were scanned and found clean.
                 if (GetContentLocality(path) == ContentLocality::NotLocal) {
-                    if (err) {
-                        err->win32 = ERROR_CLOUD_FILE_ACCESS_DENIED;
-                        err->message =
-                            "ReadAllBytes: content is not resident on this machine "
-                            "(cloud placeholder, not hydrated; a service cannot hydrate one): " +
-                            StringUtils::ToNarrow(path);
-                    }
+                    RecordFailure(err, ERROR_CLOUD_FILE_ACCESS_DENIED,
+                        "ReadAllBytes: content is not resident on this machine "
+                        "(cloud placeholder, not hydrated; a service cannot hydrate one)",
+                        path);
                     return false;
                 }
 
@@ -845,26 +932,23 @@ namespace ShadowStrike {
 
                 if (h == INVALID_HANDLE_VALUE) {
                     const DWORD lastError = GetLastError();
-                    if (err) {
-                        err->win32 = lastError;
-                        // THE MESSAGE MUST BE POPULATED HERE. It was not, and
-                        // ExecutableAnalyzer::Analyze prints this message and
-                        // nothing else - so 53 errors in the 1.0.94 field run read
-                        // "Failed to read file: " and named neither the file nor
-                        // the reason. They were the only errors that run counted.
-                        // An error object that carries a code but no description
-                        // is how a diagnosable failure becomes an undiagnosable one.
-                        if (IsContentNotLocalError(lastError)) {
-                            err->message =
-                                "ReadAllBytes: cloud filter refused to supply content (win32 " +
-                                std::to_string(lastError) + "): " + StringUtils::ToNarrow(path);
-                        }
-                        else {
-                            err->message =
-                                "ReadAllBytes: CreateFileW failed (win32 " +
-                                std::to_string(lastError) + "): " + StringUtils::ToNarrow(path);
-                        }
-                    }
+                    // THE MESSAGE MUST BE POPULATED HERE. It was not, and
+                    // ExecutableAnalyzer::Analyze prints this message and
+                    // nothing else - so 53 errors in the 1.0.94 field run read
+                    // "Failed to read file: " and named neither the file nor
+                    // the reason. They were the only errors that run counted.
+                    // An error object that carries a code but no description
+                    // is how a diagnosable failure becomes an undiagnosable one.
+                    //
+                    // Assembled by RecordFailure rather than in place so this site
+                    // cannot drift from the module's other failure paths, and so a
+                    // CreateFileW failure that reports no code still yields an error
+                    // object whose hasError() agrees with the returned false.
+                    RecordFailure(err, lastError,
+                        IsContentNotLocalError(lastError)
+                            ? "ReadAllBytes: cloud filter refused to supply content"
+                            : "ReadAllBytes: CreateFileW failed",
+                        path);
                     // Don't log for expected errors (file not found)
                     if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
                         SS_LOG_LAST_ERROR(L"FileUtils", L"ReadAllBytes: CreateFileW failed: %s", longp.c_str());
@@ -880,11 +964,13 @@ namespace ShadowStrike {
 
                 LARGE_INTEGER sz{};
                 if (!GetFileSizeEx(h, &sz)) {
-                    if (err) err->win32 = GetLastError();
+                    RecordFailure(err, ::GetLastError(),
+                        "ReadAllBytes: GetFileSizeEx failed on a handle that opened successfully",
+                        path);
                     return false;
                 }
                 
-                return ReadAllBytesImpl(h, out, static_cast<uint64_t>(sz.QuadPart), err);
+                return ReadAllBytesImpl(h, path, out, static_cast<uint64_t>(sz.QuadPart), err);
             }
 
             bool ReadAllTextUtf8(std::wstring_view path, std::string& out, Error* err) {

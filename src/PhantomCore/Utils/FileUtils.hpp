@@ -326,6 +326,16 @@ namespace ShadowStrike {
 			 * @param err Optional error output
 			 * @return true on success
 			 * @warning Limited to MAX_READ_FILE_SIZE to prevent memory exhaustion
+			 *
+			 * @note ERROR CONTRACT, and it is specific to this function. When err is
+			 *       supplied it is CLEARED on entry, and every failure path leaves it
+			 *       holding a non-zero win32 code AND a non-empty message naming the
+			 *       file. So for this function - and not yet for the rest of this
+			 *       module - err.hasError() is exactly equivalent to a returned false,
+			 *       and a caller may report err.message without first checking whether
+			 *       there is anything in it. Callers that pass nullptr still get the
+			 *       return value but no reason, which is why the on-access scan path
+			 *       passes an Error.
 			 */
 			[[nodiscard]] bool ReadAllBytes(std::wstring_view path, std::vector<std::byte>& out, Error* err = nullptr);
 
