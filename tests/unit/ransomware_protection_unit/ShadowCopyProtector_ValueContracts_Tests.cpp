@@ -157,4 +157,115 @@ TEST(ShadowCopyProtectorValueContractTests, TheUnperformedBlockCounterSurvivesCo
     EXPECT_THAT(snapshot.ToJson(), HasSubstr("blockRequestedNotPerformed"));
 }
 
+// ============================================================================
+// ENCODED-COMMAND EXTRACTION
+//
+// These cases exist because the -EncodedCommand arm decoded a LOWERCASED
+// payload. Base64 is case-sensitive ('A' is 0, 'a' is 26), so lowercasing
+// remaps every six-bit group - and because every character stays a legal base64
+// character the decode SUCCEEDED, the recursive analysis examined the resulting
+// garbage, matched no VSS keyword, and reported no attack. Nothing failed, so
+// nothing logged: what it looked like when broken was identical to what it
+// looks like when working, which is exactly why this needs a behavioural test.
+// ============================================================================
+
+// Minimal base64 encoder so every payload below is COMPUTED from the command it
+// represents rather than typed as a literal. One wrong character would produce a
+// payload that decodes to something harmless and a test that passes for the
+// wrong reason - the discipline the shipped EICAR pattern was authored under.
+std::wstring Base64OfUtf16(std::wstring_view inner) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto* bytes = reinterpret_cast<const unsigned char*>(inner.data());
+    const size_t len = inner.size() * sizeof(wchar_t);  // UTF-16LE, as PowerShell requires
+    std::string out;
+    for (size_t i = 0; i < len; i += 3) {
+        const unsigned b0 = bytes[i];
+        const unsigned b1 = (i + 1 < len) ? bytes[i + 1] : 0u;
+        const unsigned b2 = (i + 2 < len) ? bytes[i + 2] : 0u;
+        out.push_back(kAlphabet[b0 >> 2]);
+        out.push_back(kAlphabet[((b0 & 0x03u) << 4) | (b1 >> 4)]);
+        out.push_back((i + 1 < len) ? kAlphabet[((b1 & 0x0Fu) << 2) | (b2 >> 6)] : '=');
+        out.push_back((i + 2 < len) ? kAlphabet[b2 & 0x3Fu] : '=');
+    }
+    return std::wstring(out.begin(), out.end());
+}
+
+// Phase 3 of the analyzer matches vssadmin plus "delete shadows", so a correct
+// decode MUST classify this and an incorrect one cannot.
+constexpr const wchar_t* kInnerVssDelete = L"vssadmin delete shadows /all /quiet";
+
+TEST(ShadowCopyProtectorEncodedCommandTests, TheEncoderItselfIsCorrect) {
+    // UTF-16LE "A" is the two bytes 0x41 0x00, whose base64 is "QQA=". Asserting
+    // the helper against a known vector is what stops a broken encoder from
+    // making every case below vacuous.
+    EXPECT_EQ(Base64OfUtf16(L"A"), L"QQA=");
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, PlainShadowDeletionIsClassified) {
+    // POSITIVE CONTROL, deliberately NOT a discriminator - it passes before and
+    // after the fix. Its job is to prove the analyzer runs at all, so that a
+    // nullopt in the encoded cases means "not decoded" rather than "inert".
+    auto& p = ShadowCopyProtector::Instance();
+    EXPECT_TRUE(p.AnalyzeCommand(L"vssadmin delete shadows /all /quiet").has_value());
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, DocumentedMixedCaseFlagSpellingIsDecoded) {
+    // THE DISCRIMINATOR. "-EncodedCommand" is the spelling Microsoft documents
+    // and every tool emits. The old flag search used std::wstring::find against
+    // lowercase literals, so it never matched this spelling and the caller fell
+    // back to the lowercased payload, decoding remapped bytes.
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring cmd =
+        L"powershell.exe -EncodedCommand " + Base64OfUtf16(kInnerVssDelete);
+    EXPECT_TRUE(p.AnalyzeCommand(cmd).has_value())
+        << "encoded T1490 shadow deletion must be classified when the flag "
+           "carries its documented capitalisation";
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, ShortFlagFormIsDecoded) {
+    // THE SECOND DISCRIMINATOR. The Phase 12 comment has always claimed to catch
+    // "powershell -e <base64>" while the flag list contained no bare -e entry.
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring cmd = L"powershell -e " + Base64OfUtf16(kInnerVssDelete);
+    EXPECT_TRUE(p.AnalyzeCommand(cmd).has_value())
+        << "the most compact form of this obfuscation must be classified";
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, AllLowerCaseFlagStillDecodes) {
+    // REGRESSION GUARD, not a discriminator: this is the one spelling that
+    // worked before, and it must keep working now the search is case-insensitive.
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring cmd =
+        L"powershell.exe -encodedcommand " + Base64OfUtf16(kInnerVssDelete);
+    EXPECT_TRUE(p.AnalyzeCommand(cmd).has_value());
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, ExecutionPolicyIsNotMistakenForAnEncodedFlag) {
+    // THE SAFETY PROPERTY THAT MAKES A BARE -e ACCEPTABLE AT ALL. "-e" occurs
+    // inside "-ExecutionPolicy", and the extraction returns on its first match,
+    // so without the complete-token rule this ordinary command line would yield
+    // the token "xecutionpolicy" and the real flag would never be looked for -
+    // turning a missing capability into a shadowed one.
+    auto& p = ShadowCopyProtector::Instance();
+    EXPECT_FALSE(
+        p.AnalyzeCommand(L"powershell -ExecutionPolicy Bypass -File C:\\tmp\\x.ps1")
+            .has_value())
+        << "an ordinary -ExecutionPolicy invocation must not be classified as a "
+           "VSS attack";
+}
+
+TEST(ShadowCopyProtectorEncodedCommandTests, ExecutionPolicyDoesNotShadowARealEncodedFlag) {
+    // The complete-token rule must also let the real flag win when both appear,
+    // which is the arrangement an attacker would actually use. Also a
+    // discriminator: the old case-sensitive search failed on -EncodedCommand
+    // here too and fell back to the lowercased payload.
+    auto& p = ShadowCopyProtector::Instance();
+    const std::wstring cmd = L"powershell -ExecutionPolicy Bypass -EncodedCommand " +
+                             Base64OfUtf16(kInnerVssDelete);
+    EXPECT_TRUE(p.AnalyzeCommand(cmd).has_value())
+        << "a benign flag earlier in the command line must not shadow the "
+           "encoded payload";
+}
+
 }  // namespace

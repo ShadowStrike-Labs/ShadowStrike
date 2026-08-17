@@ -377,37 +377,101 @@ namespace {
     }
 
     /**
-     * @brief Extract the base64 payload from a PowerShell command line
-     *        containing -EncodedCommand or -e/-ec flags.
+     * @brief Case-insensitive search for @p needle in @p haystack from @p from.
+     *
+     * Shares WideIContains' comparator so the two cannot disagree about what
+     * "contains" means, and returns a POSITION, which the flag scan below needs
+     * in order to apply the complete-token rule.
      */
-    [[nodiscard]] std::wstring ExtractEncodedCommandPayload(const std::wstring& lowerCmd) {
-        // Search for -encodedcommand, -enc, -e (PowerShell accepts prefix matching)
+    [[nodiscard]] size_t WideIFind(std::wstring_view haystack,
+                                   std::wstring_view needle,
+                                   size_t from = 0) noexcept {
+        if (needle.empty() || needle.size() > haystack.size()) {
+            return std::wstring::npos;
+        }
+        for (size_t pos = from; pos + needle.size() <= haystack.size(); ++pos) {
+            size_t i = 0;
+            for (; i < needle.size(); ++i) {
+                if (std::towlower(static_cast<wint_t>(haystack[pos + i])) !=
+                    std::towlower(static_cast<wint_t>(needle[i]))) {
+                    break;
+                }
+            }
+            if (i == needle.size()) return pos;
+        }
+        return std::wstring::npos;
+    }
+
+    /**
+     * @brief Extract the base64 payload following a PowerShell -EncodedCommand
+     *        flag, or any of the abbreviations PowerShell accepts for it.
+     *
+     * TWO PROPERTIES ARE LOAD-BEARING AND THEY USED TO BE IN CONFLICT.
+     *
+     * (1) The caller MUST pass a command line with its ORIGINAL CASE PRESERVED,
+     *     because base64 is case-sensitive: 'A' is 0 and 'a' is 26, so
+     *     lowercasing a payload remaps every six-bit group. This parameter used
+     *     to be named lowerCmd and the flag literals below were matched with
+     *     std::wstring::find, which is case-SENSITIVE - so against the
+     *     documented spelling "-EncodedCommand" the search found nothing, the
+     *     caller fell back to its lowercased payload, and the decode SUCCEEDED
+     *     while producing entirely different bytes. The recursive analysis then
+     *     examined that garbage, matched no VSS keyword and reported no attack.
+     *     Nothing logged a failure because nothing had failed: every step
+     *     returned success on the wrong data. Encoded shadow-copy deletion was
+     *     therefore undetected unless the attacker happened to spell the flag
+     *     entirely in lower case, which neither Microsoft's documentation nor
+     *     any tooling does.
+     *
+     * (2) A flag is accepted only when it forms a COMPLETE TOKEN, which is how
+     *     PowerShell itself parses arguments. Without that rule the short form
+     *     "-e" matches inside "-ExecutionPolicy" - and since this loop returns
+     *     on its first match, an ordinary "powershell -ExecutionPolicy Bypass"
+     *     would yield the token "xecutionpolicy" and the real flag would never
+     *     be looked for. That rule is what makes it safe to accept "-e" at all,
+     *     which the Phase 12 comment has always claimed to catch and which the
+     *     flag list did not contain.
+     *
+     * RESIDUAL, STATED RATHER THAN LEFT TO BE REDISCOVERED: powershell.exe also
+     * accepts '/' as a parameter prefix, so "/EncodedCommand" is an equivalent
+     * spelling this list does not cover. Widening it is a detection-policy
+     * change and belongs in a change that can test it.
+     */
+    [[nodiscard]] std::wstring ExtractEncodedCommandPayload(const std::wstring& cmd) {
+        // Longest first. Every entry after the first is a legal PowerShell
+        // abbreviation of -EncodedCommand, so the most specific spelling must be
+        // able to claim the token before a shorter prefix of it does.
         const std::wstring_view encodedFlags[] = {
-            L"-encodedcommand", L"-enc", L"-ec", L"-en",
+            L"-encodedcommand", L"-enc", L"-ec", L"-en", L"-e",
         };
 
         for (auto flag : encodedFlags) {
-            size_t pos = lowerCmd.find(flag);
-            if (pos == std::wstring::npos) continue;
+            for (size_t pos = WideIFind(cmd, flag);
+                 pos != std::wstring::npos;
+                 pos = WideIFind(cmd, flag, pos + 1)) {
 
-            size_t afterFlag = pos + flag.size();
-            // Skip whitespace after the flag
-            while (afterFlag < lowerCmd.size() && std::iswspace(lowerCmd[afterFlag])) {
-                ++afterFlag;
+                const size_t afterFlag = pos + flag.size();
+
+                // Complete-token rule, both edges.
+                const bool startsToken =
+                    (pos == 0) || (std::iswspace(cmd[pos - 1]) != 0);
+                const bool endsToken =
+                    (afterFlag >= cmd.size()) || (std::iswspace(cmd[afterFlag]) != 0);
+                if (!startsToken || !endsToken) continue;
+
+                size_t payloadStart = afterFlag;
+                while (payloadStart < cmd.size() && std::iswspace(cmd[payloadStart])) {
+                    ++payloadStart;
+                }
+                if (payloadStart >= cmd.size()) continue;
+
+                size_t tokenEnd = payloadStart;
+                while (tokenEnd < cmd.size() && !std::iswspace(cmd[tokenEnd])) {
+                    ++tokenEnd;
+                }
+
+                return cmd.substr(payloadStart, tokenEnd - payloadStart);
             }
-
-            if (afterFlag >= lowerCmd.size()) continue;
-
-            // Extract the next token (base64 payload)
-            size_t tokenEnd = afterFlag;
-            while (tokenEnd < lowerCmd.size() && !std::iswspace(lowerCmd[tokenEnd])) {
-                ++tokenEnd;
-            }
-
-            // Use the ORIGINAL (non-lowered) command line for base64 (case-sensitive)
-            // We don't have it here, so just use the lowercase version — base64 decode
-            // handles mixed case. Caller should pass original cmdLine for this.
-            return std::wstring(lowerCmd.substr(afterFlag, tokenEnd - afterFlag));
         }
 
         return {};
@@ -713,17 +777,34 @@ public:
         //               powershell -EncodedCommand <base64>
         bool isPowerShell = WideIContains(lower, L"powershell") || WideIContains(lower, L"pwsh");
         if (isPowerShell) {
-            // First check for -e flag with base64 payload
-            std::wstring base64Payload = ExtractEncodedCommandPayload(lower);
-            if (!base64Payload.empty()) {
-                // Use the ORIGINAL command to get case-correct base64
-                std::wstring origNormalized = NormalizeCommandLine(cmdLine);
-                std::wstring origBase64 = ExtractEncodedCommandPayload(origNormalized);
-                if (origBase64.empty()) origBase64 = base64Payload;
-
-                std::wstring decoded = DecodeBase64PowerShell(origBase64);
+            // Extract from the CASE-PRESERVING normalized command line, never
+            // from `lower`. Base64 is case-sensitive, so a payload taken from
+            // the lowercased copy decodes to different bytes than the attacker
+            // supplied - the defect described at ExtractEncodedCommandPayload.
+            // `normalized` has already had carets and quotes stripped and
+            // whitespace collapsed by NormalizeCommandLine, none of which
+            // changes case, so it is both obfuscation-resistant and safe to
+            // decode. This site used to re-run NormalizeCommandLine on cmdLine
+            // to recover the case, which produced the same string at the cost of
+            // a second pass and then discarded it anyway when the case-sensitive
+            // flag search failed to match.
+            std::wstring encodedPayload = ExtractEncodedCommandPayload(normalized);
+            if (!encodedPayload.empty()) {
+                std::wstring decoded = DecodeBase64PowerShell(encodedPayload);
                 if (!decoded.empty()) {
-                    // Recursively analyze the decoded command
+                    // Recursively analyze the decoded command.
+                    //
+                    // The recursion depth is bounded BY CONSTRUCTION rather than
+                    // by a counter, and that is worth stating because the bound
+                    // is emergent rather than declared: -EncodedCommand payloads
+                    // are base64 of UTF-16LE, so each decode returns roughly
+                    // three eighths of the characters it consumed, and Windows
+                    // caps a command line at 32767 characters. Nesting therefore
+                    // collapses below the length needed to hold "powershell"
+                    // plus a flag plus a payload within about a dozen layers.
+                    // Raising DecodeBase64PowerShell's input cap, or recursing
+                    // on an encoding that does not shrink, would remove that
+                    // bound and this call would then need a real depth limit.
                     auto innerResult = AnalyzeCommandInternal(decoded);
                     if (innerResult.has_value()) {
                         return innerResult;
