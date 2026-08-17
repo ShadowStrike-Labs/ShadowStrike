@@ -2977,7 +2977,22 @@ BatchScanResult ScanEngine::ScanBatch(
         std::mutex resultMutex;
         std::atomic<uint64_t> completed{0};
 
+        // A stop-on-first-infection request has to be visible to work that has
+        // ALREADY been handed out, or it does not stop anything. A std::async
+        // future's destructor BLOCKS until its task completes, so simply breaking
+        // out of the wait loop and letting the remaining futures be destroyed
+        // still scans every remaining file - it only moves the waiting into the
+        // destructors, one at a time. MachineLearningDetector.cpp records the same
+        // rule about that destructor.
+        std::atomic<bool> stopRequested{false};
+
         auto scanTask = [&](const std::wstring& filePath) {
+            // Honour an infection another worker has already reported. Files
+            // skipped here are deliberately NOT counted as scanned: they were not.
+            if (stopRequested.load(std::memory_order_relaxed)) {
+                return false;
+            }
+
             auto result = ScanFile(filePath, request.context);
 
             {
@@ -3025,20 +3040,59 @@ BatchScanResult ScanEngine::ScanBatch(
             return false;
         };
 
-        // Execute batch scan
-        if (concurrency > 1 && m_impl->m_threadPool) {
-            // Multi-threaded
-            std::vector<std::future<bool>> futures;
-            futures.reserve(request.filePaths.size());
-
-            for (const auto& path : request.filePaths) {
-                futures.push_back(std::async(std::launch::async, scanTask, path));
+        // Execute batch scan.
+        //
+        // DELIBERATELY NOT ROUTED THROUGH m_impl->m_threadPool, and the removed
+        // `&& m_impl->m_threadPool` gate was misleading precisely because it
+        // tested for a pool it then never used. ScanBatch is reached from
+        // ScanDirectory, and ScanDirectory is what CreateScanJob submits to that
+        // very pool - so pushing per-file work back into the same bounded pool and
+        // blocking on the results would park a worker behind tasks queued behind
+        // it. With the pool clamped to 4..16 workers, one directory scan job would
+        // deadlock as soon as the workers saturate. The gate also never selected
+        // the single-threaded path on a live engine: Initialize is fatal on pool
+        // creation failure (d185b30c), so the pointer is non-null or there is no
+        // engine.
+        //
+        // What was actually wrong is the fan-out. `concurrency` was computed from
+        // request.maxConcurrency and then used only as a `> 1` boolean, while one
+        // chore was launched per path before any was awaited - so a 10,000-file
+        // batch put 10,000 scans in flight at once and ignored the concurrency the
+        // caller asked for. Each of those scans reads and analyses a file, so the
+        // request was for 10,000 simultaneous file reads.
+        if (concurrency > 1) {
+            size_t windowSize = static_cast<size_t>(concurrency);
+            if (windowSize > request.filePaths.size()) {
+                windowSize = request.filePaths.size();
             }
 
-            // Wait for completion
-            for (auto& future : futures) {
-                if (future.get() && request.stopOnFirstInfection) {
-                    break; // Stop on first infection
+            std::vector<std::future<bool>> futures;
+            futures.reserve(request.filePaths.size());
+            size_t awaited = 0;
+
+            for (const auto& path : request.filePaths) {
+                if (stopRequested.load(std::memory_order_relaxed)) {
+                    break;
+                }
+
+                futures.push_back(std::async(std::launch::async, scanTask, path));
+
+                // Hold at most `windowSize` scans in flight, so the concurrency
+                // the caller requested is the concurrency that actually runs.
+                while (futures.size() - awaited >= windowSize) {
+                    if (futures[awaited].get() && request.stopOnFirstInfection) {
+                        stopRequested.store(true, std::memory_order_relaxed);
+                    }
+                    ++awaited;
+                }
+            }
+
+            // Drain. Whatever is still in flight observes stopRequested and
+            // returns without scanning, so this is bounded by the window rather
+            // than by the remainder of the batch.
+            for (; awaited < futures.size(); ++awaited) {
+                if (futures[awaited].get() && request.stopOnFirstInfection) {
+                    stopRequested.store(true, std::memory_order_relaxed);
                 }
             }
         } else {

@@ -76,6 +76,7 @@ PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
 FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
+SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
 
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
@@ -5448,6 +5449,97 @@ class RegistryDecisionHookLockContractTests(unittest.TestCase):
                 1,
                 "FilterOperation lost its %s" % why,
             )
+
+
+class BatchScanConcurrencyContractTests(unittest.TestCase):
+    """ScanEngine::ScanBatch must bound the work it puts in flight, and a
+    stop-on-first-infection request must reach work already dispatched.
+
+    Two measured facts sit behind these guards. (1) ScanBatch is reached from
+    ScanDirectory, and ScanDirectory is what CreateScanJob submits to the engine
+    thread pool - so ScanBatch itself runs on a pool worker, which is why its
+    per-file work must NOT be routed back into that same bounded pool. (2) a
+    std::async future's destructor blocks until its task completes, so abandoning
+    futures does not cancel anything.
+    """
+
+    START_ANCHOR = "BatchScanResult ScanEngine::ScanBatch("
+    END_ANCHOR = "std::future<BatchScanResult> ScanEngine::ScanBatchAsync("
+
+    @classmethod
+    def _body(cls) -> str:
+        src = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        assert src.count(cls.START_ANCHOR) == 1, "ScanBatch start anchor is not unique"
+        assert src.count(cls.END_ANCHOR) == 1, "ScanBatchAsync end anchor is not unique"
+        start = src.index(cls.START_ANCHOR)
+        end = src.index(cls.END_ANCHOR)
+        assert end > start, "anchors are out of order"
+        return src[start:end]
+
+    def test_the_batch_scan_bounds_its_in_flight_work(self):
+        body = self._body()
+
+        self.assertEqual(
+            body.count("m_impl->m_threadPool"),
+            0,
+            "ScanBatch must not test for the engine thread pool: it is reached from "
+            "ScanDirectory, which CreateScanJob submits to that pool, so a gate on the "
+            "pool reads as though the pool were used and routing work into it would "
+            "deadlock a worker behind its own queued tasks",
+        )
+        self.assertEqual(
+            body.count("futures.size() - awaited >= windowSize"),
+            1,
+            "ScanBatch must hold at most windowSize scans in flight; without the window "
+            "one chore is launched per path and the caller's maxConcurrency is ignored",
+        )
+        self.assertEqual(
+            body.count("std::async(std::launch::async, scanTask, path)"),
+            1,
+            "the batch should dispatch through exactly one site",
+        )
+        self.assertEqual(
+            body.count("if (scanTask(path) && request.stopOnFirstInfection) {"),
+            1,
+            "the single-threaded fallback must survive",
+        )
+
+    def test_the_batch_scan_stop_request_reaches_work_already_dispatched(self):
+        body = self._body()
+
+        self.assertEqual(
+            body.count("std::atomic<bool> stopRequested{false};"),
+            1,
+            "the stop request must be shared state, not a local return value",
+        )
+        self.assertEqual(
+            body.count("stopRequested.store(true, std::memory_order_relaxed)"),
+            2,
+            "an infection must set the stop request from BOTH the windowed wait and the "
+            "drain; setting it in only one leaves the other draining the whole batch",
+        )
+        self.assertGreaterEqual(
+            body.count("stopRequested.load(std::memory_order_relaxed)"),
+            2,
+            "the stop request must be read by the dispatch loop AND by the task itself",
+        )
+
+        scan_call = "auto result = ScanFile(filePath, request.context);"
+        self.assertEqual(
+            body.count(scan_call),
+            1,
+            "the per-file scan should have exactly one call site in this function",
+        )
+
+        first_load = body.index("stopRequested.load(std::memory_order_relaxed)")
+        scan_at = body.index(scan_call)
+        self.assertLess(
+            first_load,
+            scan_at,
+            "the task must consult the stop request BEFORE scanning, or a stop only "
+            "moves the waiting into the future destructors and every remaining file is "
+            "still scanned (load at offset %d, scan at offset %d)" % (first_load, scan_at),
+        )
 
 
 if __name__ == "__main__":

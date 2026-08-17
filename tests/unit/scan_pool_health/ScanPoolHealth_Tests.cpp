@@ -54,8 +54,14 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
+
 #include "src/PhantomCore/Core/Engine/ScanEngine.hpp"
 
+using ShadowStrike::Core::Engine::BatchScanRequest;
 using ShadowStrike::Core::Engine::EngineConfig;
 using ShadowStrike::Core::Engine::ScanEngine;
 
@@ -118,4 +124,59 @@ TEST(ScanEnginePoolHealthTest, PoolAcceptsAndRunsAsynchronousWork) {
     // cannot run anything shows a queue that only grows, which is exactly what
     // the field's queued=0 could not distinguish while nothing was submitted.
     EXPECT_LE(health.queuedTasks, health.queueCapacity);
+}
+
+// ============================================================================
+//  Task 110 - the batch scan's in-flight window.
+//
+//  ScanBatch used to launch one std::async chore per path before awaiting any of
+//  them, so a 10,000-file batch put 10,000 scans in flight regardless of the
+//  caller's maxConcurrency, which was computed and then used only as a `> 1`
+//  boolean. It is now a sliding window.
+//
+//  THIS IS THE ASSERTION THAT MATTERS ABOUT THAT REWRITE. The window is the kind
+//  of loop where an off-by-one either skips a future - losing a file, which is
+//  lost coverage - or calls get() on one twice, which throws std::future_error.
+//  Both are visible as a result count that does not match the batch size. The
+//  window is deliberately set SMALLER than the batch so it actually wraps.
+//
+//  It does NOT assert on verdicts: those depend on what detection content is
+//  loaded in the test environment, whereas "one result per file" is true for any
+//  content. And it is not a discriminator for the window itself - an unbounded
+//  fan-out also returns one result per file - which is why the bound is pinned
+//  by the source contract in tests/kernel_contracts instead.
+// ============================================================================
+
+TEST(ScanEnginePoolHealthTest, BatchScanReturnsOneResultPerFileUnderABoundedWindow) {
+    auto& engine = ScanEngine::Instance();
+    ASSERT_TRUE(engine.Initialize(MinimalConfig()));
+
+    std::error_code ec;
+    const auto dir = std::filesystem::temp_directory_path() / L"phantom-batch-window";
+    std::filesystem::create_directories(dir, ec);
+    ASSERT_FALSE(ec) << "precondition: could not create the scratch directory";
+
+    BatchScanRequest request;
+    for (int i = 0; i < 4; ++i) {
+        const auto probe = dir / (L"probe" + std::to_wstring(i) + L".bin");
+        {
+            std::ofstream out(probe, std::ios::binary | std::ios::trunc);
+            ASSERT_TRUE(out.is_open()) << "precondition: could not create a scratch file";
+            out << "phantom batch window probe " << i;
+        }
+        request.filePaths.push_back(probe.wstring());
+    }
+
+    request.maxConcurrency = 2;           // smaller than the batch, so it wraps
+    request.stopOnFirstInfection = false; // every file must be visited
+
+    const auto result = engine.ScanBatch(request);
+
+    EXPECT_EQ(result.results.size(), request.filePaths.size())
+        << "every file in the batch must produce exactly one result; a windowed "
+           "wait that skips a future loses a file, and one that awaits a future "
+           "twice throws";
+    EXPECT_EQ(result.filesScanned(), request.filePaths.size());
+
+    std::filesystem::remove_all(dir, ec);
 }
