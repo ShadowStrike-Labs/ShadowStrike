@@ -24,7 +24,6 @@
 
 #include <algorithm>
 #include <cwctype>
-#include <format>
 #include <string>
 
 #include "InstallProbe.hpp"

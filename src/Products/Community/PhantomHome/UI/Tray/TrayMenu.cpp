@@ -34,7 +34,6 @@
 #endif
 #include <Windows.h>
 
-#include <format>
 #include <string>
 
 #include "TrayMenu.hpp"

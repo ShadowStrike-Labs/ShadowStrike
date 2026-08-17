@@ -76,6 +76,14 @@ PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
 FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
+
+# The logging header whose missing <format> include forced an ordering requirement on
+# every consumer, and the two projects whose language standards must agree because the
+# tray both LINKS PhantomCoreLib.lib and COMPILES its shared headers.
+LOGGER_HPP_PATH = ROOT / "src/PhantomCore/Utils/Logger.hpp"
+TRAY_VCXPROJ_PATH = ROOT / "ShadowStrikePhantomTray.vcxproj"
+PHANTOM_CORE_LIB_VCXPROJ_PATH = ROOT / "PhantomCoreLib.vcxproj"
+TRAY_SOURCE_DIR = ROOT / "src/Products/Community/PhantomHome/UI/Tray"
 BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
@@ -5111,6 +5119,84 @@ class ProcessNotifyCallbackSemanticsContractTests(unittest.TestCase):
             "processExitBlockRequestsIgnored = 0;" in window,
             "the new counter is not listed in the statistics reset beside its "
             "sibling, so ResetStatistics would leave it holding a stale value",
+        )
+
+
+class LoggerSelfContainmentContractTests(unittest.TestCase):
+    """A header must compile on its own, and one binary must not see two language modes.
+
+    Task 96. Utils/Logger.hpp declares its Fatal/Error/Warn/Info/Debug templates in
+    terms of std::format_string<Args...> while never including <format>, so every
+    consumer had to include <format> BEFORE it or fail to compile. Six translation
+    units in the tray carried exactly that workaround - three of them with no
+    explanation at all - and the tray project stayed pinned to stdcpp20 because of it,
+    while linking PhantomCoreLib.lib which is built at stdcpp23.
+    """
+
+    @staticmethod
+    def _language_standards(project_text):
+        # Parses the ELEMENT form on purpose. A prose mention of a standard inside an
+        # XML comment must not satisfy or break this - the comment-versus-code
+        # distinction that has produced false readings repeatedly in this suite.
+        found = []
+        marker = "<LanguageStandard>"
+        idx = project_text.find(marker)
+        while idx != -1:
+            end = project_text.find("</LanguageStandard>", idx)
+            if end == -1:
+                break
+            found.append(project_text[idx + len(marker):end].strip())
+            idx = project_text.find(marker, end)
+        return sorted(set(found))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.logger = strip_c_comments(read_source(LOGGER_HPP_PATH))
+        cls.tray_proj = read_source(TRAY_VCXPROJ_PATH)
+        cls.core_proj = read_source(PHANTOM_CORE_LIB_VCXPROJ_PATH)
+
+    def test_the_logger_header_includes_the_header_of_the_type_it_names(self):
+        self.assertTrue(
+            "std::format_string" in self.logger,
+            "Logger.hpp no longer names std::format_string. If the logging API genuinely "
+            "stopped using it, retire this assertion deliberately rather than leaving a "
+            "guard that no longer describes the code.",
+        )
+        self.assertTrue(
+            "#include <format>" in self.logger,
+            "Logger.hpp names std::format_string but does not include <format>. That is "
+            "not a cosmetic omission: it forces every consumer to include <format> first, "
+            "an ordering requirement no caller can discover from the declaration.",
+        )
+
+    def test_the_tray_compiles_at_the_same_standard_as_the_library_it_links(self):
+        core = self._language_standards(self.core_proj)
+        tray = self._language_standards(self.tray_proj)
+        self.assertTrue(core, "PhantomCoreLib.vcxproj declares no LanguageStandard element.")
+        self.assertTrue(tray, "ShadowStrikePhantomTray.vcxproj declares no LanguageStandard element.")
+        # Expressed as a RELATION, not a literal. Hardcoding stdcpp23 here would let the
+        # two drift apart again the day the library moves on, while this test kept passing.
+        self.assertEqual(
+            tray,
+            core,
+            "The tray links PhantomCoreLib.lib and compiles its shared headers, so two "
+            "language modes would see one set of declarations - the divergent-view hazard "
+            "behind task 73's ODR heap corruption. tray=%s core=%s" % (tray, core),
+        )
+
+    def test_no_tray_source_includes_format_without_using_it(self):
+        offenders = []
+        sources = sorted(TRAY_SOURCE_DIR.glob("*.cpp")) + sorted(TRAY_SOURCE_DIR.glob("*.hpp"))
+        self.assertTrue(sources, "no tray sources found; this guard must not pass vacuously")
+        for path in sources:
+            body = strip_c_comments(read_source(path))
+            if "#include <format>" in body and "std::format" not in body:
+                offenders.append(path.name)
+        self.assertEqual(
+            offenders,
+            [],
+            "These tray sources include <format> without naming std::format, which is the "
+            "Logger.hpp ordering workaround returning: %s" % ", ".join(offenders),
         )
 
 

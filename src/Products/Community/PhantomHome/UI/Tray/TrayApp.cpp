@@ -37,7 +37,6 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
-#include <format>   // Must precede Logger.hpp: Logger.hpp uses std::format_string<> without including <format> itself.
 #include <string>
 
 #include "TrayApp.hpp"

@@ -19,12 +19,6 @@
 
 #include "TrayApp.hpp"
 
-// <format> MUST precede Logger.hpp. This project builds at stdcpp20 while
-// Logger.hpp names std::format_string, which MSVC only exposes once <format> has
-// been included in that mode. TrayIpc.cpp carries the same ordering and the same
-// note. The real fix is to move this project to stdcpp23 as PhantomCoreLib and
-// PhantomTests already are, which is its own change.
-#include <format>
 #include <PhantomCore/Utils/Logger.hpp>
 
 namespace {

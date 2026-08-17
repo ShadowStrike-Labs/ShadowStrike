@@ -45,7 +45,14 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <!-- stdcpp23 to match PhantomCoreLib, which this project both LINKS
+           (PhantomCoreLib.lib below) and whose headers it COMPILES. Two language
+           modes over one set of shared declarations is the divergent-view hazard
+           that produced the ODR heap corruption in task 73; the C++ standard gives
+           no guarantee that project headers present an identical layout under
+           /std:c++20 and /std:c++23. No specific diverging type was identified
+           here - the point is that nothing rules one out, and parity costs a line. -->
+      <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <ConformanceMode>true</ConformanceMode>
       <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>

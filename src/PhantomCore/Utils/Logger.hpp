@@ -37,6 +37,14 @@
 #include <cstdint>
 #include <cstdarg>
 #include <deque>
+// <format> is NOT incidental here and must not be removed as unused: the Fatal/Error/
+// Warn/Info/Debug templates below take std::format_string<Args...>, which MSVC declares
+// only in <format>. This header used to name that type without including it, so every
+// consumer had to include <format> FIRST or fail to compile - an ordering requirement a
+// caller cannot discover from the declaration. Six translation units in the tray carried
+// exactly that workaround, three of them with no explanation, and one project was pinned
+// to an older language standard because of it. A header must be compilable on its own.
+#include <format>
 #include <memory>
 #include <mutex>
 #include <condition_variable>

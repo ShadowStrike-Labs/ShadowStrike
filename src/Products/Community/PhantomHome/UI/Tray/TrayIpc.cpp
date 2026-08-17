@@ -52,9 +52,6 @@
 
 #include "TrayIpc.hpp"
 
-// <format> MUST be included before Logger.hpp: Logger.hpp uses
-// std::format_string<> without including <format> itself (see TrayApp.cpp note).
-#include <format>
 #include <PhantomCore/Utils/Logger.hpp>
 
 // IpcAuthToken — header is pure C++; compiled into PhantomCoreLib.lib.
