@@ -50,6 +50,11 @@ IPC_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.hpp"
 INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
 SELF_DEFENSE_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.hpp"
 ANTIVIRUS_SERVICE_HPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.hpp"
+ANTIVIRUS_SERVICE_CPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.cpp"
+# The single place the shipped product version is written down. Both the service
+# log (task 104) and Invoke-PhantomDeploy.ps1 read it, so the macro name is a
+# contract between a C++ source and a PowerShell harness that no compiler checks.
+VERSION_INFO_H_PATH = ROOT / "src/VersionInfo.h"
 PROGRAM_UPDATER_CPP_PATH = ROOT / "src/PhantomCore/Update/ProgramUpdater.cpp"
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
@@ -93,6 +98,9 @@ ATOM_BOMBING_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombin
 # The USB responder, whose accounting was corrected alongside the exploit tier.
 BAD_USB_DETECTOR_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.cpp"
+)
+USB_DEVICE_MONITOR_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/USB_Protection/USBDeviceMonitor.cpp"
 )
 BAD_USB_DETECTOR_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.hpp"
@@ -4653,6 +4661,71 @@ class ProcessNotifyReplyHorizonContractTests(unittest.TestCase):
             "The evasion sub-budget must still be consulted at exactly its four "
             "detector stages. Fewer means a detector became unbounded; more "
             "means a stage was added without deciding which deadline owns it.",
+        )
+
+
+class ServiceBuildIdentityContractTests(unittest.TestCase):
+    """The service must state which build it is, in its own log.
+
+    Task 104. Until this was wired, every field-triage cycle had to infer the
+    running version from the MSI or the installer log, because the service never
+    named itself. Those are separate artefacts that can disagree with the binary
+    actually executing, so a log with no version in it is evidence about an
+    unknown build - which is the weakest possible position for diagnosing a
+    security product.
+
+    Asserted as source text rather than behaviour on purpose: reaching the line
+    needs a started Windows service, and the regression being guarded against is
+    somebody deleting or decoupling the version reference during an unrelated
+    edit, which is a source-level event.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(ANTIVIRUS_SERVICE_CPP_PATH))
+        cls.version_header = strip_c_comments(read_source(VERSION_INFO_H_PATH))
+
+    def test_the_version_macro_still_exists_where_the_service_expects_it(self):
+        # Renaming the macro would break the service as a compile error, but it
+        # would break Invoke-PhantomDeploy.ps1 SILENTLY, because that harness
+        # parses this header as text. Pin the name both sides depend on.
+        self.assertIn(
+            "define SS_VERSION_STRING",
+            self.version_header,
+            "VersionInfo.h no longer defines SS_VERSION_STRING. Both the service "
+            "log and Invoke-PhantomDeploy.ps1 depend on that name, and only one "
+            "of the two would fail loudly.",
+        )
+
+    def test_the_service_includes_the_single_version_header(self):
+        self.assertIn(
+            "VersionInfo.h",
+            self.src,
+            "AntivirusService.cpp no longer includes VersionInfo.h, so it cannot "
+            "name its own build. Do not substitute a local literal: one "
+            "definition included everywhere is the fix for this defect class, and "
+            "a hand-copied version string is how DRIVER_SERVICE_NAME drifted in "
+            "four modules at once.",
+        )
+
+    def test_the_service_logs_its_own_version(self):
+        # Containment is not enough. An include plus an unreferenced macro would
+        # satisfy a naive check while producing no line in the field log, which is
+        # the entire defect. Require the macro to sit inside a logging statement.
+        idx = self.src.find("SS_VERSION_STRING")
+        self.assertGreaterEqual(
+            idx,
+            0,
+            "Nothing in AntivirusService.cpp references SS_VERSION_STRING, so the "
+            "service does not state its build in the log.",
+        )
+        stmt_start = max(self.src.rfind(";", 0, idx), self.src.rfind("{", 0, idx))
+        statement = self.src[stmt_start + 1 : idx]
+        self.assertIn(
+            "SS_LOG_",
+            statement,
+            "SS_VERSION_STRING is referenced but not from within a logging call, "
+            "so the version is compiled in and never emitted.",
         )
 
 

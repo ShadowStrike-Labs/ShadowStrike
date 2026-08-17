@@ -34,6 +34,13 @@
 #include "AntivirusService.hpp"
 #include "BootTrace.hpp"
 
+// The single place the shipped product version is written down. Included here
+// so the service can state its own build identity in its log; the deploy
+// harness parses the same header to stamp the MSI and every binary's
+// VERSIONINFO resource, so the logged version and the installed version cannot
+// drift apart.
+#include "../../VersionInfo.h"
+
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
@@ -241,7 +248,28 @@ public:
                 loggerConfig.flushLevel = Utils::LogLevel::Trace;
                 Utils::Logger::Instance().Initialize(loggerConfig);
             }
-            SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service initializing...");
+            // STATE THE BUILD IDENTITY FIRST, before anything else can fail.
+            // Until now the service never logged its own version, so no field
+            // log could prove which build produced it: every triage cycle had
+            // to infer the version from the MSI or the installer log, which are
+            // separate artefacts that can disagree with the binary actually
+            // running. That inference has already been needed for 1.0.92, 1.0.93
+            // and 1.0.94, and it is exactly the kind of gap that turns a log
+            // into evidence about an unknown build.
+            //
+            // %hs because SS_VERSION_STRING and SS_PRODUCT_NAME are narrow
+            // literals from VersionInfo.h while the log macros take wide format
+            // strings.
+            //
+            // RESIDUAL, stated rather than implied: this runs inside
+            // Impl::Initialize, which all three service start paths call, so it
+            // covers every normal start - but a failure BEFORE Initialize still
+            // produces no version line. The boot trace is what covers that
+            // window.
+            SS_LOG_INFO(LOG_CATEGORY,
+                        L"%hs %hs initializing...",
+                        SS_PRODUCT_NAME,
+                        SS_VERSION_STRING);
 
             // 2. Initialize ConfigManager (must be available before any module reads config)
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ConfigManager-enter");
