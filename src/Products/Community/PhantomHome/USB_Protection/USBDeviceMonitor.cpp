@@ -31,7 +31,10 @@
  * - No detached threads (use std::jthread or join in Shutdown)
  * - Data race protection (shared_lock for reads, unique_lock for writes)
  * - Callbacks invoked outside locks
- * - EmergencyBlockDevice actually blocks devices
+ * - EmergencyBlockDevice marks POLICY STATE ONLY. It performs no PnP disable
+ *   and no eject, and the mark it writes is not read by any access decision.
+ *   The measurement is recorded at the function. SafeEjectDeviceById is the
+ *   real device-level mechanism and is deliberately not wired to it yet.
  * - Real DeviceType classification by USB class code
  * - GetStatistics returns USBMonitorStatisticsSnapshot
  *
@@ -1049,19 +1052,74 @@ void USBDeviceMonitorImpl::EmergencyBlockDevice(const std::string& deviceId) {
         return;
     }
 
+    // WHAT THIS FUNCTION DOES AND DOES NOT DO, measured rather than inferred.
+    //
+    // It marks our own in-memory record for the device as Blocked. It performs
+    // NO PnP operation: there is no CM_Disable_DevNode, no SetupDiChangeState
+    // and no eject anywhere on this path, so the device stays enumerated and
+    // fully usable by the operating system after this returns.
+    //
+    // The mark is not consulted either. USBDeviceInfo::accessLevel is assigned
+    // in several places across this subsystem but is never COMPARED anywhere in
+    // the product; the only read is on the device-arrival path above, which uses
+    // a fresh verdict obtained from DeviceControlManager rather than the stored
+    // value. So this write does not gate a later access decision.
+    //
+    // WHY THE FALSE CLAIM MATTERED: the file header asserted "EmergencyBlockDevice
+    // actually blocks devices", and BadUSBDetector's quarantine response escalates
+    // to this function and logs a successful escalation. A caller reading that
+    // header would conclude a hostile HID device had been neutralised.
+    //
+    // THE REAL MECHANISM IS NINE LINES ABOVE: SafeEjectDeviceById resolves the id
+    // to a drive letter and performs a genuine eject. Wiring it in is
+    // deliberately NOT done here. Forcibly ejecting a user's device is a
+    // destructive response; the behavioural HID path that would trigger it has no
+    // production feed today (task 154); and enabling it is an owner's policy
+    // decision of the same class as tasks 128, 142 and 162. What is corrected
+    // here is the claim, not the capability - no detection or response is removed.
+    bool deviceKnown = false;
+    USBDeviceInfo blockedDevice{};
     {
         std::unique_lock lock(m_mutex);
         auto it = m_connectedDevices.find(deviceId);
         if (it != m_connectedDevices.end()) {
             it->second.status = DeviceStatus::Blocked;
             it->second.accessLevel = AccessLevel::Blocked;
+            blockedDevice = it->second;
+            deviceKnown = true;
         }
     }
 
-    m_stats.emergencyBlocks.fetch_add(1, std::memory_order_relaxed);
-    SS_LOG_WARN(L"USBMonitor", L"EMERGENCY BLOCK triggered for device: %hs", RedactDeviceIdentifier(deviceId).c_str());
+    if (!deviceKnown) {
+        // The counter and the "EMERGENCY BLOCK triggered" line used to run here
+        // too, outside the guard, so a request naming a device we have never seen
+        // reported a block and incremented the total. Same counter-outside-the-
+        // guard shape as the BadUSB responder corrected in bb48bf8a.
+        SS_LOG_WARN(L"USBMonitor",
+                    L"EmergencyBlockDevice: no connected device matches %hs, so no "
+                    L"policy state was changed and nothing was blocked",
+                    RedactDeviceIdentifier(deviceId).c_str());
+        return;
+    }
 
-    LogEvent(DeviceEventType::AccessDeniedPolicy, USBDeviceInfo{}, AccessLevel::Blocked, "Emergency block: " + RedactDeviceIdentifier(deviceId));
+    // Counts records this function actually marked Blocked. It does NOT count
+    // devices disabled at the hardware level, because this path disables none.
+    m_stats.emergencyBlocks.fetch_add(1, std::memory_order_relaxed);
+
+    SS_LOG_WARN(L"USBMonitor",
+                L"Device marked Blocked in policy state: %hs - NOTE no PnP disable "
+                L"or eject was performed, so the device remains usable by the OS",
+                RedactDeviceIdentifier(deviceId).c_str());
+
+    // Report the device we actually found instead of a default-constructed
+    // record. The identity was in hand and was being discarded, which left the
+    // event unable to name the vendor, product or serial it applied to - the same
+    // available-value-dropped-on-the-floor shape as the hardcoded parentPid 0
+    // corrected in 47742cf5.
+    LogEvent(DeviceEventType::AccessDeniedPolicy,
+             blockedDevice,
+             AccessLevel::Blocked,
+             "Emergency block (policy state only): " + RedactDeviceIdentifier(deviceId));
 }
 
 bool USBDeviceMonitorImpl::UnblockDevice(const std::string& deviceId) {

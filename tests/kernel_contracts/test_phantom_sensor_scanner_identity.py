@@ -4729,5 +4729,111 @@ class ServiceBuildIdentityContractTests(unittest.TestCase):
         )
 
 
+class UsbEmergencyBlockClaimContractTests(unittest.TestCase):
+    """EmergencyBlockDevice must not claim a block it does not perform.
+
+    Task 156. MEASURED, not inferred: the function marks our own in-memory record
+    Blocked and performs no PnP operation of any kind, and the mark it writes is
+    never COMPARED anywhere in this product - USBDeviceInfo::accessLevel is
+    assigned in several places but the only read is the device-arrival path, which
+    uses a fresh DeviceControlManager verdict rather than the stored value. So the
+    write does not gate a later access decision either.
+
+    Why a wording defect earns a guard: BadUSBDetector's quarantine response
+    escalates to this function and logs a successful escalation on the strength of
+    the file header's claim that it "actually blocks devices". A false capability
+    claim here therefore propagates into another module's outcome reporting - the
+    same over-claimed-outcome defect corrected in bb48bf8a, 9c4daf96 and 2beb1f88.
+
+    Source text rather than behaviour for two independent reasons: PhantomTests
+    does not compile USBDeviceMonitor.cpp (it is built by PhantomHome,
+    ShadowStrike and ShadowStrikePhantomService), and reaching this path needs a
+    real removable device.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = read_source(USB_DEVICE_MONITOR_CPP_PATH)
+        cls.src = strip_c_comments(cls.raw)
+        # Slice between two anchors rather than trusting a function extractor:
+        # the public wrapper USBDeviceMonitor::EmergencyBlockDevice appears later
+        # in the file and the declaration appears earlier, so the qualified Impl
+        # definition is the only unambiguous starting point.
+        start = cls.src.find("void USBDeviceMonitorImpl::EmergencyBlockDevice(")
+        assert start >= 0, "EmergencyBlockDevice definition not found"
+        end = cls.src.find("USBDeviceMonitorImpl::UnblockDevice(", start + 1)
+        assert end > start, "UnblockDevice end anchor not found after the function"
+        cls.body = cls.src[start:end]
+
+    def test_the_file_header_no_longer_claims_the_function_blocks_devices(self):
+        # RAW source deliberately: the claim lived in a comment, so reading the
+        # comment-stripped text would make this assertion pass vacuously - which
+        # is the failure mode that let the claim survive in the first place.
+        self.assertNotIn(
+            "EmergencyBlockDevice actually blocks devices",
+            self.raw,
+            "The file header again claims EmergencyBlockDevice blocks devices. It "
+            "performs no PnP disable and no eject, and BadUSBDetector escalates to "
+            "it and reports success on the strength of that claim.",
+        )
+
+    def test_the_emergency_block_counter_is_guarded_by_finding_the_device(self):
+        self.assertEqual(
+            self.body.count("emergencyBlocks.fetch_add"),
+            1,
+            "There must be exactly one site that counts an emergency block, so "
+            "the counter cannot be incremented twice for one request or from an "
+            "unguarded path.",
+        )
+        guard = self.body.find("if (!deviceKnown)")
+        counter = self.body.find("emergencyBlocks.fetch_add")
+        self.assertGreaterEqual(
+            guard,
+            0,
+            "The not-found guard has been removed, so a request naming a device "
+            "we have never seen would report and count a block again.",
+        )
+        self.assertGreater(
+            counter,
+            guard,
+            "The counter runs before the not-found guard, so it counts blocks for "
+            "devices that were never located - the counter-outside-the-guard shape "
+            "corrected in bb48bf8a.",
+        )
+
+    def test_the_function_still_performs_no_device_level_operation(self):
+        # REGRESSION GUARD, NOT A DISCRIMINATOR. It records the measured fact that
+        # this path disables nothing, which is what makes the corrected header
+        # text true. If real blocking is ever implemented here - an owner's policy
+        # decision, because forcibly ejecting a user's device is destructive -
+        # this assertion must be REPLACED by one requiring the operation's result
+        # to be checked before anything claims success. It must not be deleted.
+        for api in ("CM_Disable_DevNode", "SetupDiChangeState", "SafeEjectDeviceById"):
+            self.assertNotIn(
+                api,
+                self.body,
+                "%s now appears in EmergencyBlockDevice. The function may finally "
+                "perform a real block - if so, update the file header and this "
+                "test together, and require the return value to be checked before "
+                "the counter or the log claims success." % api,
+            )
+        self.assertNotIn(
+            "EMERGENCY BLOCK triggered",
+            self.body,
+            "The log line again announces an emergency block without qualifying "
+            "that only policy state changed and the device remains usable.",
+        )
+
+    def test_the_logged_event_names_the_device_that_was_found(self):
+        self.assertNotIn(
+            "USBDeviceInfo{}",
+            self.body,
+            "The event is logged with a default-constructed device record while "
+            "the real one was in hand, so it cannot name the vendor, product or "
+            "serial it applied to - the same available-value-dropped-on-the-floor "
+            "shape as the hardcoded parentPid 0 corrected in 47742cf5.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
