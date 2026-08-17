@@ -3965,6 +3965,30 @@ public:
             return Communication::KernelVerdict::Allow;
         }
 
+        // ONE CLOCK, TWO DEADLINES, STARTED HERE SO THAT IT MEASURES THE WHOLE
+        // HANDLER. Shared by the evasion sub-budget and the outer reply horizon
+        // further down, so the two can never disagree about how long this handler
+        // has been running.
+        //
+        // It has to be this early rather than beside the evasion suite, and that is
+        // not a stylistic preference. Real work happens between here and there:
+        // AntiDebug's process-notify pass, and CertificateValidator's
+        // process-create pass which OPENS THE IMAGE AND VERIFIES ITS SIGNATURE -
+        // stated in the comment on its own call site below. A clock started after
+        // those would report a handler that had already spent much of its window as
+        // being at zero, and the horizon would then conclude the driver still had
+        // time left when it did not. A deadline measured from after the expensive
+        // part is the kind of bound that reads correct and enforces nothing, which
+        // is the defect this handler already had once in the form of four detector
+        // timeouts that no implementation read.
+        //
+        // NEITHER OF THOSE TWO STAGES IS GATED BY EITHER DEADLINE, deliberately:
+        // their results do not flow through the verdict, so the horizon's
+        // justification for skipping work does not extend to them. What starting
+        // the clock here buys is that their cost is CHARGED against the stages that
+        // may legitimately be skipped, rather than being invisible to both.
+        const auto notifyStart = std::chrono::steady_clock::now();
+
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
         std::wstring commandLine(req.commandLineData(), req.commandLineCharLen());
 
@@ -4054,10 +4078,6 @@ public:
             // wire protocol. When kernel adds this field, re-enable WoW64 checks.
         }
 
-        // Anti-Evasion Analysis
-        if (req.isCreation) {
-            bool evasionDetected = false;
-
         // ONE BUDGET FOR THE WHOLE EVASION SUITE.
         //
         // Five detectors run synchronously below - debugger, VM, process, network
@@ -4092,14 +4112,13 @@ public:
         // the budget is too tight or a detector is misbehaving, and either way it
         // stops being a guess.
         constexpr uint64_t kProcessNotifyBudgetMs = 250;
-        const auto evasionStart = std::chrono::steady_clock::now();
         bool evasionBudgetSpent = false;
         const auto evasionBudgetExceeded = [&](const char* nextStage) -> bool {
             if (evasionBudgetSpent) {
                 return true;
             }
             const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - evasionStart).count();
+                std::chrono::steady_clock::now() - notifyStart).count();
             if (static_cast<uint64_t>(elapsedMs) < kProcessNotifyBudgetMs) {
                 return false;
             }
@@ -4119,6 +4138,92 @@ public:
             }
             return true;
         };
+
+        // ================== THE OUTER DEADLINE: THE REPLY HORIZON ==================
+        //
+        // The budget above covers the five evasion detectors and STOPS AT THE LAST
+        // ONE, so everything after them ran unbounded on the one callback the
+        // driver blocks CreateProcess on. Re-measured stage by stage, the tail is:
+        // the exclusion check and the privilege-escalation context pair and the
+        // MemoryProtection registration (all measured cheap, none gated here); the
+        // external process-create callback fan-out; the pre-execution ScanEngine
+        // pass on a trust-cache miss; and the ransomware subsystem fan-out.
+        //
+        // WHY A HORIZON RATHER THAN A BUDGET, AND WHY IT LOSES NO COVERAGE - this
+        // is the whole basis for skipping anything at all. The driver waits
+        // PN_VERDICT_REPLY_TIMEOUT_MS (500 ms, ProcessNotify.c) and then FAILS
+        // OPEN: the process starts and whatever we eventually return is discarded.
+        // So past that point, a stage whose ONLY product is the verdict cannot
+        // change the outcome. It has stopped being protection and become work that
+        // holds a process-creation callback open for an answer nobody will read.
+        // Skipping it removes waste, not detection - and the image is still handed
+        // to the deferred worker, which re-examines it in full off this thread and
+        // can remediate what it finds.
+        //
+        // THAT REASONING IS ALSO THE LIMIT ON WHAT MAY BE GATED. It licenses
+        // skipping only reply-dependent work. Any tail stage with side effects
+        // that do NOT flow through the verdict keeps running past this horizon,
+        // because for those the driver's timeout is irrelevant and skipping would
+        // drop capability outright rather than defer it. The ransomware fan-out is
+        // exactly that case and is deliberately left outside this gate; the reason
+        // is recorded at the call site.
+        //
+        // THE VALUE IS NOT INVENTED HERE. IPCManager publishes
+        // kProcessFanOutBudgetMs = 400 as the window shared by every process
+        // subscriber, already pinned beneath the driver's 500 ms by a contract
+        // test. This handler is the only production process subscriber, so the
+        // window allotted to all subscribers is precisely the window this handler
+        // spends. It is restated rather than referenced because that constant is
+        // private to IPCManager; a contract test pins the two together so they
+        // cannot drift apart in separate commits.
+        //
+        // HONEST IMPRECISION, STATED RATHER THAN GLOSSED: this clock starts when
+        // the handler is entered, which is after the driver sent the notification
+        // and after IPC receive and dispatch. The elapsed time measured here is
+        // therefore a LOWER BOUND on how long the driver has actually been
+        // waiting, and this horizon is reached slightly later than the true
+        // deliverability limit. That errs toward running work rather than skipping
+        // it, which is the safe direction for detection.
+        constexpr uint64_t kProcessNotifyReplyHorizonMs = 400;
+        static_assert(kProcessNotifyReplyHorizonMs >= kProcessNotifyBudgetMs,
+                      "the outer reply horizon must not cut inside the evasion "
+                      "sub-budget, or the outer deadline would skip evasion "
+                      "detectors before their own budget had been spent");
+        bool replyHorizonSpent = false;
+        const auto replyHorizonExceeded = [&](const char* nextStage) -> bool {
+            if (replyHorizonSpent) {
+                return true;
+            }
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - notifyStart).count();
+            if (static_cast<uint64_t>(elapsedMs) < kProcessNotifyReplyHorizonMs) {
+                return false;
+            }
+            replyHorizonSpent = true;
+            m_stats.processNotifyReplyHorizonExceeded++;
+            Utils::Logger::Warn(
+                "RealTimeProtection: process-creation reply horizon of {} ms passed after "
+                "{} ms for PID {}; skipping {} because a verdict produced now can no "
+                "longer reach the driver before it fails open",
+                kProcessNotifyReplyHorizonMs, elapsedMs, req.processId, nextStage);
+            // Same recoverable remainder as the evasion budget, and the same honest
+            // limitation: the deferred pass re-examines the image, it does not
+            // reproduce a pre-execution decision. QueueDeferredDeepScan
+            // de-duplicates, so this costs nothing if the evasion budget already
+            // queued the same path.
+            if (!imagePath.empty()) {
+                QueueDeferredDeepScan(imagePath, req.processId);
+            }
+            return true;
+        };
+
+        // Anti-Evasion Analysis
+        //
+        // Both deadlines above are declared at handler scope rather than inside
+        // this branch, because the tail after it needs the horizon too. Only this
+        // suite is creation-gated; process exit skips it entirely.
+        if (req.isCreation) {
+            bool evasionDetected = false;
             std::wstring detectionSource;
 
             // 1. Debugger Evasion — pass kernel context for APT-grade detection
@@ -4516,9 +4621,29 @@ public:
         }
 
         // Invoke process creation callbacks (snapshot callbacks first to avoid holding lock during dispatch)
+        //
+        // GATED BY THE REPLY HORIZON ON THE CREATION BRANCH ONLY. A registrant's
+        // sole route into the outcome is the shouldBlock out-parameter below, which
+        // is reply-dependent by construction, so past the horizon its vote cannot
+        // be delivered. This fan-out is also unbounded in principle - it calls
+        // arbitrary registered code - and it runs BEFORE the two remaining tail
+        // stages, so measuring the horizon here is what stops a slow registrant
+        // from consuming the window those stages need.
+        //
+        // INERT TODAY, MEASURED NOT ASSUMED: RegisterProcessCreateCallback has
+        // exactly two references in the tree, its declaration and its definition.
+        // No production or test code registers anything, so callbackSnapshot is
+        // empty on every run and this gate changes no behaviour today. It is here
+        // so that wiring up the first registrant cannot silently reintroduce an
+        // unbounded stage on the callback the driver blocks CreateProcess on.
+        //
+        // THE EXIT BRANCH IS NEVER GATED. The driver does not wait for a verdict
+        // on process exit, and a future registrant may well do state maintenance
+        // there - the same reason the privilege-escalation erase above is
+        // unconditional.
         bool shouldBlock = false;
         std::vector<RTPProcessCreateCallback> callbackSnapshot;
-        {
+        if (!(req.isCreation && replyHorizonExceeded("external process-create callbacks"))) {
             std::shared_lock lock(m_callbackMutex);
             callbackSnapshot.reserve(m_processCreateCallbacks.size());
             for (const auto& [id, callback] : m_processCreateCallbacks) {
@@ -4548,7 +4673,19 @@ public:
         }
 
         // If configured, scan the process image
-        if (m_config.scanOnExecute && req.isCreation) {
+        //
+        // THE ONE GENUINELY UNBOUNDED REPLY-DEPENDENT STAGE, AND THEREFORE THE
+        // REASON THE HORIZON EXISTS. Its only product here is the Infected ->
+        // Block below, so once the verdict cannot be delivered this pass buys
+        // nothing while still holding the callback open; ScanFile has been measured
+        // at over six seconds on a cold path, and a measurement of the
+        // trust-determination queue found it caching ZERO verdicts, so the cold
+        // path is the normal case rather than the exception. The horizon lambda has already
+        // queued the image for the deferred worker, which runs the same analysis
+        // off this thread and can remediate, so the detection moves in time rather
+        // than being dropped.
+        if (m_config.scanOnExecute && req.isCreation &&
+            !replyHorizonExceeded("pre-execution image scan")) {
             try {
                 // Verified Microsoft-signed OS binaries are trusted operating-
                 // system code — skip the heavy ScanEngine pipeline (same TIER-1
@@ -4596,12 +4733,58 @@ public:
         // =====================================================================
         // RANSOMWARE SUBSYSTEM PROCESS-NOTIFY DISPATCH (Phase 4 kernel fan-out)
         //
-        // Fan every process create / terminate notification out to the
-        // RansomwareDetector composite engine, LockyDetector dropper-chain
-        // tracker, WannaCryDetector service-install detector, and
-        // HoneypotManager for attribution.  Each call is noexcept at the
-        // aggregator boundary; a single misbehaving module cannot take the
-        // IPC loop down.
+        // SEVEN TARGETS, NOT THE FOUR THIS COMMENT USED TO NAME. The previous
+        // wording credited RansomwareDetector, LockyDetector, WannaCryDetector and
+        // "HoneypotManager for attribution", which was wrong twice: it omitted
+        // three modules that are dispatched, and the one attribution it advertised
+        // is not performed. Enumerated against RansomwareWiring.cpp and each
+        // handler read individually:
+        //
+        //   RansomwareDetector   create: OnProcessCreated (analysis)
+        //                        exit:   ClearProcessStats (STATE ERASE)
+        //   LockyDetector        create: OnProcessCreate (analysis)
+        //                        exit:   PurgeProcessState (STATE ERASE)
+        //   HoneypotManager      BOTH BRANCHES NO-OP - every parameter is
+        //                        (void)-cast and both arms fall through to a bare
+        //                        comment, so the "attribution" credited above does
+        //                        not happen anywhere in this call
+        //   BackupProtector      create: AnalyzeProcess - records the attempt,
+        //                        notifies, moves four counters, and terminates the
+        //                        process when the action resolves to BlockKill
+        //                        exit:   early return
+        //   ShadowCopyProtector  create: OnProcessCreation - classifies a VSS
+        //                        destruction attempt, attributes MITRE T1490 and
+        //                        raises the Critical alert
+        //                        exit:   early return
+        //   FileBackupManager    create: no-op
+        //                        exit:   GetBackupCount + CommitChanges, which is
+        //                        REAL FILE I/O
+        //   WannaCryDetector     create only: five-name match, then DetectEx
+        //
+        // Each call is noexcept at the aggregator boundary; a single misbehaving
+        // module cannot take the IPC loop down.
+        //
+        // DELIBERATELY NOT GATED BY THE REPLY HORIZON, AND THIS IS THE REASON.
+        // The horizon licenses skipping only work whose sole product is the
+        // verdict, because past it the driver has failed open and the verdict is
+        // discarded. That argument does not reach this stage. The dispatch is void
+        // (RansomwareWiring.hpp states none of them block the caller) and this
+        // handler returns Allow on the next statement, so these modules contribute
+        // NOTHING to the verdict - and therefore losing the verdict costs them
+        // nothing either. What they do instead is act directly: BackupProtector can
+        // terminate the process itself, ShadowCopyProtector raises the T1490 alert,
+        // and two modules erase per-PID state while a third commits pending backups
+        // on exit. Every one of those survives the driver timing out. Skipping this
+        // call would not defer that work, it would DROP it, which is the one thing
+        // a latency bound must never do.
+        //
+        // THE COST IS REAL AND UNADDRESSED HERE, STATED PLAINLY RATHER THAN LEFT
+        // FOR SOMEONE TO DISCOVER: this stage is unbounded on the callback the
+        // driver blocks CreateProcess on. Because its results are reply-independent
+        // the correct fix is to stop running it on this thread at all rather than to
+        // skip it under load, and that is an execution-model change with its own
+        // cost/benefit - not something to bolt onto a latency bound. It must be
+        // settled before any further modules are added to this dispatch.
         // =====================================================================
         Ransomware::Wiring::DispatchProcessNotify(
             req.processId, req.parentProcessId,
@@ -6231,6 +6414,7 @@ public:
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
+        const uint64_t replyHorizon = m_stats.processNotifyReplyHorizonExceeded.load(std::memory_order_relaxed);
         const uint64_t procWithheld = m_stats.processBlocksWithheldByMode.load(std::memory_order_relaxed);
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
 
@@ -6278,11 +6462,12 @@ public:
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
-            "processNotifyBudgetExceeded={} processBlocksWithheldByMode={}",
+            "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
+            "processBlocksWithheldByMode={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, oversize, notifyBudget, procWithheld);
+            cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -6809,6 +6994,7 @@ void RTPStatistics::Reset() noexcept {
     metamorphicTruncated = 0;
     packerDeferred = 0;
     processNotifyBudgetExceeded = 0;
+    processNotifyReplyHorizonExceeded = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;

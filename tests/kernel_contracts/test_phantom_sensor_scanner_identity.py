@@ -70,6 +70,7 @@ REGISTRY_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Registry/RegistryMonito
 PROCESS_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/ProcessUtils.cpp"
 BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
+REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
@@ -4375,6 +4376,283 @@ class KernelProcessContextRetentionContractTests(unittest.TestCase):
             "The context map must be cleared on BOTH initialize and shutdown, "
             "as its two sibling containers already are. Surviving either "
             "transition attributes a previous run's processes to current ids.",
+        )
+
+
+class ProcessNotifyReplyHorizonContractTests(unittest.TestCase):
+    """The process-creation handler must bound the work whose only product is a
+    verdict the driver may already have stopped waiting for - and must NOT bound
+    the work that acts on its own.
+
+    Every assertion here is about SOURCE TEXT rather than behaviour, and that is
+    forced rather than preferred: reaching this handler needs a loaded kernel
+    driver delivering a real process notification over a live filter port, so no
+    C++ unit test can exercise it. The invariants are still checkable because
+    they are structural, and two of them are cross-language, which is why they
+    live in this suite.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # COMMENTS STRIPPED FIRST, before anything is counted. The code guarded
+        # here is heavily commented and those comments necessarily NAME every
+        # symbol asserted below - including the wording they replaced - so a
+        # comment-blind count is guaranteed to match prose and report a guard as
+        # satisfied by an explanation of the defect it exists to catch.
+        cls.rtp_cpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.rtp_hpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+        cls.ipc_hpp = read_source(IPC_MANAGER_HPP_PATH)
+        cls.driver_c = read_source(PROCESS_NOTIFY_C_PATH)
+        # The qualified return type is required: this name appears at call and
+        # registration sites EARLIER in the file than its definition, and a bare
+        # name would extract one of those instead.
+        cls.handler = extract_c_function(
+            cls.rtp_cpp, "Communication::KernelVerdict OnKernelProcessNotify"
+        )
+
+    def test_the_handler_clock_starts_before_the_expensive_pre_budget_stages(self) -> None:
+        # THE DEFECT THIS EXISTS FOR was live in the first draft of the very
+        # change that added the horizon, so it is not hypothetical. The clock was
+        # declared beside the evasion suite, roughly 140 lines into the handler,
+        # AFTER two stages that each do real work: AntiDebug's process-notify
+        # pass, and CertificateValidator's process-create pass which opens the
+        # image and verifies its signature.
+        #
+        # A deadline measured from after the expensive part reports a handler that
+        # has already spent its window as being at zero, so the horizon concludes
+        # the driver still has time when it does not. That is the same shape as
+        # the four detector timeouts this handler used to declare and never read:
+        # a bound that reads correct and enforces nothing.
+        clock = self.handler.find("notifyStart = std::chrono::steady_clock::now()")
+        self.assertNotEqual(
+            clock,
+            -1,
+            "The handler no longer starts a steady_clock named notifyStart, so "
+            "neither the evasion sub-budget nor the reply horizon has anything "
+            "to measure elapsed time against.",
+        )
+
+        for stage in (
+            "AntiDebug::Instance().OnKernelProcessNotify",
+            "CertificateValidator::Instance().OnKernelProcessCreate",
+        ):
+            at = self.handler.find(stage)
+            self.assertNotEqual(
+                at,
+                -1,
+                f"{stage} has left OnKernelProcessNotify. If it moved, this "
+                f"guard needs updating; if it was deleted, that is a coverage "
+                f"change and not a refactor.",
+            )
+            self.assertLess(
+                clock,
+                at,
+                f"notifyStart is declared at offset {clock} but {stage} runs at "
+                f"offset {at}, so that stage's cost is invisible to both "
+                f"deadlines. Start the clock before it, or the horizon will let "
+                f"the driver time out while believing it had budget left.",
+            )
+
+    def test_the_reply_horizon_is_declared_and_actually_governs_the_tail(self) -> None:
+        # A CONSTANT THAT IS NAMED BUT DOES NOT GOVERN is this codebase's most
+        # repeated defect, so the assertion is on the EXPRESSION, not on the
+        # identifier. The identifier also appears in the log line and in the
+        # static_assert, either of which would satisfy a containment check while
+        # the comparison had been removed.
+        declared = re.search(
+            r"kProcessNotifyReplyHorizonMs\s*=\s*(\d+)", self.handler
+        )
+        self.assertIsNotNone(
+            declared,
+            "kProcessNotifyReplyHorizonMs is gone, so the tail of the "
+            "process-creation handler is unbounded again.",
+        )
+
+        governs = re.search(
+            r"elapsedMs\s*\)\s*<\s*kProcessNotifyReplyHorizonMs", self.handler
+        )
+        self.assertTrue(
+            bool(governs),
+            "kProcessNotifyReplyHorizonMs is declared but no longer compared "
+            "against elapsed time, so it names a deadline that enforces "
+            "nothing.",
+        )
+
+        self.assertEqual(
+            self.handler.count("m_stats.processNotifyReplyHorizonExceeded++"),
+            1,
+            "The reply-horizon counter must be incremented exactly once, inside "
+            "the latch, or the number either double-counts one skip or stops "
+            "recording them.",
+        )
+
+    def test_the_horizon_gates_only_reply_dependent_stages(self) -> None:
+        # THE LIMIT ON WHAT MAY BE SKIPPED IS THE WHOLE ARGUMENT. Skipping is
+        # justified only where the stage's sole product is the verdict, because
+        # past the horizon the driver has failed open and the verdict is
+        # discarded. Work that acts on its own - terminating a process, raising
+        # an alert, erasing per-PID state - survives the driver timing out, so
+        # skipping it DROPS capability instead of deferring it.
+        gates = re.findall(r'replyHorizonExceeded\("([^"]+)"\)', self.handler)
+        self.assertEqual(
+            sorted(gates),
+            sorted(["external process-create callbacks", "pre-execution image scan"]),
+            "The reply horizon must gate exactly the two reply-dependent tail "
+            "stages and nothing else. A third gate means something that acts "
+            "independently of the verdict is now being skipped under load; a "
+            "missing one means an unbounded stage is back on the callback the "
+            "driver blocks CreateProcess on.",
+        )
+
+        # Both gates must test isCreation in the SAME expression. The driver does
+        # not wait for a verdict on process exit, and the exit branch carries the
+        # only eraser of the privilege-escalation context map plus the only commit
+        # of pending file backups.
+        for stage in gates:
+            window = self.handler[
+                max(0, self.handler.find(f'replyHorizonExceeded("{stage}")') - 200):
+                self.handler.find(f'replyHorizonExceeded("{stage}")')
+            ]
+            self.assertIn(
+                "req.isCreation",
+                window,
+                f'The "{stage}" gate no longer requires req.isCreation, so a '
+                f"process EXIT can now be skipped by a latency bound. Exit is "
+                f"where this handler does its state maintenance.",
+            )
+
+        # REGRESSION GUARDS, and labelled as such rather than presented as
+        # discriminators: these two must stay outside every gate.
+        # assertTrue over a boolean, never assertIn against the handler slice - a
+        # containment failure would dump the whole function into the output and
+        # bury the one line that matters.
+        self.assertTrue(
+            "OnKernelProcessExited(req.processId)" in self.handler,
+            "The privilege-escalation exit erase is gone from the handler. It is "
+            "the only eraser of that per-PID map; without it the map grows one "
+            "entry per process creation for the life of the service.",
+        )
+        self.assertTrue(
+            "Ransomware::Wiring::DispatchProcessNotify(" in self.handler,
+            "The ransomware fan-out has left the handler. Two of its seven "
+            "targets erase per-PID state on exit and a third commits pending "
+            "backups, none of which depends on the kernel verdict.",
+        )
+
+    def test_the_deadline_chain_stays_below_the_driver_wait(self) -> None:
+        # A THREE-LINK CROSS-LANGUAGE CHAIN, extending the two-link one that
+        # already pins the IPC fan-out budget beneath the driver's wait. The
+        # handler's own horizon is the new innermost link, and it is restated in
+        # RealTimeProtection.cpp rather than referenced because IPCManager keeps
+        # kProcessFanOutBudgetMs private - so nothing but this test stops the two
+        # numbers drifting apart in separate commits.
+        horizon = re.search(
+            r"kProcessNotifyReplyHorizonMs\s*=\s*(\d+)", self.handler
+        )
+        fanout = re.search(r"kProcessFanOutBudgetMs\s*=\s*(\d+)", self.ipc_hpp)
+        driver = re.search(
+            r"#define\s+PN_VERDICT_REPLY_TIMEOUT_MS\s+(\d+)", self.driver_c
+        )
+        for name, m in (
+            ("kProcessNotifyReplyHorizonMs", horizon),
+            ("kProcessFanOutBudgetMs", fanout),
+            ("PN_VERDICT_REPLY_TIMEOUT_MS", driver),
+        ):
+            self.assertIsNotNone(m, f"{name} is gone, so the deadline chain is broken.")
+
+        horizon_ms = int(horizon.group(1))
+        fanout_ms = int(fanout.group(1))
+        driver_ms = int(driver.group(1))
+
+        self.assertLessEqual(
+            horizon_ms,
+            fanout_ms,
+            f"The handler's reply horizon {horizon_ms} ms exceeds the fan-out "
+            f"budget {fanout_ms} ms that its own caller allots to every process "
+            f"subscriber, so this handler alone can overrun the window it shares.",
+        )
+        self.assertLess(
+            fanout_ms,
+            driver_ms,
+            f"Fan-out budget {fanout_ms} ms is not below the driver's "
+            f"{driver_ms} ms wait.",
+        )
+
+    def test_the_reply_horizon_counter_cannot_become_a_structural_zero(self) -> None:
+        # Learned the hard way twice: a counter declared but not plumbed through
+        # reset and reporting reads zero forever, and a zero that means "not
+        # wired" is indistinguishable from a zero that means "healthy" - which is
+        # the more dangerous of the two because it argues against the symptom.
+        #
+        # Every check below is a boolean over a membership test, never assertIn
+        # against a source file. These files are 62 KB and 394 KB; an assertIn
+        # failure prints the entire haystack and buries the finding.
+        self.assertTrue(
+            "std::atomic<uint64_t> processNotifyReplyHorizonExceeded" in self.rtp_hpp,
+            "The reply-horizon counter is no longer declared in "
+            "RealTimeProtection.hpp.",
+        )
+
+        missing = [
+            why
+            for fragment, why in (
+                (
+                    "m_stats.processNotifyReplyHorizonExceeded.load",
+                    "not read by the periodic capacity report, so the condition "
+                    "is invisible in a field log",
+                ),
+                (
+                    "processNotifyReplyHorizonExceeded={}",
+                    "not printed in the capacity line, so nothing in the field "
+                    "surfaces it",
+                ),
+                (
+                    "processNotifyReplyHorizonExceeded = 0",
+                    "not cleared by the statistics reset, so a reset leaves a "
+                    "stale value beside counters that restarted at zero",
+                ),
+            )
+            if fragment not in self.rtp_cpp
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "The reply-horizon counter is " + "; and is ".join(missing) + ".",
+        )
+
+        # The two budget counters must remain DISTINCT. Folding them together
+        # would let "the driver is about to fail open" hide inside "the evasion
+        # detectors ran long", which are different regimes needing different
+        # responses.
+        self.assertTrue(
+            "std::atomic<uint64_t> processNotifyBudgetExceeded" in self.rtp_hpp,
+            "The evasion sub-budget counter has been removed, so the two "
+            "conditions can no longer be told apart.",
+        )
+
+    def test_the_evasion_sub_budget_is_not_swallowed_by_the_outer_horizon(self) -> None:
+        # The two deadlines are nested, and the ordering is load-bearing: if the
+        # outer horizon were ever set BELOW the evasion sub-budget it would skip
+        # the evasion detectors before their own budget had been spent, quietly
+        # reducing detection while both numbers still looked deliberate.
+        self.assertTrue(
+            "static_assert(kProcessNotifyReplyHorizonMs >= kProcessNotifyBudgetMs"
+            in self.handler,
+            "The static_assert tying the outer reply horizon to the evasion "
+            "sub-budget is gone, so the two can be set into a relationship that "
+            "silently disables the evasion suite.",
+        )
+
+        budget = re.search(r"kProcessNotifyBudgetMs\s*=\s*(\d+)", self.handler)
+        self.assertIsNotNone(
+            budget, "The evasion sub-budget constant has been removed."
+        )
+        self.assertEqual(
+            self.handler.count('evasionBudgetExceeded("'),
+            4,
+            "The evasion sub-budget must still be consulted at exactly its four "
+            "detector stages. Fewer means a detector became unbounded; more "
+            "means a stage was added without deciding which deadline owns it.",
         )
 
 

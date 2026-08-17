@@ -991,6 +991,22 @@ struct alignas(64) RTPStatistics {
     ///        stage in the log so the next question is answerable.
     std::atomic<uint64_t> processNotifyBudgetExceeded{ 0 };
 
+    /// @brief Process creations where the handler passed the point at which its
+    ///        verdict can still reach the driver, so remaining work whose ONLY
+    ///        product is that verdict was skipped.
+    ///
+    ///        A SEPARATE NUMBER FROM processNotifyBudgetExceeded ON PURPOSE, and
+    ///        the two mean materially different things. That one says the
+    ///        inference-class evasion detectors ran out of their sub-budget and
+    ///        the remainder was deferred - recoverable, and expected to happen
+    ///        occasionally under load. This one says the driver is about to give
+    ///        up waiting and fail open, which means every process creation in
+    ///        that window starts without our answer. Folding them into one
+    ///        counter would let the serious condition hide inside the routine
+    ///        one, and a number that does not distinguish them cannot answer the
+    ///        question it exists for.
+    std::atomic<uint64_t> processNotifyReplyHorizonExceeded{ 0 };
+
     /// @brief Files whose content exceeded the configured real-time scan size
     ///        bound and were handed to the background deep-scan worker instead
     ///        of being read on the blocking path.
