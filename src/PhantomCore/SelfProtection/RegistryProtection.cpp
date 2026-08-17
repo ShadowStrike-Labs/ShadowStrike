@@ -833,44 +833,71 @@ public:
             return result;
         }
 
-        // Check custom decision callback and protected keys under one lock scope
-        std::shared_lock lock(m_mutex);
+        // Snapshot every piece of shared state this decision needs under ONE
+        // lock acquisition, then release it before invoking anything a caller
+        // registered. m_mutex is a std::shared_mutex and is NOT recursive: a
+        // decision callback that calls back into this module - AddProtectedKey,
+        // SetDecisionCallback, IsKeyProtected, GetStatistics - acquires m_mutex a
+        // second time, and if a writer has queued between the two acquisitions
+        // the shared re-acquisition waits behind that writer while this frame
+        // still holds the first. That is a self-deadlock on a thread that may owe
+        // the kernel a registry verdict.
+        //
+        // The previous code invoked the callback INSIDE the lock, under a comment
+        // asserting it was "now safely under lock". This same function already
+        // knew better: its blocked-operation branch below deliberately dropped
+        // the lock before firing FireBlockedOperationEvent, for exactly this
+        // reason. FileProtection::FilterOperation and BackupProtector's
+        // QueryDecision both snapshot for the same reason.
+        //
+        // The protected-key lookup now always runs, even when the callback goes
+        // on to answer and its result is discarded. That is the deliberate cost
+        // of keeping this to a single lock cycle, and it is a hash lookup.
+        RegistryOperationDecisionCallback callbackCopy;
+        bool keyIsProtected = false;
+        uint32_t blockedOps = 0;
 
-        // Check custom decision callback (now safely under lock)
-        if (m_decisionCallback) {
-            auto customResult = m_decisionCallback(request);
+        {
+            std::shared_lock lock(m_mutex);
+
+            callbackCopy = m_decisionCallback;
+
+            if (IsKeyProtectedInternal(request.keyPath)) {
+                const auto normalized = NormalizeKeyPath(request.keyPath);
+                auto keyIt = m_protectedKeys.find(normalized);
+
+                if (keyIt == m_protectedKeys.end()) {
+                    // Check parent keys for subkey protection
+                    for (const auto& [path, key] : m_protectedKeys) {
+                        if (key.includeSubkeys && normalized.starts_with(path + L"\\")) {
+                            keyIt = m_protectedKeys.find(path);
+                            break;
+                        }
+                    }
+                }
+
+                if (keyIt != m_protectedKeys.end()) {
+                    keyIsProtected = true;
+                    blockedOps = static_cast<uint32_t>(keyIt->second.blockedOperations);
+                }
+            }
+        }
+
+        // Consult the caller's decision hook FIRST and honour whatever answer it
+        // gives, exactly as before - only now with no lock held. An engaged
+        // optional wins outright, including a deliberate Allow.
+        if (callbackCopy) {
+            auto customResult = callbackCopy(request);
             if (customResult.has_value()) {
                 return customResult.value();
             }
         }
 
-        // Check if key is protected
-        if (!IsKeyProtectedInternal(request.keyPath)) {
+        if (!keyIsProtected) {
             return result;
         }
-
-        // Get protection info
-        const auto normalized = NormalizeKeyPath(request.keyPath);
-        auto keyIt = m_protectedKeys.find(normalized);
-
-        if (keyIt == m_protectedKeys.end()) {
-            // Check parent keys for subkey protection
-            for (const auto& [path, key] : m_protectedKeys) {
-                if (key.includeSubkeys && normalized.starts_with(path + L"\\")) {
-                    keyIt = m_protectedKeys.find(path);
-                    break;
-                }
-            }
-        }
-
-        if (keyIt == m_protectedKeys.end()) {
-            return result;
-        }
-
-        const auto& protectedKey = keyIt->second;
 
         // Check if operation is blocked
-        const auto blockedOps = static_cast<uint32_t>(protectedKey.blockedOperations);
         const auto reqOp = static_cast<uint32_t>(request.operation);
 
         if ((blockedOps & reqOp) != 0) {
@@ -886,8 +913,8 @@ public:
 
             m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
 
-            // Release lock before firing callbacks to avoid deadlock
-            lock.unlock();
+            // No lock is held here at all now, so neither this event fan-out nor
+            // the decision callback above can re-enter the module and self-block.
             FireBlockedOperationEvent(request, result);
         } else if (m_mode == RegistryProtectionMode::Monitor) {
             result.decision = RegistryOperationDecision::AllowLogged;

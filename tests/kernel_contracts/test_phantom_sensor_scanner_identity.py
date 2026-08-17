@@ -5338,5 +5338,117 @@ class ConnectionPoolConfigurationContractTests(unittest.TestCase):
         )
 
 
+class RegistryDecisionHookLockContractTests(unittest.TestCase):
+    """RegistryProtection must never invoke a caller's decision hook while it
+    holds m_mutex.
+
+    std::shared_mutex is NOT recursive. A decision callback that calls back into
+    RegistryProtection - AddProtectedKey, SetDecisionCallback, IsKeyProtected,
+    GetStatistics - acquires m_mutex a second time, and if a writer has queued
+    between the two acquisitions the shared re-acquisition waits behind that
+    writer while the first acquisition is still held. That is a self-deadlock on
+    a thread that may owe the kernel a registry verdict.
+
+    These are source contracts on purpose, and that choice is worth recording.
+    Driving the deadlock behaviourally would mean registering a re-entrant
+    callback and depending on the timing of a queued writer, and recursive
+    lock_shared is undefined behaviour that usually appears to work - so such a
+    test would either pass against the defect or hang the entire suite. Neither
+    outcome discriminates.
+    """
+
+    START_ANCHOR = (
+        "RegistryOperationDecisionResult FilterOperation("
+        "const RegistryOperationRequest& request) {"
+    )
+    END_ANCHOR = "void SetDecisionCallback(RegistryOperationDecisionCallback callback) {"
+
+    @classmethod
+    def _body(cls) -> str:
+        # Comments are stripped FIRST and that is load-bearing here: the fix's own
+        # explanatory comment quotes the retired expression m_decisionCallback(
+        # and the phrase "safely under lock" verbatim, so a comment-blind
+        # assertion would be satisfied - or broken - by prose.
+        src = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        assert src.count(cls.START_ANCHOR) == 1, "FilterOperation start anchor is not unique"
+        assert src.count(cls.END_ANCHOR) == 1, "SetDecisionCallback end anchor is not unique"
+        start = src.index(cls.START_ANCHOR)
+        end = src.index(cls.END_ANCHOR)
+        assert end > start, "anchors are out of order"
+        return src[start:end]
+
+    def test_the_registry_decision_hook_is_not_invoked_while_the_lock_is_held(self):
+        body = self._body()
+
+        self.assertEqual(
+            body.count("m_decisionCallback("),
+            0,
+            "FilterOperation must not call the member m_decisionCallback directly - "
+            "the member is only reachable under m_mutex, so calling it there is the "
+            "re-entrancy deadlock; snapshot it and call the copy",
+        )
+        self.assertEqual(
+            body.count("callbackCopy = m_decisionCallback;"),
+            1,
+            "FilterOperation must snapshot the decision hook exactly once",
+        )
+        self.assertEqual(
+            body.count("callbackCopy(request)"),
+            1,
+            "FilterOperation must invoke the snapshot exactly once",
+        )
+        self.assertEqual(
+            body.count("std::shared_lock"),
+            1,
+            "FilterOperation should hold m_mutex for exactly one scope - the snapshot; "
+            "a second acquisition is the lock cycle this fix removed",
+        )
+
+        lock_at = body.index("std::shared_lock")
+        snapshot_at = body.index("callbackCopy = m_decisionCallback;")
+        invoke_at = body.index("callbackCopy(request)")
+
+        self.assertLess(
+            lock_at,
+            snapshot_at,
+            "the snapshot must be taken INSIDE the lock or it races SetDecisionCallback "
+            "(lock at offset %d, snapshot at offset %d)" % (lock_at, snapshot_at),
+        )
+        self.assertLess(
+            lock_at,
+            invoke_at,
+            "the only lock scope must open before the invocation site so that the "
+            "invocation can sit after it closes (lock at offset %d, invoke at offset %d)"
+            % (lock_at, invoke_at),
+        )
+        self.assertEqual(
+            body.count("lock.unlock()"),
+            0,
+            "there is no named lock left to unlock; a reappearing manual unlock means "
+            "the callback is being invoked under a lock again",
+        )
+
+    def test_the_registry_filter_keeps_the_coverage_it_had_before_the_lock_fix(self):
+        # REGRESSION GUARD, not a discriminator: the lock fix restructured this
+        # function, so the decisions it used to make must still be reachable.
+        body = self._body()
+
+        for needle, why in (
+            ("IsProcessWhitelisted(request.processId)", "whitelisted-process early return"),
+            ("IsKeyProtectedInternal(request.keyPath)", "protected-key test"),
+            (
+                r'key.includeSubkeys && normalized.starts_with(path + L"\\")',
+                "parent-key walk that gives subkey protection its coverage",
+            ),
+            ("FireBlockedOperationEvent(request, result)", "blocked-operation event fan-out"),
+            ("m_stats.totalBlocked.fetch_add", "blocked counter"),
+        ):
+            self.assertEqual(
+                body.count(needle),
+                1,
+                "FilterOperation lost its %s" % why,
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
