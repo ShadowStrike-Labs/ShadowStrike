@@ -327,6 +327,7 @@ void AMSIStatistics::Reset() noexcept {
     bypassesRepaired.store(0, std::memory_order_relaxed);
     integrityChecks.store(0, std::memory_order_relaxed);
     integrityFailures.store(0, std::memory_order_relaxed);
+    bypassDetectionsEvicted.store(0, std::memory_order_relaxed);
     totalBytesScanned.store(0, std::memory_order_relaxed);
     cacheHits.store(0, std::memory_order_relaxed);
     cacheMisses.store(0, std::memory_order_relaxed);
@@ -350,6 +351,7 @@ void AMSIStatistics::Reset() noexcept {
     oss << "\"bypassesRepaired\":" << bypassesRepaired << ",";
     oss << "\"integrityChecks\":" << integrityChecks << ",";
     oss << "\"integrityFailures\":" << integrityFailures << ",";
+    oss << "\"bypassDetectionsEvicted\":" << bypassDetectionsEvicted << ",";
     oss << "\"totalBytesScanned\":" << totalBytesScanned << ",";
     oss << "\"cacheHits\":" << cacheHits << ",";
     oss << "\"cacheMisses\":" << cacheMisses << ",";
@@ -1198,8 +1200,7 @@ public:
                 while (m_recentBypassEvents.size() > AMSIConstants::MAX_BYPASS_EVENTS) {
                     m_recentBypassEvents.pop_front();
                 }
-                m_bypassDetectedProcesses.insert(processId);
-                m_detectedBypassTechniques[processId] = report.detectedBypasses;
+                RecordBypassDetection_Locked(processId, report.detectedBypasses);
             }
 
             InvokeBypassCallback(event);
@@ -1315,16 +1316,81 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Stopped integrity monitoring for process %u", processId);
     }
 
-    [[nodiscard]] bool IsAmsiBypassDetected(uint32_t processId) const {
-        std::shared_lock lock(m_mutex);
-        return m_bypassDetectedProcesses.find(processId) != m_bypassDetectedProcesses.end();
+    /// @brief Record that an AMSI bypass was detected in @p processId.
+    ///
+    /// PRECONDITION: the caller holds m_mutex in UNIQUE mode. Both call sites
+    /// already take that lock to append the bypass event, so the record lands
+    /// in the same critical section as the event it belongs to and the two can
+    /// never disagree about a single occurrence.
+    ///
+    /// This is the only writer, which is what makes the cap enforceable at all;
+    /// the two previous inline inserts had no bound between them.
+    void RecordBypassDetection_Locked(uint32_t processId,
+                                      AmsiBypassTechnique techniques) {
+        // Re-detection against a process already on record refreshes it rather
+        // than adding an entry, so one process under repeated attack cannot
+        // consume the cap by itself.
+        if (auto existing = m_bypassDetections.find(processId);
+            existing != m_bypassDetections.end()) {
+            existing->second.techniques = techniques;
+            existing->second.detectedAt = Clock::now();
+            return;
+        }
+
+        if (m_bypassDetections.size() >= AMSIConstants::MAX_BYPASS_DETECTIONS) {
+            // Evicting here DISCARDS REAL EVIDENCE, so it is counted and
+            // reported rather than done quietly - a silent eviction would leave
+            // the map looking healthy while detections disappeared from it.
+            const auto oldest = std::min_element(
+                m_bypassDetections.begin(), m_bypassDetections.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.second.detectedAt < rhs.second.detectedAt;
+                });
+            if (oldest != m_bypassDetections.end()) {
+                m_bypassDetections.erase(oldest);
+            }
+
+            const uint64_t evicted =
+                m_stats.bypassDetectionsEvicted.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+
+            // Rate limited deliberately: our own log writes are file writes
+            // that traverse our own minifilter, so an error per eviction while
+            // sitting at the cap would amplify the condition it reports.
+            const auto now = Clock::now();
+            if (now - m_lastBypassEvictionReport >= std::chrono::seconds(30)) {
+                m_lastBypassEvictionReport = now;
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"AMSI bypass-detection map is at its %zu-entry cap; "
+                    L"discarded the oldest record (total discarded: %llu). "
+                    L"Entries are erased precisely only when their process is "
+                    L"known to have exited, and this module is not on any "
+                    L"kernel process-notify feed.",
+                    AMSIConstants::MAX_BYPASS_DETECTIONS,
+                    static_cast<unsigned long long>(evicted));
+            }
+        }
+
+        m_bypassDetections.emplace(processId,
+                                   BypassDetection{techniques, Clock::now()});
     }
 
+    /// @note Answers from a PID-keyed map. An entry is removed precisely when
+    ///       its process is observed to be gone; until then a recycled PID
+    ///       could in principle inherit a predecessor's record. Closing that
+    ///       window completely requires a process-exit notification, which the
+    ///       script subsystem does not receive today.
+    [[nodiscard]] bool IsAmsiBypassDetected(uint32_t processId) const {
+        std::shared_lock lock(m_mutex);
+        return m_bypassDetections.find(processId) != m_bypassDetections.end();
+    }
+
+    /// @note See IsAmsiBypassDetected for the PID-reuse caveat.
     [[nodiscard]] AmsiBypassTechnique GetDetectedBypasses(uint32_t processId) const {
         std::shared_lock lock(m_mutex);
-        auto it = m_detectedBypassTechniques.find(processId);
-        if (it != m_detectedBypassTechniques.end()) {
-            return it->second;
+        const auto it = m_bypassDetections.find(processId);
+        if (it != m_bypassDetections.end()) {
+            return it->second.techniques;
         }
         return AmsiBypassTechnique::Unknown;
     }
@@ -1375,6 +1441,8 @@ public:
         snapshot.bypassesRepaired = m_stats.bypassesRepaired.load(std::memory_order_relaxed);
         snapshot.integrityChecks = m_stats.integrityChecks.load(std::memory_order_relaxed);
         snapshot.integrityFailures = m_stats.integrityFailures.load(std::memory_order_relaxed);
+        snapshot.bypassDetectionsEvicted =
+            m_stats.bypassDetectionsEvicted.load(std::memory_order_relaxed);
         snapshot.totalBytesScanned = m_stats.totalBytesScanned.load(std::memory_order_relaxed);
         snapshot.cacheHits = m_stats.cacheHits.load(std::memory_order_relaxed);
         snapshot.cacheMisses = m_stats.cacheMisses.load(std::memory_order_relaxed);
@@ -2001,6 +2069,11 @@ private:
                     L"Cross-process integrity: PID %u no longer exists", pid);
                 std::unique_lock lock(m_mutex);
                 m_monitoredProcesses.erase(pid);
+                // The process is gone, so its PID is reusable from now on and a
+                // bypass record against it must not outlive it. This is the one
+                // live path where liveness is already established, so pruning
+                // here is exact and costs no additional syscall.
+                m_bypassDetections.erase(pid);
             } else {
                 SS_LOG_WARN(LOG_CATEGORY,
                     L"Cross-process integrity: OpenProcess failed for PID %u: %lu", pid, err);
@@ -2117,7 +2190,11 @@ private:
                 while (m_recentBypassEvents.size() > AMSIConstants::MAX_BYPASS_EVENTS) {
                     m_recentBypassEvents.pop_front();
                 }
-                m_bypassDetectedProcesses.insert(pid);
+                // Record the technique this detector actually determined and
+                // placed in the event above. The previous code inserted only
+                // set membership here, so GetDetectedBypasses() reported
+                // Unknown for a cross-process patch it had just identified.
+                RecordBypassDetection_Locked(pid, event.techniques);
             }
 
             InvokeBypassCallback(event);
@@ -2392,8 +2469,7 @@ public:
             {
                 std::unique_lock lock(m_mutex);
                 wasMonitored = (m_monitoredProcesses.erase(processId) > 0);
-                m_bypassDetectedProcesses.erase(processId);
-                m_detectedBypassTechniques.erase(processId);
+                m_bypassDetections.erase(processId);
             }
 
             if (wasMonitored) {
@@ -2497,8 +2573,33 @@ private:
     std::mutex m_integrityMonitorMutex;
     std::condition_variable m_integrityMonitorCV;
     std::unordered_set<uint32_t> m_monitoredProcesses;
-    std::unordered_set<uint32_t> m_bypassDetectedProcesses;
-    std::unordered_map<uint32_t, AmsiBypassTechnique> m_detectedBypassTechniques;
+
+    // ------------------------------------------------------------------
+    // BYPASS DETECTIONS - one record per process, replacing a parallel
+    // set + map pair that tracked ONE fact in TWO structures.
+    //
+    // They had already drifted: CheckCrossProcessIntegrity determined the
+    // technique (AmsiScanBufferPatch), put it in the event it raised, and
+    // then inserted into the SET only - so GetDetectedBypasses() answered
+    // Unknown for a bypass whose technique was sitting in hand. A single
+    // record cannot disagree with itself.
+    //
+    // detectedAt exists to order eviction at the cap. It is deliberately
+    // NOT an expiry: a bypass record stays valid for as long as the
+    // process lives, and processes live for days, so expiring by elapsed
+    // time would silently forget a real detection in a long-running
+    // compromised process. Losing detection is not an acceptable way to
+    // bound a map.
+    // ------------------------------------------------------------------
+    struct BypassDetection {
+        AmsiBypassTechnique techniques{AmsiBypassTechnique::Unknown};
+        TimePoint           detectedAt{};
+    };
+    std::unordered_map<uint32_t, BypassDetection> m_bypassDetections;
+
+    /// Rate-limit anchor for the at-cap eviction report. Default-constructed
+    /// to the epoch so the first eviction is always reported.
+    TimePoint m_lastBypassEvictionReport{};
 
     // Recent bypass events (deque for O(1) pop_front)
     std::deque<AmsiBypassEvent> m_recentBypassEvents;

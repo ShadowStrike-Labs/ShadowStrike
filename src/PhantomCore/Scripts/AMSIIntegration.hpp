@@ -173,6 +173,24 @@ namespace AMSIConstants {
     /// @brief Maximum bypass events retained in ring buffer
     inline constexpr size_t MAX_BYPASS_EVENTS = 1000;
 
+    /// @brief Maximum distinct processes retained in the bypass-detection map.
+    ///
+    /// The map is keyed by PID, and the only PRECISE moment to drop an entry is
+    /// when its process exits - which is also the moment Windows may hand that
+    /// PID to something else. That notification has no producer today: the
+    /// script subsystem is not on any kernel process-notify feed, so the one
+    /// code path that erases these entries on exit is unreachable. An explicit
+    /// cap is therefore what keeps the map bounded, and it must not be removed
+    /// on the grounds that "the cleanup handles it" - the cleanup depends on an
+    /// event that can also simply be dropped by the driver's queue under load.
+    ///
+    /// Sized to match MAX_SESSIONS above: both bound a per-process map owned by
+    /// this module. Reaching this cap means thousands of distinct processes have
+    /// each had an AMSI bypass detected, which is a state worth alarming on
+    /// rather than silently accommodating - hence the eviction counter and the
+    /// rate-limited error beside it.
+    inline constexpr size_t MAX_BYPASS_DETECTIONS = 4096;
+
     /// @brief Maximum scan cache entries (hash → verdict)
     inline constexpr size_t MAX_SCAN_CACHE_ENTRIES = 8192;
 
@@ -517,6 +535,10 @@ struct AMSIStatistics {
     std::atomic<uint64_t> bypassesRepaired{0};
     std::atomic<uint64_t> integrityChecks{0};
     std::atomic<uint64_t> integrityFailures{0};
+    /// @brief Bypass records dropped because the retention cap was reached.
+    ///        Non-zero means a real detection record was discarded, so this is
+    ///        a lost-evidence counter, not a capacity statistic.
+    std::atomic<uint64_t> bypassDetectionsEvicted{0};
     std::atomic<uint64_t> totalBytesScanned{0};
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
@@ -538,6 +560,7 @@ struct AMSIStatisticsSnapshot {
     uint64_t bypassesRepaired = 0;
     uint64_t integrityChecks = 0;
     uint64_t integrityFailures = 0;
+    uint64_t bypassDetectionsEvicted = 0;
     uint64_t totalBytesScanned = 0;
     uint64_t cacheHits = 0;
     uint64_t cacheMisses = 0;

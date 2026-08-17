@@ -122,6 +122,16 @@ RANSOMWARE_WIRING_CPP_PATH = (
     ROOT / "src/PhantomCore/RansomwareProtection/RansomwareWiring.cpp"
 )
 
+# The AMSI provider. It tracked "this process attempted an AMSI bypass" in a
+# parallel set AND map - two structures for one fact - whose only eraser was a
+# process-exit branch that has no feed, while a deque in the SAME locked block
+# was explicitly bounded. So the pair grew without limit under live producers,
+# and the two had already drifted: the cross-process detector determined the
+# technique, put it in the event it raised, then recorded set membership only,
+# so the technique accessor answered Unknown for a bypass it had just named.
+AMSI_INTEGRATION_CPP_PATH = ROOT / "src/PhantomCore/Scripts/AMSIIntegration.cpp"
+AMSI_INTEGRATION_HPP_PATH = ROOT / "src/PhantomCore/Scripts/AMSIIntegration.hpp"
+
 # The test binary's entry point. It owns the temporary-file sandbox, and that
 # ownership is asserted here because the runtime guard inside it can be deleted
 # together with the thing it guards.
@@ -3998,6 +4008,152 @@ class MessageTypeNumberingContractTests(unittest.TestCase):
                 "the dispatch table's 64 slots are once again a wider set than "
                 "the 45 types this enum defines.",
             )
+
+
+class AmsiBypassRetentionContractTests(unittest.TestCase):
+    """One fact in one structure, and a PID-keyed map that cannot grow forever.
+
+    None of this is reachable behaviourally: putting a record into the map
+    requires real AMSI tampering in a real process, and the two public readers
+    have no callers yet. So the enforceable invariants are structural, the same
+    way the exploit tier's residual block claims are.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp_raw = read_source(AMSI_INTEGRATION_CPP_PATH)
+        cls.hpp_raw = read_source(AMSI_INTEGRATION_HPP_PATH)
+        # The comments here necessarily NAME every symbol asserted below,
+        # because they explain the defect being prevented. A comment-blind
+        # count is therefore guaranteed to false-positive. Strip first.
+        cls.cpp = strip_c_comments(cls.cpp_raw)
+        cls.hpp = strip_c_comments(cls.hpp_raw)
+
+    def test_bypass_state_lives_in_exactly_one_structure(self):
+        offenders = [
+            name
+            for name in ("m_bypassDetectedProcesses", "m_detectedBypassTechniques")
+            if name in self.cpp or name in self.hpp
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "AMSI bypass state is tracked in a parallel set/map pair again. Two "
+            "structures holding one fact is precisely how the technique "
+            "accessor came to answer Unknown for a bypass whose technique the "
+            "cross-process detector had already determined and logged.",
+        )
+        self.assertGreater(
+            self.cpp.count("m_bypassDetections"),
+            0,
+            "The unified bypass-detection record is gone, so this guard can no "
+            "longer speak for the invariant it exists to hold.",
+        )
+
+    def test_the_bypass_map_has_exactly_one_writer(self):
+        inserts = re.findall(
+            r"m_bypassDetections\s*\.\s*(?:emplace|insert)\s*\(", self.cpp
+        )
+        self.assertEqual(
+            len(inserts),
+            1,
+            f"Expected exactly one insertion site for m_bypassDetections, found "
+            f"{len(inserts)}. A retention cap can only be enforced where "
+            "insertion happens; two inline inserts with no bound between them "
+            "is the state this replaced.",
+        )
+        body = extract_c_function(self.cpp, "void RecordBypassDetection_Locked")
+        self.assertEqual(
+            body.count("m_bypassDetections.emplace"),
+            1,
+            "The single insertion site is no longer inside "
+            "RecordBypassDetection_Locked, so the cap no longer governs it.",
+        )
+
+    def test_the_cap_is_enforced_and_its_losses_are_counted(self):
+        body = extract_c_function(self.cpp, "void RecordBypassDetection_Locked")
+        governs = re.search(
+            r"m_bypassDetections\s*\.\s*size\(\)\s*>=\s*"
+            r"AMSIConstants::MAX_BYPASS_DETECTIONS",
+            body,
+        )
+        self.assertTrue(
+            bool(governs),
+            "The cap constant no longer governs the size comparison in "
+            "RecordBypassDetection_Locked. Merely naming it in a log line "
+            "would satisfy a weaker check while the comparison used something "
+            "else, leaving the map unbounded.",
+        )
+        self.assertEqual(
+            body.count("bypassDetectionsEvicted.fetch_add"),
+            1,
+            "Eviction at the cap discards a real detection record, so it must "
+            "be counted exactly once where it happens. An uncounted eviction "
+            "leaves the map looking healthy while evidence disappears.",
+        )
+        self.assertEqual(
+            self.hpp.count("MAX_BYPASS_DETECTIONS"),
+            1,
+            "The bound must stay one named constant in AMSIConstants rather "
+            "than a literal at the use site.",
+        )
+
+    def test_the_eviction_counter_cannot_become_a_structural_zero(self):
+        self.assertEqual(
+            self.hpp.count("bypassDetectionsEvicted"),
+            2,
+            "bypassDetectionsEvicted must be declared in BOTH AMSIStatistics "
+            "and AMSIStatisticsSnapshot. Present in only one means every "
+            "public reader sees zero regardless of how much was discarded.",
+        )
+        required = (
+            (
+                "bypassDetectionsEvicted.store(0",
+                "Reset() would leave a pre-reset value behind",
+            ),
+            (
+                "snapshot.bypassDetectionsEvicted",
+                "the snapshot copy would drop it, so it would read zero to "
+                "every caller of GetStatistics()",
+            ),
+            (
+                '\\"bypassDetectionsEvicted\\":',
+                "it would never reach an operator through ToJson",
+            ),
+        )
+        missing = [needle for needle, _ in required if needle not in self.cpp]
+        self.assertEqual(
+            missing,
+            [],
+            "bypassDetectionsEvicted is absent from a required plumbing site; "
+            "consequences in order: "
+            + "; ".join(why for _, why in required),
+        )
+
+    def test_a_known_technique_is_recorded_not_discarded(self):
+        self.assertEqual(
+            self.cpp.count("RecordBypassDetection_Locked(pid, event.techniques)"),
+            1,
+            "The cross-process bypass site no longer records the technique it "
+            "determined. It sets event.techniques, raises an alert carrying it, "
+            "and if it then records bare membership the technique accessor "
+            "answers Unknown for a bypass that was fully identified.",
+        )
+
+    def test_a_dead_process_loses_its_bypass_record(self):
+        paired = re.findall(
+            r"m_monitoredProcesses\s*\.\s*erase\(pid\);\s*"
+            r"m_bypassDetections\s*\.\s*erase\(pid\);",
+            self.cpp,
+        )
+        self.assertEqual(
+            len(paired),
+            1,
+            "The bypass record is no longer pruned at the site that already "
+            "established the process is gone. That is the only live path where "
+            "liveness is known for free, so dropping it means a record can "
+            "outlive its process and be inherited by a recycled PID.",
+        )
 
 
 if __name__ == "__main__":
