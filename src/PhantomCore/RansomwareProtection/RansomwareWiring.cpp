@@ -244,9 +244,31 @@ void DispatchProcessNotify(std::uint32_t pid,
     // attempt by type, records it, attributes it to MITRE T1490 and raises the
     // Critical alert. It was absent from this fan-out while its Init and
     // Shutdown were both called, so it reported itself as an online module
-    // with no feed - and BackupProtector, which matches overlapping commands,
-    // only writes a warning line on a hit. Without this call a T1490 attempt
-    // was visible nowhere but that one log line.
+    // with no feed.
+    //
+    // CORRECTED BY MEASUREMENT. This comment used to say that BackupProtector
+    // "only writes a warning line on a hit" and that without this call a T1490
+    // attempt "was visible nowhere but that one log line". Both are false. The
+    // 6287c7fc commit message corrected the claim and left the wrong text here,
+    // which is worse than never having written it: this is the comment a reader
+    // consults to decide whether one of the two entries is redundant.
+    //
+    // What BackupProtector_OnProcessNotify above actually reaches is
+    // AnalyzeProcess, which consults QueryDecision, moves attemptsBlocked,
+    // byThreatType and vssDeletesBlocked, raises its own alert, records
+    // backup_threat_blocked telemetry, and calls ExecuteTermination when the
+    // action resolves to BlockKill. Its patterns already cover
+    // vssadmin_delete_shadows, vssadmin_resize_shadowstorage,
+    // wmic_shadowcopy_delete and powershell_wmi_shadow_delete.
+    //
+    // So what THIS entry adds is not the only visibility. It adds the
+    // VSS-specific taxonomy (VSSAttackType rather than BackupThreatType),
+    // broader command coverage (diskshadow, Get-CimInstance, Remove-WmiObject,
+    // and base64 -EncodedCommand payloads decoded recursively), snapshot-count
+    // correlation, and it stops a module reporting itself online with no feed.
+    // Do NOT delete either entry on the assumption that the other covers it;
+    // the ownership boundary between them is task 169's decision, not an
+    // inference to be drawn from this comment.
     ShadowCopyProtector_OnProcessNotify(pid, parentPid, imagePath, commandLine, isCreation);
 
     // FileBackupManager commits any pending JIT backups when the source

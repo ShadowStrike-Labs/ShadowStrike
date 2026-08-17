@@ -54,10 +54,24 @@ void ShadowCopyProtector_Shutdown() noexcept {
 // below covers overlapping commands: the command patterns themselves are NOT
 // unique to this module - BackupProtector is wired and matches
 // vssadmin_delete_shadows, vssadmin_resize_shadowstorage,
-// wmic_shadowcopy_delete and powershell_wmi_shadow_delete. But its handler
-// does exactly one thing on a hit, SS_LOG_WARN, so before this hook existed a
-// T1490 Inhibit-System-Recovery attempt produced a single warning log line and
-// nothing an operator, the alert pipeline or the SOC could see.
+// wmic_shadowcopy_delete and powershell_wmi_shadow_delete.
+//
+// CORRECTED BY MEASUREMENT. This block used to continue "But its handler does
+// exactly one thing on a hit, SS_LOG_WARN, so before this hook existed a T1490
+// Inhibit-System-Recovery attempt produced a single warning log line and
+// nothing an operator, the alert pipeline or the SOC could see." That was
+// written from reading BackupProtector's handler and not the function it calls,
+// and it is wrong. AnalyzeProcess consults QueryDecision, moves three counters,
+// raises its own alert, records backup_threat_blocked telemetry, and calls
+// ExecuteTermination when the action resolves to BlockKill. A T1490 attempt was
+// therefore already alerted, counted, telemetered and conditionally enforced
+// before this hook existed.
+//
+// WHAT THIS HOOK GENUINELY RESTORES, stated without the overclaim: the
+// VSS-specific attack taxonomy, command coverage BackupProtector does not have
+// (diskshadow, Get-CimInstance, Remove-WmiObject, recursive base64 decoding),
+// snapshot-count correlation, and the removal of a module that ran its Init and
+// Shutdown and reported itself online while its analyzer had no feed at all.
 //
 // NO ENFORCEMENT IS NEWLY ENABLED. DispatchProcessNotify is void and
 // RealTimeProtection returns Allow immediately after calling it, so the Block
