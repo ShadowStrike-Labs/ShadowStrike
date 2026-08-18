@@ -1027,9 +1027,9 @@ TEST(ThreatIntelExporter_Export, JSON_UnicodeHandling) {
 	options.fields = ExportFields::Type | ExportFields::Value;
 
 	TestStringPool pool;
-	// UTF-8 string with Unicode characters (Trademark™, Euro€, Chinese中文, Emoji🔥)
+	// UTF-8 string with Unicode characters (Trademark U+2122, Euro U+20AC, Chinese U+4E2D U+6587, Emoji U+1F525)
 	const std::string unicode = std::string(
-		reinterpret_cast<const char*>(u8"Hello™€中文🔥")
+		reinterpret_cast<const char*>(u8"Hello\u2122\u20AC\u4E2D\u6587\U0001F525")
 	);
 	const uint64_t off = pool.Put(unicode);
 

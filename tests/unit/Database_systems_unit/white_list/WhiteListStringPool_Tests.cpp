@@ -1211,7 +1211,7 @@ TEST_F(StringPoolTest, AddString_UTF8MultiByte_Success) {
     
     // UTF-8 multi-byte characters (Japanese, Emoji, etc.)
     // Using raw UTF-8 bytes to avoid C++20 char8_t issues
-    const char utf8Raw[] = "Hello\xe4\xb8\x96\xe7\x95\x8c\xf0\x9f\x8c\x8d"; // "Hello世界🌍"
+    const char utf8Raw[] = "Hello\xe4\xb8\x96\xe7\x95\x8c\xf0\x9f\x8c\x8d"; // "Hello" + U+4E16 U+754C U+1F30D
     std::string utf8Str(utf8Raw);
     auto offset = pool->AddString(utf8Str);
     
@@ -1241,7 +1241,7 @@ TEST_F(StringPoolTest, AddWideString_SurrogatePairs_Success) {
     InitializeWritable();
     
     // Wide string with characters outside BMP (surrogate pairs on Windows)
-    std::wstring wideStr = L"Test\U0001F600\U0001F4BB"; // Emoji: 😀💻
+    std::wstring wideStr = L"Test\U0001F600\U0001F4BB"; // Emoji: U+1F600 U+1F4BB
     auto offset = pool->AddWideString(wideStr);
     
     ASSERT_TRUE(offset.has_value());

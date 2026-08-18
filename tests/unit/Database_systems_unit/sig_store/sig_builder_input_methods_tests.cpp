@@ -1664,7 +1664,7 @@ TEST_F(SignatureBuilderInputTest, AddHash_UnicodeInDescription_ShouldHandle) {
     input.hash = CreateValidMD5();
     input.name = "UnicodeTest";
     input.threatLevel = ThreatLevel::Medium;
-    input.description = std::string(reinterpret_cast<const char*>(u8"Unicode test: 你好世界 🔒"));//UTF-8
+    input.description = std::string(reinterpret_cast<const char*>(u8"Unicode test: \u4F60\u597D\u4E16\u754C \U0001F512"));// UTF-8; escaped so the bytes cannot depend on the source code page
 
     // ACT
     StoreError result = builder->AddHash(input);

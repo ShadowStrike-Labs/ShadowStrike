@@ -6139,5 +6139,204 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
         )
 
 
+class TestVectorEncodingContractTests(unittest.TestCase):
+    """Pins the encoding form of the deliberate Unicode test vectors.
+
+    WHY THE ESCAPE FORM IS REQUIRED, and it is not a style preference.  No product
+    project passes /utf-8 and these files carry no BOM, so MSVC decodes the source
+    through the active code page (1254 on the machine this was measured on).  For a
+    WIDE literal that produces mojibake, and because each of these tests writes a
+    value and then reads the same literal back, the comparison agreed with itself and
+    passed while carrying corrupted content - a test that cannot fail for the reason
+    it exists.  For a u8 literal the mojibake is then re-encoded to UTF-8, so the
+    bytes are wrong in a second way.  An escape is decoded by the compiler rather
+    than by the code page, so it is correct under either resolution of task 193.
+
+    THE NARROW CASE IS THE OPPOSITE AND MUST NOT BE "FIXED" TO MATCH.  An ordinary
+    narrow literal round-trips losslessly (decode via the code page, encode via the
+    same code page), so its bytes are already right.  Writing \\uXXXX there asks the
+    compiler to represent a codepoint the code page cannot hold: that is warning
+    C4566 and a substitution character, i.e. it would BREAK a passing test.  Narrow
+    vectors therefore use explicit \\xNN byte escapes, which state the exact bytes and
+    remove the raw characters without changing them.  JSONUtils' input is also a RAW
+    literal, where escape sequences are not processed at all.
+
+    SCOPE.  This guard covers non-BMP codepoints only.  It deliberately does NOT
+    forbid non-ASCII generally: 186 characters in WhiteListPatternIndex_Tests.cpp and
+    19 in WhiteListStringPool_Tests.cpp are wide literals belonging to task 193, and
+    17 in CacheManager_Tests.cpp are U+2705 glyphs belonging to task 208.  A guard
+    that cannot pass is a guard nobody keeps, so those are ratcheted rather than
+    banned - the ceilings may fall, never rise.
+    """
+
+    _SUFFIXES = (".cpp", ".hpp", ".h", ".c")
+
+    # Files this change made pure ASCII.  Re-introducing any raw non-ASCII character
+    # into one of them fails here.
+    _MUST_STAY_ASCII = (
+        "tests/unit/Database_systems_unit/sig_store/sig_builder_input_methods_tests.cpp",
+        "tests/unit/Database_systems_unit/threat_intel/ThreatIntelExporter_Tests.cpp",
+        "tests/unit/Database_systems_unit/configuration_db_tests.cpp",
+        "tests/unit/utils_unit/JSONUtils_Tests.cpp",
+    )
+
+    # Measured non-ASCII population that legitimately remains, with its owning task.
+    # These are CEILINGS: tasks 193 and 208 may reduce them without editing this test.
+    _NON_ASCII_CEILING = {
+        "tests/unit/Database_systems_unit/white_list/WhiteListPatternIndex_Tests.cpp": 186,
+        "tests/unit/Database_systems_unit/white_list/WhiteListStringPool_Tests.cpp": 19,
+        "tests/unit/utils_unit/CacheManager_Tests.cpp": 17,
+    }
+
+    # The value-carrying literals corrected here.  A bare "no astral codepoint" rule
+    # would also be satisfied by deleting the test, so each literal is pinned.
+    _REQUIRED_VECTORS = (
+        (
+            "tests/unit/Database_systems_unit/sig_store/sig_builder_input_methods_tests.cpp",
+            r'u8"Unicode test: \u4F60\u597D\u4E16\u754C \U0001F512"',
+            1,
+        ),
+        (
+            "tests/unit/Database_systems_unit/threat_intel/ThreatIntelExporter_Tests.cpp",
+            r'u8"Hello\u2122\u20AC\u4E2D\u6587\U0001F525"',
+            1,
+        ),
+        (
+            "tests/unit/Database_systems_unit/white_list/WhiteListPatternIndex_Tests.cpp",
+            r'L"C:\\Folder\U0001F4C1\\File\U0001F4C4.txt"',
+            2,
+        ),
+        (
+            "tests/unit/Database_systems_unit/configuration_db_tests.cpp",
+            r'L"\u6D4B\u8BD5.\u30AD\u30FC"',
+            2,
+        ),
+        (
+            "tests/unit/Database_systems_unit/configuration_db_tests.cpp",
+            r'L"\u0417\u043D\u0430\u0447\u0435\u043D\u0438\u0435 \u0442\u0435\u0441\u0442 \U0001F389"',
+            2,
+        ),
+        (
+            "tests/unit/utils_unit/CacheManager_Tests.cpp",
+            r'L"\u952E_\u041A\u043B\u044E\u0447_\u0645\u0641\u062A\u0627\u062D_\U0001F511"',
+            1,
+        ),
+    )
+
+    @classmethod
+    def _walk_test_sources(cls):
+        for path in sorted((ROOT / "tests").rglob("*")):
+            if path.is_file() and path.suffix in cls._SUFFIXES:
+                yield path
+
+    @staticmethod
+    def _read(rel: str) -> str:
+        return (ROOT / rel).read_text(encoding="utf-8")
+
+    def test_no_test_source_contains_a_non_bmp_codepoint(self) -> None:
+        offenders: list[str] = []
+        walked = 0
+        for path in self._walk_test_sources():
+            walked += 1
+            text = path.read_text(encoding="utf-8")
+            astral = sum(1 for ch in text if ord(ch) > 0xFFFF)
+            if astral:
+                rel = path.relative_to(ROOT).as_posix()
+                offenders.append(f"{rel}: {astral}")
+
+        # Anti-vacuity: a walk that finds nothing must not pass silently.
+        self.assertGreater(
+            walked,
+            200,
+            msg=f"expected to walk >200 test sources, walked {walked}",
+        )
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "a test source holds a non-BMP character directly. Write it as a "
+                r"\UXXXXXXXX escape in a wide or u8 literal, or as \xNN byte escapes "
+                f"in a narrow literal. offenders: {offenders}"
+            ),
+        )
+
+    def test_the_files_this_change_made_ascii_stay_ascii(self) -> None:
+        offenders: list[str] = []
+        for rel in self._MUST_STAY_ASCII:
+            text = self._read(rel)
+            count = sum(1 for ch in text if ord(ch) > 0x7F)
+            if count:
+                offenders.append(f"{rel}: {count}")
+        self.assertEqual(
+            [],
+            offenders,
+            msg=f"these files are required to remain pure ASCII. offenders: {offenders}",
+        )
+
+    def test_the_remaining_non_ascii_population_only_shrinks(self) -> None:
+        risen: list[str] = []
+        for rel, ceiling in self._NON_ASCII_CEILING.items():
+            text = self._read(rel)
+            count = sum(1 for ch in text if ord(ch) > 0x7F)
+            if count > ceiling:
+                risen.append(f"{rel}: {count} > ceiling {ceiling}")
+        self.assertEqual(
+            [],
+            risen,
+            msg=(
+                "the non-ASCII population of a known-affected file has grown. These "
+                "ceilings belong to tasks 193 and 208 and may only fall. "
+                f"offenders: {risen}"
+            ),
+        )
+
+    def test_the_corrected_test_vectors_keep_their_escape_form(self) -> None:
+        missing: list[str] = []
+        for rel, literal, expected in self._REQUIRED_VECTORS:
+            found = self._read(rel).count(literal)
+            if found != expected:
+                missing.append(f"{rel}: found {found} of expected {expected} -> {literal}")
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "an escaped Unicode test vector was removed or rewritten. Deleting the "
+                "vector rather than escaping it would satisfy the non-BMP rule while "
+                f"losing the coverage. offenders: {missing}"
+            ),
+        )
+
+    def test_the_narrow_json_vectors_use_byte_escapes_not_universal_names(self) -> None:
+        rel = "tests/unit/utils_unit/JSONUtils_Tests.cpp"
+        text = self._read(rel)
+
+        byte_form = r"\xe4\xb8\x96\xe7\x95\x8c \xf0\x9f\x8c\x8d"
+        self.assertEqual(
+            2,
+            text.count(byte_form),
+            msg=(
+                "both narrow JSON vectors must carry the same explicit UTF-8 bytes; "
+                "the parser input and the expected value have to agree byte for byte"
+            ),
+        )
+
+        # A universal-character-name here is warning C4566 plus a substitution
+        # character, so it would break this passing test rather than correct it.
+        offenders = [
+            line.strip()
+            for line in text.splitlines()
+            if ("Hello" in line and (r"\u4E16" in line or r"\U0001F30D" in line))
+        ]
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "a narrow literal must not use a universal-character-name: code page "
+                "1254 cannot represent these codepoints, so MSVC warns C4566 and "
+                f"substitutes. Use the byte escapes instead. offenders: {offenders}"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

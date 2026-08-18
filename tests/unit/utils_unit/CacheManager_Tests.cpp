@@ -1044,7 +1044,7 @@ TEST_F(CacheManagerTest, EdgeCase_UnicodeKeys) {
     auto& cm = CacheManager::Instance();
     cm.Initialize(testDir);
     
-    std::wstring unicodeKey = L"键_Ключ_مفتاح_🔑";
+    std::wstring unicodeKey = L"\u952E_\u041A\u043B\u044E\u0447_\u0645\u0641\u062A\u0627\u062D_\U0001F511";
     ASSERT_TRUE(cm.PutStringW(unicodeKey, L"unicode_value", std::chrono::hours(1)));
     
     std::wstring result;

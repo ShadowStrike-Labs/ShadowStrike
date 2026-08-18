@@ -1839,9 +1839,9 @@ TEST_F(PathIndexTest, Unicode_EmojiInPath) {
     auto index = CreateWritableIndex();
     
     // Some systems might have emoji in path names
-    InsertAndVerify(*index, L"C:\\Folder📁\\File📄.txt", PathMatchMode::Exact, 1);
+    InsertAndVerify(*index, L"C:\\Folder\U0001F4C1\\File\U0001F4C4.txt", PathMatchMode::Exact, 1);
     
-    EXPECT_TRUE(index->Contains(L"C:\\Folder📁\\File📄.txt", PathMatchMode::Exact));
+    EXPECT_TRUE(index->Contains(L"C:\\Folder\U0001F4C1\\File\U0001F4C4.txt", PathMatchMode::Exact));
 }
 
 // ============================================================================

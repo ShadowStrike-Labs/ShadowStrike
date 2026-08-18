@@ -769,10 +769,10 @@ TEST_F(ConfigurationDBTest, UnicodeKeysAndValuesWork) {
     EXPECT_TRUE(InitializeConfigDB());
 
     DatabaseError err;
-    EXPECT_TRUE(ConfigurationDB::Instance().SetString(L"测试.キー", L"Значение тест 🎉",
+    EXPECT_TRUE(ConfigurationDB::Instance().SetString(L"\u6D4B\u8BD5.\u30AD\u30FC", L"\u0417\u043D\u0430\u0447\u0435\u043D\u0438\u0435 \u0442\u0435\u0441\u0442 \U0001F389",
         ConfigurationDB::ConfigScope::Global, L"Test", &err));
 
-    EXPECT_EQ(ConfigurationDB::Instance().GetString(L"测试.キー"), L"Значение тест 🎉");
+    EXPECT_EQ(ConfigurationDB::Instance().GetString(L"\u6D4B\u8BD5.\u30AD\u30FC"), L"\u0417\u043D\u0430\u0447\u0435\u043D\u0438\u0435 \u0442\u0435\u0441\u0442 \U0001F389");
 }
 
 // ============================================================================

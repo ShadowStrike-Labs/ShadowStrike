@@ -167,11 +167,11 @@ TEST_F(JSONUtilsTest, Parse_NestedDepthLimit) {
 
 TEST_F(JSONUtilsTest, Parse_Unicode) {
     SS_LOG_INFO(L"JSONUtils_Tests", L"[Parse_Unicode] Testing...");
-    std::string jsonText = R"({"text":"Hello 世界 🌍"})";
+    std::string jsonText = "{\"text\":\"Hello \xe4\xb8\x96\xe7\x95\x8c \xf0\x9f\x8c\x8d\"}"; // UTF-8 bytes for U+4E16 U+754C U+1F30D
     Json j;
     
     ASSERT_TRUE(Parse(jsonText, j));
-    EXPECT_EQ(j["text"], "Hello 世界 🌍");
+    EXPECT_EQ(j["text"], "Hello \xe4\xb8\x96\xe7\x95\x8c \xf0\x9f\x8c\x8d"); // identical bytes to jsonText
 }
 
 // ============================================================================
