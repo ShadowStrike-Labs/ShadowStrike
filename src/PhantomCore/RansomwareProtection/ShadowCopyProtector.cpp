@@ -379,9 +379,20 @@ namespace {
     /**
      * @brief Case-insensitive search for @p needle in @p haystack from @p from.
      *
-     * Shares WideIContains' comparator so the two cannot disagree about what
-     * "contains" means, and returns a POSITION, which the flag scan below needs
-     * in order to apply the complete-token rule.
+     * Case-insensitive by its own comparison below, and deliberately distinct
+     * from FoldedContains(): this one runs against the case-PRESERVING command
+     * line, because commit 617978a3 established that the base64 payload
+     * following an -EncodedCommand flag must be read with its case intact.
+     * It returns a POSITION, which the flag scan below needs in order to apply
+     * the complete-token rule.
+     *
+     * @note An earlier comment here claimed this "shares WideIContains'
+     *       comparator so the two cannot disagree about what contains means".
+     *       That was never true - the loop below has always been a separate
+     *       implementation - and the helper it named no longer exists. Two
+     *       implementations asserting a shared contract that nothing enforces
+     *       is the defect class of tasks 42 and 56, so the claim is removed
+     *       rather than restated.
      */
     [[nodiscard]] size_t WideIFind(std::wstring_view haystack,
                                    std::wstring_view needle,
@@ -524,34 +535,7 @@ namespace {
             TRUE) == CSTR_EQUAL;
     }
 
-    /**
-     * @brief Case-insensitive substring search.
-     *
-     * Uses `std::towlower` for per-character lower-casing. The previous
-     * implementation relied on the documented but fragile Windows trick
-     * of passing a single character zero-extended into LPWSTR to
-     * `::CharLowerW`, which provokes /W4 /WX reinterpret-cast scrutiny
-     * and is not portable across MUI / locale changes. `towlower` from
-     * `<cwctype>` is locale-aware via the C global locale (which the
-     * ShadowStrike service explicitly leaves at "C" for deterministic
-     * detection) and avoids the cast entirely.
-     */
-    [[nodiscard]] bool WideIContains(std::wstring_view haystack, std::wstring_view needle) noexcept {
-        if (needle.empty()) return true;
-        if (haystack.size() < needle.size()) return false;
-
-        auto it = std::search(
-            haystack.begin(), haystack.end(),
-            needle.begin(), needle.end(),
-            [](wchar_t a, wchar_t b) noexcept {
-                return std::towlower(static_cast<wint_t>(a)) ==
-                       std::towlower(static_cast<wint_t>(b));
-            }
-        );
-        return it != haystack.end();
-    }
-
-    /**
+        /**
      * @brief Normalize a command line for analysis:
      *        - Strip carets
      *        - Strip inner quotes
@@ -581,12 +565,82 @@ namespace {
     }
 
     /**
-     * @brief Convert wstring to lowercase (in-place).
+     * @brief ASCII-only case fold for one wide character.
+     *
+     * Locale-independent by construction: only A-Z is touched and every other
+     * code unit passes through unchanged. Mirrors ProcessCreationMonitor.cpp's
+     * AsciiToLower, which was introduced for the same reason and documents the
+     * same hazard.
+     */
+    [[nodiscard]] constexpr wchar_t AsciiToLower(wchar_t c) noexcept {
+        return (c >= L'A' && c <= L'Z')
+            ? static_cast<wchar_t>(c + (L'a' - L'A'))
+            : c;
+    }
+
+    /**
+     * @brief Case-fold a command line in place for keyword matching.
+     *
+     * TWO PASSES, AND THE ORDER IS LOAD-BEARING.
+     *
+     * Pass 1 folds ASCII A-Z with no reference to any locale. Pass 2 hands the
+     * result to ::CharLowerBuffW, which folds the non-ASCII remainder using the
+     * user default locale.
+     *
+     * Running ASCII first is what makes every detection keyword in this file
+     * locale-independent. ::CharLowerBuffW alone is not: it honours the user
+     * default locale, so on a Turkish-locale endpoint it maps L'I' to the
+     * dotless L'\u0131', and "VSSADMIN DELETE SHADOWS" folds to
+     * "vssadm\u0131n delete shadows" - which matches none of the ASCII keywords
+     * below. Every T1490 detection in this module would silently miss on that
+     * endpoint. ProcessCreationMonitor.cpp documents the identical hazard for
+     * its path patterns and reaches the same conclusion.
+     *
+     * Keeping ::CharLowerBuffW as pass 2 is equally deliberate: replacing it
+     * with an ASCII-only fold would lose the characters that Unicode folds INTO
+     * ASCII. U+212A KELVIN SIGN lowercases to ASCII 'k' and "diskshadow"
+     * contains a 'k', so an ASCII-only fold would stop matching a command line
+     * carrying that substitution. Running both passes is strictly stronger than
+     * either pass alone, which is why neither was removed.
+     *
+     * @warning Every keyword compared against the folded result must be
+     *          lowercase ASCII, because FoldedContains() compares exactly.
      */
     void ToLowerInPlace(std::wstring& str) noexcept {
-        if (!str.empty()) {
-            ::CharLowerBuffW(str.data(), static_cast<DWORD>(str.size()));
+        if (str.empty()) return;
+
+        for (wchar_t& ch : str) {
+            ch = AsciiToLower(ch);
         }
+        ::CharLowerBuffW(str.data(), static_cast<DWORD>(str.size()));
+    }
+
+    /**
+     * @brief Containment test against a haystack ALREADY folded by ToLowerInPlace().
+     *
+     * This is an EXACT search, not a case-insensitive one, and that is the
+     * point. The previous implementation ran std::search with a comparator that
+     * called std::towlower on BOTH sides at every character position - over a
+     * haystack that had already been folded, against needles that are already
+     * lowercase. Both towlower calls were therefore no-ops, repeated across 48
+     * call sites over a command line Windows permits to reach 32,767
+     * characters, inside a search whose function-object comparator cannot
+     * vectorise. Measured at 2.84 ms against this module's own declared <500us
+     * budget for OnProcessCreation (task 191), on the callback the kernel
+     * blocks CreateProcess on.
+     *
+     * Dropping the redundant fold is provably behaviour-preserving here rather
+     * than merely faster: ToLowerInPlace has already folded the haystack, so
+     * towlower(haystack[i]) == haystack[i] at every position, and the needles
+     * are lowercase ASCII, so towlower(needle[i]) == needle[i]. The comparison
+     * the old code performed reduces exactly to the one performed here.
+     *
+     * @param foldedHaystack       Output of ToLowerInPlace(). NOT folded again here.
+     * @param lowercaseAsciiNeedle Must contain no uppercase character.
+     */
+    [[nodiscard]] inline bool FoldedContains(std::wstring_view foldedHaystack,
+                                             std::wstring_view lowercaseAsciiNeedle) noexcept {
+        return foldedHaystack.find(lowercaseAsciiNeedle) != std::wstring_view::npos;
     }
 
 } // anonymous namespace
@@ -692,13 +746,13 @@ public:
      */
     [[nodiscard]] bool IsSafeCommand(const std::wstring& lowerCmd) const noexcept {
         for (const auto& pattern : SAFE_COMMAND_PATTERNS) {
-            if (WideIContains(lowerCmd, pattern.keyword1) &&
-                WideIContains(lowerCmd, pattern.keyword2)) {
+            if (FoldedContains(lowerCmd, pattern.keyword1) &&
+                FoldedContains(lowerCmd, pattern.keyword2)) {
                 // "vssadmin list" is safe. But "vssadmin list && vssadmin delete" is NOT safe.
                 // Check that no dangerous keyword follows.
-                if (!WideIContains(lowerCmd, L"delete") &&
-                    !WideIContains(lowerCmd, L"resize") &&
-                    !WideIContains(lowerCmd, L"remove")) {
+                if (!FoldedContains(lowerCmd, L"delete") &&
+                    !FoldedContains(lowerCmd, L"resize") &&
+                    !FoldedContains(lowerCmd, L"remove")) {
                     return true;
                 }
             }
@@ -730,76 +784,76 @@ public:
         }
 
         // Phase 3: Check for vssadmin delete shadows
-        if (WideIContains(lower, L"vssadmin") &&
-            (WideIContains(lower, L"delete") || WideIContains(lower, L"shadows"))) {
-            if (WideIContains(lower, L"delete shadows") || WideIContains(lower, L"delete shadow")) {
+        if (FoldedContains(lower, L"vssadmin") &&
+            (FoldedContains(lower, L"delete") || FoldedContains(lower, L"shadows"))) {
+            if (FoldedContains(lower, L"delete shadows") || FoldedContains(lower, L"delete shadow")) {
                 return VSSAttackType::CommandLineDelete;
             }
         }
 
         // Phase 4: Check for vssadmin resize shadowstorage (shrink attack)
-        if (WideIContains(lower, L"vssadmin") && WideIContains(lower, L"resize") &&
-            WideIContains(lower, L"shadowstorage")) {
+        if (FoldedContains(lower, L"vssadmin") && FoldedContains(lower, L"resize") &&
+            FoldedContains(lower, L"shadowstorage")) {
             return VSSAttackType::StorageResize;
         }
 
         // Phase 5: Check for WMIC shadow copy deletion
-        if (WideIContains(lower, L"wmic") && WideIContains(lower, L"shadowcopy") &&
-            WideIContains(lower, L"delete")) {
+        if (FoldedContains(lower, L"wmic") && FoldedContains(lower, L"shadowcopy") &&
+            FoldedContains(lower, L"delete")) {
             return VSSAttackType::WMIDelete;
         }
 
         // Phase 6: Check for PowerShell WMI deletion
-        if ((WideIContains(lower, L"get-wmiobject") || WideIContains(lower, L"gwmi")) &&
-            WideIContains(lower, L"win32_shadowcopy")) {
+        if ((FoldedContains(lower, L"get-wmiobject") || FoldedContains(lower, L"gwmi")) &&
+            FoldedContains(lower, L"win32_shadowcopy")) {
             // "Get-WmiObject Win32_ShadowCopy | ForEach-Object { $_.Delete() }"
-            if (WideIContains(lower, L"delete") || WideIContains(lower, L"remove")) {
+            if (FoldedContains(lower, L"delete") || FoldedContains(lower, L"remove")) {
                 return VSSAttackType::WMIDelete;
             }
         }
 
         // Phase 7: Check for Remove-WmiObject (direct WMI deletion)
-        if (WideIContains(lower, L"remove-wmiobject") &&
-            WideIContains(lower, L"win32_shadowcopy")) {
+        if (FoldedContains(lower, L"remove-wmiobject") &&
+            FoldedContains(lower, L"win32_shadowcopy")) {
             return VSSAttackType::WMIDelete;
         }
 
         // Phase 8: Check for Get-CimInstance shadow copy deletion (modern PowerShell)
-        if (WideIContains(lower, L"get-ciminstance") &&
-            WideIContains(lower, L"win32_shadowcopy") &&
-            (WideIContains(lower, L"remove") || WideIContains(lower, L"delete"))) {
+        if (FoldedContains(lower, L"get-ciminstance") &&
+            FoldedContains(lower, L"win32_shadowcopy") &&
+            (FoldedContains(lower, L"remove") || FoldedContains(lower, L"delete"))) {
             return VSSAttackType::WMIDelete;
         }
 
         // Phase 9: Check for diskshadow.exe (script-based shadow manipulation)
-        if (WideIContains(lower, L"diskshadow")) {
-            if (WideIContains(lower, L"delete") || WideIContains(lower, L"/s")) {
+        if (FoldedContains(lower, L"diskshadow")) {
+            if (FoldedContains(lower, L"delete") || FoldedContains(lower, L"/s")) {
                 return VSSAttackType::CommandLineDelete;
             }
         }
 
         // Phase 10: Check for bcdedit recovery disable
-        if (WideIContains(lower, L"bcdedit")) {
-            if (WideIContains(lower, L"recoveryenabled") && WideIContains(lower, L"no")) {
+        if (FoldedContains(lower, L"bcdedit")) {
+            if (FoldedContains(lower, L"recoveryenabled") && FoldedContains(lower, L"no")) {
                 return VSSAttackType::RegistryModify;
             }
-            if (WideIContains(lower, L"ignoreallfailures")) {
+            if (FoldedContains(lower, L"ignoreallfailures")) {
                 return VSSAttackType::RegistryModify;
             }
-            if (WideIContains(lower, L"bootstatuspolicy")) {
+            if (FoldedContains(lower, L"bootstatuspolicy")) {
                 return VSSAttackType::RegistryModify;
             }
         }
 
         // Phase 11: Check for wbadmin catalog/backup deletion
-        if (WideIContains(lower, L"wbadmin") && WideIContains(lower, L"delete")) {
+        if (FoldedContains(lower, L"wbadmin") && FoldedContains(lower, L"delete")) {
             return VSSAttackType::CommandLineDelete;
         }
 
         // Phase 12: Check for PowerShell -EncodedCommand (base64 obfuscation)
         // This catches: powershell -e <base64>, powershell -enc <base64>,
         //               powershell -EncodedCommand <base64>
-        bool isPowerShell = WideIContains(lower, L"powershell") || WideIContains(lower, L"pwsh");
+        bool isPowerShell = FoldedContains(lower, L"powershell") || FoldedContains(lower, L"pwsh");
         if (isPowerShell) {
             // Extract from the CASE-PRESERVING normalized command line, never
             // from `lower`. Base64 is case-sensitive, so a payload taken from
@@ -837,21 +891,21 @@ public:
             }
 
             // Check for inline PowerShell shadow deletion even without -EncodedCommand
-            if (WideIContains(lower, L"win32_shadowcopy") &&
-                (WideIContains(lower, L"delete") || WideIContains(lower, L"remove"))) {
+            if (FoldedContains(lower, L"win32_shadowcopy") &&
+                (FoldedContains(lower, L"delete") || FoldedContains(lower, L"remove"))) {
                 return VSSAttackType::WMIDelete;
             }
         }
 
         // Phase 13: Check for sc.exe stopping VSS service
-        if (WideIContains(lower, L"sc") &&
-            (WideIContains(lower, L"stop vss") || WideIContains(lower, L"config vss"))) {
+        if (FoldedContains(lower, L"sc") &&
+            (FoldedContains(lower, L"stop vss") || FoldedContains(lower, L"config vss"))) {
             return VSSAttackType::ServiceStop;
         }
 
         // Phase 14: Check for net stop of VSS service
-        if (WideIContains(lower, L"net") && WideIContains(lower, L"stop") &&
-            WideIContains(lower, L"vss")) {
+        if (FoldedContains(lower, L"net") && FoldedContains(lower, L"stop") &&
+            FoldedContains(lower, L"vss")) {
             return VSSAttackType::ServiceStop;
         }
 

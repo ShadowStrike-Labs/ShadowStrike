@@ -494,38 +494,56 @@ TEST(ShadowCopyProtectorHotPathBudgetTests, TheBudgetHoldsAtTheLongestCommandLin
 
     std::cout << "[ hot path ] maximum-length benign command line ("
               << maxLength.size() << " chars): " << perCall
-              << " ns/call (declared budget " << kDeclaredBudgetNanos
-              << " ns - MEASURED VIOLATION, see comment)\n";
+              << " ns/call (declared budget " << kDeclaredBudgetNanos << " ns)\n";
 
-    // *** THIS INPUT DOES NOT MEET THE MODULE'S DECLARED CONTRACT AND THAT IS A
-    // FILED DEFECT, NOT AN ACCEPTED COST. Measured on this host: 2,837,605
-    // ns/call at 32,754 characters against the <500us the file header declares -
-    // 5.7x over. The four realistic cases above are enforced against the real
-    // 500us figure and meet it with 21x headroom; only length breaks it.
+    // THIS INPUT NOW MEETS THE MODULE'S DECLARED CONTRACT. It did not when this
+    // test was written, and the history is worth keeping because it is what
+    // justifies the margin below.
     //
-    // WHY THE CEILING BELOW IS NOT A WIDENED THRESHOLD: the 500us contract is
-    // still asserted, unchanged, in the test above. This case cannot assert it
-    // because the code does not currently satisfy it, and making a test pass by
-    // relaxing the number it exists to check is precisely what is forbidden. So
-    // this bound is a REGRESSION TRIPWIRE on a known, measured, filed defect: it
-    // catches the cost getting worse while the defect is open, and it must be
-    // TIGHTENED TO kDeclaredBudgetNanos in the same change that fixes the
-    // scaling - never left here as though 2.8 ms were acceptable.
+    // Measured on this host at 32,754 characters, same test code, same harness,
+    // only the library rebuilt:
+    //     before task 191's fix   2,837,605 ns/call   (5.7x OVER the 500us contract)
+    //     after                     235,440 ns/call   (2.1x UNDER it)
+    // The four realistic cases above improved by 2.6x to 10.9x on the same
+    // change. Nothing was skipped, truncated or deadlined to achieve it.
     //
-    // WHAT THE FIX IS NOT: truncating the scan at some length would let an
-    // attacker pad 32 KB of junk in FRONT of "vssadmin delete shadows" and evade
-    // classification entirely, which loses coverage rather than deferring it.
-    // Skipping phases on a deadline has the same effect. The root cause is that
-    // roughly fourteen phases each run an independent O(n*m) search over the
-    // whole string, so the honest fix is to make them share ONE pass - and this
-    // repository already contains a correct Aho-Corasick automaton built for
-    // exactly that, so the capability does not have to be written from scratch.
-    constexpr long long kKnownRegressionBoundNanos = 6LL * 1000LL * 1000LL;
-    EXPECT_LT(perCall, kKnownRegressionBoundNanos)
+    // WHAT THE FIX WAS: roughly fourteen phases each ran WideIContains over the
+    // whole string, and that helper was std::search with a comparator calling
+    // std::towlower on BOTH sides at every character position - over a haystack
+    // ToLowerInPlace had ALREADY folded, against needles that are already
+    // lowercase. Both folds were no-ops across all 48 call sites, and the
+    // function-object comparator prevented the search from vectorising. Removing
+    // the redundant fold reduced each phase to an exact std::wstring_view::find.
+    // It is behaviour-preserving by construction, not a tradeoff: see
+    // FoldedContains() in ShadowCopyProtector.cpp for the equivalence argument.
+    //
+    // THE CEILING BELOW IS THE REAL CONTRACT, NOT A TRIPWIRE. The previous
+    // 6 ms bound existed only because the code could not satisfy 500us; it was
+    // required to be tightened to kDeclaredBudgetNanos in the same change that
+    // fixed the scaling, and this is that change.
+    //
+    // THE MARGIN HERE IS THINNER THAN ABOVE AND THAT IS DELIBERATE: ~2.1x at
+    // maximum length against ~175x on realistic input. BestOfPerCallNanos takes
+    // the fastest of several samples, so interference can only inflate a reading,
+    // never deflate it - but if this assertion ever fails under load, treat it as
+    // evidence about a genuinely marginal worst case and measure the cost. DO NOT
+    // widen it: the number is taken from the module's own file header, so raising
+    // it here would make the test disagree with the contract it exists to check.
+    //
+    // WHAT A FUTURE FIX MUST STILL NOT DO, if this ever needs to be faster:
+    // truncating the scan at some length would let an attacker pad 32 KB of junk
+    // in FRONT of "vssadmin delete shadows" and evade classification entirely,
+    // and skipping phases on a deadline has the same effect. Both lose coverage
+    // rather than deferring it. If single-pass matching is ever wanted, note that
+    // the ~14 phases are CONJUNCTIONS rather than independent scans, so the
+    // repository's Aho-Corasick automaton is not a drop-in - it is byte-oriented
+    // with no case-insensitivity, while this path is wide and case-folding.
+    EXPECT_LT(perCall, kDeclaredBudgetNanos)
         << "A command line of " << maxLength.size() << " characters - a length "
         << "Windows permits and an attacker chooses - costs " << perCall
         << " ns in the analysis core alone, on the callback the kernel blocks "
-        << "CreateProcess on. That already violates the module's declared <500us "
-        << "contract and has now got WORSE than the 2.84 ms measured when this "
-        << "guard was written. Fix the per-phase scanning; do not raise this bound.";
+        << "CreateProcess on, against the <500us this module's file header "
+        << "declares. Task 191 brought this from 2,837,605 ns to 235,440 ns; a "
+        << "failure here means that gain has been lost. Fix the cost - do not "
+        << "raise this bound, which is copied from the header's own contract.";
 }

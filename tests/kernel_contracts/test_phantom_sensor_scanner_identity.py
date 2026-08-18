@@ -5542,5 +5542,137 @@ class BatchScanConcurrencyContractTests(unittest.TestCase):
         )
 
 
+class ShadowCopyFoldOrderContractTests(unittest.TestCase):
+    """Task 191: the analysis core's case fold and its keyword comparison.
+
+    NEITHER invariant below can fail on this build host, which is exactly why
+    both are pinned as source contracts rather than left to the behavioural
+    suite:
+
+      * The fold must run the ASCII pass FIRST and ::CharLowerBuffW SECOND.
+        Reversed, ::CharLowerBuffW maps L'I' to the dotless i (U+0131) under a
+        Turkish user default locale before the ASCII pass can canonicalise it,
+        so "VSSADMIN DELETE SHADOWS" folds to a string matching none of the
+        ASCII keywords and every T1490 detection in the module goes dark. On
+        this host the two folds AGREE - measured, ACP 1254 but LCID 1033 - so
+        no run here would fail. The miss appears only on a Turkish endpoint.
+
+      * Every keyword compared through FoldedContains() must be lowercase
+        ASCII. FoldedContains compares EXACTLY by design, so a single uppercase
+        character in a needle makes that phase permanently unmatchable while
+        raising nothing at all.
+
+    Both failures are silent, which is this codebase's signature failure mode.
+    """
+
+    def setUp(self) -> None:
+        # The explanatory comments in this region necessarily quote every symbol
+        # asserted below, including the retired WideIContains, so strip comments
+        # before counting anything or the assertions become self-satisfying.
+        self.src = strip_c_comments(read_source(SHADOW_COPY_PROTECTOR_CPP_PATH))
+
+    def test_the_ascii_fold_runs_before_the_locale_dependent_one(self) -> None:
+        body = extract_c_function(self.src, "ToLowerInPlace")
+        self.assertGreater(
+            len(body), 0, "ToLowerInPlace body could not be extracted")
+
+        ascii_at = body.find("AsciiToLower")
+        locale_at = body.find("CharLowerBuffW")
+
+        self.assertNotEqual(
+            ascii_at, -1,
+            "ToLowerInPlace no longer applies the ASCII fold. Without it "
+            "::CharLowerBuffW decides the fate of L'I' according to the user "
+            "default locale, and every ASCII keyword in this module stops "
+            "matching on a Turkish-locale endpoint.")
+        self.assertNotEqual(
+            locale_at, -1,
+            "ToLowerInPlace no longer calls ::CharLowerBuffW. An ASCII-only "
+            "fold loses the characters Unicode folds INTO ASCII - U+212A "
+            "KELVIN SIGN lowercases to 'k' and \"diskshadow\" contains a 'k' - "
+            "so removing this pass narrows detection.")
+        self.assertLess(
+            ascii_at, locale_at,
+            "ToLowerInPlace applies ::CharLowerBuffW at offset {} BEFORE the "
+            "ASCII fold at offset {}. The order is the whole point: the ASCII "
+            "pass must canonicalise A-Z while it is still ASCII, because once "
+            "a Turkish-locale ::CharLowerBuffW has turned L'I' into the "
+            "dotless i (U+0131) no later ASCII pass can recover it."
+            .format(locale_at, ascii_at))
+
+    def test_the_folded_comparison_never_folds_again(self) -> None:
+        body = extract_c_function(self.src, "FoldedContains")
+        self.assertIn(
+            ".find(", body,
+            "FoldedContains is no longer an exact find. It exists to be exact: "
+            "its haystack is already folded, so any per-character fold here is "
+            "the redundant work task 191 removed (2,837,605 ns -> 235,440 ns "
+            "at maximum command-line length).")
+
+        refolds = [needle for needle in ("towlower", "CharLowerBuffW",
+                                         "AsciiToLower", "std::search")
+                   if needle in body]
+        self.assertEqual(
+            [], refolds,
+            "FoldedContains has regained a per-character fold or comparator "
+            "search ({}). That reinstates the cost this guard exists to "
+            "prevent, on the callback the kernel blocks CreateProcess on."
+            .format(", ".join(refolds)))
+
+        self.assertEqual(
+            0, self.src.count("WideIContains"),
+            "WideIContains has returned. It was removed because every one of "
+            "its 48 call sites ran a towlower comparator over an already-"
+            "folded haystack; reintroducing it re-creates the 5.7x budget "
+            "violation task 191 closed.")
+
+    def test_every_folded_keyword_is_lowercase_ascii(self) -> None:
+        sites = re.findall(
+            r'FoldedContains\s*\(\s*\w+\s*,\s*L"([^"]*)"', self.src)
+        # Refuse to pass vacuously: if the walk stops finding call sites the
+        # guard has silently stopped guarding, which is worse than no guard.
+        self.assertGreaterEqual(
+            len(sites), 40,
+            "only {} FoldedContains literal call sites were found, so this "
+            "assertion is no longer inspecting the phases it was written for"
+            .format(len(sites)))
+
+        offenders = [lit for lit in sites if any(ch.isupper() for ch in lit)]
+        self.assertEqual(
+            [], offenders,
+            "these FoldedContains keywords contain an uppercase character: {}. "
+            "FoldedContains compares exactly against a folded haystack, so an "
+            "uppercase needle can never match and the phase using it is dead "
+            "without reporting anything."
+            .format(offenders))
+
+    def test_the_safe_command_table_is_lowercase_ascii(self) -> None:
+        # SAFE_COMMAND_PATTERNS supplies the only two NON-literal needles
+        # (keyword1 / keyword2). An uppercase entry there would stop
+        # IsSafeCommand recognising a benign "vssadmin list", turning it into a
+        # false T1490 conviction - a false positive on an administrative
+        # command, which is the opposite failure to the one above and worse for
+        # the operator.
+        start = self.src.find("SAFE_COMMAND_PATTERNS")
+        self.assertNotEqual(
+            start, -1, "SAFE_COMMAND_PATTERNS was not found")
+        window = self.src[start:start + 2000]
+        values = re.findall(r'L"([^"]*)"', window)
+        self.assertGreaterEqual(
+            len(values), 2,
+            "no keyword literals were found near SAFE_COMMAND_PATTERNS, so "
+            "this assertion is inspecting nothing")
+
+        offenders = [v for v in values if any(ch.isupper() for ch in v)]
+        self.assertEqual(
+            [], offenders,
+            "these SAFE_COMMAND_PATTERNS keywords contain an uppercase "
+            "character: {}. They are matched with FoldedContains against a "
+            "folded command line, so an uppercase entry silently stops the "
+            "safe-command allowance from ever firing."
+            .format(offenders))
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
