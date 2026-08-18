@@ -4,9 +4,9 @@
 // ===========================================================================
 #include "pch.h"
 #include "EDRConfigRegistration.hpp"
-#include "../../PhantomCore/Config/ConfigManager.hpp"
-#include "../../PhantomCore/Config/PolicyManager.hpp"
-#include "../../PhantomCore/Config/ProfileManager.hpp"
+#include "PhantomCore/Config/ConfigManager.hpp"
+#include "PhantomCore/Config/PolicyManager.hpp"
+#include "PhantomCore/Config/ProfileManager.hpp"
 
 namespace ShadowStrike::Products::PhantomEDR::Config {
 

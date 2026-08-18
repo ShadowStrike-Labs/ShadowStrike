@@ -143,11 +143,11 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS

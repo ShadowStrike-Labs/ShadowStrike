@@ -34,12 +34,12 @@
 
 #include "pch.h"
 #include "NetworkCapture.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
 
 #include <Windows.h>
 #include <Winsock2.h>

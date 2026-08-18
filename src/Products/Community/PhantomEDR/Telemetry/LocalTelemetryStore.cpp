@@ -52,7 +52,7 @@
 // ADDITIONAL INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
 
 #include <SQLiteCpp/SQLiteCpp.h>
 #include <nlohmann/json.hpp>

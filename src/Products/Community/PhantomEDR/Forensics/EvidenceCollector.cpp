@@ -71,12 +71,12 @@
 #include <nlohmann/json.hpp>
 
 // ShadowStrike infrastructure
-#include "../Utils/Logger.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../HashStore/HashStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
 
 // Windows-specific headers
 #ifdef _WIN32

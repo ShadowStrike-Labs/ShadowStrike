@@ -5827,5 +5827,138 @@ class CallbackVocabularyContractTests(unittest.TestCase):
 
 
 
+class PhantomEdrIncludeResolutionContractTests(unittest.TestCase):
+    """The PhantomEDR tree must not reach its dependencies with parent-relative includes.
+
+    THE DEFECT THIS GUARDS, measured rather than inferred. Twelve sources under
+    src/Products/Community/PhantomEDR spelled their shared-infrastructure includes
+    as "../Utils/<Header>.hpp", and a thirteenth used "../../PhantomCore/Config/..."
+    and "../<Store>/...". None of those can resolve:
+
+      * There is NO Utils directory under PhantomEDR. Nor is there one at any other
+        point a parent-relative path could land on - repo-root Utils, include/Utils,
+        src/Utils, src/Products/Utils and src/Products/Community/Utils were all
+        checked and none exists.
+      * The projects that compile these files search $(ProjectDir)include,
+        $(ProjectDir)include\\YARA and $(ProjectDir)src, so no include directory
+        makes a leading "../" resolve either.
+
+    The consequence was a FATAL C1083 - measured directly, not assumed:
+    compiling ArtifactExtractor.cpp through ShadowStrike.vcxproj exited 1 with
+    "C1083 ... '../Utils/Logger.hpp': No such file or directory" raised from
+    ArtifactExtractor.hpp:139. Because C1083 is fatal, every later error in those
+    translation units was invisible, which is why this subsystem's real defects went
+    unrecorded for so long.
+
+    THE CONTROL IS WHAT MAKES THE FIX PROVABLE. AssetInventory/AssetDatabase.cpp
+    sits in the SAME tree, is compiled by the SAME project with the SAME include
+    directories and the SAME toolset, and uses the "PhantomCore/Utils/..." form.
+    It compiles with exit 0 and zero errors. One spelling resolves and the other
+    cannot, with every other variable held constant.
+
+    WHY PhantomCore AND NOT PhantomHome, since several of these header names exist
+    under both: TimeUtils.hpp and DatabaseUtils.hpp exist ONLY under
+    src/PhantomCore/Utils, PhantomHome's Logger.hpp is a 418-byte stub declaring
+    none of the severities these files call, and PhantomEDR is a different product
+    from PhantomHome so depending on its Utils would be a cross-product edge. The
+    rest of this tree already agrees: 46 files reach PhantomCore this way.
+
+    WHY THIS GUARD IS DELIBERATELY NARROW. It pins the include CONVENTION and the
+    resolvability of the PhantomCore form. It does NOT assert that every include in
+    the tree resolves, because two files reach for a bare "sqlite3.h" that no search
+    path provides while the header actually sits at include/SQLiteCpp/sqlite3.h -
+    a separate defect with its own task. Widening this guard before that is fixed
+    would make it fail on the tree it ships with, and a guard that cannot pass is
+    a guard nobody keeps.
+    """
+
+    _EDR_ROOT = ROOT / "src" / "Products" / "Community" / "PhantomEDR"
+    _SRC_ROOT = ROOT / "src"
+    _SOURCE_SUFFIXES = (".cpp", ".hpp", ".h")
+
+    def _phantomedr_sources(self):
+        return sorted(
+            path
+            for path in self._EDR_ROOT.rglob("*")
+            if path.is_file() and path.suffix in self._SOURCE_SUFFIXES
+        )
+
+    def _quoted_includes(self, pattern):
+        """Yield (relative_path, line_number, include_target) for each match.
+
+        Comments are stripped FIRST. The explanatory comments added by the commit
+        that fixed this defect necessarily quote the retired "../Utils/" spelling,
+        so a comment-blind scan would report offenders that are prose.
+        """
+        compiled = re.compile(r'\s*#\s*include\s+"(' + pattern + r')"')
+        for path in self._phantomedr_sources():
+            code = strip_c_comments(read_source(path).lstrip("\ufeff"))
+            relative = path.relative_to(self._EDR_ROOT).as_posix()
+            for line_no, line in enumerate(code.splitlines(), start=1):
+                match = compiled.match(line)
+                if match:
+                    yield relative, line_no, match.group(1)
+
+    def test_no_phantomedr_source_reaches_a_dependency_with_a_parent_relative_include(self):
+        sources = self._phantomedr_sources()
+        self.assertGreaterEqual(
+            len(sources),
+            100,
+            "anti-vacuity: expected at least 100 sources under PhantomEDR, found "
+            f"{len(sources)}. A walk that finds nothing would satisfy the offender "
+            "assertion below while proving nothing at all.",
+        )
+
+        total = 0
+        offenders = []
+        for relative, line_no, target in self._quoted_includes(r"[^\"]+"):
+            total += 1
+            if target.startswith("../") or "/../" in target:
+                offenders.append(f"{relative}:{line_no} -> {target}")
+
+        self.assertGreaterEqual(
+            total,
+            150,
+            "anti-vacuity: expected at least 150 quoted includes across the "
+            f"PhantomEDR tree, found {total}.",
+        )
+        self.assertEqual(
+            [],
+            offenders,
+            "a parent-relative include cannot resolve from this tree - there is no "
+            "Utils directory under PhantomEDR and no include directory makes a "
+            "leading '../' resolve, so the compiler stops with a FATAL C1083 and "
+            "hides every later error in the translation unit. Use the "
+            "PhantomCore/... form, which is what the rest of this tree uses and "
+            "what is measured to compile.",
+        )
+
+    def test_every_phantomcore_include_in_phantomedr_resolves_to_a_real_header(self):
+        checked = 0
+        missing = []
+        for relative, line_no, target in self._quoted_includes(r"PhantomCore/[^\"]+"):
+            checked += 1
+            if not (self._SRC_ROOT / target).is_file():
+                missing.append(f"{relative}:{line_no} -> {target}")
+
+        self.assertGreaterEqual(
+            checked,
+            180,
+            "anti-vacuity: expected at least 180 PhantomCore/ includes across the "
+            f"PhantomEDR tree, found {checked}. The tree carried 154 before the 64 "
+            "unresolvable includes were converted, so a count below this floor "
+            "means either the conversion was reverted or the walk stopped working.",
+        )
+        self.assertEqual(
+            [],
+            missing,
+            "a PhantomCore/... include must name a header that exists under src/. "
+            "Spelling alone is not the contract - resolvability is, because an "
+            "include that looks conventional and resolves to nothing produces the "
+            "same fatal C1083 as the parent-relative form it replaced.",
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

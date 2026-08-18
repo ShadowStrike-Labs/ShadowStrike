@@ -60,11 +60,11 @@
 
 #include "pch.h"
 #include "MemoryDumper.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/ThreadPool.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/CryptoUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/ThreadPool.hpp"
 
 #include <algorithm>
 #include <execution>

@@ -64,15 +64,15 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/RegistryUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/RegistryUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
