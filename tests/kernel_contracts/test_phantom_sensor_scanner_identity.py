@@ -5960,5 +5960,184 @@ class PhantomEdrIncludeResolutionContractTests(unittest.TestCase):
 
 
 
+class ProductProjectBuildabilityContractTests(unittest.TestCase):
+    """Pins the project-file invariants that decide whether a product can be built at all.
+
+    Every defect guarded here was measured while making PhantomHome compile, and
+    every one of them is INVISIBLE to the C++ test suite: a project that cannot be
+    evaluated, or that lists a source which does not exist, or that discards the
+    macros its own CharacterSet contributes, produces no failing test - it produces
+    a build nobody runs.  PhantomHome had all four at once while the suite was green.
+
+    Scoped deliberately:
+      * the source-existence rule covers every user-mode project, because a listed
+        file that is absent is unambiguously wrong wherever it appears;
+      * the object-path rule covers PhantomHome ONLY.  ShadowStrike.vcxproj has NINE
+        same-named pairs and no ObjectFileName (task 197), so asserting it tree-wide
+        would land a guard that cannot pass, and a guard that cannot pass is a guard
+        nobody keeps.  Widen it in the change that fixes 197, not before.
+
+    PhantomEDR and PhantomXDR are deliberately absent from the project list.  Both
+    still name an uninstalled toolset so they cannot be evaluated at all (task 202),
+    and both carry the same stale source entries this guard rejects.  They join the
+    list when they come into scope; excluding them is a scope statement, not an
+    oversight.
+    """
+
+    _USER_MODE_PROJECTS = (
+        "PhantomHome.vcxproj",
+        "ShadowStrike.vcxproj",
+        "PhantomCoreLib.vcxproj",
+        "PhantomTests.vcxproj",
+        "ShadowStrikePhantomService.vcxproj",
+        "ShadowStrikePhantomTray.vcxproj",
+    )
+
+    # Toolsets present on a machine that can build this tree.  v145 is NOT installed
+    # anywhere and a project naming it dies at MSB8020 before one file is compiled,
+    # so the failure is invisible to any source-level test.
+    _INSTALLED_USER_MODE_TOOLSETS = ("v143",)
+
+    @classmethod
+    def _project_text(cls, name: str) -> str:
+        return (ROOT / name).read_text(encoding="utf-8").lstrip("\ufeff")
+
+    @classmethod
+    def _compiled_sources(cls, name: str) -> list[str]:
+        text = cls._project_text(name)
+        return re.findall(r'<ClCompile\s+Include="([^"]+)"', text)
+
+    def test_no_user_mode_project_lists_a_source_that_does_not_exist(self) -> None:
+        missing: list[str] = []
+        total = 0
+        for project in self._USER_MODE_PROJECTS:
+            for rel in self._compiled_sources(project):
+                total += 1
+                if not (ROOT / rel.replace("\\", "/")).is_file():
+                    missing.append(f"{project} -> {rel}")
+
+        # Anti-vacuity: a walk that finds nothing must not pass silently.
+        self.assertGreater(
+            total,
+            1500,
+            msg=f"expected the six user-mode projects to list >1500 sources, walked {total}",
+        )
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "a project lists a ClCompile source that is absent from the tree; "
+                "MSVC reports this as fatal C1083 at build time only. "
+                f"offenders: {missing}"
+            ),
+        )
+
+    def test_phantomhome_names_a_toolset_that_is_installed(self) -> None:
+        text = self._project_text("PhantomHome.vcxproj")
+        declared = re.findall(r"<PlatformToolset>([^<]+)</PlatformToolset>", text)
+        self.assertEqual(
+            4,
+            len(declared),
+            msg=f"expected one PlatformToolset per configuration, found {len(declared)}",
+        )
+        bad = sorted({t for t in declared if t not in self._INSTALLED_USER_MODE_TOOLSETS})
+        self.assertEqual(
+            [],
+            bad,
+            msg=(
+                "PhantomHome names a platform toolset that is not installed, so MSBuild "
+                "fails at project evaluation (MSB8020) and compiles nothing. "
+                f"offending toolsets: {bad}"
+            ),
+        )
+
+    def test_phantomhome_compiles_against_the_unicode_windows_api(self) -> None:
+        text = self._project_text("PhantomHome.vcxproj")
+
+        charsets = re.findall(r"<CharacterSet>([^<]+)</CharacterSet>", text)
+        self.assertEqual(
+            ["Unicode"] * 4,
+            charsets,
+            msg=(
+                "every configuration must state CharacterSet Unicode; without it TCHAR "
+                "resolves to char and every unsuffixed Win32 call binds to its ANSI "
+                "variant, which cannot carry a path outside the active code page. "
+                f"found: {charsets}"
+            ),
+        )
+
+        # CharacterSet contributes UNICODE/_UNICODE through inherited item metadata,
+        # so a definitions list that omits %(PreprocessorDefinitions) silently
+        # discards it.  That is exactly how the C2664 on SE_LOAD_DRIVER_NAME survived
+        # the CharacterSet being set correctly.
+        blocks = re.findall(
+            r"<PreprocessorDefinitions>(.*?)</PreprocessorDefinitions>",
+            text,
+            re.DOTALL,
+        )
+        self.assertGreaterEqual(
+            len(blocks),
+            4,
+            msg=f"expected at least one PreprocessorDefinitions per configuration, found {len(blocks)}",
+        )
+        non_inheriting = [
+            b.replace("\n", " ").strip()
+            for b in blocks
+            if "%(PreprocessorDefinitions)" not in b
+        ]
+        self.assertEqual(
+            [],
+            non_inheriting,
+            msg=(
+                "a PreprocessorDefinitions list replaces the inherited set instead of "
+                "extending it, so macros contributed by CharacterSet are dropped. "
+                f"offending blocks: {non_inheriting}"
+            ),
+        )
+
+    def test_phantomhome_gives_every_object_file_a_distinct_path(self) -> None:
+        text = self._project_text("PhantomHome.vcxproj")
+        sources = self._compiled_sources("PhantomHome.vcxproj")
+        self.assertGreater(
+            len(sources),
+            300,
+            msg=f"expected PhantomHome to compile >300 sources, found {len(sources)}",
+        )
+
+        seen: dict[str, list[str]] = {}
+        for rel in sources:
+            seen.setdefault(rel.split("\\")[-1].lower(), []).append(rel)
+        collisions = {k: v for k, v in seen.items() if len(v) > 1}
+
+        if collisions:
+            # Same-named sources are permitted ONLY when the object path is derived
+            # per source; otherwise one silently overwrites the other's .obj and its
+            # symbols go missing at link (MSB8027).
+            self.assertIn(
+                "<ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>",
+                text,
+                msg=(
+                    "PhantomHome compiles same-named sources without deriving the object "
+                    f"path per source, so one overwrites the other: {collisions}"
+                ),
+            )
+
+        # The intermediate directory must be private to this project.  A shared one
+        # lets two projects' objects occupy the same path (MSB8028), which makes a
+        # link consume a stale object from an unrelated build.
+        shared = re.findall(
+            re.escape("<IntDir>$(ProjectDir)build\\$(Configuration)\\</IntDir>"), text
+        )
+        self.assertEqual(
+            [],
+            shared,
+            msg=(
+                "PhantomHome writes intermediates into the shared build\\$(Configuration) "
+                "directory; give it a private subdirectory so objects cannot collide "
+                "with another project's."
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

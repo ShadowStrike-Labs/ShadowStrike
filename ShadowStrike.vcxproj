@@ -368,7 +368,6 @@
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\DNSLeakProtectionWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\IPLeakProtectionWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\wiring\PrivacyCleanerWiring.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\SystemTray.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\WebProtectionWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupManager.cpp" />
@@ -417,7 +416,6 @@
     <ClCompile Include="src\PhantomCore\Core\FileSystem\FileLockManager.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\FileReputation.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.cpp" />
-    <ClCompile Include="src\PhantomCore\Core\FileSystem\FileWatcher.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\MediaFileScanner.cpp" />
     <ClCompile Include="src\PhantomCore\Core\FileSystem\MountPointMonitor.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Network\BotnetDetector.cpp" />
@@ -464,10 +462,6 @@
     <ClCompile Include="src\PhantomCore\Database\DatabaseManager.cpp" />
     <ClCompile Include="src\PhantomCore\Database\LogDB.cpp" />
     <ClCompile Include="src\PhantomCore\Database\QuarantineDB.cpp" />
-    <ClCompile Include="src\Drivers\FileFilterCallbacks.cpp" />
-    <ClCompile Include="src\Drivers\FilterCommunication.cpp" />
-    <ClCompile Include="src\Drivers\ProcessFilterCallbacks.cpp" />
-    <ClCompile Include="src\Drivers\RegistryFilterCallbacks.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\AttachmentScanner.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailProtection.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\OutlookScanner.cpp" />
@@ -960,7 +954,6 @@
     <ClInclude Include="src\PhantomCore\Core\FileSystem\FileLockManager.hpp" />
     <ClInclude Include="src\PhantomCore\Core\FileSystem\FileReputation.hpp" />
     <ClInclude Include="src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.hpp" />
-    <ClInclude Include="src\PhantomCore\Core\FileSystem\FileWatcher.hpp" />
     <ClInclude Include="src\PhantomCore\Core\FileSystem\MediaFileScanner.hpp" />
     <ClInclude Include="src\PhantomCore\Core\FileSystem\MountPointMonitor.hpp" />
     <ClInclude Include="src\PhantomCore\Core\Network\BotnetDetector.hpp" />
@@ -1177,11 +1170,7 @@
     <ClInclude Include="src\PhantomCore\Database\DatabaseManager.hpp" />
     <ClInclude Include="src\PhantomCore\Database\LogDB.hpp" />
     <ClInclude Include="src\PhantomCore\Database\QuarantineDB.hpp" />
-    <ClInclude Include="src\Drivers\FileFilterCallbacks.hpp" />
-    <ClInclude Include="src\Drivers\FilterCommunication.hpp" />
     <ClInclude Include="src\Drivers\FilterDriver.hpp" />
-    <ClInclude Include="src\Drivers\ProcessFilterCallbacks.hpp" />
-    <ClInclude Include="src\Drivers\RegistryFilterCallbacks.hpp" />
     <ClInclude Include="src\PhantomCore\HashStore\HashStore.hpp" />
     <ClInclude Include="src\PhantomCore\PatternStore\PatternStore.hpp" />
     <ClInclude Include="src\pch.h" />
@@ -1463,7 +1452,6 @@
     <ClInclude Include="src\Products\Community\PhantomHome\Privacy\PrivacyCleaner.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Privacy\WebcamProtector.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\ThreatIntel\ThreatIntelManager.hpp" />
-    <ClInclude Include="src\Products\Community\PhantomHome\UI\SystemTray.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\USB_Protection\BadUSBDetector.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\USB_Protection\DeviceControlManager.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\USB_Protection\USBAutorunBlocker.hpp" />

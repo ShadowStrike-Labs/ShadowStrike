@@ -28,22 +28,26 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -69,7 +73,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IntDir>$(ProjectDir)build\$(Configuration)\</IntDir>
+    <IntDir>$(ProjectDir)build\$(Configuration)\PhantomHome\</IntDir>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -77,11 +81,12 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IntDir>$(ProjectDir)build\$(Configuration)\</IntDir>
+    <IntDir>$(ProjectDir)build\$(Configuration)\PhantomHome\</IntDir>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
+      <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
     </ClCompile>
@@ -92,8 +97,9 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
+      <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
       <PreprocessorDefinitions>GTEST_LINKED_AS_SHARED_LIBRARY=1
-;GMOCK_LINKED_AS_SHARED_LIBRARY=1</PreprocessorDefinitions>
+;GMOCK_LINKED_AS_SHARED_LIBRARY=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
@@ -112,6 +118,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
+      <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
     </ClCompile>
@@ -124,8 +131,9 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
+      <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
       <PreprocessorDefinitions>GTEST_LINKED_AS_SHARED_LIBRARY=1
-;GMOCK_LINKED_AS_SHARED_LIBRARY=1</PreprocessorDefinitions>
+;GMOCK_LINKED_AS_SHARED_LIBRARY=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level3</WarningLevel>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
@@ -160,7 +168,6 @@
     <ClCompile Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\ModeThresholds.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomHome\UI\SystemTray.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductEntry.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\BankingTrojanDetectorWiring.cpp" />
@@ -642,7 +649,6 @@
     <ClInclude Include="src\PhantomCore\AntiEvasion\TimeBasedEvasionDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.hpp" />
-    <ClInclude Include="src\Products\Community\PhantomHome\UI\SystemTray.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupManager.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupScheduler.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\IncrementalBackup.hpp" />
