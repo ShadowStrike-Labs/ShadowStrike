@@ -590,18 +590,57 @@ struct ScanVerdictReply {
 };
 
 //=============================================================================
-// Callback Types (only if not already defined by IPCManager.hpp kernel types)
+// Callback Types - the DECODED-message vocabulary
 //=============================================================================
-
-#ifndef SS_IPC_CALLBACK_TYPES_DEFINED
-using FileScanCallback = std::function<ScanVerdictReply(const FileScanRequest&)>;
-using ProcessNotifyCallback = std::function<ScanVerdictReply(const ProcessNotification&)>;
-using RegistryNotifyCallback = std::function<ScanVerdictReply(const RegistryNotification&)>;
-using FileNotifyCallback = std::function<void(const FileScanRequest&)>;
-using ProcessEventCallback = std::function<void(const ProcessNotification&)>;
-using RegistryEventCallback = std::function<void(const RegistryNotification&)>;
+//
+// The six message callbacks below take the rich C++ representations declared
+// above, i.e. what MessageDispatcher::ParseFileScanRequest /
+// ParseProcessNotification / ParseRegistryNotification produce AFTER a kernel
+// frame has been decoded and bounds-checked. That is what the Parsed prefix
+// records.
+//
+// They are deliberately NOT interchangeable with IPCManager.hpp's
+// FileScanCallback / ProcessNotifyCallback, which take the packed kernel structs
+// (FILE_SCAN_REQUEST, ProcessNotifyRequest) and return the kernel verdict enum
+// SHADOWSTRIKE_SCAN_VERDICT. Two vocabularies for two layers is correct; what was
+// wrong was that both layers spelled two of them with the SAME NAMES in this one
+// namespace, since IPCManager.hpp is also ShadowStrike::Communication.
+//
+// WHAT THE PREFIX REPLACED. The old arrangement guarded this block with
+// "#ifndef SS_IPC_CALLBACK_TYPES_DEFINED" and failed in two ways, only one of
+// which was ever written down:
+//
+//   1. Communication.hpp before IPCManager.hpp was a hard C2371. The guard
+//      suppressed only THIS side, so whichever header came first won and the
+//      other redeclared an alias with a different type. Include ORDER decided
+//      whether a translation unit compiled at all, and three production sources
+//      (RealTimeProtection.cpp, ProcessInjectionDetector.cpp,
+//      AMSIIntegration.cpp) carried the working order by hand.
+//   2. The guard suppressed ALL SEVEN aliases whenever IPCManager.hpp won,
+//      including the five that collided with nothing. A translation unit that
+//      included IPCManager.hpp first could not name FileNotifyCallback or
+//      ConnectionStateCallback at all, and the diagnostic it produced was an
+//      undeclared identifier - naming neither the guard nor the real conflict.
+//
+// MEASURED before renaming: these two headers declare 23 and 28 type names and
+// the intersection was exactly those two aliases. So the rename REMOVES the
+// conflict rather than relocating it, which is what makes deleting the guard
+// correct instead of merely inverting it. A contract test recomputes that
+// intersection and fails if it is ever non-empty again - that catches a future
+// collision on ANY name, which a naming prefix by itself cannot.
+//
+// ConnectionStateCallback keeps its name on purpose: it reports transport
+// lifecycle rather than a decoded message, and it has no counterpart in
+// IPCManager.hpp to collide with. It has no consumer anywhere in the tree today;
+// that is stated rather than silently removed, because it is the only written
+// form of the connection-state contract.
+using ParsedFileScanCallback = std::function<ScanVerdictReply(const FileScanRequest&)>;
+using ParsedProcessNotifyCallback = std::function<ScanVerdictReply(const ProcessNotification&)>;
+using ParsedRegistryNotifyCallback = std::function<ScanVerdictReply(const RegistryNotification&)>;
+using ParsedFileNotifyCallback = std::function<void(const FileScanRequest&)>;
+using ParsedProcessEventCallback = std::function<void(const ProcessNotification&)>;
+using ParsedRegistryEventCallback = std::function<void(const RegistryNotification&)>;
 using ConnectionStateCallback = std::function<void(ConnectionState, const std::string&)>;
-#endif
 
 //=============================================================================
 // Statistics

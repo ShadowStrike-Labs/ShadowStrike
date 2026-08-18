@@ -5674,5 +5674,158 @@ class ShadowCopyFoldOrderContractTests(unittest.TestCase):
 
 
 
+class CallbackVocabularyContractTests(unittest.TestCase):
+    """Two headers, one namespace: their declared-name intersection must stay empty.
+
+    Communication.hpp and IPCManager.hpp are BOTH ShadowStrike::Communication, and
+    each declares a callback vocabulary. IPCManager's takes the packed kernel
+    structs and returns SHADOWSTRIKE_SCAN_VERDICT; Communication's takes the
+    decoded C++ representations MessageDispatcher's parsers produce and returns the
+    rich ScanVerdictReply. Two vocabularies for two layers is correct. What was
+    wrong is that two of the NAMES were identical, so the same fully-qualified name
+    meant different things depending on include order.
+
+    That was papered over with a one-sided "#ifndef SS_IPC_CALLBACK_TYPES_DEFINED"
+    in Communication.hpp, which failed in two ways:
+
+      1. It suppressed only that side, so Communication.hpp first was a hard C2371.
+         Three production sources carried the working order by hand.
+      2. It suppressed ALL SEVEN aliases in that block whenever IPCManager.hpp won,
+         including the five that collided with nothing - so a translation unit
+         including IPCManager.hpp first could not name FileNotifyCallback or
+         ConnectionStateCallback at all, and got an undeclared-identifier
+         diagnostic that named neither the guard nor the conflict.
+
+    Task 117 renamed the decoded side to Parsed*. This test recomputes the
+    intersection instead of pinning those two names, because the next collision
+    could be on ANY name a future edit adds to either header - a naming prefix
+    cannot prevent that, and the resulting compile failure would surface in
+    whichever unrelated translation unit happened to include both.
+    """
+
+    _WIRE_FORMAT_TESTS = ROOT / "tests/unit/wire_format/WireFormat_Tests.cpp"
+
+    @staticmethod
+    def _declared_names(code):
+        """Type names declared at the top level of a header, comments already gone."""
+        names = set()
+        names |= set(re.findall(r"(?m)^\s*(?:struct|class)\s+([A-Za-z_]\w*)\s*(?:final\s*)?[{:]", code))
+        names |= set(re.findall(r"(?m)^\s*enum\s+class\s+([A-Za-z_]\w*)", code))
+        names |= set(re.findall(r"(?m)^\s*using\s+([A-Za-z_]\w*)\s*=", code))
+        return names
+
+    def test_the_two_communication_headers_declare_no_name_in_common(self):
+        comm_names = self._declared_names(strip_c_comments(read_source(COMMUNICATION_HPP_PATH)))
+        ipc_names = self._declared_names(strip_c_comments(read_source(IPC_MANAGER_HPP_PATH)))
+
+        # ANTI-VACUITY. An empty intersection is exactly what a broken extraction
+        # also produces, so require both scans to have found something and to have
+        # found the specific anchors this contract is about.
+        self.assertGreaterEqual(
+            len(comm_names), 15,
+            "declaration scan of Communication.hpp collapsed to %d names, so the "
+            "intersection below would pass for the wrong reason" % len(comm_names))
+        self.assertGreaterEqual(
+            len(ipc_names), 15,
+            "declaration scan of IPCManager.hpp collapsed to %d names, so the "
+            "intersection below would pass for the wrong reason" % len(ipc_names))
+        for anchor in ("FileScanCallback", "ProcessNotifyCallback"):
+            self.assertTrue(
+                anchor in ipc_names,
+                "IPCManager.hpp no longer declares %s, so this test is no longer "
+                "watching the vocabulary it was written for" % anchor)
+        for anchor in ("ParsedFileScanCallback", "ParsedProcessNotifyCallback"):
+            self.assertTrue(
+                anchor in comm_names,
+                "Communication.hpp no longer declares %s, so this test is no longer "
+                "watching the vocabulary it was written for" % anchor)
+
+        overlap = sorted(comm_names & ipc_names)
+        self.assertEqual(
+            overlap, [],
+            "Communication.hpp and IPCManager.hpp are both namespace "
+            "ShadowStrike::Communication and now declare these names on BOTH "
+            "sides: %s. If the types differ, any translation unit including both "
+            "fails to compile and the error names whichever unrelated file did so. "
+            "Rename one side. Do NOT add an #ifndef guard: the last one suppressed "
+            "five unrelated aliases in the same block and made include order "
+            "decide whether a file compiled." % ", ".join(overlap))
+
+    def test_the_include_order_guard_is_not_reintroduced(self):
+        # Comments are stripped FIRST and that is load-bearing: the explanatory
+        # comments left at both sites necessarily NAME the retired macro, so a
+        # comment-blind scan reports one hit per header and is guaranteed to
+        # false-positive.
+        for path, label in ((COMMUNICATION_HPP_PATH, "Communication.hpp"),
+                            (IPC_MANAGER_HPP_PATH, "IPCManager.hpp")):
+            code = strip_c_comments(read_source(path))
+            offenders = [
+                "%s:%d" % (label, i + 1)
+                for i, line in enumerate(code.splitlines())
+                if "SS_IPC_CALLBACK_TYPES_DEFINED" in line
+            ]
+            self.assertEqual(
+                offenders, [],
+                "the retired include-order guard is back in code at %s. It cannot "
+                "fix a name collision - it hides one in a single include order "
+                "while suppressing every other declaration in the same block."
+                % ", ".join(offenders))
+
+    def test_the_decoded_vocabulary_is_consumed_under_its_own_names(self):
+        code = strip_c_comments(read_source(MESSAGE_DISPATCHER_CPP_PATH))
+
+        # The lookbehind matters: it stops ParsedFileScanCallback from matching
+        # FileScanCallback, so this counts genuinely bare uses only.
+        for bare in ("FileScanCallback", "ProcessNotifyCallback", "RegistryNotifyCallback",
+                     "FileNotifyCallback", "ProcessEventCallback", "RegistryEventCallback"):
+            stray = re.findall(r"(?<![A-Za-z0-9_])" + bare + r"\b", code)
+            self.assertEqual(
+                stray, [],
+                "MessageDispatcher.cpp names the bare alias %s %d time(s). It "
+                "consumes the DECODED vocabulary, whose names carry the Parsed "
+                "prefix; the bare spelling now resolves to IPCManager.hpp's "
+                "wire-typed alias over the packed kernel struct, which is a "
+                "different contract that happens to be spelled the same way."
+                % (bare, len(stray)))
+
+        used = re.findall(r"\bParsed\w+Callback\b", code)
+        self.assertGreaterEqual(
+            len(used), 20,
+            "only %d Parsed* callback uses found in MessageDispatcher.cpp, so the "
+            "check above would pass vacuously against a file that stopped "
+            "consuming this vocabulary at all" % len(used))
+
+    def test_a_translation_unit_still_proves_the_two_headers_coexist(self):
+        """The compile-time half of the fix, pinned so it cannot quietly vanish.
+
+        WireFormat_Tests.cpp includes Communication.hpp and then IPCManager.hpp.
+        That order was the fatal one, so the file simply cannot build against the
+        pre-fix tree - which makes it the discriminator. Nothing in a passing suite
+        would notice if a future edit dropped the second include, so the ordering
+        is asserted here rather than left to chance.
+        """
+        code = strip_c_comments(read_source(self._WIRE_FORMAT_TESTS))
+        comm_at = code.find("Communication/Communication.hpp")
+        ipc_at = code.find("Communication/IPCManager.hpp")
+
+        self.assertNotEqual(
+            comm_at, -1, "WireFormat_Tests.cpp no longer includes Communication.hpp")
+        self.assertNotEqual(
+            ipc_at, -1,
+            "WireFormat_Tests.cpp no longer includes IPCManager.hpp, so the only "
+            "translation unit proving the two headers can coexist is gone")
+        self.assertLess(
+            comm_at, ipc_at,
+            "Communication.hpp must be included BEFORE IPCManager.hpp here "
+            "(offsets %d and %d). Reversing them is the order that always worked, "
+            "so it would prove nothing." % (comm_at, ipc_at))
+        self.assertEqual(
+            code.count("BothVocabulariesAreNameableInOneTranslationUnit"), 1,
+            "the case that spends both callback names is gone or duplicated; "
+            "compiling alone would also be satisfied by a guard that left one of "
+            "the two contracts unnameable")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

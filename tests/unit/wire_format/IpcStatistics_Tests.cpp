@@ -7,19 +7,20 @@
  * @brief Pins the per-message-type counter array against the message type enum.
  *
  * @par Why this is a separate translation unit
- * These assertions need IPCManager.hpp. That header cannot be included in the
- * same translation unit as Communication.hpp, because the two declare
+ * These assertions need IPCManager.hpp. That header could not previously share a
+ * translation unit with Communication.hpp, because the two declared
  * ShadowStrike::Communication::FileScanCallback and ::ProcessNotifyCallback with
- * DIFFERENT types under the same fully-qualified names:
+ * DIFFERENT types under the same fully-qualified names - the wire side over the
+ * packed kernel structs, the decoded side over Communication.hpp's own C++
+ * structs. A one-sided "#ifndef SS_IPC_CALLBACK_TYPES_DEFINED" hid the clash in
+ * one include order and produced C2371 in the other.
  *
- *   IPCManager.hpp:696    std::function<SHADOWSTRIKE_SCAN_VERDICT(const FILE_SCAN_REQUEST&)>
- *   Communication.hpp:436 std::function<ScanVerdictReply(const FileScanRequest&)>
- *
- * Including both yields C2371. IPCManager.cpp is compiled against the first and
- * MessageDispatcher.cpp against the second, so two modules in this product hold
- * different ideas of the same callback contract and it builds only because no
- * translation unit has ever needed both. That is recorded as its own finding; the
- * split here is so this file does not depend on it being resolved.
+ * Task 117 renamed the decoded side to ParsedFileScanCallback and its siblings,
+ * so the name intersection between the two headers is now empty and the guard is
+ * gone. WireFormat_Tests.cpp includes BOTH headers in the previously fatal order
+ * as the proof. This file stays separate deliberately: the constraint is retired,
+ * but merging two passing suites buys nothing and would put one commit in charge
+ * of two unrelated contracts.
  *
  * @par What is being pinned
  * IPCStatistics::byMessageType was a hardcoded std::array of 16 while

@@ -78,12 +78,14 @@
 #include <Windows.h>
 #include <winternl.h>
 
-// IPCManager MUST precede any other Communication header. Communication.hpp
-// declares ShadowStrike::Communication::FileScanCallback / ProcessNotifyCallback
-// guarded by SS_IPC_CALLBACK_TYPES_DEFINED, and IPCManager.hpp is what defines
-// that macro before declaring the ACTIVE versions of those typedefs. Including
-// Communication.hpp first therefore gives C2371 on a later IPCManager include
-// (task 117 - the conflict is include-ORDER dependent, not absolute).
+// IPCManager.hpp no longer needs to precede the other Communication headers, and
+// the note that used to demand it here is retired. Communication.hpp guarded its
+// callback aliases with SS_IPC_CALLBACK_TYPES_DEFINED, which IPCManager.hpp
+// defined, so two of those aliases were declared on both sides with different
+// types and Communication.hpp first was a C2371. Task 117 renamed the decoded
+// side to ParsedFileScanCallback and its siblings, emptying the name intersection
+// and removing the guard, so include order here now carries no meaning. This
+// module includes only IPCManager.hpp in any case.
 #include "../../Communication/IPCManager.hpp"
 
 // NOTE ON THE THREE HEADERS THAT USED TO BE HERE. This module previously

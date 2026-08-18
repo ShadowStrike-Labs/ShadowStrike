@@ -87,37 +87,37 @@ public:
      * @brief Register handler for file scan requests
      * @param callback Handler function
      */
-    void RegisterFileScanHandler(FileScanCallback callback);
+    void RegisterFileScanHandler(ParsedFileScanCallback callback);
 
     /**
      * @brief Register handler for process scan requests
      * @param callback Handler function
      */
-    void RegisterProcessScanHandler(ProcessNotifyCallback callback);
+    void RegisterProcessScanHandler(ParsedProcessNotifyCallback callback);
 
     /**
      * @brief Register handler for registry scan requests
      * @param callback Handler function
      */
-    void RegisterRegistryScanHandler(RegistryNotifyCallback callback);
+    void RegisterRegistryScanHandler(ParsedRegistryNotifyCallback callback);
 
     /**
      * @brief Register handler for file notifications (no reply)
      * @param callback Handler function
      */
-    void RegisterFileNotifyHandler(FileNotifyCallback callback);
+    void RegisterFileNotifyHandler(ParsedFileNotifyCallback callback);
 
     /**
      * @brief Register handler for process notifications (no reply)
      * @param callback Handler function
      */
-    void RegisterProcessNotifyHandler(ProcessEventCallback callback);
+    void RegisterProcessNotifyHandler(ParsedProcessEventCallback callback);
 
     /**
      * @brief Register handler for registry notifications (no reply)
      * @param callback Handler function
      */
-    void RegisterRegistryNotifyHandler(RegistryEventCallback callback);
+    void RegisterRegistryNotifyHandler(ParsedRegistryEventCallback callback);
 
     //=========================================================================
     // Message Dispatching

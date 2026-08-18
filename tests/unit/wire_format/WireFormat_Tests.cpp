@@ -66,13 +66,23 @@
 #include "PhantomCore/Communication/Communication.hpp"
 #include "PhantomCore/RealTime/FileSystemFilter.hpp"
 
-// IPCManager.hpp is deliberately NOT included here, and that is a finding rather
-// than a preference: it declares ShadowStrike::Communication::FileScanCallback
-// and ::ProcessNotifyCallback with DIFFERENT types from the ones Communication.hpp
-// declares under the same fully-qualified names, so a translation unit that
-// includes both fails to compile (C2371). The per-message-type statistics
-// assertions therefore live in IpcStatistics_Tests.cpp, which includes
-// IPCManager.hpp and not Communication.hpp.
+// IPCManager.hpp IS included here, immediately AFTER Communication.hpp, and that
+// order is the point rather than an accident. Both headers live in
+// ShadowStrike::Communication and both used to declare FileScanCallback and
+// ProcessNotifyCallback with different types under those same names, papered over
+// by "#ifndef SS_IPC_CALLBACK_TYPES_DEFINED" in Communication.hpp. The guard
+// suppressed only that one side, so THIS ORDER was a hard C2371 and the per-type
+// statistics assertions had to be exiled to a separate translation unit
+// (IpcStatistics_Tests.cpp) purely to avoid it.
+//
+// Task 117 renamed the decoded-message side to ParsedFileScanCallback and its
+// siblings, which emptied the name intersection between the two headers and let
+// the guard be deleted instead of inverted. So this include is a COMPILE-TIME
+// discriminator: this translation unit cannot be built against the previous tree
+// at all. BothVocabulariesAreNameableInOneTranslationUnit at the end of this file
+// then spends both names, because compiling alone would also be satisfied by a
+// suppression that left one of the two contracts unnameable.
+#include "PhantomCore/Communication/IPCManager.hpp"
 
 #include "../../../PhantomSensor/Shared/MessageProtocol.h"
 
@@ -703,6 +713,48 @@ TEST(WireFormatContractTest, AnyThreatNameAtAllOverrunsTheReplyCarrier) {
 // PER-TYPE STATISTICS MUST COVER EVERY TYPE ON THE WIRE
 // ============================================================================
 //
-// These assertions live in IpcStatistics_Tests.cpp. They need IPCManager.hpp,
-// which cannot be included in this translation unit alongside Communication.hpp
-// (see the note at the top of this file).
+// These assertions live in IpcStatistics_Tests.cpp. That split is now historical
+// rather than forced: it existed because this translation unit could not include
+// IPCManager.hpp alongside Communication.hpp, which it demonstrably now does. The
+// files are left separate deliberately - merging two passing suites buys nothing
+// and would make one commit responsible for both contracts.
+
+// ============================================================================
+// THE TWO CALLBACK VOCABULARIES COEXIST AND STAY DISTINCT
+// ============================================================================
+
+TEST(CallbackVocabularyContractTest, BothVocabulariesAreNameableInOneTranslationUnit) {
+    namespace C = ShadowStrike::Communication;
+
+    // The return types differ, and that difference is the entire reason two names
+    // exist. The WIRE side answers with the kernel verdict enum, which is what the
+    // driver turns into an allow or a deny. The DECODED side answers with a reply
+    // struct that can carry a threat NAME - something the fixed-size kernel reply
+    // carrier provably cannot, per AnyThreatNameAtAllOverrunsTheReplyCarrier above.
+    using WireVerdict    = std::invoke_result_t<C::FileScanCallback, const FILE_SCAN_REQUEST&>;
+    using DecodedVerdict = std::invoke_result_t<C::ParsedFileScanCallback, const C::FileScanRequest&>;
+
+    static_assert(!std::is_same_v<WireVerdict, DecodedVerdict>,
+                  "the wire and decoded verdict vocabularies must not collapse into one type");
+    static_assert(std::is_same_v<DecodedVerdict, C::ScanVerdictReply>,
+                  "the decoded callback must answer with the rich reply, not the kernel enum");
+
+    static_assert(!std::is_same_v<C::FileScanCallback, C::ParsedFileScanCallback>);
+    static_assert(!std::is_same_v<C::ProcessNotifyCallback, C::ParsedProcessNotifyCallback>);
+
+    // Being nameable is necessary but not sufficient. Spend both, so a future
+    // change that leaves one of them declared-but-unusable fails here as well.
+    const FILE_SCAN_REQUEST wireRequest{};
+    C::FileScanCallback wireHandler = [](const FILE_SCAN_REQUEST&) -> WireVerdict {
+        return static_cast<WireVerdict>(Verdict_Clean);
+    };
+    EXPECT_EQ(wireHandler(wireRequest), static_cast<WireVerdict>(Verdict_Clean));
+
+    const C::FileScanRequest decodedRequest{};
+    C::ParsedFileScanCallback decodedHandler = [](const C::FileScanRequest&) {
+        C::ScanVerdictReply reply{};
+        reply.threatName = L"contract-only";
+        return reply;
+    };
+    EXPECT_EQ(decodedHandler(decodedRequest).threatName, L"contract-only");
+}

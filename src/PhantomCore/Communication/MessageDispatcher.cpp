@@ -104,35 +104,35 @@ public:
     // Callback Registration
     //=========================================================================
 
-    void RegisterFileScanHandler(FileScanCallback callback) {
+    void RegisterFileScanHandler(ParsedFileScanCallback callback) {
         std::lock_guard<std::mutex> lock(m_handlerMutex);
         m_fileScanHandler = std::move(callback);
         Utils::Logger::Info("[MessageDispatcher] Registered file scan handler");
     }
 
-    void RegisterProcessScanHandler(ProcessNotifyCallback callback) {
+    void RegisterProcessScanHandler(ParsedProcessNotifyCallback callback) {
         std::lock_guard<std::mutex> lock(m_handlerMutex);
         m_processScanHandler = std::move(callback);
         Utils::Logger::Info("[MessageDispatcher] Registered process scan handler");
     }
 
-    void RegisterRegistryScanHandler(RegistryNotifyCallback callback) {
+    void RegisterRegistryScanHandler(ParsedRegistryNotifyCallback callback) {
         std::lock_guard<std::mutex> lock(m_handlerMutex);
         m_registryScanHandler = std::move(callback);
         Utils::Logger::Info("[MessageDispatcher] Registered registry scan handler");
     }
 
-    void RegisterFileNotifyHandler(FileNotifyCallback callback) {
+    void RegisterFileNotifyHandler(ParsedFileNotifyCallback callback) {
         std::lock_guard<std::mutex> lock(m_handlerMutex);
         m_fileNotifyHandler = std::move(callback);
     }
 
-    void RegisterProcessNotifyHandler(ProcessEventCallback callback) {
+    void RegisterProcessNotifyHandler(ParsedProcessEventCallback callback) {
         std::lock_guard<std::mutex> lock(m_handlerMutex);
         m_processNotifyHandler = std::move(callback);
     }
 
-    void RegisterRegistryNotifyHandler(RegistryEventCallback callback) {
+    void RegisterRegistryNotifyHandler(ParsedRegistryEventCallback callback) {
         std::lock_guard<std::mutex> lock(m_handlerMutex);
         m_registryNotifyHandler = std::move(callback);
     }
@@ -215,7 +215,7 @@ public:
 
                     auto request = ParseFileScanRequest(payload);
                     if (request.has_value()) {
-                        FileScanCallback handlerCopy;
+                        ParsedFileScanCallback handlerCopy;
                         {
                             std::lock_guard<std::mutex> lock(m_handlerMutex);
                             handlerCopy = m_fileScanHandler;
@@ -246,7 +246,7 @@ public:
 
                     auto notification = ParseProcessNotification(payload);
                     if (notification.has_value()) {
-                        ProcessEventCallback handlerCopy;
+                        ParsedProcessEventCallback handlerCopy;
                         {
                             std::lock_guard<std::mutex> lock(m_handlerMutex);
                             handlerCopy = m_processNotifyHandler;
@@ -277,7 +277,7 @@ public:
 
                     auto notification = ParseProcessNotification(payload);
                     if (notification.has_value()) {
-                        ProcessEventCallback handlerCopy;
+                        ParsedProcessEventCallback handlerCopy;
                         {
                             std::lock_guard<std::mutex> lock(m_handlerMutex);
                             handlerCopy = m_processNotifyHandler;
@@ -304,7 +304,7 @@ public:
 
                     auto notification = ParseRegistryNotification(payload);
                     if (notification.has_value()) {
-                        RegistryEventCallback handlerCopy;
+                        ParsedRegistryEventCallback handlerCopy;
                         {
                             std::lock_guard<std::mutex> lock(m_handlerMutex);
                             handlerCopy = m_registryNotifyHandler;
@@ -752,12 +752,12 @@ private:
     FilterConnection& m_connection;
 
     // Handler callbacks
-    FileScanCallback m_fileScanHandler;
-    ProcessNotifyCallback m_processScanHandler;
-    RegistryNotifyCallback m_registryScanHandler;
-    FileNotifyCallback m_fileNotifyHandler;
-    ProcessEventCallback m_processNotifyHandler;
-    RegistryEventCallback m_registryNotifyHandler;
+    ParsedFileScanCallback m_fileScanHandler;
+    ParsedProcessNotifyCallback m_processScanHandler;
+    ParsedRegistryNotifyCallback m_registryScanHandler;
+    ParsedFileNotifyCallback m_fileNotifyHandler;
+    ParsedProcessEventCallback m_processNotifyHandler;
+    ParsedRegistryEventCallback m_registryNotifyHandler;
     mutable std::mutex m_handlerMutex;
 
     // Configuration (atomic — written by config thread, read by dispatch workers)
@@ -786,27 +786,27 @@ MessageDispatcher::MessageDispatcher(FilterConnection& connection)
 
 MessageDispatcher::~MessageDispatcher() = default;
 
-void MessageDispatcher::RegisterFileScanHandler(FileScanCallback callback) {
+void MessageDispatcher::RegisterFileScanHandler(ParsedFileScanCallback callback) {
     if (m_impl) m_impl->RegisterFileScanHandler(std::move(callback));
 }
 
-void MessageDispatcher::RegisterProcessScanHandler(ProcessNotifyCallback callback) {
+void MessageDispatcher::RegisterProcessScanHandler(ParsedProcessNotifyCallback callback) {
     if (m_impl) m_impl->RegisterProcessScanHandler(std::move(callback));
 }
 
-void MessageDispatcher::RegisterRegistryScanHandler(RegistryNotifyCallback callback) {
+void MessageDispatcher::RegisterRegistryScanHandler(ParsedRegistryNotifyCallback callback) {
     if (m_impl) m_impl->RegisterRegistryScanHandler(std::move(callback));
 }
 
-void MessageDispatcher::RegisterFileNotifyHandler(FileNotifyCallback callback) {
+void MessageDispatcher::RegisterFileNotifyHandler(ParsedFileNotifyCallback callback) {
     if (m_impl) m_impl->RegisterFileNotifyHandler(std::move(callback));
 }
 
-void MessageDispatcher::RegisterProcessNotifyHandler(ProcessEventCallback callback) {
+void MessageDispatcher::RegisterProcessNotifyHandler(ParsedProcessEventCallback callback) {
     if (m_impl) m_impl->RegisterProcessNotifyHandler(std::move(callback));
 }
 
-void MessageDispatcher::RegisterRegistryNotifyHandler(RegistryEventCallback callback) {
+void MessageDispatcher::RegisterRegistryNotifyHandler(ParsedRegistryEventCallback callback) {
     if (m_impl) m_impl->RegisterRegistryNotifyHandler(std::move(callback));
 }
 

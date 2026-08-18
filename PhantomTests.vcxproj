@@ -283,16 +283,19 @@
          them back through the other, which is the property the product relies on
          and the only one that catches two same-width neighbours swapping. -->
     <ClCompile Include="tests\unit\wire_format\WireFormat_Tests.cpp" />
-    <!-- Separate translation unit on purpose: these assertions need IPCManager.hpp,
-         which cannot be included alongside Communication.hpp because the two
-         declare ShadowStrike::Communication::FileScanCallback and
-         ::ProcessNotifyCallback with DIFFERENT types under the same names
-         (C2371). IPCManager.cpp is built against one and MessageDispatcher.cpp
-         against the other.
+    <!-- Separate translation unit, now by choice rather than by force. These
+         assertions need IPCManager.hpp, and that header could not previously be
+         included alongside Communication.hpp: both declare
+         ShadowStrike::Communication::FileScanCallback and ::ProcessNotifyCallback,
+         and before task 117 they did so with DIFFERENT types under the same names,
+         so one include order gave C2371. The decoded side is now named
+         ParsedFileScanCallback and siblings, the name intersection between the two
+         headers is empty, and WireFormat_Tests.cpp includes BOTH headers to prove
+         it. The split is kept because merging two passing suites buys nothing.
          What it pins: IPCStatistics::byMessageType was a hardcoded array of 16
          while the message-type enum ran past 40, and every counting site guards
-         with "if (idx < size())" - so every type from 16 upward was counted
-         nowhere and the guard is what hid it. That set was every alert class the
+         with "if (idx < size())" so every type from 16 upward was counted
+         nowhere, and the guard is what hid it. That set was every alert class the
          driver can raise. TheOldSixteenSlotCeilingWouldHaveDroppedTheseTypes is
          the discriminator; it fails against the previous sizing. -->
     <ClCompile Include="tests\unit\wire_format\IpcStatistics_Tests.cpp" />

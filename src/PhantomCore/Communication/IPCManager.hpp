@@ -691,8 +691,21 @@ struct IPCConfiguration {
 // ============================================================================
 // CALLBACK TYPES
 // ============================================================================
-
-#define SS_IPC_CALLBACK_TYPES_DEFINED
+//
+// The WIRE-typed vocabulary: these take the packed kernel structs exactly as the
+// driver emits them and return SHADOWSTRIKE_SCAN_VERDICT, the enum the driver
+// turns into an allow or a deny. Communication.hpp declares the DECODED
+// counterparts (ParsedFileScanCallback and its siblings) over its own C++
+// structs, and MessageDispatcher consumes those.
+//
+// A "#define SS_IPC_CALLBACK_TYPES_DEFINED" used to sit on the next line, and
+// Communication.hpp suppressed its entire callback block on seeing it. Two of the
+// names were declared on both sides with different types, so that guard made the
+// headers order-dependent - Communication.hpp first was a C2371 - while also
+// suppressing five aliases that collided with nothing. The decoded side is now
+// prefixed, the name intersection between these two headers is empty, both sides
+// are unconditional, and include order therefore carries no meaning. A contract
+// test pins that empty intersection so the guard cannot be reintroduced as a fix.
 using FileScanCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const FILE_SCAN_REQUEST&)>;
 using ProcessNotifyCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const ProcessNotifyRequest&)>;
 using ImageLoadCallback = std::function<SHADOWSTRIKE_SCAN_VERDICT(const ImageLoadRequest&)>;
