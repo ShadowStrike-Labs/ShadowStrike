@@ -107,7 +107,10 @@
 #pragma comment(linker, "/ALTERNATENAME:MeasureSleepAcceleration=Fallback_MeasureSleepAcceleration")
 #pragma comment(linker, "/ALTERNATENAME:CheckCuckooBackdoor=Fallback_CheckCuckooBackdoor")
 #pragma comment(linker, "/ALTERNATENAME:MeasureTimingPrecision=Fallback_MeasureTimingPrecision")
-#pragma comment(linker, "/ALTERNATENAME:DetectSingleStepTiming=Fallback_DetectSingleStepTiming")
+// The shared fallback implements the SERIALIZED AVERAGED variant, which is
+// stricter than this module's own single-sample routine, so a fallback build
+// cannot weaken this check (task 206).
+#pragma comment(linker, "/ALTERNATENAME:SandboxDetectSingleStepTiming=Fallback_DetectSingleStepTiming")
 #pragma comment(linker, "/ALTERNATENAME:MeasureVMExitOverhead=Fallback_MeasureVMExitOverhead")
 #pragma comment(linker, "/ALTERNATENAME:CalibrateTimingBaseline=Fallback_CalibrateTimingBaseline")
 #pragma comment(linker, "/ALTERNATENAME:DetectTimingHook=Fallback_DetectTimingHook")

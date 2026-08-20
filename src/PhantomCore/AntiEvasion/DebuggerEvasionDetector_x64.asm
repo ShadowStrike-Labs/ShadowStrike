@@ -57,7 +57,7 @@
 ; PUBLIC EXPORTS
 ; ==============================================================================
 
-PUBLIC DetectSingleStepTiming
+PUBLIC DebuggerDetectSingleStepTiming
 PUBLIC DetectTrapFlagManipulation
 PUBLIC DetectInt2DBehavior
 PUBLIC DetectInt3Timing
@@ -155,7 +155,7 @@ GetRDTSCPrecise PROC
 GetRDTSCPrecise ENDP
 
 ; ==============================================================================
-; DetectSingleStepTiming
+; DebuggerDetectSingleStepTiming
 ;
 ; Detects single-step debugging by measuring timing of NOP sled execution.
 ; When single-stepping, each instruction causes INT 1, adding significant
@@ -165,7 +165,24 @@ GetRDTSCPrecise ENDP
 ; Returns: RAX = 1 if single-step detected, 0 otherwise
 ; Clobbers: RAX, RBX, RCX, RDX, RSI, RDI
 ; ==============================================================================
-DetectSingleStepTiming PROC
+; ------------------------------------------------------------------------------
+; The name is MODULE-QUALIFIED on purpose (task 206).
+;
+; SandboxEvasionDetector_x64.asm exports a DIFFERENT single-step timing check
+; that was also named DetectSingleStepTiming, so two objects exported one name.
+; An object file is the unit of linkage, so every project that assembles both
+; files hit LNK2005 even though nothing calls either routine. PhantomCoreLib is
+; a StaticLibrary and lib.exe archives both objects without complaint, which is
+; why this stayed invisible until an Application got far enough to link.
+;
+; Neither routine was deleted, because they are NOT the same algorithm:
+;   this one      TIMING_ITERATIONS (100) samples, CPUID+RDTSC start and
+;                 RDTSCP end so each sample is serialized, 64 NOPs per sample,
+;                 arithmetic mean, compared against THRESHOLD_SINGLESTEP (500)
+;   sandbox one   ONE unserialized RDTSC pair over ~20 mixed instructions,
+;                 compared against a hardcoded 1000
+; ------------------------------------------------------------------------------
+DebuggerDetectSingleStepTiming PROC
     push    rbx
     push    rsi
     push    rdi
@@ -285,7 +302,7 @@ single_step_exit:
     pop     rsi
     pop     rbx
     ret
-DetectSingleStepTiming ENDP
+DebuggerDetectSingleStepTiming ENDP
 
 ; ==============================================================================
 ; DetectTrapFlagManipulation

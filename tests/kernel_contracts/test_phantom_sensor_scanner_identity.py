@@ -6338,5 +6338,226 @@ class TestVectorEncodingContractTests(unittest.TestCase):
         )
 
 
+class AssemblyExportUniquenessContractTests(unittest.TestCase):
+    """No two assembly files may export the same symbol.
+
+    An object file is the unit of linkage, so a symbol declared PUBLIC and defined
+    PROC in two .asm files makes every Application that assembles both fail with
+    LNK2005 -- even when nothing calls the symbol, because each object is pulled in
+    whole to satisfy its OTHER exports. A StaticLibrary never notices, because
+    lib.exe archives both objects without complaint. That is why the duplicate
+    DetectSingleStepTiming survived inside PhantomCoreLib and only surfaced once
+    PhantomHome got far enough to reach its link step (task 206).
+
+    LNK2005 reports only the FIRST duplicate it meets, so a build error is not a
+    reliable enumeration of this defect class. This test enumerates all of them,
+    which is what turns a fatal link failure into a two-second test failure.
+    """
+
+    _ASM_ROOT = ROOT / "src"
+    _ANTIEVASION = ROOT / "src" / "PhantomCore" / "AntiEvasion"
+    _MIN_ASM_FILES = 6
+    _MIN_PUBLIC_SYMBOLS = 100
+
+    @staticmethod
+    def _strip_asm_comments(text):
+        """MASM comments run from an unquoted semicolon to end of line."""
+        cleaned = []
+        for line in text.splitlines():
+            index = line.find(";")
+            cleaned.append(line if index < 0 else line[:index])
+        return cleaned
+
+    @classmethod
+    def _inventory(cls):
+        """Return (files, public_owners, proc_owners) keyed by symbol name."""
+        public_owners = {}
+        proc_owners = {}
+        files = sorted(cls._ASM_ROOT.rglob("*.asm"))
+        for path in files:
+            text = read_source(path).lstrip("\ufeff")
+            for number, line in enumerate(cls._strip_asm_comments(text), start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped[:7].upper() == "PUBLIC ":
+                    for name in stripped[7:].split(","):
+                        name = name.strip()
+                        if name:
+                            public_owners.setdefault(name, []).append((path.name, number))
+                match = re.match(
+                    r"^([A-Za-z_][A-Za-z0-9_@$?]*)\s+PROC\b", stripped, re.IGNORECASE
+                )
+                if match:
+                    proc_owners.setdefault(match.group(1), []).append((path.name, number))
+        return files, public_owners, proc_owners
+
+    def test_no_assembly_symbol_is_exported_by_two_files(self):
+        files, public_owners, proc_owners = self._inventory()
+
+        # Anti-vacuity: this test is worthless if the walk found nothing.
+        self.assertGreaterEqual(
+            len(files),
+            self._MIN_ASM_FILES,
+            "expected at least %d .asm files under src, walked %d -- the glob is "
+            "no longer finding the assembly sources"
+            % (self._MIN_ASM_FILES, len(files)),
+        )
+        self.assertGreaterEqual(
+            len(public_owners),
+            self._MIN_PUBLIC_SYMBOLS,
+            "expected at least %d PUBLIC symbols, parsed %d -- the PUBLIC parser is "
+            "no longer matching" % (self._MIN_PUBLIC_SYMBOLS, len(public_owners)),
+        )
+
+        offenders = []
+        for name, sites in sorted(public_owners.items()):
+            owners = sorted({file_name for file_name, _ in sites})
+            if len(owners) > 1:
+                offenders.append("%s declared PUBLIC in %s" % (name, ", ".join(owners)))
+        for name, sites in sorted(proc_owners.items()):
+            owners = sorted({file_name for file_name, _ in sites})
+            if len(owners) > 1:
+                offenders.append("%s defined PROC in %s" % (name, ", ".join(owners)))
+
+        self.assertEqual(
+            offenders,
+            [],
+            "these assembly symbols are exported by more than one file, so every "
+            "Application assembling both objects fails with LNK2005: %s"
+            % "; ".join(offenders),
+        )
+
+    def test_every_public_assembly_symbol_is_defined_in_its_own_file(self):
+        """A PUBLIC with no PROC is an unresolved external for every consumer."""
+        files, public_owners, proc_owners = self._inventory()
+        self.assertGreaterEqual(len(files), self._MIN_ASM_FILES, "walked too few .asm files")
+
+        offenders = []
+        for name, sites in sorted(public_owners.items()):
+            declaring = sorted({file_name for file_name, _ in sites})
+            defining = sorted({file_name for file_name, _ in proc_owners.get(name, [])})
+            if not defining:
+                offenders.append("%s declared PUBLIC in %s but never defined PROC"
+                                 % (name, ", ".join(declaring)))
+            elif not set(declaring) & set(defining):
+                offenders.append("%s declared PUBLIC in %s but defined only in %s"
+                                 % (name, ", ".join(declaring), ", ".join(defining)))
+
+        self.assertEqual(
+            offenders,
+            [],
+            "these PUBLIC symbols have no matching PROC in the file that exports "
+            "them: %s" % "; ".join(offenders),
+        )
+
+    def test_the_single_step_timing_routines_stay_module_qualified(self):
+        """Both routines must survive under module-qualified names.
+
+        A bare no-duplicates rule is ALSO satisfied by deleting one of the two
+        routines, which would silently drop an implemented detection primitive.
+        This pins that both still exist and that the generic name is gone.
+        """
+        _, public_owners, proc_owners = self._inventory()
+
+        for symbol, owner in (
+            ("DebuggerDetectSingleStepTiming", "DebuggerEvasionDetector_x64.asm"),
+            ("SandboxDetectSingleStepTiming", "SandboxEvasionDetector_x64.asm"),
+        ):
+            self.assertTrue(
+                symbol in public_owners,
+                "%s is no longer declared PUBLIC by any assembly file" % symbol,
+            )
+            self.assertTrue(
+                symbol in proc_owners,
+                "%s is no longer defined PROC by any assembly file -- a routine was "
+                "deleted rather than renamed" % symbol,
+            )
+            declaring = sorted({name for name, _ in public_owners[symbol]})
+            defining = sorted({name for name, _ in proc_owners[symbol]})
+            self.assertEqual(
+                declaring, [owner], "%s should be exported only by %s" % (symbol, owner)
+            )
+            self.assertEqual(
+                defining, [owner], "%s should be defined only in %s" % (symbol, owner)
+            )
+
+        self.assertFalse(
+            "DetectSingleStepTiming" in public_owners,
+            "the unqualified name DetectSingleStepTiming is exported again; two "
+            "modules implement different single-step timing algorithms and the "
+            "generic name is what made their objects collide",
+        )
+        self.assertFalse(
+            "DetectSingleStepTiming" in proc_owners,
+            "the unqualified name DetectSingleStepTiming is defined again",
+        )
+
+    def test_the_cplusplus_declarations_track_the_assembly_names(self):
+        """The C++ side and the assembly must not drift apart.
+
+        If the assembly is renamed and either the extern "C" declaration or the
+        /ALTERNATENAME pragma is left behind, the pragma supplies a fallback for a
+        symbol that no longer exists while the real symbol silently has none.
+        """
+        debugger_cpp = strip_c_comments(
+            read_source(self._ANTIEVASION / "DebuggerEvasionDetector.cpp").lstrip("\ufeff")
+        )
+        sandbox_cpp = strip_c_comments(
+            read_source(self._ANTIEVASION / "SandboxEvasionDetector.cpp").lstrip("\ufeff")
+        )
+        sandbox_hpp = strip_c_comments(
+            read_source(self._ANTIEVASION / "SandboxEvasionDetector.hpp").lstrip("\ufeff")
+        )
+
+        self.assertEqual(
+            debugger_cpp.count("uint64_t DebuggerDetectSingleStepTiming() noexcept;"),
+            1,
+            "the debugger module must declare its module-qualified symbol exactly once",
+        )
+        self.assertEqual(
+            debugger_cpp.count(
+                "/alternatename:DebuggerDetectSingleStepTiming=Fallback_DetectSingleStepTiming"
+            ),
+            1,
+            "the debugger fallback pragma must name the module-qualified symbol",
+        )
+        self.assertEqual(
+            sandbox_hpp.count("uint32_t SandboxDetectSingleStepTiming(void);"),
+            1,
+            "the sandbox header must declare its module-qualified symbol exactly once",
+        )
+        self.assertEqual(
+            sandbox_cpp.count(
+                "/ALTERNATENAME:SandboxDetectSingleStepTiming=Fallback_DetectSingleStepTiming"
+            ),
+            1,
+            "the sandbox fallback pragma must name the module-qualified symbol",
+        )
+
+        # The shared C++ fallback keeps its original name and is referenced by both
+        # pragmas plus Fallback_DetectICEBPBehavior, so it must still be defined once.
+        self.assertEqual(
+            debugger_cpp.count(
+                'extern "C" uint64_t Fallback_DetectSingleStepTiming() noexcept'
+            ),
+            1,
+            "the shared single-step fallback must be defined exactly once",
+        )
+
+        for label, body in (
+            ("DebuggerEvasionDetector.cpp", debugger_cpp),
+            ("SandboxEvasionDetector.cpp", sandbox_cpp),
+            ("SandboxEvasionDetector.hpp", sandbox_hpp),
+        ):
+            leftovers = re.findall(r"(?<![A-Za-z0-9_])DetectSingleStepTiming", body)
+            self.assertEqual(
+                leftovers,
+                [],
+                "%s still names the unqualified symbol in code %d time(s)"
+                % (label, len(leftovers)),
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

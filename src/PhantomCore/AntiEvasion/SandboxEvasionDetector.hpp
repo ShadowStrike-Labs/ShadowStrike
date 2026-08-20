@@ -188,7 +188,7 @@ uint64_t MeasureTimingPrecision(void);
 
 /// @brief Detects timing-based debuggers via instruction timing analysis.
 /// @return 1 if single-stepping detected, 0 otherwise
-uint32_t DetectSingleStepTiming(void);
+uint32_t SandboxDetectSingleStepTiming(void);
 
 /// @brief Comprehensive VM detection via multiple timing measurements.
 /// @return Combined overhead score (higher = more likely VM)

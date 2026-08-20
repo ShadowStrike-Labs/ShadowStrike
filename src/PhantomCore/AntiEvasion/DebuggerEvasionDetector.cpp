@@ -392,7 +392,9 @@ namespace ShadowStrike::AntiEvasion {
 
 extern "C" {
     // Timing-based detection functions
-    uint64_t DetectSingleStepTiming() noexcept;
+    // Module-qualified: SandboxEvasionDetector exports a different single-step
+    // timing algorithm, and both objects previously exported one name (task 206).
+    uint64_t DebuggerDetectSingleStepTiming() noexcept;
     uint64_t DetectTrapFlagManipulation() noexcept;
     uint64_t DetectInt2DBehavior() noexcept;
     uint64_t DetectInt3Timing() noexcept;
@@ -429,7 +431,7 @@ extern "C" {
 
 namespace AsmFallback {
 
-    // Fallback: DetectSingleStepTiming
+    // Shared fallback for both module-qualified single-step timing symbols
     extern "C" uint64_t Fallback_DetectSingleStepTiming() noexcept {
         // Use MSVC intrinsics for timing
         uint64_t start = __rdtsc();
@@ -664,7 +666,7 @@ namespace AsmFallback {
 // If assembly functions are not found, use the C++ fallbacks
 // ============================================================================
 
-#pragma comment(linker, "/alternatename:DetectSingleStepTiming=Fallback_DetectSingleStepTiming")
+#pragma comment(linker, "/alternatename:DebuggerDetectSingleStepTiming=Fallback_DetectSingleStepTiming")
 #pragma comment(linker, "/alternatename:DetectTrapFlagManipulation=Fallback_DetectTrapFlagManipulation")
 #pragma comment(linker, "/alternatename:DetectInt2DBehavior=Fallback_DetectInt2DBehavior")
 #pragma comment(linker, "/alternatename:DetectInt3Timing=Fallback_DetectInt3Timing")

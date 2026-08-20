@@ -31,7 +31,7 @@
 ;; - MeasureCPUIDOverhead: Measure CPUID VM exit timing
 ;; - CheckCuckooBackdoor: Detect Cuckoo sandbox backdoor port
 ;; - MeasureTimingPrecision: Detect coarse-grained time sources
-;; - DetectSingleStepTiming: Detect timing-based debuggers
+;; - SandboxDetectSingleStepTiming: Detect timing-based debuggers
 ;; - MeasureVMExitOverhead: Comprehensive VM detection via timing
 ;; - GetPreciseRDTSC: Get RDTSC with serialization
 ;; - GetPreciseRDTSCP: Get RDTSCP with processor ID
@@ -55,7 +55,7 @@ PUBLIC MeasureRDTSCOverhead
 PUBLIC MeasureCPUIDOverhead
 PUBLIC CheckCuckooBackdoor
 PUBLIC MeasureTimingPrecision
-PUBLIC DetectSingleStepTiming
+PUBLIC SandboxDetectSingleStepTiming
 PUBLIC MeasureVMExitOverhead
 PUBLIC GetPreciseRDTSC
 PUBLIC GetPreciseRDTSCP
@@ -479,15 +479,30 @@ MeasureTimingPrecision PROC
 MeasureTimingPrecision ENDP
 
 ;; =============================================================================
-;; DetectSingleStepTiming
+;; SandboxDetectSingleStepTiming
 ;; =============================================================================
 ;; Detects timing-based debuggers via instruction timing analysis.
 ;; Single-stepping adds significant overhead per instruction.
 ;;
-;; Prototype: uint32_t DetectSingleStepTiming(void);
+;; Prototype: uint32_t SandboxDetectSingleStepTiming(void);
 ;; Returns: 1 if single-stepping detected, 0 otherwise
 ;; =============================================================================
-DetectSingleStepTiming PROC
+;; -----------------------------------------------------------------------------
+;; The name is MODULE-QUALIFIED on purpose (task 206).
+;;
+;; DebuggerEvasionDetector_x64.asm exports a DIFFERENT single-step timing check
+;; that was also named DetectSingleStepTiming, so two objects exported one name
+;; and every project assembling both files hit LNK2005 -- even though nothing
+;; calls either routine, because an object file is the unit of linkage.
+;;
+;; Neither routine was deleted, because they are NOT the same algorithm. This
+;; one takes a SINGLE unserialized RDTSC pair over ~20 mixed instructions
+;; against a hardcoded 1000 cycles; the debugger variant averages 100
+;; serialized 64-NOP samples against THRESHOLD_SINGLESTEP. Without CPUID or
+;; RDTSCP the pair here is subject to out-of-order execution, and a single
+;; sample has no noise rejection, so this is the looser of the two checks.
+;; -----------------------------------------------------------------------------
+SandboxDetectSingleStepTiming PROC
     push    rbx
     push    rcx
     push    rsi
@@ -546,7 +561,7 @@ DetectSingleStepTiming PROC
     pop     rcx
     pop     rbx
     ret
-DetectSingleStepTiming ENDP
+SandboxDetectSingleStepTiming ENDP
 
 ;; =============================================================================
 ;; MeasureVMExitOverhead
