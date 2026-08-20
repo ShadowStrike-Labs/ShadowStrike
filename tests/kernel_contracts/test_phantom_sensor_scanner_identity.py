@@ -6009,18 +6009,37 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
 
     def test_no_user_mode_project_lists_a_source_that_does_not_exist(self) -> None:
         missing: list[str] = []
-        total = 0
+        per_project: dict[str, int] = {}
         for project in self._USER_MODE_PROJECTS:
-            for rel in self._compiled_sources(project):
-                total += 1
+            listed = self._compiled_sources(project)
+            per_project[project] = len(listed)
+            for rel in listed:
                 if not (ROOT / rel.replace("\\", "/")).is_file():
                     missing.append(f"{project} -> {rel}")
+        total = sum(per_project.values())
 
-        # Anti-vacuity: a walk that finds nothing must not pass silently.
+        # Anti-vacuity, PER PROJECT rather than in aggregate.  An aggregate floor
+        # cannot distinguish a project that legitimately shrank from one whose parse
+        # broke, and it goes stale as soon as a project stops recompiling sources it
+        # can borrow: this floor read 1500 while PhantomHome hand-listed 317 sources
+        # that PhantomCoreLib already compiles, and reading 1496 after task 205 moved
+        # 238 of them behind a library reference was a stale constant, not a defect.
+        empty = sorted(name for name, count in per_project.items() if count == 0)
+        self.assertEqual(
+            [],
+            empty,
+            msg=(
+                "these projects yielded no ClCompile entries at all, so this walk "
+                f"proves nothing about them: {empty}"
+            ),
+        )
         self.assertGreater(
             total,
-            1500,
-            msg=f"expected the six user-mode projects to list >1500 sources, walked {total}",
+            1200,
+            msg=(
+                "expected the six user-mode projects to list >1200 sources, walked "
+                f"{total} ({per_project})"
+            ),
         )
         self.assertEqual(
             [],
@@ -6098,10 +6117,14 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     def test_phantomhome_gives_every_object_file_a_distinct_path(self) -> None:
         text = self._project_text("PhantomHome.vcxproj")
         sources = self._compiled_sources("PhantomHome.vcxproj")
+        # Anti-vacuity floor only.  It is deliberately far below the count: since
+        # task 205 PhantomHome borrows the whole shared tree from PhantomCoreLib and
+        # compiles only the sources it owns, so 300 - written when the project
+        # hand-listed 317 - described the defect rather than the requirement.
         self.assertGreater(
             len(sources),
-            300,
-            msg=f"expected PhantomHome to compile >300 sources, found {len(sources)}",
+            50,
+            msg=f"expected PhantomHome to compile >50 sources, found {len(sources)}",
         )
 
         seen: dict[str, list[str]] = {}
@@ -6556,6 +6579,232 @@ class AssemblyExportUniquenessContractTests(unittest.TestCase):
                 [],
                 "%s still names the unqualified symbol in code %d time(s)"
                 % (label, len(leftovers)),
+            )
+
+
+class ProductProjectLibraryReuseContractTests(unittest.TestCase):
+    """Pins that PhantomHome consumes PhantomCoreLib instead of recompiling it.
+
+    PhantomHome used to hand-maintain a 317-entry source list of which 243 entries
+    were files PhantomCoreLib already compiles.  That list is a dependency graph
+    maintained by hand, so it rotted: 193 shared sources were missing and the
+    executable failed at link with 123 unresolved externals while every source-level
+    test stayed green.  The same rot broke the Fuzzer for four months (task 141).
+
+    The invariants below make the rot unrepresentable rather than merely detectable:
+    an exe either owns a source or borrows it from the library, never both, and the
+    set it owns is DERIVED from a sibling project that provably links.
+
+    Why the derivation and not a literal list: a literal list is the very thing that
+    rotted.  ShadowStrikePhantomService is an Application that hosts the same
+    PhantomHome product against the same library and links today, so the product
+    sources it needs are exactly the product sources PhantomHome needs.  Comparing
+    against it is self-maintaining; comparing against a copied list is not.
+    """
+
+    _HOME = "PhantomHome.vcxproj"
+    _LIB = "PhantomCoreLib.vcxproj"
+    _SERVICE = "ShadowStrikePhantomService.vcxproj"
+    _UI = "ShadowStrikePhantomUI.vcxproj"
+
+    # The one file that may legitimately appear in both the exe and the library.
+    # A precompiled header needs a creating translation unit inside the project that
+    # consumes it, so the exe must compile its own pch.cpp; its object defines no
+    # product symbol, which is why it cannot collide.
+    _SHARED_BY_DESIGN = ("src\\pch.cpp",)
+
+    # Linking the library drags in dependencies the executable never needed while it
+    # compiled everything itself.  Each of these was measured as a real unresolved
+    # symbol or a documented library requirement, not copied hopefully:
+    #   PhantomCoreLib.lib - the library itself
+    #   onnxruntime.lib    - the library is built with SHADOWSTRIKE_HAS_ONNXRUNTIME=1
+    #   libyara.lib        - the library is built with SHADOWSTRIKE_HAS_YARA
+    #   normaliz.lib       - __imp_IdnToUnicode, from PhishingDetector.obj
+    _REQUIRED_LIBS = (
+        "PhantomCoreLib.lib",
+        "onnxruntime.lib",
+        "libyara.lib",
+        "normaliz.lib",
+    )
+
+    _PRODUCT_PREFIX = "src\\products\\community\\phantomhome\\"
+
+    @classmethod
+    def _project_text(cls, name: str) -> str:
+        return (ROOT / name).read_text(encoding="utf-8").lstrip("\ufeff")
+
+    @classmethod
+    def _sources(cls, name: str) -> list[str]:
+        text = cls._project_text(name)
+        return [
+            item.replace("/", "\\")
+            for item in re.findall(r'<ClCompile\s+Include="([^"]+)"', text)
+        ]
+
+    @classmethod
+    def _source_set(cls, name: str) -> set[str]:
+        return {item.lower() for item in cls._sources(name)}
+
+    @classmethod
+    def _assembly(cls, name: str) -> list[str]:
+        text = cls._project_text(name)
+        return re.findall(r'<MASM\s+Include="([^"]+)"', text)
+
+    def test_phantomhome_borrows_the_shared_tree_instead_of_recompiling_it(self) -> None:
+        home = self._source_set(self._HOME)
+        lib = self._source_set(self._LIB)
+
+        # Anti-vacuity on both sides: an empty parse must not read as compliance.
+        self.assertGreater(
+            len(lib),
+            400,
+            msg=f"expected PhantomCoreLib to compile >400 sources, parsed {len(lib)}",
+        )
+        self.assertGreater(
+            len(home),
+            50,
+            msg=f"expected PhantomHome to compile >50 sources, parsed {len(home)}",
+        )
+
+        allowed = {item.lower() for item in self._SHARED_BY_DESIGN}
+        duplicated = sorted(home & lib - allowed)
+        self.assertEqual(
+            [],
+            duplicated,
+            msg=(
+                "PhantomHome compiles sources PhantomCoreLib also compiles.  Every one "
+                "is a duplicate object in a link that already archives the library, so "
+                "each is a latent LNK2005 the moment the library member is pulled in "
+                "for any other symbol it defines (task 206 was exactly that failure). "
+                f"offenders: {duplicated}"
+            ),
+        )
+
+    def test_phantomhome_declares_a_reference_to_the_library_it_links(self) -> None:
+        text = self._project_text(self._HOME)
+        references = re.findall(r'<ProjectReference\s+Include="([^"]+)"', text)
+        self.assertEqual(
+            [self._LIB],
+            references,
+            msg=(
+                "PhantomHome must reference PhantomCoreLib so the library is built "
+                "before the executable links against it; without the reference a stale "
+                f"archive links silently. found: {references}"
+            ),
+        )
+
+    def test_phantomhome_links_the_dependencies_the_library_brings_with_it(self) -> None:
+        text = self._project_text(self._HOME)
+        # Both x64 configurations must carry them; fixing only Release leaves Debug
+        # unable to link, which is how a half-applied project edit hides.
+        for lib_name in self._REQUIRED_LIBS:
+            count = len(re.findall(re.escape(lib_name), text))
+            self.assertEqual(
+                2,
+                count,
+                msg=(
+                    f"{lib_name} must appear in AdditionalDependencies for both x64 "
+                    f"configurations, found {count} occurrence(s)"
+                ),
+            )
+        libdir = len(re.findall(re.escape("$(SolutionDir)lib\\$(Configuration)"), text))
+        self.assertEqual(
+            2,
+            libdir,
+            msg=(
+                "both x64 configurations must search the directory PhantomCoreLib "
+                f"publishes its archive to, found {libdir}"
+            ),
+        )
+
+    def test_the_executable_does_not_reassemble_the_libraries_assembly(self) -> None:
+        home_asm = self._assembly(self._HOME)
+        lib_asm = self._assembly(self._LIB)
+        # Anti-vacuity: the assembly layer must still be built by SOMEBODY.  A guard
+        # that passes because the .asm files vanished would be worse than no guard.
+        self.assertEqual(
+            6,
+            len(lib_asm),
+            msg=f"expected PhantomCoreLib to assemble 6 .asm files, found {len(lib_asm)}",
+        )
+        self.assertEqual(
+            [],
+            home_asm,
+            msg=(
+                "PhantomHome assembles .asm files the library already archives.  Each "
+                "duplicated object exports the same symbols, which is the linkage unit "
+                f"collision closed in task 206. offenders: {home_asm}"
+            ),
+        )
+
+    def test_phantomhome_owns_every_product_source_the_service_owns(self) -> None:
+        service = self._sources(self._SERVICE)
+        lib = self._source_set(self._LIB)
+        home = self._source_set(self._HOME)
+
+        # Product sources the proven sibling links and the library does not supply.
+        derived = sorted(
+            {
+                item.lower()
+                for item in service
+                if item.lower().startswith(self._PRODUCT_PREFIX)
+                and item.lower() not in lib
+            }
+        )
+        # Anti-vacuity: if the derivation yields nothing the comparison proves nothing.
+        self.assertGreaterEqual(
+            len(derived),
+            4,
+            msg=(
+                "expected the Service to link at least 4 PhantomHome product sources "
+                f"absent from the library, derived {len(derived)}"
+            ),
+        )
+        missing = [item for item in derived if item not in home]
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "ShadowStrikePhantomService links PhantomHome product sources that "
+                "PhantomHome does not, and PhantomCoreLib does not supply them either. "
+                "Each is an unresolved external at link time and nothing else reports "
+                f"it. missing: {missing}"
+            ),
+        )
+
+    def test_the_two_competing_wiring_anchors_are_never_linked_together(self) -> None:
+        # WiringAnchor.cpp and UI\\Client\\WiringStub.cpp both define
+        # ShadowStrike::Products::Home::EnsureAllModulesWired.  The anchor performs the
+        # real wiring; the stub is a deliberate no-op for the UI process, which has no
+        # modules to wire.  A project linking both gets LNK2005; a service-side host
+        # linking only the stub silently wires nothing, which is worse than a link
+        # error because it looks like it started.
+        home = self._source_set(self._HOME)
+        anchor = "src\\products\\community\\phantomhome\\wiringanchor.cpp"
+        stub = "src\\products\\community\\phantomhome\\ui\\client\\wiringstub.cpp"
+        self.assertIn(
+            anchor,
+            home,
+            msg="PhantomHome must link the real wiring anchor",
+        )
+        self.assertNotIn(
+            stub,
+            home,
+            msg=(
+                "PhantomHome links the UI-process wiring stub; it defines the same "
+                "symbol as WiringAnchor.cpp, so linking both is LNK2005 and linking "
+                "only the stub wires no modules at all"
+            ),
+        )
+        if (ROOT / self._UI).is_file():
+            ui = self._source_set(self._UI)
+            self.assertNotIn(
+                anchor,
+                ui,
+                msg=(
+                    "the UI project links the real wiring anchor; the UI process hosts "
+                    "no modules and the stub exists precisely so it does not"
+                ),
             )
 
 
