@@ -7893,5 +7893,85 @@ class HostContextAccessorUniformityContractTests(unittest.TestCase):
         )
 
 
+class NoMachineLifestyleSelfChecksContractTests(unittest.TestCase):
+    """A security product must not ask the questions malware asks about its own host.
+
+    Malware fingerprints the machine it lands on - has a human used it, does it hold
+    browser history, how large is the screen, has a USB ever been attached - to decide
+    whether it is being analysed and should stay dormant. A legitimate endpoint product has
+    no use for those answers: it must behave identically on a VMware Workstation box and on
+    bare metal. Carrying that code invites a reasonable reviewer to ask why an AV is
+    profiling its host the way evasive malware does.
+
+    Four such checks were removed from EnvironmentEvasionDetector: CheckUserActivity,
+    CheckBrowserArtifacts, CheckDisplayConfiguration and CheckPeripheralHistory. Each was
+    verified first to take no target parameter, to have no caller anywhere, to carry no
+    MITRE technique id, and to be referenced by no test.
+
+    DELIBERATELY NOT COVERED HERE, because these are a different thing: the host probes
+    that plausibly SUPPRESS false positives - CheckHardwareFingerprint,
+    CheckRegistryArtifacts, CheckFileSystemArtifacts, CheckNetworkConfiguration,
+    CheckBlacklistedNames, CheckTimingIndicators, CheckAdvancedCPUIDIndicators - and the
+    cloud identifiers in VMEvasionDetector, which feed IsLegitimateCloudVMType so that a
+    cloud VM is treated as legitimate rather than suspicious. Knowing the host is a VM in
+    order NOT to flag it is defensive. Knowing it in order to decide whether to act is not.
+    """
+
+    _ENV_CPP = ROOT / "src" / "PhantomCore" / "AntiEvasion" / "EnvironmentEvasionDetector.cpp"
+    _ENV_HPP = ROOT / "src" / "PhantomCore" / "AntiEvasion" / "EnvironmentEvasionDetector.hpp"
+
+    _REMOVED = (
+        "CheckUserActivity",
+        "CheckBrowserArtifacts",
+        "CheckDisplayConfiguration",
+        "CheckPeripheralHistory",
+    )
+
+    def test_the_machine_lifestyle_self_checks_stay_removed(self):
+        cpp = strip_c_comments(read_source(self._ENV_CPP))
+        hpp = strip_c_comments(read_source(self._ENV_HPP))
+        offenders = []
+        for name in self._REMOVED:
+            pattern = r"(?<![A-Za-z0-9_])" + name + r"(?![A-Za-z0-9_])"
+            if re.search(pattern, cpp):
+                offenders.append(name + " (.cpp)")
+            if re.search(pattern, hpp):
+                offenders.append(name + " (.hpp)")
+        self.assertEqual(
+            [],
+            offenders,
+            "these host-fingerprinting checks answer the question malware asks about its "
+            "own environment and have no defensive use, so they must not return: "
+            + ", ".join(offenders),
+        )
+
+    def test_the_target_analysis_surface_survived_the_removal(self):
+        """Anti-vacuity: prove the removal took the self-checks and not the detection."""
+        hpp = strip_c_comments(read_source(self._ENV_HPP))
+
+        # CheckEnvironmentVariables takes a processId and analyses the TARGET process from
+        # the live AnalyzeProcess path. It was very nearly removed alongside the self-checks
+        # because a signature scan misread it, so it is pinned explicitly here.
+        match = re.search(
+            r"(?<![A-Za-z0-9_])CheckEnvironmentVariables\s*\(([^)]*)\)", hpp
+        )
+        self.assertIsNotNone(match, "CheckEnvironmentVariables was removed from the header")
+        self.assertIn(
+            "processId",
+            match.group(1),
+            "CheckEnvironmentVariables must keep its processId parameter - it analyses the "
+            "TARGET process's environment, which is detection, not host self-assessment",
+        )
+
+        for survivor in ("AnalyzeProcess", "AnalyzeSystemEnvironment", "AnalyzeAllProcesses"):
+            self.assertRegex(
+                hpp,
+                r"(?<![A-Za-z0-9_])" + survivor + r"\s*\(",
+                "{} is missing - the removal must not have touched target analysis".format(
+                    survivor
+                ),
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

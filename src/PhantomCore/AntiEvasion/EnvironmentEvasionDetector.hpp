@@ -2795,19 +2795,6 @@ namespace ShadowStrike {
                 EnvironmentError* err = nullptr
             ) noexcept;
 
-            /**
-             * @brief Collect host user-activity context for behavioral score calibration.
-             * @param outActivityInfo Output activity info
-             * @param outDetections Context indicators (severity capped at Low)
-             * @param err Optional error output
-             * @return true if any context indicators collected
-             * @note NOT a detection source.
-             */
-            [[nodiscard]] bool CheckUserActivity(
-                UserActivityInfo& outActivityInfo,
-                std::vector<EnvironmentDetectedTechnique>& outDetections,
-                EnvironmentError* err = nullptr
-            ) noexcept;
 
             /**
              * @brief Collect host network context for behavioral score calibration.
@@ -2861,38 +2848,8 @@ namespace ShadowStrike {
                 EnvironmentError* err = nullptr
             ) noexcept;
 
-            /**
-             * @brief Check display configuration
-             * @param outDetections Output detections
-             * @param err Optional error output
-             * @return true if VM display detected
-             */
-            [[nodiscard]] bool CheckDisplayConfiguration(
-                std::vector<EnvironmentDetectedTechnique>& outDetections,
-                EnvironmentError* err = nullptr
-            ) noexcept;
 
-            /**
-             * @brief Check browser artifacts
-             * @param outDetections Output detections
-             * @param err Optional error output
-             * @return true if lack of artifacts detected
-             */
-            [[nodiscard]] bool CheckBrowserArtifacts(
-                std::vector<EnvironmentDetectedTechnique>& outDetections,
-                EnvironmentError* err = nullptr
-            ) noexcept;
 
-            /**
-             * @brief Check peripheral device history
-             * @param outDetections Output detections
-             * @param err Optional error output
-             * @return true if lack of peripherals detected
-             */
-            [[nodiscard]] bool CheckPeripheralHistory(
-                std::vector<EnvironmentDetectedTechnique>& outDetections,
-                EnvironmentError* err = nullptr
-            ) noexcept;
 
             /**
              * @brief Check if file name is hash-based or suspicious
