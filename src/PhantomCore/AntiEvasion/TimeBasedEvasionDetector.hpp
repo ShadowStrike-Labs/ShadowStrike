@@ -1360,8 +1360,76 @@ namespace ShadowStrike {
          * detector.Shutdown();
          * @endcode
          */
+        /**
+         * @brief Invariant timing characteristics of the HOST this process runs on.
+         *
+         * Every field describes the MACHINE, not an analysed process. Hypervisor presence,
+         * RDTSC overhead, CPUID latency and memory latency do not change over a process
+         * lifetime, which is why the profile is measured exactly once (see
+         * TimeBasedEvasionDetector::GetHostTimingProfile) rather than on a schedule.
+         *
+         * @warning A hypervisor being present is CONTEXT, NOT A THREAT. Enterprise and
+         *          cloud endpoints are overwhelmingly virtualised, so treating any field
+         *          here as evidence of evasion would fire on the majority of legitimate
+         *          machines. These values exist to make timing findings interpretable -
+         *          a target's measured delta means little without knowing what the host
+         *          itself costs - and for the baseline-relative thresholds that the
+         *          module's currently fixed constants could later be replaced by.
+         */
+        struct HostTimingProfile final {
+            /// Raw RDTSC instruction overhead, in cycles.
+            std::uint64_t rawRdtscOverheadCycles        = 0;
+            /// CPUID-serialized RDTSC overhead. Documented as the gold standard for VM detection.
+            std::uint64_t serializedRdtscOverheadCycles = 0;
+            /// CPUID latency. CPUID always causes a VM exit, so this rises sharply under a hypervisor.
+            std::uint64_t cpuidLatencyCycles            = 0;
+            /// Variance across repeated CPUID timings. Virtualised hosts show higher variance.
+            std::uint64_t cpuidVarianceCycles           = 0;
+            /// Cycles for a fixed instruction sequence.
+            std::uint64_t instructionSequenceCycles     = 0;
+            /// Memory access latency in cycles.
+            std::uint64_t memoryLatencyCycles           = 0;
+            /// RDTSCP minus RDTSC, in cycles. Meaningful only when rdtscpAvailable is true.
+            std::int64_t  rdtscpMinusRdtscCycles        = 0;
+            /// Whether this processor implements RDTSCP (CPUID.80000001h:EDX[27]).
+            bool          rdtscpAvailable               = false;
+            /// Whether CPUID leaf 0x40000000 reports a hypervisor.
+            bool          hypervisorPresent             = false;
+            /// Hypervisor vendor string, empty when no hypervisor is reported.
+            std::string   hypervisorVendor;
+        };
+
         class TimeBasedEvasionDetector {
         public:
+            // =========================================================================
+            // Host Environment Profile
+            // =========================================================================
+
+            /**
+             * @brief Invariant timing profile of the host, measured exactly once.
+             *
+             * The measurement runs on first call and is cached for the process lifetime,
+             * so callers pay nothing after the first. It must NOT be treated as a
+             * per-process signal: every value describes the machine.
+             *
+             * This is the consumer for the host-probing routines in
+             * TimeBasedEvasionDetector_x64.asm. Those routines measure the environment,
+             * whereas AnalyzeProcess analyses a target process, so they cannot correctly
+             * be called from the per-process path - attributing a host property to a
+             * process would be wrong, and reporting virtualisation as evasion would fire
+             * on most legitimate endpoints.
+             *
+             * Deliberately EXCLUDED from the profile: the sleep-based probes
+             * (TimingMeasureSleep, TimingDetectSleepAcceleration) because they wait by
+             * construction, the single-step probe because it manipulates the trap flag,
+             * and TimingCalibrateTimebase because it calibrates against
+             * QueryPerformanceCounter over an interval whose duration has not been
+             * measured. None of those belong in a startup path.
+             *
+             * @return Reference to the cached profile. Thread-safe.
+             */
+            [[nodiscard]] static const HostTimingProfile& GetHostTimingProfile() noexcept;
+
             // =========================================================================
             // Singleton Access
             // =========================================================================

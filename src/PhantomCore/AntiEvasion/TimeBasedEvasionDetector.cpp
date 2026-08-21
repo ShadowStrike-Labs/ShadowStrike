@@ -2476,14 +2476,84 @@ TimeBasedEvasionDetector::TimeBasedEvasionDetector()
 TimeBasedEvasionDetector::~TimeBasedEvasionDetector() = default;
 
 bool TimeBasedEvasionDetector::Initialize(std::shared_ptr<Utils::ThreadPool> threadPool) {
-    return m_impl->Initialize(std::move(threadPool), TimingDetectorConfig::CreateDefault());
+    // Delegates to the two-argument overload rather than duplicating the call to the impl,
+    // so that anything added after initialisation applies to BOTH entry points. Previously
+    // each overload called the impl directly, which is how a post-init step added to one
+    // would silently not run for callers of the other.
+    return Initialize(std::move(threadPool), TimingDetectorConfig::CreateDefault());
 }
 
 bool TimeBasedEvasionDetector::Initialize(
     std::shared_ptr<Utils::ThreadPool> threadPool,
     const TimingDetectorConfig& config)
 {
-    return m_impl->Initialize(std::move(threadPool), config);
+    if (!m_impl->Initialize(std::move(threadPool), config)) {
+        return false;
+    }
+
+    // Measure and record the host's invariant timing characteristics exactly once. This is
+    // the only consumer of the host-probing assembly routines, and it runs here - at
+    // startup, off the process-notify path - because the values describe the machine and
+    // cannot change per process. Emitting them makes every later timing finding
+    // interpretable: a target's measured delta is meaningless without knowing what the
+    // host itself costs, which is precisely the context field diagnosis has lacked.
+    const HostTimingProfile& host = GetHostTimingProfile();
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"Host timing profile: rdtsc=%llu serializedRdtsc=%llu cpuidLatency=%llu "
+        L"cpuidVariance=%llu instrSeq=%llu memLatency=%llu rdtscp=%hs rdtscpDelta=%lld "
+        L"hypervisor=%hs vendor=%hs",
+        static_cast<unsigned long long>(host.rawRdtscOverheadCycles),
+        static_cast<unsigned long long>(host.serializedRdtscOverheadCycles),
+        static_cast<unsigned long long>(host.cpuidLatencyCycles),
+        static_cast<unsigned long long>(host.cpuidVarianceCycles),
+        static_cast<unsigned long long>(host.instructionSequenceCycles),
+        static_cast<unsigned long long>(host.memoryLatencyCycles),
+        host.rdtscpAvailable ? "yes" : "no",
+        static_cast<long long>(host.rdtscpMinusRdtscCycles),
+        host.hypervisorPresent ? "yes" : "no",
+        host.hypervisorVendor.empty() ? "none" : host.hypervisorVendor.c_str());
+
+    return true;
+}
+
+const HostTimingProfile& TimeBasedEvasionDetector::GetHostTimingProfile() noexcept {
+    // Measured once, on first call, and cached for the process lifetime. A function-local
+    // static gives thread-safe one-time initialisation; subsequent calls only test a guard.
+    // Every probe below is documented bounded and none of them waits, so the one-time cost
+    // is microsecond-scale even on a virtualised host where each CPUID traps.
+    static const HostTimingProfile profile = []() noexcept -> HostTimingProfile {
+        HostTimingProfile p{};
+
+        p.rawRdtscOverheadCycles        = TimingRDTSCDelta();
+        p.serializedRdtscOverheadCycles = TimingSerializedRDTSC();
+        p.cpuidLatencyCycles            = TimingCPUIDLatency();
+        p.cpuidVarianceCycles           = TimingCPUIDVariance();
+        p.instructionSequenceCycles     = TimingMeasureInstructions();
+        p.memoryLatencyCycles           = TimingMeasureMemory();
+
+        // The routine documents a 13-byte minimum for the vendor buffer: 12 CPUID bytes
+        // from EBX/ECX/EDX plus a terminator. The oversized buffer is zero-initialised and
+        // the terminator is forced, so a routine that filled all 12 bytes without
+        // terminating still cannot produce an unterminated string here.
+        char vendor[16] = {};
+        p.hypervisorPresent = (TimingCheckHypervisorLeaf(vendor) != 0);
+        if (p.hypervisorPresent) {
+            vendor[12] = '\0';
+            p.hypervisorVendor.assign(vendor);
+        }
+
+        // RDTSCP is not baseline x64 and raises #UD where absent, so this comparison is
+        // taken only when the instruction exists. The field stays 0 otherwise, and
+        // rdtscpAvailable is what tells a reader that 0 means "not measured" rather than
+        // "measured as zero" - a distinction that matters for every consumer.
+        p.rdtscpAvailable = ::ShadowStrike::Utils::CpuFeatures::HasRDTSCP();
+        if (p.rdtscpAvailable) {
+            p.rdtscpMinusRdtscCycles = TimingCompareRDTSCvRDTSCP();
+        }
+
+        return p;
+    }();
+    return profile;
 }
 
 void TimeBasedEvasionDetector::Shutdown() {

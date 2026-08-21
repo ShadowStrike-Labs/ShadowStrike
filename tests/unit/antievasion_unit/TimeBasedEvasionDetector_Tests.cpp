@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.hpp"
+#include "../../../src/PhantomCore/Utils/CpuFeatures.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 
@@ -124,6 +125,83 @@ TEST(TimeBasedEvasionDetector_ConfigAndStats, FactoryMethodsAndStatisticsRemainS
     EXPECT_EQ(0u, stats.analysisErrors.load());
     EXPECT_DOUBLE_EQ(0.0, stats.GetCacheHitRatio());
     EXPECT_EQ(0u, stats.detectionsByType[static_cast<size_t>(TimingEvasionType::SleepBombing)].load());
+}
+
+// ============================================================================
+// Host timing profile
+//
+// This is the consumer for the host-probing routines in
+// TimeBasedEvasionDetector_x64.asm. Before it existed all eight had no caller, so
+// neither the assembly nor its /ALTERNATENAME fallback ever executed.
+//
+// The assertions below hold for either implementation, which is deliberate: the
+// contract belongs to the profile, not to whichever body the linker selected.
+// ============================================================================
+
+TEST(TimeBasedEvasionDetector_HostProfile, IsMeasuredOnceAndIsStable) {
+    const HostTimingProfile& first  = TimeBasedEvasionDetector::GetHostTimingProfile();
+    const HostTimingProfile& second = TimeBasedEvasionDetector::GetHostTimingProfile();
+
+    // The SAME object must come back. Re-measuring per call would put CPUID - which traps
+    // to the hypervisor on a virtualised host - on every caller's path, for values that
+    // cannot change during the process lifetime.
+    EXPECT_EQ(&first, &second);
+
+    EXPECT_EQ(first.rawRdtscOverheadCycles,        second.rawRdtscOverheadCycles);
+    EXPECT_EQ(first.serializedRdtscOverheadCycles, second.serializedRdtscOverheadCycles);
+    EXPECT_EQ(first.cpuidLatencyCycles,            second.cpuidLatencyCycles);
+    EXPECT_EQ(first.hypervisorPresent,             second.hypervisorPresent);
+    EXPECT_EQ(first.hypervisorVendor,              second.hypervisorVendor);
+}
+
+TEST(TimeBasedEvasionDetector_HostProfile, ProbesReturnRealMeasurements) {
+    const HostTimingProfile& p = TimeBasedEvasionDetector::GetHostTimingProfile();
+
+    // A probe returning zero did not run. RDTSC and CPUID both cost cycles on every x64
+    // processor, so zero here means the routine was never reached rather than that the
+    // machine is infinitely fast.
+    EXPECT_GT(p.rawRdtscOverheadCycles, 0u);
+    EXPECT_GT(p.cpuidLatencyCycles, 0u);
+    EXPECT_GT(p.instructionSequenceCycles, 0u);
+
+    // CPUID serializes and traps under a hypervisor; RDTSC does neither. CPUID therefore
+    // costs strictly more, on bare metal and in a VM alike. This is the assertion that
+    // distinguishes the two probes from one another - without it, both returning the same
+    // wrong value would still pass the non-zero checks above.
+    EXPECT_GT(p.cpuidLatencyCycles, p.rawRdtscOverheadCycles);
+
+    // Sanity ceiling. These are cycle counts for short sequences, not wall-clock figures;
+    // a value this large would mean the routine returned something other than cycles.
+    EXPECT_LT(p.rawRdtscOverheadCycles, 10ull * 1000ull * 1000ull);
+    EXPECT_LT(p.cpuidLatencyCycles,     10ull * 1000ull * 1000ull);
+}
+
+TEST(TimeBasedEvasionDetector_HostProfile, RdtscpFieldsAreGatedOnAvailability) {
+    const HostTimingProfile& p = TimeBasedEvasionDetector::GetHostTimingProfile();
+
+    EXPECT_EQ(p.rdtscpAvailable, Utils::CpuFeatures::HasRDTSCP())
+        << "the profile must agree with the feature probe, otherwise a consumer cannot "
+           "tell whether rdtscpMinusRdtscCycles was measured or merely left at zero";
+
+    if (!p.rdtscpAvailable) {
+        EXPECT_EQ(0, p.rdtscpMinusRdtscCycles)
+            << "RDTSCP raises #UD where the processor does not implement it, so the "
+               "comparison must not have been attempted";
+    }
+}
+
+TEST(TimeBasedEvasionDetector_HostProfile, HypervisorVendorIsConsistentWithPresence) {
+    const HostTimingProfile& p = TimeBasedEvasionDetector::GetHostTimingProfile();
+
+    if (!p.hypervisorPresent) {
+        EXPECT_TRUE(p.hypervisorVendor.empty())
+            << "a vendor string with no hypervisor reported would be a fabricated value";
+    } else {
+        // CPUID leaf 0x40000000 yields at most 12 vendor bytes across EBX/ECX/EDX.
+        EXPECT_LE(p.hypervisorVendor.size(), 12u);
+        EXPECT_FALSE(p.hypervisorVendor.empty())
+            << "a reported hypervisor should carry its vendor string";
+    }
 }
 
 } // namespace ShadowStrike::AntiEvasion::Tests
