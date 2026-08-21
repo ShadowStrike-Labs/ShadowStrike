@@ -404,7 +404,7 @@
     <ClCompile Include="src\PhantomCore\Whitelist\WhiteListPatternIndex.cpp" />
     <ClCompile Include="src\PhantomCore\Whitelist\WhiteListStore.cpp" />
     <ClCompile Include="src\PhantomCore\Whitelist\WhiteListStringPool.cpp" />
-    <!-- Additional PhantomCore modules not in original PhantomHome.vcxproj -->
+    <!-- Additional PhantomCore modules the product compile-check project does not build -->
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\ModeThresholds.cpp" />
     <!-- Zero-Trust Execution Guard — PhantomHome product module -->

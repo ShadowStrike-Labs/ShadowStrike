@@ -7,7 +7,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ShadowStrike", "ShadowStrik
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomSensor", "PhantomSensor\PhantomSensor.vcxproj", "{78370031-C4FE-967D-E0AF-6159EAC744CC}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomHome", "PhantomHome.vcxproj", "{264DE895-7C8E-4853-AB6F-EB6969F6B38D}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomHomeModules", "PhantomHomeModules.vcxproj", "{264DE895-7C8E-4853-AB6F-EB6969F6B38D}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomEDR", "PhantomEDR.vcxproj", "{A3904751-2251-4DBD-8A6D-C370D342EC9D}"
 EndProject

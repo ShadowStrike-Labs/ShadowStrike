@@ -111,7 +111,7 @@ jobs:
               # -----------------------------------------------------------
               Write-Host "=== Building PhantomHome (product modules) ==="
               cov-build --dir cov-int msbuild `
-                  PhantomHome.vcxproj `
+                  PhantomHomeModules.vcxproj `
                   /t:Rebuild `
                   /p:Configuration=Debug /p:Platform=x64 `
                   /p:PlatformToolset=v143

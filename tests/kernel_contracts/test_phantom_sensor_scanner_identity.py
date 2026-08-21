@@ -5982,10 +5982,19 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     and both carry the same stale source entries this guard rejects.  They join the
     list when they come into scope; excluding them is a scope statement, not an
     oversight.
+
+    NAMING, because two different things shared one word until task 211.  PhantomHome
+    is the PRODUCT: its sources live under src/Products/Community/PhantomHome and its
+    shipped host is ShadowStrikePhantomService.exe.  PhantomHomeModules.vcxproj is the
+    project that compile-verifies that product tree, and it ships nothing.  That
+    project was called PhantomHome.vcxproj until the rename, so narrative prose below
+    still says "PhantomHome" where it describes what the project did at the time; that
+    is deliberate and accurate about the past.  Assertions and the failure messages a
+    reader actually sees name the project as it is called now.
     """
 
     _USER_MODE_PROJECTS = (
-        "PhantomHome.vcxproj",
+        "PhantomHomeModules.vcxproj",
         "ShadowStrike.vcxproj",
         "PhantomCoreLib.vcxproj",
         "PhantomTests.vcxproj",
@@ -6052,7 +6061,7 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
         )
 
     def test_phantomhome_names_a_toolset_that_is_installed(self) -> None:
-        text = self._project_text("PhantomHome.vcxproj")
+        text = self._project_text("PhantomHomeModules.vcxproj")
         declared = re.findall(r"<PlatformToolset>([^<]+)</PlatformToolset>", text)
         self.assertEqual(
             4,
@@ -6064,14 +6073,14 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
             [],
             bad,
             msg=(
-                "PhantomHome names a platform toolset that is not installed, so MSBuild "
+                "PhantomHomeModules names a platform toolset that is not installed, so MSBuild "
                 "fails at project evaluation (MSB8020) and compiles nothing. "
                 f"offending toolsets: {bad}"
             ),
         )
 
     def test_phantomhome_compiles_against_the_unicode_windows_api(self) -> None:
-        text = self._project_text("PhantomHome.vcxproj")
+        text = self._project_text("PhantomHomeModules.vcxproj")
 
         charsets = re.findall(r"<CharacterSet>([^<]+)</CharacterSet>", text)
         self.assertEqual(
@@ -6115,8 +6124,8 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
         )
 
     def test_phantomhome_gives_every_object_file_a_distinct_path(self) -> None:
-        text = self._project_text("PhantomHome.vcxproj")
-        sources = self._compiled_sources("PhantomHome.vcxproj")
+        text = self._project_text("PhantomHomeModules.vcxproj")
+        sources = self._compiled_sources("PhantomHomeModules.vcxproj")
         # Anti-vacuity floor only.  It is deliberately far below the count: since
         # task 205 PhantomHome borrows the whole shared tree from PhantomCoreLib and
         # compiles only the sources it owns, so 300 - written when the project
@@ -6124,7 +6133,7 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
         self.assertGreater(
             len(sources),
             50,
-            msg=f"expected PhantomHome to compile >50 sources, found {len(sources)}",
+            msg=f"expected PhantomHomeModules to compile >50 sources, found {len(sources)}",
         )
 
         seen: dict[str, list[str]] = {}
@@ -6140,7 +6149,7 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
                 "<ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>",
                 text,
                 msg=(
-                    "PhantomHome compiles same-named sources without deriving the object "
+                    "PhantomHomeModules compiles same-named sources without deriving the object "
                     f"path per source, so one overwrites the other: {collisions}"
                 ),
             )
@@ -6155,7 +6164,7 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
             [],
             shared,
             msg=(
-                "PhantomHome writes intermediates into the shared build\\$(Configuration) "
+                "PhantomHomeModules writes intermediates into the shared build\\$(Configuration) "
                 "directory; give it a private subdirectory so objects cannot collide "
                 "with another project's."
             ),
@@ -6600,9 +6609,15 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
     PhantomHome product against the same library and links today, so the product
     sources it needs are exactly the product sources PhantomHome needs.  Comparing
     against it is self-maintaining; comparing against a copied list is not.
+
+    NAMING (task 211): PhantomHomeModules.vcxproj is the compile-verification project,
+    renamed from PhantomHome.vcxproj because it is not the product and ships nothing.
+    Where prose below says "PhantomHome product sources" it means sources under
+    src/Products/Community/PhantomHome, which is a source path and is unaffected by
+    the project rename.
     """
 
-    _HOME = "PhantomHome.vcxproj"
+    _HOME = "PhantomHomeModules.vcxproj"
     _LIB = "PhantomCoreLib.vcxproj"
     _SERVICE = "ShadowStrikePhantomService.vcxproj"
     _UI = "ShadowStrikePhantomUI.vcxproj"
@@ -6663,7 +6678,7 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
         self.assertGreater(
             len(home),
             50,
-            msg=f"expected PhantomHome to compile >50 sources, parsed {len(home)}",
+            msg=f"expected PhantomHomeModules to compile >50 sources, parsed {len(home)}",
         )
 
         allowed = {item.lower() for item in self._SHARED_BY_DESIGN}
@@ -6672,7 +6687,7 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
             [],
             duplicated,
             msg=(
-                "PhantomHome compiles sources PhantomCoreLib also compiles.  Every one "
+                "PhantomHomeModules compiles sources PhantomCoreLib also compiles.  Every one "
                 "is a duplicate object in a link that already archives the library, so "
                 "each is a latent LNK2005 the moment the library member is pulled in "
                 "for any other symbol it defines (task 206 was exactly that failure). "
@@ -6687,7 +6702,7 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
             [self._LIB],
             references,
             msg=(
-                "PhantomHome must reference PhantomCoreLib so the library is built "
+                "PhantomHomeModules must reference PhantomCoreLib so the library is built "
                 "before the executable links against it; without the reference a stale "
                 f"archive links silently. found: {references}"
             ),
@@ -6731,7 +6746,7 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
             [],
             home_asm,
             msg=(
-                "PhantomHome assembles .asm files the library already archives.  Each "
+                "PhantomHomeModules assembles .asm files the library already archives.  Each "
                 "duplicated object exports the same symbols, which is the linkage unit "
                 f"collision closed in task 206. offenders: {home_asm}"
             ),
@@ -6766,7 +6781,7 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
             missing,
             msg=(
                 "ShadowStrikePhantomService links PhantomHome product sources that "
-                "PhantomHome does not, and PhantomCoreLib does not supply them either. "
+                "PhantomHomeModules does not, and PhantomCoreLib does not supply them either. "
                 "Each is an unresolved external at link time and nothing else reports "
                 f"it. missing: {missing}"
             ),
@@ -6785,13 +6800,13 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
         self.assertIn(
             anchor,
             home,
-            msg="PhantomHome must link the real wiring anchor",
+            msg="PhantomHomeModules must link the real wiring anchor",
         )
         self.assertNotIn(
             stub,
             home,
             msg=(
-                "PhantomHome links the UI-process wiring stub; it defines the same "
+                "PhantomHomeModules links the UI-process wiring stub; it defines the same "
                 "symbol as WiringAnchor.cpp, so linking both is LNK2005 and linking "
                 "only the stub wires no modules at all"
             ),
@@ -6900,6 +6915,172 @@ class EmojiFreeCodebaseContractTests(unittest.TestCase):
                 "em-dash and box-drawing separators this codebase uses "
                 "deliberately".format(ord(spared)),
             )
+
+
+class ShippedBinaryIdentityContractTests(unittest.TestCase):
+    """Pins which executables the installer ships, so a project that ships nothing
+    cannot quietly start looking like a product again.
+
+    WHY THIS EXISTS.  Task 211 measured that PhantomHome.vcxproj built a googletest
+    runner named after a product tier: it linked zero test cases, so its main() took
+    its own "no tests discovered" branch and returned 1, and it appeared in none of the
+    six .wxs files.  The name was the whole problem.  FOUR filed tasks had reasoned
+    about that project as the product host and were mis-scoped as a result, and one of
+    them proposed forcing 22 module anchors into a binary nobody installs.  The project
+    is now called PhantomHomeModules to say what it does.  A name alone rots, so the
+    invariant behind the rename is asserted here instead of being remembered.
+
+    BOTH DIRECTIONS ARE ASSERTED, because each alone is weak.  Requiring the four
+    shipped names catches an installer that silently stops shipping a component -
+    which would be a product that no longer installs part of itself.  Forbidding the
+    others catches the reverse: an analysis or test harness being added to the MSI.
+
+    SUBSTRING SAFETY was checked rather than assumed.  "PhantomHome.exe" is not a
+    substring of "PhantomHomeModules.exe" and "ShadowStrike.exe" is not a substring of
+    "ShadowStrikePhantomService.exe" or "ShadowStrikeDriverResume.exe", so a plain
+    count() cannot confuse a forbidden name with a permitted one.
+    """
+
+    _WXS_DIR = ROOT / "packaging"
+
+    # Measured from build/installer/staging, which holds exactly these four .exe, and
+    # corroborated against the installed layout recorded under task 44.
+    _SHIPPED = (
+        "ShadowStrikePhantomService.exe",
+        "ShadowStrikePhantomTray.exe",
+        "ShadowStrikePhantomUI.exe",
+        "ShadowStrikeDriverResume.exe",
+    )
+
+    # Outputs of projects that exist to build, analyse or test the tree.  None is a
+    # product and none may appear in installer authoring.  PhantomHome.exe is listed
+    # deliberately: the pre-rename name must not come back either.
+    _NOT_SHIPPED = (
+        "PhantomHomeModules.exe",
+        "PhantomHome.exe",
+        "ShadowStrike.exe",
+        "phantom-tests.exe",
+        "PhantomEDR.exe",
+        "PhantomXDR.exe",
+        "PhantomSigBuild.exe",
+    )
+
+    # Anti-vacuity floor.  Six .wxs exist; a walk that finds fewer than four has lost
+    # the installer authoring, and every "appears zero times" assertion below would
+    # then pass for the wrong reason.
+    _MIN_WXS_FILES = 4
+
+    _COVERITY_WORKFLOW = ROOT / ".github/workflows/coverity-scan.yml"
+
+    @classmethod
+    def _wxs(cls) -> "list[tuple[str, str]]":
+        found = []
+        for path in sorted(cls._WXS_DIR.rglob("*.wxs")):
+            rel = path.relative_to(ROOT).as_posix()
+            found.append((rel, path.read_text(encoding="utf-8", errors="replace")))
+        return found
+
+    def test_the_installer_still_ships_every_product_executable(self) -> None:
+        files = self._wxs()
+        self.assertGreaterEqual(
+            len(files),
+            self._MIN_WXS_FILES,
+            msg=(
+                f"found only {len(files)} .wxs files under {self._WXS_DIR.name}, so the "
+                "forbidden-name assertions would pass vacuously"
+            ),
+        )
+        blob = "\n".join(text for _, text in files)
+        missing = [name for name in self._SHIPPED if name not in blob]
+        self.assertEqual(
+            [],
+            missing,
+            msg=(
+                "installer authoring no longer names these product executables, so the "
+                f"MSI would install a product missing part of itself: {missing}"
+            ),
+        )
+
+    def test_no_analysis_or_test_harness_is_declared_as_a_product(self) -> None:
+        files = self._wxs()
+        self.assertGreaterEqual(
+            len(files),
+            self._MIN_WXS_FILES,
+            msg=f"found only {len(files)} .wxs files, so this guard would pass vacuously",
+        )
+        offenders = []
+        for rel, text in files:
+            for name in self._NOT_SHIPPED:
+                count = text.count(name)
+                if count:
+                    offenders.append(f"{rel}: {name} x{count}")
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "installer authoring names the output of a project that exists only to "
+                "build, analyse or test the tree.  Shipping a test or analysis harness "
+                "puts code with no product purpose on an endpoint: "
+                f"{offenders}"
+            ),
+        )
+
+    def test_the_compile_verification_project_has_exactly_one_honest_name(self) -> None:
+        new = ROOT / "PhantomHomeModules.vcxproj"
+        old = ROOT / "PhantomHome.vcxproj"
+        self.assertTrue(
+            new.is_file(),
+            msg="PhantomHomeModules.vcxproj is missing; the product tree has no project that compile-verifies it",
+        )
+        self.assertFalse(
+            old.is_file(),
+            msg=(
+                "PhantomHome.vcxproj is back.  A project named after the product tier "
+                "while shipping nothing is what task 211 removed; two projects for one "
+                "role means the next reader cannot tell which is the product"
+            ),
+        )
+        sln = (ROOT / "ShadowStrike.sln").read_text(encoding="utf-8").lstrip("\ufeff")
+        # Bounded on purpose: assertIn against a whole file prints the file.
+        self.assertTrue(
+            "PhantomHomeModules.vcxproj" in sln,
+            msg="the solution does not name PhantomHomeModules.vcxproj, so it is not built by a solution build",
+        )
+        stale = re.findall(re.escape('"PhantomHome.vcxproj"'), sln)
+        self.assertEqual(
+            [],
+            stale,
+            msg="the solution still points at PhantomHome.vcxproj, which does not exist; the project would fail to load",
+        )
+
+    def test_coverity_still_analyses_the_phantomhome_product_modules(self) -> None:
+        # This is the assertion that matters most in this class.  The workflow is the
+        # only consumer that builds the compile-verification project, so if it names a
+        # project that does not exist, the entire PhantomHome product tree leaves
+        # static analysis and nothing in a normal build or test run reports it.
+        self.assertTrue(
+            self._COVERITY_WORKFLOW.is_file(),
+            msg=f"{self._COVERITY_WORKFLOW.name} is missing; static-analysis coverage cannot be checked",
+        )
+        text = self._COVERITY_WORKFLOW.read_text(encoding="utf-8").lstrip("\ufeff")
+        # Bounded on purpose: assertIn against a whole file prints the file.
+        self.assertTrue(
+            "PhantomHomeModules.vcxproj" in text,
+            msg=(
+                "the Coverity workflow no longer builds PhantomHomeModules.vcxproj, so "
+                "the PhantomHome product modules are silently absent from static "
+                "analysis while the scan still reports success"
+            ),
+        )
+        stale = re.findall(r"(?<!Modules)PhantomHome\.vcxproj", text)
+        self.assertEqual(
+            [],
+            stale,
+            msg=(
+                "the Coverity workflow still names PhantomHome.vcxproj, which does not "
+                "exist, so its build phase would fail or be skipped"
+            ),
+        )
 
 
 if __name__ == "__main__":

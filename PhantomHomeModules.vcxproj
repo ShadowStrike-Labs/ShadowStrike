@@ -1,5 +1,27 @@
 <?xml version='1.0' encoding='utf-8'?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build">
+  <!--
+    PhantomHomeModules : compile and link verification for the PhantomHome product tree.
+
+    THIS IS NOT A SHIPPED PRODUCT BINARY, and it is not a test runner either.
+    Measured under task 211: its only entry point is src\Main.cpp, which is a
+    googletest runner, and this project links ZERO test cases.  So main() takes its
+    own "no tests discovered" branch, prints that, and returns 1.  That is the whole
+    observable behaviour of the executable.  It appears in none of the six .wxs files
+    and build\installer\staging does not contain it.  The product is hosted by
+    ShadowStrikePhantomService.exe, which carries the 22 PhantomHome_KeepAlive_*
+    anchors and is what the MSI installs and the SCM starts.
+
+    WHAT IT IS FOR, and why it must not be deleted: it compiles the sources under
+    src\Products\Community\PhantomHome plus src\pch.cpp against PhantomCoreLib, so it
+    is the only project that proves that product tree compiles and links on its own.
+    .github/workflows/coverity-scan.yml builds it as its Phase 3, so Coverity sees
+    those product modules through this project; unlisting it silently drops the whole
+    PhantomHome product tree out of static analysis.
+
+    Build configuration work that only matters for a SHIPPED binary belongs in
+    ShadowStrikePhantomService.vcxproj rather than here.  See tasks 207 and 212.
+  -->
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
       <Configuration>Debug</Configuration>
@@ -73,7 +95,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IntDir>$(ProjectDir)build\$(Configuration)\PhantomHome\</IntDir>
+    <IntDir>$(ProjectDir)build\$(Configuration)\PhantomHomeModules\</IntDir>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -81,7 +103,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IntDir>$(ProjectDir)build\$(Configuration)\PhantomHome\</IntDir>
+    <IntDir>$(ProjectDir)build\$(Configuration)\PhantomHomeModules\</IntDir>
     <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
