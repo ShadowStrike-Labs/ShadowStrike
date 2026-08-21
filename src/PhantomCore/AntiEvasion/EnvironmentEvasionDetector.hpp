@@ -2502,8 +2502,92 @@ namespace ShadowStrike {
          *     }
          * @endcode
          */
+        /**
+         * @brief INVARIANT facts about the processor this process runs on.
+         *
+         * Every field is a property of the CPU and cannot change while the process lives,
+         * so the accessor measures them exactly once and caches them. Same lifecycle and
+         * same guarantees as TimeBasedEvasionDetector::GetHostTimingProfile.
+         *
+         * @warning CONTEXT ONLY. No field here may reach a detection verdict. These
+         *          describe the machine, not an analysed process or file, so treating any
+         *          of them as evidence would attribute a host property to a sample.
+         */
+        struct HostProcessorFacts final {
+            /// Whether SSE2 is reported by CPUID. Baseline on x64, so false is notable.
+            bool          sse2Supported          = false;
+            /// Highest extended CPUID leaf the processor implements.
+            std::uint32_t extendedCpuidMaxLeaf   = 0;
+            /// CPUID.01h:ECX feature bits.
+            std::uint32_t cpuidFeaturesEcx       = 0;
+            /// CPUID.01h:EDX feature bits.
+            std::uint32_t cpuidFeaturesEdx       = 0;
+        };
+
+        /**
+         * @brief VOLATILE debug state of THIS process, sampled at the moment of the call.
+         *
+         * @warning This structure must NEVER be cached, and the accessor deliberately does
+         *          not cache it. A debugger can attach at any time, so a cached "not
+         *          debugged" answer would become a silent false negative the instant one
+         *          did - which is precisely the tamper event worth knowing about on a
+         *          security service. That is why this does not share the one-time cache
+         *          used for HostProcessorFacts, even though both are context-only.
+         *
+         * @warning CONTEXT ONLY, like the processor facts. A debugger attached to our own
+         *          process says nothing about any file or process being analysed, so no
+         *          field here may contribute to a sample's verdict. Its value is
+         *          self-defence and forensic context.
+         *
+         * @note The assembly behind these fields reads the PEB and the debug registers
+         *       DIRECTLY. That is materially stronger than the Win32 equivalents: an
+         *       attacker who hooks IsDebuggerPresent can make it lie, whereas a direct
+         *       structure read cannot be intercepted the same way.
+         */
+        struct SelfDebugState final {
+            /// PEB->BeingDebugged, read directly rather than through IsDebuggerPresent.
+            bool          beingDebugged          = false;
+            /// PEB->NtGlobalFlag. Debug heap flags here indicate a debugger-created process.
+            std::uint32_t ntGlobalFlag           = 0;
+            /// ProcessHeap->Flags. Debug-heap bits are set when a debugger is present.
+            std::uint32_t processHeapFlags       = 0;
+            /// Whether any hardware debug register holds a breakpoint address.
+            bool          hardwareBreakpointSet  = false;
+            /// Raw DR0-DR3 breakpoint addresses, and the DR6/DR7 control pair.
+            std::uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0, dr6 = 0, dr7 = 0;
+        };
+
         class EnvironmentEvasionDetector {
         public:
+            // ========================================================================
+            // HOST CONTEXT ACCESSORS
+            //
+            // These two are the consumers for the host-subject routines in
+            // EnvironmentEvasionDetector_x64.asm, which had no caller at all before they
+            // existed. They follow the same contract as
+            // TimeBasedEvasionDetector::GetHostTimingProfile - context only, never a
+            // verdict, no waiting or trap-flag probe - and differ only in lifecycle,
+            // because one subject is invariant and the other is not.
+            // ========================================================================
+
+            /**
+             * @brief Invariant processor facts, measured exactly once and cached.
+             * @return Reference to the cached facts. Thread-safe.
+             * @note Context only: never contribute these to a detection verdict.
+             */
+            [[nodiscard]] static const HostProcessorFacts& GetHostProcessorFacts() noexcept;
+
+            /**
+             * @brief Debug state of THIS process, sampled fresh on every call.
+             * @return A snapshot taken at the moment of the call, by value.
+             * @note Returned BY VALUE and never cached, deliberately: a debugger may attach
+             *       at any moment, so a cached answer would become a false negative. The
+             *       cost is a handful of direct PEB and debug-register reads.
+             * @note Context only: a debugger on our own process says nothing about any
+             *       file or process being analysed.
+             */
+            [[nodiscard]] static SelfDebugState SampleSelfDebugState() noexcept;
+
             // ========================================================================
             // CONSTRUCTION & LIFECYCLE
             // ========================================================================

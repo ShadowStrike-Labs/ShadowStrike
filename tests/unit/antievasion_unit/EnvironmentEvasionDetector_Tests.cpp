@@ -180,4 +180,72 @@ TEST(EnvironmentEvasionDetector_Statistics, ResetClearsCounters) {
     }
 }
 
+// ============================================================================
+// Host context accessors
+//
+// Consumers for the host-subject routines in EnvironmentEvasionDetector_x64.asm,
+// which had no caller before they existed. Same contract as
+// TimeBasedEvasionDetector::GetHostTimingProfile: context only, never a verdict.
+// The lifecycles differ because the subjects do - processor facts are invariant
+// and cached, self debug state is volatile and sampled fresh.
+// ============================================================================
+
+TEST(EnvironmentEvasionDetector_HostFacts, ProcessorFactsAreMeasuredOnceAndStable) {
+    const HostProcessorFacts& first  = EnvironmentEvasionDetector::GetHostProcessorFacts();
+    const HostProcessorFacts& second = EnvironmentEvasionDetector::GetHostProcessorFacts();
+
+    EXPECT_EQ(&first, &second)
+        << "processor facts are invariant, so the accessor must cache them rather than "
+           "re-issuing CPUID - which traps to the hypervisor - on every caller";
+    EXPECT_EQ(first.extendedCpuidMaxLeaf, second.extendedCpuidMaxLeaf);
+    EXPECT_EQ(first.cpuidFeaturesEdx, second.cpuidFeaturesEdx);
+}
+
+TEST(EnvironmentEvasionDetector_HostFacts, ProcessorFactsAgreeWithTheArchitecture) {
+    const HostProcessorFacts& f = EnvironmentEvasionDetector::GetHostProcessorFacts();
+
+    // SSE2 is architecturally guaranteed on x64. A false here means the probe did not run
+    // rather than that the processor lacks it.
+    EXPECT_TRUE(f.sse2Supported);
+
+    // Leaf 0x80000000 reports the highest extended leaf; every x64 processor implements at
+    // least 0x80000001, which is where the RDTSCP bit lives.
+    EXPECT_GE(f.extendedCpuidMaxLeaf, 0x80000001u);
+
+    // Two INDEPENDENT probes must agree: CheckSSE2Support answers the question directly,
+    // while CPUID.01h:EDX bit 26 is the architectural SSE2 bit carried in the feature
+    // flags. If these disagree, one of the two routines is reading the wrong register -
+    // which no single-probe assertion above could reveal.
+    const bool sse2FromFeatureBits = ((f.cpuidFeaturesEdx >> 26) & 1u) != 0u;
+    EXPECT_EQ(f.sse2Supported, sse2FromFeatureBits);
+}
+
+TEST(EnvironmentEvasionDetector_HostFacts, SelfDebugStateIsInternallyConsistent) {
+    const SelfDebugState s = EnvironmentEvasionDetector::SampleSelfDebugState();
+
+    // Deliberately NOT asserting beingDebugged == false: running the suite under a debugger
+    // is legitimate, and a test that failed in that case would be testing the environment
+    // rather than the code.
+    if (s.hardwareBreakpointSet) {
+        const bool anyAddress = (s.dr0 | s.dr1 | s.dr2 | s.dr3) != 0ull;
+        const bool anyEnable  = (s.dr7 & 0xFFull) != 0ull;
+        EXPECT_TRUE(anyAddress || anyEnable)
+            << "a hardware breakpoint was reported while every breakpoint address and the "
+               "DR7 enable bits are clear, which cannot both be true";
+    }
+}
+
+TEST(EnvironmentEvasionDetector_HostFacts, SelfDebugStateSamplesRatherThanCaches) {
+    // Two immediate samples must agree in a stable environment. This does not by itself
+    // prove the accessor re-reads rather than caches - that is a source property and is
+    // pinned by the contract suite - but a disagreement here would mean the reads are not
+    // reproducible, which would make the field useless either way.
+    const SelfDebugState a = EnvironmentEvasionDetector::SampleSelfDebugState();
+    const SelfDebugState b = EnvironmentEvasionDetector::SampleSelfDebugState();
+
+    EXPECT_EQ(a.beingDebugged, b.beingDebugged);
+    EXPECT_EQ(a.processHeapFlags, b.processHeapFlags);
+    EXPECT_EQ(a.hardwareBreakpointSet, b.hardwareBreakpointSet);
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

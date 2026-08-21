@@ -1989,6 +1989,51 @@ namespace ShadowStrike::AntiEvasion {
     EnvironmentEvasionDetector::EnvironmentEvasionDetector(EnvironmentEvasionDetector&&) noexcept = default;
     EnvironmentEvasionDetector& EnvironmentEvasionDetector::operator=(EnvironmentEvasionDetector&&) noexcept = default;
 
+    const HostProcessorFacts& EnvironmentEvasionDetector::GetHostProcessorFacts() noexcept {
+        // Measured once and cached, because every field is a property of the processor and
+        // cannot change while this process lives. Same lifecycle as
+        // TimeBasedEvasionDetector::GetHostTimingProfile, deliberately: host-invariant
+        // probes across this layer share one contract so a reader does not have to learn a
+        // new rule per module.
+        static const HostProcessorFacts facts = []() noexcept -> HostProcessorFacts {
+            HostProcessorFacts f{};
+            f.sse2Supported        = (CheckSSE2Support() != 0);
+            f.extendedCpuidMaxLeaf = static_cast<std::uint32_t>(GetExtendedCPUIDMaxLeaf());
+
+            std::uint32_t ecx = 0;
+            std::uint32_t edx = 0;
+            if (GetCPUIDFeatureFlags(&ecx, &edx) != 0) {
+                f.cpuidFeaturesEcx = ecx;
+                f.cpuidFeaturesEdx = edx;
+            }
+            return f;
+        }();
+        return facts;
+    }
+
+    SelfDebugState EnvironmentEvasionDetector::SampleSelfDebugState() noexcept {
+        // NOT cached, and that is the whole point. A debugger can attach at any moment, so
+        // a cached answer would report "not debugged" forever after the first call and turn
+        // a tamper event into a silent false negative. Each field is one or two direct
+        // reads of the PEB or the debug registers, so sampling per call is affordable.
+        SelfDebugState s{};
+
+        s.beingDebugged         = (CheckBeingDebugged() != 0);
+        s.ntGlobalFlag          = CheckNtGlobalFlag();
+        s.processHeapFlags      = GetProcessHeapFlags();
+        s.hardwareBreakpointSet = (CheckDebugRegistersASM() != 0);
+
+        // GetDebugRegisters reports success separately from the values, so the raw
+        // registers are recorded only when the read actually succeeded. Leaving them at
+        // zero on failure is honest; filling them with a sentinel would not be.
+        std::uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0, dr6 = 0, dr7 = 0;
+        if (GetDebugRegisters(&dr0, &dr1, &dr2, &dr3, &dr6, &dr7) != 0) {
+            s.dr0 = dr0; s.dr1 = dr1; s.dr2 = dr2;
+            s.dr3 = dr3; s.dr6 = dr6; s.dr7 = dr7;
+        }
+        return s;
+    }
+
     bool EnvironmentEvasionDetector::Initialize(EnvironmentError* err) noexcept {
         if (!m_impl) {
             if (err) {
@@ -1997,7 +2042,32 @@ namespace ShadowStrike::AntiEvasion {
             }
             return false;
         }
-        return m_impl->Initialize(err);
+        if (!m_impl->Initialize(err)) {
+            return false;
+        }
+
+        // Record the host context once, at startup, off the process-notify path. This is
+        // the only consumer of these assembly routines. Both values are CONTEXT: the
+        // processor facts describe the machine and the debug state describes this service,
+        // so neither reaches a detection verdict. Emitting them makes later findings
+        // interpretable and, for the debug state, records a tamper-relevant fact that the
+        // Win32 IsDebuggerPresent could have been made to lie about.
+        const HostProcessorFacts& cpu = GetHostProcessorFacts();
+        const SelfDebugState selfState = SampleSelfDebugState();
+        SS_LOG_INFO(L"EnvironmentEvasionDetector",
+            L"Host processor facts: sse2=%hs extCpuidMaxLeaf=0x%08X featEcx=0x%08X "
+            L"featEdx=0x%08X | self debug state: beingDebugged=%hs ntGlobalFlag=0x%08X "
+            L"heapFlags=0x%08X hwBreakpoint=%hs",
+            cpu.sse2Supported ? "yes" : "no",
+            cpu.extendedCpuidMaxLeaf,
+            cpu.cpuidFeaturesEcx,
+            cpu.cpuidFeaturesEdx,
+            selfState.beingDebugged ? "yes" : "no",
+            selfState.ntGlobalFlag,
+            selfState.processHeapFlags,
+            selfState.hardwareBreakpointSet ? "yes" : "no");
+
+        return true;
     }
 
     void EnvironmentEvasionDetector::Shutdown() noexcept {

@@ -7720,59 +7720,98 @@ class PackerAntiAnalysisWiringContractTests(unittest.TestCase):
         )
 
 
-class HostTimingProfileContractTests(unittest.TestCase):
-    """Pins the host-environment profile: what it measures, and what it must never measure.
+class HostContextAccessorUniformityContractTests(unittest.TestCase):
+    """ONE rule set for EVERY host-context accessor in the anti-evasion layer.
 
-    Task 209: eight host-probing routines in TimeBasedEvasionDetector_x64.asm had no caller,
-    so neither the assembly nor its /ALTERNATENAME fallback ever ran. They could not be
-    wired into the module's live path because that path analyses a TARGET PROCESS while
-    these routines measure the HOST - attributing a machine property to a process would be
-    wrong, and reporting virtualisation as evasion would fire on most legitimate endpoints.
-    The profile is the correct consumer: measured once, at startup, off the process-notify
-    path.
+    This class exists because the assembly wiring must not become a patchwork. Each
+    accessor below is the sole consumer of a group of hand-written assembly routines that
+    previously had no caller at all, and every one of them obeys the same contract:
 
-    The exclusion test is the more important of the two. TimingMeasureSleep and
-    TimingDetectSleepAcceleration WAIT by construction, with an internal bound of 5000;
-    TimingDetectSingleStep manipulates the trap flag; TimingCalibrateTimebase calibrates
-    against QueryPerformanceCounter over an interval of unmeasured duration. Adding any of
-    them to a profile that a caller may touch would put a wall-clock wait behind an
-    innocuous-looking accessor, and the first caller to do so from a latency-sensitive path
-    would stall it. Nothing in the type system prevents that, so a contract does.
+      * CONTEXT ONLY. No accessor may contribute to a detection verdict. Host and self
+        properties describe the machine or this service, not an analysed file or process,
+        so treating them as evidence would misattribute - and reporting virtualisation as
+        a threat would fire on the majority of legitimate enterprise endpoints.
+      * NO WAITING OR STATE-MUTATING PROBE. Routines that sleep, manipulate the trap flag,
+        or have unmeasured duration are excluded, because the first caller to touch an
+        innocuous-looking accessor from a latency-sensitive path would stall it.
+      * LIFECYCLE MATCHES SUBJECT. Invariant subjects are measured once and cached.
+        Volatile subjects are sampled fresh and must NOT be cached, or a cached answer
+        becomes a silent false negative the moment the real state changes.
+
+    The two lifecycles are not an inconsistency, they are the consequence of the subjects
+    differing: a processor's feature bits cannot change while the process lives, whereas a
+    debugger can attach at any moment.
     """
 
     _ANTIEVASION_DIR = ROOT / "src" / "PhantomCore" / "AntiEvasion"
 
-    _WIRED = (
-        "TimingRDTSCDelta",
-        "TimingSerializedRDTSC",
-        "TimingCPUIDLatency",
-        "TimingCPUIDVariance",
-        "TimingMeasureInstructions",
-        "TimingMeasureMemory",
-        "TimingCheckHypervisorLeaf",
-        "TimingCompareRDTSCvRDTSCP",
+    # accessor -> (source file, lifecycle, routines it must call)
+    _CACHED = "cached"
+    _SAMPLED = "sampled"
+
+    _ACCESSORS = (
+        (
+            "GetHostTimingProfile",
+            "TimeBasedEvasionDetector.cpp",
+            _CACHED,
+            (
+                "TimingRDTSCDelta",
+                "TimingSerializedRDTSC",
+                "TimingCPUIDLatency",
+                "TimingCPUIDVariance",
+                "TimingMeasureInstructions",
+                "TimingMeasureMemory",
+                "TimingCheckHypervisorLeaf",
+                "TimingCompareRDTSCvRDTSCP",
+            ),
+        ),
+        (
+            "GetHostProcessorFacts",
+            "EnvironmentEvasionDetector.cpp",
+            _CACHED,
+            (
+                "CheckSSE2Support",
+                "GetExtendedCPUIDMaxLeaf",
+                "GetCPUIDFeatureFlags",
+            ),
+        ),
+        (
+            "SampleSelfDebugState",
+            "EnvironmentEvasionDetector.cpp",
+            _SAMPLED,
+            (
+                "CheckBeingDebugged",
+                "CheckNtGlobalFlag",
+                "GetProcessHeapFlags",
+                "CheckDebugRegistersASM",
+                "GetDebugRegisters",
+            ),
+        ),
     )
 
-    # Waits, or mutates CPU state, or has unmeasured duration.
+    # Waits, mutates CPU state, or has unmeasured duration. Forbidden in EVERY accessor.
     _FORBIDDEN = (
         "TimingMeasureSleep",
         "TimingDetectSleepAcceleration",
         "TimingDetectSingleStep",
         "TimingCalibrateTimebase",
+        "CheckTrapFlag",
+        "DetectSingleStep",
+        "DetectHardwareBreakpoints",
+        "MeasureExceptionTiming",
+        "DetectPopfTiming",
+        "MeasureINTTimingDelta",
     )
 
-    def _profile_body(self) -> str:
-        code = strip_c_comments(
-            read_source(self._ANTIEVASION_DIR / "TimeBasedEvasionDetector.cpp")
-        )
+    def _accessor_body(self, accessor: str, source: str) -> str:
+        code = strip_c_comments(read_source(self._ANTIEVASION_DIR / source))
         match = re.search(
-            r"(?<![A-Za-z0-9_])GetHostTimingProfile\s*\(\s*\)\s*noexcept\s*\{", code
+            r"(?<![A-Za-z0-9_])" + accessor + r"\s*\(\s*\)\s*noexcept\s*\{", code
         )
         self.assertIsNotNone(
             match,
-            "GetHostTimingProfile is not defined in TimeBasedEvasionDetector.cpp - it is "
-            "the only consumer of the host-probing assembly, so losing it returns all "
-            "eight routines to being dead weight",
+            "{} is not defined in {} - it is the sole consumer of its assembly routines, "
+            "so losing it returns them to being dead weight".format(accessor, source),
         )
         brace = code.index("{", match.end() - 1)
         depth = 0
@@ -7783,55 +7822,74 @@ class HostTimingProfileContractTests(unittest.TestCase):
                 depth -= 1
                 if depth == 0:
                     return code[brace:pos + 1]
-        raise AssertionError("unbalanced braces in GetHostTimingProfile")
+        raise AssertionError("unbalanced braces in " + accessor)
 
-    def test_every_host_probe_stays_wired(self):
-        body = self._profile_body()
+    def test_every_accessor_keeps_its_probes_wired(self):
         missing = []
-        for routine in self._WIRED:
-            # Word boundary, not substring: a plain search would accept the call being
-            # rerouted to Fallback_<name>, which silently substitutes the reduced C++
-            # implementation for the hand-written assembly.
-            if not re.search(r"(?<![A-Za-z0-9_])" + routine + r"(?![A-Za-z0-9_])", body):
-                missing.append(routine)
+        for accessor, source, _lifecycle, routines in self._ACCESSORS:
+            body = self._accessor_body(accessor, source)
+            for routine in routines:
+                # Word boundary, not substring: a substring test accepts the call being
+                # rerouted to Fallback_<name>, silently substituting the reduced C++
+                # implementation for the hand-written assembly.
+                if not re.search(
+                    r"(?<![A-Za-z0-9_])" + routine + r"(?![A-Za-z0-9_])", body
+                ):
+                    missing.append("{}::{}".format(accessor, routine))
         self.assertEqual(
             [],
             missing,
-            "these host probes are no longer called from the profile, which is their only "
-            "caller in the entire tree: " + ", ".join(missing),
+            "these probes are no longer called from their only consumer: "
+            + ", ".join(missing),
         )
 
-    def test_no_waiting_or_state_mutating_probe_is_in_the_profile(self):
-        body = self._profile_body()
+    def test_no_accessor_calls_a_waiting_or_state_mutating_probe(self):
         offenders = []
-        for routine in self._FORBIDDEN:
-            if re.search(r"(?<![A-Za-z0-9_])" + routine + r"(?![A-Za-z0-9_])", body):
-                offenders.append(routine)
+        for accessor, source, _lifecycle, _routines in self._ACCESSORS:
+            body = self._accessor_body(accessor, source)
+            for routine in self._FORBIDDEN:
+                if re.search(
+                    r"(?<![A-Za-z0-9_])" + routine + r"(?![A-Za-z0-9_])", body
+                ):
+                    offenders.append("{}::{}".format(accessor, routine))
         self.assertEqual(
             [],
             offenders,
-            "the profile must not call a routine that waits, mutates CPU state, or has an "
-            "unmeasured duration. TimingMeasureSleep and TimingDetectSleepAcceleration "
-            "sleep by construction, TimingDetectSingleStep manipulates the trap flag, and "
-            "TimingCalibrateTimebase calibrates over an unmeasured interval. Present here: "
-            + ", ".join(offenders),
+            "a host-context accessor must never call a routine that waits, mutates CPU "
+            "state, or has unmeasured duration - these sleep, manipulate the trap flag, or "
+            "calibrate over an unbounded interval: " + ", ".join(offenders),
         )
 
+    def test_lifecycle_matches_the_subject(self):
+        wrong = []
+        for accessor, source, lifecycle, _routines in self._ACCESSORS:
+            body = self._accessor_body(accessor, source)
+            caches = re.search(r"(?<![A-Za-z0-9_])static\s+(?:const\s+)?", body) is not None
+            if lifecycle == self._CACHED and not caches:
+                wrong.append(
+                    accessor + " describes an INVARIANT subject but does not cache, so "
+                    "every caller re-issues CPUID"
+                )
+            if lifecycle == self._SAMPLED and caches:
+                wrong.append(
+                    accessor + " describes a VOLATILE subject but caches, so it will "
+                    "report the first sample forever and turn a state change into a "
+                    "silent false negative"
+                )
+        self.assertEqual([], wrong, "; ".join(wrong))
+
     def test_the_rdtscp_comparison_is_feature_gated(self):
-        body = self._profile_body()
+        body = self._accessor_body("GetHostTimingProfile", "TimeBasedEvasionDetector.cpp")
         self.assertIn(
             "HasRDTSCP",
             body,
-            "TimingCompareRDTSCvRDTSCP executes RDTSCP, which raises #UD on processors that "
-            "do not implement it, so the profile must test HasRDTSCP before calling it",
+            "TimingCompareRDTSCvRDTSCP executes RDTSCP, which raises #UD where the "
+            "processor does not implement it, so availability must be tested first",
         )
-        gate_at = body.index("HasRDTSCP")
-        compare_at = body.index("TimingCompareRDTSCvRDTSCP")
         self.assertLess(
-            gate_at,
-            compare_at,
-            "the availability test must precede the RDTSCP comparison; ordering them the "
-            "other way round would execute the instruction before establishing it exists",
+            body.index("HasRDTSCP"),
+            body.index("TimingCompareRDTSCvRDTSCP"),
+            "the availability test must precede the RDTSCP call, not follow it",
         )
 
 
