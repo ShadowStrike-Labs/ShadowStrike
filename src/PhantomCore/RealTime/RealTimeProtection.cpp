@@ -1594,42 +1594,50 @@ public:
             if (sandbox.Initialize(m_threadPool)) {
                 m_sandboxDetectorInitialized = true;
 
-                // Wire detection callback for SOC/SIEM telemetry.
-                // The detector singleton owns the callback for process lifetime;
-                // it is released by Shutdown() in ShutdownAntiEvasionDetectors().
-                (void)sandbox.RegisterCallback(
-                    [](const ShadowStrike::AntiEvasion::SandboxEvasionResult& result) {
-                        if (result.isSandboxLikely) {
-                            Utils::Logger::Warn(
-                                "[SED-CB] Sandbox detected  -  probability={:.1f}% confidence={:.1f}% "
-                                "definitive={} product={} indicators={}",
-                                result.probability, result.confidence,
-                                result.isDefinitive ? "YES" : "NO",
-                                result.sandboxName.empty() ? std::string("Unknown") : Utils::StringUtils::ToNarrow(result.sandboxName),
-                                result.indicators.size());
+                // NO DETECTION CALLBACK IS REGISTERED HERE, AND THAT IS DELIBERATE.
+                //
+                // A callback was registered at this point to log "Sandbox detected"
+                // with its indicators. It could never run: InvokeCallbacks is reached
+                // only from ScanSystem, ScanSystem's only caller is ScanSystemAsync,
+                // and ScanSystemAsync has no caller anywhere in the product. So this
+                // was twenty-seven lines of unreachable logging whose only effect was
+                // to make the module look wired.
+                //
+                // Re-add it only together with a producer. A registration whose
+                // notifier cannot fire is indistinguishable from a working one when
+                // viewed from outside, which is precisely the silent-success failure
+                // mode this codebase keeps producing.
 
-                            // Log critical/high indicators for forensic correlation
-                            for (const auto& ind : result.indicators) {
-                                if (ind.severity >= ShadowStrike::AntiEvasion::SandboxIndicatorSeverity::High) {
-                                    Utils::Logger::Warn(
-                                        "[SED-CB] indicator={} severity={} confidence={:.1f} {}",
-                                        Utils::StringUtils::ToNarrow(ind.description.substr(0, 100)),
-                                        static_cast<int>(ind.severity),
-                                        ind.confidence,
-                                        Utils::StringUtils::ToNarrow(ind.technicalDetails.substr(0, 150)));
-                                }
-                            }
-                        }
-                    });
-
-                // Run initial system-level sandbox analysis at startup
-                auto hwProfile = sandbox.AnalyzeHardware();
-                auto envResult = sandbox.AnalyzeEnvironment();
-                if (hwProfile.isSandboxLike || envResult.suspicionScore >= 50.0f) {
-                    Utils::Logger::Warn("RealTimeProtection: Sandbox environment detected  -  "
-                        "hardware={:.1f}% env={:.1f}%  -  endpoint may be under malware analysis",
-                        hwProfile.suspicionScore, envResult.suspicionScore);
-                }
+                // HOST CONTEXT, RECORDED AS CONTEXT AND NEVER AS A VERDICT.
+                //
+                // This used to warn "endpoint may be under malware analysis" whenever
+                // the hardware profile looked sandbox-like OR the environment score
+                // reached 50. That is a claim about THIS MACHINE, and it fires on
+                // ordinary VMware, Hyper-V, KVM and cloud endpoints. A legitimate
+                // endpoint protection product must behave identically on a virtual
+                // machine and on bare metal, so virtualisation is not evidence of
+                // anything and must never be reported as a threat. The check also had
+                // no other consumer: nothing read either result, so the warning was
+                // the entire product of the measurement.
+                //
+                // THE MEASUREMENT IS KEPT, on the same terms as its two siblings.
+                // TimeBasedEvasionDetector::GetHostTimingProfile and
+                // EnvironmentEvasionDetector::GetHostProcessorFacts describe the same
+                // subject - the host - and obey the same contract: taken once, at
+                // startup, reported once, and consumed by nothing that reaches a
+                // verdict. Keeping it also leaves open the outstanding question of
+                // whether host context should calibrate detection thresholds, which
+                // deleting it would foreclose.
+                const auto hostHardware = sandbox.AnalyzeHardware();
+                const auto hostEnvironment = sandbox.AnalyzeEnvironment();
+                Utils::Logger::Info(
+                    "RealTimeProtection: host environment context - hardware score "
+                    "{:.1f} (sandbox-like={}), environment score {:.1f}. CONTEXT ONLY: "
+                    "this describes the machine we run on and contributes to no "
+                    "detection verdict.",
+                    hostHardware.suspicionScore,
+                    hostHardware.isSandboxLike ? "yes" : "no",
+                    hostEnvironment.suspicionScore);
             } else {
                 Utils::Logger::Warn("RealTimeProtection: SandboxEvasionDetector Initialize failed");
             }

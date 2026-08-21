@@ -90,6 +90,9 @@ REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtect
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
 TELEMETRY_COLLECTOR_HPP_PATH = ROOT / "src/PhantomCore/Communication/TelemetryCollector.hpp"
+SANDBOX_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/SandboxEvasionDetector.cpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -8320,6 +8323,187 @@ class EvasionFanOutReportingContractTests(unittest.TestCase):
             "EmitEvasionTelemetry and update this contract, rather than leaving the "
             "new field unpopulated",
         )
+
+
+class SandboxHostContextIsNotAVerdictContractTests(unittest.TestCase):
+    """A host probe describes the machine we run on. It is never evidence about a sample.
+
+    SandboxEvasionDetector has two independent halves, measured: a HOST half that asks
+    whether this machine looks like a sandbox, and a TARGET half that asks whether a
+    supplied process contains sandbox-evasion code. The target half calls no host-half
+    function. Only the second is detection, and the distinction is what keeps the product
+    from flagging every VMware, Hyper-V and cloud endpoint as being under analysis.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST: the fix documents the claim it removed, so the explanatory
+        # text quotes the old warning verbatim. A comment-blind scan false-positives.
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.sandbox = strip_c_comments(read_source(SANDBOX_EVASION_DETECTOR_CPP_PATH))
+
+    def _startup_block(self) -> str:
+        opening = "SandboxEvasionDetector::Instance();"
+        closing = "auto& timeBased"
+        for marker in (opening, closing):
+            found = self.rtp.count(marker)
+            self.assertEqual(
+                found, 1, f"expected exactly one {marker!r} in the startup path, found {found}"
+            )
+        return self.rtp[self.rtp.index(opening) : self.rtp.index(closing)]
+
+    def test_the_startup_host_scan_makes_no_threat_claim(self) -> None:
+        """Virtualisation is not evidence and must not be reported as a threat.
+
+        The startup path used to warn that the "endpoint may be under malware analysis"
+        whenever the hardware profile looked sandbox-like or the environment score
+        reached 50 - a claim about this machine, on a path with no other consumer.
+        """
+        block = self._startup_block()
+
+        # BOUNDED: assertNotIn against the ~2 KB startup block dumps the whole region on
+        # failure. Report only the offending line.
+        for claim in (
+            "may be under malware analysis",
+            "Sandbox environment detected",
+            "Sandbox detected",
+        ):
+            offending = [line.strip() for line in block.splitlines() if claim in line]
+            self.assertEqual(
+                offending,
+                [],
+                f"the startup host scan asserts {claim!r}. A legitimate endpoint product "
+                "must behave identically on a virtual machine and on bare metal, so "
+                "virtualisation cannot be reported as a threat. Offending line: "
+                + (offending[0] if offending else ""),
+            )
+
+        # CONTEXT ONLY, MADE ENFORCEABLE: the host result may be reported, never branched
+        # on. A condition keyed to it is the first step to it reaching a verdict.
+        offenders = [
+            line.strip()
+            for line in block.splitlines()
+            if re.search(r"\bif\s*\(", line)
+            and re.search(r"isSandboxLike|hostHardware|hostEnvironment", line)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "the host context must not be tested in a condition; found: "
+            + " | ".join(offenders[:3]),
+        )
+
+        # AND IT MUST NOT BE RAISED AT A SEVERITY THAT READS AS A FINDING.
+        #
+        # THIS IS RESOLVED AGAINST THE CALL, NOT THE LINE, AND THAT IS LOAD-BEARING. A
+        # per-line version of this assertion - requiring one line to contain both the
+        # severity token and a host value - CANNOT DISCRIMINATE, because the logger call
+        # spans several lines and the two never appear on the same one. Proven by
+        # mutation: raising the report to Warn left the per-line form passing.
+        marker = "hostHardware.suspicionScore"
+        self.assertIn(
+            marker, block, "the host context report must pass the measured value"
+        )
+        opener = block.rfind("Utils::Logger::", 0, block.index(marker))
+        self.assertNotEqual(
+            opener, -1, "the host context must be reported through the logger"
+        )
+        severity_token = block[opener : block.index("(", opener)].strip()
+        self.assertIn(
+            "Info",
+            severity_token,
+            f"host context is reported through {severity_token!r}; Warn or Error reads as "
+            "a finding, and virtualisation is not a finding",
+        )
+
+    def test_the_host_measurement_is_still_taken_and_reported(self) -> None:
+        """ANTI-VACUITY. Silencing the claim must not silently delete the measurement.
+
+        Removing it would also foreclose the open question of whether host context should
+        calibrate detection thresholds, so the measurement is deliberately retained on the
+        same terms as GetHostTimingProfile and GetHostProcessorFacts.
+        """
+        block = self._startup_block()
+        for probe in ("AnalyzeHardware()", "AnalyzeEnvironment()"):
+            calls = block.count(probe)
+            self.assertEqual(
+                calls,
+                1,
+                f"expected exactly one {probe} call in the startup path, found {calls}",
+            )
+        labels = block.count("CONTEXT ONLY")
+        self.assertGreaterEqual(
+            labels,
+            1,
+            "the reported host context must label itself as context so a reader cannot "
+            f"mistake it for a detection; found {labels} such labels",
+        )
+
+    def test_no_callback_is_registered_while_its_notifier_cannot_fire(self) -> None:
+        """A registration whose notifier is unreachable looks identical to a working one.
+
+        The startup path registered a sandbox detection callback that could never run:
+        InvokeCallbacks is reached only from ScanSystem, whose only caller is
+        ScanSystemAsync, which nothing calls.
+        """
+        block = self._startup_block()
+        # BOUNDED: the startup block is ~2 KB and assertNotIn dumps all of it.
+        registrations = [
+            line.strip() for line in block.splitlines() if "RegisterCallback" in line
+        ]
+        self.assertEqual(
+            registrations,
+            [],
+            "a sandbox detection callback is registered again; it can only fire once "
+            "something calls ScanSystem, so register it in the same change as a producer. "
+            "Offending line: " + (registrations[0] if registrations else ""),
+        )
+
+        # The premise above is asserted, not assumed: if ScanSystemAsync ever gains a
+        # caller the notifier becomes reachable and this reasoning must be revisited.
+        launcher = len(re.findall(r"(?<![A-Za-z0-9_])ScanSystemAsync\s*\(", self.sandbox))
+        self.assertEqual(
+            launcher,
+            1,
+            "ScanSystemAsync now has a caller, so the sandbox notifier is reachable and "
+            "registering a detection callback is no longer dead - revisit this contract",
+        )
+
+    def test_the_sandbox_technique_ids_belong_to_target_analysis(self) -> None:
+        """T1012 and T1057 are this product's ONLY holders of those techniques.
+
+        Measured: both are pushed in CalculateProcessEvasionScore, which takes a
+        ProcessSandboxResult and is fed by CheckTargetSandbox* - functions that take a
+        process HANDLE and examine a supplied target. They describe what the SAMPLE did,
+        not what this machine looks like. Keeping them there is what makes the attribution
+        true; moving either into a host self-check would attribute a property of our own
+        endpoint to an analysed process.
+        """
+        scorer = extract_c_function(
+            self.sandbox, "SandboxEvasionDetector::CalculateProcessEvasionScore"
+        )
+        self.assertIn(
+            "ProcessSandboxResult",
+            scorer[: scorer.index("{")],
+            "the scorer must operate on a target result, not on a host result",
+        )
+
+        for technique in ("T1057", "T1012"):
+            in_scorer = scorer.count(technique)
+            in_file = self.sandbox.count(technique)
+            self.assertEqual(
+                in_scorer,
+                1,
+                f"{technique} must be attributed exactly once, inside the target scorer; "
+                f"found {in_scorer} occurrences there",
+            )
+            self.assertEqual(
+                in_file,
+                in_scorer,
+                f"{technique} appears {in_file} times in the module but only {in_scorer} "
+                "inside the target scorer, so a host self-check is now claiming a "
+                "technique that describes an analysed sample",
+            )
 
 
 if __name__ == "__main__":
