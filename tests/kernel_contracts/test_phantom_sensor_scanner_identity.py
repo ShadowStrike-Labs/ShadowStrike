@@ -7404,5 +7404,160 @@ class AssemblyLayerWiringContractTests(unittest.TestCase):
         )
 
 
+class RdtscpFeatureGateContractTests(unittest.TestCase):
+    """RDTSCP must never execute without runtime feature detection.
+
+    RDTSCP is not baseline x64. It arrived with Intel Nehalem and AMD Barcelona and is
+    reported by CPUID.80000001h:EDX[27]; executing it on a processor without that bit
+    raises #UD, which is a hard crash rather than a degraded measurement.
+
+    Before the gate existed there were ZERO queries of CPUID leaf 0x80000000 or
+    0x80000001 anywhere in the tree, while 15 call sites across five anti-evasion
+    translation units used the __rdtscp intrinsic and 19 assembly routines execute the
+    instruction directly. That was LATENT rather than live only because those routines had
+    no reachable caller - the assembly layer is largely unwired. Wiring it is exactly the
+    outstanding work, so the gate is a prerequisite for that work rather than a fix for a
+    crash anyone has seen.
+
+    These tests are deliberately structural. The failure mode cannot be reproduced on
+    development hardware, because every machine this is built on implements RDTSCP - so a
+    behavioural test would pass on the assembly path whether or not the gate exists. A
+    source contract is the only guard that can discriminate here, which is the same reason
+    the kernel wire-format contracts are structural.
+    """
+
+    _CPU_FEATURES = ROOT / "src" / "PhantomCore" / "Utils" / "CpuFeatures.hpp"
+    _ANTIEVASION_DIR = ROOT / "src" / "PhantomCore" / "AntiEvasion"
+    _SRC_DIR = ROOT / "src"
+
+    @staticmethod
+    def _function_body(code: str, name: str) -> str:
+        idx = code.index(name)
+        brace = code.index("{", idx)
+        depth = 0
+        for pos in range(brace, len(code)):
+            if code[pos] == "{":
+                depth += 1
+            elif code[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[brace:pos + 1]
+        raise AssertionError("unbalanced braces after " + name)
+
+    def test_the_feature_probe_header_exists(self):
+        self.assertTrue(
+            self._CPU_FEATURES.is_file(),
+            "{} is missing - it is the single place allowed to execute RDTSCP".format(
+                self._CPU_FEATURES
+            ),
+        )
+
+    def test_only_the_probe_header_uses_the_rdtscp_intrinsic(self):
+        """Every other site must route through the substitute-capable helper."""
+        offenders = []
+        scanned = 0
+        for path in sorted(self._SRC_DIR.rglob("*.cpp")) + sorted(self._SRC_DIR.rglob("*.hpp")):
+            if ".venv" in str(path):
+                continue
+            scanned += 1
+            if path.resolve() == self._CPU_FEATURES.resolve():
+                continue
+            code = strip_c_comments(read_source(path))
+            count = len(re.findall(r"(?<![A-Za-z0-9_])__rdtscp\s*\(", code))
+            if count:
+                offenders.append("{}={}".format(path.name, count))
+        self.assertGreater(
+            scanned, 400, "the source walk found only {} files - it is broken".format(scanned)
+        )
+        self.assertEqual(
+            [],
+            sorted(offenders),
+            "__rdtscp raises #UD on processors that do not implement it, so it may only be "
+            "reached through CpuFeatures::ReadSerializedTsc, which substitutes a "
+            "serializing CPUID plus RDTSC. These bypass the gate: "
+            + ", ".join(sorted(offenders)),
+        )
+
+    def test_the_probe_checks_the_extended_leaf_maximum_before_the_feature_bit(self):
+        """Querying 0x80000001 unsupported returns another leaf's data, not zeroes."""
+        code = strip_c_comments(read_source(self._CPU_FEATURES))
+        self.assertIn("0x80000000", code, "the probe does not query the extended-leaf maximum")
+        self.assertIn("0x80000001", code, "the probe does not query the RDTSCP feature leaf")
+        self.assertLess(
+            code.index("0x80000000"),
+            code.index("0x80000001"),
+            "the extended-leaf maximum must be tested FIRST: if leaf 0x80000001 is "
+            "unsupported CPUID returns the highest supported leaf's data instead of "
+            "zeroes, so the feature bit would be sampled from unrelated register content",
+        )
+        self.assertIn(
+            "27",
+            code,
+            "the probe must test EDX bit 27, the architectural RDTSCP feature bit",
+        )
+        self.assertIn(
+            "regs[3]",
+            code,
+            "the RDTSCP bit lives in EDX, which is regs[3] for the __cpuid intrinsic - "
+            "reading a different register would report an unrelated capability",
+        )
+
+    def test_the_substitute_path_still_serializes(self):
+        """A substitute that dropped serialization would silently change what is measured."""
+        body = self._function_body(
+            strip_c_comments(read_source(self._CPU_FEATURES)), "ReadSerializedTsc"
+        )
+        self.assertIn(
+            "__rdtsc()",
+            body,
+            "the substitute path must still read the timestamp counter",
+        )
+        # Asserting merely that __cpuid appears would NOT discriminate: this body issues
+        # CPUID twice, once to serialize and once to derive the processor id, so deleting
+        # the serializing call would leave a passing count. Pin the ordering instead.
+        self.assertIn(
+            "__cpuid(regs, 0)",
+            body,
+            "the substitute must issue CPUID leaf 0 to serialize before sampling RDTSC",
+        )
+        self.assertLess(
+            body.index("__cpuid(regs, 0)"),
+            body.index("__rdtsc()"),
+            "CPUID must be issued BEFORE reading the counter. RDTSC is not a serializing "
+            "instruction, so without a preceding barrier the read may be reordered and the "
+            "measurement loses the ordering property RDTSCP was chosen for - which would "
+            "shift detection thresholds depending on the host processor",
+        )
+
+    def test_the_assembly_rdtscp_wrapper_is_gated_on_runtime_support(self):
+        """The assembly executes RDTSCP unconditionally, so its caller must check first."""
+        path = self._ANTIEVASION_DIR / "VMEvasionDetector.cpp"
+        code = strip_c_comments(read_source(path))
+        wrapper = "Safe_MeasureRDTSCPTiming"
+        self.assertIn(
+            wrapper,
+            code,
+            "{} no longer defines {} - if it was renamed this guard must follow it".format(
+                path.name, wrapper
+            ),
+        )
+        body = self._function_body(code, wrapper)
+        self.assertIn(
+            "HasRDTSCP",
+            body,
+            "{} is the only wrapper that can reach an RDTSCP assembly routine, so it must "
+            "test HasRDTSCP before taking the assembly path. USE_ASM_FUNCTIONS is not a "
+            "substitute: it says whether this BUILD has the assembly, not whether this "
+            "PROCESSOR has the instruction".format(wrapper),
+        )
+        self.assertIn(
+            "Fallback_MeasureRDTSCPTiming",
+            body,
+            "the ungated path must fall back to the C++ implementation rather than "
+            "returning a sentinel - a fabricated timing value would corrupt the very "
+            "measurement the detector reasons about",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -65,6 +65,7 @@
 
 #include "pch.h"
 #include "PackerDetector.hpp"
+#include "../Utils/CpuFeatures.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -605,7 +606,7 @@ namespace {
     extern "C" uint64_t Fallback_GetRDTSCPValue(uint32_t* processorId) noexcept {
 #if defined(_MSC_VER)
         unsigned int procId = 0;
-        uint64_t tsc = __rdtscp(&procId);
+        uint64_t tsc = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&procId);
         if (processorId) {
             *processorId = procId;
         }

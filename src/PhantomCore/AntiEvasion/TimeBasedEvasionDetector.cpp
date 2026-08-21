@@ -69,6 +69,7 @@
 
 #include "pch.h"
 #include "TimeBasedEvasionDetector.hpp"
+#include "../Utils/CpuFeatures.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -146,7 +147,7 @@ uint64_t Fallback_TimingGetPreciseRDTSC(void) {
 /// Fallback: TimingGetPreciseRDTSCP
 uint64_t Fallback_TimingGetPreciseRDTSCP(uint32_t* processorId) {
     unsigned int aux = 0;
-    uint64_t tsc = __rdtscp(&aux);
+    uint64_t tsc = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
     if (processorId) {
         *processorId = aux;
     }
@@ -197,8 +198,8 @@ int64_t Fallback_TimingCompareRDTSCvRDTSCP(void) {
     uint64_t rdtscDelta = rdtscEnd - rdtscStart;
     
     // Measure RDTSCP
-    uint64_t rdtscpStart = __rdtscp(&aux);
-    uint64_t rdtscpEnd = __rdtscp(&aux);
+    uint64_t rdtscpStart = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
+    uint64_t rdtscpEnd = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
     uint64_t rdtscpDelta = rdtscpEnd - rdtscpStart;
     
     return static_cast<int64_t>(rdtscpDelta) - static_cast<int64_t>(rdtscDelta);

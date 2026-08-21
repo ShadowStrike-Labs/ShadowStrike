@@ -54,6 +54,7 @@
 #include "pch.h"
 #include "../Utils/SystemUtils.hpp"  // GetKnownFolderForAllUsersOrSelf
 #include "EnvironmentEvasionDetector.hpp"
+#include "../Utils/CpuFeatures.hpp"
 
  // ============================================================================
  // STANDARD LIBRARY INCLUDES
@@ -405,9 +406,9 @@ namespace AsmFallback {
         uint64_t total = 0;
         for (uint32_t i = 0; i < iterations; ++i) {
             unsigned int aux;
-            uint64_t start = __rdtscp(&aux);
+            uint64_t start = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             _mm_lfence();
-            uint64_t end = __rdtscp(&aux);
+            uint64_t end = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             total += (end - start);
         }
         return total;
@@ -419,8 +420,8 @@ namespace AsmFallback {
         uint64_t total = 0;
         for (uint32_t i = 0; i < iterations; ++i) {
             unsigned int aux;
-            uint64_t start = __rdtscp(&aux);
-            uint64_t end = __rdtscp(&aux);
+            uint64_t start = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
+            uint64_t end = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             total += (end - start);
         }
         return (iterations > 0) ? total / iterations : 0;
@@ -433,9 +434,9 @@ namespace AsmFallback {
         int cpuInfo[4];
         for (uint32_t i = 0; i < iterations; ++i) {
             unsigned int aux;
-            uint64_t start = __rdtscp(&aux);
+            uint64_t start = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             __cpuid(cpuInfo, 0);
-            uint64_t end = __rdtscp(&aux);
+            uint64_t end = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             total += (end - start);
         }
         return total;
@@ -464,7 +465,7 @@ namespace AsmFallback {
     // Fallback: PerformRDTSCPMeasurement
     extern "C" uint64_t Fallback_PerformRDTSCPMeasurement(uint32_t* processorId) noexcept {
         unsigned int aux;
-        uint64_t tsc = __rdtscp(&aux);
+        uint64_t tsc = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
         if (processorId) *processorId = aux;
         return tsc;
     }

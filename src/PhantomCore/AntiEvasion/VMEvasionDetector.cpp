@@ -41,6 +41,7 @@
  */
 #include"pch.h"
 #include "VMEvasionDetector.hpp"
+#include "../Utils/CpuFeatures.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/MemoryUtils.hpp"
@@ -497,13 +498,13 @@ namespace {
 
         for (uint32_t i = 0; i < iterations; ++i) {
             // RDTSCP is serializing, no need for CPUID fence
-            uint64_t start = __rdtscp(&aux);
+            uint64_t start = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             
             // Execute something that causes VM exit
             int cpuInfo[4] = { 0 };
             __cpuid(cpuInfo, 0);
             
-            uint64_t end = __rdtscp(&aux);
+            uint64_t end = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
             
             totalCycles += (end - start);
         }
@@ -684,13 +685,23 @@ namespace {
         }
     }
 
-    /// @brief Wrapper for RDTSCP timing
+    /// @brief Wrapper for RDTSCP timing.
+    /// @note The RDTSCP check is NOT redundant with USE_ASM_FUNCTIONS, and the two guards
+    ///       answer different questions. USE_ASM_FUNCTIONS asks whether this build links
+    ///       the assembly; HasRDTSCP asks whether this PROCESSOR implements the
+    ///       instruction. RDTSCP is not baseline x64 - it arrived with Nehalem/Barcelona
+    ///       and is reported by CPUID.80000001h:EDX[27] - and the assembly executes it
+    ///       unconditionally, so calling it on a processor without that bit raises #UD.
+    ///       The fallback reaches RDTSCP only through CpuFeatures::ReadSerializedTsc,
+    ///       which substitutes a serializing CPUID plus RDTSC when the instruction is
+    ///       absent, so it is safe everywhere and is the correct destination here.
     [[nodiscard]] inline uint64_t Safe_MeasureRDTSCPTiming(uint32_t iterations) noexcept {
         if constexpr (USE_ASM_FUNCTIONS) {
-            return MeasureRDTSCPTiming(iterations);
-        } else {
-            return Fallback_MeasureRDTSCPTiming(iterations);
+            if (::ShadowStrike::Utils::CpuFeatures::HasRDTSCP()) {
+                return MeasureRDTSCPTiming(iterations);
+            }
         }
+        return Fallback_MeasureRDTSCPTiming(iterations);
     }
 
 } // anonymous namespace

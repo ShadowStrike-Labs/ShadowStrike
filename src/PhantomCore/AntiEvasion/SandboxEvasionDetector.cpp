@@ -40,6 +40,7 @@
 
 #include "pch.h"
 #include "SandboxEvasionDetector.hpp"
+#include "../Utils/CpuFeatures.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
@@ -139,7 +140,7 @@ uint64_t Fallback_GetPreciseRDTSC(void) {
 uint64_t Fallback_GetPreciseRDTSCP(uint32_t* processorId) {
 #ifdef _WIN32
     unsigned int aux = 0;
-    uint64_t tsc = __rdtscp(&aux);
+    uint64_t tsc = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
     if (processorId) {
         *processorId = aux;
     }
@@ -331,7 +332,7 @@ uint32_t Fallback_DetectTimingHook(void) {
     uint64_t rdtsc1 = __rdtsc();
     
     unsigned int aux;
-    uint64_t rdtscp = __rdtscp(&aux);
+    uint64_t rdtscp = ::ShadowStrike::Utils::CpuFeatures::ReadSerializedTsc(&aux);
     
     // If difference is very large, timing may be hooked
     int64_t diff = static_cast<int64_t>(rdtscp) - static_cast<int64_t>(rdtsc1);
