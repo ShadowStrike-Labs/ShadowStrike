@@ -7973,5 +7973,88 @@ class NoMachineLifestyleSelfChecksContractTests(unittest.TestCase):
             )
 
 
+class VmTechniqueMitreMappingContractTests(unittest.TestCase):
+    """Every anti-VM technique must carry an ATT&CK id, and new ones must not slip through.
+
+    VMEvasionDetector shipped detections with zero MITRE attribution while every sibling
+    carried ids - Environment 6, Sandbox 6, ProcessEvasion 11, NetworkBasedEvasion 12. Its
+    anti-VM findings were therefore uncorrelatable in a SOC and invisible in the product's
+    claimed technique coverage, despite the module having a live production entry point.
+
+    The mapping is a switch over the AntiVMTechnique enum. Nothing in C++ forces a new
+    enumerator to be classified - it would silently fall through to the parent T1497 - so
+    this test is what reports the omission. It compares the enum against the switch
+    directly, which is the only check that can catch an enumerator added without thought.
+    """
+
+    _VM_HPP = ROOT / "src" / "PhantomCore" / "AntiEvasion" / "VMEvasionDetector.hpp"
+
+    def test_every_anti_vm_technique_has_an_explicit_mapping(self):
+        source = read_source(self._VM_HPP)
+
+        enum_block = re.search(
+            r"enum\s+class\s+AntiVMTechnique\s*:\s*uint32_t\s*\{(.*?)\n\s*\};",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(enum_block, "the AntiVMTechnique enum was not found")
+        names = re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", enum_block.group(1))
+        self.assertGreaterEqual(
+            len(names),
+            40,
+            "found only {} enumerators - the enum parse is broken and this comparison "
+            "would pass vacuously".format(len(names)),
+        )
+
+        mapper = re.search(
+            r"VMTechniqueToMitreId\s*\(AntiVMTechnique\s+technique\)\s*noexcept\s*\{(.*?)\n\s{8}\}",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(mapper, "VMTechniqueToMitreId was not found")
+        body = mapper.group(1)
+
+        unmapped = [
+            n
+            for n in names
+            if not re.search(r"AntiVMTechnique::" + n + r"(?![A-Za-z0-9_])", body)
+        ]
+        self.assertEqual(
+            [],
+            unmapped,
+            "these techniques have no explicit ATT&CK mapping and would fall through to the "
+            "parent T1497, attributing a detection without saying what was observed: "
+            + ", ".join(unmapped),
+        )
+
+    def test_the_detection_exposes_a_derived_id(self):
+        source = strip_c_comments(read_source(self._VM_HPP))
+        struct = re.search(
+            r"struct\s+DetectedAntiVMTechnique\s*\{(.*?)\n\s*\};", source, re.DOTALL
+        )
+        self.assertIsNotNone(struct, "DetectedAntiVMTechnique was not found")
+        body = struct.group(1)
+
+        self.assertIn(
+            "MitreId",
+            body,
+            "the detection must expose its ATT&CK id, otherwise a consumer has no way to "
+            "attribute it",
+        )
+        self.assertIn(
+            "VMTechniqueToMitreId(technique)",
+            body,
+            "MitreId must DERIVE the id from `technique`. A stored field could be left "
+            "unset at a call site that assigns the technique and forgets it, and an empty "
+            "id on a real detection looks attributed while saying nothing",
+        )
+        self.assertNotRegex(
+            body,
+            r"std::string\s+mitreId",
+            "do not store the id alongside the technique - deriving it is what prevents the "
+            "two from disagreeing",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

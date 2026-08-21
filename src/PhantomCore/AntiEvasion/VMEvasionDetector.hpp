@@ -861,6 +861,102 @@ namespace ShadowStrike {
         };
 
         /**
+         * @brief MITRE ATT&CK technique id for an anti-VM technique observed in a target.
+         *
+         * Every technique here is a way a sample tries to work out whether it is running in
+         * a virtual machine, so all of them belong to T1497 Virtualization/Sandbox Evasion.
+         * The sub-technique follows what the sample actually does: probing the environment
+         * is T1497.001 System Checks, while measuring elapsed time is T1497.003 Time Based
+         * Evasion.
+         *
+         * WHY THIS IS DERIVED AND NOT STORED. The sibling detectors keep a `mitreId` string
+         * field, populated by a constructor that takes the technique. This struct is
+         * default-constructed and then assigned field by field at its call sites, so a
+         * stored field could be left unset at a site that sets `technique` and forgets it -
+         * and a detection carrying an empty id is worse than none, because it looks
+         * attributed. Deriving the id from `technique` makes that impossible.
+         *
+         * @param technique The technique observed.
+         * @return A static ATT&CK id string, or "" for AntiVMTechnique::None.
+         */
+        [[nodiscard]] constexpr const char* VMTechniqueToMitreId(AntiVMTechnique technique) noexcept {
+            switch (technique) {
+                case AntiVMTechnique::None:
+                    return "";
+
+                // T1497.003 Time Based Evasion - the sample measures elapsed time, whether
+                // by counter, performance counter, tick count, or instruction latency.
+                case AntiVMTechnique::RDTSCTiming:
+                case AntiVMTechnique::QPCTiming:
+                case AntiVMTechnique::GetTickCountTiming:
+                case AntiVMTechnique::InstructionTiming:
+                    return "T1497.003";
+
+                // T1497.001 System Checks - the sample inspects the environment for
+                // virtualisation artifacts: CPU identification, registry, files, network
+                // adapters, firmware tables, running processes and services, hypervisor I/O
+                // ports, descriptor tables, devices, WMI, and the classic descriptor-table
+                // instruction tests.
+                case AntiVMTechnique::CPUIDHypervisorCheck:
+                case AntiVMTechnique::CPUIDVendorString:
+                case AntiVMTechnique::CPUIDBrandString:
+                case AntiVMTechnique::CPUIDFeatureFlags:
+                case AntiVMTechnique::CPUIDLeafEnumeration:
+                case AntiVMTechnique::CPUIDCoreCount:
+                case AntiVMTechnique::CPUIDCacheInfo:
+                case AntiVMTechnique::RegistryKeyCheck:
+                case AntiVMTechnique::RegistryValueRead:
+                case AntiVMTechnique::RegistryEnumeration:
+                case AntiVMTechnique::RegistryHardwareInfo:
+                case AntiVMTechnique::FileExistenceCheck:
+                case AntiVMTechnique::DriverFileCheck:
+                case AntiVMTechnique::DirectoryEnumeration:
+                case AntiVMTechnique::FileAttributeCheck:
+                case AntiVMTechnique::MACAddressCheck:
+                case AntiVMTechnique::AdapterNameCheck:
+                case AntiVMTechnique::NetworkConfigCheck:
+                case AntiVMTechnique::SMBIOSCheck:
+                case AntiVMTechnique::ACPITableCheck:
+                case AntiVMTechnique::BIOSStringCheck:
+                case AntiVMTechnique::FirmwareTableQuery:
+                case AntiVMTechnique::ProcessEnumeration:
+                case AntiVMTechnique::ServiceEnumeration:
+                case AntiVMTechnique::ModuleEnumeration:
+                case AntiVMTechnique::WindowEnumeration:
+                case AntiVMTechnique::VMwareBackdoor:
+                case AntiVMTechnique::VBoxBackdoor:
+                case AntiVMTechnique::IOPortProbing:
+                case AntiVMTechnique::MemoryArtifactScan:
+                case AntiVMTechnique::IDTCheck:
+                case AntiVMTechnique::GDTCheck:
+                case AntiVMTechnique::LDTCheck:
+                case AntiVMTechnique::DeviceEnumeration:
+                case AntiVMTechnique::DeviceIdCheck:
+                case AntiVMTechnique::ControllerStringCheck:
+                case AntiVMTechnique::WMIQuery:
+                case AntiVMTechnique::Win32ComputerSystem:
+                case AntiVMTechnique::Win32BIOS:
+                case AntiVMTechnique::Win32BaseBoard:
+                case AntiVMTechnique::RedPillTest:
+                case AntiVMTechnique::NoPillTest:
+                case AntiVMTechnique::SWIZZTest:
+                case AntiVMTechnique::INTNCheck:
+                    return "T1497.001";
+
+                // Several categories at once - report the parent rather than pick one.
+                case AntiVMTechnique::MultipleCategories:
+                    return "T1497";
+            }
+
+            // A technique added to the enum without being classified above lands here. It
+            // returns the PARENT technique deliberately: T1497 is certainly correct for
+            // anything in this enum, whereas guessing a sub-technique would attribute a
+            // detection to behaviour it may not exhibit. A contract test fails when an
+            // enumerator reaches this line, so the omission is reported rather than shipped.
+            return "T1497";
+        }
+
+        /**
          * @brief Bitwise OR operator for VMDetectionCategory flags
          */
         inline constexpr VMDetectionCategory operator|(VMDetectionCategory lhs, VMDetectionCategory rhs) noexcept {
@@ -1272,6 +1368,19 @@ namespace ShadowStrike {
             std::vector<uint8_t> codePattern;                   ///< Matched code bytes
             float severity = 0.0f;                              ///< Severity score (0-100)
             bool isActive = false;                              ///< True if technique actively used
+
+            /**
+             * @brief MITRE ATT&CK technique id for this detection.
+             * @return Static ATT&CK id string, or "" when no technique is set.
+             * @note DERIVED from `technique` rather than stored, so it can never be left
+             *       unset or fall out of step with the technique it describes. Before this
+             *       existed, VMEvasionDetector was the only anti-evasion module shipping
+             *       detections with no ATT&CK attribution at all, which made anti-VM
+             *       findings impossible to correlate in a SOC.
+             */
+            [[nodiscard]] const char* MitreId() const noexcept {
+                return VMTechniqueToMitreId(technique);
+            }
         };
 
         /**

@@ -209,4 +209,53 @@ TEST(VMEvasionDetector_ResultHelpers, ArtifactConfidenceLevelsUseDocumentedThres
     EXPECT_EQ(VMConfidenceLevel::Definitive, artifact.GetConfidenceLevel());
 }
 
+// ============================================================================
+// MITRE ATT&CK attribution
+//
+// VMEvasionDetector was previously the only anti-evasion module shipping
+// detections with no technique id at all, so anti-VM findings could not be
+// correlated in a SOC or counted toward the product's ATT&CK coverage.
+// ============================================================================
+
+TEST(VMEvasionDetector_Mitre, EnvironmentProbingMapsToSystemChecks) {
+    // T1497.001 System Checks: the sample inspects the environment for VM artifacts.
+    EXPECT_STREQ("T1497.001", VMTechniqueToMitreId(AntiVMTechnique::CPUIDHypervisorCheck));
+    EXPECT_STREQ("T1497.001", VMTechniqueToMitreId(AntiVMTechnique::RegistryKeyCheck));
+    EXPECT_STREQ("T1497.001", VMTechniqueToMitreId(AntiVMTechnique::MACAddressCheck));
+    EXPECT_STREQ("T1497.001", VMTechniqueToMitreId(AntiVMTechnique::SMBIOSCheck));
+    EXPECT_STREQ("T1497.001", VMTechniqueToMitreId(AntiVMTechnique::VMwareBackdoor));
+    EXPECT_STREQ("T1497.001", VMTechniqueToMitreId(AntiVMTechnique::RedPillTest));
+}
+
+TEST(VMEvasionDetector_Mitre, TimeMeasurementMapsToTimeBasedEvasion) {
+    // T1497.003 is a DIFFERENT sub-technique, and keeping them apart is the point of
+    // attribution: a SOC filtering for time-based evasion must not also match every
+    // registry probe.
+    EXPECT_STREQ("T1497.003", VMTechniqueToMitreId(AntiVMTechnique::RDTSCTiming));
+    EXPECT_STREQ("T1497.003", VMTechniqueToMitreId(AntiVMTechnique::QPCTiming));
+    EXPECT_STREQ("T1497.003", VMTechniqueToMitreId(AntiVMTechnique::GetTickCountTiming));
+    EXPECT_STREQ("T1497.003", VMTechniqueToMitreId(AntiVMTechnique::InstructionTiming));
+}
+
+TEST(VMEvasionDetector_Mitre, NoTechniqueYieldsNoAttributionAndMultipleYieldsTheParent) {
+    // An empty id for None matters: a detection carrying a fabricated id would look
+    // attributed while pointing at behaviour that was never observed.
+    EXPECT_STREQ("", VMTechniqueToMitreId(AntiVMTechnique::None));
+    EXPECT_STREQ("T1497", VMTechniqueToMitreId(AntiVMTechnique::MultipleCategories));
+}
+
+TEST(VMEvasionDetector_Mitre, DetectionDerivesItsIdFromItsTechnique) {
+    // Derived rather than stored, so a detection cannot carry an id that disagrees with
+    // the technique it reports.
+    DetectedAntiVMTechnique detection;
+    EXPECT_STREQ("", detection.MitreId()) << "a default detection has no technique yet";
+
+    detection.technique = AntiVMTechnique::RDTSCTiming;
+    EXPECT_STREQ("T1497.003", detection.MitreId());
+
+    detection.technique = AntiVMTechnique::NoPillTest;
+    EXPECT_STREQ("T1497.001", detection.MitreId())
+        << "changing the technique must change the id with it";
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests
