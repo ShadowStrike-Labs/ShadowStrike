@@ -6007,6 +6007,51 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     # so the failure is invisible to any source-level test.
     _INSTALLED_USER_MODE_TOOLSETS = ("v143",)
 
+    # ---------------------------------------------------------------------------
+    # Two project-file defects that are now ABSENT from the in-scope project and
+    # still PRESENT in three that are not.  Both are expressed as SHRINK-ONLY
+    # ceilings rather than equalities, for a reason worth stating: an equality
+    # guard over the whole tree would be red on arrival, and a guard that cannot
+    # pass is a guard nobody keeps (the same reasoning that scopes the object-path
+    # rule above).  A ceiling pins the out-of-scope debt at its measured value so
+    # it is on the record and cannot grow, and it fails the moment the in-scope
+    # project regresses.  Lower a number when a project is fixed; never raise one.
+    # ---------------------------------------------------------------------------
+
+    # An absolute machine-specific toolchain path baked into a project file.
+    #
+    # WHY THIS IS A DEFECT AND NOT MERELY UNTIDY, measured rather than assumed:
+    # C:\Program Files (x86)\Windows Kits\10\Include contains ZERO files - only the
+    # version directories 10.0.26100.0 and wdf - so no #include can resolve through
+    # it.  The compiler receives the /I, searches the directory, finds nothing, and
+    # moves on.  The Windows SDK reaches the compiler through the toolset's own
+    # $(IncludePath); PhantomCoreLib, PhantomTests and ShadowStrikePhantomService
+    # name no Windows Kits path at all and compile the same headers successfully.
+    # So the entry contributes nothing to a build while hardcoding one developer's
+    # SDK layout into projects that CI builds on a machine whose layout we do not
+    # control - it can only ever start being wrong, never start being useful.
+    _ABSOLUTE_TOOLCHAIN_PATH_CEILING = {
+        "PhantomHomeModules.vcxproj": 0,
+        "ShadowStrike.vcxproj": 2,
+        "PhantomEDR.vcxproj": 2,
+        "PhantomXDR.vcxproj": 2,
+    }
+
+    # A precompiled-header output name carrying a literal '$'.
+    #
+    # $(IntDir)$pch.pch is a typo, not a convention: MSBuild substitutes only on
+    # $( , so "$p" is literal text and the compiler is told to write a file whose
+    # name begins with a dollar sign.  It did - a real 207 MB '$pch.pch' sat in the
+    # intermediate directory.  PhantomCoreLib and the Service both write
+    # $(IntDir)pch.pch, which is what the author of the other four meant, and that
+    # pair is what makes this a measured typo rather than a style judgement.
+    _BROKEN_PCH_OUTPUT_NAME_CEILING = {
+        "PhantomHomeModules.vcxproj": 0,
+        "ShadowStrike.vcxproj": 2,
+        "PhantomEDR.vcxproj": 2,
+        "PhantomXDR.vcxproj": 2,
+    }
+
     @classmethod
     def _project_text(cls, name: str) -> str:
         return (ROOT / name).read_text(encoding="utf-8").lstrip("\ufeff")
@@ -6167,6 +6212,126 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
                 "PhantomHomeModules writes intermediates into the shared build\\$(Configuration) "
                 "directory; give it a private subdirectory so objects cannot collide "
                 "with another project's."
+            ),
+        )
+
+    def test_no_project_gains_an_absolute_toolchain_include_path(self) -> None:
+        measured: dict[str, int] = {}
+        include_blocks = 0
+        for project in sorted(self._ABSOLUTE_TOOLCHAIN_PATH_CEILING):
+            self.assertTrue(
+                (ROOT / project).is_file(),
+                msg=f"{project} is absent from the tree, so this walk proves nothing about it",
+            )
+            text = self._project_text(project)
+            include_blocks += len(re.findall(r"<AdditionalIncludeDirectories>", text))
+            measured[project] = len(re.findall(r"(?i)Windows Kits", text))
+
+        # Anti-vacuity.  Every assertion below is "count is low enough", so a broken
+        # parse reports zero everywhere and passes silently.  Requiring that the walk
+        # found real include lists is what makes a zero mean "absent" rather than
+        # "not looked for".
+        self.assertGreater(
+            include_blocks,
+            4,
+            msg=(
+                "found only "
+                f"{include_blocks} AdditionalIncludeDirectories element(s) across "
+                f"{len(measured)} projects; the parse is broken, so the counts below "
+                "are meaningless"
+            ),
+        )
+
+        grown = {
+            name: (count, self._ABSOLUTE_TOOLCHAIN_PATH_CEILING[name])
+            for name, count in measured.items()
+            if count > self._ABSOLUTE_TOOLCHAIN_PATH_CEILING[name]
+        }
+        self.assertEqual(
+            {},
+            grown,
+            msg=(
+                "a project gained an absolute machine-specific SDK include path. "
+                "That directory holds no headers, so it cannot help a build, and it "
+                "pins one machine's layout into a project CI builds elsewhere. Use "
+                "the toolset's own $(IncludePath). offenders "
+                f"{{project: (found, ceiling)}}: {grown}"
+            ),
+        )
+
+        # Removing the path must not be achieved by emptying the list: the entries the
+        # project genuinely needs have to survive.  Checked on the in-scope project
+        # only, because it is the one this guard requires to be at zero.
+        home = self._project_text("PhantomHomeModules.vcxproj")
+        for required in (
+            "$(ProjectDir)include",
+            "$(ProjectDir)include\\YARA",
+            "$(ProjectDir)src",
+            "%(AdditionalIncludeDirectories)",
+        ):
+            found = home.count(required)
+            self.assertGreaterEqual(
+                found,
+                2,
+                msg=(
+                    f"PhantomHomeModules names the include entry {required!r} only "
+                    f"{found} time(s); it needs one per configuration, so the list "
+                    "was pruned too far rather than having the dead path removed"
+                ),
+            )
+
+    def test_no_project_gains_a_precompiled_header_name_with_a_literal_dollar(self) -> None:
+        measured: dict[str, int] = {}
+        declared = 0
+        for project in sorted(self._BROKEN_PCH_OUTPUT_NAME_CEILING):
+            self.assertTrue(
+                (ROOT / project).is_file(),
+                msg=f"{project} is absent from the tree, so this walk proves nothing about it",
+            )
+            text = self._project_text(project)
+            declared += len(re.findall(r"<PrecompiledHeaderOutputFile>", text))
+            measured[project] = text.count("$(IntDir)$pch.pch")
+
+        # Same anti-vacuity argument as the sibling test above.
+        self.assertGreater(
+            declared,
+            4,
+            msg=(
+                f"found only {declared} PrecompiledHeaderOutputFile element(s) across "
+                f"{len(measured)} projects; the parse is broken, so the counts below "
+                "are meaningless"
+            ),
+        )
+
+        grown = {
+            name: (count, self._BROKEN_PCH_OUTPUT_NAME_CEILING[name])
+            for name, count in measured.items()
+            if count > self._BROKEN_PCH_OUTPUT_NAME_CEILING[name]
+        }
+        self.assertEqual(
+            {},
+            grown,
+            msg=(
+                "a project gained a precompiled-header output name containing a "
+                "literal '$'. MSBuild substitutes only on '$(', so '$p' is literal "
+                "text and the compiler writes a file actually called '$pch.pch'. "
+                "PhantomCoreLib and the Service write $(IntDir)pch.pch. offenders "
+                f"{{project: (found, ceiling)}}: {grown}"
+            ),
+        )
+
+        # And the correct form must be present, so the count cannot reach zero by the
+        # element being deleted - which would silently disable the precompiled header
+        # and slow every build without failing anything.
+        home_correct = self._project_text("PhantomHomeModules.vcxproj").count(
+            "<PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>"
+        )
+        self.assertEqual(
+            2,
+            home_correct,
+            msg=(
+                "expected PhantomHomeModules to declare the corrected precompiled-header "
+                f"output path once per configuration, found {home_correct}"
             ),
         )
 
