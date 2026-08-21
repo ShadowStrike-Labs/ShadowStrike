@@ -2844,6 +2844,64 @@ private:
             result.indicators.push_back(L"Entry point outside code section");
             result.hasSuspiciousCharacteristics = true;
         }
+
+        // Anti-analysis opcodes in the entry-point stub, scanned by the hand-written
+        // routine in PackerDetector_x64.asm. The assembly resolves directly here because
+        // the .asm is linked into PhantomCoreLib; the /ALTERNATENAME pragma at the foot of
+        // this file substitutes Fallback_ScanForAntiDebugOpcodes only in a configuration
+        // that omits it. Until this call existed the routine had NO caller at all, so
+        // neither the assembly nor its fallback ever ran - the whole file was dark.
+        //
+        // The ENTRY-POINT STUB is scanned rather than the whole image, deliberately. CPUID
+        // and RDTSC occur in ordinary CRT startup and feature-detection code, so scanning
+        // the entire file would report them on virtually every legitimate binary. At the
+        // entry point the same bytes are a recognised packer / anti-analysis pattern.
+        if (!result.entryPointInfo.epBytes.empty()) {
+            uint32_t antiAnalysisFlags = 0;
+            const uint64_t antiAnalysisHits = ScanForAntiDebugOpcodes(
+                result.entryPointInfo.epBytes.data(),
+                result.entryPointInfo.epBytes.size(),
+                &antiAnalysisFlags
+            );
+
+            if (antiAnalysisHits != 0) {
+                // These bit values are fixed by the assembly (or r15d, <bit> per technique)
+                // and must match it exactly. Verified against the PROC body: INT 2Dh sets
+                // bit 0, 0xCC bit 1, 0F31 RDTSC bit 2, 0FA2 CPUID bit 3, 0F01F9 RDTSCP
+                // bit 4. The routine NULL-checks the flags pointer and zeroes it on invalid
+                // input, so a zero return leaves the mask untouched at zero.
+                struct AntiAnalysisTechnique final {
+                    uint32_t       bit;
+                    const wchar_t* description;
+                };
+                static constexpr AntiAnalysisTechnique kAntiAnalysisTechniques[] = {
+                    { 0x01u, L"Entry-point stub contains INT 2Dh anti-debug instruction" },
+                    { 0x02u, L"Entry-point stub contains INT3 (0xCC) breakpoint byte" },
+                    { 0x04u, L"Entry-point stub contains RDTSC timing instruction" },
+                    { 0x08u, L"Entry-point stub contains CPUID instruction" },
+                    { 0x10u, L"Entry-point stub contains RDTSCP timing instruction" },
+                };
+
+                for (const AntiAnalysisTechnique& technique : kAntiAnalysisTechniques) {
+                    if ((antiAnalysisFlags & technique.bit) != 0u) {
+                        result.indicators.push_back(technique.description);
+                    }
+                }
+
+                // Only INT 2Dh raises the suspicion flag, and the asymmetry is deliberate
+                // rather than timidity. `indicators` is purely descriptive - nothing in this
+                // module reads its size or contents - so recording every technique there is
+                // free information. `hasSuspiciousCharacteristics` IS read and feeds later
+                // decisions, and 0xCC doubles as alignment padding while CPUID and RDTSC
+                // appear in legitimate feature detection, so raising the flag on those would
+                // manufacture false positives on ordinary binaries. INT 2Dh is not emitted
+                // by compilers and has no benign use in an entry-point stub.
+                constexpr uint32_t kInt2DhFlag = 0x01u;
+                if ((antiAnalysisFlags & kInt2DhFlag) != 0u) {
+                    result.hasSuspiciousCharacteristics = true;
+                }
+            }
+        }
     }
 
     void AnalyzeStubCode(

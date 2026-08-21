@@ -7559,5 +7559,139 @@ class RdtscpFeatureGateContractTests(unittest.TestCase):
         )
 
 
+class PackerAntiAnalysisWiringContractTests(unittest.TestCase):
+    """Pins the anti-analysis opcode scan to its caller and to the assembly's flag bits.
+
+    Task 209: PackerDetector_x64.asm exports 15 routines and, until this wiring, NOT ONE
+    had a caller - so neither the assembly nor its /ALTERNATENAME fallback ever executed.
+    The binding was already correct (25 uppercase /ALTERNATENAME pragmas); what was missing
+    was a call site. ScanForAntiDebugOpcodes is now invoked from PerformHeuristicAnalysis
+    on the live file-analysis path.
+
+    The flag bits are declared in TWO artifacts that no compiler cross-checks: the assembly
+    sets them with `or r15d, <bit>` and the C++ caller decodes them from a table of
+    literals. If either side is renumbered alone, the product silently reports the wrong
+    technique - CPUID findings labelled as INT3, for example - while every test that only
+    exercises one side keeps passing. That is what this class exists to prevent.
+    """
+
+    _ANTIEVASION_DIR = ROOT / "src" / "PhantomCore" / "AntiEvasion"
+
+    def _packer_cpp(self) -> str:
+        return strip_c_comments(read_source(self._ANTIEVASION_DIR / "PackerDetector.cpp"))
+
+    def test_the_scanner_is_called_from_the_heuristic_analysis_path(self):
+        code = self._packer_cpp()
+        calls = re.findall(r"(?<![A-Za-z0-9_])ScanForAntiDebugOpcodes\s*\(", code)
+        self.assertGreaterEqual(
+            len(calls),
+            1,
+            "ScanForAntiDebugOpcodes has no caller in PackerDetector.cpp, so the hand-"
+            "written assembly is dark again - neither it nor its fallback runs",
+        )
+        # Anchor on the DEFINITION, not the first mention. PerformHeuristicAnalysis is
+        # forward-declared some 400 lines above its body, so a window taken from the first
+        # occurrence measures the wrong region entirely and reports a false failure.
+        definition = re.search(
+            r"(?<![A-Za-z0-9_])PerformHeuristicAnalysis\s*\([^;{]*\)\s*noexcept\s*\{",
+            code,
+        )
+        self.assertIsNotNone(
+            definition,
+            "the PerformHeuristicAnalysis definition was not found in PackerDetector.cpp",
+        )
+
+        brace = code.index("{", definition.end() - 1)
+        depth = 0
+        end = -1
+        for pos in range(brace, len(code)):
+            if code[pos] == "{":
+                depth += 1
+            elif code[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = pos
+                    break
+        self.assertGreater(end, brace, "unbalanced braces in PerformHeuristicAnalysis")
+        body = code[brace:end + 1]
+
+        self.assertIn(
+            "ScanForAntiDebugOpcodes",
+            body,
+            "the scan must be reached from inside PerformHeuristicAnalysis - that is the "
+            "function the live file analysis calls, and a call placed anywhere else would "
+            "leave the assembly dark on the scan path",
+        )
+        self.assertIn(
+            "epBytes",
+            body,
+            "the scan must run over the ENTRY-POINT bytes. Scanning the whole image would "
+            "report CPUID and RDTSC on virtually every legitimate binary, because they "
+            "occur in ordinary CRT startup code",
+        )
+
+    def test_the_flag_bits_match_the_assembly_that_sets_them(self):
+        asm = re.sub(r";[^\n]*", "", read_source(self._ANTIEVASION_DIR / "PackerDetector_x64.asm"))
+        proc = re.search(
+            r"(?is)^[ \t]*ScanForAntiDebugOpcodes[ \t]+PROC\b(.*?)^[ \t]*"
+            r"ScanForAntiDebugOpcodes[ \t]+ENDP",
+            asm,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(proc, "the ScanForAntiDebugOpcodes PROC body was not found")
+
+        # Every technique the assembly records is an `or r15d, <bit>` into the mask.
+        asm_bits = set()
+        for raw in re.findall(r"(?i)\bor\s+r15d\s*,\s*([0-9A-Fa-f]+h|\d+)", proc.group(1)):
+            token = raw.lower()
+            asm_bits.add(int(token[:-1], 16) if token.endswith("h") else int(token))
+        self.assertGreaterEqual(
+            len(asm_bits),
+            5,
+            "expected at least 5 technique bits in the assembly, found {} - either the "
+            "routine changed or this parse is broken, and a broken parse would let the "
+            "comparison below pass vacuously".format(sorted(asm_bits)),
+        )
+
+        cpp = self._packer_cpp()
+        table = re.search(r"kAntiAnalysisTechniques\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;", cpp, re.DOTALL)
+        self.assertIsNotNone(
+            table, "the C++ technique table was not found - it decodes the assembly's mask"
+        )
+        cpp_bits = {int(v, 16) for v in re.findall(r"0x([0-9A-Fa-f]+)u", table.group(1))}
+
+        self.assertEqual(
+            asm_bits,
+            cpp_bits,
+            "the assembly sets bits {} but the C++ table decodes {}. Nothing cross-checks "
+            "these two artifacts, so a mismatch mislabels techniques silently - a CPUID "
+            "finding reported as an INT3 breakpoint".format(sorted(asm_bits), sorted(cpp_bits)),
+        )
+
+    def test_only_the_unambiguous_technique_raises_the_suspicion_flag(self):
+        """0xCC is also alignment padding; CPUID and RDTSC occur in legitimate startup."""
+        cpp = self._packer_cpp()
+        marker = "kInt2DhFlag"
+        self.assertIn(
+            marker,
+            cpp,
+            "the INT 2Dh gate is gone. hasSuspiciousCharacteristics is READ by this module, "
+            "so raising it for every technique would manufacture false positives on ordinary "
+            "binaries: 0xCC doubles as padding and CPUID/RDTSC appear in CRT startup",
+        )
+        gate = cpp[cpp.index(marker):cpp.index(marker) + 400]
+        self.assertIn(
+            "hasSuspiciousCharacteristics",
+            gate,
+            "the INT 2Dh constant must guard the suspicion flag",
+        )
+        self.assertIn(
+            "0x01u",
+            gate,
+            "INT 2Dh is bit 0 in the assembly; guarding on another bit would raise the flag "
+            "for a technique that has benign uses",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

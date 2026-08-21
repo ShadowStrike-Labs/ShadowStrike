@@ -159,4 +159,115 @@ TEST(PackerDetector_Statistics, ResetClearsCounters) {
     }
 }
 
+// ============================================================================
+// Hand-written assembly: ScanForAntiDebugOpcodes
+//
+// These exercise the routine in PackerDetector_x64.asm directly. It resolves to
+// the assembly because the .asm is linked into PhantomCoreLib; /ALTERNATENAME
+// substitutes Fallback_ScanForAntiDebugOpcodes only where the .asm is absent.
+// Either implementation must satisfy every assertion below, which is the point -
+// the contract is the same on both paths.
+//
+// The flag bits are fixed by the assembly (or r15d, <bit>) and are asserted here
+// so that changing one without changing the other cannot pass silently.
+// ============================================================================
+
+namespace {
+
+constexpr uint32_t kFlagInt2Dh = 0x01u;
+constexpr uint32_t kFlagInt3   = 0x02u;
+constexpr uint32_t kFlagRdtsc  = 0x04u;
+constexpr uint32_t kFlagCpuid  = 0x08u;
+constexpr uint32_t kFlagRdtscp = 0x10u;
+
+} // namespace
+
+TEST(PackerDetector_AsmAntiDebugScan, EachTechniqueSetsItsOwnFlagAndIsCounted) {
+    struct Case final {
+        std::vector<uint8_t> bytes;
+        uint32_t             expectedFlag;
+        const char*          what;
+    };
+
+    const std::vector<Case> cases = {
+        { { 0xCD, 0x2D },       kFlagInt2Dh, "INT 2Dh"  },
+        { { 0xCC },             kFlagInt3,   "INT3"     },
+        { { 0x0F, 0x31 },       kFlagRdtsc,  "RDTSC"    },
+        { { 0x0F, 0xA2 },       kFlagCpuid,  "CPUID"    },
+        { { 0x0F, 0x01, 0xF9 }, kFlagRdtscp, "RDTSCP"   },
+    };
+
+    for (const Case& c : cases) {
+        uint32_t flags = 0xDEADBEEFu;   // poisoned, so a routine that never writes is caught
+        const uint64_t hits = ScanForAntiDebugOpcodes(c.bytes.data(), c.bytes.size(), &flags);
+
+        EXPECT_EQ(1u, hits) << "expected exactly one match for " << c.what;
+        EXPECT_EQ(c.expectedFlag, flags) << "wrong flag bit for " << c.what;
+    }
+}
+
+TEST(PackerDetector_AsmAntiDebugScan, MultipleTechniquesAccumulateIntoOneMask) {
+    // INT3, RDTSC, CPUID and INT 2Dh in one buffer, separated by NOPs.
+    const std::vector<uint8_t> buffer = {
+        0x90, 0xCC, 0x90, 0x0F, 0x31, 0x90, 0x0F, 0xA2, 0x90, 0xCD, 0x2D, 0x90
+    };
+
+    uint32_t flags = 0;
+    const uint64_t hits = ScanForAntiDebugOpcodes(buffer.data(), buffer.size(), &flags);
+
+    EXPECT_EQ(4u, hits);
+    EXPECT_EQ(kFlagInt3 | kFlagRdtsc | kFlagCpuid | kFlagInt2Dh, flags);
+    EXPECT_EQ(0u, flags & kFlagRdtscp) << "RDTSCP is absent from this buffer";
+}
+
+TEST(PackerDetector_AsmAntiDebugScan, BenignBufferProducesNoFindings) {
+    // A run of NOPs plus printable ASCII: nothing here is an anti-analysis opcode.
+    std::vector<uint8_t> buffer(512, 0x90);
+    for (size_t i = 0; i < 64; ++i) {
+        buffer[i] = static_cast<uint8_t>('A' + (i % 26));
+    }
+
+    uint32_t flags = 0xFFFFFFFFu;
+    const uint64_t hits = ScanForAntiDebugOpcodes(buffer.data(), buffer.size(), &flags);
+
+    EXPECT_EQ(0u, hits);
+    EXPECT_EQ(0u, flags) << "the routine must zero the mask when it finds nothing, "
+                            "otherwise a caller sees stale flags as real findings";
+}
+
+TEST(PackerDetector_AsmAntiDebugScan, TruncatedSequencesAtTheBufferEndAreNotReadPastTheEnd) {
+    // Each of these ends with a prefix whose completing byte lies OUTSIDE the buffer.
+    // The routine must decline to match rather than read the following byte. A failure
+    // here is an out-of-bounds read on attacker-supplied file content, so these are
+    // memory-safety assertions, not merely accuracy ones.
+    const std::vector<std::vector<uint8_t>> truncated = {
+        { 0x90, 0xCD },              // INT prefix, opcode byte missing
+        { 0x90, 0x0F },              // two-byte escape, second byte missing
+        { 0x90, 0x0F, 0x01 },        // RDTSCP prefix, final 0xF9 missing
+    };
+
+    for (const std::vector<uint8_t>& bytes : truncated) {
+        uint32_t flags = 0xABCDEF01u;
+        const uint64_t hits = ScanForAntiDebugOpcodes(bytes.data(), bytes.size(), &flags);
+
+        EXPECT_EQ(0u, hits) << "a truncated sequence must not be reported as a match";
+        EXPECT_EQ(0u, flags);
+    }
+}
+
+TEST(PackerDetector_AsmAntiDebugScan, RejectsInvalidInputWithoutTouchingMemory) {
+    uint32_t flags = 0x5A5A5A5Au;
+    EXPECT_EQ(0u, ScanForAntiDebugOpcodes(nullptr, 64, &flags));
+    EXPECT_EQ(0u, flags) << "the mask must be cleared on the failure path";
+
+    const std::vector<uint8_t> buffer = { 0xCC, 0xCC, 0xCC };
+    flags = 0x5A5A5A5Au;
+    EXPECT_EQ(0u, ScanForAntiDebugOpcodes(buffer.data(), 0, &flags));
+    EXPECT_EQ(0u, flags);
+
+    // The flags pointer is optional and NULL-checked by the routine; passing null must
+    // still return the count rather than faulting.
+    EXPECT_EQ(3u, ScanForAntiDebugOpcodes(buffer.data(), buffer.size(), nullptr));
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests
