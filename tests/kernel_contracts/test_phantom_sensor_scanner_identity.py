@@ -7630,6 +7630,33 @@ class PackerAntiAnalysisWiringContractTests(unittest.TestCase):
             "occur in ordinary CRT startup code",
         )
 
+        # Every assembly routine wired onto this path must stay wired. Each one that loses
+        # its call site goes dark in both forms, because nothing else in the tree calls it.
+        #
+        # The word-boundary lookbehind is load-bearing, not decoration. A plain substring
+        # test passes when the call is rerouted to Fallback_<name>, because the routine name
+        # remains present INSIDE the fallback's name - so the guard would accept the exact
+        # regression it exists to catch. This was found by mutation: the substring form
+        # reported OK when every call was rerouted to the reduced-capability C++ path.
+        for routine in (
+            "ScanForSMCPatterns",
+            "ScanForInt2DOpcode",
+            "ScanForRDTSCOpcode",
+            "ScanForCPUIDOpcode",
+        ):
+            direct = re.findall(
+                r"(?<![A-Za-z0-9_])" + routine + r"(?![A-Za-z0-9_])", body
+            )
+            self.assertGreaterEqual(
+                len(direct),
+                1,
+                "{} is no longer called directly from PerformHeuristicAnalysis. Nothing "
+                "else in the tree calls it, so losing this call site returns the routine "
+                "to being dead weight in the binary - and routing it through Fallback_{} "
+                "would silently substitute the reduced-capability C++ implementation for "
+                "the hand-written assembly".format(routine, routine),
+            )
+
     def test_the_flag_bits_match_the_assembly_that_sets_them(self):
         asm = re.sub(r";[^\n]*", "", read_source(self._ANTIEVASION_DIR / "PackerDetector_x64.asm"))
         proc = re.search(

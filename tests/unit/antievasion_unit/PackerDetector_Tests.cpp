@@ -270,4 +270,75 @@ TEST(PackerDetector_AsmAntiDebugScan, RejectsInvalidInputWithoutTouchingMemory) 
     EXPECT_EQ(3u, ScanForAntiDebugOpcodes(buffer.data(), buffer.size(), nullptr));
 }
 
+TEST(PackerDetector_AsmOpcodeLocators, ReturnTheOffsetOfTheFirstMatchOrMinusOne) {
+    // Each locator returns the index of the FIRST byte of the sequence, or -1.
+    const std::vector<uint8_t> int2d  = { 0x90, 0x90, 0xCD, 0x2D };
+    const std::vector<uint8_t> rdtsc  = { 0x90, 0x0F, 0x31 };
+    const std::vector<uint8_t> cpuid  = { 0x0F, 0xA2, 0x90 };
+    const std::vector<uint8_t> benign = { 0x90, 0x90, 0x90, 0x90 };
+
+    EXPECT_EQ(2, ScanForInt2DOpcode(int2d.data(), int2d.size()));
+    EXPECT_EQ(1, ScanForRDTSCOpcode(rdtsc.data(), rdtsc.size()));
+    EXPECT_EQ(0, ScanForCPUIDOpcode(cpuid.data(), cpuid.size()));
+
+    EXPECT_EQ(-1, ScanForInt2DOpcode(benign.data(), benign.size()));
+    EXPECT_EQ(-1, ScanForRDTSCOpcode(benign.data(), benign.size()));
+    EXPECT_EQ(-1, ScanForCPUIDOpcode(benign.data(), benign.size()));
+}
+
+TEST(PackerDetector_AsmOpcodeLocators, DeclineTruncatedSequencesAndInvalidInput) {
+    // A lone prefix at the final byte must not be matched, because matching would mean
+    // reading the byte after the buffer. Memory safety, not merely accuracy.
+    const std::vector<uint8_t> trailingCd = { 0x90, 0xCD };
+    const std::vector<uint8_t> trailing0f = { 0x90, 0x0F };
+    const std::vector<uint8_t> singleCd   = { 0xCD };
+
+    EXPECT_EQ(-1, ScanForInt2DOpcode(trailingCd.data(), trailingCd.size()));
+    EXPECT_EQ(-1, ScanForRDTSCOpcode(trailing0f.data(), trailing0f.size()));
+    EXPECT_EQ(-1, ScanForCPUIDOpcode(trailing0f.data(), trailing0f.size()));
+    EXPECT_EQ(-1, ScanForInt2DOpcode(singleCd.data(), singleCd.size()));
+
+    EXPECT_EQ(-1, ScanForInt2DOpcode(nullptr, 16));
+    EXPECT_EQ(-1, ScanForRDTSCOpcode(trailingCd.data(), 0));
+    EXPECT_EQ(-1, ScanForCPUIDOpcode(nullptr, 0));
+}
+
+TEST(PackerDetector_AsmSmcScan, CountsRepPrefixedStringOperations) {
+    // F3 (REP) followed by A4/A5/AA/AB - MOVSB/MOVSW/STOSB/STOSW - is how an unpacker
+    // stub writes decompressed bytes over its own code.
+    const std::vector<std::vector<uint8_t>> singles = {
+        { 0xF3, 0xA4 },   // REP MOVSB
+        { 0xF3, 0xA5 },   // REP MOVSW/D
+        { 0xF3, 0xAA },   // REP STOSB
+        { 0xF3, 0xAB },   // REP STOSW/D
+    };
+    for (const std::vector<uint8_t>& bytes : singles) {
+        EXPECT_EQ(1u, ScanForSMCPatterns(bytes.data(), bytes.size()))
+            << "expected one REP string operation to be counted";
+    }
+
+    const std::vector<uint8_t> two = { 0xF3, 0xA4, 0x90, 0xF3, 0xAA, 0x90 };
+    EXPECT_EQ(2u, ScanForSMCPatterns(two.data(), two.size()));
+}
+
+TEST(PackerDetector_AsmSmcScan, BareStringOpcodesWithoutRepAreDeliberatelyNotCounted) {
+    // STOSB/STOSW without a REP prefix are ordinary instructions and appear throughout
+    // compiler output. The assembly routes them to a non-counting branch on purpose, and
+    // this test pins that choice: counting them would inflate the figure on clean code.
+    const std::vector<uint8_t> bareStos = { 0x90, 0xAA, 0x90, 0xAB, 0x90 };
+    EXPECT_EQ(0u, ScanForSMCPatterns(bareStos.data(), bareStos.size()));
+}
+
+TEST(PackerDetector_AsmSmcScan, HandlesTruncatedPrefixAndInvalidInput) {
+    const std::vector<uint8_t> trailingRep = { 0x90, 0xF3 };   // REP with no string op
+    EXPECT_EQ(0u, ScanForSMCPatterns(trailingRep.data(), trailingRep.size()));
+
+    const std::vector<uint8_t> buffer = { 0xF3, 0xA4 };
+    EXPECT_EQ(0u, ScanForSMCPatterns(nullptr, 16));
+    EXPECT_EQ(0u, ScanForSMCPatterns(buffer.data(), 0));
+
+    std::vector<uint8_t> benign(256, 0x90);
+    EXPECT_EQ(0u, ScanForSMCPatterns(benign.data(), benign.size()));
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

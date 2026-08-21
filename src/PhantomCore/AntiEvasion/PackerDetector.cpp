@@ -2873,19 +2873,47 @@ private:
                 struct AntiAnalysisTechnique final {
                     uint32_t       bit;
                     const wchar_t* description;
+                    // Optional single-technique locator. ScanForAntiDebugOpcodes reports
+                    // WHICH techniques are present; these report WHERE the first one is.
+                    // INT3 and RDTSCP have no locator in the assembly, hence nullptr.
+                    int64_t (*locate)(const uint8_t*, size_t) noexcept;
                 };
                 static constexpr AntiAnalysisTechnique kAntiAnalysisTechniques[] = {
-                    { 0x01u, L"Entry-point stub contains INT 2Dh anti-debug instruction" },
-                    { 0x02u, L"Entry-point stub contains INT3 (0xCC) breakpoint byte" },
-                    { 0x04u, L"Entry-point stub contains RDTSC timing instruction" },
-                    { 0x08u, L"Entry-point stub contains CPUID instruction" },
-                    { 0x10u, L"Entry-point stub contains RDTSCP timing instruction" },
+                    { 0x01u, L"Entry-point stub contains INT 2Dh anti-debug instruction",
+                      &ScanForInt2DOpcode },
+                    { 0x02u, L"Entry-point stub contains INT3 (0xCC) breakpoint byte",
+                      nullptr },
+                    { 0x04u, L"Entry-point stub contains RDTSC timing instruction",
+                      &ScanForRDTSCOpcode },
+                    { 0x08u, L"Entry-point stub contains CPUID instruction",
+                      &ScanForCPUIDOpcode },
+                    { 0x10u, L"Entry-point stub contains RDTSCP timing instruction",
+                      nullptr },
                 };
 
                 for (const AntiAnalysisTechnique& technique : kAntiAnalysisTechniques) {
-                    if ((antiAnalysisFlags & technique.bit) != 0u) {
-                        result.indicators.push_back(technique.description);
+                    if ((antiAnalysisFlags & technique.bit) == 0u) {
+                        continue;
                     }
+
+                    std::wstring indicator = technique.description;
+
+                    // The locator runs ONLY for a technique the mask already reported, so
+                    // no buffer pass is spent looking for something known to be absent.
+                    // It returns the offset of the first occurrence, or -1 if not found -
+                    // which cannot normally happen here, since the mask said it is present,
+                    // so the negative case is handled rather than assumed away.
+                    if (technique.locate != nullptr) {
+                        const int64_t offset = technique.locate(
+                            result.entryPointInfo.epBytes.data(),
+                            result.entryPointInfo.epBytes.size()
+                        );
+                        if (offset >= 0) {
+                            indicator += L" at stub offset " + std::to_wstring(offset);
+                        }
+                    }
+
+                    result.indicators.push_back(std::move(indicator));
                 }
 
                 // Only INT 2Dh raises the suspicion flag, and the asymmetry is deliberate
@@ -2900,6 +2928,29 @@ private:
                 if ((antiAnalysisFlags & kInt2DhFlag) != 0u) {
                     result.hasSuspiciousCharacteristics = true;
                 }
+            }
+
+            // Self-modifying-code patterns in the same stub, via ScanForSMCPatterns in
+            // PackerDetector_x64.asm. It counts REP-prefixed string operations - F3 followed
+            // by AA/AB/A4/A5, that is REP STOSB/STOSW/MOVSB/MOVSW - which is how an unpacker
+            // stub writes decompressed code over itself before jumping to it.
+            //
+            // Recorded as an indicator only, and deliberately NOT raised to
+            // hasSuspiciousCharacteristics. REP MOVSB and REP STOSB are also how memcpy and
+            // memset are commonly emitted, so a compiler-generated startup stub can contain
+            // them legitimately: presence is informative, presence alone is not suspicious.
+            // Note the assembly counts only REP-PREFIXED sequences; a bare AA/AB reaches a
+            // deliberately non-counting branch, which keeps ordinary string operations from
+            // inflating the count.
+            const uint64_t smcPatternCount = ScanForSMCPatterns(
+                result.entryPointInfo.epBytes.data(),
+                result.entryPointInfo.epBytes.size()
+            );
+            if (smcPatternCount != 0) {
+                result.indicators.push_back(
+                    L"Entry-point stub contains " + std::to_wstring(smcPatternCount) +
+                    L" REP-prefixed bulk memory operation(s) (self-modifying code pattern)"
+                );
             }
         }
     }
