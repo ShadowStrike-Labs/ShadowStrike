@@ -973,7 +973,17 @@ struct alignas(64) RTPStatistics {
     ///        too tight for real files and the deferred queue is carrying the
     ///        actual detection work, which is a very different operating regime
     ///        from the budget rarely being reached.
-    std::atomic<uint64_t> metamorphicTruncated{ 0 };
+        std::atomic<uint64_t> metamorphicTruncated{ 0 };
+
+    /// @brief Target processes found to carry sandbox-evasion capability.
+        ///
+    /// Produced by the deferred deep-scan thread, which is the only caller of
+    /// SandboxEvasionDetector's target analysis. Before that wiring the analysis
+    /// had NO production caller, so this product's only T1012 and T1057
+    /// attributions had never been produced on an endpoint. A zero here means
+    /// either that nothing analysed carries the capability or that the feed has
+    /// stopped; the detector's own totalScans distinguishes the two.
+    std::atomic<uint64_t> sandboxEvasionCapabilityDetected{ 0 };
 
     /// @brief On-access packer analyses that did not complete in line - budget
     ///        exhausted or file over the in-line size bound - and were requeued

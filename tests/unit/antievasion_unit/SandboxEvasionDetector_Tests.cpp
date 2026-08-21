@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/AntiEvasion/SandboxEvasionDetector.hpp"
+#include "../../../src/PhantomCore/Utils/ThreadPool.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 
@@ -132,4 +133,71 @@ TEST(SandboxEvasionDetector_Statistics, ResetClearsCountersAndProductDistributio
     EXPECT_EQ(0u, stats.detectionsByProduct[static_cast<size_t>(SandboxProduct::Cuckoo)].load());
 }
 
+// ---------------------------------------------------------------------------
+// Target (TYPE B) analysis: the half of this module that examines a supplied
+// process rather than the machine we run on. It is the product's only producer
+// of T1012 and T1057, and until it was wired into the deferred deep-scan thread
+// it had no caller at all.
+// ---------------------------------------------------------------------------
+
+TEST(SandboxEvasionDetector_ProcessConfig, DefaultsAreTheOnesTheDeferredPathRelisOn) {
+    // The deferred deep-scan thread deliberately runs this analysis at SHIPPED
+    // DEFAULTS, because nothing waits on that thread and narrowing the scan is
+    // what would give up the unpacked-content coverage that makes deferring it
+    // worthwhile. Lowering either bound would silently narrow that coverage, so
+    // the values are pinned here rather than left to be noticed in the field.
+    const SandboxEvasionDetector::ProcessSandboxConfig defaults{};
+
+    EXPECT_TRUE(defaults.checkImports);
+    EXPECT_TRUE(defaults.checkMemoryStrings);
+    EXPECT_TRUE(defaults.checkCodePatterns);
+    EXPECT_EQ(64ULL * 1024 * 1024, defaults.maxMemoryScanBytes);
+    EXPECT_EQ(4ULL * 1024 * 1024, defaults.maxCodeScanBytes);
+}
+
+TEST(SandboxEvasionDetector_TargetAnalysis, IsReachableAndReportsItsOwnCost) {
+    // REACHABILITY IS THE POINT OF THIS TEST. The analysis had zero production
+    // callers, and a detector nothing calls is indistinguishable from one that
+    // finds nothing. Asserting it runs against a real process and reports a
+    // duration is what makes the restored path observable from the suite.
+    //
+    // Imports only, deliberately: the full default configuration measured about
+    // 367 ms per call against a live process, and this suite must not pay that.
+    // The pool is CONSTRUCTED BUT NOT STARTED, and that is deliberate rather than
+    // sloppy. Initialize only requires a non-null pool, and the target analysis
+    // never submits to it - it opens the process and reads it on the calling
+    // thread. Starting one costs several seconds in worker creation and join for a
+    // dependency this code path does not use, and this suite already has runtime
+    // problems worth not adding to. If the analysis ever does submit work, the
+    // pool will refuse it loudly rather than silently dropping it, which is the
+    // behaviour a started-but-unused pool would hide.
+    auto pool = std::make_shared<::ShadowStrike::Utils::ThreadPool>();
+
+    auto& detector = SandboxEvasionDetector::Instance();
+    ASSERT_TRUE(detector.Initialize(pool));
+
+    SandboxEvasionDetector::ProcessSandboxConfig config{};
+    config.checkMemoryStrings = false;
+    config.checkCodePatterns = false;
+
+    SandboxEvasionDetector::ProcessSandboxResult result{};
+    const bool analysed =
+        detector.AnalyzeProcess(::GetCurrentProcessId(), result, config);
+
+    EXPECT_TRUE(analysed) << "the target analysis must be able to examine a live "
+                             "process we own; if this fails the restored feed "
+                             "cannot produce anything";
+    if (analysed) {
+        EXPECT_EQ(::GetCurrentProcessId(), result.processId);
+        EXPECT_GT(result.analysisDurationUs, 0ULL)
+            << "the analysis must record its own cost - that field is how the "
+               "deferred path's expense stays visible";
+        // NOT an assertion about this binary's contents: a clean result and a
+        // detection are both legitimate outcomes here. What must hold is that the
+        // score and the capability flag agree with each other.
+        EXPECT_EQ(result.hasEvasionCapability, result.evasionScore >= 25.0f);
+    }
+
+    detector.Shutdown();
+}
 } // namespace ShadowStrike::AntiEvasion::Tests

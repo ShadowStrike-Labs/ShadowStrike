@@ -3161,6 +3161,136 @@ public:
         }
     }
 
+    // Runs SandboxEvasionDetector's TARGET analysis - the half that examines a
+    // supplied process rather than this machine - off the kernel-reply path.
+    //
+    // THE COST WAS MEASURED BEFORE CHOOSING WHERE THIS GOES, best-of-5 against a
+    // live process:
+    //     shipped defaults, 64 MB memory / 4 MB code ....... 367 ms
+    //     memory strings only, 64 MB ....................... 258 ms
+    //     code patterns only, 4 MB ......................... 51 ms
+    //     imports only ..................................... 42 ms
+    //     bounded to 1 MB memory / 256 KB code ............. 106 ms
+    // The driver waits PN_VERDICT_REPLY_TIMEOUT_MS = 500 ms and the evasion suite
+    // on that callback is bounded by kProcessNotifyBudgetMs = 250 ms, so a single
+    // call at shipped defaults exceeds the entire budget and consumes almost three
+    // quarters of the driver's wait - as a SIXTH detector, on top of five that
+    // already run there.
+    //
+    // AND NO BOUND MAKES IT VIABLE INLINE, which is the part that settles it.
+    // Tightening the memory limit from 64 MB to 1 MB only moves 367 ms to 106 ms,
+    // because maxMemoryScanBytes caps how many bytes are READ while the
+    // VirtualQueryEx walk across the address space and the module enumeration
+    // happen regardless of the cap. Imports-only, the cheapest configuration the
+    // API offers, still measured 42 ms. There is no setting that fits.
+    //
+    // DEFERRING IS ALSO BETTER FOR DETECTION, not merely cheaper. At creation the
+    // target's memory is essentially the freshly mapped image, so scanning it then
+    // adds little over scanning the file; by the time this thread runs, a packed
+    // sample has unpacked itself and its sandbox-evasion strings and code are
+    // visible.
+    void AnalyzeDeferredProcessForSandboxEvasion(uint32_t processId,
+                                                 const std::wstring& queuedPath) {
+        if (processId == 0 ||
+            !m_sandboxDetectorInitialized.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        HANDLE hProcess = ::OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+        if (!hProcess) {
+            // Exited, or not openable at our integrity level. Neither is evidence
+            // of anything, so this is a silent return rather than a finding.
+            return;
+        }
+        struct HandleGuard {
+            HANDLE h;
+            ~HandleGuard() { if (h) { ::CloseHandle(h); } }
+        } guard{ hProcess };
+
+        wchar_t actualImage[MAX_PATH] = {};
+        DWORD actualLength = MAX_PATH;
+        if (!::QueryFullProcessImageNameW(hProcess, 0, actualImage, &actualLength)) {
+            return;
+        }
+
+        // ONE CONDITION, THREE PROPERTIES. This is not a tidiness check.
+        //
+        // The deferred queue carries (path, processId), but the path means
+        // DIFFERENT THINGS depending on which producer queued the entry: from the
+        // file-scan handler it is the file that was accessed, from the process
+        // notify handler it is the process image. Requiring the two to agree
+        // therefore selects exactly the process-notify entries, and that single
+        // condition delivers:
+        //
+        //   1. PID-RECYCLING SAFETY. A queued pid may have exited and been reused
+        //      before this thread reaches it, and a recycled pid still opens
+        //      successfully - so without this the analysis would attribute a
+        //      different program's memory to this entry.
+        //   2. DEDUPLICATION. m_deferredSeen is keyed by PATH, so one busy process
+        //      can be queued once per distinct file it touches. Matching on the
+        //      image reduces that to one analysis per process launch.
+        //   3. A COST BOUND, following from 2: at the measured 367 ms per analysis,
+        //      admitting the file-scan stream would leave this thread permanently
+        //      behind the queue it shares with full deep file scans.
+        //
+        // A path longer than MAX_PATH fails the comparison and is skipped, which is
+        // the safe direction: it declines to analyse rather than analysing the
+        // wrong process.
+        if (queuedPath.empty() || _wcsicmp(actualImage, queuedPath.c_str()) != 0) {
+            return;
+        }
+
+        ShadowStrike::AntiEvasion::SandboxEvasionDetector::ProcessSandboxConfig config;
+        // Shipped defaults on purpose. Nothing waits on this thread, it is
+        // explicitly the slow thorough path, and narrowing the scan here is exactly
+        // what would give up the unpacked-content coverage that makes deferral
+        // worth doing. The image path is supplied so the detector does not repeat
+        // the query we just made.
+        config.kernelContext.imagePath = actualImage;
+
+        ShadowStrike::AntiEvasion::SandboxEvasionDetector::ProcessSandboxResult result;
+        if (!ShadowStrike::AntiEvasion::SandboxEvasionDetector::Instance()
+                 .AnalyzeProcess(hProcess, processId, result, config)) {
+            return;
+        }
+        if (!result.hasEvasionCapability) {
+            return;
+        }
+
+        m_stats.sandboxEvasionCapabilityDetected++;
+
+        std::string techniques;
+        for (const auto& id : result.mitreIds) {
+            if (!techniques.empty()) {
+                techniques += ",";
+            }
+            techniques += id;
+        }
+
+        // DETECTION AND TELEMETRY, NOT ENFORCEMENT, AND THE WORDING SAYS SO.
+        // The process has been running since before this thread saw it, so there is
+        // no pre-execution decision left to take. Sandbox-evasion capability is
+        // also INFERENCE - it describes what a program is equipped to do, not a
+        // specific known-bad artefact - which is the evidence class this file
+        // already declines to let act destructively on its own.
+        Utils::Logger::Warn(
+            "RealTimeProtection: target sandbox-evasion capability in PID {} ({}) - "
+            "score={:.1f} techniques=[{}] imports={:.1f} strings={:.1f} code={:.1f}. "
+            "Detected and reported, not blocked: the process was already running.",
+            processId,
+            Utils::StringUtils::ToNarrow(std::wstring(actualImage)),
+            result.evasionScore,
+            techniques,
+            result.imports.score,
+            result.strings.score,
+            result.codePatterns.score);
+
+        EmitEvasionTelemetry("SandboxEvasionDetector",
+                             static_cast<float>(result.evasionScore),
+                             false);
+    }
+
     void DeferredDeepScanLoop() {
         ::SetThreadDescription(::GetCurrentThread(), L"SS-DeferredDeepScan");
         // Background stage: must never compete with the verdict path it exists
@@ -3210,6 +3340,27 @@ public:
             } catch (const std::exception& e) {
                 Utils::Logger::Error("RealTimeProtection: deferred deep scan failed for {}: {}",
                     Utils::StringUtils::ToNarrow(item.first), e.what());
+                m_stats.scanErrors++;
+            } catch (...) {
+                m_stats.scanErrors++;
+            }
+
+            // RESTORED CAPABILITY. SandboxEvasionDetector's target analysis had no
+            // production caller anywhere, so the three checks it drives - evasion
+            // imports, embedded sandbox artefact strings, and CPUID/RDTSC timing
+            // code patterns - had never run on an endpoint, and with them this
+            // product's ONLY T1012 and T1057 attributions had no reachable
+            // producer. See the helper for why this thread is the right home.
+            //
+            // Deliberately its own try block: an exception raised while analysing a
+            // process must not be able to skip the file remediation above, nor the
+            // reverse.
+            try {
+                AnalyzeDeferredProcessForSandboxEvasion(item.second, item.first);
+            } catch (const std::exception& e) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: deferred sandbox analysis failed for PID {}: {}",
+                    item.second, e.what());
                 m_stats.scanErrors++;
             } catch (...) {
                 m_stats.scanErrors++;
@@ -6546,6 +6697,7 @@ public:
         const uint64_t exitBlockIgn = m_stats.processExitBlockRequestsIgnored.load(std::memory_order_relaxed);
         const uint64_t procWithheld = m_stats.processBlocksWithheldByMode.load(std::memory_order_relaxed);
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
+        const uint64_t sandboxCap   = m_stats.sandboxEvasionCapabilityDetected.load(std::memory_order_relaxed);
 
         // Saturation is "no worker free AND work waiting". Busy-with-nothing-queued
         // is a fully used pool keeping up, which is the desired state, not a
@@ -6592,12 +6744,13 @@ public:
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
-            "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={}",
+            "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
+            "sandboxEvasionCapabilityDetected={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn);
+            exitBlockIgn, sandboxCap);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7126,6 +7279,7 @@ void RTPStatistics::Reset() noexcept {
     processNotifyBudgetExceeded = 0;
     processNotifyReplyHorizonExceeded = 0;
     processExitBlockRequestsIgnored = 0;
+    sandboxEvasionCapabilityDetected = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;

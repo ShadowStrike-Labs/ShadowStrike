@@ -8124,6 +8124,29 @@ class EvasionFanOutReportingContractTests(unittest.TestCase):
         cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
         cls.telemetry_hpp = strip_c_comments(read_source(TELEMETRY_COLLECTOR_HPP_PATH))
 
+    def _decision_block(self) -> str:
+        """Brace-match the evasion decision block.
+
+        Sliced by anchor rather than by extract_c_function because the enclosing
+        handler is enormous and the interesting region is a single statement inside
+        it.
+        """
+        anchor = "if (!evasionFindings.empty()) {"
+        found = self.rtp.count(anchor)
+        self.assertEqual(
+            found, 1, f"expected exactly one evasion decision block, found {found}"
+        )
+        opening = self.rtp.index("{", self.rtp.index(anchor))
+        depth = 0
+        for index in range(opening, len(self.rtp)):
+            if self.rtp[index] == "{":
+                depth += 1
+            elif self.rtp[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.rtp[opening : index + 1]
+        self.fail("could not brace-match the evasion decision block")
+        return ""
     def test_the_environment_detector_is_not_gated_on_another_detector_firing(self) -> None:
         """Environment analysis must run whether or not something else already fired.
 
@@ -8233,19 +8256,53 @@ class EvasionFanOutReportingContractTests(unittest.TestCase):
         BLOCK_SUSPICIOUS. So on a default endpoint nothing was blocked and every
         record still told the SOC actionTaken="Blocked".
         """
-        calls = re.findall(r"EmitEvasionTelemetry\(([^;]*?)\)\s*;", self.rtp, re.S)
+        # SCOPED TO THE FAN-OUT, NOT THE FILE, AND THE DIFFERENCE MATTERS.
+        #
+        # The defect was SIX emissions inside the detector blocks, roughly fifty
+        # lines before the enforcement decision existed. The invariant that removes
+        # it is "one emission per finding, after the outcome is decided" WITHIN this
+        # decision - not "one emission in the whole translation unit". A file-wide
+        # count also forbids unrelated paths from reporting evasion telemetry at all,
+        # which is a different and unintended restriction: the deferred deep-scan
+        # thread legitimately reports a target sandbox-evasion finding, and there the
+        # outcome is decided by construction because nothing can be blocked once the
+        # process is already running.
+        decision = self._decision_block()
+        in_decision = re.findall(
+            r"EmitEvasionTelemetry\(([^;]*?)\)\s*;", decision, re.S
+        )
         self.assertEqual(
-            len(calls),
+            len(in_decision),
             1,
-            f"expected exactly one EmitEvasionTelemetry call site, found {len(calls)}. "
-            "Per-detector emission is what made the outcome unknowable at the point "
-            "of reporting.",
+            f"expected exactly one EmitEvasionTelemetry call inside the evasion "
+            f"decision, found {len(in_decision)}. Per-detector emission is what made "
+            "the outcome unknowable at the point of reporting.",
         )
         self.assertIn(
             "willBlock",
-            calls[0],
+            in_decision[0],
             "the telemetry call must pass the decided outcome, not a literal: "
-            f"arguments were {calls[0].strip()!r}",
+            f"arguments were {in_decision[0].strip()!r}",
+        )
+
+        # AND FILE-WIDE, NO CALL MAY CLAIM AN OUTCOME THAT WAS NEVER DECIDED. The
+        # permitted forms are the fan-out's computed decision and a literal false,
+        # which is what a path that cannot block must report.
+        calls = re.findall(r"EmitEvasionTelemetry\(([^;]*?)\)\s*;", self.rtp, re.S)
+        self.assertGreaterEqual(
+            len(calls), 1, "no evasion telemetry is emitted anywhere"
+        )
+        undecided = [
+            " ".join(args.split())
+            for args in calls
+            if "willBlock" not in args and not re.search(r"(?<![A-Za-z0-9_])false\s*\)?$", args.strip())
+        ]
+        self.assertEqual(
+            undecided,
+            [],
+            "every evasion telemetry call must report a decided outcome - the "
+            "fan-out's computed decision, or false where nothing can be blocked. "
+            "These do neither: " + " | ".join(undecided[:2]),
         )
 
         literal_true = re.findall(r"EmitEvasionTelemetry\([^;]*?,\s*true\s*\)", self.rtp, re.S)
@@ -8505,6 +8562,199 @@ class SandboxHostContextIsNotAVerdictContractTests(unittest.TestCase):
                 "technique that describes an analysed sample",
             )
 
+
+class DeferredSandboxTargetAnalysisContractTests(unittest.TestCase):
+    """SandboxEvasionDetector's target analysis belongs off the kernel-reply path.
+
+    MEASURED, best-of-5 against a live process: 367 ms at shipped defaults
+    (64 MB memory / 4 MB code), 106 ms even when the memory bound is cut to 1 MB,
+    and 42 ms for imports alone. The driver waits 500 ms and the evasion suite on
+    the process-notify callback is bounded at 250 ms, so no configuration of this
+    analysis fits there - the bound caps bytes READ while the address-space walk
+    and module enumeration happen regardless.
+
+    These are source contracts because reaching the deferred thread needs a loaded
+    driver and a live filter port.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST: the change documents its own measurements and quotes the
+        # rejected placement, so a comment-blind scan would false-positive.
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.rtp_hpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+
+    _HELPER = "AnalyzeDeferredProcessForSandboxEvasion"
+
+    def _brace_matched_body(self, source: str, anchor: str) -> str:
+        """Slice a function by brace matching from an exact anchor.
+
+        extract_c_function takes the FIRST occurrence of a name, and both functions
+        involved here are NAMED EARLIER IN THE FILE THAN THEY ARE DEFINED - the loop
+        appears in a std::thread construction hundreds of lines above its body - so
+        using it would slice a reference instead of a definition.
+        """
+        found = source.count(anchor)
+        self.assertEqual(
+            found, 1, f"expected exactly one {anchor!r}, found {found}"
+        )
+        opening = source.index("{", source.index(anchor))
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[opening : index + 1]
+        self.fail(f"could not brace-match the body of {anchor!r}")
+        return ""
+
+    def test_the_target_analysis_is_invoked_only_from_the_deferred_thread(self) -> None:
+        """It must have exactly one caller, and that caller must be the deferred loop.
+
+        Asserting the single call site rather than scanning the process-notify
+        handler is what makes this airtight: if the helper is called once and that
+        once is inside the deferred loop, it cannot also be on the callback the
+        kernel blocks CreateProcess on.
+        """
+        references = self.rtp.count(self._HELPER + "(")
+        self.assertEqual(
+            references,
+            2,
+            "expected exactly two references to the helper - its definition and one "
+            f"call - but found {references}. A second call site would put a 367 ms "
+            "analysis somewhere it has not been costed.",
+        )
+
+        # BOUNDED: assertIn would print the whole loop body on failure.
+        loop = self._brace_matched_body(self.rtp, "void DeferredDeepScanLoop() {")
+        in_loop = loop.count(self._HELPER + "(")
+        self.assertGreaterEqual(
+            in_loop,
+            1,
+            "the target analysis must be driven from the deferred deep-scan loop, "
+            "which is off the kernel-reply path and runs below normal priority; the "
+            f"loop contains {in_loop} call(s) to it",
+        )
+
+        # ANTI-VACUITY: the analysis itself must still be performed.
+        analysis_calls = self.rtp.count(".AnalyzeProcess(hProcess")
+        self.assertEqual(
+            analysis_calls,
+            1,
+            "expected exactly one handle-based AnalyzeProcess call - the restored "
+            f"target analysis - but found {analysis_calls}",
+        )
+
+    def test_the_deferred_analysis_verifies_the_process_before_reading_it(self) -> None:
+        """The queued pid must be checked against the queued image FIRST.
+
+        The deferred queue carries (path, processId) and the path means different
+        things per producer: the accessed FILE from the file-scan handler, the
+        process IMAGE from the notify handler. Requiring them to agree selects the
+        notify entries and simultaneously supplies pid-recycling safety, per-launch
+        deduplication, and the cost bound that follows from it.
+        """
+        body = self._brace_matched_body(
+            self.rtp, "void " + self._HELPER + "(uint32_t processId,"
+        )
+
+        # BOUNDED: counted rather than asserted with assertIn, which would print the
+        # entire helper body on failure.
+        for required in ("QueryFullProcessImageNameW", "_wcsicmp"):
+            present = body.count(required)
+            self.assertGreaterEqual(
+                present,
+                1,
+                f"the identity check needs {required}; without it a recycled pid "
+                "would have another program's memory attributed to this entry "
+                f"(found {present} occurrences)",
+            )
+
+        # ORDERING, NOT MERE PRESENCE. A check that runs after the read protects
+        # nothing, and an assertion that both tokens merely appear cannot tell.
+        compared = body.index("_wcsicmp")
+        analysed = body.index(".AnalyzeProcess(")
+        self.assertLess(
+            compared,
+            analysed,
+            "the image comparison must precede the analysis "
+            f"(comparison at {compared}, analysis at {analysed})",
+        )
+
+    def test_the_restored_detection_does_not_claim_or_perform_enforcement(self) -> None:
+        """This restores detection and telemetry, not blocking, and must say so.
+
+        The process has been running since before the deferred thread saw it, so no
+        pre-execution decision remains. Sandbox-evasion capability is also inference
+        - what a program is equipped to do, not a named artefact - which is the
+        evidence class this file already refuses to let act destructively alone.
+        """
+        body = self._brace_matched_body(
+            self.rtp, "void " + self._HELPER + "(uint32_t processId,"
+        )
+
+        for forbidden in (
+            "HandleDeferredThreat",
+            "TerminateProcess",
+            "BlockProcess",
+            "QuarantineFile",
+            "RequestKernelProcessBlock",
+        ):
+            offending = [line.strip() for line in body.splitlines() if forbidden in line]
+            self.assertEqual(
+                offending,
+                [],
+                f"the deferred sandbox analysis calls {forbidden}, which turns an "
+                "inference-class observation about an already-running process into "
+                "an action. That is a policy change, not a wiring change. Offending "
+                "line: " + (offending[0] if offending else ""),
+            )
+
+        telemetry = re.search(r"EmitEvasionTelemetry\(([^;]*?)\)\s*;", body, re.S)
+        self.assertIsNotNone(
+            telemetry, "the detection must be reported to telemetry"
+        )
+        assert telemetry is not None
+        self.assertIn(
+            "false",
+            telemetry.group(1),
+            "telemetry must record that nothing was blocked; arguments were "
+            f"{telemetry.group(1).strip()!r}",
+        )
+
+    def test_the_capability_counter_cannot_become_a_structural_zero(self) -> None:
+        """A counter that is declared but never reset or reported reads as healthy.
+
+        RTPStatistics::Reset carries an explicit instruction that every counter must
+        be listed, because a partial reset looks complete while leaving stale values
+        behind for the delta logging to underflow against.
+        """
+        counter = "sandboxEvasionCapabilityDetected"
+        self.assertIn(
+            counter,
+            self.rtp_hpp,
+            f"{counter} must be declared in the statistics struct",
+        )
+        sites = self.rtp.count(counter)
+        self.assertGreaterEqual(
+            sites,
+            4,
+            f"{counter} needs an increment, a load for the periodic report, a use in "
+            f"that report's format arguments, and a reset - found {sites} references",
+        )
+        self.assertIn(
+            counter + " = 0;",
+            self.rtp,
+            f"{counter} is missing from RTPStatistics::Reset, so a reset would leave "
+            "it stale while appearing to have cleared everything",
+        )
+        self.assertIn(
+            counter + "++",
+            self.rtp,
+            f"{counter} is never incremented, so it can only ever read zero",
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
