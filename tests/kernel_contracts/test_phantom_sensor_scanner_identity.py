@@ -7248,5 +7248,161 @@ class ShippedBinaryIdentityContractTests(unittest.TestCase):
         )
 
 
+class AssemblyLayerWiringContractTests(unittest.TestCase):
+    """Pins the hand-written x64 assembly anti-evasion layer against silent ABI drift.
+
+    Task 209 measured this layer on 2026-08-21: six of our own .asm files export 105
+    PROCs, and every one of them has a hand-written extern "C" prototype in a sibling
+    C++ file. There is no compiler or linker check tying a prototype to the assembly it
+    names - extern "C" suppresses mangling, so a prototype may disagree with the
+    implementation about the return width or even the ARGUMENT COUNT and still link.
+
+    That is not hypothetical. VMEvasionDetector.cpp declared MeasureInstructionTiming
+    with a second `instructionType` selector that the assembly never reads (it tests
+    only ECX), so the selector was passed in EDX and silently discarded on the
+    USE_ASM_FUNCTIONS path while the C++ fallback honoured it - the two configurations
+    measured different things, which the file's own contract note forbids.
+
+    Comment stripping is mandatory here: the fix left a comment that QUOTES the old
+    two-argument signature in order to explain it, so a comment-blind scan is
+    guaranteed to report the very defect the comment describes as fixed.
+    """
+
+    _ANTIEVASION_DIR = ROOT / "src" / "PhantomCore" / "AntiEvasion"
+
+    # Measured floors, not targets. They exist so a broken walk reports as a failure
+    # instead of trivially passing: every other assertion here is "no offenders found",
+    # which an empty file list would satisfy vacuously.
+    _MIN_ASM_FILES = 6
+    _MIN_EXPORTS = 100
+
+    @staticmethod
+    def _function_body(code: str, name: str) -> str:
+        """Return the brace-matched body of the first definition of *name*."""
+        idx = code.index(name)
+        brace = code.index("{", idx)
+        depth = 0
+        for pos in range(brace, len(code)):
+            if code[pos] == "{":
+                depth += 1
+            elif code[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[brace:pos + 1]
+        raise AssertionError("unbalanced braces after " + name)
+
+    def _asm_exports(self):
+        """Map every exported assembly PROC to the file that defines it."""
+        asm_files = sorted(self._ANTIEVASION_DIR.glob("*_x64.asm"))
+        self.assertGreaterEqual(
+            len(asm_files),
+            self._MIN_ASM_FILES,
+            "expected at least {} assembly sources under {}, found {} - the walk is "
+            "broken and every other assertion in this class would pass vacuously".format(
+                self._MIN_ASM_FILES, self._ANTIEVASION_DIR, len(asm_files)
+            ),
+        )
+        exports = {}
+        for path in asm_files:
+            # MASM comments run from ';' to end of line.
+            stripped = re.sub(r";[^\n]*", "", read_source(path))
+            for name in re.findall(
+                r"(?im)^\s*([A-Za-z_][A-Za-z0-9_]*)\s+PROC\b", stripped
+            ):
+                exports[name] = path.name
+        self.assertGreaterEqual(
+            len(exports),
+            self._MIN_EXPORTS,
+            "expected at least {} exported assembly routines, found {}".format(
+                self._MIN_EXPORTS, len(exports)
+            ),
+        )
+        return exports
+
+    def _cpp_sources(self):
+        paths = sorted(self._ANTIEVASION_DIR.glob("*.cpp"))
+        paths += sorted(self._ANTIEVASION_DIR.glob("*.hpp"))
+        self.assertGreater(
+            len(paths), 10, "no C++ sources found beside the assembly layer"
+        )
+        return {p: strip_c_comments(read_source(p)) for p in paths}
+
+    def test_every_assembly_export_is_declared_beside_the_assembly(self):
+        """An export nobody declares cannot be called, and nothing would report that."""
+        exports = self._asm_exports()
+        bodies = self._cpp_sources()
+        combined = re.compile(
+            r"(?<![A-Za-z0-9_])("
+            + "|".join(re.escape(name) for name in sorted(exports))
+            + r")\s*\("
+        )
+        declared = set()
+        for code in bodies.values():
+            declared.update(match.group(1) for match in combined.finditer(code))
+        undeclared = sorted(
+            "{} ({})".format(name, exports[name])
+            for name in exports
+            if name not in declared
+        )
+        self.assertEqual(
+            [],
+            undeclared,
+            "every exported assembly routine must be declared in a C++ file beside the "
+            "assembly, so the prototype and the implementation stay reviewable "
+            "together; these have no prototype at all: " + ", ".join(undeclared),
+        )
+
+    def test_the_assembly_instruction_timer_is_never_declared_with_a_selector(self):
+        """The assembly reads only ECX, so a second parameter is silently discarded."""
+        bodies = self._cpp_sources()
+        # The lookbehind rejects Fallback_/Safe_ prefixed names, which legitimately do
+        # take a selector because they are C++ implementations, not the assembly symbol.
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_])MeasureInstructionTiming\s*\([^;{)]*,[^;{)]*\)\s*"
+            r"(noexcept\s*)?;"
+        )
+        offenders = []
+        for path, code in bodies.items():
+            for match in pattern.finditer(code):
+                offenders.append("{} at offset {}".format(path.name, match.start()))
+        self.assertEqual(
+            [],
+            offenders,
+            "MeasureInstructionTiming in EnvironmentEvasionDetector_x64.asm takes ONE "
+            "argument - it tests only ECX and times a fixed instruction sequence. A "
+            "two-argument prototype links silently because extern \"C\" suppresses "
+            "mangling, and the extra argument is then discarded in EDX: "
+            + ", ".join(offenders),
+        )
+
+    def test_the_typed_instruction_timing_wrapper_is_not_build_switch_dependent(self):
+        """Its meaning must not change with USE_ASM_FUNCTIONS, per the file's own note."""
+        path = self._ANTIEVASION_DIR / "VMEvasionDetector.cpp"
+        code = strip_c_comments(read_source(path))
+        wrapper = "Safe_MeasureInstructionTiming"
+        self.assertIn(
+            wrapper,
+            code,
+            "{} no longer defines {} - if the typed wrapper was renamed this guard must "
+            "follow it rather than being deleted".format(path.name, wrapper),
+        )
+        body = self._function_body(code, wrapper)
+        self.assertNotIn(
+            "USE_ASM_FUNCTIONS",
+            body,
+            "{} must not select an implementation on the build switch: only the C++ "
+            "implementation honours the instruction-type selector, so gating here makes "
+            "the measured quantity depend on how the product was compiled".format(
+                wrapper
+            ),
+        )
+        self.assertEqual(
+            1,
+            body.count("Fallback_MeasureInstructionTiming"),
+            "{} must route to the one implementation that honours the selector, exactly "
+            "once".format(wrapper),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

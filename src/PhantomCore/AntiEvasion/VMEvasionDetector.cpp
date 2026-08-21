@@ -116,8 +116,26 @@ extern "C" {
     /// @brief Checks segment descriptor limits for VM detection
     bool CheckSegmentLimits(uint32_t* csLimit, uint32_t* dsLimit, uint32_t* ssLimit) noexcept;
 
-    /// @brief Generic instruction timing measurement
-    uint64_t MeasureInstructionTiming(uint32_t iterations, uint32_t instructionType) noexcept;
+    // MeasureInstructionTiming is deliberately NOT declared in this translation unit.
+    //
+    // The assembly implementation in EnvironmentEvasionDetector_x64.asm takes exactly
+    // ONE argument: it reads only ECX (test ecx,ecx / cmp ecx,10000h / mov esi,ecx) and
+    // times a FIXED "mov rax,rax / xor rbx,rbx / add rcx,0 / sub rdx,0 / nop / nop"
+    // sequence. It has no instruction-type selector, and neither does the 1-argument
+    // fallback that EnvironmentEvasionDetector.cpp binds to it via
+    // #pragma comment(linker, "/alternatename:MeasureInstructionTiming=...").
+    //
+    // This file previously declared the same extern "C" symbol with a second
+    // `uint32_t instructionType` parameter. Because extern "C" suppresses mangling the
+    // linker cannot see such a disagreement, so the selector was passed in EDX and
+    // silently discarded: on the USE_ASM_FUNCTIONS path every instruction class
+    // measured the same fixed sequence, while the fallback path honoured the selector.
+    // That is precisely the build-switch-dependent divergence the contract note on
+    // Fallback_MeasureCPUIDTiming says must never happen.
+    //
+    // Typed measurement is provided by Fallback_MeasureInstructionTiming below, which is
+    // the only implementation that honours the selector. Callers use
+    // Safe_MeasureInstructionTiming, which routes there unconditionally.
 
     /// @brief Intel VT-x hypercall detection (causes #UD on non-VM)
     bool DetectVMCALL() noexcept;
@@ -616,14 +634,17 @@ namespace {
         }
     }
 
-    /// @brief Wrapper for instruction timing
-    [[nodiscard]] inline uint64_t Safe_MeasureInstructionTiming(uint32_t iterations, 
+    /// @brief Wrapper for typed instruction timing.
+    /// @note Deliberately NOT gated on USE_ASM_FUNCTIONS. The assembly routine of this
+    ///       name accepts only an iteration count and times a fixed instruction
+    ///       sequence (see the note where its declaration used to sit), so routing here
+    ///       would discard `instructionType` and make the measured quantity depend on a
+    ///       build switch. Only the C++ implementation honours the selector, so it is
+    ///       used in both configurations - which is what keeps this wrapper's meaning
+    ///       identical however USE_ASM_FUNCTIONS is set.
+    [[nodiscard]] inline uint64_t Safe_MeasureInstructionTiming(uint32_t iterations,
                                                                  uint32_t instructionType) noexcept {
-        if constexpr (USE_ASM_FUNCTIONS) {
-            return MeasureInstructionTiming(iterations, instructionType);
-        } else {
-            return Fallback_MeasureInstructionTiming(iterations, instructionType);
-        }
+        return Fallback_MeasureInstructionTiming(iterations, instructionType);
     }
 
     /// @brief Wrapper for VMCALL detection
