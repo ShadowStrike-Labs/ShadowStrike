@@ -1019,7 +1019,7 @@ class PhantomCortexPipeline:
             f"**Mode:** {data['mode']}  ",
             f"**Generated:** {data['generated_at']}  ",
             f"**Host:** {data['host']}  ",
-            f"**Overall:** {'✅ PASS' if data['overall_success'] else '❌ FAIL'}  ",
+            f"**Overall:** {'PASS' if data['overall_success'] else 'FAIL'}  ",
             f"**Total duration:** {data['total_duration_s']:.1f}s  ",
             "",
             "## Steps",
@@ -1028,7 +1028,7 @@ class PhantomCortexPipeline:
             "|------|--------|----------|-------|",
         ]
         for step in data["steps"]:
-            status = "✅" if step["success"] else "❌"
+            status = "PASS" if step["success"] else "FAIL"
             err = step.get("error") or ""
             if len(err) > 60:
                 err = err[:57] + "…"
@@ -1092,7 +1092,7 @@ class PhantomCortexPipeline:
 
     def _notify(self) -> None:
         ok = all(r.success for r in self._results)
-        subject = f"PhantomCortex {'✅ PASS' if ok else '❌ FAIL'} — {self._run_id}"
+        subject = f"PhantomCortex {'PASS' if ok else 'FAIL'} — {self._run_id}"
         body = f"Pipeline {self._mode.name} completed {'successfully' if ok else 'with failures'}.\n"
         for r in self._results:
             status = "PASS" if r.success else "FAIL"

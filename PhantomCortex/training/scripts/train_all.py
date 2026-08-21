@@ -761,7 +761,7 @@ def _print_summary(
     print("  " + "-" * 76)
 
     for r in results:
-        status = "✓ OK" if r.success else "✗ FAIL"
+        status = "OK" if r.success else "FAIL"
         time_str = f"{r.training_time_s:.0f}s" if r.training_time_s > 0 else "N/A"
 
         key_metric = "N/A"

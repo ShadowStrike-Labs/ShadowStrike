@@ -2073,7 +2073,7 @@ bool InjectDLL(ProcessId pid, std::wstring_view dllPath, Error* err) noexcept {
     ProcessHandle ph;
     if (!ph.Open(pid, PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
-        SYNCHRONIZE, err)) { // ✅ SYNCHRONIZE eklendi
+        SYNCHRONIZE, err)) { // SYNCHRONIZE eklendi
         return false;
     }
 

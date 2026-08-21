@@ -2214,12 +2214,12 @@ bool IPLeakProtectionImpl::SelfTest() {
         if (dnsServers.empty()) {
             Utils::Logger::Warn("No DNS servers detected (may be expected)");
         } else {
-            Utils::Logger::Info("✓ DNS server detection test passed ({} servers)", dnsServers.size());
+            Utils::Logger::Info("[OK] DNS server detection test passed ({} servers)", dnsServers.size());
         }
 
         // Test 2: VPN detection
         DetectVPNState();
-        Utils::Logger::Info("✓ VPN detection test passed (state: {})", static_cast<int>(m_vpnState.load()));
+        Utils::Logger::Info("[OK] VPN detection test passed (state: {})", static_cast<int>(m_vpnState.load()));
 
         // Test 3: Configuration validation
         IPLeakProtectionConfiguration testConfig;
@@ -2231,7 +2231,7 @@ bool IPLeakProtectionImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Configuration validation");
             return false;
         }
-        Utils::Logger::Info("✓ Configuration validation test passed");
+        Utils::Logger::Info("[OK] Configuration validation test passed");
 
         // Test 4: Leak severity calculation
         auto severity = CalculateLeakSeverity(LeakType::VPNLeak, true);
@@ -2239,7 +2239,7 @@ bool IPLeakProtectionImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Severity calculation");
             return false;
         }
-        Utils::Logger::Info("✓ Leak severity calculation test passed");
+        Utils::Logger::Info("[OK] Leak severity calculation test passed");
 
         Utils::Logger::Info("All IPLeakProtection self-tests passed!");
         return true;

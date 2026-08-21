@@ -225,7 +225,7 @@ TEST_F(LogDBTest, LogBasicEntrySucceeds) {
 
     EXPECT_TRUE(InitializeLogDB());
 
-    // ✅ DEBUG: Check config after init
+    // DEBUG: Check config after init
     auto config = LogDB::Instance().GetConfig();
     std::cout << "Config after init:\n";
     std::cout << "  asyncLogging: " << (config.asyncLogging ? "TRUE" : "FALSE") << "\n";
@@ -308,7 +308,7 @@ TEST_F(LogDBTest, ConvenienceMethodsWork) {
 
     EXPECT_TRUE(InitializeLogDB());
 
-    // ✅ DEBUG: Check config
+    // DEBUG: Check config
     auto config = LogDB::Instance().GetConfig();
     std::cout << "asyncLogging: " << (config.asyncLogging ? "TRUE" : "FALSE") << "\n";
 

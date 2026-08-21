@@ -1598,7 +1598,7 @@ bool LocationPrivacyImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: GeoLocation validation");
             return false;
         }
-        Utils::Logger::Info("✓ GeoLocation validation test passed");
+        Utils::Logger::Info("[OK] GeoLocation validation test passed");
 
         // Test 2: Distance calculation
         GeoLocation loc1;
@@ -1614,7 +1614,7 @@ bool LocationPrivacyImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Distance calculation ({} km)", distance);
             return false;
         }
-        Utils::Logger::Info("✓ Distance calculation test passed ({:.2f} km)", distance);
+        Utils::Logger::Info("[OK] Distance calculation test passed ({:.2f} km)", distance);
 
         // Test 3: Geofence creation
         GeofenceRegion testRegion;
@@ -1629,7 +1629,7 @@ bool LocationPrivacyImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Geofence creation");
             return false;
         }
-        Utils::Logger::Info("✓ Geofence creation test passed");
+        Utils::Logger::Info("[OK] Geofence creation test passed");
 
         // Test 4: Geofence containment
         GeoLocation insideLoc = testLoc;  // Same as center
@@ -1643,7 +1643,7 @@ bool LocationPrivacyImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Geofence containment (outside)");
             return false;
         }
-        Utils::Logger::Info("✓ Geofence containment test passed");
+        Utils::Logger::Info("[OK] Geofence containment test passed");
 
         // Test 5: Mock location
         SetMockLocation(testLoc);
@@ -1652,7 +1652,7 @@ bool LocationPrivacyImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Mock location");
             return false;
         }
-        Utils::Logger::Info("✓ Mock location test passed");
+        Utils::Logger::Info("[OK] Mock location test passed");
 
         // Cleanup
         (void)RemoveGeofence(testRegion.regionId);

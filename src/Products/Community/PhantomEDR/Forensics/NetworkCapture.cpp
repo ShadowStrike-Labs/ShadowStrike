@@ -1943,7 +1943,7 @@ bool NetworkCaptureImpl::SelfTest() {
             return false;
         }
         WSACleanup();
-        Utils::Logger::Info("✓ Winsock test passed");
+        Utils::Logger::Info("[OK] Winsock test passed");
 
         // Test 2: IP address parsing
         auto ip4 = IPAddress::FromString("192.168.1.1");
@@ -1951,18 +1951,18 @@ bool NetworkCaptureImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: IPv4 parsing");
             return false;
         }
-        Utils::Logger::Info("✓ IPv4 parsing test passed");
+        Utils::Logger::Info("[OK] IPv4 parsing test passed");
 
         auto ip6 = IPAddress::FromString("::1");
         if (!ip6.has_value() || ip6->IsIPv4()) {
             Utils::Logger::Error("Self-test failed: IPv6 parsing");
             return false;
         }
-        Utils::Logger::Info("✓ IPv6 parsing test passed");
+        Utils::Logger::Info("[OK] IPv6 parsing test passed");
 
         // Test 3: Check interfaces
         auto ifaces = GetInterfaces();
-        Utils::Logger::Info("✓ Found {} network interfaces", ifaces.size());
+        Utils::Logger::Info("[OK] Found {} network interfaces", ifaces.size());
 
         // Test 4: Session ID generation
         auto sessionId = GenerateSessionId();
@@ -1970,7 +1970,7 @@ bool NetworkCaptureImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Session ID generation");
             return false;
         }
-        Utils::Logger::Info("✓ Session ID generation test passed");
+        Utils::Logger::Info("[OK] Session ID generation test passed");
 
         Utils::Logger::Info("All NetworkCapture self-tests passed!");
         return true;

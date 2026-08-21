@@ -112,11 +112,11 @@ public:
         }
         std::cout << "========================================================================\n";
         if (failed_ == 0 && total_ > 0)
-            std::cout << "\n✓ ALL TESTS PASSED\n\n";
+            std::cout << "\n[OK] ALL TESTS PASSED\n\n";
         else if (total_ == 0)
-            std::cout << "\n✗ NO TESTS FOUND\n\n";
+            std::cout << "\n[FAIL] NO TESTS FOUND\n\n";
         else
-            std::cout << "\n✗ TESTS FAILED\n\n";
+            std::cout << "\n[FAIL] TESTS FAILED\n\n";
     }
     // Remaining pass-throughs
     void OnTestProgramEnd(const ::testing::UnitTest& u) override { default_->OnTestProgramEnd(u); }

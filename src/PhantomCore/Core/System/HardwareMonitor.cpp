@@ -2852,7 +2852,7 @@ bool HardwareMonitor::ExportReport(const std::wstring& outputPath) const {
             file << L"  Temperature: " << disk.temperatureCelsius << L"°C\n";
             file << L"  Health Percent: " << static_cast<int>(disk.healthPercent) << L"%\n";
             if (disk.failurePredicted) {
-                file << L"  ⚠ FAILURE PREDICTED: " << disk.failureReason << L"\n";
+                file << L"  [WARN] FAILURE PREDICTED: " << disk.failureReason << L"\n";
             }
             file << L"\n";
         }

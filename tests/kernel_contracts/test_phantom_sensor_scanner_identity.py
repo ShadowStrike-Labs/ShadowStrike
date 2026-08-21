@@ -6808,5 +6808,99 @@ class ProductProjectLibraryReuseContractTests(unittest.TestCase):
             )
 
 
+class EmojiFreeCodebaseContractTests(unittest.TestCase):
+    """Task 208. The project owner has forbidden emoji in the codebase, so this guard
+    refuses the five emoji-class BMP glyphs that were swept out of 21 of our own files
+    (86 sites): U+2713, U+2705, U+2717, U+26A0 and U+274C.
+
+    TWELVE of those 86 sat inside WIDE string literals in files carrying no BOM, and no
+    product project passes /utf-8 (task 193), so MSVC decoded them through the ANSI code
+    page and the operator-visible text was already mojibake before the sweep. For those
+    twelve the removal is a correctness fix, not only hygiene.
+
+    DELIBERATELY OUT OF SCOPE pending the owner's answer: README.md, SECURITY.md,
+    CLAUDE.md and .github/copilot-instructions.md carry ten further glyphs. Those are
+    presentation documents where GitHub emoji are conventional and removing them changes
+    the public face of the project rather than any shipped behaviour, so they sit outside
+    the walk roots below rather than being swept silently.
+
+    OUT OF SCOPE BY CONSTRUCTION: PhantomCortex\\.venv_local holds vendored third-party
+    Python packages (fontTools, huggingface_hub, onnxscript, rich, torch) whose own emoji
+    are not ours to edit, so the walk starts at PhantomCortex\\training.
+    """
+
+    _EMOJI_CODEPOINTS = ("\u2713", "\u2705", "\u2717", "\u26A0", "\u274C")
+
+    # Arrows and box-drawing are a SEPARATE class and are deliberately NOT swept: U+2192
+    # alone appears well over a thousand times as an ASCII-art relation in comments, and
+    # task 193's measured non-ASCII population depends on the rest staying where it is.
+    _SPARED_CODEPOINTS = ("\u2190", "\u2192", "\u2193", "\u2194", "\u21C6",
+                          "\u21D2", "\u2500")
+
+    _WALK_ROOTS = ("src", "tests", "tools", "PhantomSensor", "Fuzzer",
+                   "PhantomCortex/training")
+    _EXTENSIONS = (".cpp", ".hpp", ".h", ".c", ".asm", ".py", ".ps1", ".rc", ".inc")
+    _SKIP_DIRS = ("build", "bin", "lib", "obj", "node_modules", ".git", "vendor",
+                  "include", ".venv", ".venv_local", "__pycache__", "x64")
+    _MIN_FILES_WALKED = 800
+
+    def _walk_own_code(self):
+        found = []
+        for rel in self._WALK_ROOTS:
+            base = ROOT / rel
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*"):
+                if path.suffix.lower() not in self._EXTENSIONS:
+                    continue
+                if any(part.lower() in self._SKIP_DIRS for part in path.parts):
+                    continue
+                if path.is_file():
+                    found.append(path)
+        return found
+
+    def test_no_emoji_class_glyph_survives_in_our_own_code(self):
+        files = self._walk_own_code()
+        self.assertGreater(
+            len(files), self._MIN_FILES_WALKED,
+            "the walk found only {} source files, so this guard would pass vacuously; "
+            "check _WALK_ROOTS and _SKIP_DIRS".format(len(files)),
+        )
+        offenders = []
+        for path in files:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if not any(glyph in text for glyph in self._EMOJI_CODEPOINTS):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                names = sorted({"U+{:04X}".format(ord(ch))
+                                for ch in line if ch in self._EMOJI_CODEPOINTS})
+                if names:
+                    offenders.append("{}:{} {}".format(
+                        path.relative_to(ROOT).as_posix(), lineno, ",".join(names)))
+        # Bounded output by construction: report the offenders, never the haystack.
+        self.assertEqual(
+            offenders[:20], [],
+            "{} emoji-class glyph site(s) remain in our own code; the owner has "
+            "forbidden emoji in the codebase (task 208). Use [OK] / [FAIL] / [WARN] in "
+            "operator-visible text, and delete the glyph outright in a comment. "
+            "First 20 shown.".format(len(offenders)),
+        )
+
+    def test_the_guard_is_emoji_only_and_never_a_de_unicode_sweep(self):
+        self.assertEqual(
+            len(self._EMOJI_CODEPOINTS), 5,
+            "the emoji set is fixed at five codepoints; widening it would turn a "
+            "hygiene guard into a general non-ASCII purge",
+        )
+        for spared in self._SPARED_CODEPOINTS:
+            self.assertNotIn(
+                spared, self._EMOJI_CODEPOINTS,
+                "U+{:04X} is an arrow or box-drawing character, not an emoji: sweeping "
+                "it would destroy task 193's measured non-ASCII population and the "
+                "em-dash and box-drawing separators this codebase uses "
+                "deliberately".format(ord(spared)),
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2448,7 +2448,7 @@ std::string FormatAlertEmail(const Alert& alert) {
     html += "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>";
     html += "<div style='font-family:Arial,sans-serif;max-width:600px;margin:0 auto'>";
     html += "<div style='background:" + GetSeverityColor(alert.severity) + ";color:#fff;padding:16px;border-radius:8px 8px 0 0'>";
-    html += "<h2 style='margin:0'>⚠ ShadowStrike Alert — " + std::string(GetAlertSeverityName(alert.severity)) + "</h2>";
+    html += "<h2 style='margin:0'>ShadowStrike Alert — " + std::string(GetAlertSeverityName(alert.severity)) + "</h2>";
     html += "</div>";
     html += "<div style='padding:16px;border:1px solid #ddd;border-top:none;border-radius:0 0 8px 8px'>";
     html += "<table style='width:100%;border-collapse:collapse'>";
@@ -2491,7 +2491,7 @@ std::string FormatAlertTeams(const Alert& alert) {
     payload += "\"themeColor\":\"" + color.substr(1) + "\",";
     payload += "\"summary\":\"" + JsonEscape(alert.subject) + "\",";
     payload += "\"sections\":[{";
-    payload += "\"activityTitle\":\"⚠ ShadowStrike — " + JsonEscape(alert.subject) + "\",";
+    payload += "\"activityTitle\":\"ShadowStrike — " + JsonEscape(alert.subject) + "\",";
     payload += "\"facts\":[";
     payload += "{\"name\":\"Severity\",\"value\":\"" + std::string(GetAlertSeverityName(alert.severity)) + "\"},";
     payload += "{\"name\":\"Type\",\"value\":\"" + std::string(GetAlertTypeName(alert.type)) + "\"},";

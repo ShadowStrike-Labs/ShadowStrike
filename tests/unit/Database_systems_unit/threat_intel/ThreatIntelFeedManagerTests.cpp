@@ -91,7 +91,7 @@ class MockHttpClient : public IHttpClient {
 public:
     MOCK_METHOD(HttpResponse, Execute, (const HttpRequest& request), (override));
     MOCK_METHOD(std::future<HttpResponse>, ExecuteAsync, (const HttpRequest& request), (override));
-    MOCK_METHOD(void, SetDefaultHeaders, (const HeaderMap& headers), (override));  // ✅ FIXED
+    MOCK_METHOD(void, SetDefaultHeaders, (const HeaderMap& headers), (override));  // FIXED
     MOCK_METHOD(void, SetProxy, (const std::string& proxyUrl), (override));
     MOCK_METHOD(std::string, GetLastError, (), (const, override));
 

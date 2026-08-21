@@ -497,9 +497,9 @@ bool EDRProductOrchestratorImpl::InitSubsystem(const SubsystemDescriptor& desc) 
 
     if (ok) {
         m_initCount.fetch_add(1, std::memory_order_relaxed);
-        Logger::Info("{} ✓ {} initialized ({}ms)", kLogPrefix, desc.name, elapsed);
+        Logger::Info("{} [OK] {} initialized ({}ms)", kLogPrefix, desc.name, elapsed);
     } else {
-        Logger::Error("{} ✗ {} FAILED ({}ms) [critical={}]",
+        Logger::Error("{} [FAIL] {} FAILED ({}ms) [critical={}]",
                       kLogPrefix, desc.name, elapsed, desc.critical ? "yes" : "no");
     }
     return ok;
@@ -579,7 +579,7 @@ void EDRProductOrchestratorImpl::Shutdown() {
         const auto& desc = m_bootSequence[*it];
         try {
             desc.shutdown();
-            Logger::Info("{} ✓ {} shut down", kLogPrefix, desc.name);
+            Logger::Info("{} [OK] {} shut down", kLogPrefix, desc.name);
         } catch (const std::exception& ex) {
             Logger::Error("{} Exception shutting down {}: {}",
                           kLogPrefix, desc.name, ex.what());

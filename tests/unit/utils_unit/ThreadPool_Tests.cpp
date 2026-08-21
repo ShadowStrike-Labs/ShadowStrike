@@ -717,7 +717,7 @@ TEST_F(ThreadPoolTest, DecreaseThreadCount) {
     // Şimdi azalt
     pool.DecreaseThreadCount(2);  // 4-2=2 thread
 
-    EXPECT_EQ(pool.GetThreadCount(), 2);  // ✅ ŞIMDI GEÇER!
+    EXPECT_EQ(pool.GetThreadCount(), 2);  // ŞIMDI GEÇER!
 }
 
 TEST_F(ThreadPoolTest, DecreaseThreadCountRespectsMinLimit) {

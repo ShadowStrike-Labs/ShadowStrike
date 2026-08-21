@@ -2689,20 +2689,20 @@ StoreError SignatureBuilder::ValidateOutput(
 
     SS_LOG_INFO(L"SignatureBuilder", L"ValidateOutput: ALL VALIDATIONS PASSED");
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ File exists and readable");
+        L"  [OK] File exists and readable");
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ File size valid (%llu bytes)",
+        L"  [OK] File size valid (%llu bytes)",
         static_cast<uint64_t>(fileSize.QuadPart));
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ Header valid (magic, version)");
+        L"  [OK] Header valid (magic, version)");
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ Sections in bounds and non-overlapping");
+        L"  [OK] Sections in bounds and non-overlapping");
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ Statistics reasonable");
+        L"  [OK] Statistics reasonable");
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ SHA-256 checksum verified");
+        L"  [OK] SHA-256 checksum verified");
     SS_LOG_INFO(L"SignatureBuilder",
-        L"  ✓ Database is SAFE FOR PRODUCTION");
+        L"  [OK] Database is SAFE FOR PRODUCTION");
 
     return StoreError{ SignatureStoreError::Success };
 }
@@ -2930,11 +2930,11 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
 
         if (metrics.averageHashLookupNanoseconds > 1000) {
             SS_LOG_WARN(L"SignatureBuilder",
-                L"    ⚠ BELOW TARGET: Hash lookups slower than 1µs target");
+                L"    [WARN] BELOW TARGET: Hash lookups slower than 1µs target");
         }
         else {
             SS_LOG_INFO(L"SignatureBuilder",
-                L"    ✓ MEETS TARGET: Hash lookups < 1µs");
+                L"    [OK] MEETS TARGET: Hash lookups < 1µs");
         }
     }
 
@@ -3033,11 +3033,11 @@ SignatureBuilder::PerformanceMetrics SignatureBuilder::BenchmarkDatabase(
 
         if (metrics.averagePatternScanMicroseconds > 10000) {
             SS_LOG_WARN(L"SignatureBuilder",
-                L"    ⚠ BELOW TARGET: Pattern scanning slower than 10ms target");
+                L"    [WARN] BELOW TARGET: Pattern scanning slower than 10ms target");
         }
         else {
             SS_LOG_INFO(L"SignatureBuilder",
-                L"    ✓ MEETS TARGET: Pattern scanning < 10ms");
+                L"    [OK] MEETS TARGET: Pattern scanning < 10ms");
         }
     }
 

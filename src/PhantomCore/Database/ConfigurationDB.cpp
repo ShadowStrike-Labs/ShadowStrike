@@ -1278,7 +1278,7 @@ namespace ShadowStrike {
             auto utf8Desc = wstringToUtf8(entry.description);
             auto utf8ModifiedBy = wstringToUtf8(SanitizeAuditField(entry.modifiedBy));
 
-            // ✅ CRITICAL FIX: Use UPDATE for existing keys, INSERT for new keys
+            // CRITICAL FIX: Use UPDATE for existing keys, INSERT for new keys
             // This prevents foreign key constraint violation when inserting history
             const char* sql = nullptr;
             if (keyExists) {
@@ -1352,7 +1352,7 @@ namespace ShadowStrike {
                 }
             }
 
-            // ✅ HISTORY INSERT - Now works correctly because UPDATE preserves foreign key
+            // HISTORY INSERT - Now works correctly because UPDATE preserves foreign key
             if (enableVersioning && oldVersion.has_value() && oldValueBlob.has_value()) {
                 auto historyTimestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1374,7 +1374,7 @@ namespace ShadowStrike {
                 )) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Failed to write history for key: %ls - ROLLING BACK!", entry.key.c_str());
                     trans->Rollback(nullptr);
-                    return false;  // ✅ Changed from WARN to ERROR - fail transaction if history fails
+                    return false;  // Changed from WARN to ERROR - fail transaction if history fails
                 }
             }
 

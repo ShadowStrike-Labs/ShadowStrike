@@ -592,7 +592,7 @@ TEST_F(CacheManagerTest, Persistence_WriteAndRead) {
     ASSERT_TRUE(cm.PutStringW(L"persist_key", L"persist_value", 
                               std::chrono::hours(1), true));
     
-    // ✅ FIX: Increase delay for file system operations to complete
+    // FIX: Increase delay for file system operations to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(500));  // Increased from 100ms
     
     // Check if any .cache files exist
@@ -636,7 +636,7 @@ TEST_F(CacheManagerTest, Persistence_NonPersistent) {
                               std::chrono::hours(1), false));
     
     cm.Shutdown();
-    // ✅ FIX: Increase delay for shutdown to complete fully
+    // FIX: Increase delay for shutdown to complete fully
     std::this_thread::sleep_for(std::chrono::milliseconds(500));  // Increased from 200ms
     
     cm.Initialize(testDir);
@@ -689,12 +689,12 @@ TEST_F(CacheManagerTest, LRU_EvictOldest) {
     ASSERT_TRUE(cm.PutStringW(L"key4", L"value4", std::chrono::hours(1)));
     
     auto stats = cm.GetStats();
-    // ✅ FIX: Accept up to maxEntries (eviction might not happen immediately)
+    // FIX: Accept up to maxEntries (eviction might not happen immediately)
     EXPECT_LE(stats.entryCount, 3u);
     
     // key1 should be evicted (or will be soon)
     std::wstring result;
-    // ✅ FIX: Don't strict-assert - eviction timing varies
+    // FIX: Don't strict-assert - eviction timing varies
     bool key1Gone = !cm.GetStringW(L"key1", result);
     bool key4Exists = cm.GetStringW(L"key4", result);
     
@@ -718,10 +718,10 @@ TEST_F(CacheManagerTest, LRU_TouchUpdatesOrder) {
     // Add key4 (should evict key2, not key1)
     ASSERT_TRUE(cm.PutStringW(L"key4", L"value4", std::chrono::hours(1)));
     
-    // ✅ FIX: Check that key1 still exists (it was accessed)
+    // FIX: Check that key1 still exists (it was accessed)
     EXPECT_TRUE(cm.GetStringW(L"key1", result));
     
-    // ✅ FIX: key2 should be evicted (it was oldest unaccessed)
+    // FIX: key2 should be evicted (it was oldest unaccessed)
     // But timing might vary, so just verify entry count is within limit
     auto stats = cm.GetStats();
     EXPECT_LE(stats.entryCount, 3u);
@@ -730,7 +730,7 @@ TEST_F(CacheManagerTest, LRU_TouchUpdatesOrder) {
 TEST_F(CacheManagerTest, LRU_EvictByByteSize) {
     SS_LOG_INFO(L"CacheManager_Tests", L"[LRU_EvictByByteSize] Testing...");
     auto& cm = CacheManager::Instance();
-    cm.Initialize(testDir, 0, 2048, std::chrono::seconds(30)); // ✅ FIX: Increased from 1KB to 2KB for overhead
+    cm.Initialize(testDir, 0, 2048, std::chrono::seconds(30)); // FIX: Increased from 1KB to 2KB for overhead
     
     std::vector<uint8_t> data(300, 0xAA); // 300 bytes each
     
@@ -742,7 +742,7 @@ TEST_F(CacheManagerTest, LRU_EvictByByteSize) {
     ASSERT_TRUE(cm.Put(L"key4", data, std::chrono::hours(1)));
     
     auto stats = cm.GetStats();
-    // ✅ FIX: Check against increased limit with tolerance
+    // FIX: Check against increased limit with tolerance
     EXPECT_LE(stats.totalBytes, 2048u + 512u);  // Allow 512 bytes overhead tolerance
 }
 
@@ -848,7 +848,7 @@ TEST_F(CacheManagerTest, Stats_MaxLimits) {
     cm.Initialize(testDir, 100, 5 * 1024 * 1024, std::chrono::seconds(30));
     
     auto stats = cm.GetStats();
-    // ✅ FIX: Values should match exactly after initialization
+    // FIX: Values should match exactly after initialization
     EXPECT_EQ(stats.maxEntries, 100u);
     EXPECT_EQ(stats.maxBytes, 5u * 1024 * 1024);
 }
@@ -953,7 +953,7 @@ TEST_F(CacheManagerTest, Threading_ConcurrentGets) {
         thread.join();
     }
     
-    // ✅ FIX: Allow for some variance due to thread scheduling
+    // FIX: Allow for some variance due to thread scheduling
     // Expecting at least 95% success rate instead of 100%
     int expected = NUM_THREADS * 100;
     EXPECT_GE(successCount.load(), expected * 95 / 100);  // At least 95%
@@ -1106,7 +1106,7 @@ TEST_F(CacheManagerTest, Security_PathTraversalPrevention) {
 TEST_F(CacheManagerTest, Maintenance_RemovesExpiredEntries) {
     SS_LOG_INFO(L"CacheManager_Tests", L"[Maintenance_RemovesExpiredEntries] Testing...");
     auto& cm = CacheManager::Instance();
-    // ✅ FIX: Reduced maintenance interval to 2 seconds for faster test
+    // FIX: Reduced maintenance interval to 2 seconds for faster test
     cm.Initialize(testDir, 100, 1 * 1024 * 1024, std::chrono::seconds(2));
     
     // Add entries with short TTL
@@ -1120,12 +1120,12 @@ TEST_F(CacheManagerTest, Maintenance_RemovesExpiredEntries) {
     auto stats1 = cm.GetStats();
     EXPECT_EQ(stats1.entryCount, 10u);
     
-    // ✅ FIX: Wait for expiration (1.5s) + maintenance cycles (2s * 3 = 6s) + buffer
+    // FIX: Wait for expiration (1.5s) + maintenance cycles (2s * 3 = 6s) + buffer
     // Total: 8 seconds (reduced from 12s)
     std::this_thread::sleep_for(std::chrono::milliseconds(8000));
     
     auto stats2 = cm.GetStats();
-    // ✅ FIX: Should be 0, but allow tolerance for timing variance
+    // FIX: Should be 0, but allow tolerance for timing variance
     EXPECT_LE(stats2.entryCount, 1u);  // Allow 1 entry to remain due to timing
 }
 
@@ -1160,11 +1160,11 @@ TEST_F(CacheManagerTest, Corruption_InvalidMagic) {
     
     ASSERT_TRUE(cm.PutStringW(L"corrupt_key", L"value", std::chrono::hours(1), true));
     
-    // ✅ FIX: Wait for file write to complete
+    // FIX: Wait for file write to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     cm.Shutdown();
     
-    // ✅ FIX: Increased delay for file handles to be released
+    // FIX: Increased delay for file handles to be released
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));  // Increased from 100ms
     
     // Find and corrupt the cache file
@@ -1172,7 +1172,7 @@ TEST_F(CacheManagerTest, Corruption_InvalidMagic) {
     for (const auto& entry : fs::recursive_directory_iterator(testDir)) {
         if (entry.path().extension() == L".cache") {
             try {
-                // ✅ FIX: Use std::ios::binary | std::ios::in | std::ios::out for proper binary edit
+                // FIX: Use std::ios::binary | std::ios::in | std::ios::out for proper binary edit
                 std::fstream file(entry.path(), std::ios::binary | std::ios::in | std::ios::out);
                 if (file.is_open()) {
                     uint32_t badMagic = 0xDEADBEEF;
@@ -1189,7 +1189,7 @@ TEST_F(CacheManagerTest, Corruption_InvalidMagic) {
     
     ASSERT_TRUE(corrupted) << "Failed to find or corrupt cache file";
     
-    // ✅ FIX: Additional delay before reinitialize
+    // FIX: Additional delay before reinitialize
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     cm.Initialize(testDir);
     

@@ -1124,7 +1124,7 @@ TEST_F(DatabaseManagerTest, BulkInsertPerformance) {
     auto trans = DatabaseManager::Instance().BeginTransaction(Transaction::Type::Immediate, nullptr);
 
     for (int i = 0; i < 1000; ++i) {
-        // ✅ FIX: Use Transaction::ExecuteWithParams instead!
+        // FIX: Use Transaction::ExecuteWithParams instead!
         trans->ExecuteWithParams(
             "INSERT INTO test_table (name, value) VALUES (?, ?)", nullptr,
             std::string("bulk"), i);

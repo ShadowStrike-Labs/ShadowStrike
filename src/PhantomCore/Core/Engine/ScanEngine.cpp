@@ -2715,7 +2715,7 @@ EngineResult ScanEngine::ScanFile(
                             // and are wired via their respective EDR subsystems, not file scan.
                             // Emulation ML model awaits EmulationEngine instruction-trace export.
                             auto ensemble = cortex.EnsembleVerdict(
-                                staticVerdict,           // static model ✅
+                                staticVerdict,           // static model
                                 behavioralVerdict,       // behavioral from emulation API trace
                                 std::nullopt,            // memory (runtime: MemoryScanner)
                                 std::nullopt,            // network (runtime: NetworkSensor)

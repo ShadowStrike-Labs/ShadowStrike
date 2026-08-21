@@ -462,7 +462,7 @@ def _build_report(model_path: str, checks: list[CheckResult]) -> ValidationRepor
     )
     for c in checks:
         level = logging.INFO if c.passed else logging.WARNING
-        logger.log(level, "  [%s] %s: %s", "✓" if c.passed else "✗", c.name, c.message)
+        logger.log(level, "  [%s] %s: %s", "OK" if c.passed else "FAIL", c.name, c.message)
 
     return report
 

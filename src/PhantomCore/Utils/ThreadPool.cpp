@@ -1987,14 +1987,14 @@ std::string ThreadPool::GetHealthReport() const {
     report << "Status: " << (isHealthy ? "HEALTHY" : "UNHEALTHY") << "\n\n";
 
     report << "Checks:\n";
-    report << "  [" << (initialized_.load(std::memory_order_acquire) ? "✓" : "✗") << "] Initialized\n";
-    report << "  [" << (!shutdown_.load(std::memory_order_acquire) ? "✓" : "✗") << "] Not Shutdown\n";
-    report << "  [" << (threadStats_.currentThreadCount.load(std::memory_order_relaxed) >= config_.minThreads ? "✓" : "✗") << "] Minimum Threads\n";
-    report << "  [" << (taskStats_.GetSuccessRate() > 95.0 ? "✓" : "✗") << "] Task Success Rate > 95%\n";
+    report << "  [" << (initialized_.load(std::memory_order_acquire) ? "OK" : "FAIL") << "] Initialized\n";
+    report << "  [" << (!shutdown_.load(std::memory_order_acquire) ? "OK" : "FAIL") << "] Not Shutdown\n";
+    report << "  [" << (threadStats_.currentThreadCount.load(std::memory_order_relaxed) >= config_.minThreads ? "OK" : "FAIL") << "] Minimum Threads\n";
+    report << "  [" << (taskStats_.GetSuccessRate() > 95.0 ? "OK" : "FAIL") << "] Task Success Rate > 95%\n";
 
     if (deadlockDetector_) {
         const bool noDeadlock = !deadlockDetector_->IsDeadlockDetected();
-        report << "  [" << (noDeadlock ? "✓" : "✗") << "] No Deadlock Detected\n";
+        report << "  [" << (noDeadlock ? "OK" : "FAIL") << "] No Deadlock Detected\n";
 
         if (!noDeadlock) {
             auto suspicious = deadlockDetector_->GetSuspiciousThreads();
