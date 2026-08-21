@@ -89,6 +89,7 @@ BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyze
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
+TELEMETRY_COLLECTOR_HPP_PATH = ROOT / "src/PhantomCore/Communication/TelemetryCollector.hpp"
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -2454,16 +2455,23 @@ class SourceContractTests(unittest.TestCase):
 
     def test_an_inference_class_process_block_honours_the_protection_mode(self) -> None:
         # Wiring the reply turned "return Block" from a no-op into real enforcement,
-        # and the decision it enables is the OR of five evasion detectors, any one of
-        # which sets evasionDetected. The file-scan handler already gates a
-        # Suspicious verdict on the configured mode; this handler did not, so a
-        # MONITOR_ONLY endpoint would have had process creations blocked by a control
-        # it had explicitly turned down.
+        # and the decision it enables is the OR of six evasion detectors, any one of
+        # which records a finding. The file-scan handler already gates a Suspicious
+        # verdict on the configured mode; this handler did not, so a MONITOR_ONLY
+        # endpoint would have had process creations blocked by a control it had
+        # explicitly turned down.
+        #
+        # THE CONDITION SPELLING CHANGED AND THE LOCATOR FOLLOWED IT, THE PROPERTY DID
+        # NOT MOVE. The handler used to test a bool `evasionDetected`; it now asks
+        # whether any finding was recorded, because a single shared description string
+        # meant only one detector could ever be named in the alert. Everything this
+        # test pins - a reachable Monitor return, the mode being consulted, the
+        # withheld case not counting as a block, an unconditional alert - is unchanged.
         rtp = read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp")
         source = strip_c_comments(rtp)
 
         gate = re.search(
-            r"if\s*\(\s*evasionDetected\s*\)\s*\{(?P<body>.*?)return\s+"
+            r"if\s*\(\s*!\s*evasionFindings\.empty\(\)\s*\)\s*\{(?P<body>.*?)return\s+"
             r"Communication::KernelVerdict::Monitor\s*;",
             source,
             re.DOTALL,
@@ -2481,6 +2489,36 @@ class SourceContractTests(unittest.TestCase):
             body,
             "an inference-class process block must consult the configured mode, the "
             "same way the file path does for a Suspicious verdict",
+        )
+
+        # THE DECISION MUST DRIVE THE BRANCH, NOT MERELY BE COMPUTED. Hoisting the
+        # mode comparison into a named value so telemetry can report the real outcome
+        # created a failure mode the original form did not have: the value could be
+        # computed, satisfying the assertion above, and then ignored by a branch that
+        # blocks unconditionally.
+        decision = re.search(
+            r"const\s+bool\s+(?P<name>\w+)\s*=\s*[^;]*ProtectionMode::BLOCK_SUSPICIOUS[^;]*;",
+            body,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            decision,
+            "the mode comparison must be captured in a named decision so the "
+            "enforcement outcome is settled once and reported truthfully",
+        )
+        assert decision is not None
+        # BOUNDED: assertRegex prints the entire string it searched, and this body is
+        # thousands of characters. Search first, then assert on a boolean so a failure
+        # names the offender instead of reprinting the handler.
+        driven = re.search(
+            r"if\s*\(\s*" + decision.group("name") + r"\s*\)\s*\{",
+            body,
+        )
+        self.assertTrue(
+            driven is not None,
+            "the branch that returns Block must be driven by the mode-derived "
+            f"decision {decision.group('name')!r}, not by an unconditional test; no "
+            f"`if ({decision.group('name')})` appears in the decision block",
         )
         self.assertIn("processBlocksWithheldByMode", body)
 
@@ -8053,6 +8091,234 @@ class VmTechniqueMitreMappingContractTests(unittest.TestCase):
             r"std::string\s+mitreId",
             "do not store the id alongside the technique - deriving it is what prevents the "
             "two from disagreeing",
+        )
+
+
+class EvasionFanOutReportingContractTests(unittest.TestCase):
+    """The process-creation evasion fan-out must report every detector that fired,
+    must not skip a detector because another already fired, and must not claim an
+    enforcement outcome before that outcome has been decided.
+
+    These are source contracts rather than behavioural tests because reaching this
+    handler needs a loaded kernel driver and a live filter port - the same reason the
+    reply-horizon and fan-out-budget contracts beside them are expressed this way.
+    """
+
+    _EXPECTED_DETECTORS = (
+        "DebuggerEvasionDetector",
+        "VMEvasionDetector",
+        "ProcessEvasionDetector",
+        "TimeBasedEvasionDetector",
+        "NetworkBasedEvasionDetector",
+        "EnvironmentEvasionDetector",
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST: the change deliberately documents the defects it removed,
+        # so the explanatory text names evasionDetected, the hardcoded true and the
+        # dead parameters. A comment-blind scan is guaranteed to false-positive.
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.telemetry_hpp = strip_c_comments(read_source(TELEMETRY_COLLECTOR_HPP_PATH))
+
+    def test_the_environment_detector_is_not_gated_on_another_detector_firing(self) -> None:
+        """Environment analysis must run whether or not something else already fired.
+
+        It was the only one of the six gated on !evasionDetected, so any process that
+        had already tripped the debugger, VM, process, timing or network detector got
+        no environment examination at all - losing T1016, T1082, T1497 and its three
+        sub-techniques on exactly the samples most worth examining.
+        """
+        marker = 'evasionBudgetExceeded("EnvironmentEvasionDetector")'
+        occurrences = self.rtp.count(marker)
+        self.assertEqual(
+            occurrences,
+            1,
+            "expected exactly one environment-detector budget check in the "
+            f"process-notify handler, found {occurrences}",
+        )
+        gate = enclosing_statement(self.rtp, self.rtp.index(marker))
+
+        for forbidden in ("evasionDetected", "evasionFindings.empty()", "evasionFindings.size()"):
+            self.assertNotIn(
+                forbidden,
+                gate,
+                "the environment detector's gate must not depend on whether another "
+                f"detector already fired, but it names {forbidden!r}. Skipping this "
+                "analysis because other evidence exists discards T1016/T1082/T1497 "
+                "coverage on the highest-risk processes.",
+            )
+
+        # ANTI-WEAKENING: the budget is this path's sanctioned way to shed work under
+        # time pressure and must survive. Removing it would be a different defect.
+        self.assertIn(
+            "evasionBudgetExceeded",
+            gate,
+            "the environment detector must stay inside the process-notify budget",
+        )
+
+        # ANTI-VACUITY: the block must still perform the analysis. Counted rather than
+        # asserted with assertIn, which would dump the whole 400 KB source on failure.
+        analyses = self.rtp.count("m_environmentDetector->AnalyzeProcess(")
+        self.assertGreaterEqual(
+            analyses,
+            1,
+            "the environment analysis call itself must still be present; found "
+            f"{analyses} call sites, so this test would pass vacuously",
+        )
+
+    def test_every_evasion_detector_records_through_one_mechanism(self) -> None:
+        """All six detectors must append a finding, not write a shared string.
+
+        Six blocks previously wrote one std::wstring under three different rules -
+        unconditional overwrite, assign-only-if-nothing-fired, and whole-block skip -
+        so which detector the SOC alert named depended on block order crossed with
+        per-block guard style, and every other finding was dropped from the alert.
+        """
+        sites = self.rtp.count("noteEvasion(")
+        self.assertEqual(
+            sites,
+            len(self._EXPECTED_DETECTORS),
+            f"expected {len(self._EXPECTED_DETECTORS)} noteEvasion call sites, one "
+            f"per evasion detector, found {sites}",
+        )
+
+        missing = [
+            name
+            for name in self._EXPECTED_DETECTORS
+            if f'noteEvasion("{name}"' not in self.rtp
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "every evasion detector must record its finding through noteEvasion so "
+            "the alert can name all of them; these do not: " + ", ".join(missing),
+        )
+
+        # No block may go back to assigning the shared description directly - that is
+        # what made the report depend on ordering.
+        direct = re.findall(r"detectionSource\s*=\s*std::format", self.rtp)
+        self.assertEqual(
+            direct,
+            [],
+            "a detector block assigned the shared description string directly "
+            f"({len(direct)} site(s)); findings must be appended instead so no "
+            "detector can overwrite another's evidence",
+        )
+
+    def test_the_findings_record_is_append_only(self) -> None:
+        """The budget's correctness argument depends on findings never being removed.
+
+        The comment above the budget states that a detector can only ADD evidence, so
+        skipping one can never manufacture a wrong Block. That holds only while the
+        container is append-only.
+        """
+        for mutator in (".clear()", ".erase(", ".pop_back(", ".resize("):
+            self.assertNotIn(
+                "evasionFindings" + mutator,
+                self.rtp,
+                f"evasionFindings{mutator} would break the append-only property the "
+                "budget's safety argument relies on",
+            )
+
+    def test_evasion_telemetry_reports_the_outcome_it_actually_had(self) -> None:
+        """Telemetry must carry the real enforcement outcome, not an assumed one.
+
+        Six records were emitted inside their detector blocks with blocked hardcoded
+        true, about fifty lines before the enforcement decision existed - and that
+        decision is gated on a protection mode whose default, BLOCK_KNOWN, is below
+        BLOCK_SUSPICIOUS. So on a default endpoint nothing was blocked and every
+        record still told the SOC actionTaken="Blocked".
+        """
+        calls = re.findall(r"EmitEvasionTelemetry\(([^;]*?)\)\s*;", self.rtp, re.S)
+        self.assertEqual(
+            len(calls),
+            1,
+            f"expected exactly one EmitEvasionTelemetry call site, found {len(calls)}. "
+            "Per-detector emission is what made the outcome unknowable at the point "
+            "of reporting.",
+        )
+        self.assertIn(
+            "willBlock",
+            calls[0],
+            "the telemetry call must pass the decided outcome, not a literal: "
+            f"arguments were {calls[0].strip()!r}",
+        )
+
+        literal_true = re.findall(r"EmitEvasionTelemetry\([^;]*?,\s*true\s*\)", self.rtp, re.S)
+        self.assertEqual(
+            literal_true,
+            [],
+            "EmitEvasionTelemetry must never be handed a literal true for the "
+            "outcome - that is the over-claimed-block defect this guard exists for",
+        )
+
+        # ORDERING, NOT MERE PRESENCE. A test that only checks willBlock appears
+        # cannot tell whether it was computed before the record was emitted.
+        decided = self.rtp.index("const bool willBlock")
+        emitted = self.rtp.index("EmitEvasionTelemetry(finding")
+        self.assertLess(
+            decided,
+            emitted,
+            "the enforcement outcome must be decided BEFORE telemetry reports it "
+            f"(willBlock at {decided}, emission at {emitted})",
+        )
+        self.assertIn(
+            "ProtectionMode::BLOCK_SUSPICIOUS",
+            enclosing_statement(self.rtp, decided),
+            "the outcome must be derived from the configured protection mode",
+        )
+
+    def test_evasion_telemetry_does_not_accept_data_it_cannot_record(self) -> None:
+        """The function must not promise attribution the telemetry struct cannot hold.
+
+        It used to take processId, imagePath, detectionSource and techniqueCount and
+        use none of them, because DetectionEventData has no field for any of them.
+        Four dead parameters read as attribution that works.
+
+        THIS TEST IS ALSO THE FORCING FUNCTION FOR THE GAP: if DetectionEventData ever
+        gains a process or path field, the second half fails and whoever added it is
+        told to wire evasion attribution through rather than leave it unused.
+        """
+        body = extract_c_function(self.rtp, "EmitEvasionTelemetry")
+        signature = body[: body.index("{")]
+        for dead in ("processId", "imagePath", "detectionSource", "techniqueCount"):
+            self.assertNotIn(
+                dead,
+                signature,
+                f"EmitEvasionTelemetry accepts {dead!r} but DetectionEventData has no "
+                "field it can be assigned to, so the parameter is a false promise of "
+                "attribution",
+            )
+
+        # extract_c_function is for functions; brace-match the struct directly.
+        opening = self.telemetry_hpp.index("{", self.telemetry_hpp.index("struct DetectionEventData"))
+        depth = 0
+        closing = opening
+        for index in range(opening, len(self.telemetry_hpp)):
+            if self.telemetry_hpp[index] == "{":
+                depth += 1
+            elif self.telemetry_hpp[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    closing = index
+                    break
+        self.assertGreater(
+            closing, opening, "could not brace-match struct DetectionEventData"
+        )
+        struct = self.telemetry_hpp[opening : closing + 1]
+        carriers = [
+            field
+            for field in ("processId", "ProcessId", "filePath", "imagePath", "processName")
+            if re.search(r"(?<![A-Za-z0-9_])" + field + r"(?![A-Za-z0-9_])", struct)
+        ]
+        self.assertEqual(
+            carriers,
+            [],
+            "DetectionEventData has gained " + ", ".join(carriers) + ", so evasion "
+            "telemetry can now identify its subject - wire it through "
+            "EmitEvasionTelemetry and update this contract, rather than leaving the "
+            "new field unpopulated",
         )
 
 

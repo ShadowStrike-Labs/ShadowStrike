@@ -254,13 +254,23 @@ namespace {
     // TELEMETRY & ALERT EMISSION HELPERS
     // =========================================================================
 
+    // Emit one telemetry record for one detector that fired.
+    //
+    // THE RECORD CARRIES NO PROCESS OR IMAGE ATTRIBUTION, AND THAT IS A LIMIT OF
+    // DetectionEventData RATHER THAN AN OMISSION HERE. This function used to accept
+    // processId, imagePath, detectionSource and techniqueCount and used NONE of
+    // them - measured, each occurred exactly once in the whole function, in the
+    // signature. DetectionEventData has no field any of them could be assigned to:
+    // threatName, threatType, fileHash, fileSize, detectionMethod, actionTaken,
+    // detectionTime, signatureVersion, fpProbability, and its ToJson emits exactly
+    // those nine. So a consumer of evasion telemetry cannot tell which process or
+    // image a detection concerned. Four dead parameters read as attribution that
+    // works, so they are gone rather than left as a false promise; the gap is
+    // recorded here because closing it means extending a telemetry contract shared
+    // by every detection in this product, which is wider than this handler.
     void EmitEvasionTelemetry(
-        uint32_t processId,
-        const std::wstring& imagePath,
-        const std::wstring& detectionSource,
         const std::string& detectorName,
         float evasionScore,
-        uint32_t techniqueCount,
         bool blocked)
     {
         try {
@@ -4093,11 +4103,11 @@ public:
         // It also means a detector added later inherits the bound instead of having
         // to remember to implement one.
         //
-        // WHY SKIPPING IS SAFE FOR CORRECTNESS: evasionDetected is an OR-accumulator
-        // and the only consumer is a single `if (evasionDetected)` below. Each
-        // detector can therefore only ADD evidence; none is a required input and
-        // none can be skipped into a wrong Block. Skipping loses a chance to detect,
-        // it never manufactures a detection.
+        // WHY SKIPPING IS SAFE FOR CORRECTNESS: the detectors append to a findings
+        // list that is never shortened, and the only consumer asks a single
+        // question - is it empty - below. Each detector can therefore only ADD
+        // evidence; none is a required input and none can be skipped into a wrong
+        // Block. Skipping loses a chance to detect, it never manufactures one.
         //
         // AND WHY IT IS BETTER THAN NO BUDGET: unbounded, five slow detectors run
         // past the driver's reply timeout, at which point the kernel gives up and
@@ -4223,8 +4233,37 @@ public:
         // this branch, because the tail after it needs the horizon too. Only this
         // suite is creation-gated; process exit skips it entirely.
         if (req.isCreation) {
-            bool evasionDetected = false;
-            std::wstring detectionSource;
+            // EVERY DETECTOR THAT FIRES IS RECORDED, NOT JUST ONE ARBITRARY WINNER.
+            //
+            // This was a single std::wstring written by six blocks under THREE
+            // different rules: three overwrote it unconditionally (last writer
+            // won), two assigned only when nothing had fired yet (first writer
+            // won), and the sixth was skipped entirely. So which detector the SOC
+            // alert named depended on block order crossed with per-block guard
+            // style, and every other firing detector's evidence was absent from
+            // the alert. A sample that trips anti-debug AND anti-VM - which this
+            // file's own comment calls the common APT combination - was reported
+            // as one or the other depending on which guard style happened to win.
+            //
+            // A vector cannot express that inconsistency: each block appends, so
+            // the record is order-independent in content and every finding
+            // survives. Findings are only ever appended and never removed, so the
+            // OR-accumulator property the budget comment above relies on still
+            // holds exactly - a detector can only ADD evidence.
+            struct EvasionFinding {
+                const char* detector;   // static literal - no allocation, no lifetime question
+                std::wstring detail;    // human-readable, per-detector
+                float score;
+                uint32_t techniqueCount;
+            };
+            std::vector<EvasionFinding> evasionFindings;
+            const auto noteEvasion = [&evasionFindings](const char* detector,
+                                                        std::wstring detail,
+                                                        float score,
+                                                        uint32_t techniqueCount) {
+                evasionFindings.push_back(
+                    EvasionFinding{ detector, std::move(detail), score, techniqueCount });
+            };
 
             // 1. Debugger Evasion — pass kernel context for APT-grade detection
             if (m_debuggerDetector) {
@@ -4243,11 +4282,13 @@ public:
 
                 auto result = m_debuggerDetector->AnalyzeProcess(req.processId, dedConfig);
                 if (result.isEvasive) {
-                    evasionDetected = true;
-                    detectionSource = std::format(L"Debugger Evasion (score={:.1f}, techniques={}, severity={})",
-                        result.evasionScore,
-                        result.totalDetections,
-                        static_cast<int>(result.maxSeverity));
+                    noteEvasion("DebuggerEvasionDetector",
+                        std::format(L"Debugger Evasion (score={:.1f}, techniques={}, severity={})",
+                            result.evasionScore,
+                            result.totalDetections,
+                            static_cast<int>(result.maxSeverity)),
+                        static_cast<float>(result.evasionScore),
+                        result.totalDetections);
 
                     // Log technique details for SOC/SIEM correlation
                     for (const auto& tech : result.detectedTechniques) {
@@ -4257,9 +4298,6 @@ public:
                         }
                     }
 
-                    EmitEvasionTelemetry(req.processId, imagePath, detectionSource,
-                        "DebuggerEvasionDetector", static_cast<float>(result.evasionScore),
-                        result.totalDetections, true);
                 }
             }
 
@@ -4284,13 +4322,13 @@ public:
                 if (!evasionBudgetExceeded("VMEvasionDetector") &&
                     m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
                     if (vmResult.hasAntiVMBehavior) {
-                        if (!evasionDetected) {
-                            evasionDetected = true;
-                            detectionSource = std::format(
-                                L"VM Evasion [score={:.1f} techniques={}]",
+                        noteEvasion("VMEvasionDetector",
+                            std::format(L"VM Evasion [score={:.1f} techniques={}]",
                                 vmResult.evasionScore,
-                                vmResult.GetTechniqueCount());
-                        }
+                                vmResult.GetTechniqueCount()),
+                            static_cast<float>(vmResult.evasionScore),
+                            static_cast<uint32_t>(std::min(vmResult.GetTechniqueCount(),
+                                static_cast<size_t>(std::numeric_limits<uint32_t>::max()))));
 
                         // Rich telemetry for SOC/SIEM: per-technique logging (always runs)
                         for (const auto& tech : vmResult.techniqueDetails) {
@@ -4318,10 +4356,6 @@ public:
                         if (techniqueCount > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
                             Utils::Logger::Warn("RealTimeProtection: VM evasion technique count overflow: {}", techniqueCount);
                         }
-                        EmitEvasionTelemetry(req.processId, imagePath,
-                            std::format(L"VM Evasion [score={:.1f}]", vmResult.evasionScore),
-                            "VMEvasionDetector", static_cast<float>(vmResult.evasionScore),
-                            static_cast<uint32_t>(std::min(techniqueCount, static_cast<size_t>(std::numeric_limits<uint32_t>::max()))), true);
                     }
                 }
             }
@@ -4344,11 +4378,12 @@ public:
 
                 auto result = m_processDetector->AnalyzeProcess(req.processId, pedConfig);
                 if (result.isEvasive) {
-                    evasionDetected = true;
-                    detectionSource = std::format(
-                        L"Process Evasion [score={:.1f} severity={} detections={}]",
-                        result.evasionScore,
-                        static_cast<int>(result.maxSeverity),
+                    noteEvasion("ProcessEvasionDetector",
+                        std::format(L"Process Evasion [score={:.1f} severity={} detections={}]",
+                            result.evasionScore,
+                            static_cast<int>(result.maxSeverity),
+                            result.totalDetections),
+                        static_cast<float>(result.evasionScore),
                         result.totalDetections);
 
                     // Rich telemetry for SOC/SIEM: per-technique logging
@@ -4371,9 +4406,6 @@ public:
                             result.totalDetections, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)));
                     }
 
-                    EmitEvasionTelemetry(req.processId, imagePath, detectionSource,
-                        "ProcessEvasionDetector", static_cast<float>(result.evasionScore),
-                        result.totalDetections, true);
                 }
             }
 
@@ -4384,12 +4416,14 @@ public:
                     auto result = ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance()
                         .AnalyzeProcess(req.processId);
                     if (result.isEvasive) {
-                        evasionDetected = true;
-                        detectionSource = std::format(
-                            L"Time-Based Evasion [threat={:.1f} severity={} findings={}]",
-                            result.threatScore,
-                            static_cast<int>(result.severity),
-                            result.findings.size());
+                        noteEvasion("TimeBasedEvasionDetector",
+                            std::format(L"Time-Based Evasion [threat={:.1f} severity={} findings={}]",
+                                result.threatScore,
+                                static_cast<int>(result.severity),
+                                result.findings.size()),
+                            static_cast<float>(result.threatScore),
+                            static_cast<uint32_t>(std::min(result.findings.size(),
+                                static_cast<size_t>(std::numeric_limits<uint32_t>::max()))));
 
                         // Rich telemetry for SOC/SIEM: per-finding logging
                         for (const auto& finding : result.findings) {
@@ -4412,9 +4446,6 @@ public:
                                 result.findings.size(), Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)));
                         }
 
-                        EmitEvasionTelemetry(req.processId, imagePath, detectionSource,
-                            "TimeBasedEvasionDetector", static_cast<float>(result.threatScore),
-                            static_cast<uint32_t>(result.findings.size()), true);
                     }
                 } catch (...) {}
             }
@@ -4438,14 +4469,13 @@ public:
                     auto result = m_networkDetector->AnalyzeProcess(req.processId, nbedConfig);
 
                     if (result.isEvasive) {
-                        if (!evasionDetected) {
-                            evasionDetected = true;
-                            detectionSource = std::format(
-                                L"Network Evasion (score={:.1f}, techniques={}, severity={})",
+                        noteEvasion("NetworkBasedEvasionDetector",
+                            std::format(L"Network Evasion (score={:.1f}, techniques={}, severity={})",
                                 result.evasionScore,
                                 result.totalDetections,
-                                static_cast<int>(result.maxSeverity));
-                        }
+                                static_cast<int>(result.maxSeverity)),
+                            static_cast<float>(result.evasionScore),
+                            result.totalDetections);
 
                         for (const auto& tech : result.detectedTechniques) {
                             if (tech.severity >= ShadowStrike::AntiEvasion::NetworkEvasionSeverity::High) {
@@ -4456,10 +4486,7 @@ public:
                             }
                         }
 
-                        EmitEvasionTelemetry(req.processId, imagePath,
-                            std::format(L"Network Evasion [score={:.1f}]", result.evasionScore),
-                            "NetworkBasedEvasionDetector", static_cast<float>(result.evasionScore),
-                            result.totalDetections, true);
+
                     }
                 } catch (const std::exception& ex) {
                     Utils::Logger::Error("RealTimeProtection: NetworkBasedEvasionDetector exception for PID {}: {}",
@@ -4471,7 +4498,27 @@ public:
             }
 
             // 6. Environment Evasion — pass kernel context for APT-grade detection
-            if (!evasionDetected && m_environmentDetector &&
+            // THE ANALYSIS RUNS WHETHER OR NOT SOMETHING ELSE ALREADY FIRED.
+            //
+            // This block alone was gated on !evasionDetected, so environment
+            // analysis was SKIPPED on exactly the samples most worth analysing:
+            // any process that had already tripped the debugger, VM, process,
+            // timing or network detector got no environment examination at all -
+            // no detections, no per-technique SOC logging, no telemetry. This
+            // module owns T1016, T1082, T1497 and its three sub-techniques, so
+            // that evidence was discarded for the highest-risk population.
+            //
+            // It cannot be read as a cost measure either: the budget check below
+            // is this path's sanctioned way to shed work under time pressure and
+            // is retained unchanged, and three sibling blocks carry explicit
+            // comments saying they always run so telemetry stays complete.
+            //
+            // NO VERDICT CAN CHANGE. Findings are only ever appended, and the
+            // single consumer tests whether any exist. Reaching this block with a
+            // finding already recorded means the consumer's answer is already
+            // settled, so an additional finding cannot alter it - only enrich the
+            // alert, the logs and the telemetry.
+            if (m_environmentDetector &&
                 !evasionBudgetExceeded("EnvironmentEvasionDetector")) {
                 ShadowStrike::AntiEvasion::EnvironmentAnalysisConfig eedConfig;
 
@@ -4486,11 +4533,13 @@ public:
 
                 auto result = m_environmentDetector->AnalyzeProcess(req.processId, eedConfig);
                 if (result.isEvasive) {
-                    evasionDetected = true;
-                    detectionSource = std::format(L"Environment Evasion (score={:.1f}, techniques={}, severity={})",
-                        result.evasionScore,
-                        result.totalDetections,
-                        static_cast<int>(result.maxSeverity));
+                    noteEvasion("EnvironmentEvasionDetector",
+                        std::format(L"Environment Evasion (score={:.1f}, techniques={}, severity={})",
+                            result.evasionScore,
+                            result.totalDetections,
+                            static_cast<int>(result.maxSeverity)),
+                        static_cast<float>(result.evasionScore),
+                        result.totalDetections);
 
                     for (const auto& tech : result.detectedTechniques) {
                         if (tech.severity >= ShadowStrike::AntiEvasion::EnvironmentEvasionSeverity::High) {
@@ -4499,21 +4548,60 @@ public:
                         }
                     }
 
-                    EmitEvasionTelemetry(req.processId, imagePath, detectionSource,
-                        "EnvironmentEvasionDetector", static_cast<float>(result.evasionScore),
-                        result.totalDetections, true);
                 }
             }
 
-            if (evasionDetected) {
-                Utils::Logger::Warn("RealTimeProtection: Evasion detected in process creation: {} (PID: {}, Source: {})", 
-                    Utils::StringUtils::ToNarrow(imagePath), req.processId, Utils::StringUtils::ToNarrow(detectionSource));
+            if (!evasionFindings.empty()) {
+                // Join every finding. BOUNDED BY CONSTRUCTION, not by a guard: all
+                // six detail strings are std::format over numbers only - scores,
+                // counts and severities - with no path or technique text, so six
+                // findings cannot exceed a few hundred characters. A cap here would
+                // be a guard with no reachable trigger.
+                std::wstring detectionSource;
+                std::string detectorList;
+                for (const auto& finding : evasionFindings) {
+                    if (!detectionSource.empty()) {
+                        detectionSource += L"; ";
+                    }
+                    detectionSource += finding.detail;
+                    if (!detectorList.empty()) {
+                        detectorList += "+";
+                    }
+                    detectorList += finding.detector;
+                }
+
+                // THE ENFORCEMENT DECISION IS TAKEN BEFORE ANYTHING REPORTS AN
+                // OUTCOME. That ordering is the fix for a false claim, not a
+                // refactor: every one of the six telemetry records was emitted
+                // inside its own detector block, roughly fifty lines above this
+                // point, with blocked hardcoded true - while the decision below is
+                // gated on a protection mode whose default, BLOCK_KNOWN, is BELOW
+                // BLOCK_SUSPICIOUS. So on a default endpoint nothing was blocked
+                // and every evasion telemetry record still reported
+                // actionTaken="Blocked" to the SOC.
+                const bool willBlock =
+                    m_mode.load(std::memory_order_acquire) >= ProtectionMode::BLOCK_SUSPICIOUS;
+
+                Utils::Logger::Warn("RealTimeProtection: Evasion detected in process creation: {} "
+                    "(PID: {}, Detectors: {}, Source: {})",
+                    Utils::StringUtils::ToNarrow(imagePath), req.processId,
+                    detectorList, Utils::StringUtils::ToNarrow(detectionSource));
+
                 // THE DETECTION IS REPORTED EITHER WAY. Only the enforcement below
                 // is conditional, and it is conditional on a control this product
                 // already ships and documents - not on anything invented here.
+                //
+                // The alert now names the DETECTORS. It used to be handed the first
+                // eighty characters of the source string as its "detector name",
+                // which truncated mid-word and then printed the same text twice, as
+                // both Detector and Source.
                 EmitEvasionAlert(req.processId, imagePath, detectionSource,
-                    Utils::StringUtils::ToNarrow(detectionSource.substr(0, 80)),
+                    detectorList,
                     Communication::AlertSeverity::High);
+
+                for (const auto& finding : evasionFindings) {
+                    EmitEvasionTelemetry(finding.detector, finding.score, willBlock);
+                }
 
                 // HONOUR THE CONFIGURED PROTECTION MODE, WHICH THIS PATH IGNORED.
                 //
@@ -4527,9 +4615,9 @@ public:
                 // WHY THAT MATTERS NOW RATHER THAN BEFORE: until the reply was
                 // wired, returning Block here did nothing at all, so the omission
                 // was invisible. Wiring it turns this into real enforcement, and
-                // this particular decision is the OR of five evasion detectors -
-                // debugger, VM, process, network and environment - any single one
-                // of which sets evasionDetected. That is INFERENCE, a score with no
+                // this particular decision is the OR of six evasion detectors -
+                // debugger, VM, process, timing, network and environment - any
+                // single one of which records a finding. That is INFERENCE, with no
                 // named referent, which is the same evidence class the remediation
                 // guard already refuses to let take a destructive action against a
                 // signed OS binary. It is also completely unmeasured on this path:
@@ -4546,7 +4634,7 @@ public:
                 // the kernel records. An IDENTIFICATION - the ScanEngine Infected
                 // result further down - still blocks under the default mode, which
                 // is the case where the evidence names a specific known-bad thing.
-                if (m_mode.load(std::memory_order_acquire) >= ProtectionMode::BLOCK_SUSPICIOUS) {
+                if (willBlock) {
                     m_stats.processesBlocked++;
                     Utils::Logger::Warn("RealTimeProtection: returning BLOCK for process creation: "
                         "{} (PID: {}, Source: {})",
