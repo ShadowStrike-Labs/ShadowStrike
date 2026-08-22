@@ -2179,159 +2179,67 @@ namespace ShadowStrike {
             [[nodiscard]] SandboxDetectorConfig GetConfig() const;
 
             // =========================================================================
-            // System-Wide Behavioral Scan
-            // =========================================================================
-
-            /**
-             * @brief Scans all running processes for anti-sandbox evasion behavior.
-             *
-             * Phase 1: Collects host context (hardware, timing, artifacts) for
-             *   behavioral score CALIBRATION — not as a detection source.
-             * Phase 2: Analyzes each process for embedded sandbox detection
-             *   imports, strings, and code patterns (the primary detection).
-             *
-             * @return Complete analysis result with per-process behavioral findings.
-             * @note May take several seconds depending on configuration.
-             */
-            [[nodiscard]] SandboxEvasionResult ScanSystem();
-
-            /**
-             * @brief Async version of ScanSystem().
-             * @param callback Callback invoked when scan completes.
-             * @return true if scan started successfully.
-             */
-            [[nodiscard]] bool ScanSystemAsync(std::function<void(SandboxEvasionResult)> callback);
-
-            /**
-             * @brief Quick scan with minimal checks (artifact-based, NOT behavioral).
-             * @return true if sandbox likely, false otherwise.
-             * @note Context query only — use ScanSystem() for full behavioral scan.
-             */
-            [[nodiscard]] bool QuickScan();
-
-            // =========================================================================
-            // HOST CONTEXT COLLECTION (for score calibration — NOT detection)
+            // THE SYSTEM-WIDE HOST SCAN USED TO LIVE HERE. IT IS GONE ON PURPOSE.
             // =========================================================================
             //
-            // These methods collect host environment context to CALIBRATE
-            // behavioral per-process scores. They are NOT detection sources.
+            // Removed: ScanSystem, ScanSystemAsync, QuickScan, AnalyzeHardware,
+            // AnalyzeWearAndTear, AnalyzeEnvironment, ScanArtifacts, the human-interaction
+            // probes, the eleven per-aspect Check* helpers, the probability and product
+            // identification scorers, the host indicator plumbing and the result cache and
+            // callback machinery - about 2,350 lines of implementation, none of which had
+            // any caller left once the startup context log was removed.
             //
-            // On a sandbox host: anti-sandbox probing → LOWER confidence
-            // On a production host: anti-sandbox probing → HIGHER confidence
+            // WHAT THEY ANSWERED, AND WHY A SECURITY PRODUCT MUST NOT ASK IT. Every one of
+            // them examined THIS MACHINE to decide whether THIS MACHINE is a sandbox or an
+            // analysis VM. That is a question a malware sample asks in order to hide. An
+            // endpoint protection product has the opposite obligation: it must behave
+            // identically on a virtual machine and on bare metal, because a large share of
+            // the endpoints it protects are virtual - cloud instances, VDI, test rigs.
+            //
+            // THE CALIBRATION INTENT THAT USED TO BE DOCUMENTED HERE WAS RIGHT, AND IT IS
+            // DELIBERATELY PRESERVED. The banner these lines replace read:
+            //
+            //     HOST CONTEXT COLLECTION (for score calibration - NOT detection)
+            //     On a sandbox host:    anti-sandbox probing -> LOWER confidence
+            //     On a production host: anti-sandbox probing -> HIGHER confidence
+            //
+            // That rule is sound and it is the right shape for reducing false positives:
+            // the same probing behaviour genuinely is weaker evidence on a virtualised host,
+            // where hypervisor-aware licensing checks, VM guest tools and management agents
+            // legitimately probe for the same artifacts. MEASURED, HOWEVER: the rule was
+            // never wired. Nothing consumed AnalyzeHardware or AnalyzeEnvironment except a
+            // startup log line, so the calibration existed only as this comment.
+            //
+            // AND THE INPUT IT PROPOSED WOULD HAVE MADE DETECTION WORSE, NOT BETTER.
+            // isSandboxLike was derived from screen resolution, system uptime, installed RAM,
+            // recent-document count and mouse-movement entropy. An ordinary corporate VDI
+            // desktop, a freshly booted cloud instance and a headless server all score TRUE
+            // on those. Feeding that into the rule above LOWERS detection confidence on
+            // precisely the endpoints enterprises deploy most, which converts a false
+            // positive problem into a false NEGATIVE problem on the majority of the fleet.
+            //
+            // SO THE INTENT MOVES AND THE INPUT DOES NOT. The same rule belongs on inputs
+            // that are measured rather than inferred:
+            //
+            //   TimeBasedEvasionDetector::GetHostTimingProfile - hypervisorPresent comes
+            //       from a single CPUID leaf (0x40000000), and the cycle costs are real
+            //       measurements in the SAME UNIT as a target RDTSC delta, so they can form
+            //       a baseline instead of a guess.
+            //   EnvironmentEvasionDetector::GetHostProcessorFacts - CPU feature bits, which
+            //       decide whether a target instruction sequence is meaningful at all.
+            //
+            // A host measurement may calibrate a target measurement only when the two share
+            // a unit, or when the host fact is exact rather than inferred. A composite
+            // "sandbox likeness" score satisfies neither test.
             // =========================================================================
 
-            /**
-             * @brief Collect host hardware context for behavioral score calibration.
-             * @return Hardware analysis results.
-             * @note Context for calibration, not a detection source.
-             */
-            [[nodiscard]] HardwareProfile AnalyzeHardware();
-
-            /**
-             * @brief Collect system wear/tear context for behavioral score calibration.
-             * @return Wear and tear analysis results.
-             * @note Context for calibration, not a detection source.
-             */
-            [[nodiscard]] WearAndTearAnalysis AnalyzeWearAndTear();
-
-            /**
-             * @brief Collect environment context for behavioral score calibration.
-             * @return Environment analysis results.
-             * @note Context for calibration, not a detection source.
-             */
-            [[nodiscard]] EnvironmentAnalysis AnalyzeEnvironment();
-
-            /**
-             * @brief Scan for sandbox artifacts (context enrichment).
-             * @return Artifact analysis results.
-             * @note Context for calibration, not a detection source.
-             */
-            [[nodiscard]] ArtifactAnalysis ScanArtifacts();
-
-            /**
-             * @brief Monitor user input to verify human presence (context).
-             * @param monitoringDurationMs Duration to monitor (milliseconds).
-             * @return true if human interaction pattern is detected.
-             * @note Context for calibration, not a detection source.
-             */
-            [[nodiscard]] bool VerifyHumanInteraction(
-                uint32_t monitoringDurationMs = SandboxConstants::DEFAULT_INTERACTION_MONITOR_MS
-            );
-
-            /**
-             * @brief Detailed human interaction analysis (context).
-             * @param monitoringDurationMs Duration to monitor.
-             * @return Detailed interaction analysis results.
-             * @note Context for calibration, not a detection source.
-             */
-            [[nodiscard]] HumanInteractionAnalysis AnalyzeHumanInteraction(
-                uint32_t monitoringDurationMs = SandboxConstants::DEFAULT_INTERACTION_MONITOR_MS
-            );
+            // TYPE A of this module is therefore retired. What remains below is TYPE B:
+            // the per-process analysis that examines a SUPPLIED target, which is detection,
+            // and is the only half of this module that reaches a verdict. It is fed from
+            // RealTimeProtection::AnalyzeDeferredProcessForSandboxEvasion (ad218385).
 
             // =========================================================================
-            // Specific Checks
-            // =========================================================================
-
-            /**
-             * @brief Check if specific sandbox product is detected.
-             * @param product Sandbox product to check for.
-             * @return true if product is detected.
-             */
-            [[nodiscard]] bool IsSandboxProductDetected(SandboxProduct product);
-
-            /**
-             * @brief Get system uptime.
-             * @return System uptime in milliseconds.
-             */
-            [[nodiscard]] uint64_t GetSystemUptime();
-
-            /**
-             * @brief Get screen resolution.
-             * @return Pair of (width, height) in pixels.
-             */
-            [[nodiscard]] std::pair<uint32_t, uint32_t> GetScreenResolution();
-
-            /**
-             * @brief Check for specific sandbox DLL.
-             * @param dllName DLL name to check.
-             * @return true if DLL is loaded.
-             */
-            [[nodiscard]] bool IsSandboxDLLLoaded(std::wstring_view dllName);
-
-            /**
-             * @brief Check for specific sandbox process.
-             * @param processName Process name to check.
-             * @return true if process is running.
-             */
-            [[nodiscard]] bool IsSandboxProcessRunning(std::wstring_view processName);
-
-            /**
-             * @brief Check for specific mutex.
-             * @param mutexName Mutex name to check.
-             * @return true if mutex exists.
-             */
-            [[nodiscard]] bool DoesMutexExist(std::wstring_view mutexName);
-
-            // =========================================================================
-            // Callbacks
-            // =========================================================================
-
-            /**
-             * @brief Register callback for sandbox detection.
-             * @param callback Callback function.
-             * @return Registration ID.
-             */
-            [[nodiscard]] uint64_t RegisterCallback(SandboxDetectionCallback callback);
-
-            /**
-             * @brief Unregister callback.
-             * @param callbackId ID returned by RegisterCallback.
-             * @return true if callback was found and removed.
-             */
-            bool UnregisterCallback(uint64_t callbackId);
-
-            // =========================================================================
-            // Statistics & Cache
+            // Statistics
             // =========================================================================
 
             /**
@@ -2344,21 +2252,6 @@ namespace ShadowStrike {
              */
             void ResetStats();
 
-            /**
-             * @brief Get cached result (if available).
-             * @return Cached result or nullopt.
-             */
-            [[nodiscard]] std::optional<SandboxEvasionResult> GetCachedResult() const;
-
-            /**
-             * @brief Clear result cache.
-             */
-            void ClearCache();
-
-            /**
-             * @brief Get current hardware profile (cached).
-             */
-            [[nodiscard]] std::optional<HardwareProfile> GetHardwareProfile() const;
 
             // =========================================================================
             // TYPE B: Per-Process Sandbox Evasion Analysis
@@ -2466,115 +2359,9 @@ namespace ShadowStrike {
             ~SandboxEvasionDetector();
 
             // =========================================================================
-            // Internal Check Methods
+            // Internal Methods (Target Process Analysis)
             // =========================================================================
 
-            /**
-             * @brief Check hardware specifications.
-             */
-            void CheckHardwareSpecs(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check system uptime.
-             */
-            void CheckUptime(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check for sandbox DLLs in loaded modules.
-             */
-            void CheckLoadedModules(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check system wear and tear indicators.
-             */
-            void CheckSystemWearAndTear(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check for known sandbox named objects.
-             */
-            void CheckNamedObjects(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check screen resolution and display settings.
-             */
-            void CheckScreenResolution(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check running processes for sandbox indicators.
-             * @param result Result to populate.
-             * @param artifacts Pre-scanned artifacts (avoids redundant ScanArtifacts calls).
-             */
-            void CheckProcesses(SandboxEvasionResult& result, const ArtifactAnalysis& artifacts);
-
-            /**
-             * @brief Check services for sandbox indicators.
-             */
-            void CheckServices(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check registry for sandbox artifacts.
-             */
-            void CheckRegistry(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check file system for sandbox artifacts.
-             * @param result Result to populate.
-             * @param artifacts Pre-scanned artifacts (avoids redundant ScanArtifacts calls).
-             */
-            void CheckFileSystem(SandboxEvasionResult& result, const ArtifactAnalysis& artifacts);
-
-            /**
-             * @brief Check for API hooks.
-             */
-            void CheckAPIHooks(SandboxEvasionResult& result);
-
-            /**
-             * @brief Check network characteristics.
-             */
-            void CheckNetworkCharacteristics(SandboxEvasionResult& result);
-
-            /**
-             * @brief Calculate final probability from all checks.
-             */
-            void CalculateProbability(SandboxEvasionResult& result);
-
-            /**
-             * @brief Identify specific sandbox product.
-             */
-            void IdentifySandboxProduct(SandboxEvasionResult& result);
-
-            /**
-             * @brief Add MITRE ATT&CK mappings.
-             */
-            void AddMitreMappings(SandboxEvasionResult& result);
-
-            /**
-             * @brief Add indicator to result.
-             */
-            void AddIndicator(
-                SandboxEvasionResult& result,
-                SandboxCheckType checkType,
-                SandboxIndicatorCategory category,
-                SandboxIndicatorSeverity severity,
-                float weight,
-                float confidence,
-                const std::wstring& description,
-                const std::wstring& technicalDetails = L"",
-                const std::wstring& observedValue = L"",
-                const std::wstring& expectedValue = L"",
-                SandboxProduct suspectedProduct = SandboxProduct::Unknown,
-                bool isConclusive = false
-            );
-
-            /**
-             * @brief Update cache with result.
-             */
-            void UpdateCache(const SandboxEvasionResult& result);
-
-            /**
-             * @brief Invoke registered callbacks.
-             */
-            void InvokeCallbacks(const SandboxEvasionResult& result);
 
             // =========================================================================
             // TYPE B Internal Methods (Target Process Analysis)
@@ -2650,23 +2437,6 @@ namespace ShadowStrike {
             return SandboxIndicatorSeverity::Info;
         }
 
-        /**
-         * @brief Calculate mouse path entropy.
-         * @param movements Vector of (x, y) coordinates.
-         * @return Entropy value (higher = more random/human-like).
-         */
-        [[nodiscard]] double CalculateMousePathEntropy(
-            const std::vector<std::pair<int32_t, int32_t>>& movements
-        ) noexcept;
-
-        /**
-         * @brief Calculate straight line ratio for mouse path.
-         * @param movements Vector of (x, y) coordinates.
-         * @return Ratio (0.0 - 1.0, higher = more linear/bot-like).
-         */
-        [[nodiscard]] double CalculateStraightLineRatio(
-            const std::vector<std::pair<int32_t, int32_t>>& movements
-        ) noexcept;
 
     } // namespace AntiEvasion
 } // namespace ShadowStrike

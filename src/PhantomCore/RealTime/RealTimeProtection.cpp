@@ -1608,36 +1608,45 @@ public:
                 // viewed from outside, which is precisely the silent-success failure
                 // mode this codebase keeps producing.
 
-                // HOST CONTEXT, RECORDED AS CONTEXT AND NEVER AS A VERDICT.
+                // NO HOST SANDBOX-LIKENESS MEASUREMENT IS TAKEN HERE, AND THAT IS
+                // NOW A SETTLED DECISION RATHER THAN AN OPEN QUESTION.
                 //
-                // This used to warn "endpoint may be under malware analysis" whenever
-                // the hardware profile looked sandbox-like OR the environment score
-                // reached 50. That is a claim about THIS MACHINE, and it fires on
-                // ordinary VMware, Hyper-V, KVM and cloud endpoints. A legitimate
-                // endpoint protection product must behave identically on a virtual
-                // machine and on bare metal, so virtualisation is not evidence of
-                // anything and must never be reported as a threat. The check also had
-                // no other consumer: nothing read either result, so the warning was
-                // the entire product of the measurement.
+                // Until this change the startup path called AnalyzeHardware() and
+                // AnalyzeEnvironment() and logged their scores as "CONTEXT ONLY".
+                // 658d8ffa kept the measurement deliberately, because the owner had
+                // not yet decided whether host context should calibrate detection
+                // thresholds, and deleting it would have foreclosed that choice.
                 //
-                // THE MEASUREMENT IS KEPT, on the same terms as its two siblings.
-                // TimeBasedEvasionDetector::GetHostTimingProfile and
-                // EnvironmentEvasionDetector::GetHostProcessorFacts describe the same
-                // subject - the host - and obey the same contract: taken once, at
-                // startup, reported once, and consumed by nothing that reaches a
-                // verdict. Keeping it also leaves open the outstanding question of
-                // whether host context should calibrate detection thresholds, which
-                // deleting it would foreclose.
-                const auto hostHardware = sandbox.AnalyzeHardware();
-                const auto hostEnvironment = sandbox.AnalyzeEnvironment();
-                Utils::Logger::Info(
-                    "RealTimeProtection: host environment context - hardware score "
-                    "{:.1f} (sandbox-like={}), environment score {:.1f}. CONTEXT ONLY: "
-                    "this describes the machine we run on and contributes to no "
-                    "detection verdict.",
-                    hostHardware.suspicionScore,
-                    hostHardware.isSandboxLike ? "yes" : "no",
-                    hostEnvironment.suspicionScore);
+                // THE DECISION IS NOW TAKEN: host context MAY calibrate detection,
+                // because a threshold that adapts to the machine produces fewer false
+                // positives than a fixed constant. That decision does NOT rescue these
+                // two calls, and the reason is a unit test in the literal sense:
+                //
+                //   A host measurement can calibrate a target measurement only if the
+                //   two are expressed in the SAME UNIT.
+                //
+                // TimeBasedEvasionDetector::GetHostTimingProfile yields CYCLES, and a
+                // target RDTSC delta is also cycles, so the host figure is a usable
+                // baseline. EnvironmentEvasionDetector::GetHostProcessorFacts yields
+                // CPU feature bits, which decide whether a target instruction sequence
+                // is even meaningful. Both calibrate something.
+                //
+                // AnalyzeHardware and AnalyzeEnvironment yielded a "suspicion score"
+                // and an isSandboxLike flag describing THIS MACHINE. No target
+                // measurement anywhere in the product is denominated in sandbox
+                // likeness, so there is nothing for those values to calibrate. They
+                // answered "am I being analysed?", which is a question a malware sample
+                // asks and a legitimate endpoint product has no use for - it must behave
+                // identically on a virtual machine and on bare metal.
+                //
+                // So the measurement is removed rather than re-homed, and with it the
+                // 15 registry, adapter, display and volume queries the two performed on
+                // every single service start for a value nothing consumed.
+                //
+                // The TARGET half of this detector is untouched and is wired through
+                // AnalyzeDeferredProcessForSandboxEvasion - see ad218385. That half
+                // examines an analysed process, which is detection, and it is the only
+                // part of this module that reaches a verdict.
             } else {
                 Utils::Logger::Warn("RealTimeProtection: SandboxEvasionDetector Initialize failed");
             }

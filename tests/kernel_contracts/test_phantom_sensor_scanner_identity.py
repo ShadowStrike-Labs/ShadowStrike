@@ -93,6 +93,9 @@ TELEMETRY_COLLECTOR_HPP_PATH = ROOT / "src/PhantomCore/Communication/TelemetryCo
 SANDBOX_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/SandboxEvasionDetector.cpp"
 )
+SANDBOX_EVASION_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/SandboxEvasionDetector.hpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -8398,6 +8401,9 @@ class SandboxHostContextIsNotAVerdictContractTests(unittest.TestCase):
         # text quotes the old warning verbatim. A comment-blind scan false-positives.
         cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
         cls.sandbox = strip_c_comments(read_source(SANDBOX_EVASION_DETECTOR_CPP_PATH))
+        cls.sandbox_hpp = strip_c_comments(
+            read_source(SANDBOX_EVASION_DETECTOR_HPP_PATH)
+        )
 
     def _startup_block(self) -> str:
         opening = "SandboxEvasionDetector::Instance();"
@@ -8450,82 +8456,167 @@ class SandboxHostContextIsNotAVerdictContractTests(unittest.TestCase):
             + " | ".join(offenders[:3]),
         )
 
-        # AND IT MUST NOT BE RAISED AT A SEVERITY THAT READS AS A FINDING.
+        # THE SEVERITY ASSERTION THAT USED TO SIT HERE IS GONE ON PURPOSE.
         #
-        # THIS IS RESOLVED AGAINST THE CALL, NOT THE LINE, AND THAT IS LOAD-BEARING. A
-        # per-line version of this assertion - requiring one line to contain both the
-        # severity token and a host value - CANNOT DISCRIMINATE, because the logger call
-        # spans several lines and the two never appear on the same one. Proven by
-        # mutation: raising the report to Warn left the per-line form passing.
-        marker = "hostHardware.suspicionScore"
-        self.assertIn(
-            marker, block, "the host context report must pass the measured value"
-        )
-        opener = block.rfind("Utils::Logger::", 0, block.index(marker))
-        self.assertNotEqual(
-            opener, -1, "the host context must be reported through the logger"
-        )
-        severity_token = block[opener : block.index("(", opener)].strip()
-        self.assertIn(
-            "Info",
-            severity_token,
-            f"host context is reported through {severity_token!r}; Warn or Error reads as "
-            "a finding, and virtualisation is not a finding",
-        )
+        # It required the host report to be raised through Logger::Info rather than Warn,
+        # which only makes sense while a host report EXISTS. The owner has since decided
+        # that host context may calibrate detection, and that decision removed these two
+        # probes outright rather than re-homing them - see the sibling test for the unit
+        # argument. There is no host report left to check the severity of, so asserting one
+        # would be asserting the presence of the thing this contract now forbids.
+    def test_the_startup_path_takes_no_host_sandbox_likeness_measurement(self) -> None:
+        """A host "sandbox-likeness" score cannot calibrate anything, so it is not taken.
 
-    def test_the_host_measurement_is_still_taken_and_reported(self) -> None:
-        """ANTI-VACUITY. Silencing the claim must not silently delete the measurement.
+        SUPERSEDES an earlier contract that REQUIRED these two probes to run. That contract
+        was correct while the owner had not yet decided whether host context may calibrate
+        detection thresholds: deleting the measurement would have foreclosed the choice, so
+        it was kept and only its threat CLAIM was removed.
 
-        Removing it would also foreclose the open question of whether host context should
-        calibrate detection thresholds, so the measurement is deliberately retained on the
-        same terms as GetHostTimingProfile and GetHostProcessorFacts.
+        The decision has since been taken - host context MAY calibrate detection, because a
+        threshold that adapts to the machine yields fewer false positives than a fixed
+        constant. That does not rescue these two probes, and the reason is a unit argument:
+
+            a host measurement can calibrate a target measurement only when the two are
+            expressed in the SAME UNIT.
+
+        GetHostTimingProfile yields cycles and a target RDTSC delta is cycles, so it is a
+        usable baseline. GetHostProcessorFacts yields CPU feature bits, which decide whether
+        a target instruction sequence is meaningful at all. AnalyzeHardware and
+        AnalyzeEnvironment yielded a suspicion score and an isSandboxLike flag describing
+        THIS MACHINE, and nothing in the product is denominated in sandbox likeness, so
+        there was nothing for them to calibrate. They answered "am I being analysed?" - a
+        question a malware sample asks and a legitimate endpoint product has no use for.
         """
-        block = self._startup_block()
-        for probe in ("AnalyzeHardware()", "AnalyzeEnvironment()"):
-            calls = block.count(probe)
+        code = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        for probe in ("AnalyzeHardware", "AnalyzeEnvironment"):
+            calls = len(re.findall(r"(?<![A-Za-z0-9_])" + probe + r"\s*\(", code))
             self.assertEqual(
                 calls,
-                1,
-                f"expected exactly one {probe} call in the startup path, found {calls}",
+                0,
+                f"{probe}() is called {calls} time(s) on a product path. It measures this "
+                "machine's sandbox likeness, which no target measurement shares a unit "
+                "with, so it can calibrate nothing and must not run on an endpoint.",
             )
-        labels = block.count("CONTEXT ONLY")
-        self.assertGreaterEqual(
-            labels,
-            1,
-            "the reported host context must label itself as context so a reader cannot "
-            f"mistake it for a detection; found {labels} such labels",
-        )
 
-    def test_no_callback_is_registered_while_its_notifier_cannot_fire(self) -> None:
-        """A registration whose notifier is unreachable looks identical to a working one.
-
-        The startup path registered a sandbox detection callback that could never run:
-        InvokeCallbacks is reached only from ScanSystem, whose only caller is
-        ScanSystemAsync, which nothing calls.
-        """
+        # ANTI-VACUITY 1: this must not pass because the startup block was deleted.
         block = self._startup_block()
-        # BOUNDED: the startup block is ~2 KB and assertNotIn dumps all of it.
-        registrations = [
-            line.strip() for line in block.splitlines() if "RegisterCallback" in line
-        ]
+        inits = block.count("sandbox.Initialize(")
         self.assertEqual(
-            registrations,
-            [],
-            "a sandbox detection callback is registered again; it can only fire once "
-            "something calls ScanSystem, so register it in the same change as a producer. "
-            "Offending line: " + (registrations[0] if registrations else ""),
-        )
-
-        # The premise above is asserted, not assumed: if ScanSystemAsync ever gains a
-        # caller the notifier becomes reachable and this reasoning must be revisited.
-        launcher = len(re.findall(r"(?<![A-Za-z0-9_])ScanSystemAsync\s*\(", self.sandbox))
-        self.assertEqual(
-            launcher,
+            inits,
             1,
-            "ScanSystemAsync now has a caller, so the sandbox notifier is reachable and "
-            "registering a detection callback is no longer dead - revisit this contract",
+            "the sandbox detector must still be initialised at startup; its TARGET half is "
+            f"live and gated on that, but Initialize appears {inits} time(s)",
+        )
+        self.assertIn(
+            "m_sandboxDetectorInitialized",
+            block,
+            "the initialisation flag the deferred target analysis is gated on must survive",
         )
 
+        # ANTI-VACUITY 2: the half that DOES reach a verdict must still be wired. Removing
+        # host inference must never be satisfiable by removing the detector altogether.
+        feeds = len(
+            re.findall(
+                r"(?<![A-Za-z0-9_])AnalyzeDeferredProcessForSandboxEvasion\s*\(", code
+            )
+        )
+        self.assertGreaterEqual(
+            feeds,
+            2,
+            "the target-analysis feed restored in ad218385 must still be declared and "
+            f"called; found {feeds} occurrence(s) of its helper",
+        )
+    def test_the_host_scan_half_no_longer_exists(self) -> None:
+        """SUPERSEDES a guard that required the host notifier to exist but stay unreachable.
+
+        That contract said: do not register a sandbox detection callback, because
+        InvokeCallbacks is reachable only from ScanSystem, whose only caller is
+        ScanSystemAsync, which nothing calls. It asserted ScanSystemAsync still existed so
+        that the reasoning would be revisited if the notifier ever became reachable.
+
+        The notifier is now GONE rather than merely unreachable, which is strictly stronger:
+        a callback cannot be registered because there is no registration API and no result
+        type to deliver. The whole host half - the half that asked whether THIS MACHINE is a
+        sandbox - has been removed. A legitimate endpoint product must behave identically on
+        a virtual machine and on bare metal, so that question has no product use.
+        """
+        removed = (
+            "ScanSystem",
+            "ScanSystemAsync",
+            "QuickScan",
+            "AnalyzeHardware",
+            "AnalyzeEnvironment",
+            "AnalyzeWearAndTear",
+            "ScanArtifacts",
+            "AnalyzeHumanInteraction",
+            "VerifyHumanInteraction",
+            "CheckHardwareSpecs",
+            "CheckUptime",
+            "CheckScreenResolution",
+            "CheckNamedObjects",
+            "CheckSystemWearAndTear",
+            "CheckAPIHooks",
+            "CalculateProbability",
+            "IdentifySandboxProduct",
+            "CalculateMousePathEntropy",
+            "AddIndicator",
+            "RegisterCallback",
+            "UnregisterCallback",
+            "InvokeCallbacks",
+        )
+        for source, label in ((self.sandbox, "cpp"), (self.sandbox_hpp, "hpp")):
+            offenders = [
+                name
+                for name in removed
+                if re.search(r"(?<![A-Za-z0-9_])" + name + r"\s*\(", source)
+            ]
+            self.assertEqual(
+                offenders,
+                [],
+                f"the host scan half is back in the {label}: {offenders}. It answers "
+                '"is this machine a sandbox?", which is a question a malware sample asks. '
+                "If a genuine need appears, take it to a module whose subject is this host "
+                "and give it a consumer that cannot reach a sample verdict.",
+            )
+
+        # ANTI-VACUITY 1: the TARGET half must survive. This contract must never be
+        # satisfiable by deleting the detector outright - that half is real detection and
+        # is the product's only producer of T1012 and T1057.
+        for kept in (
+            "CheckTargetSandboxImports",
+            "CheckTargetSandboxStrings",
+            "CheckTargetTimingPatterns",
+            "CalculateProcessEvasionScore",
+        ):
+            # BOUNDED: assertRegex prints the ENTIRE haystack on failure, and this one is
+            # the whole 1,700-line module - measured at 55,602 characters in a mutation
+            # run. A failure nobody can read is a failure nobody acts on.
+            found = re.search(r"(?<![A-Za-z0-9_])" + kept + r"\s*\(", self.sandbox)
+            self.assertIsNotNone(
+                found,
+                f"{kept} is gone; the target half is this module's reason to exist",
+            )
+
+        # ANTI-VACUITY 2, AND THE MORE IMPORTANT ONE. The host TIMING routines are kept
+        # deliberately and must not be swept away by a later "delete unreferenced code"
+        # pass. They measure this host in CYCLES, which is the same unit a target RDTSC
+        # delta is measured in, so they are the only legitimate calibration input this
+        # module can offer - unlike the sandbox-likeness score that was just removed,
+        # which nothing shares a unit with. Deleting them would foreclose the
+        # baseline-relative thresholds the owner has decided to build.
+        for calibration in (
+            "Fallback_MeasureRDTSCOverhead",
+            "Fallback_MeasureCPUIDOverhead",
+            "Fallback_GetRDTSCFrequency",
+            "Fallback_MeasureTimingPrecision",
+        ):
+            found = re.search(r"(?<![A-Za-z0-9_])" + calibration + r"\s*\(", self.sandbox)
+            self.assertIsNotNone(
+                found,
+                f"{calibration} was removed. It measures the host in cycles and is a "
+                "calibration input, not dead code - see the header note where the host "
+                "scan used to be declared.",
+            )
     def test_the_sandbox_technique_ids_belong_to_target_analysis(self) -> None:
         """T1012 and T1057 are this product's ONLY holders of those techniques.
 
