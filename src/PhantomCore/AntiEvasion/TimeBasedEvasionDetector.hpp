@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -481,6 +481,28 @@ namespace ShadowStrike {
 
         /**
          * @brief Detection method used to identify evasion.
+         */
+        /**
+         * @brief How a timing finding was obtained.
+         *
+         * @warning ONLY StaticAnalysis IS IMPLEMENTED. Measured across this module: every
+         *          producer sets TimingDetectionMethod::StaticAnalysis, and no code path
+         *          performs dynamic monitoring, API interception, hardware counter
+         *          sampling, kernel instrumentation or hypervisor observation.
+         *
+         * THIS MATTERS FOR READING THE ANALYSIS STRUCTS BELOW. Several of their fields can
+         * only be produced by a method that does not exist yet - anything describing an
+         * OBSERVED duration, delta, rate or drift requires watching the target run, which
+         * static import and opcode analysis cannot do. Those fields therefore hold their
+         * default of zero permanently, and a zero from them means NOT MEASURED, never
+         * "measured as zero". Each is marked at its declaration.
+         *
+         * A consumer that treats an unmeasured zero as a benign measurement produces a
+         * false negative, which is the failure mode an empty bloom filter and a
+         * non-walkable B+tree index both produced in this codebase already. Do not write
+         * a comparison against one of those fields until its producer exists: the
+         * comparison cannot be true, so it adds the appearance of detection and none of
+         * the substance.
          */
         enum class TimingDetectionMethod : uint8_t {
             /// @brief Unknown detection method
@@ -1182,18 +1204,33 @@ namespace ShadowStrike {
             uint64_t rdtscCpuidComboCount = 0;
 
             /// @brief Average RDTSC delta (nanoseconds)
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             uint64_t avgDeltaNs = 0;
 
             /// @brief Minimum RDTSC delta
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             uint64_t minDeltaNs = 0;
 
             /// @brief Maximum RDTSC delta
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             uint64_t maxDeltaNs = 0;
 
             /// @brief Standard deviation of deltas
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             double deltaStdDev = 0.0;
 
             /// @brief RDTSC calls per second
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             double callsPerSecond = 0.0;
 
             /// @brief Whether high-frequency RDTSC was detected
@@ -1245,21 +1282,36 @@ namespace ShadowStrike {
             uint32_t crossCheckCount = 0;
 
             /// @brief Maximum GetTickCount delta observed (milliseconds)
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             uint64_t maxTickCountDeltaMs = 0;
 
             /// @brief QPC frequency measured (Hz)
             uint64_t qpcFrequencyHz = 0;
 
             /// @brief Expected QPC frequency (Hz)
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             uint64_t expectedQpcFrequencyHz = 0;
 
             /// @brief QPC frequency deviation (percentage)
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             double qpcFrequencyDeviation = 0.0;
 
             /// @brief Whether GetTickCount anomaly was detected
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             bool tickCountAnomalyDetected = false;
 
             /// @brief Whether QPC anomaly was detected
+            /// @warning NOT MEASURED. No producer exists; requires a runtime
+            ///          observation method (see TimingDetectionMethod). A zero here
+            ///          means not measured, NOT measured-as-zero.
             bool qpcAnomalyDetected = false;
 
             /// @brief Whether cross-checking was detected

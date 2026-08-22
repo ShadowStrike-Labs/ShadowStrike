@@ -1324,9 +1324,41 @@ struct TimeBasedEvasionDetector::Impl {
 
         // Get expected QPC frequency
         LARGE_INTEGER freq;
+        // THE MEASURED VALUE GOES IN THE FIELD NAMED FOR THE MEASUREMENT.
+        //
+        // This used to assign the live QueryPerformanceFrequency result to
+        // expectedQpcFrequencyHz, leaving qpcFrequencyHz - the field whose name means
+        // "the frequency this host reports" - at zero forever. So the one QPC fact the
+        // module actually had was filed under "expected" and the field a consumer would
+        // read was empty. Same class as the file-scan PathLength unit split: a value that
+        // is present, correct, and stored where nobody looks for it.
         if (QueryPerformanceFrequency(&freq)) {
-            analysis.expectedQpcFrequencyHz = static_cast<uint64_t>(freq.QuadPart);
+            analysis.qpcFrequencyHz = static_cast<uint64_t>(freq.QuadPart);
         }
+
+        // expectedQpcFrequencyHz, qpcFrequencyDeviation AND qpcAnomalyDetected ARE
+        // DELIBERATELY LEFT UNSET, AND THIS IS THE LOAD-BEARING PART.
+        //
+        // The obvious completion is to compare the measured frequency against an expected
+        // one and raise qpcAnomalyDetected on deviation, gated by the already-declared
+        // TimingConstants::QPC_FREQUENCY_ANOMALY_PERCENT. THAT WOULD BE A FALSE POSITIVE
+        // MACHINE, because there is no defensible "expected" value:
+        //
+        //   Windows 8+ on invariant-TSC hardware reports 10,000,000 Hz
+        //   an ACPI PM timer host reports        3,579,545 Hz
+        //   an HPET host reports                14,318,180 Hz
+        //   hypervisors report other values again, legitimately
+        //
+        // So a deviation measures WHICH TIMER THIS MACHINE USES, not whether an analysed
+        // process is evading anything. Raising it as a per-process anomaly would fire on
+        // every virtual and every older physical endpoint - exactly the defect removed
+        // from SandboxEvasionDetector in 6a1ee4a3, where a host property was reported as
+        // evidence about a sample.
+        //
+        // The measured frequency is kept because it IS useful as host CONTEXT: it is an
+        // exact quantity in Hz, so it can calibrate how much a timing observation is
+        // worth once a runtime-observation method exists. That is the same standard
+        // GetHostTimingProfile is held to. It must not become a verdict.
 
         // Get process modules
         std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;

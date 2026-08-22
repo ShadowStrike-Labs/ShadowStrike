@@ -99,6 +99,9 @@ SANDBOX_EVASION_DETECTOR_HPP_PATH = (
 TIME_BASED_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.cpp"
 )
+TIME_BASED_EVASION_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.hpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -8926,6 +8929,124 @@ class TimingDetectorHonestEvidenceContractTests(unittest.TestCase):
             self.assertIsNotNone(
                 present, f"{measured} is the measured evidence the findings now cite"
             )
+
+class TimingUnmeasuredFieldContractTests(unittest.TestCase):
+    """A zero that means "not measured" must never be compared as if it were data.
+
+    TimeBasedEvasionDetector declares six detection methods and implements one. Anything
+    describing an OBSERVED delta, rate, duration or drift needs a runtime method that does
+    not exist, so those fields hold their default of zero permanently. A comparison against
+    one of them cannot be true, which makes it worse than absent: it adds the appearance of
+    detection and none of the substance. That is the failure mode an unpopulated bloom
+    filter and a non-walkable B+tree index both produced in this codebase.
+    """
+
+    # Fields with no producer. Each is marked at its declaration in the header.
+    UNMEASURED = (
+        "avgDeltaNs",
+        "minDeltaNs",
+        "maxDeltaNs",
+        "deltaStdDev",
+        "callsPerSecond",
+        "maxTickCountDeltaMs",
+        "expectedQpcFrequencyHz",
+        "qpcFrequencyDeviation",
+        "tickCountAnomalyDetected",
+        "qpcAnomalyDetected",
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST for the implementation: the fix explains at length WHY these are
+        # not computed, naming each one, so a comment-blind scan reports the defect as
+        # present. The HEADER is read RAW on purpose - the marker being asserted there IS
+        # a comment.
+        cls.cpp = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))
+        cls.hpp_raw = read_source(TIME_BASED_EVASION_DETECTOR_HPP_PATH)
+        cls.hpp = strip_c_comments(cls.hpp_raw)
+
+    def test_the_measured_qpc_frequency_is_stored_under_its_own_name(self) -> None:
+        """The live QueryPerformanceFrequency result belonged in qpcFrequencyHz."""
+        measured = len(re.findall(r"analysis\.qpcFrequencyHz\s*=", self.cpp))
+        self.assertEqual(
+            measured,
+            1,
+            f"qpcFrequencyHz is assigned {measured} time(s); the measured host frequency "
+            "must be stored in the field whose name means the measurement",
+        )
+        misfiled = len(re.findall(r"analysis\.expectedQpcFrequencyHz\s*=", self.cpp))
+        self.assertEqual(
+            misfiled,
+            0,
+            "the measured frequency is filed under expectedQpcFrequencyHz again. There is "
+            "no defensible expected value: 10 MHz on invariant-TSC hosts, 3,579,545 Hz on "
+            "ACPI PM, 14,318,180 Hz on HPET, and other values under hypervisors - all "
+            "legitimate. A deviation measures which timer this machine uses, not whether a "
+            "sample is evading anything.",
+        )
+
+    def test_no_code_compares_against_a_field_that_has_no_producer(self) -> None:
+        """The invariant that stops detection being built on a permanent zero."""
+        offenders = []
+        for field in self.UNMEASURED:
+            # a relational or equality test with the field on either side
+            pattern = (
+                r"(?<![A-Za-z0-9_])" + field + r"\s*(?:[<>]=?|[!=]=)"
+                r"|(?:[<>]=?|[!=]=)\s*[A-Za-z_][A-Za-z0-9_\.\->]*" + field + r"(?![A-Za-z0-9_])"
+            )
+            if re.search(pattern, self.cpp):
+                offenders.append(field)
+        self.assertEqual(
+            offenders,
+            [],
+            "these fields have no producer, so a comparison against them can never be "
+            f"true and manufactures the appearance of detection: {offenders}. Write the "
+            "producer in the SAME change as the comparison, and update this contract then.",
+        )
+
+    def test_every_unmeasured_field_says_so_at_its_declaration(self) -> None:
+        """A reader must not have to grep the module to learn a zero is not a measurement."""
+        # LINE-SCOPED, AND THAT IS LOAD-BEARING. A character window measured back from the
+        # declaration BLEEDS INTO THE PREVIOUS FIELD'S MARKER, so a field could lose its own
+        # warning and still pass on its neighbour's. Proven by mutation: stripping the
+        # marker from callsPerSecond left an earlier character-window form PASSING, because
+        # deltaStdDev is declared immediately above it and carries its own marker.
+        lines = self.hpp_raw.splitlines()
+        missing = []
+        for field in self.UNMEASURED:
+            decl = None
+            for i, line in enumerate(lines):
+                if re.search(
+                    r"(?<![A-Za-z0-9_])" + field + r"(?![A-Za-z0-9_])\s*=", line
+                ):
+                    decl = i
+                    break
+            if decl is None:
+                missing.append(field + " (declaration absent)")
+                continue
+            # only the four lines directly above the declaration count; a three-line
+            # marker fits, a neighbour's cannot reach
+            window = "\n".join(lines[max(0, decl - 4) : decl])
+            if "NOT MEASURED" not in window:
+                missing.append(field)
+        self.assertEqual(
+            missing,
+            [],
+            f"these declarations do not warn that they are unmeasured: {missing}",
+        )
+
+        # ANTI-VACUITY: the fields that ARE produced must not be swept into the list.
+        for produced in ("rdtscCount", "rdtscCpuidComboCount", "qpcCalls", "sleepCallCount"):
+            self.assertNotIn(
+                produced,
+                self.UNMEASURED,
+                f"{produced} is computed by static analysis and must not be marked "
+                "unmeasured - doing so would invite deleting a working detection input",
+            )
+            present = re.search(
+                r"(?<![A-Za-z0-9_])" + produced + r"(?![A-Za-z0-9_])", self.cpp
+            )
+            self.assertIsNotNone(present, f"{produced} is a live measurement and must stay")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
