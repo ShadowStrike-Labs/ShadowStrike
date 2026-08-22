@@ -1136,24 +1136,35 @@ namespace ShadowStrike {
         ///          the target's PE import table by AnalyzeSleep, so it reflects the
         ///          delay APIs the binary can call.
         ///
-        ///          RUNTIME half - NOT POPULATED IN THIS BUILD. Every field below
-        ///          marked NOT OBSERVED is sourced from ProcessMonitoringContext,
-        ///          which is only filled by RecordTimingEvent. Measured across src
-        ///          and tests: RecordTimingEvent has FOUR references - one
-        ///          declaration, two definitions and one delegation - and ZERO
-        ///          CALLERS. StartMonitoring likewise has no production caller, so
-        ///          m_monitoredProcesses is permanently empty and the lookup in
-        ///          AnalyzeSleep always misses.
+        ///          RUNTIME half - WHICH PRODUCER FILLED IT DECIDES WHAT IT MEANS,
+        ///          and there are exactly two, with very different standing.
         ///
-        /// @warning THEREFORE HasSleepEvasion() RETURNS FALSE FOR EVERY PROCESS, AND
-        ///          FALSE HERE MEANS "NOT OBSERVED", NOT "CLEAN". Reading it as a
-        ///          clean result is a false negative presented as a verdict. Use
-        ///          runtimeObservationAvailable to tell the two apart.
+        ///          (1) AnalyzeObservedDelays - REAL. Driven from PhantomEmulator's
+        ///              intercepted delay calls, which carry the requested duration
+        ///              per call. This populates the counts, the totals, the
+        ///              per-call distribution and the fragmentation verdict, and it
+        ///              sets runtimeObservationAvailable.
         ///
-        ///          Nothing here is deleted: the analysis, the three detection
-        ///          branches that consume it and their MITRE attribution are real
-        ///          capability and are the seam a timing feed plugs into. What is
-        ///          missing is the producer, not the detection.
+        ///          (2) AnalyzeSleep(pid) - STILL HAS NO RUNTIME PRODUCER. It reads
+        ///              ProcessMonitoringContext, which is filled only by
+        ///              RecordTimingEvent. Measured across src and tests:
+        ///              RecordTimingEvent has ZERO CALLERS, and StartMonitoring has
+        ///              no production caller, so m_monitoredProcesses is permanently
+        ///              empty and that lookup always misses.
+        ///
+        /// @warning SO FOR A LIVE PROCESS, HasSleepEvasion() STILL RETURNS FALSE
+        ///          ALWAYS, AND FALSE THERE MEANS "NOT OBSERVED", NOT "CLEAN".
+        ///          Reading it as a clean result is a false negative presented as a
+        ///          verdict. runtimeObservationAvailable is what distinguishes them,
+        ///          and it is the flag to check on ANY result from this struct.
+        ///
+        ///          Why a live process cannot be observed today, measured rather
+        ///          than assumed: Windows exposes no delay or timer notification
+        ///          callback, so a kernel driver cannot see a Sleep without SSDT
+        ///          patching, which PatchGuard bugchecks; and no ETW provider emits
+        ///          a per-delay event. Emulation is the only mechanism that sees
+        ///          this, which is also why it is the right one - fragmenting a
+        ///          sleep is an ANTI-SANDBOX technique.
         struct SleepAnalysis {
             /// @brief Process ID analyzed
             uint32_t processId = 0;
@@ -1186,7 +1197,7 @@ namespace ShadowStrike {
             uint64_t totalActualDurationMs = 0;
 
             /// @brief Average requested sleep duration
-            /// @warning NOT OBSERVED - no producer. Always 0.
+            /// @note Produced by AnalyzeObservedDelays. Zero from AnalyzeSleep(pid).
             uint64_t avgRequestedDurationMs = 0;
 
             /// @brief Average actual sleep duration
@@ -1194,8 +1205,11 @@ namespace ShadowStrike {
             uint64_t avgActualDurationMs = 0;
 
             /// @brief Maximum single sleep duration requested
-            /// @warning NOT OBSERVED - no producer. Always 0. Requires per-call
-            ///          durations, which the monitoring context does not keep.
+            /// @note Produced by AnalyzeObservedDelays, which sees per-call
+            ///       durations. Zero from AnalyzeSleep(pid), whose monitoring
+            ///       context keeps no distribution.
+            /// @note Load-bearing for fragmentation: the technique requires that no
+            ///       SINGLE call was independently evasive.
             uint64_t maxRequestedDurationMs = 0;
 
             /// @brief Sleep acceleration ratio (actual/requested)
@@ -1206,11 +1220,13 @@ namespace ShadowStrike {
             double accelerationRatio = 1.0;
 
             /// @brief Number of fragmented sleeps detected
-            /// @warning NOT OBSERVED - no producer. Always 0.
+            /// @note Produced by AnalyzeObservedDelays when fragmentation is found.
+            ///       Zero from AnalyzeSleep(pid).
             uint32_t fragmentedSleepCount = 0;
 
             /// @brief Average fragment duration if fragmented
-            /// @warning NOT OBSERVED - no producer. Always 0.
+            /// @note Produced by AnalyzeObservedDelays when fragmentation is found.
+            ///       Zero from AnalyzeSleep(pid).
             uint64_t avgFragmentDurationMs = 0;
 
             /// @brief Whether sleep bombing was detected
@@ -1223,17 +1239,22 @@ namespace ShadowStrike {
             ///          currently be raised.
             bool accelerationDetected = false;
 
-            /// @brief Whether sleep fragmentation was detected
-            /// @warning NOT OBSERVED - NO PRODUCER ANYWHERE. This field is read by
-            ///          the SleepFragmentation branch and assigned by nothing, so
-            ///          TimingEvasionType::SleepFragmentation (T1497.003) cannot
-            ///          currently be raised at all.
+            /// @brief Whether sleep fragmentation was detected - T1497.003.
             ///
-            ///          It cannot honestly be derived from what is available either:
-            ///          fragmentation is a statement about the SHAPE of a runtime
-            ///          delay - many short sleeps summing to a long one - and a
-            ///          static import list cannot distinguish one Sleep call site in
-            ///          a loop from six hundred executions of it.
+            /// @note Produced by AnalyzeObservedDelays. Zero from AnalyzeSleep(pid),
+            ///       and that asymmetry is not an oversight: fragmentation is a
+            ///       statement about the SHAPE of a runtime delay - many short
+            ///       sleeps summing to a long one - and a static import list cannot
+            ///       distinguish one Sleep call site in a loop from six hundred
+            ///       executions of it. Only an execution observer can.
+            ///
+            /// @warning THE PREDICATE MUST KEEP ITS FOURTH CLAUSE. Requiring the
+            ///          delay calls to outnumber all other observed API activity is
+            ///          what separates this from an ordinary polling loop -
+            ///          while (!done) { Sleep(100); DoWork(); } - which matches the
+            ///          delay shape exactly and is entirely legitimate. Removing it
+            ///          turns this into a false-positive generator against normal
+            ///          software. There is a test whose only job is that case.
             bool fragmentationDetected = false;
 
             /// @brief Confidence score for sleep evasion (0.0 - 100.0)
@@ -1243,8 +1264,9 @@ namespace ShadowStrike {
             std::vector<std::wstring> sleepAPIsUsed;
 
             /// @brief Individual sleep durations for pattern analysis
-            /// @warning NOT OBSERVED - no producer. Always empty. This is the
-            ///          distribution a fragmentation predicate would need.
+            /// @note Produced by AnalyzeObservedDelays, one entry per observed call.
+            ///       Empty from AnalyzeSleep(pid), whose monitoring context keeps
+            ///       only aggregates.
             std::vector<uint64_t> sleepDurations;
 
             /**
@@ -1675,6 +1697,46 @@ namespace ShadowStrike {
              * @param processId Target process ID.
              * @return Sleep-specific analysis results.
              */
+            /// @brief One observed delay-API call, as seen by an execution observer.
+            ///
+            /// This is the producer type the sleep analysis always lacked. It carries
+            /// what a STATIC import list cannot: how many times a delay was actually
+            /// requested, and for how long each time.
+            ///
+            /// The only observer in this product that can supply it is PhantomEmulator,
+            /// whose APICallRecord already records functionName, the argument list and
+            /// the argument list for every intercepted call. A kernel driver cannot
+            /// produce this - Windows exposes no delay or timer notification callback,
+            /// and observing NtDelayExecution from kernel mode would mean SSDT patching,
+            /// which PatchGuard bugchecks. No ETW provider emits a per-delay event
+            /// either. Emulation is therefore not a fallback here, it is the only
+            /// mechanism that can see this, and it is also the right one: fragmenting a
+            /// sleep is an ANTI-SANDBOX technique, so the sandbox is where it shows.
+            struct ObservedDelayCall {
+                /// @brief Delay API that was called, e.g. "Sleep", "NtDelayExecution".
+                std::string functionName;
+
+                /// @brief Requested delay in milliseconds, as passed by the sample.
+                uint64_t requestedMs = 0;
+
+
+            };
+
+            /// @brief Derive a sleep analysis from OBSERVED delay calls.
+            ///
+            /// @param calls              Delay calls observed during execution.
+            /// @param otherApiCallCount  Number of NON-delay API calls observed in the
+            ///                           same execution. Load-bearing, not decoration:
+            ///                           it is what separates a malicious fragmented
+            ///                           delay from an ordinary polling loop.
+            ///
+            /// Unlike AnalyzeSleep(pid), which can only read the target's import table
+            /// and a monitoring context nothing fills, this reports measured behaviour
+            /// and sets runtimeObservationAvailable.
+            [[nodiscard]] SleepAnalysis AnalyzeObservedDelays(
+                const std::vector<ObservedDelayCall>& calls,
+                uint64_t otherApiCallCount) const;
+
             [[nodiscard]] SleepAnalysis AnalyzeSleep(uint32_t processId);
 
             /**

@@ -56,6 +56,7 @@
 #include "../../FuzzyHasher/FuzzyHasher.hpp"
 #include "SandboxAnalyzer.hpp"
 #include "EmulationEngine.hpp"
+#include "../../AntiEvasion/TimeBasedEvasionDetector.hpp"
 #include "ZeroDayDetector.hpp"
 #include "../FileSystem/ArchiveExtractor.hpp"
 #include "../FileSystem/DocumentScanner.hpp"
@@ -2578,6 +2579,123 @@ EngineResult ScanEngine::ScanFile(
 
                         m_impl->InvokeDetectionCallbacks(result);
                         goto finalize_scan;
+                    }
+
+                    // ============================================================
+                    // SLEEP-FRAGMENTATION AGGREGATE - T1497.003
+                    //
+                    // WHY THIS EXISTS AND WHY IT IS NOT A DUPLICATE OF THE
+                    // EMULATOR'S OWN CHECK. PhantomEmulator's HandleAntiSandboxAPI
+                    // records a sandbox-evasion attempt when a SINGLE Sleep exceeds
+                    // 60s. Sleep fragmentation is the technique that defeats exactly
+                    // that rule: the sample splits one long delay into many short
+                    // ones, so every individual call falls under the threshold and
+                    // NONE of them is recorded. Nothing anywhere aggregated them.
+                    //
+                    // WHY THE EMULATOR IS THE RIGHT OBSERVER, measured rather than
+                    // assumed: a kernel driver cannot see a delay at all - Windows
+                    // exposes no delay or timer notification callback and hooking
+                    // NtDelayExecution from kernel mode means SSDT patching, which
+                    // PatchGuard bugchecks - and no ETW provider emits a per-delay
+                    // event. The emulator already intercepts these calls WITH their
+                    // arguments, and it accelerates time, so the requested delay is
+                    // observed without ever being paid.
+                    //
+                    // COST: a pass over apiCalls we already hold, no I/O.
+                    if (emuResult.emulationComplete && !emuResult.apiCalls.empty()) {
+                        std::vector<ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::ObservedDelayCall> observedDelays;
+                        uint64_t otherApiCalls = 0;
+
+                        for (const auto& apiCall : emuResult.apiCalls) {
+                            // ARGUMENTS ARE ALWAYS "0x" + UPPERCASE HEX - the single
+                            // formatting site is ResultConverter.cpp's
+                            // snprintf("0x%llX"), so this parse is exact rather than
+                            // heuristic. Anything that does not match that shape is
+                            // treated as an unknown duration, never as zero.
+                            const auto parseHexArg =
+                                [&apiCall](size_t index, uint64_t& outMs) -> bool {
+                                    if (index >= apiCall.arguments.size()) {
+                                        return false;
+                                    }
+                                    const std::string& raw = apiCall.arguments[index];
+                                    if (raw.size() < 3 || raw[0] != '0' ||
+                                        (raw[1] != 'x' && raw[1] != 'X')) {
+                                        return false;
+                                    }
+                                    try {
+                                        outMs = std::stoull(raw.substr(2), nullptr, 16);
+                                    } catch (...) {
+                                        return false;
+                                    }
+                                    return true;
+                                };
+
+                            uint64_t requestedMs = 0;
+                            bool durationKnown = false;
+
+                            // Argument POSITIONS are taken from the emulator's own
+                            // handler, not guessed: Sleep/SleepEx read args[0] and
+                            // WaitForSingleObject reads args[1].
+                            if (apiCall.functionName == "Sleep" ||
+                                apiCall.functionName == "SleepEx") {
+                                durationKnown = parseHexArg(0, requestedMs);
+                            } else if (apiCall.functionName == "WaitForSingleObject" ||
+                                       apiCall.functionName == "WaitForSingleObjectEx") {
+                                durationKnown = parseHexArg(1, requestedMs) &&
+                                                requestedMs != 0xFFFFFFFFull;  // not INFINITE
+                            }
+                            // NtDelayExecution is DELIBERATELY EXCLUDED: its interval
+                            // is a pointer to a LARGE_INTEGER in 100ns units which the
+                            // argument capture does not dereference, so its duration is
+                            // genuinely unknown. Counting it with a zero duration would
+                            // inflate the call count while understating the total and
+                            // corrupt the average. Under-claiming is correct here.
+
+                            if (durationKnown) {
+                                ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::ObservedDelayCall observed;
+                                observed.functionName = apiCall.functionName;
+                                observed.requestedMs = requestedMs;
+                                observedDelays.push_back(std::move(observed));
+                            } else {
+                                ++otherApiCalls;
+                            }
+                        }
+
+                        if (!observedDelays.empty()) {
+                            const auto sleepView =
+                                ShadowStrike::AntiEvasion::TimeBasedEvasionDetector::Instance()
+                                    .AnalyzeObservedDelays(observedDelays, otherApiCalls);
+
+                            if (sleepView.HasSleepEvasion()) {
+                                m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
+
+                                // SUSPICIOUS, NOT INFECTED, and deliberately so. This
+                                // is behavioural inference about a delay pattern with
+                                // no named threat behind it, so it belongs in the same
+                                // class as the emulator's own behavioural verdict
+                                // immediately above rather than in the identification
+                                // class that names a known-bad thing.
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = sleepView.fragmentationDetected
+                                    ? "Evasion.SleepFragmentation"
+                                    : "Evasion.SleepBombing";
+                                result.threatScore = sleepView.confidence;
+                                result.detectionSource = "EmulationEngine+TimeBasedEvasionDetector";
+                                result.sha256 = fileHash;
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Sleep-evasion aggregate: %u delay call(s), %llu ms requested, "
+                                    L"max single %llu ms, %llu other API call(s) - %ls",
+                                    sleepView.sleepCallCount,
+                                    sleepView.totalRequestedDurationMs,
+                                    sleepView.maxRequestedDurationMs,
+                                    otherApiCalls,
+                                    StringUtils::ToWide(result.threatName).c_str());
+
+                                m_impl->InvokeDetectionCallbacks(result);
+                                goto finalize_scan;
+                            }
+                        }
                     }
                     } // end if (emuFileSize >= 0)
                 }

@@ -1248,6 +1248,125 @@ struct TimeBasedEvasionDetector::Impl {
     // SLEEP ANALYSIS
     // ========================================================================
 
+    // ========================================================================
+    // OBSERVED-BEHAVIOUR SLEEP ANALYSIS
+    // ========================================================================
+
+    [[nodiscard]] SleepAnalysis AnalyzeObservedDelays(
+        const std::vector<TimeBasedEvasionDetector::ObservedDelayCall>& calls,
+        uint64_t otherApiCallCount) const {
+
+        SleepAnalysis analysis;
+
+        // Snapshot the thresholds under the config lock. Every number used below is
+        // one this module already declares; none is introduced here.
+        uint64_t evasionThresholdMs;
+        size_t   minFragments;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            evasionThresholdMs = m_config.sleepEvasionThresholdMs;
+            minFragments       = m_config.minSleepFragments;
+        }
+
+        if (calls.empty()) {
+            // NOT OBSERVED stays false: an empty observation is not a clean result,
+            // and a caller must be able to tell the two apart.
+            return analysis;
+        }
+
+        // The observation happened. This is the flag whose absence made "no sleep
+        // evasion" and "nothing was ever measured" the same value.
+        analysis.runtimeObservationAvailable = true;
+
+        // Linear dedup on purpose: the distinct delay-API population is a handful of
+        // names, so a hash set would cost more than it saves and would add an include
+        // this translation unit does not otherwise need.
+        std::vector<std::string> distinctApis;
+
+        analysis.sleepDurations.reserve(calls.size());
+        for (const auto& call : calls) {
+            ++analysis.sleepCallCount;
+            analysis.totalRequestedDurationMs += call.requestedMs;
+            analysis.maxRequestedDurationMs =
+                (std::max)(analysis.maxRequestedDurationMs, call.requestedMs);
+            analysis.sleepDurations.push_back(call.requestedMs);
+            if (!call.functionName.empty()) {
+                bool seen = false;
+                for (const auto& known : distinctApis) {
+                    if (known == call.functionName) { seen = true; break; }
+                }
+                if (!seen) {
+                    distinctApis.push_back(call.functionName);
+                }
+            }
+        }
+
+        for (const auto& api : distinctApis) {
+            analysis.sleepAPIsUsed.push_back(Utils::StringUtils::ToWide(api));
+        }
+
+        analysis.avgRequestedDurationMs =
+            analysis.totalRequestedDurationMs / analysis.sleepCallCount;
+
+        // ------------------------------------------------------------------
+        // SLEEP FRAGMENTATION - T1497.003
+        //
+        // The technique: a sandbox patches or skips a long sleep, so the sample
+        // splits one long delay into many short ones. The aggregate delay is
+        // evasive while no single call is.
+        //
+        // THE FALSE POSITIVE THIS MUST NOT PRODUCE, and it is a very ordinary
+        // shape: while (!done) { Sleep(100); DoWork(); } is hundreds of short
+        // sleeps summing to a long total with no single long call. It matches the
+        // first three clauses exactly and is entirely legitimate.
+        //
+        // The fourth clause is what separates them, and it needs NO threshold: a
+        // sample fragmenting a delay to burn time does little else, whereas a
+        // polling loop does work between its sleeps. So require the delay calls to
+        // OUTNUMBER all other observed API activity combined. That is a structural
+        // statement about the execution, not a tuned number.
+        //
+        // The first three clauses use only thresholds this module already declares:
+        //   minSleepFragments        (10)    - enough calls to be a pattern
+        //   sleepEvasionThresholdMs  (60000) - the ACCUMULATED delay is evasive
+        //   the same value again             - yet no SINGLE call would have tripped it
+        // ------------------------------------------------------------------
+        const bool enoughFragments =
+            analysis.sleepCallCount >= minFragments;
+        const bool aggregateIsEvasive =
+            analysis.totalRequestedDurationMs >= evasionThresholdMs;
+        const bool noSingleCallIsEvasive =
+            analysis.maxRequestedDurationMs < evasionThresholdMs;
+        const bool delayingRatherThanWorking =
+            static_cast<uint64_t>(analysis.sleepCallCount) > otherApiCallCount;
+
+        if (enoughFragments && aggregateIsEvasive &&
+            noSingleCallIsEvasive && delayingRatherThanWorking) {
+            analysis.fragmentationDetected = true;
+            // Every observed delay call is a fragment of the aggregate delay, so
+            // the fragment population IS the observed call population. Stated
+            // rather than left implicit, because with a per-call distribution a
+            // future analysis could legitimately narrow it.
+            analysis.fragmentedSleepCount = analysis.sleepCallCount;
+            analysis.avgFragmentDurationMs = analysis.avgRequestedDurationMs;
+            analysis.confidence = 75.0f;
+        }
+
+        // SLEEP BOMBING - the module's own existing predicate, unchanged, now
+        // reachable because the counts are real. Deliberately NOT re-tuned: the
+        // numbers are the ones AnalyzeSleep already used.
+        if (analysis.sleepAPIsUsed.size() >= 3 && analysis.sleepCallCount > 50) {
+            analysis.sleepBombingDetected = true;
+            analysis.confidence = (std::max)(analysis.confidence, 60.0f);
+        } else if (analysis.sleepAPIsUsed.size() >= 4 &&
+                   analysis.totalRequestedDurationMs > 30000) {
+            analysis.sleepBombingDetected = true;
+            analysis.confidence = (std::max)(analysis.confidence, 50.0f);
+        }
+
+        return analysis;
+    }
+
     [[nodiscard]] SleepAnalysis AnalyzeSleep(uint32_t processId) {
         SleepAnalysis analysis;
         analysis.processId = processId;
@@ -2851,6 +2970,13 @@ void TimeBasedEvasionDetector::MonitoringTick(uint32_t processId) {
 
 void TimeBasedEvasionDetector::InvokeCallbacks(const TimingEvasionResult& result) {
     m_impl->InvokeCallbacks(result);
+}
+
+SleepAnalysis
+TimeBasedEvasionDetector::AnalyzeObservedDelays(
+    const std::vector<ObservedDelayCall>& calls,
+    uint64_t otherApiCallCount) const {
+    return m_impl->AnalyzeObservedDelays(calls, otherApiCallCount);
 }
 
 void TimeBasedEvasionDetector::RecordTimingEvent(const TimingEventRecord& event) {

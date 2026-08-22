@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
   PhantomTests.vcxproj
   ====================
@@ -264,6 +264,7 @@
          valid=true with a count of zero and any test checking only validity
          would have passed throughout. -->
     <ClCompile Include="tests\unit\scan_pool_health\ScanPoolHealth_Tests.cpp" />
+    <ClCompile Include="tests\unit\sleep_evasion\SleepEvasion_Tests.cpp" />
     <!-- Pins every structure that crosses the kernel boundary, by absolute offset.
          The transport prefix name FILTER_MESSAGE_HEADER used to resolve to a
          DIFFERENT TYPE depending on include order: MessageProtocol.h aliased our

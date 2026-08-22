@@ -8909,8 +8909,20 @@ class TimingDetectorHonestEvidenceContractTests(unittest.TestCase):
         )
 
     def test_no_finding_cites_an_evidence_field_nothing_computes(self) -> None:
-        """Measured: each of these has zero assignments anywhere in the module."""
-        for field in ("accelerationRatio", "fragmentedSleepCount", "avgFragmentDurationMs"):
+        """A field may only be cited once something assigns it.
+
+        NARROWED when AnalyzeObservedDelays landed, exactly as this test's own
+        failure message instructed: fragmentedSleepCount and avgFragmentDurationMs
+        now have a real producer driven from the emulator's intercepted delay calls,
+        so forbidding their citation had become wrong. They moved to the opposite
+        assertion below rather than simply being deleted, which is strictly
+        stronger - it pins that the producer still exists.
+        """
+        # STILL no producer anywhere in the module. accelerationRatio describes the
+        # ratio of ACTUAL to REQUESTED delay, and measuring an actual delay needs
+        # observation of both entry and exit of the call. The emulator reports the
+        # requested duration only, so this remains unproduced and uncitable.
+        for field in ("accelerationRatio",):
             cites = len(
                 re.findall(r"(?<![A-Za-z0-9_])" + field + r"(?![A-Za-z0-9_])", self.tbe)
             )
@@ -8921,6 +8933,24 @@ class TimingDetectorHonestEvidenceContractTests(unittest.TestCase):
                 "zero and any alert quoting it fabricates its own supporting evidence. If a "
                 "producer has since been written, cite it here and update this contract in "
                 "the SAME change.",
+            )
+
+        # NOW PRODUCED. Require the assignment to survive, so a future edit cannot
+        # silently return these to permanently-zero while the reporting that quotes
+        # them stays in place.
+        for field in ("fragmentedSleepCount", "avgFragmentDurationMs"):
+            assigned = len(
+                re.findall(
+                    r"(?<![A-Za-z0-9_])" + field + r"\s*=(?!=)", self.tbe
+                )
+            )
+            self.assertGreaterEqual(
+                assigned,
+                1,
+                f"{field} lost its producer. It is populated by AnalyzeObservedDelays "
+                "from the emulator's observed delay calls; if that was removed, the "
+                "fragmentation reporting that quotes this field must be removed in the "
+                "SAME change rather than left quoting a permanent zero.",
             )
 
         # ANTI-VACUITY: the two detections must survive. This contract must never be
@@ -9657,17 +9687,21 @@ class SleepEvasionObservationContractTests(unittest.TestCase):
         body = self._sleep_struct()
         lines = body.split("\n")
         # fields whose only writer is a default initialiser, measured field by field
+        # NARROWED when AnalyzeObservedDelays landed. Six of the original ten now
+        # have a real producer driven from the emulator's intercepted delay calls,
+        # so their NOT OBSERVED warnings would have become FALSE DOCUMENTATION -
+        # which is the defect this whole strand exists to remove. What remains is
+        # the set that still genuinely has no producer anywhere.
+        #
+        # totalActualDurationMs / avgActualDurationMs / accelerationRatio all
+        # describe the ACTUAL elapsed delay, which requires observing both entry and
+        # exit of the call. The emulator reports the REQUESTED duration only, so
+        # these stay unproduced until an observer measures both edges.
         unobserved = [
             "threadId",
             "totalActualDurationMs",
-            "avgRequestedDurationMs",
             "avgActualDurationMs",
-            "maxRequestedDurationMs",
             "accelerationRatio",
-            "fragmentedSleepCount",
-            "avgFragmentDurationMs",
-            "fragmentationDetected",
-            "sleepDurations",
         ]
         missing = []
         for field in unobserved:
