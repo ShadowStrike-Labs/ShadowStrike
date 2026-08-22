@@ -2433,8 +2433,25 @@ namespace ShadowStrike::AntiEvasion {
             DetectAPIHookCheckBehavior(processId, detections);
         }
 
-        // Add all detections to result
+        // HOST-CONTEXT CALIBRATION NOW APPLIES ON THE LIVE PATH.
+        //
+        // It previously existed ONLY inside AnalyzeSystemInternal, and
+        // AnalyzeSystemEnvironment - the sole entry that reaches it - has ZERO
+        // CALLERS anywhere in src or tests. Measured: four references, being its
+        // definition, its own error-log string, a doc-comment example and its
+        // declaration. So the calibration was correct, complete, and had never once
+        // run, while THIS path - the one RealTimeProtection drives on every process
+        // creation - reported VM-artefact probes at full confidence on VM hosts.
+        //
+        // That is the wrong way round for the product's own stated reason for
+        // calibrating: false-positive reduction on the endpoints people actually run.
+        //
+        // The host fact is read ONCE per analysis rather than per detection - it is a
+        // cached property of the machine, not of the finding.
+        const bool hostVirtualized = HostIsVirtualized();
+
         for (auto& detection : detections) {
+            CalibrateForHostContext(detection, hostVirtualized);
             AddDetection(result, std::move(detection));
         }
 
@@ -2515,19 +2532,12 @@ namespace ShadowStrike::AntiEvasion {
             if (!processResult.analysisComplete) continue;
 
             for (auto& detection : processResult.detectedTechniques) {
-                // Calibrate confidence based on host context:
-                // If the host IS virtualized and the process is checking for VMs,
-                // reduce confidence (legitimate software may do this on VMs).
-                if (hostIsVirtualized) {
-                    const bool isVmProbing =
-                        detection.category == EnvironmentEvasionCategory::HardwareFingerprinting ||
-                        detection.category == EnvironmentEvasionCategory::RegistryArtifacts ||
-                        detection.category == EnvironmentEvasionCategory::FileSystemArtifacts;
-
-                    if (isVmProbing && detection.confidence > 0.3) {
-                        detection.confidence *= 0.6;  // Reduce on VM hosts
-                    }
-                }
+                // ONE IMPLEMENTATION, TWO CALLERS. This was an inline copy of the
+                // calibration; the per-process path had none at all. Two copies of a
+                // policy is how they drift - task 56 found two YARA metadata builders
+                // disagreeing about severity, and task 66 found two producers of one
+                // on-disk format where the broken one was the one that ran.
+                CalibrateForHostContext(detection, hostIsVirtualized);
 
                 // Tag with source process for forensic traceability
                 if (detection.detectedValue.empty()) {
@@ -2603,6 +2613,38 @@ namespace ShadowStrike::AntiEvasion {
         result.evasionScore = std::min(score, 100.0);
         result.maxSeverity = maxSev;
         result.isEvasive = (score >= EnvironmentConstants::HIGH_EVASION_THRESHOLD);
+    }
+
+    bool EnvironmentEvasionDetector::HostIsVirtualized() const noexcept {
+        if (!m_impl || !m_impl->m_cachedHardwareInfo) {
+            // NOT VIRTUALIZED IS THE CONSERVATIVE ANSWER HERE. An absent measurement
+            // must not reduce anyone's confidence, so an unknown host is treated as
+            // bare metal and detections keep their full weight.
+            return false;
+        }
+        const auto& hw = *m_impl->m_cachedHardwareInfo;
+        return hw.hypervisorDetected || !hw.vmIndicators.empty();
+    }
+
+    void EnvironmentEvasionDetector::CalibrateForHostContext(
+        EnvironmentDetectedTechnique& detection,
+        bool hostIsVirtualized) noexcept {
+
+        if (!hostIsVirtualized) {
+            return;
+        }
+
+        // Only categories whose evidence IS a VM-artefact probe are calibrated.
+        // Behavioural categories are untouched, because being on a VM says nothing
+        // about whether probing for a debugger or hooking an API is legitimate.
+        const bool isVmProbing =
+            detection.category == EnvironmentEvasionCategory::HardwareFingerprinting ||
+            detection.category == EnvironmentEvasionCategory::RegistryArtifacts ||
+            detection.category == EnvironmentEvasionCategory::FileSystemArtifacts;
+
+        if (isVmProbing && detection.confidence > 0.3) {
+            detection.confidence *= 0.6;  // Reduce on VM hosts
+        }
     }
 
     void EnvironmentEvasionDetector::AddDetection(

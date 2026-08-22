@@ -265,6 +265,7 @@
          would have passed throughout. -->
     <ClCompile Include="tests\unit\scan_pool_health\ScanPoolHealth_Tests.cpp" />
     <ClCompile Include="tests\unit\sleep_evasion\SleepEvasion_Tests.cpp" />
+    <ClCompile Include="tests\unit\host_calibration\HostCalibration_Tests.cpp" />
     <!-- Pins every structure that crosses the kernel boundary, by absolute offset.
          The transport prefix name FILTER_MESSAGE_HEADER used to resolve to a
          DIFFERENT TYPE depending on include order: MessageProtocol.h aliased our

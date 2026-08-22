@@ -114,6 +114,9 @@ ENVIRONMENT_EVASION_DETECTOR_CPP_PATH = (
 NETWORK_BASED_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
 )
+ENVIRONMENT_EVASION_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/EnvironmentEvasionDetector.hpp"
+)
 NETWORK_BASED_EVASION_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.hpp"
 )
@@ -9828,6 +9831,160 @@ class SleepEvasionObservationContractTests(unittest.TestCase):
             "RecordTimingEvent now has a caller, so the sleep analysis may finally "
             "observe real behaviour. Revisit the NOT OBSERVED warnings in "
             "SleepAnalysis and this contract: " + "; ".join(callers),
+        )
+
+class HostContextCalibrationWiringContractTests(unittest.TestCase):
+    """The host-context calibration must exist ONCE and run on BOTH analysis paths.
+
+    It previously existed only inside AnalyzeSystemInternal, and the sole entry that
+    reaches that function - AnalyzeSystemEnvironment - has zero callers anywhere in
+    src or tests. So a correct, complete policy had never once executed, while the
+    live per-creation path that RealTimeProtection drives on every process creation
+    reported VM-artefact probes at full confidence on VM hosts. That is the opposite
+    of the policy's stated purpose, which is false-positive reduction.
+
+    The policy LOGIC is covered behaviourally by HostContextCalibrationTest. What
+    cannot be unit-tested is the WIRING: reaching AnalyzeProcessInternal needs a live
+    target process. So the call sites are pinned here as source contracts, which is
+    the same split used for the kernel reply paths.
+    """
+
+    @staticmethod
+    def _function_body(start_marker: str, end_marker: str) -> str:
+        """Slice between two DEFINITION markers, comments stripped.
+
+        Both markers are namespace-qualified because these functions are CALLED
+        earlier in the file than they are DEFINED, so a first-occurrence anchor
+        measures the wrong region - a mistake that has produced three vacuous guards
+        in this suite already.
+        """
+        src = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        start = src.find(start_marker)
+        assert start != -1, f"definition not found: {start_marker}"
+        end = src.find(end_marker, start + 1)
+        assert end > start, f"following definition not found: {end_marker}"
+        return src[start:end]
+
+    def test_the_calibration_has_exactly_one_implementation(self):
+        """Two copies of a policy is how they drift."""
+        src = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+
+        arithmetic = src.count("detection.confidence *= 0.6")
+        self.assertEqual(
+            arithmetic,
+            1,
+            f"the calibration arithmetic appears {arithmetic} time(s); it must exist "
+            "exactly once. Task 56 found two YARA metadata builders disagreeing about "
+            "severity and task 66 found two producers of one on-disk format where the "
+            "broken one was the one that ran - both were duplication with drift.",
+        )
+
+        definitions = src.count(
+            "void EnvironmentEvasionDetector::CalibrateForHostContext("
+        )
+        self.assertEqual(definitions, 1, "the calibration must be defined exactly once")
+
+    def test_both_analysis_paths_apply_the_calibration(self):
+        """Per-process and system-aggregate must not diverge in what they calibrate."""
+        per_process = self._function_body(
+            "void EnvironmentEvasionDetector::AnalyzeProcessInternal(",
+            "void EnvironmentEvasionDetector::AnalyzeSystemInternal(",
+        )
+        # BOUNDED, never assertIn against a function body. The unbounded form dumped
+        # 4,993 characters on failure, which is the same rule this suite has broken
+        # repeatedly: a containment assertion must never print its haystack.
+        self.assertTrue(
+            "CalibrateForHostContext(" in per_process,
+            "the PER-PROCESS path must calibrate. This is the path "
+            "RealTimeProtection drives on every process creation, and it is the one "
+            "that had no calibration at all while the dark system path had it.",
+        )
+        self.assertTrue(
+            "HostIsVirtualized()" in per_process,
+            "the per-process path must read the host fact; calibrating on a "
+            "hardcoded value would defeat the point",
+        )
+
+        system_path = self._function_body(
+            "void EnvironmentEvasionDetector::AnalyzeSystemInternal(",
+            "void EnvironmentEvasionDetector::AddDetection(",
+        )
+        self.assertTrue(
+            "CalibrateForHostContext(" in system_path,
+            "the system-aggregate path must call the shared implementation rather "
+            "than carry its own inline copy",
+        )
+
+    def test_the_calibration_input_is_an_exact_host_fact(self):
+        """Never a composite sandbox-likeness score."""
+        src = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        start = src.find("bool EnvironmentEvasionDetector::HostIsVirtualized()")
+        self.assertNotEqual(start, -1, "HostIsVirtualized has been removed")
+        body = src[start:start + 700]
+
+        self.assertTrue(
+            "hypervisorDetected" in body,
+            "the host fact must come from the CPUID hypervisor-present bit, which is "
+            "EXACT. 6a1ee4a3 removed a sandbox-likeness score for precisely this "
+            "reason: it derived from screen resolution, uptime, RAM and "
+            "recent-document counts, all of which read as sandbox-like on ordinary "
+            "VDI, cloud and headless endpoints, so calibrating on it would LOWER "
+            "confidence exactly where enterprises deploy most.",
+        )
+        for forbidden in ("isSandboxLike", "sandboxLikeness", "mouseEntropy"):
+            self.assertFalse(
+                forbidden in body,
+                f"{forbidden} is an INFERRED host property and must never calibrate a "
+                "detection; only exact facts may.",
+            )
+
+    def test_calibration_cannot_suppress_a_finding(self):
+        """A reduction must not be able to drop a detection.
+
+        Measured when the calibration was made live: AddDetection does not gate on
+        confidence, and minReportableConfidence / minConfidence / confidenceThreshold
+        have zero references in the module. This test fails if a confidence gate is
+        introduced, because at that moment a reduction COULD suppress a finding and
+        the policy would need re-examining rather than silently becoming a filter.
+        """
+        src = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+
+        # A DECLARATION IS HARMLESS; A READ IS THE HAZARD. This distinction was found
+        # by this very test: EnvironmentAnalysisConfig DOES declare
+        # minConfidenceThreshold = 0.3, which an earlier word-boundary measurement of
+        # "minConfidence" and "confidenceThreshold" could not match. The field is
+        # declared and never read, so no gate exists and the calibration cannot
+        # suppress anything - but three sibling AntiEvasion modules declare the same
+        # field and PackerDetector genuinely READS its copy at two sites, so wiring
+        # this one is a live possibility rather than a hypothetical.
+        for gate in (
+            "minReportableConfidence",
+            "minConfidenceThreshold",
+            "confidenceThreshold",
+        ):
+            reads = src.count(gate)
+            self.assertEqual(
+                reads,
+                0,
+                f"{gate} is now READ in the implementation. Host-context calibration "
+                "REDUCES confidence, so a confidence gate makes it capable of "
+                "SUPPRESSING a detection rather than merely re-weighting one. That "
+                "changes the policy from a re-weighting into a filter, which is a "
+                "detection decision. Re-examine the policy and this contract together "
+                "before wiring it.",
+            )
+
+        # And the only confidence COMPARISON in the module must be the calibration's
+        # own floor, which exists so a weak finding is not pushed toward zero.
+        comparisons = len(
+            re.findall(r"(?<![A-Za-z0-9_])confidence\s*(?:<|>|<=|>=)", src)
+        )
+        self.assertEqual(
+            comparisons,
+            1,
+            f"{comparisons} confidence comparison(s) in the module; expected exactly "
+            "one, the calibration floor. Any other comparison is a potential "
+            "suppression point.",
         )
 
 if __name__ == "__main__":

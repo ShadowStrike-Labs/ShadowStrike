@@ -2744,6 +2744,45 @@ namespace ShadowStrike {
              * @param err Optional error output
              * @return Batch result
              */
+            /// @brief Apply host-context calibration to one detection's confidence.
+            ///
+            /// THE POLICY, STATED ONCE. On a host that IS virtualized, a process
+            /// probing for VM artefacts is materially more likely to be legitimate -
+            /// VM-aware software, VDI tooling and hypervisor guest agents all do it -
+            /// so its confidence is reduced. On bare metal the same probe keeps its
+            /// full weight.
+            ///
+            /// PUBLIC AND STATIC ON PURPOSE. This is the most consequential policy in
+            /// this module and a policy nobody can test is a policy nobody can verify,
+            /// which is the same reason RealTimeProtection::DetectionSourceIdentifiesThreat
+            /// and IPCManager::CombineKernelVerdicts are public statics. Taking the host
+            /// fact as a PARAMETER rather than reading the cache keeps it a pure
+            /// function, so both values can be exercised on any build machine
+            /// regardless of whether that machine happens to be a VM.
+            ///
+            /// @warning THIS CANNOT DROP A DETECTION, and that is what makes it safe
+            ///          rather than a weakening. Measured: AddDetection does not gate on
+            ///          confidence, and minReportableConfidence, minConfidence and
+            ///          confidenceThreshold have ZERO references in this module. Every
+            ///          detection is still recorded, counted, reported to the callback
+            ///          and stored; only the confidence number it carries changes. If a
+            ///          confidence gate is ever introduced, revisit this - at that point
+            ///          a reduction COULD suppress a finding.
+            ///
+            /// @warning The host fact must be EXACT, never inferred. hypervisorDetected
+            ///          comes from the CPUID hypervisor-present bit. Do NOT feed this a
+            ///          composite "sandbox-likeness" score: screen resolution, uptime,
+            ///          RAM and recent-document counts all read as sandbox-like on
+            ///          ordinary VDI, cloud and headless endpoints, so calibrating on
+            ///          them would LOWER confidence exactly where enterprises deploy
+            ///          most. That scan was removed in 6a1ee4a3 for this reason.
+            ///
+            /// @param detection         Detection whose confidence may be adjusted.
+            /// @param hostIsVirtualized Exact host fact: is this machine a VM guest.
+            static void CalibrateForHostContext(
+                EnvironmentDetectedTechnique& detection,
+                bool hostIsVirtualized) noexcept;
+
             [[nodiscard]] EnvironmentBatchResult AnalyzeAllProcesses(
                 const EnvironmentAnalysisConfig& config = EnvironmentAnalysisConfig{},
                 EnvironmentProgressCallback progressCallback = nullptr,
@@ -3106,6 +3145,13 @@ namespace ShadowStrike {
             // ========================================================================
 
             /// @brief Per-process behavioral analysis (TYPE B — examines target process)
+            /// @brief Exact host virtualization fact, from the cache filled at Initialize.
+            ///
+            /// Reads m_cachedHardwareInfo, which CollectHardwareInfo populates once
+            /// during Initialize, so this costs a load and two branches - safe on the
+            /// process-creation path.
+            [[nodiscard]] bool HostIsVirtualized() const noexcept;
+
             void AnalyzeProcessInternal(
                 HANDLE hProcess,
                 uint32_t processId,
