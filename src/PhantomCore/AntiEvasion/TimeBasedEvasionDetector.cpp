@@ -1292,6 +1292,10 @@ struct TimeBasedEvasionDetector::Impl {
             auto it = m_monitoredProcesses.find(processId);
             if (it != m_monitoredProcesses.end()) {
                 const auto& ctx = *it->second;
+                // RECORD THAT OBSERVATION HAPPENED, so a caller can tell "no sleep
+                // evasion" from "nothing was observed". Without this the absence of
+                // a runtime feed is indistinguishable from a clean process.
+                analysis.runtimeObservationAvailable = true;
                 analysis.sleepCallCount = ctx.sleepCallCount;
                 analysis.totalRequestedDurationMs = ctx.sleepTotalMs;
                 analysis.sleepBombingDetected = ctx.sleepBombingDetected;
@@ -1299,16 +1303,36 @@ struct TimeBasedEvasionDetector::Impl {
             }
         }
 
-        // Detect sleep bombing: requires BOTH many sleep API imports AND runtime evidence
-        // Import count alone is insufficient (legitimate apps import multiple wait APIs)
-        if (analysis.sleepAPIsUsed.size() >= 3 && analysis.sleepCallCount > 50) {
-            analysis.sleepBombingDetected = true;
-            analysis.confidence = 60.0f;
-        } else if (analysis.sleepAPIsUsed.size() >= 4 &&
-                   analysis.totalRequestedDurationMs > 30000) {
-            // Many sleep APIs + significant total sleep duration (static + runtime)
-            analysis.sleepBombingDetected = true;
-            analysis.confidence = 50.0f;
+        // SLEEP BOMBING NEEDS STATIC *AND* RUNTIME EVIDENCE, AND THE RUNTIME HALF IS
+        // NOW A STRUCTURAL PRECONDITION RATHER THAN AN ACCIDENTAL ONE.
+        //
+        // BEHAVIOUR-NEUTRAL BY CONSTRUCTION, not by intention: when no monitoring
+        // context exists, sleepCallCount is 0 and totalRequestedDurationMs is 0, so
+        // both predicates below were already false. Gating them on the flag cannot
+        // change any verdict - it makes the dependency impossible to misread.
+        //
+        // WHY THAT MATTERS: read without the gate, this block looks as though a
+        // binary importing four delay APIs might be reported as sleep bombing. It
+        // cannot, and it must not - the original comment says so and it is right,
+        // because ordinary software imports several wait APIs. The gate states that
+        // in code instead of leaving it to be re-derived.
+        //
+        // MEASURED: nothing calls RecordTimingEvent or StartMonitoring, so this
+        // branch is unreachable in the current build. It is KEPT because it is the
+        // consumer a timing feed would serve, and deleting it would lose the
+        // detection rather than defer it.
+        if (analysis.runtimeObservationAvailable) {
+            // Detect sleep bombing: requires BOTH many sleep API imports AND runtime evidence
+            // Import count alone is insufficient (legitimate apps import multiple wait APIs)
+            if (analysis.sleepAPIsUsed.size() >= 3 && analysis.sleepCallCount > 50) {
+                analysis.sleepBombingDetected = true;
+                analysis.confidence = 60.0f;
+            } else if (analysis.sleepAPIsUsed.size() >= 4 &&
+                       analysis.totalRequestedDurationMs > 30000) {
+                // Many sleep APIs + significant total sleep duration (static + runtime)
+                analysis.sleepBombingDetected = true;
+                analysis.confidence = 50.0f;
+            }
         }
 
         return analysis;

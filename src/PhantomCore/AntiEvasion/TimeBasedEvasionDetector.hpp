@@ -1127,47 +1127,113 @@ namespace ShadowStrike {
         /**
          * @brief Detailed analysis of sleep behavior.
          */
+        /// @brief Sleep-based evasion analysis of a target process.
+        ///
+        /// @warning THIS STRUCT HAS TWO HALVES WITH VERY DIFFERENT STANDING, AND A
+        ///          CALLER MUST NOT TREAT THEM ALIKE.
+        ///
+        ///          STATIC half - populated, trustworthy. sleepAPIsUsed is read from
+        ///          the target's PE import table by AnalyzeSleep, so it reflects the
+        ///          delay APIs the binary can call.
+        ///
+        ///          RUNTIME half - NOT POPULATED IN THIS BUILD. Every field below
+        ///          marked NOT OBSERVED is sourced from ProcessMonitoringContext,
+        ///          which is only filled by RecordTimingEvent. Measured across src
+        ///          and tests: RecordTimingEvent has FOUR references - one
+        ///          declaration, two definitions and one delegation - and ZERO
+        ///          CALLERS. StartMonitoring likewise has no production caller, so
+        ///          m_monitoredProcesses is permanently empty and the lookup in
+        ///          AnalyzeSleep always misses.
+        ///
+        /// @warning THEREFORE HasSleepEvasion() RETURNS FALSE FOR EVERY PROCESS, AND
+        ///          FALSE HERE MEANS "NOT OBSERVED", NOT "CLEAN". Reading it as a
+        ///          clean result is a false negative presented as a verdict. Use
+        ///          runtimeObservationAvailable to tell the two apart.
+        ///
+        ///          Nothing here is deleted: the analysis, the three detection
+        ///          branches that consume it and their MITRE attribution are real
+        ///          capability and are the seam a timing feed plugs into. What is
+        ///          missing is the producer, not the detection.
         struct SleepAnalysis {
             /// @brief Process ID analyzed
             uint32_t processId = 0;
 
+            /// @brief True if per-process runtime timing observations were available.
+            ///
+            /// Set only when AnalyzeSleep finds a ProcessMonitoringContext for the
+            /// target. FALSE ON EVERY ANALYSIS IN THIS BUILD, because nothing calls
+            /// RecordTimingEvent. It gates the runtime-dependent predicates below so
+            /// the dependency is structural rather than accidental.
+            bool runtimeObservationAvailable = false;
+
             /// @brief Thread ID analyzed
+            /// @warning NOT OBSERVED - no producer. Always 0.
             uint32_t threadId = 0;
 
             /// @brief Number of sleep calls observed
+            /// @warning NOT OBSERVED while runtimeObservationAvailable is false:
+            ///          copied from the monitoring context, which is never filled.
             uint32_t sleepCallCount = 0;
 
             /// @brief Total requested sleep duration (milliseconds)
+            /// @warning NOT OBSERVED while runtimeObservationAvailable is false.
             uint64_t totalRequestedDurationMs = 0;
 
             /// @brief Total actual sleep duration (milliseconds)
+            /// @warning NOT OBSERVED - no producer at all. Always 0. Measuring an
+            ///          ACTUAL duration needs observation of both entry and exit of
+            ///          the delay, which no component performs.
             uint64_t totalActualDurationMs = 0;
 
             /// @brief Average requested sleep duration
+            /// @warning NOT OBSERVED - no producer. Always 0.
             uint64_t avgRequestedDurationMs = 0;
 
             /// @brief Average actual sleep duration
+            /// @warning NOT OBSERVED - no producer. Always 0.
             uint64_t avgActualDurationMs = 0;
 
             /// @brief Maximum single sleep duration requested
+            /// @warning NOT OBSERVED - no producer. Always 0. Requires per-call
+            ///          durations, which the monitoring context does not keep.
             uint64_t maxRequestedDurationMs = 0;
 
             /// @brief Sleep acceleration ratio (actual/requested)
+            /// @warning NOT OBSERVED - no producer. Always 1.0. A Critical alert
+            ///          used to print this value as measured evidence; that citation
+            ///          was removed in 5b088ab9 precisely because it was never
+            ///          computed. Do not cite it again without a producer.
             double accelerationRatio = 1.0;
 
             /// @brief Number of fragmented sleeps detected
+            /// @warning NOT OBSERVED - no producer. Always 0.
             uint32_t fragmentedSleepCount = 0;
 
             /// @brief Average fragment duration if fragmented
+            /// @warning NOT OBSERVED - no producer. Always 0.
             uint64_t avgFragmentDurationMs = 0;
 
             /// @brief Whether sleep bombing was detected
             bool sleepBombingDetected = false;
 
             /// @brief Whether sleep acceleration was detected
+            /// @warning NOT OBSERVED while runtimeObservationAvailable is false:
+            ///          copied from the monitoring context, which is never filled.
+            ///          TimingEvasionType::SleepAccelerationDetect therefore cannot
+            ///          currently be raised.
             bool accelerationDetected = false;
 
             /// @brief Whether sleep fragmentation was detected
+            /// @warning NOT OBSERVED - NO PRODUCER ANYWHERE. This field is read by
+            ///          the SleepFragmentation branch and assigned by nothing, so
+            ///          TimingEvasionType::SleepFragmentation (T1497.003) cannot
+            ///          currently be raised at all.
+            ///
+            ///          It cannot honestly be derived from what is available either:
+            ///          fragmentation is a statement about the SHAPE of a runtime
+            ///          delay - many short sleeps summing to a long one - and a
+            ///          static import list cannot distinguish one Sleep call site in
+            ///          a loop from six hundred executions of it.
             bool fragmentationDetected = false;
 
             /// @brief Confidence score for sleep evasion (0.0 - 100.0)
@@ -1177,10 +1243,24 @@ namespace ShadowStrike {
             std::vector<std::wstring> sleepAPIsUsed;
 
             /// @brief Individual sleep durations for pattern analysis
+            /// @warning NOT OBSERVED - no producer. Always empty. This is the
+            ///          distribution a fragmentation predicate would need.
             std::vector<uint64_t> sleepDurations;
 
             /**
              * @brief Check if any sleep evasion was detected.
+             *
+             * @warning FALSE MEANS "NOT OBSERVED", NOT "CLEAN", whenever
+             *          runtimeObservationAvailable is false - which is every
+             *          analysis in this build. All three disjuncts are
+             *          runtime-sourced: sleepBombingDetected and
+             *          accelerationDetected come from the monitoring context, and
+             *          fragmentationDetected has no producer at all.
+             *
+             *          The logic is deliberately UNCHANGED. Making this return true
+             *          on static import evidence alone would fire on ordinary
+             *          software that imports several wait APIs, which the analyzer's
+             *          own comment already warns against.
              */
             [[nodiscard]] bool HasSleepEvasion() const noexcept {
                 return sleepBombingDetected || accelerationDetected || fragmentationDetected;

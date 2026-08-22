@@ -9622,5 +9622,179 @@ class NetworkEvasionDeadlineContractTests(unittest.TestCase):
             "A truncated analysis must be REQUEUED. Coverage may move in time, not be lost.",
         )
 
+class SleepEvasionObservationContractTests(unittest.TestCase):
+    """The sleep half of TimeBasedEvasionDetector has no runtime producer.
+
+    Three MITRE techniques - SleepBombing, SleepAccelerationDetect and
+    SleepFragmentation (T1497.003) - are fully implemented and consume fields that
+    are only written from ProcessMonitoringContext, which is filled exclusively by
+    RecordTimingEvent. That function has no caller anywhere in src or tests, so
+    HasSleepEvasion() returns false for every process and false means NOT OBSERVED
+    rather than CLEAN.
+
+    These tests do not require the gap to be closed. They require it to stay
+    VISIBLE, and they require nobody to close it by making a static import list
+    masquerade as observed behaviour.
+    """
+
+    @staticmethod
+    def _sleep_struct():
+        """The SleepAnalysis struct body, comments PRESERVED.
+
+        Comments are deliberately kept: the whole contract here is about the
+        warnings attached to the declarations, so a comment-stripped read would
+        assert nothing.
+        """
+        src = read_source(TIME_BASED_EVASION_DETECTOR_HPP_PATH)
+        start = src.find("struct SleepAnalysis {")
+        self_end = src.find("struct RDTSCAnalysis", start + 1)
+        assert start != -1, "SleepAnalysis struct not found"
+        assert self_end > start, "the struct following SleepAnalysis was not found"
+        return src[start:self_end]
+
+    def test_every_unobserved_sleep_field_says_so_at_its_declaration(self):
+        """A caller reading a zero must be able to tell measured-zero from no-producer."""
+        body = self._sleep_struct()
+        lines = body.split("\n")
+        # fields whose only writer is a default initialiser, measured field by field
+        unobserved = [
+            "threadId",
+            "totalActualDurationMs",
+            "avgRequestedDurationMs",
+            "avgActualDurationMs",
+            "maxRequestedDurationMs",
+            "accelerationRatio",
+            "fragmentedSleepCount",
+            "avgFragmentDurationMs",
+            "fragmentationDetected",
+            "sleepDurations",
+        ]
+        missing = []
+        for field in unobserved:
+            idx = None
+            for i, line in enumerate(lines):
+                # the DECLARATION line: a type, the name, and an initialiser or ;
+                if re.search(r"(?<![A-Za-z0-9_])" + re.escape(field) + r"\s*(=|;)", line):
+                    idx = i
+                    break
+            if idx is None:
+                missing.append(field + " (declaration not found)")
+                continue
+            # SCOPE TO THE CONTIGUOUS DOC-COMMENT BLOCK, not to a fixed span.
+            #
+            # A fixed window is wrong in BOTH directions and both failures have now
+            # happened here. Measured back N characters it reads the PREVIOUS field's
+            # warning and passes on it. Measured back N lines it TRUNCATES a long
+            # warning and reports a marked field as unmarked - which is exactly how
+            # this test first failed, on fragmentationDetected, whose warning runs
+            # eleven lines.
+            #
+            # The comment block is terminated by any non-comment line, and between
+            # two field declarations that line is always the previous declaration
+            # itself, so walking backwards is exact: it can neither truncate nor
+            # bleed.
+            block = []
+            k = idx - 1
+            while k >= 0:
+                stripped = lines[k].strip()
+                if stripped.startswith("///") or stripped.startswith("*") or stripped == "":
+                    block.append(lines[k])
+                    k -= 1
+                    continue
+                break
+            window = "\n".join(block)
+            if "NOT OBSERVED" not in window:
+                missing.append(field)
+        self.assertEqual(
+            missing,
+            [],
+            "These SleepAnalysis fields have no producer but their declarations do "
+            "not say so, so a reader cannot distinguish a measured zero from an "
+            "absent measurement: " + ", ".join(missing),
+        )
+
+    def test_the_runtime_dependency_is_structural_not_accidental(self):
+        """The bombing predicates must be gated on observation actually happening."""
+        src = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))
+        flag = "analysis.runtimeObservationAvailable = true;"
+        self.assertTrue(
+            flag in src,
+            "AnalyzeSleep must record that a monitoring context was found. Without "
+            "it, 'no sleep evasion' and 'nothing was observed' are the same value.",
+        )
+        gate = "if (analysis.runtimeObservationAvailable) {"
+        self.assertTrue(
+            gate in src,
+            "The sleep-bombing predicates must be gated on observation. Ungated they "
+            "read as though static import evidence alone could raise sleep bombing.",
+        )
+        # ORDERING: the flag must be set BEFORE the gate tests it.
+        self.assertLess(
+            src.index(flag),
+            src.index(gate),
+            "The observation flag is set after the gate that reads it.",
+        )
+
+    def test_sleep_evasion_is_never_raised_from_static_imports_alone(self):
+        """The one wrong fix this gap invites, refused explicitly.
+
+        Making HasSleepEvasion() true on import evidence would fire on ordinary
+        software that imports several wait APIs. The analyzer's own comment says so.
+        """
+        hpp = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_HPP_PATH))
+        self.assertTrue(
+            "return sleepBombingDetected || accelerationDetected || fragmentationDetected;" in hpp,
+            "HasSleepEvasion()'s disjunction has changed. It must remain the OR of "
+            "the three runtime-sourced flags; widening it to static import evidence "
+            "converts a false negative into a false positive on normal software.",
+        )
+        cpp = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))
+        # both predicates must still require a runtime term, not imports alone
+        self.assertTrue(
+            "analysis.sleepCallCount > 50" in cpp,
+            "the sleep-bombing predicate lost its runtime call-count term",
+        )
+        self.assertTrue(
+            "analysis.totalRequestedDurationMs > 30000" in cpp,
+            "the sleep-bombing predicate lost its runtime duration term",
+        )
+
+    def test_the_timing_feed_still_has_no_producer(self):
+        """A PIN ON THE GAP ITSELF, so it cannot go stale silently.
+
+        This test FAILS THE DAY SOMEONE WIRES A TIMING FEED. That is the intent: at
+        that moment every NOT OBSERVED warning in SleepAnalysis becomes false, the
+        three sleep techniques become reachable, and this contract must be revisited
+        deliberately rather than left describing a world that no longer exists.
+
+        If you are reading this because the test failed: good. Remove the warnings
+        that are no longer true, re-point this test at whatever now bounds the feed,
+        and keep the ones that remain accurate.
+        """
+        roots = [ROOT / "src", ROOT / "tests"]
+        callers = []
+        for base in roots:
+            if not base.exists():
+                continue
+            for path in base.rglob("*.cpp"):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                for num, line in enumerate(text.split("\n"), start=1):
+                    if "RecordTimingEvent" not in line:
+                        continue
+                    stripped = line.strip()
+                    # a DEFINITION or a DELEGATION inside the module itself is not a feed
+                    if path.name == "TimeBasedEvasionDetector.cpp":
+                        continue
+                    if stripped.startswith("//") or stripped.startswith("*"):
+                        continue
+                    callers.append(f"{path.name}:{num}: {stripped}")
+        self.assertEqual(
+            callers,
+            [],
+            "RecordTimingEvent now has a caller, so the sleep analysis may finally "
+            "observe real behaviour. Revisit the NOT OBSERVED warnings in "
+            "SleepAnalysis and this contract: " + "; ".join(callers),
+        )
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
