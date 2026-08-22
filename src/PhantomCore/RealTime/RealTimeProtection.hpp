@@ -980,6 +980,9 @@ struct alignas(64) RTPStatistics {
         /// @brief Times the environment evasion analysis hit its deadline and was requeued.
         std::atomic<uint64_t> environmentEvasionAnalysisTruncated{ 0 };
 
+        /// @brief Times the network evasion analysis hit its deadline and was requeued.
+        std::atomic<uint64_t> networkEvasionAnalysisTruncated{ 0 };
+
     /// @brief Target processes found to carry sandbox-evasion capability.
         ///
     /// Produced by the deferred deep-scan thread, which is the only caller of

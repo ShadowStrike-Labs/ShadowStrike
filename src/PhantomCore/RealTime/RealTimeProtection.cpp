@@ -4707,7 +4707,31 @@ public:
                     nbedKernelCtx.creatingThreadId = req.creatingThreadId;
                     nbedConfig.kernelContext = std::move(nbedKernelCtx);
 
+                    // Bound it with the clock already running, measured from the same
+                    // notifyStart as the outer gate. Clamped to at least 1 ms because 0
+                    // means UNLIMITED.
+                    const auto netElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - notifyStart).count();
+                    const uint64_t netRemainingMs =
+                        (static_cast<uint64_t>(netElapsedMs) < kProcessNotifyBudgetMs)
+                            ? (kProcessNotifyBudgetMs - static_cast<uint64_t>(netElapsedMs))
+                            : 1ULL;
+                    nbedConfig.timeoutMs = static_cast<uint32_t>(netRemainingMs);
+
                     auto result = m_networkDetector->AnalyzeProcess(req.processId, nbedConfig);
+
+                    // COVERAGE MOVES IN TIME, IT IS NOT LOST.
+                    if (result.analysisTruncated) {
+                        m_stats.networkEvasionAnalysisTruncated++;
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: network evasion analysis for PID {} truncated "
+                            "at its {} ms slice of the {} ms budget; image requeued for "
+                            "deferred analysis",
+                            req.processId, nbedConfig.timeoutMs, kProcessNotifyBudgetMs);
+                        if (!imagePath.empty()) {
+                            QueueDeferredDeepScan(imagePath, req.processId);
+                        }
+                    }
 
                     if (result.isEvasive) {
                         noteEvasion("NetworkBasedEvasionDetector",
@@ -6801,6 +6825,7 @@ public:
         const uint64_t vmTrunc      = m_stats.vmEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t dbgTrunc     = m_stats.debuggerEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t envTrunc     = m_stats.environmentEvasionAnalysisTruncated.load(std::memory_order_relaxed);
+        const uint64_t netTrunc     = m_stats.networkEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
         const uint64_t replyHorizon = m_stats.processNotifyReplyHorizonExceeded.load(std::memory_order_relaxed);
@@ -6856,12 +6881,12 @@ public:
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
-            "debuggerEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={}",
+            "debuggerEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, envTrunc);
+            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, envTrunc, netTrunc);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7394,6 +7419,7 @@ void RTPStatistics::Reset() noexcept {
     vmEvasionAnalysisTruncated = 0;
     debuggerEvasionAnalysisTruncated = 0;
     environmentEvasionAnalysisTruncated = 0;
+    networkEvasionAnalysisTruncated = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;

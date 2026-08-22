@@ -111,6 +111,12 @@ DEBUGGER_EVASION_DETECTOR_CPP_PATH = (
 ENVIRONMENT_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/EnvironmentEvasionDetector.cpp"
 )
+NETWORK_BASED_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
+)
+NETWORK_BASED_EVASION_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.hpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -9459,6 +9465,161 @@ class EnvironmentEvasionDeadlineContractTests(unittest.TestCase):
             "A truncated analysis must be REQUEUED. Coverage may move in time; it may not "
             "be lost. A truncated scan that found nothing is exactly the case needing "
             "re-examination.",
+        )
+
+class NetworkEvasionDeadlineContractTests(unittest.TestCase):
+    """NetworkAnalysisConfig declared THREE timeouts and read none of them.
+
+    Only ONE of the three describes work this module performs. Task 199's fourth and
+    final module, after eca285e9 (VMEvasion), dfe6a57e (DebuggerEvasion) and 9e27eeaf
+    (EnvironmentEvasion).
+    """
+
+    @staticmethod
+    def _internal_body():
+        """The body of AnalyzeProcessInternal, sliced between two DEFINITION markers.
+
+        AnalyzeProcessInternal is CALLED (in AnalyzeProcess) roughly a thousand lines
+        above where it is DEFINED, so a first-occurrence anchor measures the wrong
+        region. Both markers are namespace-qualified for that reason.
+        """
+        src = strip_c_comments(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+        start = src.find("void NetworkBasedEvasionDetector::AnalyzeProcessInternal(")
+        end = src.find("void NetworkBasedEvasionDetector::DetectNetworkEvasionImports(", start + 1)
+        assert start != -1, "AnalyzeProcessInternal definition not found"
+        assert end > start, "the following definition was not found after it"
+        return src[start:end]
+
+    def test_the_declared_analysis_timeout_is_actually_read(self):
+        body = self._internal_body()
+        self.assertTrue(
+            "config.timeoutMs" in body,
+            "NetworkAnalysisConfig::timeoutMs declares a 5,000 ms analysis timeout. "
+            "AnalyzeProcessInternal must READ it - a declared control nothing reads means "
+            "a caller setting it gets silence.",
+        )
+        self.assertTrue(
+            "steady_clock" in body,
+            "The deadline must use a monotonic clock; system_clock steps with NTP.",
+        )
+        self.assertTrue(
+            "config.timeoutMs > 0" in body,
+            "Zero must mean NO LIMIT, matching every sibling config in this subsystem.",
+        )
+
+    def test_the_first_stage_is_never_gated_by_the_deadline(self):
+        """Task 52: an analysis must never return having examined nothing."""
+        body = self._internal_body()
+        lam = body.find("const auto netOutOfTime = [&]()")
+        self.assertNotEqual(lam, -1, "the deadline lambda has disappeared")
+        stage_one = body.find("DetectNetworkEvasionImports(processId", lam)
+        first_call = body.find("if (netOutOfTime())", lam)
+        self.assertNotEqual(stage_one, -1, "stage 1 has disappeared")
+        self.assertNotEqual(first_call, -1, "no deadline check remains at any stage boundary")
+        self.assertLess(
+            stage_one,
+            first_call,
+            "The FIRST stage must run before any deadline check. A check ahead of it lets "
+            "the analysis return having examined nothing, which task 52 forbade.",
+        )
+
+    def test_every_later_stage_is_bounded(self):
+        body = self._internal_body()
+        guards = body.count("if (netOutOfTime()) { result.analysisTruncated = true; }")
+        self.assertGreaterEqual(
+            guards,
+            4,
+            f"Expected at least 4 stage-boundary deadline checks but found {guards}. "
+            "DNS, traffic-pattern, beaconing and kernel-correlation stages each follow the "
+            "first and each needs a boundary check.",
+        )
+
+    def test_a_truncated_analysis_is_never_reported_complete(self):
+        src = strip_c_comments(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+        self.assertTrue(
+            "result.analysisComplete = !result.analysisTruncated" in src,
+            "analysisComplete must be DERIVED from the truncation flag. An unconditional "
+            "'= true' is the defect task 36 found in the metamorphic detector.",
+        )
+        self.assertFalse(
+            "result.analysisComplete = true;" in src,
+            "An unconditional 'analysisComplete = true' has returned. A truncated analysis "
+            "must never claim completeness.",
+        )
+
+    def test_a_truncated_analysis_is_never_cached(self):
+        src = strip_c_comments(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+        writes = src.count("UpdateCache(processId, result);")
+        self.assertGreaterEqual(writes, 1, "the cache write site has moved or vanished")
+        gated = src.count("!result.analysisTruncated")
+        self.assertGreaterEqual(
+            gated,
+            5,
+            "Expected the truncation flag to gate the cache write as well as the later "
+            f"stages, but found only {gated} uses. The cache is pid-keyed with a TTL, so a "
+            "truncated result would be authoritative for the rest of that window.",
+        )
+        # PIN THE GATE TEXT ITSELF, not a character window. A window measured back from
+        # UpdateCache also sees the neighbouring completion statement, which mentions the
+        # same flag, so an ungated cache would still have satisfied it. The '&&' form exists
+        # only in the guarded spelling - the cache-READ site a few lines above uses the bare
+        # 'EnableCaching)) {' form, so this cannot be satisfied by the wrong site.
+        self.assertTrue(
+            "NetworkAnalysisFlags::EnableCaching) &&" in src,
+            "The UpdateCache call is no longer guarded by the truncation flag. The cache is "
+            "pid-keyed with a TTL, so a truncated result would be served as authoritative "
+            "for the rest of that window.",
+        )
+
+    def test_the_two_io_timeouts_are_not_wired_to_anything(self):
+        """dnsTimeoutMs and httpTimeoutMs bound NO operation that exists.
+
+        Measured: DnsQuery_A/W/Ex, InternetOpenA/W and HttpOpenRequestA/W appear in this
+        module ONLY as string literals compared against the TARGET process's import
+        table - static inspection of what the sample can do, not something this module
+        does. The single real Winsock call is a WSAStartup in Impl::Initialize.
+
+        Wiring these would create a timeout attached to nothing: a control that looks
+        like a safety bound while providing none. That is the same trap as a threshold
+        compared against a field with no producer, and this test exists to stop a future
+        reader "finishing the job".
+        """
+        src = strip_c_comments(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+        for field in ("config.dnsTimeoutMs", "config.httpTimeoutMs"):
+            self.assertFalse(
+                field in src,
+                f"{field} is now read. Before wiring it, a real DNS or HTTP call must "
+                "exist for it to bound - otherwise this is a decorative safety control. "
+                "If such a call was genuinely added, update this contract deliberately.",
+            )
+        hpp = read_source(NETWORK_BASED_EVASION_DETECTOR_HPP_PATH)
+        self.assertTrue(
+            "THIS BOUNDS NOTHING" in hpp,
+            "The declarations must say plainly that they bound nothing, so the next reader "
+            "does not mistake them for unfinished wiring.",
+        )
+
+    def test_rtp_derives_a_real_budget_and_requeues_what_it_truncates(self):
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        call = rtp.find("m_networkDetector->AnalyzeProcess(")
+        self.assertNotEqual(call, -1, "the network detector call site has moved")
+        window = rtp[max(0, call - 1600):call]
+        self.assertTrue(
+            "nbedConfig.timeoutMs" in window,
+            "RealTimeProtection must set nbedConfig.timeoutMs before calling.",
+        )
+        self.assertTrue(
+            "notifyStart" in window and "kProcessNotifyBudgetMs" in window,
+            "The timeout must be DERIVED from the running clock and the shared budget.",
+        )
+        tail = rtp[call:call + 1800]
+        self.assertTrue(
+            "networkEvasionAnalysisTruncated" in tail,
+            "A truncation must be counted or the product cannot tell it is skipping work.",
+        )
+        self.assertTrue(
+            "QueueDeferredDeepScan" in tail,
+            "A truncated analysis must be REQUEUED. Coverage may move in time, not be lost.",
         )
 
 if __name__ == "__main__":

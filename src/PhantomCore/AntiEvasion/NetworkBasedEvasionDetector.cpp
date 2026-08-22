@@ -2879,7 +2879,10 @@ namespace ShadowStrike::AntiEvasion {
 
             result.analysisDurationMs = duration.count();
             result.analysisEndTime = std::chrono::system_clock::now();
-            result.analysisComplete = true;
+            // DERIVED, NEVER ASSERTED. An unconditional 'true' is the defect task 36 found in
+            // the metamorphic detector: a run that stopped early still reported itself
+            // complete.
+            result.analysisComplete = !result.analysisTruncated;
 
             m_impl->m_stats.totalAnalyses++;
             m_impl->m_stats.totalAnalysisTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
@@ -2889,7 +2892,10 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Update cache
-            if (HasFlag(config.flags, NetworkAnalysisFlags::EnableCaching)) {
+            // A TRUNCATED RESULT IS NEVER CACHED: the cache is pid-keyed with a TTL, so a
+            // partial answer would be served as authoritative for the rest of that window.
+            if (HasFlag(config.flags, NetworkAnalysisFlags::EnableCaching) &&
+                !result.analysisTruncated) {
                 UpdateCache(processId, result);
             }
 
@@ -3841,6 +3847,24 @@ namespace ShadowStrike::AntiEvasion {
 
             // === TYPE B: Behavioral PE analysis — scan target's imports for ===
             // === network evasion API clusters and embedded network strings  ===
+            // THE DECLARED TIMEOUT IS NOW ENFORCED (task 199). NetworkAnalysisConfig
+            // ::timeoutMs held a 5,000 ms default and was read by NOTHING - measured, zero
+            // reads across 4,753 lines, no deadline machinery in the module. This runs on
+            // RealTimeProtection's process-creation path, which the kernel blocks
+            // CreateProcess on and abandons after 500 ms. Fourth and last module in the task
+            // 199 class, after eca285e9, dfe6a57e and 9e27eeaf.
+            //
+            // THE FIRST STAGE IS DELIBERATELY NOT GATED, per task 52: an analysis must never
+            // return having examined nothing at all.
+            //
+            // 0 means NO LIMIT, matching every sibling config in this subsystem.
+            const bool netDeadlineEnabled = (config.timeoutMs > 0);
+            const auto netDeadline = std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(config.timeoutMs);
+            const auto netOutOfTime = [&]() noexcept -> bool {
+                return netDeadlineEnabled && std::chrono::steady_clock::now() >= netDeadline;
+            };
+
             DetectNetworkEvasionImports(processId, result);
             DetectNetworkEvasionStrings(processId, result);
 
@@ -3850,7 +3874,10 @@ namespace ShadowStrike::AntiEvasion {
             // ====================================================================
 
             // === TYPE B: Analyze per-process DNS activity ===
-            if (HasFlag(config.flags, NetworkAnalysisFlags::ScanDNS)) {
+            if (netOutOfTime()) { result.analysisTruncated = true; }
+
+            if (!result.analysisTruncated &&
+                HasFlag(config.flags, NetworkAnalysisFlags::ScanDNS)) {
                 std::vector<std::chrono::system_clock::time_point> dnsTimestamps;
                 std::unordered_map<std::wstring, std::vector<std::wstring>> dnsDomainToIPs;
                 {
@@ -3867,7 +3894,10 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // === TYPE B: Analyze per-process traffic patterns ===
-            if (HasFlag(config.flags, NetworkAnalysisFlags::ScanTrafficPatterns)) {
+            if (netOutOfTime()) { result.analysisTruncated = true; }
+
+            if (!result.analysisTruncated &&
+                HasFlag(config.flags, NetworkAnalysisFlags::ScanTrafficPatterns)) {
                 std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>> targetTimestamps;
                 {
                     std::shared_lock lock(m_impl->m_mutex);
@@ -3882,7 +3912,10 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // === TYPE B: Analyze per-process beaconing ===
-            if (HasFlag(config.flags, NetworkAnalysisFlags::ScanBeaconing)) {
+            if (netOutOfTime()) { result.analysisTruncated = true; }
+
+            if (!result.analysisTruncated &&
+                HasFlag(config.flags, NetworkAnalysisFlags::ScanBeaconing)) {
                 std::map<std::wstring, std::vector<std::chrono::system_clock::time_point>> targetTimestamps;
                 {
                     std::shared_lock lock(m_impl->m_mutex);
@@ -3897,7 +3930,10 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // === TYPE B: Kernel-enriched process-network correlation ===
-            if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
+            if (netOutOfTime()) { result.analysisTruncated = true; }
+
+            if (!result.analysisTruncated &&
+                config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
                 AnalyzeKernelContext(processId, *config.kernelContext, result);
             }
 

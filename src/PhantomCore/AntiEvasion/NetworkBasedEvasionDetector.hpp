@@ -1024,12 +1024,33 @@ namespace ShadowStrike {
             NetworkAnalysisFlags flags = NetworkAnalysisFlags::Default;
 
             /// @brief Timeout in milliseconds
+            /// @note ENFORCED as of task 199. AnalyzeProcessInternal derives a deadline from
+            ///       this value and checks it at every stage boundary after the first.
+            ///       0 means NO LIMIT, matching every sibling config in this subsystem.
             uint32_t timeoutMs = NetworkEvasionConstants::DEFAULT_ANALYSIS_TIMEOUT_MS;
 
             /// @brief DNS query timeout
+            /// @warning THIS BOUNDS NOTHING, AND WIRING IT WOULD INVENT BEHAVIOUR RATHER THAN
+            ///          ENFORCE IT. This detector issues no DNS query. Measured across all
+            ///          4,753 lines: DnsQuery_A, DnsQuery_W and DnsQueryEx appear ONLY as
+            ///          string literals compared against the TARGET process's import table,
+            ///          which is static inspection of what the sample can do, not something
+            ///          this module does. The per-process path analyses imports, embedded
+            ///          strings and previously-recorded tracking data; it performs no
+            ///          resolution. The only real Winsock call in the module is a single
+            ///          WSAStartup in Impl::Initialize.
+            ///
+            ///          There is therefore no operation for this value to bound. Leave it
+            ///          unread until a DNS query actually exists, because a timeout attached
+            ///          to nothing looks like a safety control while providing none - the
+            ///          same trap as a threshold compared against a field with no producer.
             uint32_t dnsTimeoutMs = NetworkEvasionConstants::DNS_QUERY_TIMEOUT_MS;
 
             /// @brief HTTP timeout
+            /// @warning THIS BOUNDS NOTHING - see dnsTimeoutMs above. InternetOpenA/W and
+            ///          HttpOpenRequestA/W appear ONLY as import-table name comparisons
+            ///          against the target process. This module opens no HTTP connection on
+            ///          the per-process analysis path.
             uint32_t httpTimeoutMs = NetworkEvasionConstants::HTTP_CONNECTION_TIMEOUT_MS;
 
             /// @brief Enable caching
@@ -1148,6 +1169,19 @@ namespace ShadowStrike {
             /// @brief Analysis completed
             bool analysisComplete = false;
 
+            /// @brief True if the per-process analysis stopped early on its deadline.
+            ///
+            /// NetworkAnalysisConfig::timeoutMs declared 5,000 ms and was read by NOTHING -
+            /// measured, zero reads across 4,753 lines, with no deadline machinery anywhere
+            /// in the module (its four steady_clock uses are all cache-age bookkeeping).
+            /// This analysis runs on RealTimeProtection's process-creation path, which the
+            /// kernel blocks CreateProcess on and abandons after 500 ms.
+            ///
+            /// @warning A truncated result must NOT be cached. The cache is pid-keyed with a
+            ///          TTL, so a partial answer would be authoritative for that window.
+            /// @warning analysisComplete is DERIVED from this flag, never asserted.
+            bool analysisTruncated = false;
+
             /// @brief From cache
             bool fromCache = false;
 
@@ -1191,6 +1225,7 @@ namespace ShadowStrike {
                 analysisDurationMs = 0;
                 config = {};
                 analysisComplete = false;
+                analysisTruncated = false;
                 fromCache = false;
             }
         };
