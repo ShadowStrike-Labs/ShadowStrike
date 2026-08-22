@@ -2407,6 +2407,32 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
     result.evasionScore = 0.0f;
     result.detectedTechniques = AntiVMTechnique::None;
 
+    // THE DECLARED TIMEOUT IS NOW ENFORCED. ProcessAnalysisConfig::timeoutMs has existed
+    // with a 10,000 ms default since this module was written and was read by NOTHING -
+    // measured, this file contained zero occurrences of timeoutMs and zero of steady_clock
+    // in 3,906 lines. So the scan below was unbounded on RealTimeProtection's
+    // process-creation path, which the kernel blocks CreateProcess on and abandons after
+    // PN_VERDICT_REPLY_TIMEOUT_MS = 500. Same class as tasks 36, 49, 52 and 54: a field the
+    // caller sets, an implementation that never reads it, and a call site that looks bounded.
+    //
+    // WHY THE WORK NEEDS A BOUND AT ALL. What follows is a full address-space walk -
+    // VirtualQueryEx from the minimum to the maximum application address - and for every
+    // committed executable image region it allocates up to 16 MB, ReadProcessMemory's it,
+    // and runs a byte-by-byte opcode scan, up to maxMemoryToScan which defaults to 64 MB.
+    // SandboxEvasionDetector's structurally identical target scan measured 367 ms per call
+    // at comparable settings, against a 250 ms budget shared by six detectors.
+    //
+    // 0 MEANS NO LIMIT, matching MetamorphicAnalysisConfig and PackerConfig so a caller
+    // does not have to remember a third convention. The caller on the kernel path passes a
+    // real value derived from the remaining process-notify budget.
+    const bool vmDeadlineEnabled = (config.timeoutMs > 0);
+    const auto vmDeadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(config.timeoutMs);
+    const auto vmPastDeadline = [&]() noexcept -> bool {
+        return vmDeadlineEnabled && std::chrono::steady_clock::now() >= vmDeadline;
+    };
+    bool vmTruncated = false;
+
     try {
         // 1. Get process info
         Utils::ProcessUtils::ProcessInfo procInfo;
@@ -2445,6 +2471,14 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
         MEMORY_BASIC_INFORMATION mbi = { 0 };
 
         while (pAddr < pMax && totalScanned < MAX_SCAN_SIZE) {
+            // Region boundary: the natural stage edge. Checking only here would still let
+            // one 16 MB region overrun the whole budget, which is why the byte scan below
+            // carries its own check - the lesson task 36 recorded when a deadline tested
+            // only between stages was overrun by a single DisassembleBuffer call.
+            if (vmPastDeadline()) {
+                vmTruncated = true;
+                break;
+            }
             if (VirtualQueryEx((HANDLE)hProcess.get(), pAddr, &mbi, sizeof(mbi)) == 0) {
                 pAddr += sysInfo.dwPageSize; // Skip if query fails
                 continue;
@@ -2467,7 +2501,18 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
                 if (ReadProcessMemory((HANDLE)hProcess.get(), mbi.BaseAddress, buffer.data(), regionScanSize, &bytesRead)) {
                     // Scan buffer for Anti-VM patterns — guard against underflow
                     if (bytesRead >= 4) {
+                        // Checked on a STRIDE against an explicit next-checkpoint rather
+                        // than on (i % N), because the loop body advances i by 32 on a hit
+                        // and a modulus test can be stepped straight over.
+                        size_t vmNextDeadlineCheck = 0;
                         for (size_t i = 0; i <= bytesRead - 4; ++i) {
+                            if (i >= vmNextDeadlineCheck) {
+                                vmNextDeadlineCheck = i + (64u * 1024u);
+                                if (vmPastDeadline()) {
+                                    vmTruncated = true;
+                                    break;
+                                }
+                            }
                         // Pattern 1: SIDT (Red Pill)
                         // x86: 0F 01 0D
                         // x64: 0F 01 4C 24 (SIDT [RSP+...]) or just 0F 01 (SIDT/SGDT)
@@ -2569,6 +2614,10 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
                 totalScanned += bytesRead;
             }
 
+            if (vmTruncated) {
+                break;
+            }
+
             pAddr += mbi.RegionSize;
         }
 
@@ -2580,7 +2629,20 @@ bool VMEvasionDetector::AnalyzeProcessAntiVMBehavior(
             }
         }
 
+        // completed stays TRUE for a truncated run and that is deliberate, not sloppy.
+        // This function ends with eturn result.completed, and RealTimeProtection calls it
+        // inside a short-circuit condition, so returning false would DISCARD every technique
+        // already found instead of deferring the remainder - losing detection to gain
+        // latency, which is exactly what a bound must never do. truncated carries the
+        // completeness fact separately, and the caller requeues on it.
         result.completed = true;
+        result.truncated = vmTruncated;
+        if (vmTruncated) {
+            SS_LOG_WARN(L"AntiEvasion",
+                L"AnalyzeProcessAntiVMBehavior hit its %u ms deadline for PID %u after "
+                L"%zu byte(s); %zu technique(s) kept, remainder deferred",
+                config.timeoutMs, processId, totalScanned, result.techniqueDetails.size());
+        }
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeProcessAntiVMBehavior failed for PID %u: %hs",

@@ -1401,7 +1401,24 @@ namespace ShadowStrike {
             std::chrono::nanoseconds analysisTime{ 0 };          ///< How long analysis took
 
             // Error handling
-            bool completed = false;                             ///< True if analysis completed
+            /// @brief True if the analysis produced a result without an internal error.
+            /// @note This does NOT mean the whole address space was examined - see
+            ///       truncated. It stays the return value of AnalyzeProcessAntiVMBehavior
+            ///       so a bounded run still delivers the techniques it did find.
+            bool completed = false;
+
+            /// @brief True if the analysis stopped early because its deadline expired.
+            ///
+            /// ProcessAnalysisConfig::timeoutMs was declared, defaulted to 10000 and read
+            /// by NOTHING, so the scan below was unbounded on the callback the kernel
+            /// blocks CreateProcess on. The deadline is now enforced, which means a run can
+            /// end with findings AND an unexamined remainder. A caller that treats a
+            /// truncated result as a complete one records a clean verdict for memory nobody
+            /// looked at, so this flag exists to make that impossible to do by accident.
+            ///
+            /// @warning A truncated result must NOT be cached as authoritative, and its
+            ///          remainder must be re-examined off the kernel's thread.
+            bool truncated = false;
             std::wstring errorMessage;                          ///< Error message if failed
 
             /**

@@ -102,6 +102,9 @@ TIME_BASED_EVASION_DETECTOR_CPP_PATH = (
 TIME_BASED_EVASION_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.hpp"
 )
+VM_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/VMEvasionDetector.cpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -8249,9 +8252,9 @@ class EvasionFanOutReportingContractTests(unittest.TestCase):
         container is append-only.
         """
         for mutator in (".clear()", ".erase(", ".pop_back(", ".resize("):
-            self.assertNotIn(
-                "evasionFindings" + mutator,
-                self.rtp,
+            # BOUNDED: assertNotIn prints the entire 394 KB source on failure.
+            self.assertFalse(
+                ("evasionFindings" + mutator) in self.rtp,
                 f"evasionFindings{mutator} would break the append-only property the "
                 "budget's safety argument relies on",
             )
@@ -8841,15 +8844,14 @@ class DeferredSandboxTargetAnalysisContractTests(unittest.TestCase):
             f"{counter} needs an increment, a load for the periodic report, a use in "
             f"that report's format arguments, and a reset - found {sites} references",
         )
-        self.assertIn(
-            counter + " = 0;",
-            self.rtp,
+        # BOUNDED: assertIn prints the entire 394 KB source on failure.
+        self.assertTrue(
+            (counter + " = 0;") in self.rtp,
             f"{counter} is missing from RTPStatistics::Reset, so a reset would leave "
             "it stale while appearing to have cleared everything",
         )
-        self.assertIn(
-            counter + "++",
-            self.rtp,
+        self.assertTrue(
+            (counter + "++") in self.rtp,
             f"{counter} is never incremented, so it can only ever read zero",
         )
 
@@ -9047,6 +9049,146 @@ class TimingUnmeasuredFieldContractTests(unittest.TestCase):
                 r"(?<![A-Za-z0-9_])" + produced + r"(?![A-Za-z0-9_])", self.cpp
             )
             self.assertIsNotNone(present, f"{produced} is a live measurement and must stay")
+
+class VmEvasionAnalysisDeadlineContractTests(unittest.TestCase):
+    """A declared analysis timeout must bound the work, and a bound must not lose coverage.
+
+    ProcessAnalysisConfig::timeoutMs existed with a 10,000 ms default and was read by
+    nothing: measured, VMEvasionDetector.cpp contained zero occurrences of timeoutMs and
+    zero of steady_clock across 3,906 lines. The scan it should have bounded is a full
+    address-space walk that allocates up to 16 MB per executable region and byte-scans up
+    to 64 MB, and it runs on the callback the kernel blocks CreateProcess on and abandons
+    after PN_VERDICT_REPLY_TIMEOUT_MS = 500.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST: the fix explains the defect at length and names timeoutMs and
+        # steady_clock in prose, so a comment-blind scan cannot tell fix from description.
+        cls.vme = strip_c_comments(read_source(VM_EVASION_DETECTOR_CPP_PATH))
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+    def test_the_declared_timeout_is_actually_read(self) -> None:
+        reads = len(re.findall(r"(?<![A-Za-z0-9_])config\.timeoutMs(?![A-Za-z0-9_])", self.vme))
+        self.assertGreaterEqual(
+            reads,
+            1,
+            "ProcessAnalysisConfig::timeoutMs is unread again, so the scan is unbounded on "
+            "the process-creation callback",
+        )
+        clocks = len(re.findall(r"steady_clock", self.vme))
+        self.assertGreaterEqual(
+            clocks,
+            1,
+            "no steady_clock in the module, so no deadline can be enforced even in "
+            "principle - this is the state task 199 recorded",
+        )
+
+    def test_the_deadline_is_checked_inside_the_scan_and_not_only_around_it(self) -> None:
+        """One 16 MB region can overrun a budget on its own.
+
+        Task 36 recorded exactly this: a deadline tested only between stages was overrun by
+        a single DisassembleBuffer call, so the fix needed an instruction bound as well. The
+        equivalent here is that the byte scan inside a region must be interruptible, not
+        just the loop over regions.
+        """
+        checks = len(re.findall(r"vmPastDeadline\s*\(\s*\)", self.vme))
+        self.assertGreaterEqual(
+            checks,
+            2,
+            f"the deadline is tested {checks} time(s). It must be tested both at the region "
+            "boundary AND inside the per-region byte scan, or one large region overruns the "
+            "whole budget while the code looks bounded.",
+        )
+
+        # The stride check must not be expressed as a modulus: the loop advances i by 32 on
+        # a hit, so a modulus test can be stepped straight over.
+        self.assertNotRegex(
+            "\n".join(
+                line
+                for line in self.vme.splitlines()
+                if "vmNextDeadlineCheck" in line or "vmPastDeadline" in line
+            ),
+            r"%\s*\d+|&\s*0x[0-9A-Fa-f]+",
+            "the in-region deadline check uses a modulus or mask; the loop can skip past "
+            "it because it advances i by 32 on a detection. Use an explicit next-checkpoint.",
+        )
+
+    def test_a_truncated_scan_keeps_its_findings_and_requeues_the_remainder(self) -> None:
+        """A bound must defer coverage, never drop it."""
+        # The function returns result.completed and the caller short-circuits on it, so
+        # completed must NOT be cleared by truncation or every finding is discarded.
+        self.assertTrue(
+            "result.truncated = vmTruncated;" in self.vme,
+            "truncation must be reported on its own field. BOUNDED: assertIn would print "
+            "the whole 3,900-line module - measured at 290,833 characters in a mutation run.",
+        )
+        offenders = [
+            line.strip()
+            for line in self.vme.splitlines()
+            if re.search(r"result\.completed\s*=\s*false", line) and "vmTruncated" in line
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "completed is cleared on truncation. This function ends with "
+            "'return result.completed' and RealTimeProtection calls it inside a "
+            "short-circuit, so that discards every technique already found - losing "
+            "detection to gain latency. Offending line: "
+            + (offenders[0] if offenders else ""),
+        )
+
+        # And the caller must requeue, before testing whether anything was found.
+        self.assertTrue(
+            "vmResult.truncated" in self.rtp,
+            "RealTimeProtection must react to a truncated VM scan",
+        )
+        idx = self.rtp.index("vmResult.truncated")
+        window = self.rtp[idx : idx + 700]
+        self.assertIn(
+            "QueueDeferredDeepScan",
+            window,
+            "a truncated VM scan must requeue the image so the unexamined remainder is "
+            "analysed off the kernel's thread",
+        )
+        self.assertIn(
+            "vmEvasionAnalysisTruncated",
+            window,
+            "truncation must be counted, or a bound that fires constantly is invisible",
+        )
+        # ORDERING: the requeue must precede the hasAntiVMBehavior test, because a truncated
+        # scan that found nothing is exactly the case that needs re-examining.
+        self.assertLess(
+            self.rtp.index("vmResult.truncated"),
+            self.rtp.index("vmResult.hasAntiVMBehavior"),
+            "the truncation requeue must run before the finding test, or a truncated scan "
+            "with no findings is silently dropped",
+        )
+
+    def test_the_budget_passed_in_can_never_mean_unlimited(self) -> None:
+        """Zero means NO LIMIT in this config family, so a computed zero inverts the fix."""
+        self.assertTrue(
+            "vmConfig.timeoutMs = static_cast<uint32_t>(std::max<uint64_t>(1ULL" in self.rtp,
+            "the derived timeout is not clamped. It is computed from the remaining slice of "
+            "kProcessNotifyBudgetMs, and zero means unlimited in this config family, so an "
+            "exhausted budget would REMOVE the bound instead of applying the tightest one.",
+        )
+        self.assertIn(
+            "kProcessNotifyBudgetMs",
+            self.rtp[
+                self.rtp.index("vmConfig.timeoutMs") - 900 : self.rtp.index("vmConfig.timeoutMs")
+            ],
+            "the timeout must be derived from the budget already being spent, not from a "
+            "second constant that can drift out of step with the outer gate",
+        )
+
+        # ANTI-VACUITY: the scan itself must survive. This contract must never be
+        # satisfiable by deleting the analysis.
+        for kept in ("VirtualQueryEx", "ReadProcessMemory"):
+            self.assertTrue(
+                kept in self.vme,
+                f"{kept} is gone; the target memory scan is what this detector is for",
+            )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

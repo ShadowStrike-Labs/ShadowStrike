@@ -974,6 +974,7 @@ struct alignas(64) RTPStatistics {
     ///        actual detection work, which is a very different operating regime
     ///        from the budget rarely being reached.
         std::atomic<uint64_t> metamorphicTruncated{ 0 };
+        std::atomic<uint64_t> vmEvasionAnalysisTruncated{ 0 };
 
     /// @brief Target processes found to carry sandbox-evasion capability.
         ///

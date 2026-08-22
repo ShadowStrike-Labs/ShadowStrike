@@ -4487,8 +4487,51 @@ public:
                 vmKernelCtx.creatingThreadId = req.creatingThreadId;
                 vmConfig.kernelContext = std::move(vmKernelCtx);
 
+                // BOUND THE SCAN WITH THE BUDGET WE ARE ALREADY SPENDING, not a new number.
+                //
+                // ProcessAnalysisConfig::timeoutMs defaulted to 10,000 ms and was read by
+                // nothing, so this call was unbounded on the callback the kernel blocks
+                // CreateProcess on and abandons after PN_VERDICT_REPLY_TIMEOUT_MS = 500.
+                // The detector now enforces it, and the value comes from the remaining
+                // slice of kProcessNotifyBudgetMs so there is no second constant to drift
+                // out of step with the outer gate.
+                //
+                // CLAMPED TO AT LEAST 1 ms BECAUSE ZERO MEANS UNLIMITED. That convention is
+                // shared with MetamorphicAnalysisConfig and PackerConfig, which makes a
+                // computed zero the exact inverse of what is intended here - it would
+                // remove the bound instead of applying the tightest one. The outer
+                // short-circuit already skips this call once the budget is spent, so a zero
+                // remainder should be unreachable; the clamp makes that a property of the
+                // code rather than of the reasoning about it.
+                const auto vmElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - notifyStart).count();
+                const uint64_t vmRemainingMs =
+                    (static_cast<uint64_t>(vmElapsedMs) < kProcessNotifyBudgetMs)
+                        ? (kProcessNotifyBudgetMs - static_cast<uint64_t>(vmElapsedMs))
+                        : 1ULL;
+                vmConfig.timeoutMs = static_cast<uint32_t>(std::max<uint64_t>(1ULL, vmRemainingMs));
+
                 if (!evasionBudgetExceeded("VMEvasionDetector") &&
                     m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
+                    // COVERAGE MOVES IN TIME RATHER THAN BEING DROPPED. A deadline that
+                    // simply stopped scanning would trade detection for latency, which is
+                    // the one thing a bound must never do. This runs BEFORE the
+                    // hasAntiVMBehavior test on purpose: a truncated scan that found
+                    // nothing is precisely the case that needs re-examining, and gating the
+                    // requeue on a finding would skip it.
+                    if (vmResult.truncated) {
+                        m_stats.vmEvasionAnalysisTruncated++;
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: VM evasion scan for PID {} truncated at "
+                            "its {} ms slice of the {} ms budget; {} technique(s) kept, "
+                            "image requeued for deferred analysis",
+                            req.processId, vmConfig.timeoutMs, kProcessNotifyBudgetMs,
+                            vmResult.GetTechniqueCount());
+                        if (!imagePath.empty()) {
+                            QueueDeferredDeepScan(imagePath, req.processId);
+                        }
+                    }
+
                     if (vmResult.hasAntiVMBehavior) {
                         noteEvasion("VMEvasionDetector",
                             std::format(L"VM Evasion [score={:.1f} techniques={}]",
@@ -6700,6 +6743,7 @@ public:
         const uint64_t trustDropped = m_stats.sigDetermQueueDropped.load(std::memory_order_relaxed);
         const uint64_t cached       = m_stats.signatureVerdictsCached.load(std::memory_order_relaxed);
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
+        const uint64_t vmTrunc      = m_stats.vmEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
         const uint64_t replyHorizon = m_stats.processNotifyReplyHorizonExceeded.load(std::memory_order_relaxed);
@@ -6754,12 +6798,12 @@ public:
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
-            "sandboxEvasionCapabilityDetected={}",
+            "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, sandboxCap);
+            exitBlockIgn, sandboxCap, vmTrunc);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7289,6 +7333,7 @@ void RTPStatistics::Reset() noexcept {
     processNotifyReplyHorizonExceeded = 0;
     processExitBlockRequestsIgnored = 0;
     sandboxEvasionCapabilityDetected = 0;
+    vmEvasionAnalysisTruncated = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;
