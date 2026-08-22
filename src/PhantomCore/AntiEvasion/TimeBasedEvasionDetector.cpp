@@ -903,6 +903,27 @@ struct TimeBasedEvasionDetector::Impl {
             config = m_config;
         }
 
+        // HONOUR THE MASTER SWITCH. TimingDetectorConfig::enabled was declared,
+        // defaulted to true, and read by NOTHING - so an administrator or a policy
+        // that switched this detector off got silence and a detector that kept
+        // running. This is the declared-but-unwired control class of tasks 36/49/52/54.
+        //
+        // BEHAVIOUR IS UNCHANGED ON EVERY SHIPPED CONFIGURATION, by construction: the
+        // field defaults to true and no caller in the product sets it false. What
+        // changes is that the control now means what its name says.
+        //
+        // A DISABLED DETECTOR REPORTS NOT-ANALYSED, NEVER CLEAN. analysisComplete is
+        // set false and the reason recorded, because isEvasive defaults to false and a
+        // caller that could not tell "found nothing" from "did not look" would treat a
+        // switched-off detector as a clean verdict. That is the distinction the empty
+        // bloom filter and the unreachable B+tree leaves both destroyed.
+        if (!config.enabled) {
+            result.analysisComplete = false;
+            result.errorMessage = L"Timing evasion analysis is disabled by configuration";
+            result.analysisEndTime = std::chrono::system_clock::now();
+            return result;
+        }
+
         // Check cache first
         if (config.enableResultCache) {
             auto cached = GetCachedResult(processId);
@@ -1514,23 +1535,64 @@ struct TimeBasedEvasionDetector::Impl {
                 finding.severity = TimingEvasionSeverity::Critical;
                 finding.confidence = 90.0f;
                 finding.description = L"Sleep acceleration detection attempt";
+                // EVIDENCE MUST BE MEASURED, NOT DECLARED. This line used to print
+                // "Acceleration ratio: %.2f" from sleepAnalysis.accelerationRatio, and
+                // that field is assigned NOWHERE in this module - measured, its only
+                // reference in the whole file was this format argument. So every
+                // Critical sleep-acceleration alert this product has ever raised carried
+                // the evidence string "Acceleration ratio: 0.00".
+                //
+                // The DETECTION is sound and is untouched: accelerationDetected is a real
+                // value assigned from the static analysis context. Only its stated
+                // evidence was fabricated, which is the same defect class as a counter
+                // that reports a block nobody performed - the finding is true and the
+                // number beside it is not.
+                //
+                // What is cited below is measured: the distinct sleep APIs the target
+                // imports and its total sleep call count, both populated in
+                // AnalyzeSleep. Computing a real acceleration ratio needs runtime
+                // observation of the target, which this static path does not perform;
+                // that belongs with the monitoring mode and is filed, not faked here.
                 finding.technicalDetails = Utils::StringUtils::Format(
-                    L"Acceleration ratio: %.2f", sleepAnalysis.accelerationRatio);
+                    L"Sleep acceleration probing detected via %zu distinct sleep API(s) "
+                    L"across %u call site(s). Acceleration ratio is not measured on the "
+                    L"static analysis path.",
+                    sleepAnalysis.sleepAPIsUsed.size(),
+                    sleepAnalysis.sleepCallCount);
                 finding.mitreId = "T1497.003";
 
                 result.findings.push_back(finding);
                 result.detectedTypes.set(static_cast<size_t>(TimingEvasionType::SleepAccelerationDetect));
             }
 
+            // THIS BRANCH CANNOT FIRE TODAY, AND THAT IS RECORDED RATHER THAN HIDDEN.
+            // MEASURED: sleepAnalysis.fragmentationDetected has exactly ONE reference in
+            // this entire module - the condition on the next line. Nothing assigns it, so
+            // it holds its default of false forever and TimingEvasionType::
+            // SleepFragmentation has no reachable producer. Its three evidence fields
+            // (fragmentedSleepCount, avgFragmentDurationMs) are likewise never computed.
+            //
+            // THE BRANCH IS KEPT DELIBERATELY. Sleep fragmentation - splitting one long
+            // sleep into many short ones to defeat a sandbox timeout - is a real T1497.003
+            // technique and this is the correct place to report it. Deleting the branch
+            // would lose the only written statement of that intent. What is missing is the
+            // producer, which needs per-call sleep duration accounting in AnalyzeSleep.
+            // Filed as coverage restoration; wiring it is NOT a one-line change and must
+            // not be faked by deriving a fragment count from the call count.
+            //
+            // The evidence string below no longer cites the two uncomputed fields, so if a
+            // producer is added the alert cannot silently ship fabricated numbers.
             if (sleepAnalysis.fragmentationDetected) {
                 finding.type = TimingEvasionType::SleepFragmentation;
                 finding.severity = TimingEvasionSeverity::High;
                 finding.confidence = 75.0f;
                 finding.description = L"Sleep fragmentation pattern detected";
                 finding.technicalDetails = Utils::StringUtils::Format(
-                    L"Fragment count: %u, Avg fragment: %llu ms",
-                    sleepAnalysis.fragmentedSleepCount,
-                    sleepAnalysis.avgFragmentDurationMs);
+                    L"Sleep fragmentation pattern across %zu distinct sleep API(s) and "
+                    L"%u call site(s), total requested %llu ms.",
+                    sleepAnalysis.sleepAPIsUsed.size(),
+                    sleepAnalysis.sleepCallCount,
+                    sleepAnalysis.totalRequestedDurationMs);
                 finding.mitreId = "T1497.003";
 
                 result.findings.push_back(finding);

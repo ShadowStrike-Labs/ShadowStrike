@@ -96,6 +96,9 @@ SANDBOX_EVASION_DETECTOR_CPP_PATH = (
 SANDBOX_EVASION_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/SandboxEvasionDetector.hpp"
 )
+TIME_BASED_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.cpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -8846,6 +8849,83 @@ class DeferredSandboxTargetAnalysisContractTests(unittest.TestCase):
             self.rtp,
             f"{counter} is never incremented, so it can only ever read zero",
         )
+
+class TimingDetectorHonestEvidenceContractTests(unittest.TestCase):
+    """A declared control must act, and a stated measurement must have been taken.
+
+    TimeBasedEvasionDetector carried both defects. Its master switch was declared,
+    defaulted true and read by nothing, so a policy that disabled the detector got a
+    detector that kept running. And two of its findings cited evidence fields that are
+    assigned nowhere in the module, so a Critical sleep-acceleration alert reported
+    "Acceleration ratio: 0.00" as its supporting detail.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST. The fix DOCUMENTS the fields it stopped citing, naming each one
+        # in prose, so a comment-blind scan would report the defect as still present.
+        cls.tbe = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))
+
+    def test_the_master_switch_is_honoured_and_reports_not_analysed(self) -> None:
+        """A switched-off detector must not be indistinguishable from a clean verdict."""
+        reads = len(re.findall(r"(?<![A-Za-z0-9_])config\.enabled(?![A-Za-z0-9_])", self.tbe))
+        self.assertEqual(
+            reads,
+            1,
+            f"config.enabled is read {reads} time(s); the master switch must gate the "
+            "analysis exactly once",
+        )
+
+        idx = self.tbe.index("config.enabled")
+        window = self.tbe[idx : idx + 600]
+        self.assertIn(
+            "analysisComplete = false",
+            window,
+            "a disabled detector must report NOT ANALYSED. isEvasive defaults to false, so "
+            "returning without clearing analysisComplete lets a caller read a detector that "
+            "never looked as a clean verdict",
+        )
+        self.assertIn(
+            "errorMessage",
+            window,
+            "the reason for not analysing must be recorded, not left for a reader to infer",
+        )
+
+    def test_no_finding_cites_an_evidence_field_nothing_computes(self) -> None:
+        """Measured: each of these has zero assignments anywhere in the module."""
+        for field in ("accelerationRatio", "fragmentedSleepCount", "avgFragmentDurationMs"):
+            cites = len(
+                re.findall(r"(?<![A-Za-z0-9_])" + field + r"(?![A-Za-z0-9_])", self.tbe)
+            )
+            self.assertEqual(
+                cites,
+                0,
+                f"{field} is cited in code again. Nothing assigns it, so it is permanently "
+                "zero and any alert quoting it fabricates its own supporting evidence. If a "
+                "producer has since been written, cite it here and update this contract in "
+                "the SAME change.",
+            )
+
+        # ANTI-VACUITY: the two detections must survive. This contract must never be
+        # satisfiable by deleting the findings that carried the bad evidence.
+        for detection in ("accelerationDetected", "fragmentationDetected"):
+            present = re.search(
+                r"(?<![A-Za-z0-9_])" + detection + r"(?![A-Za-z0-9_])", self.tbe
+            )
+            self.assertIsNotNone(
+                present,
+                f"{detection} is gone; sleep-based evasion is a real T1497.003 technique "
+                "and the branch is the only written statement of that intent",
+            )
+
+        # And the replacement evidence must be drawn from fields that ARE populated.
+        for measured in ("sleepAPIsUsed", "sleepCallCount"):
+            present = re.search(
+                r"(?<![A-Za-z0-9_])" + measured + r"(?![A-Za-z0-9_])", self.tbe
+            )
+            self.assertIsNotNone(
+                present, f"{measured} is the measured evidence the findings now cite"
+            )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
