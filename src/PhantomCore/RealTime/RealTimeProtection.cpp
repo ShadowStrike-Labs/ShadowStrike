@@ -4448,7 +4448,37 @@ public:
                 kernelCtx.isCreation = req.isCreation;
                 dedConfig.kernelContext = std::move(kernelCtx);
 
+                // BOUND IT WITH THE BUDGET ALREADY RUNNING. This stage has no
+                // evasionBudgetExceeded gate in front of it by design - task 52 keeps the
+                // first detector unskippable - which means an unbounded stage here could
+                // spend the entire reply window before any other detector was consulted.
+                // Clamped to at least 1 ms because zero means UNLIMITED in this config
+                // family, so a computed zero would remove the bound instead of tightening it.
+                const auto dbgElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - notifyStart).count();
+                const uint64_t dbgRemainingMs =
+                    (static_cast<uint64_t>(dbgElapsedMs) < kProcessNotifyBudgetMs)
+                        ? (kProcessNotifyBudgetMs - static_cast<uint64_t>(dbgElapsedMs))
+                        : 1ULL;
+                dedConfig.timeoutMs = static_cast<uint32_t>(std::max<uint64_t>(1ULL, dbgRemainingMs));
+
                 auto result = m_debuggerDetector->AnalyzeProcess(req.processId, dedConfig);
+
+                // Coverage moves in time rather than being dropped, and this runs before the
+                // isEvasive test because a truncated analysis that found nothing is exactly
+                // the case that needs re-examining off the kernel's thread.
+                if (result.analysisTruncated) {
+                    m_stats.debuggerEvasionAnalysisTruncated++;
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: debugger evasion analysis for PID {} truncated "
+                        "at its {} ms slice of the {} ms budget; {} detection(s) kept, image "
+                        "requeued for deferred analysis",
+                        req.processId, dedConfig.timeoutMs, kProcessNotifyBudgetMs,
+                        result.totalDetections);
+                    if (!imagePath.empty()) {
+                        QueueDeferredDeepScan(imagePath, req.processId);
+                    }
+                }
                 if (result.isEvasive) {
                     noteEvasion("DebuggerEvasionDetector",
                         std::format(L"Debugger Evasion (score={:.1f}, techniques={}, severity={})",
@@ -6744,6 +6774,7 @@ public:
         const uint64_t cached       = m_stats.signatureVerdictsCached.load(std::memory_order_relaxed);
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t vmTrunc      = m_stats.vmEvasionAnalysisTruncated.load(std::memory_order_relaxed);
+        const uint64_t dbgTrunc     = m_stats.debuggerEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
         const uint64_t replyHorizon = m_stats.processNotifyReplyHorizonExceeded.load(std::memory_order_relaxed);
@@ -6798,12 +6829,13 @@ public:
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
-            "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={}",
+            "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
+            "debuggerEvasionAnalysisTruncated={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, sandboxCap, vmTrunc);
+            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7334,6 +7366,7 @@ void RTPStatistics::Reset() noexcept {
     processExitBlockRequestsIgnored = 0;
     sandboxEvasionCapabilityDetected = 0;
     vmEvasionAnalysisTruncated = 0;
+    debuggerEvasionAnalysisTruncated = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;

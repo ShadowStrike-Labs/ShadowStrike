@@ -1957,12 +1957,21 @@ namespace ShadowStrike::AntiEvasion {
             // Calculate Score
             CalculateEvasionScore(result);
 
-            // Cache result
-            if (config.enableCaching) {
+            // A TRUNCATED RESULT IS NEVER CACHED. The cache is keyed by pid with a TTL, so
+            // storing a partial answer would turn one exhausted budget into a permanent
+            // partial answer for that process - the same shape as a bloom filter built from
+            // nothing answering not-present for the rest of the run. Task 36 recorded this
+            // exact rule for the metamorphic detector.
+            if (config.enableCaching && !result.analysisTruncated) {
                 UpdateCache(result.targetPid, result);
             }
 
-            result.analysisComplete = true;
+            // DERIVED, NOT ASSERTED. This was an unconditional 'true', which is the defect
+            // task 36 found in the metamorphic detector: a run that stopped early still
+            // reported itself complete. The two in-tree precedents are
+            // metamorphic_polymorphicdetector.cpp and PackerDetector.cpp, both of which
+            // write analysisComplete = !analysisTruncated.
+            result.analysisComplete = !result.analysisTruncated;
             result.analysisEndTime = std::chrono::system_clock::now();
 
             const auto endTime = std::chrono::high_resolution_clock::now();
@@ -5045,18 +5054,41 @@ namespace ShadowStrike::AntiEvasion {
         const AnalysisConfig& config,
         DebuggerEvasionResult& result
     ) noexcept {
+        // THE DECLARED TIMEOUT IS NOW ENFORCED. AnalysisConfig::timeoutMs carried a
+        // 30,000 ms default and was read by NOTHING - measured, zero reads in 5,583 lines.
+        // This runs on RealTimeProtection's process-creation path, and it is the FIRST
+        // evasion stage there AND the only one with no evasionBudgetExceeded gate in front
+        // of it, so nothing bounded it at any level.
+        //
+        // Checked BETWEEN STAGES, which is where it can be honoured cheaply: the ten stages
+        // below are already individually flag-gated, so a stage boundary is a natural and
+        // consistent place to stop. STAGE 1 IS DELIBERATELY NOT GATED - task 52 established
+        // that the first detector always runs, so an analysis can never return having done
+        // no work at all.
+        //
+        // 0 means no limit, matching MetamorphicAnalysisConfig, PackerConfig and
+        // ProcessAnalysisConfig so callers do not face a fourth convention.
+        const bool dbgDeadlineEnabled = (config.timeoutMs > 0);
+        const auto dbgDeadline = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(config.timeoutMs);
+        const auto dbgOutOfTime = [&]() noexcept -> bool {
+            return dbgDeadlineEnabled && std::chrono::steady_clock::now() >= dbgDeadline;
+        };
+
         try {
             // 1. PEB Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanPEBTechniques)) {
                 AnalyzePEB(hProcess, processId, result);
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 2. API/Object Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanAPITechniques)) {
                 AnalyzeAPIUsage(hProcess, processId, result);
                 AnalyzeHandles(hProcess, processId, result);
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 3. Thread Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanThreadTechniques) ||
                 HasFlag(config.flags, AnalysisFlags::ScanHardwareBreakpoints)) {
@@ -5073,16 +5105,19 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 4. Memory Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanMemoryArtifacts)) {
                 ScanMemory(hProcess, processId, result);
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 5. Parent Process Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanProcessRelationships)) {
                 AnalyzeProcessRelationships(processId, result);
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 6. Timing Analysis
             if (HasFlag(config.flags, AnalysisFlags::ScanTimingTechniques)) {
                 std::vector<DetectedTechnique> detections;
@@ -5091,6 +5126,7 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 7. Exception Handling
             if (HasFlag(config.flags, AnalysisFlags::ScanExceptionTechniques)) {
                 std::vector<DetectedTechnique> detections;
@@ -5099,6 +5135,7 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 8. Code Integrity (Hook Detection)
             if (HasFlag(config.flags, AnalysisFlags::ScanCodeIntegrity)) {
                 std::vector<DetectedTechnique> detections;
@@ -5107,11 +5144,13 @@ namespace ShadowStrike::AntiEvasion {
                 }
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 9. Kernel Debug Query Detection (behavioral — scans target's code)
             if (HasFlag(config.flags, AnalysisFlags::ScanKernelQueries)) {
                 QueryKernelDebugInfo(hProcess, processId, result);
             }
 
+            if (dbgOutOfTime()) { result.analysisTruncated = true; return; }
             // 10. Kernel-Enriched Command-Line Correlation
             // When kernel context is available, correlate command-line patterns with
             // debugger evasion techniques for APT-grade detection

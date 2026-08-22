@@ -105,6 +105,9 @@ TIME_BASED_EVASION_DETECTOR_HPP_PATH = (
 VM_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/VMEvasionDetector.cpp"
 )
+DEBUGGER_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/DebuggerEvasionDetector.cpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -9189,6 +9192,115 @@ class VmEvasionAnalysisDeadlineContractTests(unittest.TestCase):
                 kept in self.vme,
                 f"{kept} is gone; the target memory scan is what this detector is for",
             )
+
+class DebuggerEvasionDeadlineContractTests(unittest.TestCase):
+    """The first evasion stage had no bound at any level, and now has one.
+
+    AnalysisConfig::timeoutMs carried a 30,000 ms default and was read by NOTHING - measured,
+    zero reads across 5,583 lines. This analysis runs on RealTimeProtection's process-creation
+    path, which the kernel blocks CreateProcess on and abandons after 500 ms, and it is the
+    FIRST evasion stage there AND the only one with no evasionBudgetExceeded gate in front of
+    it. So neither the module nor the caller bounded it.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Comments FIRST: the fix names timeoutMs, analysisComplete and the cache rule in
+        # prose, so a comment-blind scan cannot tell the fix from its own description.
+        cls.ded = strip_c_comments(read_source(DEBUGGER_EVASION_DETECTOR_CPP_PATH))
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+    def test_the_declared_timeout_bounds_every_stage_after_the_first(self) -> None:
+        reads = len(re.findall(r"(?<![A-Za-z0-9_])config\.timeoutMs(?![A-Za-z0-9_])", self.ded))
+        self.assertGreaterEqual(
+            reads, 1, "AnalysisConfig::timeoutMs is unread again, so the analysis is unbounded"
+        )
+        checks = len(re.findall(r"dbgOutOfTime\s*\(\s*\)", self.ded))
+        self.assertGreaterEqual(
+            checks,
+            9,
+            f"the deadline is tested {checks} time(s). AnalyzeProcessInternal has ten "
+            "flag-gated stages and every one after the first must be preceded by a check, or "
+            "a late stage can overrun the whole reply window.",
+        )
+
+    def test_the_first_stage_is_never_skipped(self) -> None:
+        """Task 52's rule: the first detector always runs, so a bound cannot return nothing."""
+        # ANCHOR ON THE DEFINITION, NOT THE FIRST OCCURRENCE. AnalyzeProcessInternal is
+        # CALLED at ~:1955, thousands of lines above its definition at ~:5042, so
+        # index("AnalyzeProcessInternal(") lands on the call and the window covers the wrong
+        # region entirely. Proven by mutation: an earlier form of this test did not fire when
+        # a guard was placed before stage 1.
+        definition = self.ded.index(
+            "void DebuggerEvasionDetector::AnalyzeProcessInternal("
+        )
+        first_stage = self.ded.index("AnalyzePEB(", definition)
+        head = self.ded[definition:first_stage]
+        self.assertNotIn(
+            "dbgOutOfTime()",
+            head,
+            "a deadline check has been placed before the FIRST stage. That lets the analysis "
+            "return having done no work at all when the budget is already spent, which is why "
+            "task 52 made the first detector unskippable.",
+        )
+
+    def test_a_truncated_result_is_never_cached_and_never_claims_completion(self) -> None:
+        self.assertTrue(
+            "config.enableCaching && !result.analysisTruncated" in self.ded,
+            "a truncated result can be cached again. The cache is pid-keyed with a TTL, so "
+            "storing a partial answer makes one exhausted budget permanent for that process.",
+        )
+        self.assertTrue(
+            "result.analysisComplete = !result.analysisTruncated" in self.ded,
+            "analysisComplete is asserted rather than derived. An unconditional true is the "
+            "defect task 36 found in the metamorphic detector: a run that stopped early "
+            "reported itself complete. The in-tree precedents are "
+            "metamorphic_polymorphicdetector.cpp and PackerDetector.cpp.",
+        )
+        offenders = [
+            line.strip()
+            for line in self.ded.splitlines()
+            if re.search(r"result\.analysisComplete\s*=\s*true", line)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "analysisComplete is set unconditionally somewhere: "
+            + (offenders[0] if offenders else ""),
+        )
+
+    def test_the_caller_bounds_it_from_the_running_budget_and_requeues(self) -> None:
+        self.assertTrue(
+            "dedConfig.timeoutMs = static_cast<uint32_t>(std::max<uint64_t>(1ULL" in self.rtp,
+            "the derived timeout is not clamped, and zero means UNLIMITED in this config "
+            "family, so an exhausted budget would remove the bound instead of tightening it",
+        )
+        idx = self.rtp.index("dedConfig.timeoutMs")
+        self.assertIn(
+            "kProcessNotifyBudgetMs",
+            self.rtp[max(0, idx - 900) : idx],
+            "the timeout must come from the budget already being spent, not a new constant",
+        )
+        tidx = self.rtp.index("result.analysisTruncated")
+        window = self.rtp[tidx : tidx + 800]
+        self.assertIn(
+            "QueueDeferredDeepScan",
+            window,
+            "a truncated debugger analysis must requeue the image, or the bound trades "
+            "detection for latency instead of deferring it",
+        )
+        self.assertIn(
+            "debuggerEvasionAnalysisTruncated",
+            window,
+            "truncation must be counted or a bound that fires constantly is invisible",
+        )
+        # ANTI-VACUITY: the analysis must still be invoked at all.
+        self.assertIn(
+            "m_debuggerDetector->AnalyzeProcess(",
+            self.rtp,
+            "the debugger analysis call is gone; this contract must never be satisfiable by "
+            "removing the detector",
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

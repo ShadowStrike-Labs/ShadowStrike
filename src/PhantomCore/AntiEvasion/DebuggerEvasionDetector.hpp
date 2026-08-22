@@ -1328,6 +1328,21 @@ namespace ShadowStrike {
             /// @brief Was analysis completed successfully?
             bool analysisComplete = false;
 
+            /// @brief True if the analysis stopped early because its deadline expired.
+            ///
+            /// AnalysisConfig::timeoutMs was declared with a 30,000 ms default and read by
+            /// NOTHING, so this analysis was unbounded on RealTimeProtection's
+            /// process-creation path - the callback the kernel blocks CreateProcess on and
+            /// abandons after 500 ms. It is also the FIRST evasion stage there and the only
+            /// one with no budget gate in front of it, so nothing else could bound it either.
+            ///
+            /// @warning A truncated result must NOT be cached. The cache is keyed by pid with
+            ///          a TTL, so caching a partial answer turns one exhausted budget into a
+            ///          permanent partial answer for that process. analysisComplete is
+            ///          derived from this flag rather than set unconditionally, matching
+            ///          MetamorphicResult and PackingInfo.
+            bool analysisTruncated = false;
+
             /// @brief Was result from cache?
             bool fromCache = false;
 
@@ -1405,6 +1420,7 @@ namespace ShadowStrike {
                 config = {};
                 errors.clear();
                 analysisComplete = false;
+            analysisTruncated = false;
                 fromCache = false;
             }
         };
