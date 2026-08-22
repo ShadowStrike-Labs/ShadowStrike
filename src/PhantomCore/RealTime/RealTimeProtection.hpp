@@ -977,6 +977,9 @@ struct alignas(64) RTPStatistics {
         std::atomic<uint64_t> vmEvasionAnalysisTruncated{ 0 };
         std::atomic<uint64_t> debuggerEvasionAnalysisTruncated{ 0 };
 
+        /// @brief Times the environment evasion analysis hit its deadline and was requeued.
+        std::atomic<uint64_t> environmentEvasionAnalysisTruncated{ 0 };
+
     /// @brief Target processes found to carry sandbox-evasion capability.
         ///
     /// Produced by the deferred deep-scan thread, which is the only caller of

@@ -2192,6 +2192,9 @@ namespace ShadowStrike {
             EnvironmentAnalysisFlags flags = EnvironmentAnalysisFlags::Default;
 
             /// @brief Timeout in milliseconds
+            /// @note ENFORCED as of task 199. AnalyzeProcessInternal derives a deadline from
+            ///       this value and checks it at every stage boundary after the first.
+            ///       0 means NO LIMIT, matching every sibling config in this subsystem.
             uint32_t timeoutMs = EnvironmentConstants::DEFAULT_SCAN_TIMEOUT_MS;
 
             /// @brief Enable caching
@@ -2338,6 +2341,25 @@ namespace ShadowStrike {
             /// @brief Analysis completed successfully
             bool analysisComplete = false;
 
+            /// @brief True if the per-process analysis stopped early on its deadline.
+            ///
+            /// EnvironmentAnalysisConfig::timeoutMs carried a 30,000 ms default and was read
+            /// by NOTHING - measured, zero reads across 5,779 lines, and no steady_clock
+            /// deadline existed anywhere in the module (its four existing steady_clock uses
+            /// are cache-age bookkeeping, not budgets). This analysis runs on
+            /// RealTimeProtection's process-creation path, which the kernel blocks
+            /// CreateProcess on and abandons after PN_VERDICT_REPLY_TIMEOUT_MS = 500 ms.
+            ///
+            /// @warning A truncated result must NOT be cached. The cache is keyed by pid with
+            ///          a TTL, so storing a partial answer would make one exhausted budget
+            ///          authoritative for the rest of that window.
+            /// @warning analysisComplete is DERIVED from this flag, never asserted - matching
+            ///          MetamorphicResult, PackingInfo and DebuggerEvasionResult. It matters
+            ///          more here than in the siblings because AnalyzeSystemInternal SKIPS
+            ///          every result whose analysisComplete is false when it aggregates, so
+            ///          an untruthful value silently changes the system-wide picture.
+            bool analysisTruncated = false;
+
             /// @brief From cache
             bool fromCache = false;
 
@@ -2421,6 +2443,7 @@ namespace ShadowStrike {
                 config = {};
                 errors.clear();
                 analysisComplete = false;
+                analysisTruncated = false;
                 fromCache = false;
             }
         };

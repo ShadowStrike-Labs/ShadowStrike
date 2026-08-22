@@ -4772,7 +4772,32 @@ public:
                 eedKernelCtx.creatingThreadId = req.creatingThreadId;
                 eedConfig.kernelContext = std::move(eedKernelCtx);
 
+                // Bound it with the clock already running, measured from the same notifyStart
+                // as the outer gate. Clamped to at least 1 ms because 0 means UNLIMITED.
+                const auto envElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - notifyStart).count();
+                const uint64_t envRemainingMs =
+                    (static_cast<uint64_t>(envElapsedMs) < kProcessNotifyBudgetMs)
+                        ? (kProcessNotifyBudgetMs - static_cast<uint64_t>(envElapsedMs))
+                        : 1ULL;
+                eedConfig.timeoutMs = static_cast<uint32_t>(envRemainingMs);
+
                 auto result = m_environmentDetector->AnalyzeProcess(req.processId, eedConfig);
+
+                // COVERAGE MOVES IN TIME, IT IS NOT LOST. A truncated scan that found nothing
+                // is exactly the case that needs re-examining, so the requeue happens here
+                // rather than inside a detection branch.
+                if (result.analysisTruncated) {
+                    m_stats.environmentEvasionAnalysisTruncated++;
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: environment evasion analysis for PID {} truncated "
+                        "at its {} ms slice of the {} ms budget; image requeued for deferred "
+                        "analysis",
+                        req.processId, eedConfig.timeoutMs, kProcessNotifyBudgetMs);
+                    if (!imagePath.empty()) {
+                        QueueDeferredDeepScan(imagePath, req.processId);
+                    }
+                }
                 if (result.isEvasive) {
                     noteEvasion("EnvironmentEvasionDetector",
                         std::format(L"Environment Evasion (score={:.1f}, techniques={}, severity={})",
@@ -6775,6 +6800,7 @@ public:
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t vmTrunc      = m_stats.vmEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t dbgTrunc     = m_stats.debuggerEvasionAnalysisTruncated.load(std::memory_order_relaxed);
+        const uint64_t envTrunc     = m_stats.environmentEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
         const uint64_t notifyBudget = m_stats.processNotifyBudgetExceeded.load(std::memory_order_relaxed);
         const uint64_t replyHorizon = m_stats.processNotifyReplyHorizonExceeded.load(std::memory_order_relaxed);
@@ -6830,12 +6856,12 @@ public:
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
-            "debuggerEvasionAnalysisTruncated={}",
+            "debuggerEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc);
+            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, envTrunc);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7367,6 +7393,7 @@ void RTPStatistics::Reset() noexcept {
     sandboxEvasionCapabilityDetected = 0;
     vmEvasionAnalysisTruncated = 0;
     debuggerEvasionAnalysisTruncated = 0;
+    environmentEvasionAnalysisTruncated = 0;
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;

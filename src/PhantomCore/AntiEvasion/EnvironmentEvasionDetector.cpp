@@ -2147,7 +2147,9 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Update cache
-            if (config.enableCaching) {
+            // A TRUNCATED RESULT IS NEVER CACHED: the cache is pid-keyed with a TTL, so a
+            // partial answer would be served as authoritative for the rest of that window.
+            if (config.enableCaching && !result.analysisTruncated) {
                 UpdateCache(processId, result);
             }
 
@@ -2237,7 +2239,9 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Update cache
-            if (config.enableCaching) {
+            // A TRUNCATED RESULT IS NEVER CACHED: the cache is pid-keyed with a TTL, so a
+            // partial answer would be served as authoritative for the rest of that window.
+            if (config.enableCaching && !result.analysisTruncated) {
                 UpdateCache(processId, result);
             }
 
@@ -2370,6 +2374,29 @@ namespace ShadowStrike::AntiEvasion {
         // This ensures zero false positives on Azure/Hyper-V/AWS/cloud VMs:
         // the EDR does not flag the host as "evasive" just because it IS a VM.
         // Instead, we detect PROCESSES that exhibit evasion-probing behavior.
+        // THE DECLARED TIMEOUT IS NOW ENFORCED (task 199). EnvironmentAnalysisConfig
+        // ::timeoutMs held a 30,000 ms default and was read by NOTHING - measured, zero reads
+        // across 5,779 lines, with no deadline machinery anywhere in the module. This runs on
+        // RealTimeProtection's process-creation path, which the kernel blocks CreateProcess on
+        // and abandons after 500 ms. Same class as tasks 36, 49, 52, 54 and the two siblings
+        // bounded in eca285e9 (VMEvasion) and dfe6a57e (DebuggerEvasion).
+        //
+        // Checked BETWEEN STAGES. Each TYPE B stage below opens a target process handle,
+        // parses its PE or scans its strings, so a stage boundary is the only place a deadline
+        // can be honoured without abandoning work half-done.
+        //
+        // THE FIRST STAGE IS DELIBERATELY NOT GATED. Task 52 established the rule: an
+        // analysis must never be able to return having examined nothing at all. A check
+        // before stage 1 would allow exactly that.
+        //
+        // 0 means NO LIMIT, matching every sibling config in this subsystem.
+        const bool envDeadlineEnabled = (config.timeoutMs > 0);
+        const auto envDeadline = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(config.timeoutMs);
+        const auto envOutOfTime = [&]() noexcept -> bool {
+            return envDeadlineEnabled && std::chrono::steady_clock::now() >= envDeadline;
+        };
+
         std::vector<EnvironmentDetectedTechnique> detections;
 
         // === TYPE B: Target process environment variable analysis ===
@@ -2377,34 +2404,56 @@ namespace ShadowStrike::AntiEvasion {
             (void)CheckEnvironmentVariables(processId, result.processEnvInfo, detections, nullptr);
         }
 
+        if (envOutOfTime()) { result.analysisTruncated = true; }
+
         // === TYPE B: Target executable filename pattern analysis ===
-        if (HasFlag(config.flags, EnvironmentAnalysisFlags::ScanFileNamingPatterns)) {
+        if (!result.analysisTruncated &&
+            HasFlag(config.flags, EnvironmentAnalysisFlags::ScanFileNamingPatterns)) {
             (void)CheckFileNaming(processId, result.fileNamingInfo, detections, nullptr);
         }
 
+        if (envOutOfTime()) { result.analysisTruncated = true; }
+
         // === TYPE B: Target PE import/section/entropy analysis ===
-        (void)AnalyzeProcessPeForEvasion(processId, detections, nullptr);
+        if (!result.analysisTruncated) {
+            (void)AnalyzeProcessPeForEvasion(processId, detections, nullptr);
+        }
+
+        if (envOutOfTime()) { result.analysisTruncated = true; }
 
         // === TYPE B: Target PE embedded environment-probing string scan ===
-        DetectEnvironmentProbingStrings(processId, detections);
+        if (!result.analysisTruncated) {
+            DetectEnvironmentProbingStrings(processId, detections);
+        }
+
+        if (envOutOfTime()) { result.analysisTruncated = true; }
 
         // === TYPE B: Target hook-detection behavioral analysis ===
-        DetectAPIHookCheckBehavior(processId, detections);
+        if (!result.analysisTruncated) {
+            DetectAPIHookCheckBehavior(processId, detections);
+        }
 
         // Add all detections to result
         for (auto& detection : detections) {
             AddDetection(result, std::move(detection));
         }
 
+        if (envOutOfTime()) { result.analysisTruncated = true; }
+
         // Kernel-enriched context correlation (APT-grade detection)
-        if (config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
+        if (!result.analysisTruncated &&
+            config.kernelContext.has_value() && config.kernelContext->hasKernelData()) {
             AnalyzeKernelContext(processId, config.kernelContext.value(), result);
         }
 
         CalculateEvasionScore(result);
 
         result.analysisEndTime = std::chrono::system_clock::now();
-        result.analysisComplete = true;
+        // DERIVED, NEVER ASSERTED. This was an unconditional 'true', which is precisely the
+        // defect task 36 found in the metamorphic detector: a run that stopped early still
+        // reported itself complete. It carries extra weight here because
+        // AnalyzeSystemInternal skips every result whose analysisComplete is false.
+        result.analysisComplete = !result.analysisTruncated;
     }
 
     void EnvironmentEvasionDetector::AnalyzeSystemInternal(

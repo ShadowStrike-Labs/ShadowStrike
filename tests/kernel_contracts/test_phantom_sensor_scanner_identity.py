@@ -108,6 +108,9 @@ VM_EVASION_DETECTOR_CPP_PATH = (
 DEBUGGER_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/DebuggerEvasionDetector.cpp"
 )
+ENVIRONMENT_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/EnvironmentEvasionDetector.cpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -9300,6 +9303,162 @@ class DebuggerEvasionDeadlineContractTests(unittest.TestCase):
             self.rtp,
             "the debugger analysis call is gone; this contract must never be satisfiable by "
             "removing the detector",
+        )
+
+class EnvironmentEvasionDeadlineContractTests(unittest.TestCase):
+    """EnvironmentAnalysisConfig::timeoutMs declared 30,000 ms and was read by NOTHING.
+
+    This analysis runs on RealTimeProtection's process-creation path, which the kernel
+    blocks CreateProcess on and abandons after PN_VERDICT_REPLY_TIMEOUT_MS = 500 ms.
+    Task 199, same class as tasks 36/49/52/54 and the siblings bounded in eca285e9
+    (VMEvasion) and dfe6a57e (DebuggerEvasion).
+    """
+
+    @staticmethod
+    def _internal_body():
+        """The body of AnalyzeProcessInternal.
+
+        Sliced between two DEFINITION markers on purpose. extract_c_function grabs the
+        FIRST occurrence of a name, and 'AnalyzeProcessInternal(' appears twice as a CALL
+        (in both AnalyzeProcess overloads) thousands of lines above its definition, so a
+        first-occurrence anchor would measure the wrong region and the test would not fire.
+        """
+        src = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        start_marker = "void EnvironmentEvasionDetector::AnalyzeProcessInternal("
+        end_marker = "void EnvironmentEvasionDetector::AnalyzeSystemInternal("
+        start = src.find(start_marker)
+        end = src.find(end_marker, start + 1)
+        assert start != -1, "AnalyzeProcessInternal definition not found"
+        assert end > start, "AnalyzeSystemInternal definition not found after it"
+        return src[start:end]
+
+    def test_the_declared_analysis_timeout_is_actually_read(self):
+        """A caller setting timeoutMs must not get silence."""
+        body = self._internal_body()
+        self.assertTrue(
+            "config.timeoutMs" in body,
+            "EnvironmentAnalysisConfig::timeoutMs is declared with a 30,000 ms default. "
+            "AnalyzeProcessInternal must READ it - a declared control that nothing reads "
+            "means a caller setting it gets silence.",
+        )
+        self.assertTrue(
+            "steady_clock" in body,
+            "The timeout must be enforced with a monotonic clock. system_clock is "
+            "wall-clock and steps with NTP, so it cannot bound a latency budget.",
+        )
+        # 0 must mean unlimited, matching every sibling config in this subsystem.
+        self.assertTrue(
+            "config.timeoutMs > 0" in body,
+            "A zero timeout must mean NO LIMIT, not an instantly-expired deadline. "
+            "Every sibling AntiEvasion config uses that convention.",
+        )
+
+    def test_the_first_stage_is_never_gated_by_the_deadline(self):
+        """Task 52's rule: an analysis must never return having examined nothing.
+
+        This asserts an ABSENCE, deliberately. Adding a deadline check before stage 1
+        would let a spent budget produce an analysis that looked at no evidence at all.
+        """
+        body = self._internal_body()
+        # MEASURE FROM THE LAMBDA, NOT FROM THE TOP OF THE FUNCTION. An earlier block in this
+        # same function also tests EnvironmentAnalysisFlags::ScanEnvironmentVars, so anchoring
+        # stage 1 on that flag found the EARLIER occurrence - which sits above the lambda and
+        # therefore above every possible guard, making this assertion vacuous. A mutation that
+        # put a deadline check before stage 1 did not fire until this was corrected.
+        lam = body.find("const auto envOutOfTime = [&]()")
+        self.assertNotEqual(lam, -1, "the deadline lambda has disappeared")
+        stage_one = body.find("CheckEnvironmentVariables(processId", lam)
+        first_call = body.find("if (envOutOfTime())", lam)
+        self.assertNotEqual(stage_one, -1, "stage 1 (CheckEnvironmentVariables) has disappeared")
+        self.assertNotEqual(first_call, -1, "no deadline check remains at any stage boundary")
+        self.assertLess(
+            stage_one,
+            first_call,
+            "The FIRST stage must run before any deadline check. A check ahead of it lets "
+            "the analysis return having examined nothing, which is exactly what task 52 "
+            "forbade when it made the first detector unskippable.",
+        )
+
+    def test_every_later_stage_is_bounded(self):
+        """Five stages follow the first, and each needs a boundary check."""
+        body = self._internal_body()
+        guards = body.count("if (envOutOfTime()) { result.analysisTruncated = true; }")
+        self.assertGreaterEqual(
+            guards,
+            5,
+            "Expected at least 5 stage-boundary deadline checks (stages 2-6) but found "
+            f"{guards}. Each stage opens a process handle, parses a PE or scans strings, "
+            "so an unguarded stage can overrun the whole budget on its own.",
+        )
+        # The findings merge must NOT be gated: a bound defers work, it never discards
+        # findings already collected.
+        self.assertTrue(
+            "for (auto& detection : detections) {" in body,
+            "The detections merge loop must survive and must stay ungated - truncation "
+            "defers the stages that did not run, it does not discard the ones that did.",
+        )
+
+    def test_a_truncated_analysis_is_never_reported_complete(self):
+        """analysisComplete must be DERIVED, not asserted.
+
+        Extra weight here: AnalyzeSystemInternal skips every result whose analysisComplete
+        is false when it aggregates, so an untruthful value silently changes the
+        system-wide picture rather than merely mislabelling one process.
+        """
+        body = self._internal_body()
+        self.assertTrue(
+            "result.analysisComplete = !result.analysisTruncated" in body,
+            "analysisComplete must be derived from the truncation flag. An unconditional "
+            "'= true' is the defect task 36 found in the metamorphic detector: a run that "
+            "stopped early still reported itself complete.",
+        )
+        self.assertFalse(
+            "result.analysisComplete = true;" in body,
+            "An unconditional 'analysisComplete = true' has returned to "
+            "AnalyzeProcessInternal. A truncated analysis must never claim completeness.",
+        )
+
+    def test_a_truncated_analysis_is_never_cached(self):
+        """The cache is pid-keyed with a TTL, so a partial answer would persist."""
+        src = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        total = src.count("UpdateCache(processId, result);")
+        gated = src.count("config.enableCaching && !result.analysisTruncated")
+        self.assertGreaterEqual(total, 2, "the cache write sites have moved or vanished")
+        self.assertGreaterEqual(
+            gated,
+            total,
+            f"{total} UpdateCache site(s) but only {gated} guarded by the truncation flag. "
+            "The cache is keyed by pid with a TTL, so storing a truncated result makes one "
+            "exhausted budget authoritative for the rest of that window.",
+        )
+
+    def test_rtp_derives_a_real_budget_and_requeues_what_it_truncates(self):
+        """A hardcoded timeout would not be a budget, and dropped coverage is a loss."""
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        call = rtp.find("m_environmentDetector->AnalyzeProcess(")
+        self.assertNotEqual(call, -1, "the environment detector call site has moved")
+        window = rtp[max(0, call - 1600):call]
+        self.assertTrue(
+            "eedConfig.timeoutMs" in window,
+            "RealTimeProtection must set eedConfig.timeoutMs before calling. Leaving the "
+            "30,000 ms default on a path the kernel abandons after 500 ms is no bound.",
+        )
+        self.assertTrue(
+            "notifyStart" in window and "kProcessNotifyBudgetMs" in window,
+            "The timeout must be DERIVED from the clock already running (notifyStart) and "
+            "the shared budget, not hardcoded - six detectors share that budget.",
+        )
+        tail = rtp[call:call + 1800]
+        self.assertTrue(
+            "environmentEvasionAnalysisTruncated" in tail,
+            "A truncation must be counted, otherwise the product cannot tell whether it is "
+            "silently skipping analysis in the field.",
+        )
+        self.assertTrue(
+            "QueueDeferredDeepScan" in tail,
+            "A truncated analysis must be REQUEUED. Coverage may move in time; it may not "
+            "be lost. A truncated scan that found nothing is exactly the case needing "
+            "re-examination.",
         )
 
 if __name__ == "__main__":
