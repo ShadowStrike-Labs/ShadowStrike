@@ -2584,7 +2584,7 @@ namespace ShadowStrike::AntiEvasion {
                         L" (" + processResult.processName + L")";
                 } else {
                     detection.detectedValue = L"pid:" + std::to_wstring(processResult.targetPid) +
-                        L" (" + processResult.processName + L") — " + detection.detectedValue;
+                        L" (" + processResult.processName + L") - " + detection.detectedValue;
                 }
 
                 AddDetection(result, std::move(detection));

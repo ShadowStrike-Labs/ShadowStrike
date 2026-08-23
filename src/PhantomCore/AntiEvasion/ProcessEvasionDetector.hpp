@@ -36,7 +36,7 @@
  *    - Thread hijacking (SuspendThread + SetThreadContext)
  *    - APC injection (QueueUserAPC)
  *    - AtomBombing (NtQueueApcThread + GlobalAddAtom)
- *    - Process Doppelgänging (NTFS transactions)
+ *    - Process Doppelganging (NTFS transactions)
  *    - Process Herpaderping (obscure file mapping)
  *
  * 2. CODE INJECTION DETECTION:

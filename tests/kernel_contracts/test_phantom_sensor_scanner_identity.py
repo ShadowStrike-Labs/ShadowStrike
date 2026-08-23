@@ -10472,5 +10472,182 @@ class AssemblyExportCensusContractTests(unittest.TestCase):
             "unused code and wires it: " + ", ".join(missing),
         )
 
+
+
+class AntiEvasionLiteralEncodingContractTests(unittest.TestCase):
+    """No string literal in the AntiEvasion layer may hold a non-ASCII character.
+
+    WHY THIS IS A CORRECTNESS GUARD AND NOT HYGIENE (task 193's mechanism):
+    no product project passes /utf-8 and these sources carry no BOM, so MSVC decodes
+    them with the system code page.  A 3-byte UTF-8 em-dash becomes three separate
+    wide characters and a 2-byte umlaut becomes two.  For a log message that is
+    mojibake; for a MITRE technique DISPLAY NAME it is a wrong string, and
+    MITREMapper.cpp substring-matches display names, so the vocabulary must agree
+    across modules or a match silently fails.
+
+    MEASURED WHEN THIS GUARD LANDED: five separate modules render the T1055.013
+    display name.  Three already spelled it ASCII, including MITREMapper.c and
+    MITREMapper.cpp, which are the authority for technique names in this tree.  Two
+    did not.  The ASCII spelling therefore wins because it is the incumbent
+    convention, not because ASCII is easier.
+
+    DELIBERATELY NOT ASSERTED: non-ASCII inside COMMENTS.  Box-drawing separators
+    and em-dashes in prose are presentation and cannot change a verdict; two headers
+    hold hundreds of them on purpose.  Sweeping them would have buried a behavioural
+    fix in churn.  Instead the third test records that debt as a shrink-only ceiling
+    so it cannot grow while remaining green on arrival - an equality guard there
+    would have been red on arrival, and a guard that cannot pass is a guard nobody
+    keeps (task 207).
+    """
+
+    _ANTIEVASION_DIR = ROOT / "src/PhantomCore/AntiEvasion"
+    _SOURCE_SUFFIXES = (".cpp", ".hpp", ".h", ".asm")
+    _LITERAL = re.compile(r'(L?)"(?:[^"\\\n]|\\.)*"')
+    # IGNORECASE is load-bearing and mutation round 3 proved it: a case-sensitive
+    # pattern cannot SEE "Process DoppelGanging", so a case divergence would slip
+    # through the disagreement check entirely rather than being caught by it.
+    _DOPPEL_LITERAL = re.compile(r'"[^"\n]*Doppelg[^"\n]*"', re.IGNORECASE)
+    _MIN_LITERALS = 5700
+    _MIN_RENDERERS = 10
+
+    # non-ASCII BYTES per file, measured when this guard landed.  Shrink-only.
+    _COMMENT_DEBT_CEILING = {
+        "DebuggerEvasionDetector.cpp": 24,
+        "DebuggerEvasionDetector.hpp": 3,
+        "DebuggerEvasionDetector_x64.asm": 0,
+        "EnvironmentEvasionDetector.cpp": 36,
+        "EnvironmentEvasionDetector.hpp": 39,
+        "EnvironmentEvasionDetector_x64.asm": 0,
+        "NetworkBasedEvasionDetector.cpp": 33,
+        "NetworkBasedEvasionDetector.hpp": 3,
+        "PackerDetector.cpp": 9,
+        "PackerDetector.hpp": 0,
+        "PackerDetector_x64.asm": 3,
+        "ProcessEvasionDetector.cpp": 48,
+        "ProcessEvasionDetector.hpp": 2157,
+        "SandboxEvasionDetector.cpp": 27,
+        "SandboxEvasionDetector.hpp": 24,
+        "SandboxEvasionDetector_x64.asm": 6,
+        "TimeBasedEvasionDetector.cpp": 27,
+        "TimeBasedEvasionDetector.hpp": 1689,
+        "TimeBasedEvasionDetector_x64.asm": 9,
+        "VMEvasionDetector.cpp": 45,
+        "VMEvasionDetector.hpp": 36,
+        "VMEvasionDetector_x64.asm": 3,
+        "metamorphic_polymorphicdetector.cpp": 24,
+        "metamorphic_polymorphicdetector.hpp": 0,
+        "nt_undocumented.h": 0,
+    }
+
+    @staticmethod
+    def _is_comment_line(line):
+        stripped = line.lstrip()
+        return (stripped.startswith("//")
+                or stripped.startswith("*")
+                or stripped.startswith("/*"))
+
+    @classmethod
+    def _read(cls, path):
+        # bytes -> str deliberately: read_text() would translate CRLF and these
+        # files are a mix of CRLF-only and LF-only conventions.
+        return path.read_bytes().decode("utf-8", errors="replace")
+
+    def test_no_antievasion_string_literal_holds_a_non_ascii_character(self):
+        offenders = []
+        examined = 0
+        for path in sorted(self._ANTIEVASION_DIR.glob("*")):
+            if path.suffix.lower() not in self._SOURCE_SUFFIXES:
+                continue
+            for number, line in enumerate(self._read(path).split("\n"), start=1):
+                if self._is_comment_line(line):
+                    continue
+                for match in self._LITERAL.finditer(line):
+                    examined += 1
+                    bad = [c for c in match.group(0) if ord(c) > 127]
+                    if bad:
+                        offenders.append("%s:%d %s" % (
+                            path.name, number,
+                            " ".join("U+%04X" % ord(c) for c in dict.fromkeys(bad))))
+        self.assertGreaterEqual(
+            examined, self._MIN_LITERALS,
+            "anti-vacuity: only %d literals examined, expected at least %d - the "
+            "walk is not reaching the AntiEvasion sources"
+            % (examined, self._MIN_LITERALS))
+        self.assertEqual(
+            [], offenders,
+            "a string literal in the AntiEvasion layer holds a non-ASCII character; "
+            "with no /utf-8 and no BOM MSVC mis-decodes it, so the string the "
+            "product emits is not the string in the source: " + "; ".join(offenders))
+
+    def test_no_renderer_of_the_doppelganging_technique_name_holds_non_ascii(self):
+        """Tree-wide, not folder-wide: this technique name is rendered by five
+        separate modules and the ASCII spelling is what the MITRE mappers use.
+
+        DELIBERATELY NOT ASSERTED - that every renderer spells it IDENTICALLY.
+        That reads like a stronger invariant and is not a sound one: MITREMapper.c
+        carries both "Process Doppelganging" (the name) and "Process doppelganging"
+        (the description) inside the SAME struct literal, and this codebase has no
+        convention separating a title-case name from a sentence-case description.
+        Asserting agreement therefore produces false positives on correct code,
+        which is how a guard gets deleted.  Non-ASCII is the defect that was real.
+        """
+        non_ascii = []
+        renderers = 0
+        for folder in ("src", "tests", "PhantomSensor", "PhantomEmulator"):
+            base = ROOT / folder
+            if not base.exists():
+                continue
+            for path in sorted(base.rglob("*")):
+                if path.suffix.lower() not in (".cpp", ".hpp", ".h", ".c"):
+                    continue
+                for number, line in enumerate(self._read(path).split("\n"), start=1):
+                    if self._is_comment_line(line):
+                        continue
+                    for match in self._DOPPEL_LITERAL.finditer(line):
+                        renderers += 1
+                        literal = match.group(0)
+                        bad = [c for c in literal if ord(c) > 127]
+                        if bad:
+                            non_ascii.append("%s:%d %s" % (
+                                path.name, number,
+                                " ".join("U+%04X" % ord(c)
+                                         for c in dict.fromkeys(bad))))
+        self.assertGreaterEqual(
+            renderers, self._MIN_RENDERERS,
+            "anti-vacuity: found only %d code-site literals mentioning this "
+            "technique, expected at least %d" % (renderers, self._MIN_RENDERERS))
+        self.assertEqual(
+            [], non_ascii,
+            "a code site renders the T1055.013 technique name with a non-ASCII "
+            "character.  With no /utf-8 and no BOM that string is mis-decoded, so "
+            "it cannot match the ASCII spelling MITREMapper.c and MITREMapper.cpp "
+            "use - and MITREMapper.cpp substring-matches technique text: "
+            + "; ".join(non_ascii))
+
+    def test_the_antievasion_non_ascii_debt_does_not_grow(self):
+        grew = []
+        missing = []
+        for name, ceiling in sorted(self._COMMENT_DEBT_CEILING.items()):
+            path = self._ANTIEVASION_DIR / name
+            if not path.exists():
+                missing.append(name)
+                continue
+            actual = sum(1 for b in path.read_bytes() if b > 127)
+            if actual > ceiling:
+                grew.append("%s: %d non-ASCII bytes, ceiling %d"
+                            % (name, actual, ceiling))
+        self.assertEqual(
+            [], missing,
+            "a file this ceiling covers has been renamed or removed; update the "
+            "ceiling in the same change: " + ", ".join(missing))
+        self.assertEqual(
+            [], grew,
+            "non-ASCII was added to an AntiEvasion source.  This ceiling is "
+            "shrink-only: decorative non-ASCII in comments is tolerated at its "
+            "measured level but must not increase, and a new non-ASCII byte inside "
+            "a string literal is a correctness defect caught by the sibling test: "
+            + "; ".join(grew))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

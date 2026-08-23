@@ -229,7 +229,7 @@ namespace ShadowStrike::AntiEvasion {
         case ProcessEvasionTechnique::INJ_ThreadHijacking: return L"Thread Hijacking";
         case ProcessEvasionTechnique::INJ_APCInjection: return L"APC Injection";
         case ProcessEvasionTechnique::INJ_AtomBombing: return L"AtomBombing";
-        case ProcessEvasionTechnique::INJ_ProcessDoppelganging: return L"Process Doppelgänging";
+        case ProcessEvasionTechnique::INJ_ProcessDoppelganging: return L"Process Doppelganging";
         case ProcessEvasionTechnique::INJ_ProcessHerpaderping: return L"Process Herpaderping";
         case ProcessEvasionTechnique::INJ_EarlyBirdInjection: return L"Early Bird Injection";
         case ProcessEvasionTechnique::INJ_ExtraWindowMemory: return L"Extra Window Memory Injection";
@@ -294,7 +294,7 @@ namespace ShadowStrike::AntiEvasion {
         case InjectionMethod::ThreadHijacking: return L"Thread Hijacking";
         case InjectionMethod::APC: return L"APC Injection";
         case InjectionMethod::AtomBombing: return L"AtomBombing";
-        case InjectionMethod::Doppelganging: return L"Process Doppelgänging";
+        case InjectionMethod::Doppelganging: return L"Process Doppelganging";
         case InjectionMethod::Herpaderping: return L"Process Herpaderping";
         default: return L"Unknown";
         }
@@ -317,7 +317,7 @@ namespace ShadowStrike::AntiEvasion {
         case ProcessEvasionTechnique::INJ_AtomBombing:
             return "T1055";      // Process Injection
         case ProcessEvasionTechnique::INJ_ProcessDoppelganging:
-            return "T1055.013";  // Process Doppelgänging
+            return "T1055.013";  // Process Doppelganging
         case ProcessEvasionTechnique::INJ_ProcessHerpaderping:
             return "T1055";      // Process Injection
         case ProcessEvasionTechnique::MASK_LegitProcessNameAbuse:
@@ -3032,7 +3032,7 @@ namespace ShadowStrike::AntiEvasion {
                     detection.confidence = 0.98;
                     detection.description = L"Kernel-verified PPID spoofing detected";
                     detection.technicalDetails = std::format(
-                        L"Kernel: parentPid={} creatingPid={} image={} — "
+                        L"Kernel: parentPid={} creatingPid={} image={} - "
                         L"creating process differs from declared parent (definitive spoof)",
                         kctx.parentProcessId, kctx.creatingProcessId,
                         kctx.imagePath.substr(0, 120));
@@ -3057,7 +3057,7 @@ namespace ShadowStrike::AntiEvasion {
                             detection.confidence = 0.95;
                             detection.description = L"Kernel-verified path anomaly";
                             detection.technicalDetails = std::format(
-                                L"Kernel path={} process={} — kernel confirms masquerading",
+                                L"Kernel path={} process={} - kernel confirms masquerading",
                                 kctx.imagePath.substr(0, 100),
                                 result.processName.substr(0, 60));
                             AddDetection(result, std::move(detection));
@@ -3085,7 +3085,7 @@ namespace ShadowStrike::AntiEvasion {
                         detection.confidence = 0.92;
                         detection.description = L"Injection-capable process with obfuscated command line";
                         detection.technicalDetails = std::format(
-                            L"cmd={} — process has {} injected DLLs, {} suspicious memory regions",
+                            L"cmd={} - process has {} injected DLLs, {} suspicious memory regions",
                             kctx.commandLine.substr(0, 150),
                             result.injectionInfo.injectedDLLs.size(),
                             result.injectionInfo.suspiciousMemoryRegions);

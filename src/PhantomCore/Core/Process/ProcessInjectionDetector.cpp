@@ -269,7 +269,7 @@ void TrimVectorToCap(std::vector<T>& v, size_t cap) noexcept {
         case InjectionType::EarlyBird: return "Early Bird APC";
         case InjectionType::APCWritePrimitive: return "APC Write Primitive";
         case InjectionType::ProcessHollowing: return "Process Hollowing";
-        case InjectionType::ProcessDoppelganging: return "Process Doppelgänging";
+        case InjectionType::ProcessDoppelganging: return "Process Doppelganging";
         case InjectionType::ProcessHerpaderping: return "Process Herpaderping";
         case InjectionType::ProcessGhosting: return "Process Ghosting";
         case InjectionType::TransactedHollowing: return "Transacted Hollowing";

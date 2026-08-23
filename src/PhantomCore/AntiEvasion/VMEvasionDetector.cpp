@@ -1407,11 +1407,11 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
     m_impl->UpdateCache(result);
 
     if (result.isVM) {
-        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context — VM detected (%ls, confidence: %.1f%%). "
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context - VM detected (%ls, confidence: %.1f%%). "
                           L"Behavioral scores calibrated for VM environment.",
                           VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
     } else {
-        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context — bare metal (duration: %lldms)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context - bare metal (duration: %lldms)",
                           result.detectionDuration.count() / 1000000);
     }
 
@@ -1473,7 +1473,7 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment(const VMDetectionConfig& co
     UpdateStatistics(result, result.detectionDuration);
 
     if (result.isVM) {
-        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context (custom config) — VM detected (%ls, confidence: %.1f%%)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context (custom config) - VM detected (%ls, confidence: %.1f%%)",
                            VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
     }
 
@@ -1534,7 +1534,7 @@ VMEvasionResult VMEvasionDetector::DetectEnvironmentWithProgress(ProgressCallbac
     m_impl->UpdateCache(result);
 
     if (result.isVM) {
-        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context — VM detected (%ls, confidence: %.1f%%)",
+        SS_LOG_INFO(L"AntiEvasion", L"VMEvasionDetector: Host context - VM detected (%ls, confidence: %.1f%%)",
                            VMTypeToString(result.detectedType).c_str(), result.confidenceScore);
     }
 

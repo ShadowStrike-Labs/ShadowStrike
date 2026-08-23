@@ -4298,7 +4298,7 @@ namespace ShadowStrike::AntiEvasion {
                     detection.severity = NetworkEvasionSeverity::Critical;
                     detection.description = L"PPID-spoofed process performing network operations";
                     detection.technicalDetails = std::format(
-                        L"Kernel: parentPid={} creatingPid={} image={} — PPID mismatch with active network connections",
+                        L"Kernel: parentPid={} creatingPid={} image={} - PPID mismatch with active network connections",
                         kernelCtx.parentProcessId, kernelCtx.creatingProcessId,
                         kernelCtx.imagePath.substr(0, 120));
                     detection.mitreId = "T1036.005";
