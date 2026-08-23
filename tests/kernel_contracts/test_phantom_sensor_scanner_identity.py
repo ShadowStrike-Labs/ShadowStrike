@@ -10140,5 +10140,337 @@ class HostProbeContextOnlyContractTests(unittest.TestCase):
             "ad535230 and have returned: " + ", ".join(returned) + "."
         )
 
+
+class AssemblyExportCensusContractTests(unittest.TestCase):
+    """Pins WHICH assembly routines are reached, and forbids wiring the ones that lie.
+
+    Task 209 was filed as "of 105 exported routines only about 8 have a real caller".
+    Measured on 2026-08-23 the live count is 43, and the filed claim that "3 of the 6
+    files are referenced by nothing at all" is false - all six are named by four
+    project files each.
+
+    IT TOOK THREE ATTEMPTS TO COUNT THIS CORRECTLY, and both wrong answers came from
+    testing PUNCTUATION instead of the return type:
+      45 - a per-LINE declaration test.  A multi-line prototype
+           (`int64_t SIMDScanForPattern(const uint8_t* buffer, size_t bufferSize,`)
+           has no semicolon on its own line, so five prototypes read as calls.
+      40 - joined statements, but a declaration was defined as "ends in ';' with no
+           '='".  A void function called as a bare statement
+           (`CheckVMwareBackdoor(rax, rbx, rcx, rdx);`) satisfies that exactly, so
+           three real call sites read as prototypes.
+      43 - the discriminator that actually works: a declaration carries a RETURN TYPE
+           immediately before the name; a call carries nothing, an assignment, a
+           control keyword or an enclosing call.
+    Anyone re-deriving this census must use _call_sites below rather than a grep.
+
+    What the census actually shows is not 65 missing capabilities.  It shows
+    DUPLICATION: EnvironmentEvasionDetector_x64.asm is the layer's shared CPU
+    primitive library - VMEvasionDetector.cpp alone calls ten of its exports - so the
+    dark routines are overwhelmingly second and third copies of ~10 primitives that
+    already have exactly one live implementation.  Two whole modules
+    (DebuggerEvasionDetector 18/18, SandboxEvasionDetector 17/17) are entirely dark
+    for that reason, and that is 35 of the 65.
+
+    THE POINT OF THIS CLASS IS THE SECOND TEST.  48 of the dark routines convert a
+    measurement of THIS MACHINE into a boolean "detected" or a score.  On any VMware,
+    Hyper-V or cloud endpoint they read positive, so wiring one to a verdict convicts
+    the endpoint we are defending.  TimingDetectVMExit is the clearest: its fallback
+    scores rdtscOverhead > 500 as +35, cpuidLatency > 1500 as +40 and the CPUID
+    hypervisor bit as +25, which is 100/100 on every virtual machine, every time.
+    That is the false-positive engine deleted in 6a1ee4a3 and capped in 73ea88ba, and
+    "restoring coverage" by calling these is how it comes back.
+
+    Comment stripping is mandatory: the disposition blocks this change added NAME every
+    routine asserted here in order to explain it, so a comment-blind scan is guaranteed
+    to report a call site for all 65.
+    """
+
+    _ANTIEVASION_DIR = ROOT / "src" / "PhantomCore" / "AntiEvasion"
+
+    # Measured floors so a broken walk fails loudly instead of passing vacuously.
+    _MIN_ASM_FILES = 6
+    _EXPECTED_EXPORTS = 105
+
+    # Every routine with at least one real call site or function-pointer table entry,
+    # measured.  A name LEAVING this set means a reachable routine went dark, which is
+    # how coverage is silently lost; a name ENTERING it means review is due.
+    _LIVE = {
+        # EnvironmentEvasionDetector_x64.asm - the shared CPU primitive library (24)
+        "CheckCPUIDHypervisorBit", "MeasureRDTSCTimingDelta", "MeasureRDTSCPTiming",
+        "MeasureCPUIDTiming", "GetIDTBase", "GetGDTBase", "GetLDTSelector",
+        "GetTRSelector", "CheckSegmentLimits", "GetIDTAndGDTInfo", "GetDebugRegisters",
+        "CheckNtGlobalFlag", "GetProcessHeapFlags", "CheckBeingDebugged",
+        "CheckCPUIDHypervisorVendor", "GetCPUIDFeatureFlags", "GetExtendedCPUIDMaxLeaf",
+        "CheckSSE2Support", "GetProcessorCoreCount", "MeasureRDTSCLatency",
+        "CheckDebugRegistersASM", "CheckCPUIDVMXSupport", "GetCPUIDBrandString",
+        "GetCPUIDVendorString",
+        # PackerDetector_x64.asm - the only TARGET-subject routines in the layer (5)
+        "ScanForAntiDebugOpcodes", "ScanForInt2DOpcode", "ScanForRDTSCOpcode",
+        "ScanForCPUIDOpcode", "ScanForSMCPatterns",
+        # TimeBasedEvasionDetector_x64.asm - the host timing profile, measured once (8)
+        "TimingRDTSCDelta", "TimingSerializedRDTSC", "TimingCompareRDTSCvRDTSCP",
+        "TimingCPUIDLatency", "TimingCheckHypervisorLeaf", "TimingCPUIDVariance",
+        "TimingMeasureInstructions", "TimingMeasureMemory",
+        # VMEvasionDetector_x64.asm - the only module with no dark export (6)
+        "CheckHyperVBackdoor", "GetExtendedCPUIDInfo", "DetectVMCALL", "DetectVMMCALL",
+        "CheckCPUIDLeafRange", "CheckVMwareBackdoor",
+    }
+
+    # Dark routines whose SUBJECT is this machine or this process and whose product is a
+    # verdict rather than a measurement.  These must never acquire a caller that feeds a
+    # sample verdict.  Grouped by owning .asm for reviewability.
+    _NEVER_WIRE_AS_VERDICT = {
+        # DebuggerEvasionDetector_x64.asm (14).  Read the bodies before the names:
+        # DetectInt3Timing executes NO int 3 - it times 32 NOPs against a threshold -
+        # and DetectInt2DBehavior executes no int 2Dh; it reads the PEB BeingDebugged
+        # byte via gs:[60h] then DISCARDS it and returns a CPUID-timing verdict instead.
+        "DebuggerDetectSingleStepTiming", "DetectTrapFlagManipulation",
+        "DetectInt2DBehavior", "DetectInt3Timing", "DetectHardwareBreakpointsTiming",
+        "MeasureDebugInstructionTiming", "DetectICEBPBehavior", "DetectIDTRelocation",
+        "DetectGDTRelocation", "DetectLDTPresence", "CheckDebugRegistersIndirect",
+        "MeasureCPUIDRDTSCPair", "DetectPrefetchTiming", "DetectExceptionHandlerTiming",
+        # EnvironmentEvasionDetector_x64.asm (8)
+        "DetectHardwareBreakpoints", "DetectSingleStep", "CheckTrapFlag",
+        "PerformRDTSCPMeasurement", "MeasureInstructionTiming", "MeasureINTTimingDelta",
+        "MeasureExceptionTiming", "DetectPopfTiming",
+        # PackerDetector_x64.asm (4) - host timing opinions inside a FILE verdict
+        "MeasureInstructionSequence", "DetectTimingAnomaly",
+        "CheckHardwareBreakpointTraps", "DetectRDTSCAntiDebug",
+        # SandboxEvasionDetector_x64.asm (15).  Their own doc comments give them away:
+        # "high = likely VM", "deviation percentage", "0 = exact".
+        "MeasureRDTSCOverhead", "MeasureCPUIDOverhead", "MeasureSleepAcceleration",
+        "CheckCuckooBackdoor", "MeasureTimingPrecision", "SandboxDetectSingleStepTiming",
+        "MeasureVMExitOverhead", "CalibrateTimingBaseline", "DetectTimingHook",
+        "MeasureMemoryLatency", "CheckHypervisorBit", "MeasureIntOverhead",
+        "SandboxRDTSCDifference", "GetRDTSCFrequency", "DetectRDTSCEmulation",
+        # TimeBasedEvasionDetector_x64.asm (7)
+        "TimingMeasureSleep", "TimingDetectSleepAcceleration", "TimingCalibrateTimebase",
+        "TimingDetectSingleStep", "TimingGetTSCFrequency", "TimingDetectVMExit",
+        "TimingMeasureHypervisor",
+    }
+
+
+    _DISPOSITION_MARKER = "DISPOSITION"
+
+    _DOCUMENTED_MODULES = (
+        "DebuggerEvasionDetector.cpp", "SandboxEvasionDetector.hpp",
+        "TimeBasedEvasionDetector.hpp", "PackerDetector.hpp",
+        "EnvironmentEvasionDetector.cpp",
+    )
+
+    # ---------------------------------------------------------------- helpers
+
+    def _asm_exports(self):
+        """Map every exported PROC to its owning .asm file name."""
+        asm_files = sorted(self._ANTIEVASION_DIR.glob("*_x64.asm"))
+        self.assertGreaterEqual(
+            len(asm_files), self._MIN_ASM_FILES,
+            "expected at least {} assembly sources under {}, walked {} - the glob is "
+            "broken and every assertion here would pass vacuously".format(
+                self._MIN_ASM_FILES, self._ANTIEVASION_DIR, len(asm_files)),
+        )
+        exports = {}
+        for path in asm_files:
+            stripped = re.sub(r";[^\n]*", "", read_source(path))
+            for name in re.findall(
+                r"(?im)^\s*([A-Za-z_][A-Za-z0-9_]*)\s+PROC\b", stripped
+            ):
+                exports[name] = path.name
+        return exports
+
+    def _consumer_sources(self):
+        """Comment-stripped C/C++ that could reference an assembly export."""
+        paths = sorted((ROOT / "src").rglob("*.cpp")) + sorted((ROOT / "src").rglob("*.hpp"))
+        paths += sorted((ROOT / "tests").rglob("*.cpp"))
+        self.assertGreater(len(paths), 200, "the consumer walk found almost no sources")
+        return {p: strip_c_comments(read_source(p)) for p in paths}
+
+    # Control-flow keywords may sit immediately before a name and still be a CALL.
+    # Without this list `return Foo();` reads as a declaration, because "return " matches
+    # the same character class a return type does.
+    _NOT_A_RETURN_TYPE = frozenset(
+        ("return", "if", "while", "for", "switch", "else", "do", "case", "goto")
+    )
+
+    @classmethod
+    def _statement_around(cls, code, position):
+        """Return the joined logical statement containing *position*.
+
+        Deliberately NOT enclosing_statement(): that helper stops BEFORE the terminator
+        because it exists to compare two tokens inside one boolean expression, so any
+        test for a trailing ';' against its output is always false.  Reusing it here
+        classified all 65 dark routines as live.
+        """
+        start = max(code.rfind(";", 0, position), code.rfind("{", 0, position),
+                    code.rfind("}", 0, position))
+        ends = [off for off in (code.find(";", position), code.find("{", position))
+                if off >= 0]
+        stop = min(ends) if ends else len(code)
+        return " ".join(code[start + 1:stop].split())
+
+    @classmethod
+    def _call_sites(cls, code, name):
+        """Real call sites of *name*: excludes prototypes, definitions and ALTERNATENAME.
+
+        The discriminator is the text immediately BEFORE the name in its joined
+        statement.  A declaration or definition carries a RETURN TYPE there
+        (`uint64_t Foo(`); a call carries nothing (`Foo();`), an assignment
+        (`x = Foo()`), a control keyword (`return Foo()`) or a nested call
+        (`EXPECT_EQ(1u, Foo(`).  Joining the statement first is load-bearing: a
+        multi-line prototype has no semicolon on its own line, which is what made a
+        per-line test report five call sites that do not exist.
+
+        '&name' counts as live because the packer reaches three routines through a
+        function-pointer table rather than by calling them.
+        """
+        # Preprocessor lines are removed so `#endif` cannot become part of a return
+        # type, and so an /ALTERNATENAME pragma can never be read as a call.
+        body = re.sub(r"(?m)^\s*#[^\n]*", "", code)
+        sites = []
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9_])" + re.escape(name) + r"\s*\(", body
+        ):
+            flat = cls._statement_around(body, match.start())
+            if "ALTERNATENAME" in flat or ("Fallback_" + name) in flat:
+                continue
+            if name not in flat:
+                sites.append(flat[:110])
+                continue
+            head = flat[:flat.index(name)]
+            head = head.replace('extern "C"', "").replace("{", "").replace("}", "").strip()
+            words = head.replace("*", " ").replace("&", " ").split()
+            is_type = (
+                bool(head)
+                and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:<>,\*&\s]*", head))
+                and not any(w in cls._NOT_A_RETURN_TYPE for w in words)
+            )
+            if not is_type:
+                sites.append(flat[:110])
+        for _ in re.finditer(r"&\s*" + re.escape(name) + r"(?![A-Za-z0-9_])", body):
+            sites.append("&" + name)
+        return sites
+
+    # Three tests need the same census and the walk reads over a thousand sources, so it
+    # is computed once per process rather than once per test.
+    _census_cache = None
+
+    def _live_names(self):
+        if type(self)._census_cache is None:
+            exports = self._asm_exports()
+            sources = self._consumer_sources()
+            live = set()
+            for name in exports:
+                for code in sources.values():
+                    if name not in code:
+                        continue
+                    if self._call_sites(code, name):
+                        live.add(name)
+                        break
+            type(self)._census_cache = (exports, live)
+        return type(self)._census_cache
+
+    # ---------------------------------------------------------------- tests
+
+    def test_the_assembly_export_census_has_not_drifted(self):
+        exports, live = self._live_names()
+        self.assertEqual(
+            self._EXPECTED_EXPORTS, len(exports),
+            "the assembly layer exports {} routines, measured {}.  Update this count "
+            "together with the _LIVE and _NEVER_WIRE_AS_VERDICT sets - a bare count "
+            "bump hides which routine moved.".format(self._EXPECTED_EXPORTS, len(exports)),
+        )
+        went_dark = sorted(self._LIVE - live)
+        self.assertEqual(
+            [], went_dark,
+            "these routines had a real caller and now have none, so hand-written "
+            "assembly that used to run is dead weight in the binary and nothing else "
+            "reports it: " + ", ".join(went_dark),
+        )
+        newly_live = sorted(live - self._LIVE)
+        self.assertEqual(
+            [], newly_live,
+            "these routines acquired a caller.  That may be correct, but it needs a "
+            "reviewer: confirm the SUBJECT is the scanned sample and not this machine, "
+            "then add the name to _LIVE: " + ", ".join(newly_live),
+        )
+
+    def test_no_host_inference_routine_has_acquired_a_caller(self):
+        exports, live = self._live_names()
+        # Refuse to pass on a stale list: every name here must still be exported.
+        missing = sorted(self._NEVER_WIRE_AS_VERDICT - set(exports))
+        self.assertEqual(
+            [], missing,
+            "these names are on the never-wire list but are no longer exported by any "
+            ".asm, so this guard is protecting nothing: " + ", ".join(missing),
+        )
+        wired = sorted(self._NEVER_WIRE_AS_VERDICT & live)
+        self.assertEqual(
+            [], wired,
+            "these routines measure THIS MACHINE and return a verdict, and they now "
+            "have a caller: " + ", ".join(wired) + ".  On any VMware, Hyper-V or cloud "
+            "endpoint they read positive, so a verdict built from them convicts the "
+            "endpoint being defended rather than the sample being scanned.  If a "
+            "genuine CONTEXT consumer is intended, cap its severity and confidence the "
+            "way 73ea88ba capped CheckTimingIndicators, state at the call site that the "
+            "product is context and never a verdict, and only then move the name out of "
+            "_NEVER_WIRE_AS_VERDICT.",
+        )
+
+    def test_every_dark_routine_keeps_its_prototype_and_fallback_binding(self):
+        exports, live = self._live_names()
+        dark = sorted(set(exports) - live)
+        self.assertGreaterEqual(
+            len(dark), 50,
+            "expected the dark set to be large (measured 65); found {} - if the layer "
+            "was genuinely wired this guard needs rewriting, not deleting".format(len(dark)),
+        )
+        sources = self._consumer_sources()
+        raw = {p: read_source(p) for p in sources}
+
+        undeclared, unbound = [], []
+        for name in dark:
+            declared = any(
+                re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"\s*\(", code)
+                for code in sources.values()
+            )
+            if not declared:
+                undeclared.append(name)
+            bound = any(
+                re.search(r"(?i)ALTERNATENAME\s*:\s*" + re.escape(name) + r"\s*=", text)
+                for text in raw.values()
+            )
+            if not bound:
+                unbound.append(name)
+
+        self.assertEqual(
+            [], sorted(undeclared),
+            "a dark routine with no prototype cannot be called even deliberately, so "
+            "the capability is unrecoverable rather than merely unused: "
+            + ", ".join(sorted(undeclared)),
+        )
+        self.assertEqual(
+            [], sorted(unbound),
+            "these dark routines have no /ALTERNATENAME fallback, so a caller added "
+            "later links against assembly alone and any configuration that does not "
+            "assemble it fails at link time instead of degrading: "
+            + ", ".join(sorted(unbound)),
+        )
+
+
+    def test_the_disposition_of_the_dark_layer_is_documented_where_it_is_declared(self):
+        """The reasoning must live beside the prototypes, not only in a commit message."""
+        missing = []
+        for name in self._DOCUMENTED_MODULES:
+            # RAW source: the disposition IS a comment, so stripping would delete it.
+            text = read_source(self._ANTIEVASION_DIR / name)
+            if self._DISPOSITION_MARKER not in text:
+                missing.append(name)
+        self.assertEqual(
+            [], missing,
+            "these modules export assembly routines that are deliberately dark and no "
+            "longer explain why beside the declarations, so the next reader sees only "
+            "unused code and wires it: " + ", ".join(missing),
+        )
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

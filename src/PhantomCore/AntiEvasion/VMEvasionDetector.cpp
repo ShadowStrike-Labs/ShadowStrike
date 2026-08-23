@@ -94,6 +94,20 @@ extern "C" {
     uint16_t GetLDTSelector() noexcept;
 
     /// @brief Checks VMware backdoor port 0x5658 (implemented in ASM)
+    /// @note SUBJECT IS THIS MACHINE (task 209, measured): this routine IS called,
+    ///       at three sites in this file, and all six exports of
+    ///       VMEvasionDetector_x64.asm are live -- the only module in the layer
+    ///       with no dark export.
+    ///       What it may produce is therefore the constraint, not whether it runs.
+    ///       It writes to I/O port 0x5658 and reports how the host answers, so its
+    ///       product is CONTEXT about the endpoint we are defending. It can never
+    ///       be a verdict about a scanned sample: on a VMware guest it reads
+    ///       positive every time, and a confidence built from that convicts the
+    ///       machine rather than the file. Note the layer already answers "is a
+    ///       hypervisor present" from an EXACT fact -- the CPUID hypervisor bit
+    ///       read by EnvironmentEvasionDetector's CheckCPUIDHypervisorBit -- so
+    ///       prefer that as the calibration input and treat this as corroboration.
+    ///       Pinned live by AssemblyExportCensusContractTests.
     void CheckVMwareBackdoor(uint32_t* rax, uint32_t* rbx, uint32_t* rcx, uint32_t* rdx) noexcept;
 
     // ========================================================================

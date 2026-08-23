@@ -144,12 +144,40 @@
 // =============================================================================
 // ASSEMBLY FUNCTION DECLARATIONS (SandboxEvasionDetector_x64.asm)
 // =============================================================================
-// These functions provide low-level timing and environment detection that
-// cannot be reliably implemented in C++ due to:
-// - Precise instruction sequencing requirements
-// - Need to avoid compiler optimizations
-// - Direct access to CPU features (RDTSC, CPUID, RDPMC)
-// - Detection of VM/hypervisor timing anomalies
+// These functions reach CPU facilities that C++ cannot express directly:
+// precise instruction sequencing, freedom from compiler reordering, and RDTSC /
+// RDTSCP / CPUID access.
+//
+// CORRECTION (task 209): the previous wording here claimed they "cannot be
+// reliably implemented in C++". That is contradicted by this module's own code --
+// every routine below carries a Fallback_* C++ implementation bound by
+// /ALTERNATENAME, precisely so the module still links and answers without the
+// .asm. What assembly buys is PRECISION, not possibility.
+//
+// DISPOSITION (measured): ALL 17 routines exported by this .asm have ZERO
+// callers, and that is the intended state. AssemblyExportCensusContractTests
+// enforces it. Fifteen of the seventeen must NEVER be wired to a verdict, and
+// the doc comments below say why in their own words: "high = likely VM",
+// "deviation percentage", "0 = exact". Those describe a measurement of THIS
+// MACHINE. Under the subject rule a host measurement is context and can never
+// be a verdict about a scanned sample -- and on any VMware, Hyper-V or cloud
+// endpoint every one of them reads positive, so wiring them would convict the
+// endpoint we are defending. That is the defect 6a1ee4a3 deleted and 73ea88ba
+// capped; do not reintroduce it here.
+//
+// The remaining two (GetPreciseRDTSC, GetPreciseRDTSCP) are pure clock readers
+// with no verdict of their own, and they are still dark because
+// TimeBasedEvasionDetector_x64.asm already publishes the host timing profile
+// through eight LIVE routines (TimingRDTSCDelta, TimingSerializedRDTSC,
+// TimingCompareRDTSCvRDTSCP, TimingCPUIDLatency, TimingCPUIDVariance,
+// TimingMeasureInstructions, TimingMeasureMemory, TimingCheckHypervisorLeaf).
+// One host clock profile, measured once, is the design; a second is drift.
+//
+// MeasureSleepAcceleration is dark for a further, settled reason: sleep
+// fragmentation is an ANTI-SANDBOX behaviour, so it is observed where the
+// sandbox is -- PhantomEmulator, which accelerates time and can therefore see a
+// delay without paying it. Neither the kernel driver nor ETW can observe a
+// Sleep at all (measured: Windows exposes no delay notification callback).
 // =============================================================================
 
 #ifdef __cplusplus

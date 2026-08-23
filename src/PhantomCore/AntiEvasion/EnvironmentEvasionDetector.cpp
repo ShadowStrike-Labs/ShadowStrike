@@ -118,7 +118,46 @@
 // ============================================================================
 // EXTERNAL ASSEMBLY FUNCTIONS
 // Defined in EnvironmentEvasionDetector_x64.asm
-// High-precision CPU detection that cannot be reliably performed in C++
+// High-precision CPU detection that C++ cannot express directly
+// ============================================================================
+//
+// THIS IS THE ANTI-EVASION LAYER'S SHARED CPU PRIMITIVE LIBRARY, and that fact
+// is what explains the whole layer's assembly census (task 209, measured).
+// VMEvasionDetector.cpp calls TEN of the routines below -- CheckCPUIDHypervisorBit
+// (:529), MeasureRDTSCTimingDelta (:547), GetIDTBase (:556), GetGDTBase (:565),
+// GetLDTSelector (:574), GetTRSelector (:583), MeasureCPUIDTiming (:602),
+// CheckSegmentLimits (:632), GetIDTAndGDTInfo (:682), MeasureRDTSCPTiming (:701)
+// -- which is why VMEvasionDetector_x64.asm needs only six exports of its own.
+//
+// DISPOSITION: 24 of the 32 routines here are LIVE, the highest ratio in the
+// layer, precisely because the other modules delegate their CPU probing here
+// instead of reimplementing it. AssemblyExportCensusContractTests pins the set.
+//
+// WHAT THE LIVE 22 MAY AND MAY NOT DO. Their subject is THIS MACHINE, so their
+// product is CONTEXT -- calibration input and self-defence state -- and never a
+// verdict about a scanned sample. Two lifecycles apply and must not be merged:
+// INVARIANT facts (CPUID leaves, descriptor-table bases, measured timing costs)
+// are read once and cached; VOLATILE self state (CheckBeingDebugged,
+// GetDebugRegisters, CheckDebugRegistersASM, CheckNtGlobalFlag,
+// GetProcessHeapFlags) MUST be read fresh on every call, because a cached
+// "not debugged" is a silent false negative.
+//
+// THE EIGHT DARK ONES:
+//   DetectHardwareBreakpoints / DetectSingleStep / CheckTrapFlag
+//       Duplicates of the live CheckDebugRegistersASM and GetDebugRegisters.
+//       DetectSingleStep is one of four single-step probes across this layer,
+//       all dark; task 206 already had to rename two of them for colliding on
+//       one exported name.
+//   PerformRDTSCPMeasurement / MeasureInstructionTiming / MeasureINTTimingDelta /
+//   MeasureExceptionTiming / DetectPopfTiming
+//       Host timing inference. TimeBasedEvasionDetector already publishes the
+//       host timing profile through eight live routines, measured once and
+//       cached. A second uncalibrated timing opinion is drift, and a boolean
+//       "detected" derived from it fires on any loaded host and every VM --
+//       the false-positive engine deleted in 6a1ee4a3 and capped in 73ea88ba.
+//
+// Binding is NOT the obstacle: every routine has a prototype here and a
+// Fallback_* bound by /ALTERNATENAME, so a caller added tomorrow links and runs.
 // ============================================================================
 
 extern "C" {

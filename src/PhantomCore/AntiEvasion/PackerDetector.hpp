@@ -227,8 +227,53 @@
 // ============================================================================
 // ASSEMBLY FUNCTION DECLARATIONS (PackerDetector_x64.asm)
 // ============================================================================
-// These functions provide low-level detection capabilities that cannot be
-// reliably implemented in C++ due to compiler optimizations.
+// These functions provide low-level detection capabilities that C++ cannot
+// express reliably, because the compiler is free to reorder or eliminate the
+// instruction sequences the measurement depends on.
+//
+// DISPOSITION (task 209, measured): 5 of the 15 routines exported by this .asm
+// are LIVE and 10 are dark. AssemblyExportCensusContractTests pins both sets.
+//
+// THE FIVE LIVE ONES ARE THE ONLY ROUTINES IN THIS WHOLE LAYER WHOSE SUBJECT IS
+// THE SCANNED SAMPLE, which is why they are the ones that carry a verdict:
+// ScanForAntiDebugOpcodes (5 callers, 4 of them tests), ScanForSMCPatterns (2),
+// and ScanForInt2DOpcode / ScanForRDTSCOpcode / ScanForCPUIDOpcode, reached
+// through the function-pointer table at PackerDetector.cpp:2883-2889. They read
+// caller-supplied entry-point bytes, so what they find is a property of the file
+// and belongs in that file's verdict.
+//
+// THE TEN DARK ONES:
+//   GetRDTSCValue / GetRDTSCPValue / MeasureInstructionSequence /
+//   MeasureUnpackStubTiming / DetectTimingAnomaly / DetectRDTSCAntiDebug /
+//   CheckHardwareBreakpointTraps
+//       Subject is THIS MACHINE or THIS PROCESS, not the sample. Under the
+//       settled rule a host measurement is context and can never be a verdict
+//       about a file, and TimeBasedEvasionDetector already publishes the host
+//       timing profile through eight live routines. Wiring these would add a
+//       second, uncalibrated timing opinion to a file verdict.
+//
+//   SIMDScanForByte / SIMDScanForWord / SIMDScanForPattern
+//       These three DO take a caller-supplied buffer, so subject is not the
+//       obstacle -- there is simply no consumer that needs them, and measurement
+//       says there is no performance case either: the packer path scans at most
+//       MAX_EP_BYTES = 512 bytes (PackerDetector.cpp:115), where a vectorised
+//       search cannot pay for itself.
+//       READ BEFORE BELIEVING THE NAMES. Only SIMDScanForByte is vectorised
+//       (movdqu / pcmpeqb / pmovmskb, 16 bytes per iteration). SIMDScanForWord
+//       and SIMDScanForPattern contain ZERO SIMD instructions -- both are
+//       scalar byte-at-a-time loops in the .asm, and both C++ fallbacks are
+//       scalar as well, the pattern one being a naive O(n*m) double loop. The
+//       names assert a capability the bodies do not have. They are left in place
+//       rather than renamed because renaming a dark export churns four sites
+//       (.asm, prototype, fallback, /ALTERNATENAME) for no behaviour change --
+//       but nothing may cite these names as evidence of vectorisation, and if a
+//       caller is ever added it must either implement the vectorisation or drop
+//       the SIMD prefix in the same change.
+//       Note Fallback_SIMDScanForByte routes to memchr, which the MSVC CRT
+//       already vectorises, so on that one the fallback is not the slow path.
+//
+// Binding is NOT the obstacle: every routine has a prototype here and a
+// Fallback_* bound by /ALTERNATENAME, so a caller added tomorrow links and runs.
 // ============================================================================
 
 extern "C" {

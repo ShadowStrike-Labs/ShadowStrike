@@ -389,6 +389,53 @@ namespace ShadowStrike::AntiEvasion {
 // These provide low-level CPU timing and instruction execution for advanced
 // debugger detection that cannot be reliably done in pure C++.
 // ============================================================================
+//
+// DISPOSITION (task 209, measured): ALL 18 routines exported by this .asm have
+// ZERO callers, and that is the intended state -- not a coverage gap. Every one
+// of them is enforced dark by AssemblyExportCensusContractTests. Do NOT "restore
+// coverage" by calling them; read this first.
+//
+// WHY. Two independent reasons, both measured:
+//
+//  1. DUPLICATION. EnvironmentEvasionDetector_x64.asm is the layer's shared CPU
+//     primitive library -- VMEvasionDetector.cpp alone calls ten of its exports
+//     (CheckCPUIDHypervisorBit, MeasureRDTSC*/CPUIDTiming, GetIDTBase,
+//     GetGDTBase, GetLDTSelector, GetTRSelector, CheckSegmentLimits,
+//     GetIDTAndGDTInfo). Each routine below already has a LIVE equivalent there:
+//       DetectIDTRelocation / DetectGDTRelocation  -> GetIDTBase / GetGDTBase /
+//                                                     GetIDTAndGDTInfo  (live)
+//       DetectLDTPresence                          -> GetLDTSelector    (live)
+//       CheckDebugRegistersIndirect                -> CheckDebugRegistersASM
+//                                                     and GetDebugRegisters (live)
+//       GetRDTSCPrecise / SerializeCPU             -> MeasureRDTSCLatency (live)
+//                                                     and TimingSerializedRDTSC
+//     Wiring a second copy adds cost and a second number to reconcile, not reach.
+//
+//  2. THE NAMES OVER-STATE THE BODIES, and the bodies are host-timing INFERENCE.
+//     Read before trusting a name: DetectInt3Timing executes no INT 3 at all --
+//     it times 32 NOPs and returns 1 when the average exceeds THRESHOLD_INT3.
+//     DetectInt2DBehavior executes no INT 2Dh -- it reads the PEB BeingDebugged
+//     byte through gs:[60h], DISCARDS it (the value is overwritten by the next
+//     xor eax,eax), and returns a verdict from CPUID timing instead. So the one
+//     exact self-debug signal in this file is read and thrown away in favour of
+//     a measurement that rises on any loaded host, any VM that exits on RDTSC,
+//     and any machine under contention.
+//     That is the false-positive engine deleted in 6a1ee4a3 and capped in
+//     73ea88ba. A host timing measurement is CONTEXT, never a verdict.
+//
+// WHAT WOULD MAKE ONE OF THESE LEGITIMATE. Only a change of SUBJECT. Two here
+// take a caller-supplied buffer rather than probing this machine --
+// ScanForBreakpointOpcodes and MeasureCodeIntegrity -- so they could in
+// principle contribute to a verdict about the thing being scanned. They are
+// still dark because PackerDetector's ScanForAntiDebugOpcodes (live, 5 callers)
+// already covers that ground on the entry-point bytes. Wire one of those two
+// only with a named consumer and a test; never wire the other sixteen.
+//
+// Binding is NOT the obstacle and never was: every routine below has both a
+// prototype here and a Fallback_* C++ implementation bound by /ALTERNATENAME,
+// so a caller added tomorrow links and runs. The callers are what is absent,
+// deliberately.
+// ============================================================================
 
 extern "C" {
     // Timing-based detection functions

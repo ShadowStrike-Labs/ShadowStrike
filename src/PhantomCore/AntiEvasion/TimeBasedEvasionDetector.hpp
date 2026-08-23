@@ -141,12 +141,55 @@
 // =============================================================================
 // ASSEMBLY FUNCTION DECLARATIONS (TimeBasedEvasionDetector_x64.asm)
 // =============================================================================
-// These functions provide low-level CPU timing measurements that CANNOT be
-// reliably implemented in C++ due to:
+// These functions provide low-level CPU timing measurements that C++ cannot
+// express directly:
 // - Compiler optimizations that reorder or eliminate timing instructions
 // - Instruction scheduling that adds variable overhead
 // - Need for precise CPUID serialization before RDTSC
 // - Detection of sub-microsecond VM exit latency
+//
+// DISPOSITION (task 209, measured): 8 of the 17 routines exported by this .asm
+// are LIVE and 9 are deliberately dark. AssemblyExportCensusContractTests pins
+// both sets, so a live one cannot silently go dark and a dark one cannot
+// silently go live.
+//
+// THE EIGHT LIVE ONES ARE THE HOST TIMING PROFILE, and it is measured ONCE and
+// cached: TimingRDTSCDelta, TimingSerializedRDTSC, TimingCompareRDTSCvRDTSCP,
+// TimingCPUIDLatency, TimingCPUIDVariance, TimingMeasureInstructions,
+// TimingMeasureMemory, TimingCheckHypervisorLeaf. Their subject is THIS MACHINE,
+// so their product is context for calibration -- never a verdict about a scanned
+// sample. That distinction is the settled rule of this layer.
+//
+// THE NINE DARK ONES, and why each stays dark:
+//   TimingGetPreciseRDTSC / TimingGetPreciseRDTSCP
+//       Pure clock readers, no verdict. Redundant: the eight above already read
+//       the clock, and one profile is the design while two is drift.
+//   TimingCalibrateTimebase / TimingGetTSCFrequency
+//       Superseded by the cached profile above.
+//   TimingDetectSingleStep
+//       One of FOUR single-step probes in this layer (the others live in
+//       Debugger, Sandbox and Environment), all dark. Note task 206 had to
+//       rename two of them because two objects exported one name -- the
+//       duplication is old and documented.
+//   TimingMeasureSleep / TimingDetectSleepAcceleration
+//       Sleep fragmentation is an ANTI-SANDBOX behaviour, so it is observed
+//       where the sandbox is: PhantomEmulator, which accelerates time and can
+//       see a delay without paying it. Measured and settled -- the kernel driver
+//       CANNOT see a Sleep (Windows exposes no delay notification callback;
+//       reaching NtDelayExecution from kernel mode means SSDT patching and a
+//       PatchGuard bugcheck) and no ETW provider emits a per-delay event.
+//   TimingMeasureHypervisor
+//       Duplicate of the live TimingCheckHypervisorLeaf.
+//   TimingDetectVMExit  <-- MUST NEVER BE WIRED TO A VERDICT
+//       Read its fallback before considering it. It scores rdtscOverhead > 500
+//       as +35, cpuidLatency > 1500 as +40 and the CPUID hypervisor bit as +25.
+//       On any VMware, Hyper-V or cloud endpoint all three hold, so it returns
+//       100/100 -- on the machine we are defending, every time. It is a
+//       confidence generator with no target, which is exactly the class deleted
+//       in 6a1ee4a3 and capped in 73ea88ba.
+//
+// Binding is NOT the obstacle: every routine has a prototype here and a
+// Fallback_* bound by /ALTERNATENAME, so a caller added tomorrow links and runs.
 // =============================================================================
 
 #ifdef __cplusplus
