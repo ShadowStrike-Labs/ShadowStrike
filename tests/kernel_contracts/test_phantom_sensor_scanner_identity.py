@@ -9987,5 +9987,158 @@ class HostContextCalibrationWiringContractTests(unittest.TestCase):
             "suppression point.",
         )
 
+class HostProbeContextOnlyContractTests(unittest.TestCase):
+    """EnvironmentEvasionDetector's host-subject probes stay context, never verdicts.
+
+    Every one of these routines inspects THIS machine rather than a caller-supplied
+    sample, so under the subject rule the module already follows, none of them may
+    produce a verdict. Commit ad535230 removed four siblings outright for asking
+    "what does malware ask about the box it landed on"; it KEPT these on the stated
+    grounds that knowing the host is a VM in order NOT to flag it is defensive. That
+    retention is only true while the findings are marked as context and capped, which
+    is exactly what CheckTimingIndicators was missing - it was the single unmarked
+    routine of the eight and emitted confidences up to 0.90.
+    """
+
+    # Every host-subject probe in the module. The population is asserted below so a
+    # newly added host probe cannot skip the marking by simply not being listed here.
+    HOST_SUBJECT_PROBES = (
+        "CheckBlacklistedNames",
+        "CheckHardwareFingerprint",
+        "CheckFileSystemArtifacts",
+        "CheckRegistryArtifacts",
+        "CheckNetworkConfiguration",
+        "CheckRunningProcesses",
+        "CheckTimingIndicators",
+        "CheckAdvancedCPUIDIndicators",
+    )
+
+    CONTEXT_MARKER = "NOT a detection source."
+
+    # The context ceiling. CheckRunningProcesses sets the precedent for this module:
+    # 0.20 for "VMs are ubiquitous in enterprise", 0.10 for "these are legitimate
+    # tools". A host fact that is true of ordinary infrastructure must not be scored
+    # above it.
+    CONTEXT_CONFIDENCE_CEILING = 0.20
+
+    def test_every_host_subject_probe_is_marked_as_context(self):
+        # The markers ARE doc comments, so this one check must read the RAW source.
+        hpp = read_source(ENVIRONMENT_EVASION_DETECTOR_HPP_PATH)
+        unmarked = []
+        for name in self.HOST_SUBJECT_PROBES:
+            m = re.search(r"bool\s+" + name + r"\s*\(", hpp)
+            self.assertIsNotNone(
+                m, name + " is no longer declared in EnvironmentEvasionDetector.hpp. "
+                "If it was deliberately removed, drop it from HOST_SUBJECT_PROBES in "
+                "the SAME change and say why in the commit message."
+            )
+            # Locate the doc block that IMMEDIATELY precedes the declaration, anchored
+            # on its closing delimiter. A fixed character or line window bleeds into the
+            # previous declaration's comment or truncates a long one, and testing "the
+            # last semicolon precedes the last /**" is unsound because a doc comment may
+            # itself contain a semicolon - that heuristic reported this very function as
+            # having no doc block at all. Requiring only whitespace and an optional
+            # attribute between */ and the declaration can do neither.
+            head = hpp[:m.start()]
+            close = head.rfind("*/")
+            between = head[close + 2:].strip() if close >= 0 else "x"
+            if close < 0 or between not in ("", "[[nodiscard]]"):
+                unmarked.append(name + " (no doc-comment block on the declaration)")
+                continue
+            block_start = head.rfind("/**", 0, close)
+            if block_start < 0:
+                unmarked.append(name + " (unterminated doc-comment block)")
+                continue
+            if self.CONTEXT_MARKER not in head[block_start:close]:
+                unmarked.append(name)
+        self.assertEqual(
+            [], unmarked,
+            "These host-subject probes do not carry '" + self.CONTEXT_MARKER + "' on "
+            "their declaration: " + ", ".join(unmarked) + ". A routine that inspects "
+            "THIS machine may contribute context, never a verdict - see ad535230."
+        )
+
+    def test_the_host_timing_probe_caps_every_finding_it_collects(self):
+        cpp = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        body = extract_c_function(cpp, "EnvironmentEvasionDetector::CheckTimingIndicators")
+        self.assertIsNotNone(body, "CheckTimingIndicators definition not found.")
+
+        pushes = len(re.findall(r"outDetections\.push_back", body))
+        caps = len(re.findall(
+            r"severity\s*=\s*EnvironmentEvasionSeverity::Low", body))
+        # Anti-vacuity: if the routine stops collecting anything this test must fail
+        # rather than pass by having nothing left to check.
+        self.assertGreaterEqual(
+            pushes, 6,
+            "CheckTimingIndicators now collects only " + str(pushes) + " indicators. "
+            "This guard exists to bound them; if the routine was deliberately reduced, "
+            "re-derive the floor in the same change."
+        )
+        self.assertEqual(
+            pushes, caps,
+            "CheckTimingIndicators collects " + str(pushes) + " indicators but caps "
+            "severity on only " + str(caps) + ". Every finding about THIS machine must "
+            "be capped at Low - an uncapped host finding is a verdict about the host."
+        )
+
+    def test_the_host_timing_probe_scores_nothing_above_the_context_ceiling(self):
+        cpp = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        body = extract_c_function(cpp, "EnvironmentEvasionDetector::CheckTimingIndicators")
+        self.assertIsNotNone(body, "CheckTimingIndicators definition not found.")
+
+        offenders = []
+        for m in re.finditer(r"confidence\s*=\s*([0-9]*\.?[0-9]+)", body):
+            value = float(m.group(1))
+            if value > self.CONTEXT_CONFIDENCE_CEILING + 1e-9:
+                offenders.append(m.group(0).strip())
+        # Every signal here is true of ordinary corporate infrastructure: short uptime
+        # after any reboot, a recent install on any re-imaged endpoint, tick drift on
+        # any loaded host, few scheduled tasks on a lean image, System Restore off by
+        # default on Server, and a boot mismatch on any resumed snapshot.
+        self.assertEqual(
+            [], offenders,
+            "CheckTimingIndicators scores host facts above the "
+            + str(self.CONTEXT_CONFIDENCE_CEILING) + " context ceiling: "
+            + ", ".join(offenders) + ". Each of its signals is true of ordinary "
+            "infrastructure, so a higher score would fire on the endpoints this "
+            "product ships to."
+        )
+
+    def test_the_host_timing_probe_is_not_wired_to_a_verdict_path(self):
+        cpp = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        # Comment-stripped, so the aggregator comment at AnalyzeProcessInternal that
+        # NAMES this routine cannot satisfy or break the count.
+        refs = len(re.findall(
+            r"(?<![A-Za-z0-9_])CheckTimingIndicators(?![A-Za-z0-9_])", cpp))
+        # Exactly two: the definition, and its own error-log string. A third is a call.
+        self.assertEqual(
+            2, refs,
+            "CheckTimingIndicators has " + str(refs) + " comment-stripped references "
+            "in EnvironmentEvasionDetector.cpp, expected 2 (its definition and its own "
+            "error-log string). A caller has been added. This routine inspects THIS "
+            "machine and every signal it collects is true of ordinary infrastructure, "
+            "so it must not feed a verdict path. It cannot feed CalibrateForHostContext "
+            "either: that policy takes an EXACT host fact and these are all inferred, "
+            "which is precisely the composite sandbox-likeness input 6a1ee4a3 removed. "
+            "If a genuine context consumer has been written, cite it here and update "
+            "this contract in the SAME change."
+        )
+
+    def test_the_four_removed_self_checks_have_not_returned(self):
+        # ad535230 removed these outright. Re-adding one would re-introduce host
+        # fingerprinting with no defensive reading.
+        hpp = read_source(ENVIRONMENT_EVASION_DETECTOR_HPP_PATH)
+        cpp = read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH)
+        returned = []
+        for name in ("CheckUserActivity", "CheckBrowserArtifacts",
+                     "CheckDisplayConfiguration", "CheckPeripheralHistory"):
+            if name in hpp or name in cpp:
+                returned.append(name)
+        self.assertEqual(
+            [], returned,
+            "These host-fingerprinting self-checks were deliberately removed by "
+            "ad535230 and have returned: " + ", ".join(returned) + "."
+        )
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

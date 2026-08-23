@@ -2885,10 +2885,43 @@ namespace ShadowStrike {
             ) noexcept;
 
             /**
-             * @brief Check system timing (uptime, install date)
-             * @param outDetections Output detections
+             * @brief Collect host timing context (uptime, install date, boot consistency).
+             *
+             * @param outDetections Context indicators (severity capped at Low)
              * @param err Optional error output
-             * @return true if suspicious timing found
+             * @return true if any context indicators collected
+             * @note NOT a detection source.
+             *
+             * THE SUBJECT IS THIS MACHINE, NOT A SAMPLE. It takes no target parameter and
+             * every signal it collects describes the host we are running on. Per the
+             * subject rule this module already follows, that makes it CONTEXT and never a
+             * verdict - the same standing as its six siblings CheckBlacklistedNames,
+             * CheckHardwareFingerprint, CheckFileSystemArtifacts, CheckRegistryArtifacts,
+             * CheckNetworkConfiguration and CheckRunningProcesses, all of which carry this
+             * note. This function was the only one of the seven that did not.
+             *
+             * @warning EVERY SIGNAL HERE FIRES ON ORDINARY CORPORATE INFRASTRUCTURE, which
+             *          is why the confidences are deliberately very low and the severity is
+             *          capped. Measured, signal by signal:
+             *            - short uptime: true on EVERY machine for the first half hour after
+             *              EVERY reboot;
+             *            - recent install: true on every newly provisioned laptop and every
+             *              re-imaged or freshly cloned VDI desktop;
+             *            - tick-count drift over a 100 ms sleep: default timer granularity is
+             *              ~15.6 ms and scheduling delay on a loaded or oversubscribed host
+             *              routinely exceeds the window outright;
+             *            - few scheduled tasks: true of lean and hardened golden images;
+             *            - System Restore disabled: the DEFAULT on Windows Server and on most
+             *              cloud and VDI images, and switched off by policy in many estates;
+             *            - boot-time mismatch: true of every VM resumed from a snapshot, which
+             *              is normal operation rather than analysis.
+             *
+             * @warning DO NOT WIRE THIS INTO AnalyzeProcessInternal OR ANY VERDICT PATH. It has
+             *          no caller today and a contract test keeps it that way. Its findings
+             *          cannot calibrate anything either: CalibrateForHostContext requires an
+             *          EXACT host fact and every signal above is INFERRED, which is precisely
+             *          the composite sandbox-likeness input 6a1ee4a3 removed for reading true
+             *          on the endpoints enterprises deploy most.
              */
             [[nodiscard]] bool CheckTimingIndicators(
                 std::vector<EnvironmentDetectedTechnique>& outDetections,

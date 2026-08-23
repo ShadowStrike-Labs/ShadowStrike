@@ -4217,18 +4217,24 @@ namespace ShadowStrike::AntiEvasion {
             if (identity.uptimeMs < EnvironmentConstants::MAX_FRESH_BOOT_UPTIME_MS) {
                 double confidenceAdjust = 0.0;
                 // Shorter uptime = higher confidence it's a sandbox
+                // The GRADIENT is kept - a shorter uptime is genuinely more indicative - but
+                // scaled to the context ceiling so the strongest case still lands at 0.20.
                 if (identity.uptimeMs < 5 * 60 * 1000) {  // Less than 5 minutes
-                    confidenceAdjust = 0.3;
+                    confidenceAdjust = 0.10;
                 }
                 else if (identity.uptimeMs < 15 * 60 * 1000) {  // Less than 15 minutes
-                    confidenceAdjust = 0.15;
+                    confidenceAdjust = 0.05;
                 }
 
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_ShortUptime);
-                detection.confidence = 0.60 + confidenceAdjust;
+                // VERY LOW - this is true of EVERY machine for the first half hour after
+                // EVERY reboot. Read as anything stronger it would fire daily, on every
+                // endpoint, and bury the findings that matter.
+                detection.confidence = 0.10 + confidenceAdjust;
+                detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                 detection.detectedValue = std::to_wstring(identity.uptimeMs / 60000) + L" minutes";
                 detection.expectedValue = L"> 30 minutes on normal system";
-                detection.description = L"Very short system uptime indicates fresh sandbox";
+                detection.description = L"Short system uptime (recent boot; may be a fresh analysis VM)";
                 detection.source = L"System Timing";
                 outDetections.push_back(detection);
                 found = true;
@@ -4250,17 +4256,22 @@ namespace ShadowStrike::AntiEvasion {
                     // If system is less than 24 hours old
                     if (systemAge < 24) {
                         EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_RecentInstall);
-                        detection.confidence = 0.75;
+                        // VERY LOW - true of every newly provisioned laptop and every
+                        // re-imaged or freshly cloned VDI desktop.
+                        detection.confidence = 0.20;
+                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = std::to_wstring(systemAge) + L" hours since install";
                         detection.expectedValue = L"> 7 days on normal system";
-                        detection.description = L"Very recent Windows installation (sandbox indicator)";
+                        detection.description = L"Very recent Windows installation (new or re-imaged host)";
                         detection.source = L"Install Timestamp";
                         outDetections.push_back(detection);
                         found = true;
                     }
                     else if (systemAge < 168) {  // Less than 7 days
                         EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_RecentInstall);
-                        detection.confidence = 0.50;
+                        // VERY LOW - a week-old install is entirely ordinary.
+                        detection.confidence = 0.10;
+                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = std::to_wstring(systemAge / 24) + L" days since install";
                         detection.expectedValue = L"> 30 days on typical system";
                         detection.description = L"Recent Windows installation";
@@ -4286,9 +4297,14 @@ namespace ShadowStrike::AntiEvasion {
             ULONGLONG tickDiff = tick2 - tick1;
             if (tickDiff < 50 || tickDiff > 500) {  // Too fast or too slow
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_AcceleratedTime);
-                detection.confidence = 0.70;
+                // VERY LOW, AND THE INSTRUMENT IS THE REASON. Default timer granularity is
+                // ~15.6 ms and scheduling delay on a loaded or oversubscribed host routinely
+                // exceeds the 500 ms ceiling on its own, so an overshoot measures system load
+                // far more often than it measures a manipulated clock.
+                detection.confidence = 0.15;
+                detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                 detection.detectedValue = std::to_wstring(tickDiff) + L" ms (expected ~100ms)";
-                detection.description = L"Time acceleration or manipulation detected";
+                detection.description = L"Sleep(100) elapsed outside the expected window (host load or clock skew)";
                 detection.source = L"Tick Count Analysis";
                 outDetections.push_back(detection);
                 found = true;
@@ -4306,10 +4322,12 @@ namespace ShadowStrike::AntiEvasion {
 
                 if (qStatus == ERROR_SUCCESS && taskCount < 50) {
                     EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
-                    detection.confidence = 0.45;
+                    // VERY LOW - lean and hardened golden images legitimately carry few tasks.
+                    detection.confidence = 0.15;
+                    detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                     detection.detectedValue = std::to_wstring(taskCount) + L" scheduled tasks";
                     detection.expectedValue = L">= 100 on typical system";
-                    detection.description = L"Very few scheduled tasks (fresh/sandbox system)";
+                    detection.description = L"Few scheduled tasks (lean image, fresh install or sandbox)";
                     detection.source = L"Task Scheduler";
                     outDetections.push_back(detection);
                     found = true;
@@ -4330,9 +4348,13 @@ namespace ShadowStrike::AntiEvasion {
                     // RPSessionInterval of 0 means disabled
                     if (rpSessionInterval == 0) {
                         EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
-                        detection.confidence = 0.40;
+                        // VERY LOW - System Restore is DISABLED BY DEFAULT on Windows Server
+                        // and on most cloud and VDI images, and switched off by policy in many
+                        // estates. This is close to a statement about the edition, not the host.
+                        detection.confidence = 0.10;
+                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = L"System Restore disabled";
-                        detection.description = L"System Restore is disabled (common in VMs)";
+                        detection.description = L"System Restore is disabled (default on Server and most VM images)";
                         detection.source = L"System Restore";
                         outDetections.push_back(detection);
                         found = true;
@@ -4355,10 +4377,16 @@ namespace ShadowStrike::AntiEvasion {
                     // If very few records, it's a fresh system
                     if (numRecords < 200) {
                         EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_EventLogCleared);
-                        detection.confidence = 0.55;
+                        // VERY LOW, AND THE TECHNIQUE ID OVERSTATES THE EVIDENCE. A low record
+                        // count is equally the signature of a fresh install or of a small log
+                        // retention policy, and neither is someone CLEARING a log. Reading
+                        // "few" as "cleared" is a second inference stacked on a host fact, so
+                        // this cannot carry a deliberate-anti-forensics reading on its own.
+                        detection.confidence = 0.10;
+                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = std::to_wstring(numRecords) + L" system events";
                         detection.expectedValue = L">= 1000 on normal system";
-                        detection.description = L"Very few system events (fresh/sandbox system)";
+                        detection.description = L"Few system events (fresh install, short retention or sandbox)";
                         detection.source = L"Event Log";
                         outDetections.push_back(detection);
                         found = true;
@@ -4378,9 +4406,12 @@ namespace ShadowStrike::AntiEvasion {
             int64_t uptimeDiff = static_cast<int64_t>(identity.uptimeMs) - static_cast<int64_t>(expectedUptime);
             if (std::abs(uptimeDiff) > 3600000) {  // More than 1 hour difference
                 EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_BootTimeAnomaly);
-                detection.confidence = 0.60;
+                // VERY LOW - every VM resumed from a snapshot shows this, and resuming a
+                // snapshot is normal operation rather than evidence of analysis.
+                detection.confidence = 0.15;
+                detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                 detection.detectedValue = L"Uptime mismatch: " + std::to_wstring(uptimeDiff / 60000) + L" minutes";
-                detection.description = L"Boot time inconsistency detected (possible snapshot restore)";
+                detection.description = L"Boot time inconsistency (snapshot resume or clock adjustment)";
                 detection.source = L"Boot Time Analysis";
                 outDetections.push_back(detection);
                 found = true;
