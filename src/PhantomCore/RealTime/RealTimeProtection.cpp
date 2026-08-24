@@ -4506,15 +4506,38 @@ public:
 
                 auto result = m_debuggerDetector->AnalyzeProcess(req.processId, dedConfig);
 
-                // Coverage moves in time rather than being dropped, and this runs before the
-                // isEvasive test because a truncated analysis that found nothing is exactly
-                // the case that needs re-examining off the kernel's thread.
+                // COVERAGE MOVES IN TIME ONLY PARTLY. THIS COMMENT USED TO OVERSTATE IT AND THE
+                // CORRECTION IS MEASURED.
+                //
+                // WHAT THE REQUEUE GENUINELY BUYS, and why it stays: QueueDeferredDeepScan puts
+                // the image through DeferredDeepScanLoop, which calls ScanEngine::ScanFile with
+                // deepScan = true, so the file receives the signature, YARA, ML, packer and
+                // heuristic tiers off the kernel's thread. That is real added coverage.
+                //
+                // WHAT IT DOES NOT DO IS FINISH THIS ANALYSIS. ScanEngine.cpp references
+                // DebuggerEvasionDetector, VMEvasionDetector, ProcessEvasionDetector,
+                // NetworkBasedEvasionDetector and EnvironmentEvasionDetector ZERO times, so no
+                // deferred route re-enters any of them. The truncated evasion analysis is never
+                // completed, and the counter below should be read as work CUT SHORT rather than
+                // work successfully deferred.
+                //
+                // AND IT CANNOT SIMPLY BE WIDENED TO DO SO. These detectors analyse a LIVE
+                // PROCESS by pid, while the deferred worker runs at THREAD_PRIORITY_BELOW_NORMAL
+                // at least a second later - by then the process may have exited, or its pid may
+                // have been reused by an unrelated one, so AnalyzeProcess(pid) there is not the
+                // same measurement. Restoring this coverage is a design decision about WHERE the
+                // analysis runs, not a wider requeue, and it is filed rather than guessed at.
+                //
+                // The requeue still runs BEFORE the isEvasive test on purpose: a truncated
+                // analysis that found nothing is exactly the case worth re-examining, and gating
+                // it on a finding would skip it.
                 if (result.analysisTruncated) {
                     m_stats.debuggerEvasionAnalysisTruncated++;
                     Utils::Logger::Warn(
                         "RealTimeProtection: debugger evasion analysis for PID {} truncated "
                         "at its {} ms slice of the {} ms budget; {} detection(s) kept, image "
-                        "requeued for deferred analysis",
+                        "queued for deferred FILE analysis - this evasion analysis is "
+                        "NOT resumed",
                         req.processId, dedConfig.timeoutMs, kProcessNotifyBudgetMs,
                         result.totalDetections);
                     if (!imagePath.empty()) {
@@ -4585,18 +4608,19 @@ public:
 
                 if (!evasionBudgetExceeded("VMEvasionDetector") &&
                     m_vmDetector->AnalyzeProcessAntiVMBehavior(req.processId, vmResult, vmConfig)) {
-                    // COVERAGE MOVES IN TIME RATHER THAN BEING DROPPED. A deadline that
-                    // simply stopped scanning would trade detection for latency, which is
-                    // the one thing a bound must never do. This runs BEFORE the
-                    // hasAntiVMBehavior test on purpose: a truncated scan that found
-                    // nothing is precisely the case that needs re-examining, and gating the
-                    // requeue on a finding would skip it.
+                    // THE REQUEUE BUYS THE DEFERRED FILE TIERS, NOT COMPLETION OF THIS ANALYSIS.
+                    // ScanEngine references none of these evasion detectors, so the truncated
+                    // evasion work is never finished; the image does get the signature, YARA, ML
+                    // and packer tiers off this thread. Full reasoning on the debugger stage above.
+                    // This runs BEFORE the verdict test on purpose: a truncated analysis that
+                    // found nothing is exactly the case worth re-examining.
                     if (vmResult.truncated) {
                         m_stats.vmEvasionAnalysisTruncated++;
                         Utils::Logger::Warn(
                             "RealTimeProtection: VM evasion scan for PID {} truncated at "
                             "its {} ms slice of the {} ms budget; {} technique(s) kept, "
-                            "image requeued for deferred analysis",
+                            "image queued for deferred FILE analysis - this evasion "
+                            "analysis is NOT resumed",
                             req.processId, vmConfig.timeoutMs, kProcessNotifyBudgetMs,
                             vmResult.GetTechniqueCount());
                         if (!imagePath.empty()) {
@@ -4697,6 +4721,7 @@ public:
                 // something that may no longer exist, or may have been replaced at the
                 // same pid.
                 if (result.analysisTruncated) {
+                    m_stats.processEvasionAnalysisTruncated++;
                     Utils::Logger::Warn(
                         "RealTimeProtection: process evasion analysis for PID {} was cut "
                         "short by its {} ms slice of the {} ms budget - findings kept, "
@@ -4806,13 +4831,18 @@ public:
 
                     auto result = m_networkDetector->AnalyzeProcess(req.processId, nbedConfig);
 
-                    // COVERAGE MOVES IN TIME, IT IS NOT LOST.
+                    // THE REQUEUE BUYS THE DEFERRED FILE TIERS, NOT COMPLETION OF THIS ANALYSIS.
+                    // ScanEngine references none of these evasion detectors, so the truncated
+                    // evasion work is never finished; the image does get the signature, YARA, ML
+                    // and packer tiers off this thread. Full reasoning on the debugger stage above.
+                    // This runs BEFORE the verdict test on purpose: a truncated analysis that
+                    // found nothing is exactly the case worth re-examining.
                     if (result.analysisTruncated) {
                         m_stats.networkEvasionAnalysisTruncated++;
                         Utils::Logger::Warn(
                             "RealTimeProtection: network evasion analysis for PID {} truncated "
-                            "at its {} ms slice of the {} ms budget; image requeued for "
-                            "deferred analysis",
+                            "at its {} ms slice of the {} ms budget; image queued for deferred "
+                            "FILE analysis - this evasion analysis is NOT resumed",
                             req.processId, nbedConfig.timeoutMs, kProcessNotifyBudgetMs);
                         if (!imagePath.empty()) {
                             QueueDeferredDeepScan(imagePath, req.processId);
@@ -4894,15 +4924,18 @@ public:
 
                 auto result = m_environmentDetector->AnalyzeProcess(req.processId, eedConfig);
 
-                // COVERAGE MOVES IN TIME, IT IS NOT LOST. A truncated scan that found nothing
-                // is exactly the case that needs re-examining, so the requeue happens here
-                // rather than inside a detection branch.
+                // THE REQUEUE BUYS THE DEFERRED FILE TIERS, NOT COMPLETION OF THIS ANALYSIS.
+                // ScanEngine references none of these evasion detectors, so the truncated
+                // evasion work is never finished; the image does get the signature, YARA, ML
+                // and packer tiers off this thread. Full reasoning on the debugger stage above.
+                // This runs BEFORE the verdict test on purpose: a truncated analysis that
+                // found nothing is exactly the case worth re-examining.
                 if (result.analysisTruncated) {
                     m_stats.environmentEvasionAnalysisTruncated++;
                     Utils::Logger::Warn(
                         "RealTimeProtection: environment evasion analysis for PID {} truncated "
-                        "at its {} ms slice of the {} ms budget; image requeued for deferred "
-                        "analysis",
+                        "at its {} ms slice of the {} ms budget; image queued for deferred FILE "
+                        "analysis - this evasion analysis is NOT resumed",
                         req.processId, eedConfig.timeoutMs, kProcessNotifyBudgetMs);
                     if (!imagePath.empty()) {
                         QueueDeferredDeepScan(imagePath, req.processId);
@@ -6910,6 +6943,7 @@ public:
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t vmTrunc      = m_stats.vmEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t dbgTrunc     = m_stats.debuggerEvasionAnalysisTruncated.load(std::memory_order_relaxed);
+        const uint64_t pedTrunc     = m_stats.processEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t envTrunc     = m_stats.environmentEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t netTrunc     = m_stats.networkEvasionAnalysisTruncated.load(std::memory_order_relaxed);
         const uint64_t packerDef    = m_stats.packerDeferred.load(std::memory_order_relaxed);
@@ -6967,12 +7001,12 @@ public:
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
-            "debuggerEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={}",
+            "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, envTrunc, netTrunc);
+            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7504,6 +7538,7 @@ void RTPStatistics::Reset() noexcept {
     sandboxEvasionCapabilityDetected = 0;
     vmEvasionAnalysisTruncated = 0;
     debuggerEvasionAnalysisTruncated = 0;
+    processEvasionAnalysisTruncated = 0;
     environmentEvasionAnalysisTruncated = 0;
     networkEvasionAnalysisTruncated = 0;
     oversizeDeferred = 0;

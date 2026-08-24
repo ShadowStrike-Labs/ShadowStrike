@@ -977,6 +977,19 @@ struct alignas(64) RTPStatistics {
         std::atomic<uint64_t> vmEvasionAnalysisTruncated{ 0 };
         std::atomic<uint64_t> debuggerEvasionAnalysisTruncated{ 0 };
 
+        /**
+         * @brief Times the process evasion analysis hit its deadline.
+         *
+         * NOT requeued, unlike its four siblings, and that is deliberate rather than
+         * an omission: the requeue those stages perform buys the deferred FILE tiers
+         * and cannot finish an evasion analysis, because ScanEngine references none of
+         * these detectors. For a process-subject analysis there is no equivalent
+         * deferred route at all, so this counter is a pure measure of coverage cut
+         * short - if it is ever non-trivial in the field, the answer is to move the
+         * analysis off this thread, not to raise the budget.
+         */
+        std::atomic<uint64_t> processEvasionAnalysisTruncated{ 0 };
+
         /// @brief Times the environment evasion analysis hit its deadline and was requeued.
         std::atomic<uint64_t> environmentEvasionAnalysisTruncated{ 0 };
 

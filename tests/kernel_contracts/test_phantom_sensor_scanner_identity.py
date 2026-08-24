@@ -11239,5 +11239,135 @@ class ProcessEvasionDeadlineContractTests(unittest.TestCase):
             "identical clamp.")
 
 
+
+
+class EvasionTruncationHonestyContractTests(unittest.TestCase):
+    """What a requeued truncation actually accomplishes, and what it may claim.
+
+    Four evasion stages on the process-creation path count a truncation, requeue the
+    image, and used to state that coverage moves in time rather than being lost. MEASURED:
+    QueueDeferredDeepScan feeds DeferredDeepScanLoop, which calls ScanEngine::ScanFile,
+    and ScanEngine references DebuggerEvasionDetector, VMEvasionDetector,
+    ProcessEvasionDetector, NetworkBasedEvasionDetector and EnvironmentEvasionDetector
+    ZERO times. So the requeue buys the deferred FILE tiers - signature, YARA, ML, packer,
+    heuristics - and cannot finish an evasion analysis.
+
+    The distinction matters because the counter is the only field evidence of coverage
+    lost to the deadline. Read as "work successfully deferred" it says the bound is free;
+    read correctly it says a process was only partly examined.
+    """
+
+    _EVASION_DETECTORS = (
+        "DebuggerEvasionDetector",
+        "VMEvasionDetector",
+        "ProcessEvasionDetector",
+        "NetworkBasedEvasionDetector",
+        "EnvironmentEvasionDetector",
+    )
+
+    # Every truncation counter on this path, with the five sites each must occupy.
+    _TRUNCATION_COUNTERS = (
+        "metamorphicTruncated",
+        "vmEvasionAnalysisTruncated",
+        "debuggerEvasionAnalysisTruncated",
+        "processEvasionAnalysisTruncated",
+        "environmentEvasionAnalysisTruncated",
+        "networkEvasionAnalysisTruncated",
+    )
+
+    _RETIRED = (
+        "COVERAGE MOVES IN TIME, IT IS NOT LOST",
+        "COVERAGE MOVES IN TIME RATHER THAN BEING DROPPED",
+        "requeued for deferred analysis",
+    )
+
+    def test_no_truncation_block_claims_the_evasion_analysis_is_resumed(self):
+        raw = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        back = [phrase for phrase in self._RETIRED if phrase in raw]
+        self.assertEqual(
+            [], back,
+            "a retired requeue claim is back in RealTimeProtection. The requeue reaches "
+            "ScanEngine, which references none of the evasion detectors, so it cannot "
+            "resume an evasion analysis: " + "; ".join(back))
+        # and the corrected text must carry the measurement, not just softer wording
+        self.assertTrue(
+            "COVERAGE MOVES IN TIME ONLY PARTLY" in raw,
+            "the authoritative note explaining what the requeue does and does not buy is "
+            "gone, so the three short notes that refer to it now point at nothing")
+        self.assertEqual(
+            3, raw.count("THE REQUEUE BUYS THE DEFERRED FILE TIERS"),
+            "expected exactly three short notes referring to the authoritative one; a "
+            "changed count means a stage was added or removed without its note")
+        self.assertEqual(
+            4, raw.count("NOT resumed"),
+            "all four requeueing stages must say in their FIELD LOG that this evasion "
+            "analysis is not resumed - the log is what an operator actually reads")
+
+    def test_the_deferred_path_still_cannot_reach_these_detectors(self):
+        """A REVIEW PROMPT, not a prohibition.
+
+        This passes while no deferred route re-enters the evasion detectors, and fails the
+        moment one does - which would be a genuine coverage restoration. It exists so the
+        comments asserting unreachability cannot silently outlive the fact.
+        """
+        scan = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        reachable = []
+        for name in self._EVASION_DETECTORS:
+            hits = len(re.findall(r"(?<![A-Za-z0-9_])" + name + r"(?![A-Za-z0-9_])", scan))
+            if hits:
+                reachable.append("%s (%d reference(s))" % (name, hits))
+        self.assertEqual(
+            [], reachable,
+            "ScanEngine now references an evasion detector: " + "; ".join(reachable) +
+            ". If a deferred route really does re-enter it, that is a coverage "
+            "RESTORATION and welcome - but the truncation comments in "
+            "RealTimeProtection.cpp state that no such route exists, and they must be "
+            "corrected in the same change rather than left to mislead.")
+
+    def test_every_evasion_truncation_counter_is_plumbed_through_all_five_sites(self):
+        header = read_source(REAL_TIME_PROTECTION_HPP_PATH)
+        cpp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        broken = []
+        for name in self._TRUNCATION_COUNTERS:
+            declared = ("std::atomic<uint64_t> " + name) in header
+            incremented = ("m_stats." + name + "++") in cpp
+            loaded = ("m_stats." + name + ".load(") in cpp
+            formatted = (name + "={}") in cpp
+            reset = bool(re.search(r"(?m)^\s*" + name + r"\s*=\s*0\s*;", cpp))
+            missing = [label for label, ok in (("declared", declared),
+                                               ("incremented", incremented),
+                                               ("loaded", loaded),
+                                               ("in the report format", formatted),
+                                               ("reset", reset)) if not ok]
+            if missing:
+                broken.append("%s: missing %s" % (name, ", ".join(missing)))
+        self.assertEqual(
+            [], broken,
+            "a truncation counter is not plumbed through every site it needs. A counter "
+            "that is incremented but never reported is invisible in the field, and one "
+            "that is never reset accumulates across a Reset() call and misreports the "
+            "next interval: " + "; ".join(broken))
+
+    def test_the_capacity_report_format_matches_its_arguments(self):
+        """The classic plumbing bug in this file: a placeholder added without an argument,
+        or an argument inserted at the wrong position so every later value shifts."""
+        cpp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        m = re.search(r"const auto line = std::format\((.*?)\);", cpp, re.S)
+        self.assertIsNotNone(m, "the capacity report's std::format call was not found")
+        blob = m.group(1)
+        placeholders = blob.count("{}")
+        tail = blob[blob.rfind('"') + 1:]
+        args = [a.strip() for a in tail.split(",") if a.strip()]
+        self.assertEqual(
+            placeholders, len(args),
+            "the capacity report has %d placeholders and %d arguments. A mismatch either "
+            "fails to compile or, worse, silently shifts every value after the insertion "
+            "point so the whole line misreports." % (placeholders, len(args)))
+        self.assertGreater(
+            placeholders, 15,
+            "the capacity report has shrunk to %d placeholders; if fields were removed "
+            "on purpose, re-derive this floor in the same change" % placeholders)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
