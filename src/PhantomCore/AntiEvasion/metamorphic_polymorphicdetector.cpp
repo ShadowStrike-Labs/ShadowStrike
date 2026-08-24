@@ -249,6 +249,43 @@ public:
     // ENTROPY CALCULATION
     // ========================================================================
 
+    // Shannon entropy of a byte distribution, from a frequency table that has
+    // ALREADY been built.
+    //
+    // WHY THIS EXISTS - it removes a redundant full pass over the scanned buffer.
+    // ComputeOpcodeHistogram builds a 256-bin frequency table over the whole
+    // buffer and then called CalculateEntropy(buffer, size), which built an
+    // IDENTICAL table by walking the same bytes a second time. Entropy is a
+    // function of the distribution alone, so the second walk could not produce a
+    // different answer; it only cost time.
+    //
+    // THAT TIME IS DETECTION, NOT MICRO-OPTIMISATION. On the on-access path the
+    // buffer is the ENTIRE mapped file - AnalyzeFile passes mappedFile.data() and
+    // mappedFile.size() straight into AnalyzeFileInternal - and the caller sets
+    // timeoutMs to 50 ms because a kernel thread is parked in FltSendMessage
+    // holding an IRP_MJ_CREATE. A budget can only be tested BETWEEN stages, so
+    // every millisecond spent walking the buffer twice is a millisecond that
+    // pushes a later stage past the deadline and into analysisTruncated. Removing
+    // the second pass buys completed stages, which is more detection, not less.
+    [[nodiscard]] static double EntropyFromByteCounts(
+        const std::array<uint64_t, 256>& counts, size_t total) noexcept {
+        if (total == 0) {
+            return 0.0;
+        }
+
+        double entropy = 0.0;
+        const double totalAsDouble = static_cast<double>(total);
+
+        for (uint64_t count : counts) {
+            if (count > 0) {
+                const double p = static_cast<double>(count) / totalAsDouble;
+                entropy -= p * std::log2(p);
+            }
+        }
+
+        return entropy;
+    }
+
     [[nodiscard]] double CalculateEntropy(const uint8_t* buffer, size_t size) const noexcept {
         if (!buffer || size == 0) {
             return 0.0;
@@ -259,17 +296,12 @@ public:
             ++freq[buffer[i]];
         }
 
-        double entropy = 0.0;
-        double total = static_cast<double>(size);
-
-        for (uint64_t count : freq) {
-            if (count > 0) {
-                double p = static_cast<double>(count) / total;
-                entropy -= p * std::log2(p);
-            }
-        }
-
-        return entropy;
+        // Delegate the sum so this module holds exactly ONE implementation of
+        // Shannon entropy. Two copies of one calculation is how the two YARA
+        // metadata builders (task 56) and the two on-disk trie producers (task 66)
+        // drifted apart in this codebase - in both cases the poorer copy was the
+        // one that ran.
+        return EntropyFromByteCounts(freq, size);
     }
 
     // ========================================================================
@@ -301,8 +333,10 @@ public:
         out.jmpPercentage = (static_cast<double>(out.byteCounts[MetamorphicConstants::OPCODE_JMP_SHORT] +
                                                   out.byteCounts[MetamorphicConstants::OPCODE_JMP_NEAR]) / total) * 100.0;
 
-        // Calculate entropy
-        out.entropy = CalculateEntropy(buffer, size);
+        // Entropy from the table built above - deliberately NOT a second walk over
+        // the buffer. See EntropyFromByteCounts for why that matters when the
+        // buffer is the whole mapped file and the budget is 50 ms.
+        out.entropy = EntropyFromByteCounts(out.byteCounts, size);
 
         // Calculate chi-squared statistic
         double expected = total / 256.0;
@@ -315,7 +349,12 @@ public:
         // Determine flags
         out.isPotentiallyEncrypted = out.entropy >= MetamorphicConstants::MIN_ENCRYPTED_ENTROPY;
         out.hasExcessiveNops = out.nopPercentage >= MetamorphicConstants::MIN_SUSPICIOUS_NOP_PERCENTAGE;
-        out.hasJunkCodeSignature = out.int3Percentage > 5.0 || out.hasExcessiveNops;
+        // The 0xCC term used a bare 5.0, which is MEASURED FALSE FOR HALF OF
+        // WINDOWS - see MIN_SUSPICIOUS_INT3_PERCENTAGE for the sample. Nothing
+        // reads this field, and that is what stopped a false-positive wave.
+        out.hasJunkCodeSignature =
+            out.int3Percentage >= MetamorphicConstants::MIN_SUSPICIOUS_INT3_PERCENTAGE ||
+            out.hasExcessiveNops;
         out.valid = true;
 
         return true;

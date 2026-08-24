@@ -10649,5 +10649,161 @@ class AntiEvasionLiteralEncodingContractTests(unittest.TestCase):
             + "; ".join(grew))
 
 
+
+
+class MetamorphicHistogramContractTests(unittest.TestCase):
+    """The opcode histogram must cost one pass and must not carry a false threshold.
+
+    TWO PROPERTIES, neither of which any behavioural test can protect.
+
+    ONE PASS.  ComputeOpcodeHistogram builds a 256-bin frequency table over the whole
+    buffer.  It used to then call CalculateEntropy(buffer, size), which built an
+    IDENTICAL table by walking the same bytes a second time.  On the on-access path
+    that buffer is the ENTIRE mapped file - AnalyzeFile hands mappedFile.data() and
+    mappedFile.size() straight to AnalyzeFileInternal - and the caller sets timeoutMs
+    to 50 ms because a kernel thread is parked in FltSendMessage holding an
+    IRP_MJ_CREATE.  A deadline can only be tested BETWEEN stages, so a wasted pass
+    pushes later stages past it and into analysisTruncated.  Reintroducing that pass
+    would produce the SAME entropy value, so the C++ equivalence test would still
+    pass - only this guard can see it.
+
+    A CALIBRATED THRESHOLD.  The 0xCC term was a bare `> 5.0`.  Measuring 0xCC over
+    the whole file across 600 Microsoft-signed System32 binaries, which is exactly
+    what this histogram measures, gives median 4.92%, p75 6.78%, p90 8.49%, p95
+    10.05%, p99 12.27% and maximum 15.94% - so 5% was true for 294 of 600 legitimate
+    Windows binaries.  This guard pins the VALUE above that observed maximum, not
+    merely the presence of a named constant, because a constant that can be quietly
+    moved back to 5.0 protects nothing.
+    """
+
+    _CPP = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
+    _HPP = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.hpp"
+
+    # The highest 0xCC ratio observed across the 600-binary sample.
+    _OBSERVED_LEGITIMATE_MAXIMUM = 15.94
+
+    @classmethod
+    def _read(cls, path):
+        # bytes -> str deliberately: read_text() applies universal-newline
+        # translation, and these sources are CRLF.
+        return path.read_bytes().decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _balanced_body(text, start_index):
+        """The brace-balanced body beginning at the first '{' at or after start."""
+        try:
+            open_index = text.index("{", start_index)
+        except ValueError:
+            return None
+        depth = 0
+        for offset in range(open_index, len(text)):
+            if text[offset] == "{":
+                depth += 1
+            elif text[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[open_index:offset + 1]
+        return None
+
+    @classmethod
+    def _histogram_implementation(cls, code):
+        """The Impl body of ComputeOpcodeHistogram - the largest of its definitions.
+
+        There are two: the Impl implementation and a two-line public forwarder.
+        Taking the largest cannot accidentally select the forwarder, and the size
+        assertion below refuses if the shape ever changes enough to make that
+        selection meaningless.
+        """
+        bodies = []
+        for match in re.finditer(r"bool\s+ComputeOpcodeHistogram\s*\(", code):
+            body = cls._balanced_body(code, match.end())
+            if body:
+                bodies.append(body)
+        if not bodies:
+            return None
+        return max(bodies, key=len)
+
+    def test_the_histogram_computes_entropy_without_a_second_pass(self):
+        code = strip_c_comments(self._read(self._CPP))
+        body = self._histogram_implementation(code)
+        self.assertIsNotNone(
+            body, "could not locate ComputeOpcodeHistogram; the guard cannot pass "
+                  "vacuously, so this is a failure rather than a skip")
+        self.assertGreater(
+            len(body), 600,
+            "the body selected for ComputeOpcodeHistogram is only %d chars, which "
+            "means the public forwarder was picked instead of the implementation"
+            % len(body))
+
+        self.assertNotIn(
+            "CalculateEntropy(", body,
+            "ComputeOpcodeHistogram calls CalculateEntropy, which rebuilds the "
+            "256-bin frequency table this function has already built - a second "
+            "full pass over the whole mapped file inside a 50 ms budget. Use "
+            "EntropyFromByteCounts with the counts already in hand.")
+        self.assertIn(
+            "EntropyFromByteCounts(out.byteCounts", body,
+            "ComputeOpcodeHistogram must derive entropy from the byte counts it "
+            "already built rather than from a fresh walk over the buffer")
+
+        # exactly one buffer walk in the function
+        walks = len(re.findall(r"for\s*\(\s*size_t\s+\w+\s*=\s*0;[^;]*<\s*size;", body))
+        self.assertEqual(
+            1, walks,
+            "ComputeOpcodeHistogram should walk the buffer exactly once (found %d "
+            "size-bounded loops); every extra pass is time taken from a stage that "
+            "has not run yet" % walks)
+
+    def test_the_module_holds_exactly_one_entropy_implementation(self):
+        code = strip_c_comments(self._read(self._CPP))
+        sums = len(re.findall(r"entropy\s*-=\s*p\s*\*\s*std::log2\(p\)", code))
+        self.assertEqual(
+            1, sums,
+            "found %d Shannon entropy summations in this module, expected exactly 1. "
+            "Two copies of one calculation is how the two YARA metadata builders "
+            "(task 56) and the two on-disk trie producers (task 66) drifted apart, "
+            "in both cases with the poorer copy being the one that ran." % sums)
+        self.assertIn(
+            "return EntropyFromByteCounts(freq, size);", code,
+            "CalculateEntropy must delegate to the shared summation so the two "
+            "entry points cannot diverge")
+
+    def test_the_int3_threshold_stays_above_the_measured_legitimate_maximum(self):
+        cpp = strip_c_comments(self._read(self._CPP))
+        self.assertNotIn(
+            "int3Percentage > 5.0", cpp,
+            "the bare 5.0 threshold is back. Measured across 600 Microsoft-signed "
+            "System32 binaries, 0xCC over the whole file exceeds 5% in 294 of them, "
+            "so this term would be true for half of Windows.")
+        self.assertIn(
+            "MetamorphicConstants::MIN_SUSPICIOUS_INT3_PERCENTAGE", cpp,
+            "the 0xCC threshold must be a named constant, so its calibration can be "
+            "read at the declaration instead of guessed at the use site")
+
+        raw_header = self._read(self._HPP)
+        match = re.search(
+            r"MIN_SUSPICIOUS_INT3_PERCENTAGE\s*=\s*([0-9]+(?:\.[0-9]+)?)", raw_header)
+        self.assertIsNotNone(
+            match, "MIN_SUSPICIOUS_INT3_PERCENTAGE is not declared with a literal "
+                   "value that can be checked")
+        value = float(match.group(1))
+        self.assertGreaterEqual(
+            value, self._OBSERVED_LEGITIMATE_MAXIMUM,
+            "MIN_SUSPICIOUS_INT3_PERCENTAGE is %.2f, at or below the %.2f maximum "
+            "measured across 600 signed Windows binaries. A threshold inside the "
+            "legitimate range is a false-positive source, and naming the constant "
+            "does not make the number safe."
+            % (value, self._OBSERVED_LEGITIMATE_MAXIMUM))
+
+        # The evidence must survive with the number, or the next reader cannot tell
+        # a calibrated threshold from an invented one.
+        for token in ("600", "15.94", "294"):
+            self.assertIn(
+                token, raw_header,
+                "the measurement behind MIN_SUSPICIOUS_INT3_PERCENTAGE no longer "
+                "records %r. Without the sample size and the observed maximum the "
+                "value is indistinguishable from a guess." % token)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

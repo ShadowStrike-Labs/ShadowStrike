@@ -177,4 +177,141 @@ TEST(MetamorphicDetector_Statistics, ResetClearsDetectionAndCategoryCounters) {
     EXPECT_EQ(0u, stats.categoryDetections[static_cast<size_t>(MetamorphicCategory::Obfuscation)].load());
 }
 
+// ============================================================================
+// OPCODE HISTOGRAM
+// ============================================================================
+
+namespace {
+
+/// Build a buffer with an exact 0xCC ratio.
+///
+/// The filler cycles 0x01-0x7F, a range containing neither 0x90 (NOP) nor 0xCC
+/// (INT3), so the only 0xCC bytes present are the ones planted deliberately and
+/// hasExcessiveNops can never be what satisfies an assertion about junk padding.
+std::vector<uint8_t> MakeBufferWithInt3Ratio(size_t total, size_t int3Count) {
+    std::vector<uint8_t> buffer(total);
+
+    uint8_t filler = 0x01;
+    for (size_t i = 0; i < total; ++i) {
+        buffer[i] = filler;
+        filler = static_cast<uint8_t>(filler >= 0x7F ? 0x01 : filler + 1);
+    }
+
+    for (size_t i = 0; i < int3Count && i < total; ++i) {
+        buffer[i] = 0xCC;
+    }
+
+    return buffer;
+}
+
+} // namespace
+
+TEST(MetamorphicDetector_Histogram, EntropyFromTheHistogramMatchesStandaloneEntropy) {
+    // WHAT THIS PINS: ComputeOpcodeHistogram builds a 256-bin frequency table over
+    // the buffer and then called CalculateEntropy(buffer, size), which rebuilt an
+    // IDENTICAL table by walking the same bytes a second time. The sum is now
+    // shared between both paths, so they cannot disagree - hence EXPECT_DOUBLE_EQ
+    // rather than EXPECT_NEAR. If a second implementation is ever reintroduced,
+    // this is where the drift surfaces.
+    MetamorphicDetector detector;
+
+    std::vector<std::vector<uint8_t>> buffers;
+
+    buffers.emplace_back(4096, static_cast<uint8_t>(0x00));   // zero entropy
+
+    std::vector<uint8_t> fullRange(256);
+    for (size_t i = 0; i < fullRange.size(); ++i) {
+        fullRange[i] = static_cast<uint8_t>(i);
+    }
+    buffers.push_back(fullRange);                             // maximum entropy
+
+    buffers.push_back(MakeBufferWithInt3Ratio(1000, 100));    // skewed
+
+    std::vector<uint8_t> lopsided(2048, static_cast<uint8_t>(0x41));
+    for (size_t i = 0; i < 7; ++i) {
+        lopsided[i] = static_cast<uint8_t>(0x80 + i);
+    }
+    buffers.push_back(lopsided);                              // one dominant symbol
+
+    for (const auto& buffer : buffers) {
+        OpcodeHistogram histogram;
+        ASSERT_TRUE(detector.ComputeOpcodeHistogram(
+            buffer.data(), buffer.size(), histogram))
+            << "histogram must be computable for a " << buffer.size() << "-byte buffer";
+        ASSERT_TRUE(histogram.valid);
+
+        EXPECT_DOUBLE_EQ(detector.CalculateEntropy(buffer.data(), buffer.size()),
+                         histogram.entropy)
+            << "the histogram entropy and the standalone entropy are one "
+               "implementation, so they cannot differ for the same bytes";
+    }
+}
+
+TEST(MetamorphicDetector_Histogram, HistogramEntropyIsCorrectNotMerelyConsistent) {
+    // Agreement with CalculateEntropy would still hold if BOTH paths were wrong, so
+    // pin the absolute values on the histogram path against distributions whose
+    // Shannon entropy is known exactly.
+    MetamorphicDetector detector;
+
+    const std::vector<uint8_t> single(1024, static_cast<uint8_t>(0x5A));
+    OpcodeHistogram oneSymbol;
+    ASSERT_TRUE(detector.ComputeOpcodeHistogram(
+        single.data(), single.size(), oneSymbol));
+    EXPECT_NEAR(0.0, oneSymbol.entropy, 1e-9)
+        << "a single repeated byte carries no information";
+
+    std::vector<uint8_t> twoSymbols(1024);
+    for (size_t i = 0; i < twoSymbols.size(); ++i) {
+        twoSymbols[i] = static_cast<uint8_t>(i % 2 == 0 ? 0x00 : 0xFF);
+    }
+    OpcodeHistogram pair;
+    ASSERT_TRUE(detector.ComputeOpcodeHistogram(
+        twoSymbols.data(), twoSymbols.size(), pair));
+    EXPECT_NEAR(1.0, pair.entropy, 1e-9)
+        << "two equiprobable symbols is exactly one bit";
+
+    std::vector<uint8_t> allBytes(256);
+    for (size_t i = 0; i < allBytes.size(); ++i) {
+        allBytes[i] = static_cast<uint8_t>(i);
+    }
+    OpcodeHistogram uniform;
+    ASSERT_TRUE(detector.ComputeOpcodeHistogram(
+        allBytes.data(), allBytes.size(), uniform));
+    EXPECT_NEAR(8.0, uniform.entropy, 1e-9)
+        << "256 equiprobable symbols is exactly eight bits";
+}
+
+TEST(MetamorphicDetector_Histogram, AlignmentPaddingIsNotMistakenForJunkCode) {
+    // MEASURED CALIBRATION, and this case FAILS against the previous threshold,
+    // which is what makes it a discriminator. The 0xCC term was a bare `> 5.0`.
+    // Measuring 0xCC over the whole file across 600 Microsoft-signed System32
+    // binaries - exactly what this histogram measures - gives median 4.92%,
+    // p95 10.05% and maximum 15.94%, so 5% was true for 294 of 600 legitimate
+    // Windows binaries. A ratio inside that range must not read as junk code.
+    MetamorphicDetector detector;
+
+    const auto legitimate = MakeBufferWithInt3Ratio(1000, 100);   // 10%, inside p95
+    OpcodeHistogram lowPadding;
+    ASSERT_TRUE(detector.ComputeOpcodeHistogram(
+        legitimate.data(), legitimate.size(), lowPadding));
+    ASSERT_NEAR(10.0, lowPadding.int3Percentage, 0.01)
+        << "the test buffer was not built as intended";
+    EXPECT_FALSE(lowPadding.hasExcessiveNops)
+        << "the NOP term must not be what decides this assertion";
+    EXPECT_FALSE(lowPadding.hasJunkCodeSignature)
+        << "10 percent 0xCC sits inside the measured range for legitimate "
+           "Windows binaries, so it must not be reported as junk code";
+
+    const auto padded = MakeBufferWithInt3Ratio(1000, 200);        // 20%, above max
+    OpcodeHistogram highPadding;
+    ASSERT_TRUE(detector.ComputeOpcodeHistogram(
+        padded.data(), padded.size(), highPadding));
+    ASSERT_NEAR(20.0, highPadding.int3Percentage, 0.01)
+        << "the test buffer was not built as intended";
+    EXPECT_FALSE(highPadding.hasExcessiveNops);
+    EXPECT_TRUE(highPadding.hasJunkCodeSignature)
+        << "20 percent 0xCC exceeds the highest ratio observed across 600 signed "
+           "binaries, so it is genuinely unusual";
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

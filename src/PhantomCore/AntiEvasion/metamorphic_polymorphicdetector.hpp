@@ -252,6 +252,28 @@ namespace ShadowStrike {
             /// Visual C++ Release builds with /O2 can have 18-22% NOP for alignment
             inline constexpr double MIN_SUSPICIOUS_NOP_PERCENTAGE = 25.0;
 
+            /// @brief Minimum 0xCC (INT3) percentage indicating deliberate junk padding
+            ///
+            /// FP FIX, MEASURED: this term lived as a bare `> 5.0` inside
+            /// ComputeOpcodeHistogram, and 5% is TRUE FOR HALF OF WINDOWS. Sampling
+            /// 600 Microsoft-signed binaries in System32 and measuring 0xCC over the
+            /// whole file, which is exactly what that histogram does:
+            ///     median 4.92%   p75 6.78%   p90 8.49%   p95 10.05%
+            ///     p99 12.27%     max 15.94%   ->   294 of 600 exceeded 5%
+            /// The highest ratios were all SMALL DLLs of 32-70 KB (Chakrathunk.dll
+            /// 15.94%, acledit.dll 14.14%, comcat.dll 13.59%), where 0xCC file
+            /// alignment padding dominates a tiny .text section. 16.0 sits just above
+            /// the observed maximum, so exceeding it is unusual rather than routine.
+            ///
+            /// STILL NOT WIRED TO A DETECTION, deliberately: no evidence exists that
+            /// malware junk padding reliably exceeds 16% of a WHOLE FILE either, so a
+            /// usable signal would have to measure the code section rather than the
+            /// file. Compare MIN_SUSPICIOUS_NOP_PERCENTAGE above, which the same
+            /// sample shows firing on 0 of 600 - NOP maximum 1.30% against a 25%
+            /// threshold. That is what a calibrated byte-frequency threshold looks
+            /// like, and it is the standard any future wiring here has to meet.
+            inline constexpr double MIN_SUSPICIOUS_INT3_PERCENTAGE = 16.0;
+
             /// @brief Minimum dead code percentage for metamorphic detection
             inline constexpr double MIN_SUSPICIOUS_DEAD_CODE_PERCENTAGE = 20.0;
 
@@ -1087,6 +1109,34 @@ namespace ShadowStrike {
 
         /**
          * @brief Opcode histogram statistics
+         *
+         * DISPOSITION OF THESE FIELDS - measured, so no reader has to guess which of
+         * them can influence a verdict.
+         *
+         * EXACTLY ONE reaches a detection: hasExcessiveNops drives META_NOPInsertion
+         * at 0.75 confidence, and its threshold is calibrated - 0 of 600 signed
+         * System32 binaries reach 25% NOP, the observed maximum being 1.30%.
+         *
+         * EVERY OTHER FIELD IS REPORTING DATA WITH NO DETECTION CONSUMER, and that is
+         * deliberate rather than an oversight:
+         *   - entropy and isPotentiallyEncrypted are computed over the WHOLE MAPPED
+         *     FILE, so wiring them would duplicate STRUCT_HighEntropy far more crudely
+         *     than it does the job: that detection measures entropy PER SECTION, drops
+         *     confidence to 0.10 for .NET assemblies and 0.15 for known compressed
+         *     section names, and raises it only above 7.5 and 7.9. A whole-file
+         *     threshold of 6.5 has none of that and would fire on every installer.
+         *   - int3Percentage feeds hasJunkCodeSignature, whose threshold is documented
+         *     at MIN_SUSPICIOUS_INT3_PERCENTAGE and is not usable as a conviction on a
+         *     whole-file basis.
+         *   - chiSquared, xorPercentage, retPercentage, callPercentage and
+         *     jmpPercentage have no reader anywhere in src or tests. They are kept
+         *     because they are free once byteCounts exists and are the natural inputs
+         *     for a future section-scoped signal - not because anything uses them.
+         *
+         * So do not read a zero in one of those fields as "nothing was found"; read it
+         * as "nothing consults this". The whole structure costs one pass over the
+         * buffer for byteCounts plus a 256-iteration loop, because the entropy sum now
+         * reuses byteCounts instead of walking the buffer a second time.
          */
         struct OpcodeHistogram {
             /// @brief Count of each byte value (0-255)
