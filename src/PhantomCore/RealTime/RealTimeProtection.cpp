@@ -3735,12 +3735,40 @@ public:
             // scan time in the session, and it is what the owner feels when a
             // right-click or a UI tab switch locks the desktop.
             //
-            // Depth and flags are deliberately left untouched: this is a deadline,
-            // not a narrower analysis, so every technique still runs and simply has
-            // to fit a budget appropriate to having a kernel thread waiting.
-            // Anything that does not fit is still covered, because
-            // QueueDeferredDeepScan re-examines the file off the kernel's thread
-            // where the full default timeout applies.
+            // THE BUDGET IS A DEADLINE OVER A SUBSET, NOT OVER EVERYTHING THE
+            // MODULE CAN DO, and an earlier version of this comment claimed
+            // otherwise - it said "every technique still runs". That is false, and
+            // the correction is measured rather than argued.
+            //
+            // Flags are left at MetamorphicAnalysisConfig's default, which is
+            // MetamorphicAnalysisFlags::Default == StandardScan == QuickScan |
+            // ScanPolymorphic | ScanMetamorphic | EnableDisassembly. That leaves
+            // ScanObfuscation, ScanSelfModifying, ScanVMProtection,
+            // EnableCFGAnalysis, EnableFuzzyHashing and ScanSimilarity OFF - and
+            // NOTHING ANYWHERE IN THIS PRODUCT SETS THEM. Each has zero assignment
+            // sites tree-wide, and MetamorphicAnalysisFlags::DeepScan appears only
+            // at its own definition. Attributing every technique-emitting site to
+            // its INNERMOST flag gate, 15 of the module's 40 emitted techniques
+            // cannot fire on this path or on any other:
+            //   ScanObfuscation    OBF_APIHashing, OBF_AntiDisassembly,
+            //                      OBF_ExceptionControlFlow,
+            //                      OBF_MixedBooleanArithmetic, OBF_ReturnOriented,
+            //                      OBF_StringEncryption
+            //   ScanSelfModifying  SELF_DynamicCodeGen, SELF_ExecutableHeap,
+            //                      SELF_JITEmission, SELF_RuntimePatching
+            //   ScanVMProtection   VM_CustomBytecode, VM_CustomInterpreter,
+            //                      VM_RegisterBased, VM_StackBased
+            //   EnableCFGAnalysis  OBF_ControlFlowFlattening
+            //
+            // The 50 ms deadline itself is correct and still necessary - a field
+            // trace caught one invocation at 5,293.97 ms on this path. RAISING THE
+            // FLAGS HERE IS NOT THE FIX: obfuscation, self-modifying and
+            // VM-protection analysis are the expensive stages, which is exactly why
+            // they belong on a thread with no kernel caller waiting. Restoring them
+            // is filed as its own task, because it has two measured blockers -
+            // a self-requeue loop in the deferred queue, and shared decoder state
+            // used without a lock - and wiring it blind would trade a coverage gap
+            // for a data race.
             metaCfg.timeoutMs = 50u;
 
             // BOUND THE DISASSEMBLY, WHICH IS WHAT ACTUALLY COST THE 10.9 SECONDS.
@@ -3770,9 +3798,23 @@ public:
             if (metaResult.analysisTruncated) {
                 // The budget stopped this analysis before every technique ran, so
                 // this file has NOT been cleared - it has been partially examined.
-                // Re-examine it off the kernel's thread, where the full limits
-                // apply. Without this the deadline would silently trade detection
-                // for latency, which is the one trade this project does not make.
+                //
+                // WHAT THE REQUEUE DOES AND DOES NOT DO, corrected here because the
+                // previous comment claimed the full metamorphic limits are applied
+                // off this thread and they are not. MEASURED: DeferredDeepScanLoop
+                // builds a Core::Engine::ScanContext with deepScan = true and calls
+                // ScanEngine::ScanFile; it constructs no metamorphic config. And
+                // MetamorphicDetector has exactly FIVE production references in the
+                // whole tree, all of them in this file, so no ScanEngine route can
+                // reach it - PolymorphicDetector.cpp is a separate 2,470-line module
+                // that names it zero times.
+                //
+                // So the requeue genuinely buys the deep signature, sandbox,
+                // emulation and zero-day stages for this file, which is worth having
+                // and is why it stays. It does NOT resume the metamorphic analysis.
+                // metamorphicTruncated is therefore the count of files whose
+                // metamorphic examination was cut short and never completed, and it
+                // should be read that way rather than as work successfully deferred.
                 m_stats.metamorphicTruncated++;
                 QueueDeferredDeepScan(filePath, req.ProcessId);
             }

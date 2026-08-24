@@ -10805,5 +10805,142 @@ class MetamorphicHistogramContractTests(unittest.TestCase):
                 "value is indistinguishable from a guess." % token)
 
 
+
+
+class MetamorphicReachabilityContractTests(unittest.TestCase):
+    """What the metamorphic layer can actually reach, and what its comments may claim.
+
+    MEASURED: the module emits 40 techniques.  Its only production caller leaves
+    flags at MetamorphicAnalysisFlags::Default == StandardScan, and NOTHING anywhere
+    sets the deeper flags, so 15 of those 40 cannot fire - the six OBF_* behind
+    ScanObfuscation, the four SELF_* behind ScanSelfModifying, the four VM_* behind
+    ScanVMProtection, and OBF_ControlFlowFlattening behind EnableCFGAnalysis.
+
+    Two comments in RealTimeProtection asserted the opposite: that "every technique
+    still runs", and that the truncation requeue re-examines the file "where the full
+    default timeout applies".  The second is false because DeferredDeepScanLoop calls
+    ScanEngine::ScanFile and MetamorphicDetector has exactly five production
+    references, all in RealTimeProtection.cpp, so no ScanEngine route reaches it.
+
+    THE FIRST TEST IS A DELIBERATE REVIEW PROMPT, not a prohibition.  It passes while
+    the deeper flags remain unset and FAILS the moment someone wires them - which is
+    the desired change - so that the coverage numbers recorded in two comments cannot
+    silently become stale in the same commit that fixes the gap.  Same technique as
+    the C_ASSERT review prompt on the kernel reply size.
+    """
+
+    _RTP = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
+    _META_CPP = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
+    _META_HPP = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.hpp"
+
+    # Flags whose gated techniques are unreachable because no caller sets them.
+    _NEVER_SET = ("ScanObfuscation", "ScanSelfModifying", "ScanVMProtection",
+                  "EnableCFGAnalysis", "EnableFuzzyHashing", "ScanSimilarity",
+                  "EnableFamilyMatching", "DeepScan", "ComprehensiveScan")
+
+    @classmethod
+    def _read(cls, path):
+        return path.read_bytes().decode("utf-8", errors="replace")
+
+    @classmethod
+    def _enum_body_span(cls, header):
+        """Byte span of the MetamorphicAnalysisFlags enum, so its own definitions
+        of these names are not mistaken for a caller setting them."""
+        start = header.find("enum class MetamorphicAnalysisFlags")
+        if start < 0:
+            return (0, 0)
+        open_i = header.index("{", start)
+        depth, i = 0, open_i
+        while i < len(header):
+            if header[i] == "{":
+                depth += 1
+            elif header[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return (start, i)
+            i += 1
+        return (start, len(header))
+
+    def test_the_deeper_metamorphic_flags_still_have_no_caller(self):
+        low, high = self._enum_body_span(self._read(self._META_HPP))
+        offenders = []
+        for folder in ("src", "tests"):
+            base = ROOT / folder
+            if not base.exists():
+                continue
+            for path in sorted(base.rglob("*")):
+                if path.suffix.lower() not in (".cpp", ".hpp", ".h"):
+                    continue
+                code = strip_c_comments(self._read(path))
+                is_header = (path == self._META_HPP)
+                raw = self._read(path)
+                for flag in self._NEVER_SET:
+                    needle = "MetamorphicAnalysisFlags::" + flag
+                    for offset in range(len(code)):
+                        offset = code.find(needle, offset)
+                        if offset < 0:
+                            break
+                        # a HasFlag(...) TEST is a read, not a setter
+                        window = code[max(0, offset - 60):offset]
+                        if "HasFlag" in window:
+                            continue
+                        if is_header and low <= offset <= high:
+                            continue
+                        line = code[:offset].count("\n") + 1
+                        offenders.append("%s:%d %s" % (path.name, line, flag))
+                        break
+        self.assertEqual(
+            [], sorted(set(offenders)),
+            "a deeper metamorphic flag now has a caller. That is the RIGHT direction - "
+            "it restores up to 15 of the module's 40 techniques - but two comments "
+            "record the current coverage numbers (RealTimeProtection's on-access block "
+            "and the preset block in metamorphic_polymorphicdetector.hpp) and they must "
+            "be corrected in the SAME change, or the next reader inherits a stale "
+            "measurement. Update both, then update this guard: " + "; ".join(sorted(set(offenders))))
+
+    def test_the_corrected_coverage_claims_are_not_restored(self):
+        rtp = strip_c_comments(self._read(self._RTP))
+        raw = self._read(self._RTP)
+        retired = ("so every technique still runs and simply has",
+                   "where the full default timeout applies")
+        back = [phrase for phrase in retired if phrase in raw]
+        self.assertEqual(
+            [], back,
+            "a retired coverage claim is back in RealTimeProtection. Measured: flags "
+            "default to StandardScan so six analysis groups never run, and the "
+            "truncation requeue reaches ScanEngine, not MetamorphicDetector: "
+            + "; ".join(back))
+        # the corrected text must carry the measurement, or it is just prose
+        for token in ("15 of the module's 40 emitted techniques",
+                      "metamorphicTruncated is therefore the count"):
+            self.assertIn(
+                token, raw,
+                "the corrected comment no longer records %r, so the claim it replaced "
+                "cannot be checked by the next reader" % token)
+
+    def test_the_empty_custom_pattern_loop_is_not_reintroduced(self):
+        code = strip_c_comments(self._read(self._META_CPP))
+        iterations = code.count("for (const auto& pattern : m_impl->m_customPatterns)")
+        self.assertEqual(
+            0, iterations,
+            "the empty custom-pattern loop is back. m_customPatterns is written only "
+            "by AddCustomPattern, which has no caller, so the container is permanently "
+            "empty and the loop acquired a lock to iterate nothing.")
+        shared = code.count("std::shared_lock lock(m_impl->m_patternMutex)")
+        self.assertEqual(
+            0, shared,
+            "a shared_lock on m_patternMutex is back with no reader behind it; the "
+            "only legitimate users of that mutex are AddCustomPattern and "
+            "ClearCustomPatterns, which take unique_lock")
+        # the API seam must survive - removing it would delete the capability, not the
+        # dead code
+        for name in ("AddCustomPattern", "ClearCustomPatterns"):
+            self.assertEqual(
+                1, len(re.findall(r"(?<![A-Za-z0-9_])" + name + r"(?![A-Za-z0-9_])", code)),
+                "%s must keep exactly its definition in the .cpp - it is the seam a "
+                "caller uses to supply patterns, and deleting it would remove the "
+                "capability rather than the dead loop" % name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

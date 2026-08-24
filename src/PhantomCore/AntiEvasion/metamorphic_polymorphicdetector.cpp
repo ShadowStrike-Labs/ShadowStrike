@@ -5183,17 +5183,22 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
     // Pattern Store Family Matching
     // ========================================================================
 
-    if (m_impl->m_patternStore) {
-        // Query pattern store for matching patterns
-        std::shared_lock lock(m_impl->m_patternMutex);
-
-        for (const auto& pattern : m_impl->m_customPatterns) {
-            // Match custom patterns against the file
-            // This would typically use the PatternStore's matching engine
-
-            // For now, record that pattern matching infrastructure is available
-        }
-    }
+    // NO CUSTOM-PATTERN MATCHING HAPPENS HERE, and the loop that used to sit at
+    // this point is removed rather than left in place.
+    //
+    // It took a shared_lock on m_patternMutex and iterated m_customPatterns with an
+    // empty body, under a comment stating that "pattern matching infrastructure is
+    // available". MEASURED: m_customPatterns is written only by AddCustomPattern,
+    // and AddCustomPattern has exactly two occurrences tree-wide - its definition
+    // and its declaration - so it has NO CALLER and the container is permanently
+    // empty. The loop therefore acquired a lock, iterated nothing, and asserted a
+    // capability that does not exist.
+    //
+    // AddCustomPattern and ClearCustomPatterns are KEPT: they are a public API for a
+    // caller to supply patterns, and deleting them would remove the seam rather than
+    // the dead code. What is gone is the pretence that this function consults them.
+    // Wiring them means routing through PatternStore's matching engine, which is a
+    // capability change and needs its own measurement - not an empty loop.
 
     // ========================================================================
     // Instruction N-Gram Analysis

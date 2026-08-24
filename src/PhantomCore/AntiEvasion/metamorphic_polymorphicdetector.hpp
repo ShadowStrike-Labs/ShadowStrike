@@ -904,6 +904,36 @@ namespace ShadowStrike {
             IncludeRawData = 1 << 23,
 
             // Presets
+            //
+            // WHICH OF THESE ARE ACTUALLY USED, measured tree-wide so a reader does
+            // not assume the deeper ones are reachable:
+            //
+            //   Default (== StandardScan) is the ONLY preset any caller uses. The
+            //   sole production caller is RealTimeProtection's on-access handler,
+            //   which sets processId, timeoutMs and maxInstructions and leaves flags
+            //   alone.
+            //
+            //   DeepScan and ComprehensiveScan have ZERO assignment sites anywhere -
+            //   DeepScan appears only on the line below that defines it. So
+            //   ScanObfuscation, ScanSelfModifying, ScanVMProtection,
+            //   EnableCFGAnalysis, EnableFuzzyHashing and ScanSimilarity are never
+            //   enabled, and the 15 techniques behind them never fire: the six OBF_*
+            //   from ScanObfuscation, the four SELF_* from ScanSelfModifying, the
+            //   four VM_* from ScanVMProtection and OBF_ControlFlowFlattening from
+            //   EnableCFGAnalysis. That is 15 of the 40 techniques this module
+            //   emits, and it is a coverage gap rather than dead code - every one of
+            //   those detectors is implemented.
+            //
+            //   EnableFamilyMatching is stronger still: it has exactly ONE site in
+            //   the entire tree, its own declaration above. Nothing reads it, so it
+            //   gates nothing, and MatchKnownFamilies - the function it exists for -
+            //   has no caller. Do not treat its bit as reserved-and-working.
+            //
+            // DO NOT "FIX" THIS BY PUTTING DeepScan ON THE ON-ACCESS PATH. That path
+            // carries a 50 ms deadline because a kernel thread is parked in
+            // FltSendMessage holding an IRP_MJ_CREATE, and the never-set groups are
+            // precisely the expensive ones. They belong on a thread with no caller
+            // waiting.
             QuickScan = EnableEntropyAnalysis | ScanPacking | ScanStructuralAnomalies | EnableCaching,
             StandardScan = QuickScan | ScanPolymorphic | ScanMetamorphic | EnableDisassembly,
             DeepScan = StandardScan | EnableCFGAnalysis | ScanObfuscation | ScanVMProtection |
