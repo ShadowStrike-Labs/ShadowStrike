@@ -4650,6 +4650,34 @@ public:
                                 | ShadowStrike::AntiEvasion::ProcessAnalysisFlags::DeepAnalysis;
                 pedConfig.enableDeepScan = true;
 
+                // BOUND THIS THE SAME WAY ITS FOUR SIBLINGS ARE BOUND.
+                //
+                // ProcessEvasionAnalysisConfig had no timeoutMs at all, so this was the one
+                // evasion detector on this path with no deadline - while being the one asked
+                // for the deepest mode. Both lines above widen the work: Default |
+                // DeepAnalysis and enableDeepScan = true turn on inline-hook detection and
+                // import analysis on top of injection, masquerading, anti-debug and memory
+                // scanning. One call can take three whole-system snapshots, enumerate threads
+                // and modules, issue six cross-process reads and run two WinVerifyTrust
+                // signature verifications that can hit disk.
+                //
+                // evasionBudgetExceeded() above cannot help with that: it is tested BETWEEN
+                // stages, so it refuses to START this detector when the budget is already
+                // gone but cannot interrupt it once inside.
+                //
+                // CLAMPED TO AT LEAST 1 ms BECAUSE ZERO MEANS UNLIMITED, the same clamp the
+                // debugger and VM stages use. Taking the value from the remaining slice of
+                // kProcessNotifyBudgetMs rather than inventing a second constant keeps it
+                // from drifting out of step with the outer gate.
+                const auto pedElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - notifyStart).count();
+                const uint64_t pedRemainingMs =
+                    (static_cast<uint64_t>(pedElapsedMs) < kProcessNotifyBudgetMs)
+                        ? (kProcessNotifyBudgetMs - static_cast<uint64_t>(pedElapsedMs))
+                        : 1ULL;
+                pedConfig.timeoutMs =
+                    static_cast<uint32_t>(std::max<uint64_t>(1ULL, pedRemainingMs));
+
                 // Feed kernel-verified context for tamper-proof masquerading/PPID detection
                 ShadowStrike::AntiEvasion::ProcessKernelContext pedKernelCtx;
                 pedKernelCtx.imagePath = imagePath;
@@ -4660,6 +4688,22 @@ public:
                 pedConfig.kernelContext = std::move(pedKernelCtx);
 
                 auto result = m_processDetector->AnalyzeProcess(req.processId, pedConfig);
+
+                // A BOUNDED PASS IS NOT A CLEAN PASS. Say so where a reader will see it:
+                // the absence of a finding after truncation proves nothing about this
+                // process, and a silent bound is how a latency fix turns into a detection
+                // loss. There is no requeue here on purpose - the analysis subject is a
+                // live process rather than a file, so re-examining it later examines
+                // something that may no longer exist, or may have been replaced at the
+                // same pid.
+                if (result.analysisTruncated) {
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: process evasion analysis for PID {} was cut "
+                        "short by its {} ms slice of the {} ms budget - findings kept, "
+                        "process NOT cleared",
+                        req.processId, pedConfig.timeoutMs, kProcessNotifyBudgetMs);
+                }
+
                 if (result.isEvasive) {
                     noteEvasion("ProcessEvasionDetector",
                         std::format(L"Process Evasion [score={:.1f} severity={} detections={}]",

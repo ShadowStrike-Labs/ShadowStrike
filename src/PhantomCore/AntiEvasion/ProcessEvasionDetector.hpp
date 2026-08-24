@@ -187,6 +187,16 @@ namespace ShadowStrike::AntiEvasion {
         /// @brief Cache TTL (seconds)
         inline constexpr uint32_t CACHE_TTL_SECONDS = 300;
 
+        /**
+         * @brief Default wall-clock ceiling for one AnalyzeProcess call, in ms.
+         *
+         * GENEROUS ON PURPOSE, because this is the on-demand default. The caller that
+         * runs on the kernel's process-creation callback must pass its own remaining
+         * slice instead of relying on this - see the note on
+         * ProcessEvasionAnalysisConfig::timeoutMs.
+         */
+        inline constexpr uint32_t DEFAULT_ANALYSIS_TIMEOUT_MS = 30000;
+
         /// @brief Minimum evasion score for detection
         inline constexpr float MIN_EVASION_SCORE = 50.0f;
 
@@ -399,6 +409,12 @@ namespace ShadowStrike::AntiEvasion {
         bool isDebuggerPresent = false;
         bool hasDebugPrivilege = false;
         bool hasHardwareBreakpoints = false;
+
+        /// @brief NEVER WRITTEN AND NEVER READ - not merely unread, measured both ways.
+        ///        Its sibling hasHardwareBreakpoints is produced and consumed; this one is
+        ///        vocabulary only. Detecting a software breakpoint means finding a planted
+        ///        0xCC in the target's code, which needs a cross-process code scan this
+        ///        module does not perform. Kept as the named slot for that capability.
         bool hasSoftwareBreakpoints = false;
         std::vector<std::wstring> detectedTechniques;
         bool valid = false;
@@ -454,6 +470,48 @@ namespace ShadowStrike::AntiEvasion {
         ProcessAnalysisFlags flags = ProcessAnalysisFlags::Default;
         uint32_t cacheTtlSeconds = ProcessEvasionConstants::CACHE_TTL_SECONDS;
         bool enableDeepScan = false;
+
+        /**
+         * @brief Wall-clock ceiling for one analysis, in milliseconds. 0 MEANS NO LIMIT.
+         *
+         * ZERO MEANS UNLIMITED, which is the convention this config family already uses -
+         * MetamorphicAnalysisConfig, PackerConfig and the VM, Debugger, Network and
+         * Environment evasion configs all read it that way. A caller that COMPUTES this
+         * value from a remaining budget must therefore clamp it to at least 1, because a
+         * computed zero inverts the bound into no bound at all. RealTimeProtection does
+         * that with std::max<uint64_t>(1ULL, ...) for its siblings and now for this one.
+         *
+         * WHY THIS EXISTS. AnalyzeProcess had no deadline of any kind, while four of the
+         * five evasion detectors on RealTimeProtection's process-creation path already
+         * took one. That path is the callback the kernel blocks CreateProcess on; it
+         * carries kProcessNotifyBudgetMs = 250 and the driver abandons the reply after
+         * PN_VERDICT_REPLY_TIMEOUT_MS = 500. A single call can take three whole-system
+         * snapshots, enumerate threads and modules, issue six cross-process reads, walk
+         * the address space, and perform two WinVerifyTrust signature verifications that
+         * can hit disk - and its caller asks for the deepest mode explicitly.
+         *
+         * The deadline is checked BETWEEN stages, never inside one, so a stage that has
+         * started always completes and every finding it produced is kept. Coverage is
+         * deferred rather than discarded, and result.analysisTruncated records that it
+         * happened so no reader mistakes a bounded pass for a clean one.
+         */
+        uint32_t timeoutMs = ProcessEvasionConstants::DEFAULT_ANALYSIS_TIMEOUT_MS;
+
+        /**
+         * @brief RESERVED - DECLARED BUT READ BY NOTHING. Measured, not assumed.
+         *
+         * Neither field has a single reader anywhere in src or tests, comment-stripped and
+         * member-qualified. They were evidently intended to bound the thread and module
+         * walks this module performs, and they default to the EXPENSIVE setting, so the
+         * walks always run in full.
+         *
+         * They are kept rather than deleted because an operator switch that narrows an
+         * unbounded walk is real capability, and because the walks they would gate live in
+         * file-scope helpers that do not receive this config - wiring them is a signature
+         * change, not a flag read. The deadline above is what actually bounds the cost
+         * today. Do NOT wire these to default false: that would reduce coverage rather
+         * than bound latency, which is the one trade this project does not make.
+         */
         bool checkAllThreads = true;
         bool checkAllModules = true;
 
@@ -470,12 +528,24 @@ namespace ShadowStrike::AntiEvasion {
         std::wstring processName;
         std::wstring processPath;
         uint32_t parentProcessId = 0;
+
+        /// @brief Parent image name. WRITTEN TWICE IN THIS MODULE AND READ BY NOTHING -
+        ///        measured member-qualified across src and tests. Kept because parent
+        ///        attribution belongs in an alert and the value is already resolved here;
+        ///        it needs a consumer, not deletion.
         std::wstring parentProcessName;
 
         // Detection results
         bool isEvasive = false;
         float evasionScore = 0.0f;
         ProcessEvasionSeverity maxSeverity = ProcessEvasionSeverity::Low;
+
+        /// @brief Human-readable confidence band. ASSIGNED TWELVE TIMES IN THIS MODULE AND
+        ///        READ BY NOTHING in production - the only qualified read anywhere is a
+        ///        same-named field in a VM detector test. RealTimeProtection consumes
+        ///        isEvasive, evasionScore, maxSeverity, totalDetections and
+        ///        detectedTechniques, and never this. Kept because a rendered band is what
+        ///        an alert should show; it needs a consumer.
         std::wstring confidenceLevel;
 
         // Specific detection info
@@ -496,6 +566,18 @@ namespace ShadowStrike::AntiEvasion {
         uint64_t analysisDurationMs = 0;
         bool analysisComplete = false;
         bool fromCache = false;
+
+        /**
+         * @brief True when config.timeoutMs stopped the analysis before every enabled
+         *        stage ran.
+         *
+         * analysisComplete and this flag answer DIFFERENT questions and both are needed. A
+         * result may be complete in the sense that nothing failed while still having been
+         * cut short by the deadline. When this is true the findings present are real and
+         * were kept, but their ABSENCE proves nothing - the file or process was not
+         * cleared, it was only partly examined.
+         */
+        bool analysisTruncated = false;
 
         /**
          * @brief Get technique with highest confidence

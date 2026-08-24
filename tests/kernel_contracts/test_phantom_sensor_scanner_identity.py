@@ -120,6 +120,12 @@ ENVIRONMENT_EVASION_DETECTOR_HPP_PATH = (
 NETWORK_BASED_EVASION_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.hpp"
 )
+PROCESS_EVASION_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/ProcessEvasionDetector.cpp"
+)
+PROCESS_EVASION_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/ProcessEvasionDetector.hpp"
+)
 MESSAGE_DISPATCHER_CPP_PATH = ROOT / "src/PhantomCore/Communication/MessageDispatcher.cpp"
 FUZZER_VCXPROJ_PATH = ROOT / "Fuzzer/Fuzzer.vcxproj"
 FILTER_REGISTRATION_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/FilterRegistration.c"
@@ -11060,6 +11066,177 @@ class MetamorphicReachabilityContractTests(unittest.TestCase):
                 "%s must keep exactly its definition in the .cpp - it is the seam a "
                 "caller uses to supply patterns, and deleting it would remove the "
                 "capability rather than the dead loop" % name)
+
+
+
+
+class ProcessEvasionDeadlineContractTests(unittest.TestCase):
+    """ProcessEvasionAnalysisConfig had no timeout at all, on the kernel's callback.
+
+    THE FIFTH AND LAST MEMBER OF THIS FAMILY. Four of the five evasion detectors on
+    RealTimeProtection's process-creation path already took a remaining-budget timeout -
+    debugger, VM, network and environment. This one took none, because its config had no
+    field for it, and the module contained no deadline machinery whatsoever: timeoutMs,
+    deadline, budget, elapsed and analysisTruncated were each zero occurrences.
+
+    WHAT ONE CALL CAN COST, measured: three whole-system CreateToolhelp32Snapshot calls,
+    thread enumeration, three EnumProcessModules (two with no gate), six
+    ReadProcessMemory, VirtualQueryEx address-space walks, and TWO WinVerifyTrust
+    signature verifications that can hit disk. 42 loops, only 5 with a visible cap, and
+    six uncapped loops containing ReadProcessMemory. Meanwhile the caller asks for the
+    deepest mode explicitly: flags = Default | DeepAnalysis and enableDeepScan = true.
+
+    The outer evasionBudgetExceeded() gate cannot help - it is tested BETWEEN detectors,
+    so it declines to start this one when the budget is already spent but cannot
+    interrupt it once inside.
+    """
+
+    # The expensive stages, in the order the orchestrator runs them. Stage one is
+    # deliberately absent: see test_the_first_stage_is_never_gated_by_the_deadline.
+    BOUNDED_STAGES = ("CheckMasquerading", "CheckAntiDebug", "CheckMemory")
+
+    @staticmethod
+    def _internal_body():
+        """AnalyzeProcessInternal's body, sliced between two DEFINITION markers.
+
+        Anchoring on the first occurrence of the name would measure the CALL site in
+        AnalyzeProcess, which sits hundreds of lines above the definition - the same trap
+        the network sibling documents.
+        """
+        src = strip_c_comments(read_source(PROCESS_EVASION_DETECTOR_CPP_PATH))
+        start = src.find("void ProcessEvasionDetector::AnalyzeProcessInternal(")
+        assert start != -1, "AnalyzeProcessInternal definition not found"
+        nxt = src.find("void ProcessEvasionDetector::", start + 1)
+        end = nxt if nxt > start else len(src)
+        return src[start:end]
+
+    def test_the_declared_analysis_timeout_is_actually_read(self):
+        body = self._internal_body()
+        self.assertTrue(
+            "config.timeoutMs" in body,
+            "ProcessEvasionAnalysisConfig::timeoutMs must be READ by the orchestrator. A "
+            "declared control nothing reads means a caller that sets it gets silence - "
+            "which is what checkAllThreads and checkAllModules already do in this same "
+            "struct.")
+        self.assertTrue(
+            "steady_clock" in body,
+            "the deadline must use a monotonic clock; system_clock steps with NTP and an "
+            "NTP correction would either abort the analysis instantly or disable the bound")
+
+    def test_zero_means_no_limit_and_the_bound_is_an_absolute_point(self):
+        """The inversion this family exists to prevent.
+
+        Zero means UNLIMITED across every config in this subsystem. A deadline expressed
+        as a remaining-milliseconds counter that each stage recomputes can therefore reach
+        zero and silently switch the bound OFF at the exact moment it starts to matter.
+        An absolute time point cannot.
+        """
+        body = self._internal_body()
+        self.assertTrue(
+            "config.timeoutMs == 0u" in body or "config.timeoutMs > 0" in body,
+            "nothing in the orchestrator distinguishes timeoutMs == 0, so either zero no "
+            "longer means unlimited - which breaks the convention four sibling configs "
+            "share - or the bound now applies a zero-millisecond deadline and every "
+            "analysis truncates immediately")
+        self.assertTrue(
+            "std::nullopt" in body,
+            "the no-limit case must be representable as the ABSENCE of a deadline rather "
+            "than as a sentinel value that later arithmetic can resurrect")
+        # the bound must be computed once, not per stage
+        self.assertEqual(
+            1, body.count("std::chrono::steady_clock::now() +"),
+            "the deadline must be computed EXACTLY ONCE. Recomputing it per stage restarts "
+            "the clock and the total is then unbounded no matter how small each slice is.")
+
+    def test_the_first_stage_is_never_gated_by_the_deadline(self):
+        """Task 52: an analysis must never return having examined nothing."""
+        body = self._internal_body()
+        lam = body.find("const auto outOfTime = [&](")
+        self.assertNotEqual(lam, -1, "the deadline lambda has disappeared")
+        self.assertTrue(
+            "!outOfTime(" in body[lam:],
+            "no deadline check remains at any stage boundary, so the bound is gone")
+
+        # ORDERING IS THE WRONG INVARIANT HERE and asserting it was a real hole: a gate
+        # added on the line AFTER the stage name still leaves the name textually first,
+        # so a mutation that gated stage one produced zero failures. What must be true is
+        # that the injection stage's GATE EXPRESSION contains no deadline check at all.
+        m = re.search(r"HasFlag\(config\.flags,\s*ProcessAnalysisFlags::CheckInjection\)"
+                      r"([^{]{0,160})\{", body)
+        self.assertIsNotNone(
+            m, "the injection stage gate is no longer recognisable, so this guard cannot "
+               "tell whether it is bounded")
+        self.assertNotIn(
+            "outOfTime", m.group(1),
+            "the FIRST stage is now behind a deadline check. With an already-spent budget "
+            "the analysis would return having examined NOTHING, which task 52 forbade. "
+            "The first stage must always run; only later stages may be skipped.")
+
+    def test_every_later_expensive_stage_is_bounded(self):
+        body = self._internal_body()
+        unbounded = []
+        for flag in self.BOUNDED_STAGES:
+            m = re.search(r"HasFlag\(config\.flags,\s*ProcessAnalysisFlags::"
+                          + flag + r"\)([^{]{0,120})\{", body)
+            if not m:
+                unbounded.append(flag + " (stage gate not found)")
+            elif "outOfTime" not in m.group(1):
+                unbounded.append(flag + " (runs without a deadline check)")
+        # the deep-analysis stage is gated on two conditions, so match it separately
+        deep = re.search(r"config\.enableDeepScan([^{]{0,200})\{", body)
+        if not deep:
+            unbounded.append("deep analysis (stage gate not found)")
+        elif "outOfTime" not in deep.group(1):
+            unbounded.append("deep analysis (runs without a deadline check)")
+        self.assertEqual(
+            [], unbounded,
+            "these stages can run after the deadline has passed: " + "; ".join(unbounded)
+            + ". Each performs syscalls that scale with the target - snapshots, thread and "
+            "module enumeration, cross-process reads, and for deep analysis two "
+            "WinVerifyTrust calls that can hit disk.")
+
+    def test_the_cheap_kernel_context_stage_is_not_gated(self):
+        """Bounding free work loses detection and buys nothing.
+
+        The kernel-context stage only compares values the caller already supplied, so it
+        issues no syscalls. Gating it would drop findings to save no measurable time,
+        which is the trade this project refuses. Same reasoning that keeps the ransomware
+        fan-out outside the reply horizon.
+        """
+        body = self._internal_body()
+        k = body.find("config.kernelContext.has_value()")
+        self.assertNotEqual(k, -1, "the kernel-context stage has disappeared")
+        window = body[max(0, k - 260):k]
+        self.assertNotIn(
+            "outOfTime", window,
+            "the kernel-context stage is now behind a deadline check. It performs no "
+            "syscalls - it compares data the kernel already handed us - so skipping it "
+            "drops detection without saving measurable time.")
+
+    def test_a_truncated_analysis_is_recorded_and_keeps_what_it_found(self):
+        body = self._internal_body()
+        self.assertTrue(
+            "result.analysisTruncated = true;" in body,
+            "a bounded analysis must RECORD that it was bounded. Without the flag a "
+            "caller cannot tell a clean pass from a partial one, and the absence of a "
+            "finding silently becomes evidence of safety.")
+        for destructive in ("detectedTechniques.clear()", "result = ProcessEvasionResult"):
+            self.assertTrue(
+                destructive not in body,
+                "the truncation path must not discard findings already collected (%s). A "
+                "bound defers coverage; it never deletes it." % destructive)
+
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        self.assertTrue(
+            "result.analysisTruncated" in rtp,
+            "RealTimeProtection must read analysisTruncated. A truncation nobody reports "
+            "is how a latency fix becomes an unmeasured detection loss.")
+        self.assertTrue(
+            "std::max<uint64_t>(1ULL, pedRemainingMs)" in rtp,
+            "the caller must clamp its computed budget to at least 1 ms, because zero "
+            "means UNLIMITED in this config family - the clamp is what stops a spent "
+            "budget from removing the bound entirely. The debugger and VM stages use the "
+            "identical clamp.")
 
 
 if __name__ == "__main__":

@@ -2953,6 +2953,51 @@ namespace ShadowStrike::AntiEvasion {
         try {
             bool is64Bit = m_impl->IsProcess64Bit(hProcess);
 
+            // ================================================================
+            // THE ANALYSIS DEADLINE
+            // ================================================================
+            //
+            // This routine runs on RealTimeProtection's process-creation path, which is
+            // the callback the kernel blocks CreateProcess on. Four of the five evasion
+            // detectors on that path already took a remaining-budget timeout; this one
+            // took none, because the config had no field for it.
+            //
+            // The deadline is an ABSOLUTE time point captured once. It is deliberately
+            // not a remaining-milliseconds counter that each stage decrements: zero
+            // means unlimited in this config family, so a recomputed remainder that
+            // reaches zero would silently turn the bound off at exactly the moment it
+            // was needed. Comparing against a fixed point cannot do that.
+            //
+            // IT IS CHECKED BETWEEN STAGES AND NEVER INSIDE ONE. A stage that has begun
+            // always finishes and everything it found is kept, so the bound defers
+            // coverage instead of discarding it. The kernel-context stage at the end is
+            // deliberately NOT gated: it only compares values the caller already handed
+            // us, so it costs no syscalls, and skipping free work would lose detection
+            // for nothing.
+            const std::optional<std::chrono::steady_clock::time_point> analysisDeadline =
+                (config.timeoutMs == 0u)
+                    ? std::nullopt
+                    : std::optional<std::chrono::steady_clock::time_point>(
+                          std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config.timeoutMs));
+
+            const auto outOfTime = [&](const wchar_t* nextStage) -> bool {
+                if (!analysisDeadline.has_value()) {
+                    return false;
+                }
+                if (std::chrono::steady_clock::now() < *analysisDeadline) {
+                    return false;
+                }
+                if (!result.analysisTruncated) {
+                    result.analysisTruncated = true;
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"AnalyzeProcessInternal: PID %u hit its %u ms deadline before %ls; "
+                        L"findings so far are kept and the process is NOT cleared",
+                        processId, config.timeoutMs, nextStage);
+                }
+                return true;
+            };
+
             // Injection detection — use Core to avoid redundant OpenProcess
             if (HasFlag(config.flags, ProcessAnalysisFlags::CheckInjection)) {
                 DetectInjectionCore(hProcess, processId, result.injectionInfo);
@@ -2962,14 +3007,16 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Masquerading detection (no handle needed — uses snapshot APIs)
-            if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMasquerading)) {
+            if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMasquerading) &&
+                !outOfTime(L"masquerading detection")) {
                 if (DetectMasquerading(processId, result.masqueradingInfo, nullptr)) {
                     CheckMasqueradingTechniques(hProcess, processId, result);
                 }
             }
 
             // Anti-debugging detection — use Core to avoid redundant OpenProcess
-            if (HasFlag(config.flags, ProcessAnalysisFlags::CheckAntiDebug)) {
+            if (HasFlag(config.flags, ProcessAnalysisFlags::CheckAntiDebug) &&
+                !outOfTime(L"anti-debug detection")) {
                 DetectAntiDebugCore(hProcess, processId, result.antiDebugInfo);
                 if (result.antiDebugInfo.hasAntiDebug) {
                     CheckAntiDebugTechniques(hProcess, result);
@@ -2977,12 +3024,15 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Memory scanning — use Impl directly to avoid redundant OpenProcess
-            if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMemory)) {
+            if (HasFlag(config.flags, ProcessAnalysisFlags::CheckMemory) &&
+                !outOfTime(L"memory scanning")) {
                 (void)m_impl->ScanProcessMemory(hProcess, result.suspiciousMemoryRegions);
             }
 
             // Deep analysis - additional checks
-            if (config.enableDeepScan || HasFlag(config.flags, ProcessAnalysisFlags::DeepAnalysis)) {
+            if ((config.enableDeepScan ||
+                 HasFlag(config.flags, ProcessAnalysisFlags::DeepAnalysis)) &&
+                !outOfTime(L"deep analysis (inline hooks and suspicious imports)")) {
                 // Check for inline hooks
                 std::vector<std::wstring> hookedFunctions;
                 if (m_impl->DetectInlineHooks(hProcess, is64Bit, hookedFunctions)) {
