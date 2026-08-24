@@ -11369,5 +11369,147 @@ class EvasionTruncationHonestyContractTests(unittest.TestCase):
             "on purpose, re-derive this floor in the same change" % placeholders)
 
 
+
+
+class NetworkEvasionOutboundTrafficContractTests(unittest.TestCase):
+    """NetworkBasedEvasionDetector must not generate outbound traffic.
+
+    This project's stated position is that every network call the product makes is visible
+    in its source and that no cloud service is required to reach a verdict. A module named
+    for network analysis is the most likely place for that to erode - by adding a DNS
+    resolution to characterise a domain, or an HTTP probe to see what a connectivity-check
+    URL returns.
+
+    MEASURED TODAY: the module's only network calls are LOCAL QUERIES - one WSAStartup in
+    Impl::Initialize, GetAdaptersAddresses, GetExtendedTcpTable in DetectTor, and
+    InternetGetConnectedState. No socket connect, no DNS query, no HTTP request, no ICMP.
+    That is why DNSQueryInfo and HTTPProbeInfo have no producer: they describe capability
+    the module deliberately does not have.
+
+    The analytical point matters as much as the privacy one. A connectivity probe issued by
+    US characterises OUR behaviour, not the sample's. Observing a target probing a
+    connectivity URL is a real sandbox-detection signal, but it has to be observed on the
+    traffic path, not manufactured here.
+    """
+
+    # Calls that put a packet on the wire. Names only ever seen as import-table strings in
+    # this module are excluded from the source before matching, so a name comparison
+    # against the TARGET's imports cannot be mistaken for a call we make.
+    _OUTBOUND = (
+        "connect", "send", "sendto", "recv", "recvfrom", "WSAConnect", "WSASend",
+        "getaddrinfo", "GetAddrInfoW", "gethostbyname", "DnsQuery_A", "DnsQuery_W",
+        "DnsQueryEx", "InternetOpenUrlA", "InternetOpenUrlW", "InternetReadFile",
+        "HttpSendRequestA", "HttpSendRequestW", "WinHttpSendRequest",
+        "WinHttpReceiveResponse", "IcmpSendEcho", "IcmpSendEcho2",
+        "URLDownloadToFileA", "URLDownloadToFileW", "URLDownloadToCacheFile",
+    )
+
+    # Local queries the module legitimately makes. These are the anti-vacuity control: if
+    # the scanner cannot see these, it cannot see an outbound call either.
+    _LOCAL = ("GetAdaptersAddresses", "GetExtendedTcpTable", "InternetGetConnectedState",
+              "WSAStartup")
+
+    @staticmethod
+    def _code_only(text):
+        """Remove comments AND string/char literals, leaving only code.
+
+        Stripping comments alone is not enough here: this module compares import names such
+        as "HttpSendRequestW" as WIDE STRING LITERALS, and those would otherwise register
+        as calls the module makes.
+        """
+        out = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "/" and i + 1 < n and text[i + 1] == "/":
+                j = text.find("\n", i)
+                i = n if j == -1 else j
+            elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+                j = text.find("*/", i + 2)
+                i = n if j == -1 else j + 2
+            elif ch in ('"', "'"):
+                q, j = ch, i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == q or text[j] == "\n":
+                        j += 1
+                        break
+                    j += 1
+                out.append(" ")
+                i = j
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
+
+    def test_the_module_makes_no_outbound_network_call(self):
+        code = self._code_only(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+
+        # ANTI-VACUITY FIRST. If the local queries are invisible to this scanner then a
+        # zero result below would mean nothing at all.
+        seen_local = [name for name in self._LOCAL
+                      if re.search(r"(?<![A-Za-z0-9_])" + name + r"\s*\(", code)]
+        self.assertGreaterEqual(
+            len(seen_local), 3,
+            "this scanner can only see %d of the local network queries the module is known "
+            "to make (%s), so a zero outbound count would prove nothing. Either the module "
+            "changed shape or _code_only is over-stripping."
+            % (len(seen_local), ", ".join(seen_local) or "none"))
+
+        offenders = []
+        for name in self._OUTBOUND:
+            for m in re.finditer(r"(?<![A-Za-z0-9_])" + name + r"\s*\(", code):
+                line = code[:m.start()].count("\n") + 1
+                offenders.append("%s (near code line %d)" % (name, line))
+        self.assertEqual(
+            [], offenders,
+            "NetworkBasedEvasionDetector now makes an outbound network call: "
+            + "; ".join(offenders) + ". An endpoint security agent generating its own "
+            "traffic is a product and privacy decision, not a detail: this project states "
+            "that every network call it makes is in the source and that no cloud service "
+            "is needed for a verdict. It is also analytically wrong here - a probe we "
+            "issue describes OUR behaviour, not the sample's. Observe the target instead.")
+
+    def test_the_unproduced_record_types_stay_documented_as_unproduced(self):
+        header = read_source(NETWORK_BASED_EVASION_DETECTOR_HPP_PATH)
+        for token, why in (
+                ("NO INSTANCE OF THIS TYPE IS EVER PRODUCED, and that is a property",
+                 "DNSQueryInfo"),
+                ("NO INSTANCE OF THIS TYPE IS EVER PRODUCED. statusCode",
+                 "HTTPProbeInfo")):
+            self.assertTrue(
+                token in header,
+                "%s no longer records that it is never produced. If a producer was added, "
+                "that is a capability change requiring a decision about outbound traffic, "
+                "and this note must be replaced rather than deleted." % why)
+        # the containers must keep saying so too
+        self.assertEqual(
+            2, header.count("NEVER POPULATED"),
+            "expected both unpopulated result containers to say so; a changed count means "
+            "one was wired or the note was dropped")
+
+    def test_the_host_config_struct_cannot_reach_the_verdict(self):
+        """networkConfig describes THIS machine, so it must never score a sample."""
+        code = strip_c_comments(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+        body = extract_c_function(code, "NetworkBasedEvasionDetector::CalculateEvasionScore")
+        self.assertTrue(body, "CalculateEvasionScore has no readable body")
+        self.assertTrue(
+            "detectedTechniques" in body,
+            "CalculateEvasionScore no longer reads detectedTechniques, so this guard is "
+            "measuring the wrong function")
+        leaked = [name for name in ("networkConfig", "httpProbes", "dnsQueries",
+                                    "beacons", "fastFluxDomains")
+                  if name in body]
+        self.assertEqual(
+            [], leaked,
+            "the evasion score now reads %s. networkConfig describes THIS HOST - a VPN or "
+            "a public resolver is normal on ordinary corporate infrastructure - so letting "
+            "it into evasionScore, maxSeverity or isEvasive scores the machine rather than "
+            "the sample. That is the same mistake a composite sandbox-likeness score was "
+            "removed from this layer for making." % ", ".join(leaked))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

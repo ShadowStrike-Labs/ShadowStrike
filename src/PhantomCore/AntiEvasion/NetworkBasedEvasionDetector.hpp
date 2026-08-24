@@ -835,6 +835,25 @@ namespace ShadowStrike {
          * @brief DNS query information
          */
         struct DNSQueryInfo {
+            // NO INSTANCE OF THIS TYPE IS EVER PRODUCED, and that is a property of the
+            // design rather than an oversight. Measured: every field below has no producer,
+            // and NetworkEvasionResult::dnsQueries - the only container of them - has none
+            // either.
+            //
+            // THE REASON IS THAT THIS MODULE ISSUES NO DNS QUERY. Its only network calls are
+            // local queries: one WSAStartup in Impl::Initialize, GetAdaptersAddresses,
+            // GetExtendedTcpTable in DetectTor, and InternetGetConnectedState. DnsQuery_W and
+            // the Winsock resolvers appear ONLY as import-table name comparisons against the
+            // target process, which is what DetectNetworkEvasionImports does.
+            //
+            // DO NOT WIRE THIS BY ADDING RESOLUTION. Making the product resolve a domain in
+            // order to characterise it would generate outbound traffic from an endpoint
+            // security agent, and this project's stated position is that every network call
+            // it makes is visible in the source and that no cloud service is required to
+            // reach a verdict. Populating this type is therefore a PRODUCT decision, not a
+            // wiring task. It is kept as the named shape for that data if the decision is
+            // ever taken - most plausibly from telemetry the kernel or a passive DNS feed
+            // already has, which costs no new traffic.
             /// @brief Queried domain
             std::wstring domain;
 
@@ -873,6 +892,20 @@ namespace ShadowStrike {
          * @brief HTTP connectivity probe information
          */
         struct HTTPProbeInfo {
+            // NO INSTANCE OF THIS TYPE IS EVER PRODUCED. statusCode, responseTimeMs and
+            // isConnectivityCheck have no producer, and NetworkEvasionResult::httpProbes has
+            // none either.
+            //
+            // THE MODULE OPENS NO HTTP CONNECTION. InternetOpen, InternetOpenUrl,
+            // HttpOpenRequest and HttpSendRequest appear only as import-table names checked
+            // against the target. The same warning already sits on
+            // NetworkAnalysisConfig::httpTimeoutMs.
+            //
+            // Note the analytical trap in the name isConnectivityCheck: malware probing a
+            // known connectivity URL is a sandbox-detection signal, but for US to observe it
+            // we must watch the TARGET's traffic, not make the request ourselves. A probe
+            // issued by this module would characterise our own behaviour. Any real
+            // implementation belongs on the traffic-observation path, not here.
             /// @brief Target URL
             std::wstring url;
 
@@ -934,13 +967,22 @@ namespace ShadowStrike {
             /// @brief IP addresses observed
             std::vector<std::wstring> observedIPs;
 
-            /// @brief IP change timestamps
+            /// @brief IP change timestamps.
+            /// @warning WRITTEN ONCE IN DetectFastFlux AND READ BY NOTHING. Its three
+            ///          siblings observedIPs, ipChangeCount and isFastFlux ARE consumed, so
+            ///          the fast-flux detection itself works; this is the per-change history
+            ///          behind it, which no consumer asks for. Keep it: an interval series is
+            ///          what distinguishes genuine fast flux from a single re-resolution, and
+            ///          ipChangeCount alone cannot.
             std::vector<std::chrono::system_clock::time_point> changeTimestamps;
 
             /// @brief Total IP changes
             size_t ipChangeCount = 0;
 
-            /// @brief Average TTL
+            /// @brief Average TTL.
+            /// @warning NO PRODUCER. A TTL requires reading a DNS response, and this module
+            ///          issues no query - see the note on DNSQueryInfo. DNSQueryInfo::ttl is
+            ///          unproduced for the same reason.
             double averageTTL = 0.0;
 
             /// @brief Is fast flux detected
@@ -951,6 +993,24 @@ namespace ShadowStrike {
          * @brief Network configuration information
          */
         struct NetworkConfigInfo {
+            // THE SUBJECT OF THIS STRUCT IS THE HOST, NOT THE SAMPLE, so under the subject
+            // rule this layer follows its contents are context and may never become a
+            // verdict. That is currently true by construction and worth keeping true:
+            // CalculateEvasionScore reads ONLY result.detectedTechniques, so nothing in here
+            // can reach evasionScore, maxSeverity or isEvasive.
+            //
+            // TEN OF ITS FIELDS ARE INERT, measured. Written once and read never: hasProxy,
+            // proxyAddress, hasVPN, vpnAdapter, hasTor, adapters - the first three pairs are
+            // filled by CheckNetworkConfiguration and consumed by nothing. No producer at
+            // all: usesPublicDNS, dnsServers, defaultGateway, isNATDetected.
+            //
+            // KEPT, NOT DELETED, but be clear about what wiring them would mean. "This host
+            // is behind a VPN" or "this host uses a public resolver" describes OUR machine.
+            // It is a legitimate calibration input only if it is EXACT and only if it never
+            // scores a sample - the same ruling that removed a composite
+            // sandbox-likeness score elsewhere in this layer for reading true on ordinary
+            // corporate infrastructure. A VPN is normal on a corporate laptop and a public
+            // resolver is normal everywhere.
             /// @brief Has internet connectivity
             bool hasInternetConnectivity = false;
 
@@ -1059,10 +1119,23 @@ namespace ShadowStrike {
             /// @brief Cache TTL
             uint32_t cacheTtlSeconds = NetworkEvasionConstants::RESULT_CACHE_TTL_SECONDS;
 
-            /// @brief Minimum confidence threshold
+            /// @brief Minimum confidence threshold.
+            /// @warning ZERO CODE OCCURRENCES IN THE .cpp - this module never filters by it.
+            ///          Every detection it raises is reported regardless of confidence, and
+            ///          the weighting happens later in CalculateEvasionScore, which multiplies
+            ///          confidence by a severity factor instead of thresholding it. Wiring
+            ///          this would DISCARD low-confidence detections, so it is a detection
+            ///          decision and not a tidy-up: the present behaviour keeps weak evidence
+            ///          visible and lets the score decide, which is the safer direction.
             double minConfidenceThreshold = 0.5;
 
-            /// @brief Maximum domains to check
+            /// @brief Maximum domains to check.
+            /// @warning THIS BOUNDS NOTHING, for the same reason as dnsTimeoutMs above: there
+            ///          is no per-domain network operation to cap. The domain work this module
+            ///          does is string and import analysis over data it already has, bounded
+            ///          by timeoutMs. Leave it unread rather than applying it to a loop it was
+            ///          not written for - a cap attached to the wrong loop silently truncates
+            ///          analysis while looking like a safety control.
             size_t maxDomainsToCheck = NetworkEvasionConstants::MAX_DOMAINS_PER_ANALYSIS;
 
             /// @brief Kernel-verified process context for enhanced detection
@@ -1109,16 +1182,33 @@ namespace ShadowStrike {
             /// @brief All detected techniques
             std::vector<NetworkDetectedTechnique> detectedTechniques;
 
-            /// @brief DNS queries performed
+            // THE FOUR DETAIL CONTAINERS BELOW ARE NOT WHAT DRIVES THE VERDICT.
+            // CalculateEvasionScore reads only detectedTechniques, so these are supporting
+            // evidence for a reader - and measured, no reader asks for them.
+
+            /// @brief DNS queries performed.
+            /// @warning NEVER POPULATED - this module issues no DNS query. See DNSQueryInfo.
             std::vector<DNSQueryInfo> dnsQueries;
 
-            /// @brief HTTP probes performed
+            /// @brief HTTP probes performed.
+            /// @warning NEVER POPULATED - this module opens no HTTP connection. See
+            ///          HTTPProbeInfo.
             std::vector<HTTPProbeInfo> httpProbes;
 
-            /// @brief Beaconing information
+            /// @brief Beaconing information.
+            /// @warning POPULATED BY CheckBeaconing AND READ BY NOTHING. Unlike the two above
+            ///          this is real computed evidence being discarded: the beacon interval,
+            ///          jitter and regularity behind a BEACON_* technique. The technique
+            ///          itself does reach the verdict through detectedTechniques, so no
+            ///          DETECTION is lost - what is lost is the detail an analyst needs to
+            ///          confirm it. Surfacing it belongs with the per-technique SOC logging
+            ///          the caller already performs for its sibling detectors.
             std::vector<BeaconingInfo> beacons;
 
-            /// @brief Fast flux detections
+            /// @brief Fast flux detections.
+            /// @warning POPULATED BY CheckDNSEvasion AND READ BY NOTHING - same situation as
+            ///          beacons above: the detection survives, the supporting detail is
+            ///          dropped.
             std::vector<FastFluxInfo> fastFluxDomains;
 
             /// @brief Network configuration
