@@ -2901,7 +2901,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Check username
             if (m_impl->IsBlacklistedUsername(identity.username)) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NAME_BlacklistedUsername);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NAME_BlacklistedUsername);
                 detection.confidence = 0.95;
                 detection.detectedValue = identity.username;
                 detection.description = L"Username matches known sandbox/analysis environment";
@@ -2912,7 +2912,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Check computer name
             if (m_impl->IsBlacklistedComputerName(identity.computerName)) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NAME_BlacklistedComputerName);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NAME_BlacklistedComputerName);
                 detection.confidence = 0.95;
                 detection.detectedValue = identity.computerName;
                 detection.description = L"Computer name matches known sandbox/analysis environment";
@@ -2955,7 +2955,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Check low processor count
             if (outHardwareInfo.processorCount < EnvironmentConstants::MIN_NORMAL_PROCESSOR_COUNT) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_LowProcessorCount);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_LowProcessorCount);
                 detection.confidence = 0.7;
                 detection.detectedValue = std::to_wstring(outHardwareInfo.processorCount);
                 detection.expectedValue = L">= 2";
@@ -2966,7 +2966,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Check low RAM
             if (outHardwareInfo.totalRAM < EnvironmentConstants::MIN_NORMAL_RAM_BYTES) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_LowRAM);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_LowRAM);
                 detection.confidence = 0.7;
                 detection.detectedValue = std::to_wstring(outHardwareInfo.totalRAM / (1024 * 1024)) + L" MB";
                 detection.expectedValue = L">= 2048 MB";
@@ -2980,7 +2980,7 @@ namespace ShadowStrike::AntiEvasion {
             // Azure, AWS, GCP, Hyper-V, VMware in enterprise - all set this bit
             // This should NOT be treated as suspicious on its own
             if (outHardwareInfo.hypervisorDetected) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
                 detection.confidence = 0.15;  // VERY LOW - VMs are normal in enterprise/cloud
                 detection.detectedValue = L"Present";
                 detection.description = L"CPUID hypervisor bit is set (informational - VMs are common)";
@@ -2992,7 +2992,7 @@ namespace ShadowStrike::AntiEvasion {
             // Check for VM indicators in hardware strings
             // NOTE: Also informational - VM presence alone is not suspicious
             if (!outHardwareInfo.vmIndicators.empty()) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
                 detection.confidence = 0.20;  // LOW - VMs are normal
                 detection.detectedValue = outHardwareInfo.manufacturer;
                 detection.description = L"VM indicators found in hardware info (informational)";
@@ -3113,7 +3113,7 @@ namespace ShadowStrike::AntiEvasion {
 
             for (const auto& [path, vendor] : vmToolsDirs) {
                 if (SafePathExists(path)) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_VMToolsDirectory);
                     detection.confidence = 0.30;  // LOW - VM presence is not suspicious
                     detection.detectedValue = path;
                     detection.description = vendor + L" VM artifact (informational)";
@@ -3156,7 +3156,7 @@ namespace ShadowStrike::AntiEvasion {
 
             for (const auto& [path, desc] : definiteSandboxPaths) {
                 if (SafePathExists(path)) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_SandboxAgentFiles);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_SandboxAgentFiles);
                     detection.confidence = 0.85;  // High but not certain
                     detection.detectedValue = path;
                     detection.description = desc + L" directory detected";
@@ -3168,7 +3168,7 @@ namespace ShadowStrike::AntiEvasion {
             
             for (const auto& [path, desc] : ambiguousPaths) {
                 if (SafePathExists(path)) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_SandboxAgentFiles);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_SandboxAgentFiles);
                     detection.confidence = 0.30;  // LOW - Sandboxie is used by security-conscious users
                     detection.detectedValue = path;
                     detection.description = desc + L" directory (informational)";
@@ -3206,7 +3206,7 @@ namespace ShadowStrike::AntiEvasion {
 
             for (const auto& [path, desc] : suspiciousDlls) {
                 if (SafePathExists(path)) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_AnalysisToolsInstalled);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_AnalysisToolsInstalled);
                     detection.confidence = 0.75;  // Moderate - could be security software
                     detection.detectedValue = path;
                     detection.description = desc + L" detected in System32";
@@ -3224,7 +3224,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Empty Desktop folder check
             if (activityInfo.desktopItemsCount == 0) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDesktop);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDesktop);
                 detection.confidence = 0.65;
                 detection.detectedValue = L"0 items";
                 detection.description = L"Empty Desktop folder (typical of fresh sandboxes)";
@@ -3235,7 +3235,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Empty Documents folder check
             if (activityInfo.documentsCount == 0) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDocuments);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDocuments);
                 detection.confidence = 0.60;
                 detection.detectedValue = L"0 items";
                 detection.description = L"Empty Documents folder";
@@ -3246,7 +3246,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Empty Downloads folder check
             if (activityInfo.downloadsCount == 0) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDownloads);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_EmptyDownloads);
                 detection.confidence = 0.60;
                 detection.detectedValue = L"0 items";
                 detection.description = L"Empty Downloads folder";
@@ -3257,7 +3257,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Very few Recent Documents
             if (activityInfo.recentDocumentsCount < 3) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_NoRecentFiles);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_NoRecentFiles);
                 detection.confidence = 0.55;
                 detection.detectedValue = std::to_wstring(activityInfo.recentDocumentsCount) + L" items";
                 detection.expectedValue = L">= 5 items";
@@ -3284,7 +3284,7 @@ namespace ShadowStrike::AntiEvasion {
                 catch (...) {}
 
                 if (prefetchCount < 10) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_CleanSystemDirs);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_CleanSystemDirs);
                     detection.confidence = 0.70;
                     detection.detectedValue = std::to_wstring(prefetchCount) + L" prefetch files";
                     detection.expectedValue = L">= 30 files on normal system";
@@ -3311,7 +3311,7 @@ namespace ShadowStrike::AntiEvasion {
                 catch (...) {}
 
                 if (tempFileCount < 5) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_SuspiciousTempDir);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_SuspiciousTempDir);
                     detection.confidence = 0.55;
                     detection.detectedValue = std::to_wstring(tempFileCount) + L" items";
                     detection.description = L"Nearly empty TEMP folder (fresh/sandbox system)";
@@ -3345,7 +3345,7 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             if (installedApps < 2) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::FILESYSTEM_MissingUserArtifacts);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::FILESYSTEM_MissingUserArtifacts);
                 detection.confidence = 0.50;
                 detection.detectedValue = std::to_wstring(installedApps) + L" common apps found";
                 detection.expectedValue = L">= 3 on typical user system";
@@ -3483,7 +3483,6 @@ namespace ShadowStrike::AntiEvasion {
                     detection.detectedValue = key;
                     detection.description = desc + L" registry key detected";
                     detection.source = L"Registry";
-                    detection.severity = EnvironmentEvasionSeverity::Critical;
                     outDetections.push_back(detection);
                     found = true;
                 }
@@ -3507,7 +3506,7 @@ namespace ShadowStrike::AntiEvasion {
 
                 for (const auto& [pattern, vendor] : vmBiosStrings) {
                     if (m_impl->ContainsSubstringCI(biosVersion, pattern)) {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_VMServices);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_VMServices);
                         detection.confidence = 0.95;
                         detection.detectedValue = biosVersion;
                         detection.description = vendor + L" detected in BIOS version string";
@@ -3523,7 +3522,7 @@ namespace ShadowStrike::AntiEvasion {
             std::wstring videoBios = m_impl->GetRegistryString(HKEY_LOCAL_MACHINE,
                 L"HARDWARE\\DESCRIPTION\\System", L"VideoBiosVersion");
             if (!videoBios.empty() && m_impl->ContainsSubstringCI(videoBios, L"VIRTUALBOX")) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_VirtualBoxKeys);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_VirtualBoxKeys);
                 detection.confidence = 0.95;
                 detection.detectedValue = videoBios;
                 detection.description = L"VirtualBox detected in Video BIOS string";
@@ -3555,7 +3554,7 @@ namespace ShadowStrike::AntiEvasion {
 
                     for (const auto& [pattern, vendor] : vmDiskPatterns) {
                         if (!vendor.empty() && m_impl->ContainsSubstringCI(diskId, pattern)) {
-                            EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor);
+                            auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_VMDiskVendor);
                             detection.confidence = 0.92;
                             detection.detectedValue = diskId;
                             detection.description = vendor + L" disk identifier detected";
@@ -3584,7 +3583,7 @@ namespace ShadowStrike::AntiEvasion {
 
                 for (const auto& [pattern, vendor] : vmScsiPatterns) {
                     if (m_impl->ContainsSubstringCI(scsiIdentifier, pattern)) {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_VMServices);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_VMServices);
                         detection.confidence = 0.90;
                         detection.detectedValue = scsiIdentifier;
                         detection.description = vendor + L" SCSI device identifier detected";
@@ -3609,7 +3608,7 @@ namespace ShadowStrike::AntiEvasion {
                 RegCloseKey(hRecentDocsKey);
 
                 if (qStatus == ERROR_SUCCESS && subKeyCount < 2 && valueCount < 5) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
                     detection.confidence = 0.55;
                     detection.detectedValue = std::to_wstring(valueCount) + L" values, " + std::to_wstring(subKeyCount) + L" subkeys";
                     detection.expectedValue = L">= 10 values on normal system";
@@ -3628,7 +3627,7 @@ namespace ShadowStrike::AntiEvasion {
                 RegCloseKey(hComDlgKey);
 
                 if (qStatus == ERROR_SUCCESS && subKeyCount < 3) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_EmptyMRULists);
                     detection.confidence = 0.50;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" file type categories";
                     detection.expectedValue = L">= 5 on normal system";
@@ -3647,7 +3646,7 @@ namespace ShadowStrike::AntiEvasion {
                 RegCloseKey(hTypedURLsKey);
 
                 if (qStatus == ERROR_SUCCESS && valueCount < 3) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_NoTypedURLs);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_NoTypedURLs);
                     detection.confidence = 0.45;
                     detection.detectedValue = std::to_wstring(valueCount) + L" typed URLs";
                     detection.description = L"Very few typed URLs (possible sandbox)";
@@ -3667,7 +3666,7 @@ namespace ShadowStrike::AntiEvasion {
                 RegCloseKey(hUninstallKey);
 
                 if (qStatus == ERROR_SUCCESS && subKeyCount < 15) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_MissingSoftwareKeys);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_MissingSoftwareKeys);
                     detection.confidence = 0.55;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" programs";
                     detection.expectedValue = L">= 30 on typical system";
@@ -3688,7 +3687,7 @@ namespace ShadowStrike::AntiEvasion {
                 RegCloseKey(hNetworkProfiles);
 
                 if (qStatus == ERROR_SUCCESS && subKeyCount < 2) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::REGISTRY_MissingSoftwareKeys);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::REGISTRY_MissingSoftwareKeys);
                     detection.confidence = 0.50;
                     detection.detectedValue = std::to_wstring(subKeyCount) + L" network profiles";
                     detection.expectedValue = L">= 3 on normal system";
@@ -3757,7 +3756,7 @@ namespace ShadowStrike::AntiEvasion {
                     }
                 }
 
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_VMMACPrefix);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NETWORK_VMMACPrefix);
                 detection.confidence = 0.92;
                 detection.detectedValue = std::to_wstring(outNetworkInfo.vmAdapterCount) + L" VM adapters";
                 detection.technicalDetails = L"VM MACs: " + vmAdapterDetails;
@@ -3786,7 +3785,7 @@ namespace ShadowStrike::AntiEvasion {
                 for (const auto& [pattern, vendor] : vmAdapterPatterns) {
                     if (m_impl->ContainsSubstringCI(adapter.name, pattern) ||
                         m_impl->ContainsSubstringCI(adapter.description, pattern)) {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_VMAdapterName);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NETWORK_VMAdapterName);
                         detection.confidence = 0.88;
                         detection.detectedValue = adapter.description;
                         detection.description = vendor + L" network adapter name detected";
@@ -3802,7 +3801,7 @@ namespace ShadowStrike::AntiEvasion {
             // 3. NO WIFI ADAPTER CHECK (VMs typically don't have WiFi)
             // ================================================================
             if (!outNetworkInfo.hasWiFi && outNetworkInfo.adapterCount > 0) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_NoWiFiHistory);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NETWORK_NoWiFiHistory);
                 detection.confidence = 0.40;
                 detection.detectedValue = L"No WiFi adapter found";
                 detection.description = L"No wireless adapter detected (common in VMs)";
@@ -3815,7 +3814,7 @@ namespace ShadowStrike::AntiEvasion {
             // 4. ONLY LOOPBACK ADAPTER CHECK
             // ================================================================
             if (outNetworkInfo.adapterCount == 0) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_OnlyLoopback);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NETWORK_OnlyLoopback);
                 detection.confidence = 0.70;
                 detection.detectedValue = L"Only loopback adapter";
                 detection.description = L"Only loopback adapter found (isolated sandbox)";
@@ -3832,7 +3831,7 @@ namespace ShadowStrike::AntiEvasion {
                 if (adapter.ipAddress.starts_with(L"192.168.56.") ||  // VirtualBox default
                     adapter.ipAddress.starts_with(L"172.16.") ||       // VMware default
                     adapter.ipAddress.starts_with(L"10.0.2.")) {       // VirtualBox NAT
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_SuspiciousIPRange);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NETWORK_SuspiciousIPRange);
                     detection.confidence = 0.45;
                     detection.detectedValue = adapter.ipAddress;
                     detection.description = L"IP address in common VM/sandbox range";
@@ -3878,7 +3877,7 @@ namespace ShadowStrike::AntiEvasion {
 
                     // Check for suspicious DNS servers
                     if (dnsServer.empty() || dnsServer == "0.0.0.0" || dnsServer == "127.0.0.1") {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::NETWORK_SuspiciousDNS);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::NETWORK_SuspiciousDNS);
                         detection.confidence = 0.50;
                         detection.detectedValue = Utils::StringUtils::ToWide(dnsServer.empty() ? "None" : dnsServer);
                         detection.description = L"Suspicious or missing DNS configuration";
@@ -3906,6 +3905,32 @@ namespace ShadowStrike::AntiEvasion {
             }
             return false;
         }
+    }
+
+    // ========================================================================
+    // HOST CONTEXT INDICATOR FACTORY
+    // ========================================================================
+    //
+    // The single construction path for host-context indicators. It exists because the
+    // ordinary converting constructor inherits severity from
+    // GetDefaultTechniqueSeverity, and that function is written for VERDICT-BEARING
+    // detections: it maps 22 techniques as Critical, High or Medium and reaches Low
+    // only through its default case. Severity is then multiplied into the score by
+    // CalculateEvasionScore at 1.0, 2.5, 5.0 and 10.0, so an inherited Critical gives
+    // an observation about our own machine ten times the weight of an ordinary one.
+    //
+    // Forcing the value here rather than assigning it at each call site is deliberate.
+    // Six of the seven host-context methods shipped above the cap their own
+    // declarations state, and five of those six never named a severity at all - they
+    // simply inherited one. A per-site assignment would have fixed those and been
+    // forgotten again by whoever adds the next indicator.
+
+    EnvironmentDetectedTechnique EnvironmentEvasionDetector::MakeContextIndicator(
+        EnvironmentEvasionTechnique tech
+    ) noexcept {
+        EnvironmentDetectedTechnique indicator(tech);
+        indicator.severity = EnvironmentEvasionSeverity::Low;
+        return indicator;
     }
 
     // ========================================================================
@@ -4113,7 +4138,7 @@ namespace ShadowStrike::AntiEvasion {
             
             // VM Tools - INFORMATIONAL ONLY (low confidence)
             if (!detectedVMTools.empty()) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_VMToolsRunning);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::PROCESS_VMToolsRunning);
                 detection.confidence = 0.20;  // LOW - VMs are ubiquitous in enterprise
                 std::wstring tools;
                 for (const auto& t : detectedVMTools) {
@@ -4123,7 +4148,6 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"VM Tools processes detected (informational)";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::Low;  // Informational
                 outDetections.push_back(detection);
                 found = true;
             }
@@ -4131,7 +4155,7 @@ namespace ShadowStrike::AntiEvasion {
             // Debuggers - only flag if actively debugging target process
             // NOTE: Reduced confidence because debuggers run for legitimate development
             if (!detectedDebuggers.empty()) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_DebuggerRunning);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::PROCESS_DebuggerRunning);
                 detection.confidence = 0.40;  // MODERATE - debuggers are used for legitimate development
                 std::wstring tools;
                 for (const auto& t : detectedDebuggers) {
@@ -4141,14 +4165,13 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"Debugger processes detected (may be legitimate development)";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::Medium;  // Reduced severity
                 outDetections.push_back(detection);
                 found = true;
             }
 
             // Definitive sandbox agents - high confidence
             if (!detectedSandboxAgents.empty()) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_SandboxAgentRunning);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::PROCESS_SandboxAgentRunning);
                 detection.confidence = 0.85;  // HIGH but not certain
                 std::wstring tools;
                 for (const auto& t : detectedSandboxAgents) {
@@ -4158,14 +4181,13 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"Sandbox agent processes detected";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::High;  // Reduced from Critical
                 outDetections.push_back(detection);
                 found = true;
             }
 
             // Legitimate security tools - INFORMATIONAL ONLY
             if (!detectedLegitimateTools.empty()) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning);
                 detection.confidence = 0.10;  // VERY LOW - these are legitimate tools
                 std::wstring tools;
                 for (const auto& t : detectedLegitimateTools) {
@@ -4175,7 +4197,6 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"Legitimate security/IT tools running (informational only)";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::Low;  // Informational
                 detection.technicalDetails = L"These tools are commonly used by IT and security teams";
                 outDetections.push_back(detection);
                 // NOTE: Do NOT set found = true for legitimate tools
@@ -4183,7 +4204,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Other analysis tools (PE analyzers, hex editors, etc.)
             if (!detectedAnalysisTools.empty()) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::PROCESS_AnalysisToolRunning);
                 detection.confidence = 0.50;  // MODERATE - could be security researcher
                 std::wstring tools;
                 for (const auto& t : detectedAnalysisTools) {
@@ -4193,7 +4214,6 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = tools;
                 detection.description = L"Analysis tool processes detected";
                 detection.source = L"Process Enumeration";
-                detection.severity = EnvironmentEvasionSeverity::Medium;  // Reduced severity
                 outDetections.push_back(detection);
                 found = true;
             }
@@ -4202,7 +4222,7 @@ namespace ShadowStrike::AntiEvasion {
             // NOTE: Modern minimal Windows installations can have < 50 processes
             // Docker containers, Server Core, etc. are legitimate and have low counts
             if (totalProcessCount < 20) {  // Reduced from 30 to avoid FP on minimal installs
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::PROCESS_LowProcessCount);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::PROCESS_LowProcessCount);
                 detection.confidence = 0.30;  // LOW - minimal installs are legitimate
                 detection.detectedValue = std::to_wstring(totalProcessCount) + L" processes";
                 detection.expectedValue = L">= 30 on typical Windows system";
@@ -4265,12 +4285,11 @@ namespace ShadowStrike::AntiEvasion {
                     confidenceAdjust = 0.05;
                 }
 
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_ShortUptime);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_ShortUptime);
                 // VERY LOW - this is true of EVERY machine for the first half hour after
                 // EVERY reboot. Read as anything stronger it would fire daily, on every
                 // endpoint, and bury the findings that matter.
                 detection.confidence = 0.10 + confidenceAdjust;
-                detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                 detection.detectedValue = std::to_wstring(identity.uptimeMs / 60000) + L" minutes";
                 detection.expectedValue = L"> 30 minutes on normal system";
                 detection.description = L"Short system uptime (recent boot; may be a fresh analysis VM)";
@@ -4294,11 +4313,10 @@ namespace ShadowStrike::AntiEvasion {
                     
                     // If system is less than 24 hours old
                     if (systemAge < 24) {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_RecentInstall);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_RecentInstall);
                         // VERY LOW - true of every newly provisioned laptop and every
                         // re-imaged or freshly cloned VDI desktop.
                         detection.confidence = 0.20;
-                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = std::to_wstring(systemAge) + L" hours since install";
                         detection.expectedValue = L"> 7 days on normal system";
                         detection.description = L"Very recent Windows installation (new or re-imaged host)";
@@ -4307,10 +4325,9 @@ namespace ShadowStrike::AntiEvasion {
                         found = true;
                     }
                     else if (systemAge < 168) {  // Less than 7 days
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_RecentInstall);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_RecentInstall);
                         // VERY LOW - a week-old install is entirely ordinary.
                         detection.confidence = 0.10;
-                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = std::to_wstring(systemAge / 24) + L" days since install";
                         detection.expectedValue = L"> 30 days on typical system";
                         detection.description = L"Recent Windows installation";
@@ -4335,13 +4352,12 @@ namespace ShadowStrike::AntiEvasion {
             // Expected difference should be ~100ms
             ULONGLONG tickDiff = tick2 - tick1;
             if (tickDiff < 50 || tickDiff > 500) {  // Too fast or too slow
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_AcceleratedTime);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_AcceleratedTime);
                 // VERY LOW, AND THE INSTRUMENT IS THE REASON. Default timer granularity is
                 // ~15.6 ms and scheduling delay on a loaded or oversubscribed host routinely
                 // exceeds the 500 ms ceiling on its own, so an overshoot measures system load
                 // far more often than it measures a manipulated clock.
                 detection.confidence = 0.15;
-                detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                 detection.detectedValue = std::to_wstring(tickDiff) + L" ms (expected ~100ms)";
                 detection.description = L"Sleep(100) elapsed outside the expected window (host load or clock skew)";
                 detection.source = L"Tick Count Analysis";
@@ -4360,10 +4376,9 @@ namespace ShadowStrike::AntiEvasion {
                 RegCloseKey(hTaskKey);
 
                 if (qStatus == ERROR_SUCCESS && taskCount < 50) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
                     // VERY LOW - lean and hardened golden images legitimately carry few tasks.
                     detection.confidence = 0.15;
-                    detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                     detection.detectedValue = std::to_wstring(taskCount) + L" scheduled tasks";
                     detection.expectedValue = L">= 100 on typical system";
                     detection.description = L"Few scheduled tasks (lean image, fresh install or sandbox)";
@@ -4386,12 +4401,11 @@ namespace ShadowStrike::AntiEvasion {
                 if (RegQueryValueExW(hSysProtKey, L"RPSessionInterval", nullptr, nullptr, reinterpret_cast<LPBYTE>(&rpSessionInterval), &dataSize) == ERROR_SUCCESS) {
                     // RPSessionInterval of 0 means disabled
                     if (rpSessionInterval == 0) {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_NoScheduledTasks);
                         // VERY LOW - System Restore is DISABLED BY DEFAULT on Windows Server
                         // and on most cloud and VDI images, and switched off by policy in many
                         // estates. This is close to a statement about the edition, not the host.
                         detection.confidence = 0.10;
-                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = L"System Restore disabled";
                         detection.description = L"System Restore is disabled (default on Server and most VM images)";
                         detection.source = L"System Restore";
@@ -4415,14 +4429,13 @@ namespace ShadowStrike::AntiEvasion {
                     
                     // If very few records, it's a fresh system
                     if (numRecords < 200) {
-                        EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_EventLogCleared);
+                        auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_EventLogCleared);
                         // VERY LOW, AND THE TECHNIQUE ID OVERSTATES THE EVIDENCE. A low record
                         // count is equally the signature of a fresh install or of a small log
                         // retention policy, and neither is someone CLEARING a log. Reading
                         // "few" as "cleared" is a second inference stacked on a host fact, so
                         // this cannot carry a deliberate-anti-forensics reading on its own.
                         detection.confidence = 0.10;
-                        detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                         detection.detectedValue = std::to_wstring(numRecords) + L" system events";
                         detection.expectedValue = L">= 1000 on normal system";
                         detection.description = L"Few system events (fresh install, short retention or sandbox)";
@@ -4444,11 +4457,10 @@ namespace ShadowStrike::AntiEvasion {
             // If there's significant mismatch (>1 hour), something is off
             int64_t uptimeDiff = static_cast<int64_t>(identity.uptimeMs) - static_cast<int64_t>(expectedUptime);
             if (std::abs(uptimeDiff) > 3600000) {  // More than 1 hour difference
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_BootTimeAnomaly);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_BootTimeAnomaly);
                 // VERY LOW - every VM resumed from a snapshot shows this, and resuming a
                 // snapshot is normal operation rather than evidence of analysis.
                 detection.confidence = 0.15;
-                detection.severity = EnvironmentEvasionSeverity::Low;  // Context only
                 detection.detectedValue = L"Uptime mismatch: " + std::to_wstring(uptimeDiff / 60000) + L" minutes";
                 detection.description = L"Boot time inconsistency (snapshot resume or clock adjustment)";
                 detection.source = L"Boot Time Analysis";
@@ -5095,12 +5107,11 @@ namespace ShadowStrike::AntiEvasion {
             // NOTE: This is INFORMATIONAL - VMs are ubiquitous in enterprise/cloud
             // ================================================================
             if (CheckCPUIDHypervisorBit() != 0) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
                 detection.confidence = 0.15;  // VERY LOW - VMs are normal
                 detection.detectedValue = L"Hypervisor bit set in CPUID";
                 detection.description = L"CPUID indicates hypervisor presence (informational - VMs are common)";
                 detection.source = L"CPUID Leaf 1";
-                detection.severity = EnvironmentEvasionSeverity::Low;  // Informational only
                 outDetections.push_back(detection);
                 found = true;
 
@@ -5125,12 +5136,11 @@ namespace ShadowStrike::AntiEvasion {
                         hvName = L"Parallels";
                     }
 
-                    EnvironmentDetectedTechnique hvDetection(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
+                    auto hvDetection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_VMManufacturer);
                     hvDetection.confidence = 0.20;  // LOW - VMs are normal in enterprise
                     hvDetection.detectedValue = hvVendorW;
                     hvDetection.description = hvName + L" hypervisor identified (informational)";
                     hvDetection.source = L"CPUID Hypervisor Vendor";
-                    hvDetection.severity = EnvironmentEvasionSeverity::Low;  // Informational only
                     outDetections.push_back(hvDetection);
                 }
             }
@@ -5144,7 +5154,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Check for non-standard vendor strings
             if (vendorW != L"GenuineIntel" && vendorW != L"AuthenticAMD") {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMCPUBrand);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_VMCPUBrand);
                 detection.confidence = 0.85;
                 detection.detectedValue = vendorW;
                 detection.expectedValue = L"GenuineIntel or AuthenticAMD";
@@ -5174,12 +5184,11 @@ namespace ShadowStrike::AntiEvasion {
 
             for (const auto& [pattern, vendor] : vmBrandPatterns) {
                 if (m_impl->ContainsSubstringCI(brandW, pattern)) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_VMCPUBrand);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_VMCPUBrand);
                     detection.confidence = 0.92;
                     detection.detectedValue = brandW;
                     detection.description = vendor + L" signature in CPU brand string";
                     detection.source = L"CPUID Extended Leaves";
-                    detection.severity = EnvironmentEvasionSeverity::High;
                     outDetections.push_back(detection);
                     found = true;
                     break;
@@ -5194,7 +5203,7 @@ namespace ShadowStrike::AntiEvasion {
             // Typical bare-metal RDTSC latency is 20-100 cycles
             // VMs often show 500+ cycles due to VMEXIT overhead
             if (rdtscLatency > 500) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::TIMING_AcceleratedTime);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::TIMING_AcceleratedTime);
                 detection.confidence = 0.75;
                 detection.detectedValue = std::to_wstring(rdtscLatency) + L" cycles";
                 detection.expectedValue = L"< 100 cycles on bare metal";
@@ -5212,7 +5221,7 @@ namespace ShadowStrike::AntiEvasion {
                 // VMX support on its own isn't suspicious, but combined with
                 // hypervisor bit it indicates nested virtualization
                 if (CheckCPUIDHypervisorBit() != 0) {
-                    EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
+                    auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_HypervisorBit);
                     detection.confidence = 0.25;  // LOW - nested virtualization is legitimate
                     detection.detectedValue = L"VMX + Hypervisor bit set";
                     detection.description = L"Nested virtualization environment (informational)";
@@ -5233,7 +5242,7 @@ namespace ShadowStrike::AntiEvasion {
             // Mismatch between CPUID and Windows API can indicate VM
             // But also occurs with Intel Alder Lake+ hybrid architectures
             if (cpuidCoreCount > 0 && cpuidCoreCount != sysInfo.dwNumberOfProcessors) {
-                EnvironmentDetectedTechnique detection(EnvironmentEvasionTechnique::HARDWARE_LowProcessorCount);
+                auto detection = MakeContextIndicator(EnvironmentEvasionTechnique::HARDWARE_LowProcessorCount);
                 detection.confidence = 0.25;  // LOW - can happen on physical hardware
                 detection.detectedValue = L"CPUID: " + std::to_wstring(cpuidCoreCount) +
                     L", Windows: " + std::to_wstring(sysInfo.dwNumberOfProcessors);

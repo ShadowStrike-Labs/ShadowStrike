@@ -2796,6 +2796,41 @@ namespace ShadowStrike {
             // IMPORTANT: These methods collect HOST environment context for
             // behavioral scoring calibration. They are NOT detection sources.
             //
+            // EVERY INDICATOR THEY PRODUCE MUST BE BUILT BY MakeContextIndicator.
+            // Constructing EnvironmentDetectedTechnique directly inherits a
+            // VERDICT-GRADE severity from GetDefaultTechniqueSeverity, which maps 22
+            // techniques as Critical, High or Medium and reaches Low only through its
+            // default case - and severity is a score multiplier in
+            // CalculateEvasionScore (Low 1.0, Medium 2.5, High 5.0, Critical 10.0).
+            // So a direct construction silently gives a fact about THIS MACHINE up to
+            // ten times the weight of an ordinary indicator. Six of these seven
+            // methods did exactly that before this factory existed, none of them on
+            // purpose: five inherited it without naming a severity at all.
+
+            /**
+             * @brief Build a host-context indicator with the severity the contract requires.
+             *
+             * @param tech Technique identifier
+             * @return An indicator whose severity is Low, whatever GetDefaultTechniqueSeverity
+             *         would have assigned.
+             *
+             * THE SEVERITY IS FORCED, NOT DEFAULTED. The subject of every one of these
+             * methods is the machine we are running on, so under the subject rule this
+             * module already follows, their output is context and never a verdict. Low is
+             * therefore the only severity a host observation may carry.
+             *
+             * NOTHING IS LOST BY THE CAP. How strong each signal is still travels in
+             * confidence, which these methods already grade carefully from 0.10 for
+             * legitimate IT tooling up to 0.98 for a registry key only a named sandbox
+             * product creates, and the technique enumerator still says exactly what was
+             * seen. What the cap removes is the ability of a host fact to multiply a
+             * score by up to ten.
+             */
+            [[nodiscard]] static EnvironmentDetectedTechnique MakeContextIndicator(
+                EnvironmentEvasionTechnique tech
+            ) noexcept;
+
+            //
             // An EDR must NOT flag processes as evasive based on whether the
             // HOST is a VM — that would cause false positives on every Azure,
             // AWS, or Hyper-V instance. Instead, these methods provide context

@@ -10064,8 +10064,13 @@ class HostProbeContextOnlyContractTests(unittest.TestCase):
         self.assertIsNotNone(body, "CheckTimingIndicators definition not found.")
 
         pushes = len(re.findall(r"outDetections\.push_back", body))
-        caps = len(re.findall(
-            r"severity\s*=\s*EnvironmentEvasionSeverity::Low", body))
+        # The cap MOVED from a per-site assignment into MakeContextIndicator, which
+        # forces Low for every indicator it builds. Counting factory calls expresses
+        # the same invariant against the mechanism that now enforces it, and a
+        # stronger one: a per-site assignment can be forgotten on the next indicator
+        # someone adds - which is precisely how seven of the eight host probes came to
+        # ship Critical and High - whereas a construction cannot be.
+        caps = len(re.findall(r"MakeContextIndicator\s*\(", body))
         # Anti-vacuity: if the routine stops collecting anything this test must fail
         # rather than pass by having nothing left to check.
         self.assertGreaterEqual(
@@ -10076,9 +10081,12 @@ class HostProbeContextOnlyContractTests(unittest.TestCase):
         )
         self.assertEqual(
             pushes, caps,
-            "CheckTimingIndicators collects " + str(pushes) + " indicators but caps "
-            "severity on only " + str(caps) + ". Every finding about THIS machine must "
-            "be capped at Low - an uncapped host finding is a verdict about the host."
+            "CheckTimingIndicators collects " + str(pushes) + " indicators but builds "
+            "only " + str(caps) + " through MakeContextIndicator. Every finding about "
+            "THIS machine must be capped at Low, and the factory is what caps it - an "
+            "uncapped host finding is a verdict about the host. Do NOT satisfy this by "
+            "assigning severity at the call site again; that is the pattern that let "
+            "seven of the eight probes inherit Critical and High."
         )
 
     def test_the_host_timing_probe_scores_nothing_above_the_context_ceiling(self):
@@ -10139,6 +10147,118 @@ class HostProbeContextOnlyContractTests(unittest.TestCase):
             "These host-fingerprinting self-checks were deliberately removed by "
             "ad535230 and have returned: " + ", ".join(returned) + "."
         )
+
+    # ------------------------------------------------------------------ the factory
+    #
+    # THE CAP USED TO BE REMEMBERED AND IS NOW STRUCTURAL. Seven of these eight probes
+    # shipped above the cap their own declarations state, and five of the seven never
+    # named a severity at all - they inherited one, because
+    # EnvironmentDetectedTechnique's converting constructor sets
+    # severity(GetDefaultTechniqueSeverity(tech)) and that function is written for
+    # VERDICT-BEARING detections: it maps 22 techniques as Critical, High or Medium and
+    # reaches Low only through its default case. Severity is then multiplied into the
+    # score by CalculateEvasionScore at Low 1.0, Medium 2.5, High 5.0, Critical 10.0, so
+    # an inherited Critical gave an observation about OUR OWN MACHINE ten times the
+    # weight of an ordinary indicator.
+    #
+    # Assigning Low at each of the 53 sites would have fixed the eight that exist and
+    # been forgotten by whoever adds the 54th. So every indicator is built by a factory
+    # that forces the value, and these tests pin that rather than the individual sites.
+    CONTEXT_FACTORY = "MakeContextIndicator"
+
+    def test_every_host_probe_builds_its_indicators_through_the_context_factory(self):
+        source = read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH)
+        code = strip_c_comments(source)
+        direct = re.compile(r"EnvironmentDetectedTechnique\s+(\w+)\s*\(\s*"
+                            r"EnvironmentEvasionTechnique::\w+\s*\)\s*;")
+        assigns = re.compile(r"\w+\.severity\s*=\s*EnvironmentEvasionSeverity::(\w+)")
+
+        offenders = []
+        factory_calls_in_probes = 0
+        for name in self.HOST_SUBJECT_PROBES:
+            body = extract_c_function(code, name)
+            self.assertTrue(
+                body,
+                "host-subject probe %s no longer has a body this guard can read. If it "
+                "was removed on purpose, drop it from HOST_SUBJECT_PROBES in the same "
+                "change so the population stays honest." % name)
+            n_direct = len(direct.findall(body))
+            n_assign = assigns.findall(body)
+            n_factory = body.count(self.CONTEXT_FACTORY + "(")
+            factory_calls_in_probes += n_factory
+            if n_direct:
+                offenders.append("%s constructs %d indicator(s) directly, which inherits "
+                                 "a verdict-grade severity" % (name, n_direct))
+            if n_assign:
+                offenders.append("%s assigns severity itself (%s); the factory owns that "
+                                 "value" % (name, ",".join(sorted(set(n_assign)))))
+            if not n_factory:
+                offenders.append("%s builds no indicator through %s, so either it stopped "
+                                 "collecting context or it found another way to construct "
+                                 "one" % (name, self.CONTEXT_FACTORY))
+        self.assertEqual(
+            [], offenders,
+            "a host-context probe can produce a verdict-grade severity again. Severity is "
+            "a score multiplier (Low 1.0, Medium 2.5, High 5.0, Critical 10.0) and the "
+            "subject of these probes is THIS MACHINE, so Low is the only value a host "
+            "observation may carry: " + "; ".join(offenders))
+
+        # The factory must not leak onto a verdict path either: a real detection needs a
+        # real severity, so every call site belongs to one of the eight probes.
+        total = len(re.findall(re.escape(self.CONTEXT_FACTORY) + r"\s*\(\s*"
+                               r"EnvironmentEvasionTechnique::", code))
+        self.assertEqual(
+            factory_calls_in_probes, total,
+            "%s is called %d time(s) but only %d of those are inside the eight "
+            "host-context probes. The factory forces Low, so using it on a "
+            "verdict-bearing detection would silently cap a real finding - the opposite "
+            "defect." % (self.CONTEXT_FACTORY, total, factory_calls_in_probes))
+
+    def test_the_context_factory_forces_the_severity_rather_than_inheriting_it(self):
+        code = strip_c_comments(read_source(ENVIRONMENT_EVASION_DETECTOR_CPP_PATH))
+        body = extract_c_function(code, "EnvironmentEvasionDetector::" + self.CONTEXT_FACTORY)
+        if not body:
+            body = extract_c_function(code, self.CONTEXT_FACTORY)
+        self.assertTrue(
+            body,
+            "%s has no definition in EnvironmentEvasionDetector.cpp, so nothing "
+            "forces the host-context cap" % self.CONTEXT_FACTORY)
+        forced = re.search(r"\w+\.severity\s*=\s*EnvironmentEvasionSeverity::Low\s*;", body)
+        self.assertTrue(
+            forced,
+            "%s no longer forces severity to Low. Without that line it merely forwards "
+            "the converting constructor, which inherits Critical, High or Medium for the "
+            "22 techniques GetDefaultTechniqueSeverity maps - and the probes no longer "
+            "assign severity themselves, so nothing else would catch it."
+            % self.CONTEXT_FACTORY)
+        raised = re.findall(r"severity\s*=\s*EnvironmentEvasionSeverity::"
+                            r"(Medium|High|Critical)", body)
+        self.assertEqual(
+            [], raised,
+            "%s assigns a verdict-grade severity (%s)" % (self.CONTEXT_FACTORY,
+                                                          ",".join(raised)))
+
+    def test_the_inheritance_hazard_the_factory_exists_for_is_still_real(self):
+        """Anti-vacuity. If GetDefaultTechniqueSeverity ever returned Low for
+        everything, the factory would look decorative and a future reader could delete
+        it - while every verdict-bearing detection silently lost its severity. So prove
+        the hazard the factory guards against still exists."""
+        header = read_source(ENVIRONMENT_EVASION_DETECTOR_HPP_PATH)
+        code = strip_c_comments(header)
+        body = extract_c_function(code, "GetDefaultTechniqueSeverity")
+        self.assertTrue(
+            body, "GetDefaultTechniqueSeverity has no readable body in the header")
+        graded = re.findall(r"return\s+EnvironmentEvasionSeverity::"
+                            r"(Medium|High|Critical)\s*;", body)
+        self.assertTrue(
+            len(graded) >= 3,
+            "GetDefaultTechniqueSeverity now returns almost nothing above Low (%d "
+            "verdict-grade returns). Either the verdict severities were flattened - "
+            "which would weaken every real detection in this module - or this guard is "
+            "reading the wrong function. %s is only load-bearing while a direct "
+            "construction would inherit a graded severity."
+            % (len(graded), self.CONTEXT_FACTORY))
+
 
 
 class AssemblyExportCensusContractTests(unittest.TestCase):
