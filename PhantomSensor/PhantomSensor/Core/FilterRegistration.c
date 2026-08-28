@@ -585,6 +585,123 @@ ShadowStrikePostSetInformation(
 // FILE SYSTEM CALLBACKS - IRP_MJ_CLEANUP
 // ============================================================================
 
+//
+// FILE_ATTRIBUTE_RECALL_ON_OPEN and FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS are
+// declared in winnt.h, which kernel sources do not include. Defined defensively so
+// this compiles whether or not the WDK headers in use happen to surface them.
+//
+#ifndef FILE_ATTRIBUTE_RECALL_ON_OPEN
+#define FILE_ATTRIBUTE_RECALL_ON_OPEN 0x00040000
+#endif
+#ifndef FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+#define FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS 0x00400000
+#endif
+
+//
+// The two attributes that mean "the data is not here yet, and touching it fetches
+// it". FILE_ATTRIBUTE_OFFLINE is DELIBERATELY EXCLUDED: legacy hierarchical-storage
+// and some backup products set it on files whose content IS resident, so acting on it
+// would queue rescans for files that were never placeholders. The user-mode locality
+// probe excludes it for the same reason, and the two must agree.
+//
+#define SHADOWSTRIKE_CONTENT_NOT_LOCAL_ATTRIBUTES \
+    (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+// ============================================================================
+// CLOUD PLACEHOLDER HYDRATION
+// ============================================================================
+
+//
+// Whether this stream was a dehydrated cloud placeholder when it was opened and its
+// content has since become resident on this volume.
+//
+// THIS IS THE ONLY POINT AT WHICH WE CAN OBSERVE HYDRATION. Measured: our altitude is
+// 385210 (FSFilter Activity Monitor) and cldflt sits at 180451 (FSFilter HSM), so we
+// are ABOVE the cloud filter and the write it performs to populate the file happens
+// BELOW us - invisible to our IRP_MJ_WRITE callback. By cleanup, whoever read the file
+// has caused the fetch to complete, so the bytes are local and a scan can finally
+// examine real content.
+//
+// WHY THIS MATTERS: a session-0 service cannot hydrate a placeholder itself - the open
+// returns ERROR_CLOUD_FILE_ACCESS_DENIED instead of fetching. In the 1.0.94 field run
+// that left eicar.com and eicar_com.zip on the user's Desktop unexaminable, a known
+// malicious file physically present and never read. Rescanning here is what converts
+// that from lost coverage into deferred coverage.
+//
+// The create-time attributes are NOT re-derived here: PocQueryFileAttributes already
+// recorded them in the stream context at PostCreate, and until now nothing read them.
+//
+// NOT PAGEABLE ON PURPOSE - no alloc_text pragma. Cleanup can be reached at
+// APC_LEVEL, and a pageable body entered above PASSIVE_LEVEL is a bugcheck waiting to
+// happen. The IRQL test below governs only the query, not entry.
+//
+_IRQL_requires_max_(APC_LEVEL)
+static
+BOOLEAN
+ShadowStrikeStreamContentBecameLocal(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PSHADOWSTRIKE_STREAM_CONTEXT StreamContext
+    )
+{
+    FILE_BASIC_INFORMATION currentInfo;
+    NTSTATUS status;
+
+    if (FltObjects == NULL || FltObjects->Instance == NULL ||
+        FltObjects->FileObject == NULL || StreamContext == NULL) {
+        return FALSE;
+    }
+
+    //
+    // CHEAP TEST FIRST. A file that was already resident when it was opened can never
+    // be a hydration case, and that is almost every file on the machine - so ordinary
+    // files pay one field read and nothing else. The query below is reached only for
+    // streams that genuinely were placeholders.
+    //
+    // Read without the context lock, matching what the rest of this callback already
+    // does with Dirty, Scanned and ScanVerdictTTL. FileAttributes is an aligned ULONG
+    // so the read cannot tear; a concurrent update would at worst cost one deferred
+    // rescan, never a wrong verdict.
+    //
+    if ((StreamContext->FileAttributes &
+         SHADOWSTRIKE_CONTENT_NOT_LOCAL_ATTRIBUTES) == 0) {
+        return FALSE;
+    }
+
+    //
+    // FltQueryInformationFile is a PASSIVE_LEVEL interface. If we are higher, report
+    // nothing rather than guessing: the file is still examined on its next access,
+    // because by then the create-time attributes show resident content and the
+    // ordinary on-access path handles it. Skipping here defers coverage, it does not
+    // drop it.
+    //
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;
+    }
+
+    RtlZeroMemory(&currentInfo, sizeof(currentInfo));
+
+    status = FltQueryInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &currentInfo,
+        sizeof(currentInfo),
+        FileBasicInformation,
+        NULL
+        );
+
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    //
+    // Still a placeholder means nobody read the content through this handle, so a
+    // rescan would fail exactly as the original scan did. Refusing here is what stops
+    // an enumerated OneDrive folder from queueing a rescan per untouched file.
+    //
+    return (BOOLEAN)((currentInfo.FileAttributes &
+                      SHADOWSTRIKE_CONTENT_NOT_LOCAL_ATTRIBUTES) == 0);
+}
+
 _IRQL_requires_max_(APC_LEVEL)
 FLT_PREOP_CALLBACK_STATUS
 ShadowStrikePreCleanup(
@@ -622,9 +739,19 @@ ShadowStrikePreCleanup(
     UNREFERENCED_PARAMETER(Data);
 
     //
-    // Check if file was modified - trigger rescan if needed
+    // Decide whether this stream needs re-examining. TWO INDEPENDENT REASONS -
+    // modification is no longer the only one.
     //
-    if (g_DriverData.Config.ScanOnWrite && FltObjects->FileObject != NULL) {
+    // THE STREAM CONTEXT IS NOW FETCHED FOR EVERY CLEANUP, not only when
+    // ScanOnWrite is enabled, because one of the two rescan reasons below must not
+    // be gated on that config field.
+    //
+    // COST, stated rather than hoped: FltGetStreamContext is a filter-manager
+    // lookup with no I/O, once per handle close. Everything more expensive stays
+    // behind the cheap attribute test inside
+    // ShadowStrikeStreamContentBecameLocal.
+    //
+    if (FltObjects->FileObject != NULL) {
         status = FltGetStreamContext(
             FltObjects->Instance,
             FltObjects->FileObject,
@@ -633,14 +760,42 @@ ShadowStrikePreCleanup(
 
         if (NT_SUCCESS(status) && streamContext != NULL) {
             //
+            // REASON 1 - A CLOUD PLACEHOLDER'S CONTENT ARRIVED WHILE THIS HANDLE WAS
+            // OPEN. Deliberately NOT gated on Config.ScanOnWrite.
+            //
+            // That field defaults to FALSE (Globals.h) and its only writers are policy
+            // messages; measured, user mode never sends one, so anything behind it has
+            // never executed. Leaving a known coverage hole behind an unsettable
+            // control would keep it closed, and this is the one case where the file
+            // was provably never examined rather than merely stale.
+            //
+            if (ShadowStrikeStreamContentBecameLocal(FltObjects, streamContext)) {
+                needsRescan = TRUE;
+
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_TRACE_LEVEL,
+                           "[ShadowStrike] Cloud content became local; rescanning\n");
+            }
+
+            //
+            // REASON 2 - modified or never scanned. UNCHANGED, including its gate.
+            //
+            // KNOWN ADJACENT DEFECT, RECORDED RATHER THAN WORKED AROUND: nothing ever
+            // sets streamContext->Scanned to TRUE. The three PostCreate sites that
+            // would are gated on CompletionContext->WasScanned, which is declared in
+            // both PostCreate.h and PreCreate.h and assigned NOWHERE. So !Scanned is
+            // always true and enabling ScanOnWrite today would rescan every file at
+            // every close. That is why this change does not touch the default.
+            //
             // Check if rescan is needed:
             // 1. File was modified (Dirty) since last scan, OR
             // 2. File was never scanned, OR
             // 3. Verdict TTL expired
             //
-            if (streamContext->Dirty || !streamContext->Scanned) {
+            if (!needsRescan && g_DriverData.Config.ScanOnWrite &&
+                (streamContext->Dirty || !streamContext->Scanned)) {
                 needsRescan = TRUE;
-            } else if (streamContext->ScanVerdictTTL > 0) {
+            } else if (!needsRescan && g_DriverData.Config.ScanOnWrite &&
+                       streamContext->ScanVerdictTTL > 0) {
                 LARGE_INTEGER now;
                 KeQuerySystemTimePrecise(&now);
                 LONGLONG elapsedSec = (now.QuadPart - streamContext->ScanTime.QuadPart) / 10000000LL;

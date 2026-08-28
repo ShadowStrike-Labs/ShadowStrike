@@ -12312,5 +12312,124 @@ class CloudPlaceholderCoverageContractTests(unittest.TestCase):
                 % (site, name))
 
 
+
+
+class CloudHydrationRescanContractTests(unittest.TestCase):
+    """A cloud file must be examined at the moment its content becomes local.
+
+    A session-0 service cannot hydrate a Cloud Filter placeholder - the open returns
+    ERROR_CLOUD_FILE_ACCESS_DENIED instead of fetching - so the access that TRIGGERS
+    hydration cannot be examined from user mode. The driver closes that hole at
+    IRP_MJ_CLEANUP, by which point whoever read the file has caused the fetch to complete
+    and the bytes are resident.
+
+    WHY CLEANUP AND NOT WRITE, measured from the altitudes: we are 385210 (FSFilter
+    Activity Monitor) and cldflt is 180451 (FSFilter HSM), so we sit ABOVE the cloud
+    filter and the write it performs to populate the file happens BELOW us, invisible to
+    our IRP_MJ_WRITE callback.
+    """
+
+    @staticmethod
+    def _cleanup_body():
+        source = strip_c_comments(read_source(FILTER_REGISTRATION_C_PATH))
+        return extract_c_function(source, "ShadowStrikePreCleanup")
+
+    def test_the_hydration_rescan_is_not_gated_on_an_unsettable_control(self):
+        body = self._cleanup_body()
+        self.assertIsNotNone(body, "ShadowStrikePreCleanup is gone")
+
+        call = body.find("ShadowStrikeStreamContentBecameLocal(")
+        self.assertNotEqual(
+            -1, call,
+            "the cleanup callback no longer asks whether a placeholder's content became "
+            "local, so a cloud file that was unexaminable at open is never re-examined")
+
+        # The cloud reason must be reachable without Config.ScanOnWrite. That field
+        # defaults to FALSE and its only writers are policy messages user mode never
+        # sends, so anything behind it has never executed in production.
+        # Take the condition of the if-statement that ENCLOSES the call: scan back to
+        # the nearest opening if and read forward from there.
+        #
+        # AN EARLIER DRAFT OF THIS TEST DID NOT WORK. It searched forward FROM the
+        # ScanOnWrite token looking for an opening if, which can never match, because
+        # the if precedes the token rather than following it. The mutation that puts
+        # the hydration rescan behind that gate produced ZERO failures - the single
+        # most important invariant in this change was unguarded.
+        preceding = body[:call]
+        gate_start = preceding.rfind("if (")
+        self.assertNotEqual(
+            -1, gate_start, "no enclosing if-statement found; this guard is stale")
+        condition = preceding[gate_start:]
+        self.assertNotIn(
+            "Config.ScanOnWrite", condition,
+            "the hydration rescan now sits behind a Config.ScanOnWrite test. That "
+            "control defaults to FALSE and nothing in the product can set it, so gating "
+            "this on it puts a known coverage hole back behind an unsettable switch. "
+            "Enclosing condition: %s" % condition.strip()[:160])
+
+        # ANTI-VACUITY: the OTHER reason must still be gated, or this test would pass
+        # simply because the gate was deleted wholesale.
+        self.assertIn(
+            "g_DriverData.Config.ScanOnWrite", body,
+            "the modified-or-unscanned rescan reason lost its ScanOnWrite gate. Nothing "
+            "sets streamContext->Scanned to TRUE, so an ungated reason 2 would rescan "
+            "EVERY file at EVERY close.")
+
+    def test_the_hydration_probe_is_cheap_before_it_is_thorough(self):
+        source = strip_c_comments(read_source(FILTER_REGISTRATION_C_PATH))
+        helper = extract_c_function(source, "ShadowStrikeStreamContentBecameLocal")
+        self.assertIsNotNone(helper, "the hydration probe is gone")
+
+        attr_test = helper.find("StreamContext->FileAttributes")
+        query = helper.find("FltQueryInformationFile")
+        irql = helper.find("KeGetCurrentIrql")
+        for label, offset in (("create-time attribute test", attr_test),
+                              ("IRQL guard", irql),
+                              ("attribute query", query)):
+            self.assertNotEqual(-1, offset, "the %s is missing from the probe" % label)
+
+        self.assertLess(
+            attr_test, query,
+            "the probe queries the file system before checking the attributes recorded at "
+            "create. Almost every file on the machine was never a placeholder, so the "
+            "cheap field test must come first or every handle close pays for a query.")
+        self.assertLess(
+            irql, query,
+            "FltQueryInformationFile is a PASSIVE_LEVEL interface and the IRQL test no "
+            "longer precedes it. Cleanup can be reached at APC_LEVEL.")
+
+    def test_offline_is_not_treated_as_content_not_being_local(self):
+        source = read_source(FILTER_REGISTRATION_C_PATH)
+        mask_start = source.find("#define SHADOWSTRIKE_CONTENT_NOT_LOCAL_ATTRIBUTES")
+        self.assertNotEqual(-1, mask_start, "the recall mask is gone")
+        mask = source[mask_start:mask_start + 260]
+
+        for attribute in ("FILE_ATTRIBUTE_RECALL_ON_OPEN",
+                          "FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS"):
+            self.assertIn(attribute, mask,
+                          "%s is no longer treated as content-not-resident" % attribute)
+
+        self.assertNotIn(
+            "FILE_ATTRIBUTE_OFFLINE", mask,
+            "FILE_ATTRIBUTE_OFFLINE is back in the recall mask. Legacy "
+            "hierarchical-storage and some backup products set it on files whose content "
+            "IS resident, so including it queues rescans for files that were never "
+            "placeholders - and it would disagree with the user-mode locality probe, "
+            "which excludes it for the same reason.")
+
+    def test_the_stream_context_is_still_released_exactly_once(self):
+        """Opening the outer gate widened how often the context is fetched."""
+        body = self._cleanup_body()
+        self.assertIsNotNone(body, "ShadowStrikePreCleanup is gone")
+        self.assertEqual(
+            1, body.count("FltGetStreamContext("),
+            "the cleanup callback acquires the stream context more than once")
+        self.assertEqual(
+            1, body.count("FltReleaseContext(streamContext)"),
+            "the stream context is no longer released exactly once. This callback now "
+            "fetches a context on EVERY cleanup rather than only when ScanOnWrite is "
+            "enabled, so a leaked reference here leaks per handle close.")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
