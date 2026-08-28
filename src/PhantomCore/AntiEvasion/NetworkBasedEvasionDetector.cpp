@@ -4479,7 +4479,11 @@ namespace ShadowStrike::AntiEvasion {
             // Check each domain for DGA, fast flux, tunneling, etc.
             for (const auto& [domain, ips] : domainToIPs) {
                 std::vector<NetworkDetectedTechnique> domainDetections;
-                AnalyzeDomain(domain, domainDetections, nullptr);
+                // Found-flag discarded deliberately: AnalyzeDomain ends
+                // `return !outDetections.empty()`, and every detection it produced is
+                // merged into the result by the loop just below, so the flag restates what
+                // that loop already sees.
+                (void)AnalyzeDomain(domain, domainDetections, nullptr);
 
                 for (auto& detection : domainDetections) {
                     AddDetection(result, std::move(detection));
@@ -4659,7 +4663,11 @@ namespace ShadowStrike::AntiEvasion {
             // Check domains against known C2 lists
             for (const auto& domain : domains) {
                 std::vector<NetworkDetectedTechnique> detections;
-                AnalyzeDomain(domain, detections, nullptr);
+                // Found-flag discarded deliberately: AnalyzeDomain ends
+                // `return !outDetections.empty()`, and every detection it produced is
+                // merged into the result by the loop just below, so the flag restates what
+                // that loop already sees.
+                (void)AnalyzeDomain(domain, detections, nullptr);
 
                 for (auto& detection : detections) {
                     AddDetection(result, std::move(detection));

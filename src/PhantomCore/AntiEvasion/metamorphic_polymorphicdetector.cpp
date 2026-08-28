@@ -168,13 +168,23 @@ public:
             return false;
         }
 
+        // THE FORMATTER'S FAILURE IS DELIBERATELY NOT FATAL, unlike the two decoders
+        // above, and this became true in the same change that deleted its only caller.
+        //
+        // Nothing in this module consumes formatted instruction text: the sole
+        // FormatInstruction call was removed from DisassembleBuffer because `text` had no
+        // reader. Failing Initialize here would disable every technique this detector
+        // implements in order to report that a REPORTING facility was unavailable. The
+        // decoders remain fatal because detection genuinely depends on them; nothing
+        // depends on this.
+        //
+        // The Init call and the member are KEPT so the seam stays ready for a text-matching
+        // detector. err is deliberately NOT set: Initialize succeeds, and an error object
+        // describing a successful call would be a lie.
         if (Phantom::Disasm::IsFailed(m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel))) {
-            if (err) {
-                err->win32Code = ERROR_INVALID_FUNCTION;
-                err->message = L"Failed to initialize PhantomDisassembler formatter";
-            }
-            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize PhantomDisassembler formatter");
-            return false;
+            SS_LOG_WARN(L"MetamorphicDetector",
+                L"PhantomDisassembler formatter initialization failed; no consumer exists "
+                L"for formatted instruction text, so detection is unaffected");
         }
 
         m_disasmInitialized = true;
@@ -370,6 +380,9 @@ public:
         Phantom::Disasm::Mnemonic mnemonic;
         Phantom::Disasm::DecodedInstruction instruction;
         Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
+        // NOT POPULATED BY DisassembleBuffer - see the note at the removed FormatInstruction
+        // call there. Nothing consumed this, and formatting it per decoded instruction was
+        // measurable dead work. Format it at the point of use if a consumer ever needs it.
         char text[256];
     };
 
@@ -406,15 +419,22 @@ public:
             instr.length = instr.instruction.length;
             instr.mnemonic = instr.instruction.mnemonic;
 
-            m_formatter.FormatInstruction(
-                instr.instruction,
-                instr.operands,
-                instr.instruction.operand_count,
-                instr.text,
-                sizeof(instr.text),
-                instr.address,
-                nullptr
-            );
+            // THE INSTRUCTION TEXT IS DELIBERATELY NOT FORMATTED HERE, AND REMOVING THAT
+            // CALL WAS A PERFORMANCE FIX RATHER THAN A WARNING FIX.
+            //
+            // Measured: `text` has exactly two occurrences in this translation unit and both
+            // were arguments of the FormatInstruction call that stood here; `->text` has
+            // none. DisassembledInstruction is declared inside Impl, so no other translation
+            // unit can see the field either. Nothing ever read the formatted string.
+            //
+            // This loop runs ONCE PER DECODED INSTRUCTION, bounded by MAX_INSTRUCTIONS
+            // (10,000,000), so formatting every instruction into a buffer no code reads was
+            // the most expensive dead work on the disassembly path. Removing it changes no
+            // detection: not one technique in this module consults the text.
+            //
+            // THE FIELD IS KEPT as the extension seam it is - a text-matching detector is a
+            // reasonable thing to add - but a consumer must format it at the point of use
+            // instead of inheriting a string this loop filled in silently for nobody.
 
             out.push_back(instr);
             offset += instr.length;
@@ -2065,7 +2085,29 @@ void MetamorphicDetector::AnalyzeFileInternal(
                 }
 
                 if (outOfTime(L"DetectSelfModifyingImports")) { return; }
-            m_impl->DetectSelfModifyingImports(peInfo, imports, result.detectedTechniques);
+            // THE FOUND-FLAGS IN THIS STAGE SEQUENCE ARE DISCARDED DELIBERATELY, AND THAT
+            // IS NOT THE SAME DECISION AS THE TWO CHECKED RESULTS BELOW.
+            //
+            // Proven one definition at a time rather than assumed from the naming:
+            // DetectSelfModifyingImports ends `return !highAPIs.empty() || ...`,
+            // DetectGetPCTechniques ends `return !out.empty()`, and
+            // DetectInstructionSubstitution, DetectDeadCode, DetectAPIHashing and
+            // DetectVMProtection each end `out.push_back(std::move(detection)); return true;`
+            // with `return false` otherwise. Every one reports WHETHER IT FOUND SOMETHING,
+            // not whether it succeeded - and everything found is already in
+            // result.detectedTechniques, which this orchestrator aggregates. The flag holds
+            // no information this function does not already have.
+            //
+            // CONTRAST ComputeOpcodeHistogram AND AnalyzeCFG further down, which report
+            // SUCCESS and are therefore checked: a field of their out-parameter is read
+            // afterwards and defaults to false, so discarding those made an analysis that
+            // never ran read exactly like one that found nothing.
+            //
+            // [[nodiscard]] IS DELIBERATELY LEFT ON THE DECLARATIONS. It is correct for any
+            // caller that wants the answer without inspecting the vector. The honest fix is
+            // to make this orchestrator's ignoring explicit, not to weaken a diagnostic for
+            // every other caller.
+            (void)m_impl->DetectSelfModifyingImports(peInfo, imports, result.detectedTechniques);
             }
 
             PEParser::TLSInfo tlsInfo;
@@ -2174,12 +2216,12 @@ void MetamorphicDetector::AnalyzeFileInternal(
             if (outOfTime(L"post-disassembly")) { return; }
 
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanMetamorphic)) {
-                m_impl->DetectInstructionSubstitution(instructions, result.detectedTechniques);
-                m_impl->DetectDeadCode(instructions, result.detectedTechniques);
+                (void)m_impl->DetectInstructionSubstitution(instructions, result.detectedTechniques);
+                (void)m_impl->DetectDeadCode(instructions, result.detectedTechniques);
             }
 
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanPolymorphic)) {
-                m_impl->DetectGetPCTechniques(codeBuffer, codeSize, result.detectedTechniques);
+                (void)m_impl->DetectGetPCTechniques(codeBuffer, codeSize, result.detectedTechniques);
 
                 std::vector<DecryptionLoopInfo> loops;
                 if (m_impl->DetectDecryptionLoops(codeBuffer, codeSize, loops, is64Bit)) {
@@ -2204,12 +2246,12 @@ void MetamorphicDetector::AnalyzeFileInternal(
 
             if (outOfTime(L"ScanObfuscation")) { return; }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanObfuscation)) {
-                m_impl->DetectAPIHashing(instructions, result.detectedTechniques);
+                (void)m_impl->DetectAPIHashing(instructions, result.detectedTechniques);
             }
 
             if (outOfTime(L"ScanVMProtection")) { return; }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanVMProtection)) {
-                m_impl->DetectVMProtection(codeBuffer, codeSize, instructions, result.detectedTechniques);
+                (void)m_impl->DetectVMProtection(codeBuffer, codeSize, instructions, result.detectedTechniques);
             }
 
             if (outOfTime(L"EnableCFGAnalysis")) { return; }

@@ -1812,7 +1812,19 @@ namespace ShadowStrike {
              *
              * @param results Output: Map of process ID to analysis result
              * @param config Optional analysis configuration
-             * @return Number of processes with anti-VM behavior detected
+             *
+             * @return Number of processes SUCCESSFULLY ANALYSED - NOT the number found to
+             *         exhibit anti-VM behaviour. This forwards AnalyzeProcessesBatch
+             *         unchanged, which counts only the processes for which
+             *         AnalyzeProcessAntiVMBehavior returned true, and that function is
+             *         documented "true if analysis completed successfully" and ends
+             *         `return result.completed`. AnalyzeProcessesBatch one screen up
+             *         documents this same value correctly; this comment previously
+             *         contradicted it.
+             *
+             *         The findings themselves are in @p results. A ZERO therefore means
+             *         nothing could be analysed - a health signal, not a clean verdict -
+             *         and callers in this file report it rather than discarding it.
              */
             [[nodiscard]] size_t ScanAllProcesses(
                 std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult>& results,

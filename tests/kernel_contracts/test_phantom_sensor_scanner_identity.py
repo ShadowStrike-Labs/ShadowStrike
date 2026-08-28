@@ -102,6 +102,9 @@ TIME_BASED_EVASION_DETECTOR_CPP_PATH = (
 TIME_BASED_EVASION_DETECTOR_HPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.hpp"
 )
+VM_EVASION_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/VMEvasionDetector.hpp"
+)
 VM_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/VMEvasionDetector.cpp"
 )
@@ -11743,6 +11746,231 @@ class DiscardedAnalysisResultContractTests(unittest.TestCase):
             "for (const auto& adapter : adapterDetails)" in code,
             "the adapter-name loop is gone; this guard's reasoning about which checks need "
             "gating no longer describes the code")
+
+
+
+
+def enclosing_block_of(text, needle):
+    """Return the { ... } block of the statement containing `needle`, or None.
+
+    Anchored on the brace that OPENS after the needle and matched by depth, so it does not
+    depend on indentation - the earlier version of this guard assumed a 12-space body and
+    silently matched nothing.
+    """
+    index = text.find(needle)
+    if index == -1:
+        return None
+    open_brace = text.find("{", index)
+    if open_brace == -1:
+        return None
+    depth = 0
+    for position in range(open_brace, len(text)):
+        if text[position] == "{":
+            depth += 1
+        elif text[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:position + 1]
+    return None
+
+
+
+class DiscardedNodiscardClosureContractTests(unittest.TestCase):
+    """Closes the discarded-[[nodiscard]] strand for the AntiEvasion folder.
+
+    Twenty-two sites discarded a [[nodiscard]] result. They were NOT one defect: measuring
+    each callee's return semantics split them into five classes, and nine turned out to be
+    live defects while thirteen were correct-but-unstated. A blanket (void) sweep would
+    have silenced three real ones.
+
+    These tests pin the two invariants that a future edit could plausibly undo, plus the
+    two defects the measurement exposed along the way - a fatal check on a component with
+    no consumer, and a header comment that contradicted its own implementation.
+    """
+
+    MODULES = (
+        ("metamorphic_polymorphicdetector.cpp", "metamorphic_polymorphicdetector.hpp"),
+        ("VMEvasionDetector.cpp", "VMEvasionDetector.hpp"),
+        ("NetworkBasedEvasionDetector.cpp", "NetworkBasedEvasionDetector.hpp"),
+        ("SandboxEvasionDetector.cpp", "SandboxEvasionDetector.hpp"),
+        ("TimeBasedEvasionDetector.cpp", "TimeBasedEvasionDetector.hpp"),
+    )
+
+
+    @staticmethod
+    def _disassembler_nodiscard_names():
+        """Names declared [[nodiscard]] by the disassembler this folder calls into."""
+        names = set()
+        headers = sorted((ROOT / "PhantomDisassembler").rglob("*.h*"))
+        for header in headers:
+            names |= set(re.findall(
+                r"\[\[nodiscard\]\]\s+[\w:<>,\s\*&]*?(\w+)\s*\(",
+                strip_c_comments(read_source(header))))
+        names.discard("")
+        # ANTI-VACUITY: if the tree moves, this silently returns nothing and the union adds
+        # no protection at all.
+        assert len(names) >= 20, (
+            "only %d [[nodiscard]] names found across %d disassembler header(s); the scan "
+            "has broken and the external half of this guard is inert"
+            % (len(names), len(headers)))
+        return names
+
+    def test_no_analysis_result_in_this_folder_is_silently_discarded(self):
+        """A bare statement form means a [[nodiscard]] value went nowhere unstated.
+
+        THE SUBJECT SET IS DERIVED, NOT LISTED. Every name declared [[nodiscard]] in the
+        module's own header or .cpp becomes a subject, so the guard cannot drift out of date
+        as functions are added, and it cannot over-constrain by flagging void-returning
+        siblings that merely share a naming prefix - an earlier draft matched bare `Detect`
+        and would have done exactly that.
+
+        The receiver chain is optional, so `x->Foo(` and `a.b.Foo(` are caught as well as a
+        plain `Foo(`. The earlier draft anchored on the literal call text and would have
+        missed a regression at `formatter.FormatInstruction(` entirely.
+
+        KNOWN LIMITATION, stated rather than hidden: a statement start is recognised by the
+        previous non-blank line ending in ';', '{' or '}'. A braceless single-line `if (x)
+        Foo();` would therefore not be examined. Every conditional in this folder uses
+        braces, so the gap is currently empty, but it is a gap.
+        """
+        folder = METAMORPHIC_DETECTOR_CPP_PATH.parent
+        offenders = []
+        derived = {}
+        for cpp_name, hpp_name in self.MODULES:
+            cpp_path, hpp_path = folder / cpp_name, folder / hpp_name
+            code = strip_c_comments(read_source(cpp_path))
+            declarations = code
+            if hpp_path.exists():
+                declarations += strip_c_comments(read_source(hpp_path))
+            names = set(re.findall(r"\[\[nodiscard\]\]\s+[\w:<>,\s\*&]*?(\w+)\s*\(",
+                                   declarations))
+            names.discard("")
+            # THE EXTERNAL APIS MUST BE IN THE SET TOO. Init and FormatInstruction are
+            # declared in PhantomDisassembler, not in these modules, so a set derived only
+            # from the module's own files left both unprotected - proven by a mutation that
+            # made formatter.FormatInstruction bare and produced ZERO failures. Discarding an
+            # Init result is the exact defect fixed in Sandbox and TimeBased, so the external
+            # surface this folder calls belongs in scope.
+            names |= self._disassembler_nodiscard_names()
+            derived[cpp_name] = len(names)
+            if not names:
+                continue
+            alternation = "|".join(sorted(re.escape(n) for n in names))
+            bare = re.compile(r"^(?:\w+\s*(?:\.|->)\s*)*(" + alternation + r")\s*\(")
+            rows = code.splitlines()
+            for number, line in enumerate(rows, start=1):
+                stripped = line.strip()
+                if not bare.match(stripped):
+                    continue
+                # A MATCH IS ONLY A DISCARDED RESULT IF IT STARTS A STATEMENT. Without this
+                # the check reported continuation lines: `VMTypeToString(x).c_str(), y);`
+                # continuing an SS_LOG_INFO argument list, and the second operand of
+                # `if (a && m_impl->DisassembleBuffer(...))` - whose value IS consumed.
+                previous = ""
+                for back in range(number - 2, -1, -1):
+                    if rows[back].strip():
+                        previous = rows[back].strip()
+                        break
+                if previous and previous[-1] not in ";{}":
+                    continue
+                offenders.append("%s stripped-line %d: %s"
+                                 % (cpp_name, number, stripped[:64]))
+
+        # ANTI-VACUITY: if the declaration scan breaks, every module yields an empty subject
+        # set and this test passes while checking nothing.
+        thin = {name: count for name, count in derived.items() if count < 10}
+        self.assertEqual(
+            {}, thin,
+            "the [[nodiscard]] declaration scan found almost nothing for %s, so this test "
+            "would pass vacuously - fix the scan before trusting a green result" % thin)
+
+        self.assertEqual(
+            [], offenders,
+            "%d [[nodiscard]] analysis call(s) appear as a bare statement, discarding the "
+            "result with no stated reason. Either consume the value or write (void) with the "
+            "reason, as the rest of this folder now does. Line numbers are from the "
+            "comment-stripped text: %s" % (len(offenders), " | ".join(offenders[:6])))
+
+    def test_the_formatter_failure_cannot_disable_metamorphic_detection(self):
+        """Nothing consumes formatted text, so failing Initialize over it drops everything."""
+        code = strip_c_comments(read_source(METAMORPHIC_DETECTOR_CPP_PATH))
+        block = enclosing_block_of(code, "m_formatter.Init(")
+        self.assertIsNotNone(block, "the formatter Init call is gone entirely")
+        self.assertNotIn(
+            "return false", block,
+            "a formatter Init failure aborts Initialize again. Nothing in this module "
+            "consumes formatted instruction text, so this refuses to run EVERY technique "
+            "the detector implements in order to report that a reporting facility was "
+            "unavailable. Block: %s" % block.strip()[:200])
+        self.assertIn(
+            "SS_LOG_WARN", block,
+            "the formatter failure is now silent; it must still be reported. Block: %s"
+            % block.strip()[:200])
+
+        # ANTI-VACUITY: the decoders MUST stay fatal, which also proves this test can tell
+        # a fatal block from a warning block rather than passing on anything it reads.
+        for decoder in ("m_decoder32.Init(", "m_decoder64.Init("):
+            dblock = enclosing_block_of(code, decoder)
+            self.assertIsNotNone(dblock, "%s is gone" % decoder)
+            self.assertIn(
+                "return false", dblock,
+                "%s no longer aborts Initialize. Detection genuinely depends on the "
+                "decoders - an uninitialised decoder decodes nothing and the module then "
+                "reports no techniques, which is indistinguishable from a clean file."
+                % decoder)
+
+    def test_the_unread_instruction_text_is_not_formatted_per_instruction(self):
+        """Formatting every decoded instruction into a buffer nobody reads is dead work."""
+        code = strip_c_comments(read_source(METAMORPHIC_DETECTOR_CPP_PATH))
+        readers = [ln for ln in code.splitlines() if ".text" in ln]
+        if readers:
+            # A READER APPEARED. That is not automatically wrong - it makes the removed
+            # formatting meaningful again - but it invalidates the reasoning recorded at the
+            # removal site, so it must be a deliberate decision rather than a silent drift.
+            self.fail(
+                "something now references the instruction text field (%d line(s), e.g. %r). "
+                "The formatting call was removed because NOTHING read it and the loop runs "
+                "once per decoded instruction up to MAX_INSTRUCTIONS. If a consumer is "
+                "genuinely wanted, restore the formatting deliberately and update the note "
+                "at the removal site - do not leave a reader of a field that is never "
+                "written." % (len(readers), readers[0].strip()[:70]))
+        self.assertEqual(
+            0, code.count("m_formatter.FormatInstruction"),
+            "per-instruction formatting is back while nothing reads the result")
+        self.assertTrue(
+            "char text[256];" in code,
+            "the text field was deleted rather than left as the extension seam it is. "
+            "Removing the formatting was a cost fix; removing the field discards a place a "
+            "text-matching detector could attach.")
+
+    def test_the_primary_process_scan_reports_when_it_analysed_nothing(self):
+        """Zero is a success count of zero, not a clean machine."""
+        code = strip_c_comments(read_source(VM_EVASION_DETECTOR_CPP_PATH))
+        captured = code.count("const size_t analyzedProcesses = ScanAllProcesses(processResults);")
+        reported = code.count("if (analyzedProcesses == 0) {")
+        self.assertEqual(
+            3, captured,
+            "expected all 3 ScanAllProcesses call sites to capture the count, found %d"
+            % captured)
+        self.assertEqual(
+            3, reported,
+            "expected all 3 sites to report a zero, found %d. Zero means NOT ONE PROCESS "
+            "COULD BE ANALYSED on the phase this file's own comment calls the PRIMARY "
+            "detection - silence there is a health signal, not a clean verdict." % reported)
+
+    def test_scan_all_processes_does_not_claim_to_return_a_detection_count(self):
+        """The header contradicted its own implementation and its sibling one screen up."""
+        header = read_source(VM_EVASION_DETECTOR_HPP_PATH)
+        self.assertFalse(
+            "@return Number of processes with anti-VM behavior detected" in header,
+            "ScanAllProcesses again claims to return a DETECTION count. It forwards "
+            "AnalyzeProcessesBatch unchanged, which counts processes for which "
+            "AnalyzeProcessAntiVMBehavior returned true, and that is documented 'true if "
+            "analysis completed successfully'. The findings are in the out-parameter.")
+        self.assertTrue(
+            "@return Number of processes successfully analyzed" in header,
+            "AnalyzeProcessesBatch's correct wording is gone; it is the reference this "
+            "correction was measured against")
 
 
 if __name__ == "__main__":

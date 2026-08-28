@@ -1362,8 +1362,23 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment() {
 
         // --- Phase 2: Behavioral scan of all running processes ---
         // This is the PRIMARY detection: scan each process for anti-VM code patterns.
+        //
+        // THE COUNT IS CHECKED BECAUSE IT REPORTS ANALYSIS SUCCESS, NOT DETECTIONS.
+        //
+        // Measured through both layers: ScanAllProcesses forwards AnalyzeProcessesBatch
+        // unchanged, that increments only when AnalyzeProcessAntiVMBehavior returns true,
+        // and that function is documented "true if analysis completed successfully" and
+        // ends `return result.completed`. So zero does not mean a clean machine - it means
+        // NOT ONE PROCESS COULD BE ANALYSED, typically because every OpenProcess was
+        // refused, on the phase the line above calls the PRIMARY detection. Total silence
+        // from the primary detector is worth a line in the log.
         std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult> processResults;
-        ScanAllProcesses(processResults);
+        const size_t analyzedProcesses = ScanAllProcesses(processResults);
+        if (analyzedProcesses == 0) {
+            SS_LOG_WARN(L"AntiEvasion",
+                L"Behavioral anti-VM scan analysed 0 processes; the primary per-process "
+                L"detection contributed nothing to this result");
+        }
 
         // --- Phase 3: Merge behavioral results with context calibration ---
         // Adjust process behavioral scores based on host context.
@@ -1443,8 +1458,16 @@ VMEvasionResult VMEvasionDetector::DetectEnvironment(const VMDetectionConfig& co
         }
 
         // Phase 2: Behavioral scan of all running processes
+        //
+        // Zero means nothing could be analysed rather than nothing was found; the reasoning
+        // is recorded in full at the first of the three identical calls in this file.
         std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult> processResults;
-        ScanAllProcesses(processResults);
+        const size_t analyzedProcesses = ScanAllProcesses(processResults);
+        if (analyzedProcesses == 0) {
+            SS_LOG_WARN(L"AntiEvasion",
+                L"Behavioral anti-VM scan analysed 0 processes; the primary per-process "
+                L"detection contributed nothing to this result");
+        }
 
         // Phase 3: Merge with context calibration
         const bool hostIsVirtualized = result.isVM;
@@ -1503,8 +1526,16 @@ VMEvasionResult VMEvasionDetector::DetectEnvironmentWithProgress(ProgressCallbac
         }
 
         // Phase 2: Behavioral scan of all running processes
+        //
+        // Zero means nothing could be analysed rather than nothing was found; the reasoning
+        // is recorded in full at the first of the three identical calls in this file.
         std::unordered_map<Utils::ProcessUtils::ProcessId, ProcessVMEvasionResult> processResults;
-        ScanAllProcesses(processResults);
+        const size_t analyzedProcesses = ScanAllProcesses(processResults);
+        if (analyzedProcesses == 0) {
+            SS_LOG_WARN(L"AntiEvasion",
+                L"Behavioral anti-VM scan analysed 0 processes; the primary per-process "
+                L"detection contributed nothing to this result");
+        }
 
         // Phase 3: Merge with context calibration
         const bool hostIsVirtualized = result.isVM;
@@ -3452,7 +3483,12 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
                 if (isAntiVM) {
                     // Format the full instruction text
                     char fmtBuffer[256] = { 0 };
-                    formatter.FormatInstruction(instruction, operands,
+                    // Status discarded deliberately, and the zero-initialiser above is what
+                    // makes that safe: a formatting failure leaves fmtBuffer an empty C
+                    // string, so fullText below is empty and operandText stays empty. That
+                    // loses reporting detail in the technical description, not detection -
+                    // isAntiVM is already true and the technique is recorded either way.
+                    (void)formatter.FormatInstruction(instruction, operands,
                         instruction.operand_count_visible, fmtBuffer, sizeof(fmtBuffer),
                         virtualAddress + offset);
 
