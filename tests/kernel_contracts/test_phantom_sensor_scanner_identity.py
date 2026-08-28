@@ -114,6 +114,9 @@ DEBUGGER_EVASION_DETECTOR_CPP_PATH = (
 ENVIRONMENT_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/EnvironmentEvasionDetector.cpp"
 )
+METAMORPHIC_DETECTOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.hpp"
+)
 METAMORPHIC_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
 )
@@ -12145,6 +12148,71 @@ class TechniqueAttributionContractTests(unittest.TestCase):
             "would pass for the wrong reason. Note TIMING_RDTSCP does NOT satisfy this - "
             "the boundary is deliberate, because an unbounded substring test let a mutation "
             "swap the enumerator undetected. Case: %s" % rdtsc_case.strip()[:200])
+
+
+
+
+class MetamorphicResultVocabularyContractTests(unittest.TestCase):
+    """Keeps the metamorphic result vocabulary honest about what it produces.
+
+    Six declared members carry no producer, and one carries eleven producers and no
+    consumer. Both states are documented at the declarations; these tests keep the
+    documentation and the code from drifting apart in either direction.
+    """
+
+    _UNPRODUCED = ("successors", "predecessors", "structuralHash", "variantName",
+                   "familyMatches")
+
+    def test_the_unproduced_result_members_say_so_at_their_declarations(self):
+        header = read_source(METAMORPHIC_DETECTOR_HPP_PATH)
+        missing = [name for name in self._UNPRODUCED
+                   if not re.search(r"(?<![A-Za-z0-9_])" + name + r"(?![A-Za-z0-9_])[^;]*;",
+                                    header)]
+        self.assertEqual([], missing, "declaration(s) vanished: %s" % missing)
+
+        self.assertGreaterEqual(
+            header.count("NOT POPULATED") + header.count("NOT PRODUCED"), 6,
+            "the unproduced-member notes have been thinned out. A member that reads as a "
+            "measurement while having no producer is the defect these notes exist to "
+            "prevent - an empty familyMatches vector looks exactly like a file that "
+            "matched no family.")
+
+        # The name collision is the specific trap that made an earlier measurement wrong.
+        self.assertTrue(
+            "DO NOT CONFUSE THIS WITH" in header,
+            "the warning that MetamorphicStatistics::familyMatches is a DIFFERENT and "
+            "LIVE member is gone. Without it a module-scoped search for the name finds "
+            "the counter's producer and reports the inert vector as live.")
+
+    def test_the_error_vector_still_has_producers_and_no_consumer(self):
+        """If a consumer appears the recorded gap is closed and the note must change."""
+        body = strip_c_comments(read_source(METAMORPHIC_DETECTOR_CPP_PATH))
+        producers = re.findall(r"result\.errors\.push_back\s*\(", body)
+        self.assertGreaterEqual(
+            len(producers), 11,
+            "the metamorphic error vector lost producers (%d left, 11 measured). Each one "
+            "records a distinct reason an analysis could not run; removing them makes a "
+            "failed analysis even less distinguishable from a clean one."
+            % len(producers))
+
+        # A READ would be any use that is not one of those appends and not a .clear().
+        reads = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if "errors" not in stripped:
+                continue
+            if re.search(r"errors\.(?:push_back|clear)\s*\(", stripped):
+                continue
+            if re.search(r"(?<![A-Za-z0-9_])errors(?![A-Za-z0-9_])", stripped):
+                reads.append(stripped[:70])
+        if reads:
+            self.fail(
+                "something now reads the metamorphic error vector (%d site(s), e.g. %r). "
+                "That is an IMPROVEMENT - it closes the diagnosability gap recorded at the "
+                "declaration - but the note in metamorphic_polymorphicdetector.hpp still "
+                "says the vector is never consumed. Update the note in the same change so "
+                "the header stops understating what the module reports."
+                % (len(reads), reads[0]))
 
 
 if __name__ == "__main__":

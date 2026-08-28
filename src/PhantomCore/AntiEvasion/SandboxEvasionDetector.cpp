@@ -1260,6 +1260,18 @@ namespace ShadowStrike {
             return AnalyzeProcess(hProcess, processId, result, config);
         }
 
+        // THE HOOK IS COMPLETE AND UNREGISTERED, which is not the same as dead code.
+        //
+        // AnalyzeProcess invokes this callback under a shared lock when a target
+        // process is found to carry sandbox-evasion capability, with the exception
+        // guard already in place. What is missing is a caller for this setter:
+        // measured, SetProcessDetectionCallback has exactly two occurrences tree-wide,
+        // its declaration and this definition. So the callback is never populated, the
+        // invocation never fires, and the finding reaches nobody.
+        //
+        // This is the AntiEvasion folder's entire share of the unwired-callback-setter
+        // strand: the other eight detectors either have their SetDetectionCallback
+        // registered by RealTimeProtection or declare no setter at all.
         void SandboxEvasionDetector::SetProcessDetectionCallback(ProcessSandboxCallback callback) {
             std::unique_lock lock(m_impl->configMutex);
             m_impl->processDetectionCallback = std::move(callback);

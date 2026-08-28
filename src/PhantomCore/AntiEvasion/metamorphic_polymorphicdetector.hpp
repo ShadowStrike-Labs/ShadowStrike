@@ -1228,10 +1228,13 @@ namespace ShadowStrike {
             /// @brief Number of instructions
             size_t instructionCount = 0;
 
-            /// @brief Successor block addresses
+            /// @brief Successor block addresses.
+            /// NOT POPULATED. Measured across src and tests: zero writes, zero reads.
+            /// AnalyzeCFG fills the block list and the edge COUNTS but never links
+            /// blocks to each other, so graph-shaped analysis has no input yet.
             std::vector<uint64_t> successors;
 
-            /// @brief Predecessor block addresses
+            /// @brief Predecessor block addresses. NOT POPULATED - see successors.
             std::vector<uint64_t> predecessors;
 
             /// @brief Block type (normal, conditional, unconditional, call, return)
@@ -1272,7 +1275,10 @@ namespace ShadowStrike {
             /// @brief Contains dead code
             bool hasDeadCode = false;
 
-            /// @brief Hash of function structure (for similarity)
+            /// @brief Hash of function structure (for similarity).
+            /// NOT PRODUCED. Its only occurrence tree-wide is this initialiser, so it
+            /// reads 0 for every function. A similarity consumer must compute it;
+            /// reading it today cannot distinguish two functions.
             uint64_t structuralHash = 0;
         };
 
@@ -1398,7 +1404,9 @@ namespace ShadowStrike {
             /// @brief Matched family name (alias for backward compatibility)
             std::wstring familyName;
 
-            /// @brief Matched variant name
+            /// @brief Matched variant name.
+            /// NOT PRODUCED. familyName is populated by family matching; the variant
+            /// is never resolved, so this stays empty on every match.
             std::wstring variantName;
 
             /// @brief Match confidence (0.0-1.0)
@@ -1626,7 +1634,9 @@ namespace ShadowStrike {
             /// @brief Identified malware family (if matched)
             std::wstring familyName;
 
-            /// @brief Variant name
+            /// @brief Variant name.
+            /// NOT PRODUCED - see FamilyMatchInfo::variantName. Only the declaration
+            /// and Clear() reference it anywhere in the tree.
             std::wstring variantName;
 
             // ========================================================================
@@ -1651,7 +1661,15 @@ namespace ShadowStrike {
             /// @brief PE analysis
             PEAnalysisInfo peAnalysis;
 
-            /// @brief Family matches
+            /// @brief Family matches.
+            /// NOT PRODUCED. Nothing appends to this vector, so it is empty on every
+            /// result. EnableFamilyMatching, the flag that would drive it, has exactly
+            /// one occurrence tree-wide - its own declaration.
+            ///
+            /// DO NOT CONFUSE THIS WITH MetamorphicStatistics::familyMatches, which is
+            /// a live atomic counter incremented in the .cpp. The two share a name and
+            /// only the counter has a producer; a module-scoped search reports the name
+            /// as live and means the counter.
             std::vector<FamilyMatchInfo> familyMatches;
 
             // ========================================================================
@@ -1699,7 +1717,15 @@ namespace ShadowStrike {
             /// @brief Configuration used
             MetamorphicAnalysisConfig config;
 
-            /// @brief Errors encountered
+            /// @brief Errors encountered.
+            /// PRODUCED BUT NEVER CONSUMED, and that is a diagnosability gap rather
+            /// than unused vocabulary. Eleven sites append a distinct reason here -
+            /// detector not initialised, file mapping failed, empty file, file too
+            /// large, invalid buffer, process open failed, module enumeration failed,
+            /// process read failed - and no consumer anywhere reads the vector.
+            /// RealTimeProtection consumes MetamorphicResult and never looks at it, so
+            /// a metamorphic analysis that could not run is indistinguishable in the
+            /// field from one that ran and found nothing.
             std::vector<MetamorphicError> errors;
 
             /// @brief Analysis completed
