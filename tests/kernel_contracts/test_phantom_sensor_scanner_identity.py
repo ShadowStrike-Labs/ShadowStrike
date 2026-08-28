@@ -10548,6 +10548,74 @@ class AssemblyExportCensusContractTests(unittest.TestCase):
             "_NEVER_WIRE_AS_VERDICT.",
         )
 
+    # The three SIMD-named exports of PackerDetector_x64.asm. Two of them do not do what
+    # their names say, which is recorded at their declarations in PackerDetector.hpp.
+    _SIMD_NAMED_ROUTINES = ("SIMDScanForByte", "SIMDScanForWord", "SIMDScanForPattern")
+
+    # Deliberately NOT a file-wide scan. PackerDetector_x64.asm contains vector
+    # instructions, all of them inside the one routine that is honestly named, so a
+    # file-wide test would report all three as vectorised.
+    _VECTOR_TOKENS = re.compile(
+        r"(?i)(?<![A-Za-z0-9_])(?:xmm\d|ymm\d|movdqu|movdqa|pcmpeqb|pmovmskb|vpcmpeqb)"
+        r"(?![A-Za-z0-9_])")
+
+    @classmethod
+    def _asm_procedure_body(cls, name):
+        """The PROC/ENDP body of *name*, with assembly comments removed.
+
+        Stripping ';' comments is load-bearing: these bodies carry prose that NAMES the
+        instructions, so a comment-blind scan would read a routine documented as
+        "scalar - no pcmpeqb here" as vectorised.
+        """
+        source = read_source(cls._ANTIEVASION_DIR / "PackerDetector_x64.asm")
+        match = re.search(
+            r"(?im)^[ \t]*" + name + r"[ \t]+PROC\b(.*?)^[ \t]*" + name + r"[ \t]+ENDP",
+            source, re.S)
+        if match is None:
+            return None
+        return re.sub(r";[^\n]*", "", match.group(1))
+
+    def test_a_simd_named_routine_stays_dark_while_its_body_is_scalar(self):
+        """A name may promise vectorisation only for as long as nothing relies on it."""
+        scalar, vectorised = [], []
+        for name in self._SIMD_NAMED_ROUTINES:
+            body = self._asm_procedure_body(name)
+            self.assertIsNotNone(
+                body,
+                "%s no longer has a PROC/ENDP pair in PackerDetector_x64.asm, so this "
+                "guard can no longer see whether it is vectorised" % name)
+            if self._VECTOR_TOKENS.search(body):
+                vectorised.append(name)
+            else:
+                scalar.append(name)
+
+        # ANTI-VACUITY. If the token scan breaks, every routine reads as scalar and the
+        # test still passes - while also declaring the one HONEST name dishonest. The
+        # scan must keep recognising the routine that genuinely vectorises.
+        self.assertIn(
+            "SIMDScanForByte", vectorised,
+            "the vector-token scan no longer recognises SIMDScanForByte, which is "
+            "measured to use movdqu/pcmpeqb/pmovmskb, so it cannot be trusted about the "
+            "other two. Fix the scan before believing a green result here.")
+
+        # The two scalar ones must stay dark. This is the rule PackerDetector.hpp states.
+        consumers = self._consumer_sources()
+        offenders = []
+        for name in scalar:
+            for path, code in consumers.items():
+                if self._call_sites(code, name):
+                    offenders.append("%s <- %s" % (name, path.name))
+
+        self.assertEqual(
+            [], offenders,
+            "%d SIMD-named routine(s) whose assembly body contains NO vector instruction "
+            "have acquired a caller: %s. PackerDetector.hpp records the rule at the "
+            "declarations: a caller may be added only in the SAME change that either "
+            "implements the vectorisation or drops the SIMD prefix. Wiring one as-is "
+            "makes the product cite a capability it does not have, and the packer path "
+            "scans at most MAX_EP_BYTES = 512 bytes, where vectorising cannot pay for "
+            "itself anyway." % (len(offenders), " | ".join(offenders)))
+
     def test_every_dark_routine_keeps_its_prototype_and_fallback_binding(self):
         exports, live = self._live_names()
         dark = sorted(set(exports) - live)
