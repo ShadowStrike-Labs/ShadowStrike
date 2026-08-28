@@ -111,6 +111,9 @@ DEBUGGER_EVASION_DETECTOR_CPP_PATH = (
 ENVIRONMENT_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/EnvironmentEvasionDetector.cpp"
 )
+METAMORPHIC_DETECTOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
+)
 NETWORK_BASED_EVASION_DETECTOR_CPP_PATH = (
     ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
 )
@@ -11647,6 +11650,99 @@ class DisassemblerReadinessContractTests(unittest.TestCase):
                 "formatterReady" in code,
                 "%s no longer computes a formatter result at all. Deleting it would satisfy "
                 "the assertions above while losing the report that it failed." % name)
+
+
+
+
+class DiscardedAnalysisResultContractTests(unittest.TestCase):
+    """An analysis that did not run must not be read as an analysis that found nothing.
+
+    Three [[nodiscard]] returns were discarded and each produced a wrong answer rather
+    than merely a compiler warning.
+
+    MEASURED SEMANTICS, because the fix depended on them: Impl::ComputeOpcodeHistogram
+    sets outHistogram.valid = true then returns true, with an early return false from its
+    entry guard - so the value means SUCCEEDED, not FOUND-SOMETHING. Impl::AnalyzeCFG has
+    the identical shape. Both callers discarded the value and then read a field of the
+    out-parameter, and those fields default to false, so an analysis that never ran read
+    exactly like one that found nothing.
+
+    THE THIRD IS THE SERIOUS ONE. DetectSandboxNetwork discarded CheckNetworkAdapters'
+    result and then concluded from `adapterDetails.size() <= 1` that a sandbox network was
+    present, appending "Only single network adapter present." and returning true. On a
+    failed enumeration that vector is empty, the test holds, and the function returned a
+    POSITIVE verdict carrying a claim about the machine that was never measured. An empty
+    result is silence, not evidence.
+    """
+
+    @staticmethod
+    def _meta():
+        return strip_c_comments(read_source(METAMORPHIC_DETECTOR_CPP_PATH))
+
+    @staticmethod
+    def _net():
+        return strip_c_comments(read_source(NETWORK_BASED_EVASION_DETECTOR_CPP_PATH))
+
+    def test_an_unbuilt_histogram_is_not_read_as_a_clean_one(self):
+        code = self._meta()
+        bare = re.findall(r"(?m)^\s*m_impl->ComputeOpcodeHistogram\s*\(", code)
+        self.assertEqual(
+            [], bare,
+            "the opcode histogram is computed as a bare statement again, so its success "
+            "value is discarded and hasExcessiveNops is then read from a histogram that "
+            "may never have been built - a default false, indistinguishable from a file "
+            "with no NOP padding")
+        self.assertTrue(
+            "ComputeOpcodeHistogram(buffer, size, result.opcodeHistogram) &&" in code,
+            "the histogram result is no longer conjoined with the field it guards; "
+            "nothing now distinguishes 'analysed and clean' from 'not analysed'")
+
+    def test_an_unanalysed_cfg_is_not_read_as_unflattened(self):
+        code = self._meta()
+        bare = re.findall(r"(?m)^\s*m_impl->AnalyzeCFG\s*\(", code)
+        self.assertEqual(
+            [], bare,
+            "AnalyzeCFG is called as a bare statement again, so isFlattened is read from "
+            "a CFG that may never have been analysed")
+        self.assertTrue(
+            "result.cfgAnalysis) &&" in code,
+            "the CFG result is no longer conjoined with the isFlattened read it guards")
+
+    def test_a_failed_adapter_enumeration_cannot_produce_a_sandbox_verdict(self):
+        code = self._net()
+        bare = re.findall(r"(?m)^\s*CheckNetworkAdapters\s*\(", code)
+        self.assertEqual(
+            [], bare,
+            "CheckNetworkAdapters is called as a bare statement again, so a failed "
+            "enumeration leaves adapterDetails empty and the count test below turns that "
+            "absence into a positive sandbox verdict")
+        self.assertTrue(
+            "const bool adaptersEnumerated = CheckNetworkAdapters(" in code,
+            "the enumeration result is no longer captured")
+
+        # THE GATE IS THE WHOLE POINT: an ungated count test is the defect.
+        gated = re.findall(r"if\s*\(\s*adaptersEnumerated\s*&&\s*adapterDetails\.size\(\)\s*<=\s*1\s*\)",
+                           code)
+        self.assertEqual(
+            1, len(gated),
+            "the adapter-count inference is not gated on the enumeration having "
+            "succeeded (%d matching gate(s) found). size() <= 1 is satisfied by an EMPTY "
+            "vector, so without the gate a failure produces 'Only single network adapter "
+            "present.' and a true return." % len(gated))
+
+        self.assertNotIn(
+            "bool vpnDetected, vmMacDetected;", code,
+            "the two adapter flags are uninitialised again while being passed by "
+            "reference to a function that may return without writing them")
+
+        # ANTI-VACUITY: the adapter-NAME loop is deliberately NOT gated, because iterating
+        # an empty vector finds nothing, which is the correct outcome of being unable to
+        # look. If a future edit gates it too, that is a larger change than this guard
+        # describes and the reasoning here should be revisited rather than silently kept.
+        self.assertTrue(
+            "for (const auto& adapter : adapterDetails)" in code,
+            "the adapter-name loop is gone; this guard's reasoning about which checks need "
+            "gating no longer describes the code")
 
 
 if __name__ == "__main__":

@@ -2089,9 +2089,16 @@ void MetamorphicDetector::AnalyzeFileInternal(
     }
 
     if (HasFlag(config.flags, MetamorphicAnalysisFlags::EnableEntropyAnalysis)) {
-        m_impl->ComputeOpcodeHistogram(buffer, size, result.opcodeHistogram);
-
-        if (result.opcodeHistogram.hasExcessiveNops) {
+        // THE RESULT IS CHECKED BECAUSE IT REPORTS WHETHER THE HISTOGRAM WAS BUILT.
+        // Measured: Impl::ComputeOpcodeHistogram returns false from its entry guard and
+        // otherwise sets outHistogram.valid = true and returns true, so the value means
+        // SUCCEEDED rather than FOUND-SOMETHING. Reading hasExcessiveNops from a
+        // histogram that was never built reads a default-initialised false, so an
+        // unbuilt histogram was indistinguishable from one showing no NOP padding -
+        // safe in the sense that it raises no false detection, dishonest in that it
+        // cannot tell "analysed and clean" from "not analysed".
+        if (m_impl->ComputeOpcodeHistogram(buffer, size, result.opcodeHistogram) &&
+            result.opcodeHistogram.hasExcessiveNops) {
             auto detection = MetamorphicDetectionBuilder()
                 .Technique(MetamorphicTechnique::META_NOPInsertion)
                 .Confidence(0.75)
@@ -2207,9 +2214,14 @@ void MetamorphicDetector::AnalyzeFileInternal(
 
             if (outOfTime(L"EnableCFGAnalysis")) { return; }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::EnableCFGAnalysis)) {
-                m_impl->AnalyzeCFG(codeBuffer, codeSize, baseAddress, is64Bit, result.cfgAnalysis);
-
-                if (result.cfgAnalysis.isFlattened) {
+                // CHECKED FOR THE SAME REASON AS ComputeOpcodeHistogram ABOVE: measured,
+                // Impl::AnalyzeCFG returns false from its entry guard and otherwise sets
+                // outInfo.valid = true and returns true, so it reports SUCCESS. isFlattened
+                // defaults to false, so a CFG that was never analysed used to read as a
+                // control flow that is not flattened.
+                if (m_impl->AnalyzeCFG(codeBuffer, codeSize, baseAddress, is64Bit,
+                                       result.cfgAnalysis) &&
+                    result.cfgAnalysis.isFlattened) {
                     auto detection = MetamorphicDetectionBuilder()
                         .Technique(MetamorphicTechnique::OBF_ControlFlowFlattening)
                         .Confidence(0.8)

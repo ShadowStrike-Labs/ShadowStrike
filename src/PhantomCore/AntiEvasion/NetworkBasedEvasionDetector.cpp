@@ -1808,14 +1808,41 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // 2. Check network adapter count and types
-            bool vpnDetected, vmMacDetected;
+            //
+            // BOTH FLAGS ARE INITIALISED. They are passed by reference to a function that
+            // may return early without writing them, and an indeterminate bool that is
+            // later read is a defect whether or not it is read today.
+            bool vpnDetected = false;
+            bool vmMacDetected = false;
             std::wstring vpnName, vmMacInfo;
             std::vector<std::wstring> adapterDetails;
 
-            CheckNetworkAdapters(vpnDetected, vpnName, vmMacDetected, vmMacInfo, adapterDetails, nullptr);
+            // THE ENUMERATION RESULT IS CHECKED, AND THAT IS A DETECTION FIX RATHER THAN
+            // A WARNING FIX.
+            //
+            // adapterDetails is EMPTY when enumeration fails, so the count test below -
+            // size() <= 1 - used to hold, append "Only single network adapter present."
+            // to the caller's explanation, and return TRUE meaning a sandbox network was
+            // detected. A failed enumeration therefore produced a POSITIVE verdict
+            // carrying a factual claim about this machine that was never measured. An
+            // empty result is silence, not evidence - the same inference removed from the
+            // DKOM check when an uninitialised process cache made every registry write
+            // look like a hidden process.
+            //
+            // ONLY THE COUNT TEST IS GATED. The adapter-NAME loop further down needs no
+            // gate: iterating an empty vector finds nothing, which is the correct outcome
+            // of having been unable to look. It draws no conclusion from absence.
+            const bool adaptersEnumerated = CheckNetworkAdapters(
+                vpnDetected, vpnName, vmMacDetected, vmMacInfo, adapterDetails, nullptr);
+
+            if (!adaptersEnumerated) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Network adapter enumeration failed; the adapter-count sandbox check is "
+                    L"SKIPPED rather than answered from an empty list");
+            }
 
             // Very few adapters might indicate sandbox
-            if (adapterDetails.size() <= 1) {
+            if (adaptersEnumerated && adapterDetails.size() <= 1) {
                 outDetails += L"Only single network adapter present. ";
                 return true;
             }
