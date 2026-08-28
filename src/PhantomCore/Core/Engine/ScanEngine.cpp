@@ -1434,8 +1434,55 @@ EngineResult ScanEngine::ScanFile(
 
             if (!HashUtils::ComputeFile(HashUtils::Algorithm::SHA256,
                                        filePath, hashBytes, &hashErr)) {
-                SS_LOG_ERROR(L"ScanEngine", L"Hash computation failed");
+                // THE REASON IS RECORDED, NOT JUST THE FAILURE.
+                //
+                // hashErr was collected and then discarded here, and
+                // EngineResult::errorCode / ::errorMessage were left empty, so a
+                // caller could not tell a cloud placeholder apart from a genuine I/O
+                // fault and neither could a field log. In the 1.0.94 run that
+                // produced 271 identical lines reading only "Hash computation
+                // failed", for files that included eicar.com sitting on the user's
+                // Desktop inside OneDrive.
+                //
+                // THE VERDICT IS DELIBERATELY UNCHANGED. Error is correct: the file
+                // was not examined, so it must not be reported Clean. What was
+                // missing is the reason, which the two fields below already existed
+                // to carry.
                 result.verdict = ScanVerdict::Error;
+                result.errorCode = hashErr.win32;
+
+                if (Utils::FileUtils::IsContentNotLocalError(hashErr.win32)) {
+                    result.errorMessage =
+                        L"content is not resident on this machine (cloud "
+                        L"placeholder); the file was NOT examined";
+
+                    // DEBUG RATHER THAN ERROR, AND THAT IS NOT A DOWNGRADE OF
+                    // SEVERITY BY CONVENIENCE. A service in session 0 cannot
+                    // hydrate a placeholder - the open returns 395 instead of
+                    // fetching - so on a machine using Files On-Demand this fires
+                    // once per dehydrated file touched. Our log writes traverse our
+                    // own minifilter, so a per-file ERROR would amplify exactly the
+                    // condition it reports and bury real faults, which is the
+                    // mistake already corrected on the deferred-queue drop path.
+                    // The AGGREGATE is what an operator needs, and
+                    // RealTimeProtection counts it separately for that reason.
+                    SS_LOG_DEBUG(L"ScanEngine",
+                        L"Not examined - content not resident (win32=%lu): %ls",
+                        static_cast<unsigned long>(hashErr.win32),
+                        std::wstring(filePath).c_str());
+                } else {
+                    result.errorMessage = L"file hash could not be computed";
+
+                    // A GENUINE FAULT KEEPS ERROR SEVERITY AND NOW NAMES ITSELF.
+                    // The previous message carried neither the code nor the path,
+                    // so a real permissions or hardware fault was indistinguishable
+                    // from the routine cloud case above.
+                    SS_LOG_ERROR(L"ScanEngine",
+                        L"Hash computation failed (win32=%lu): %ls",
+                        static_cast<unsigned long>(hashErr.win32),
+                        std::wstring(filePath).c_str());
+                }
+
                 return result;
             }
 

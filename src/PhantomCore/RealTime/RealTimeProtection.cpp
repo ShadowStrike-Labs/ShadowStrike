@@ -4164,7 +4164,30 @@ public:
                 return Communication::KernelVerdict::Monitor;
 
             case Core::Engine::ScanVerdict::Error:
-                m_stats.scanErrors++;
+                // A PLATFORM CONSTRAINT IS NOT A SCAN FAULT, and counting them
+                // together made both numbers useless. A cloud placeholder whose
+                // content is not resident cannot be read by a service at all, so it
+                // arrives here on every access; in the 1.0.94 run 271 such files
+                // inflated scanErrors and hid whatever genuine faults were among
+                // them. The engine now carries the reason in errorCode.
+                if (Utils::FileUtils::IsContentNotLocalError(engineResult.errorCode)) {
+                    m_stats.contentNotLocalNotExamined++;
+                } else {
+                    m_stats.scanErrors++;
+                }
+
+                // THE FAILURE POLICY IS HONOURED UNCHANGED, INCLUDING FOR
+                // PLACEHOLDERS, AND THE CONSEQUENCE IS STATED HERE RATHER THAN
+                // DISCOVERED IN THE FIELD.
+                //
+                // Under FAIL_CLOSED this returns Block, so on an endpoint using
+                // Files On-Demand every dehydrated file would be denied until its
+                // content is fetched - which a service cannot make happen. That is
+                // consistent with what the policy asks for (if it cannot be
+                // verified, deny) and special-casing it here would silently override
+                // an owner control, so it is deliberately NOT special-cased. The
+                // counter above is what makes the blast radius measurable before
+                // anyone turns FAIL_CLOSED on.
                 return m_config.failurePolicy == FailurePolicy::FAIL_CLOSED ?
                        Communication::KernelVerdict::Block : Communication::KernelVerdict::Allow;
 
@@ -6952,6 +6975,7 @@ public:
         const uint64_t exitBlockIgn = m_stats.processExitBlockRequestsIgnored.load(std::memory_order_relaxed);
         const uint64_t procWithheld = m_stats.processBlocksWithheldByMode.load(std::memory_order_relaxed);
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
+        const uint64_t notLocal     = m_stats.contentNotLocalNotExamined.load(std::memory_order_relaxed);
         const uint64_t sandboxCap   = m_stats.sandboxEvasionCapabilityDetected.load(std::memory_order_relaxed);
 
         // Saturation is "no worker free AND work waiting". Busy-with-nothing-queued
@@ -6998,6 +7022,7 @@ public:
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
+            "contentNotLocalNotExamined={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
@@ -7005,7 +7030,7 @@ public:
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, oversize, notifyBudget, replyHorizon, procWithheld,
+            cached, metaTrunc, packerDef, oversize, notLocal, notifyBudget, replyHorizon, procWithheld,
             exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc);
 
         if (newDeepDrops > 0) {
@@ -7506,6 +7531,7 @@ void RTPStatistics::Reset() noexcept {
     suspiciousFiles = 0;
     puaFiles = 0;
     scanErrors = 0;
+    contentNotLocalNotExamined = 0;
     filesBlocked = 0;
     processesBlocked = 0;
     connectionsBlocked = 0;

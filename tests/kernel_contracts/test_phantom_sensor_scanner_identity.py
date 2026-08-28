@@ -12215,5 +12215,102 @@ class MetamorphicResultVocabularyContractTests(unittest.TestCase):
                 % (len(reads), reads[0]))
 
 
+
+
+class CloudPlaceholderCoverageContractTests(unittest.TestCase):
+    """A file we could not read must say WHY, and must never be reported clean.
+
+    A cloud placeholder whose content is not resident cannot be read by a service at all:
+    a session-0 process cannot hydrate one, so the open returns
+    ERROR_CLOUD_FILE_ACCESS_DENIED instead of fetching. In the 1.0.94 field run that
+    applied to eicar.com and eicar_com.zip sitting on the user's Desktop inside OneDrive -
+    a known-malicious file physically present and never examined.
+
+    These tests pin the two properties that make that state honest rather than silent:
+    the reason travels with the result, and it is counted apart from genuine faults.
+    """
+
+    def test_an_unreadable_file_carries_its_reason_and_is_never_clean(self):
+        engine = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+
+        self.assertTrue(
+            "result.errorCode = hashErr.win32;" in engine,
+            "the hash failure path no longer records the error code. hashErr was already "
+            "being collected and then discarded, which is why 271 field log lines said "
+            "only 'Hash computation failed' with no path and no reason.")
+
+        self.assertTrue(
+            "IsContentNotLocalError(hashErr.win32)" in engine,
+            "the engine no longer distinguishes a cloud placeholder from a genuine I/O "
+            "fault, so both are reported at the same severity and a real fault is buried "
+            "under routine ones.")
+
+        # THE SAFE DIRECTION IS THE ONE THAT MUST NOT MOVE. Error means not examined; if
+        # this ever became Clean, an unexaminable file would be reported safe.
+        #
+        # The window is anchored on the hash-failure statement itself rather than on an
+        # enclosing function name: extract_c_function RAISES on a name it cannot find, so
+        # a guessed name gives a test that fails against correct code instead of a
+        # fallback.
+        opening = engine.find("if (!HashUtils::ComputeFile(HashUtils::Algorithm::SHA256,")
+        self.assertNotEqual(
+            -1, opening,
+            "the hash-failure statement moved or was reworded; this guard is stale and "
+            "must be re-anchored rather than deleted")
+        closing = engine.find("CheckCache", opening)
+        self.assertNotEqual(-1, closing, "the cache lookup that bounds this region is gone")
+        window = engine[opening:closing]
+
+        self.assertFalse(
+            "ScanVerdict::Clean" in window,
+            "the hash-failure region can now yield Clean. A file whose content could not "
+            "be read has not been examined and must never be reported clean - that is the "
+            "false-negative-by-silence class this whole strand exists to prevent.")
+        self.assertTrue(
+            "ScanVerdict::Error" in window,
+            "the hash-failure region no longer sets Error, so an unreadable file would "
+            "fall through carrying whatever verdict was already in the result")
+
+    def test_a_platform_constraint_is_not_counted_as_a_scan_fault(self):
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+        self.assertTrue(
+            "IsContentNotLocalError(engineResult.errorCode)" in rtp,
+            "the on-access Error case no longer separates a non-resident file from a "
+            "genuine fault, so scanErrors again mixes a platform constraint with real "
+            "faults and neither number can be read.")
+        self.assertTrue(
+            "m_stats.contentNotLocalNotExamined++;" in rtp,
+            "the coverage counter is gone; an unexamined file becomes invisible again")
+
+        # The failure policy must keep deciding the verdict. Special-casing placeholders
+        # here would override an owner control silently.
+        self.assertTrue(
+            "m_config.failurePolicy == FailurePolicy::FAIL_CLOSED" in rtp,
+            "the Error case no longer honours failurePolicy. Under FAIL_CLOSED an "
+            "unverifiable file is meant to be denied; removing that is a policy change, "
+            "not a bug fix.")
+
+    def test_the_coverage_counter_is_plumbed_through_every_statistics_site(self):
+        """A counter missing one site is a structural zero that always looks healthy."""
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        header = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+        name = "contentNotLocalNotExamined"
+
+        self.assertEqual(
+            1, header.count("std::atomic<uint64_t> %s{ 0 };" % name),
+            "the counter is not declared exactly once in RTPStatistics")
+        for site, needle in (("increment", "m_stats.%s++;" % name),
+                             ("report load", "m_stats.%s.load" % name),
+                             ("format string", '"%s={} "' % name),
+                             ("Reset()", "    %s = 0;" % name)):
+            self.assertTrue(
+                needle in rtp,
+                "the %s site for %s is missing. Every counter in this struct needs all "
+                "five: a counter that is incremented but never reset reports pre-reset "
+                "values forever, and one that is never printed cannot be read at all."
+                % (site, name))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

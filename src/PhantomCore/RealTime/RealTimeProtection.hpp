@@ -884,6 +884,14 @@ struct alignas(64) RTPStatistics {
     std::atomic<uint64_t> puaFiles{ 0 };
     std::atomic<uint64_t> scanErrors{ 0 };
 
+    /// @brief Files not examined because their content is not resident locally.
+    /// Counted apart from scanErrors because a cloud placeholder is a platform
+    /// constraint rather than a fault: a session-0 service cannot hydrate one, so
+    /// the open fails with ERROR_CLOUD_FILE_ACCESS_DENIED every time. A non-zero
+    /// value means files on this endpoint are going unexamined, which is a
+    /// COVERAGE number, not an error rate.
+    std::atomic<uint64_t> contentNotLocalNotExamined{ 0 };
+
     // Blocking statistics
     std::atomic<uint64_t> filesBlocked{ 0 };
     std::atomic<uint64_t> processesBlocked{ 0 };
