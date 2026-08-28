@@ -2571,14 +2571,61 @@ namespace ShadowStrike::AntiEvasion {
                             technique = EvasionTechnique::MEMORY_SoftwareBreakpoints;
                             desc = L"Software breakpoint (INT3) in code";
                             break;
-                        case Phantom::Disasm::Mnemonic::INT:
-                            technique = EvasionTechnique::EXCEPTION_INT2D;
-                            desc = L"INT instruction (possible debug interrupt)";
+                        case Phantom::Disasm::Mnemonic::INT: {
+                            // THE INTERRUPT NUMBER DECIDES THE TECHNIQUE, AND NOT
+                            // CHECKING IT WAS A LIVE FALSE POSITIVE.
+                            //
+                            // Labelling every `INT n` as EXCEPTION_INT2D asserted a
+                            // specific anti-debug instruction that was never observed.
+                            // INT 0x29 is __fastfail, emitted by ordinary CFG-hardened
+                            // Microsoft binaries, so compiler-generated code was
+                            // attributed to the INT 2D debug-service trick. This function
+                            // is reached from :5135 and the detector's findings reach the
+                            // verdict, so the misattribution shipped.
+                            //
+                            // PackerDetector already gates on the immediate; this is the
+                            // same check. `INT n` encodes as CD n, so the immediate is the
+                            // byte after the opcode - the padding test below reads
+                            // buffer[offset + 1] the same way.
+                            if (offset + 1 >= bytesRead) {
+                                continue;
+                            }
+
+                            switch (buffer[offset + 1]) {
+                            case 0x2D:
+                                technique = EvasionTechnique::EXCEPTION_INT2D;
+                                desc = L"INT 2D debug service interrupt in code";
+                                break;
+                            case 0x03:
+                                technique = EvasionTechnique::EXCEPTION_INT3;
+                                desc = L"INT 3 (two-byte CD 03 form) in code";
+                                break;
+                            case 0x01:
+                                technique = EvasionTechnique::EXCEPTION_INT1;
+                                desc = L"INT 1 debug exception in code";
+                                break;
+                            default:
+                                // Not an anti-debug interrupt. INT 0x29 (__fastfail) and
+                                // INT 0x80 are the common benign cases, and reporting
+                                // those was the defect. `continue` skips the instruction
+                                // rather than recording an unnamed technique.
+                                continue;
+                            }
                             break;
+                        }
                         case Phantom::Disasm::Mnemonic::CPUID:
-                            // CPUID can be used for VM/hypervisor detection
-                            technique = EvasionTechnique::TIMING_RDTSC; // Reuse timing category
-                            desc = L"CPUID instruction (possible timing/VM check)";
+                            // A CPUID in the code stream is a hypervisor/VM probe, and
+                            // this enum already has the right label for it. It previously
+                            // reported TIMING_RDTSC under the comment "Reuse timing
+                            // category", naming an instruction that is not the one found -
+                            // so the MITRE id, the category and the severity derived from
+                            // the technique were all wrong, and the comment admitted it.
+                            //
+                            // Reusing an existing enumerator deliberately avoids adding
+                            // one, which would require bumping _MaxTechniqueId and
+                            // extending all four technique mapping functions.
+                            technique = EvasionTechnique::ADVANCED_HypervisorDebug;
+                            desc = L"CPUID instruction (possible hypervisor/VM probe)";
                             break;
                         default:
                             continue;

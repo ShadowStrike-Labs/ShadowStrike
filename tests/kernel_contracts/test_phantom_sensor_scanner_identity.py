@@ -11973,5 +11973,104 @@ class DiscardedNodiscardClosureContractTests(unittest.TestCase):
             "correction was measured against")
 
 
+
+
+class TechniqueAttributionContractTests(unittest.TestCase):
+    """A reported technique must name the instruction that was actually found.
+
+    DebuggerEvasionDetector::AnalyzeHandles decodes executable memory and maps each
+    anti-debug instruction to an EvasionTechnique. Two mappings named something that was
+    not observed, and because the technique drives the MITRE id, the category and the
+    severity, a wrong technique is three wrong facts.
+
+    REACHABILITY WAS MEASURED, not assumed: AnalyzeHandles is called at :5135 and the
+    detector is wired at RealTimeProtection.cpp:4465 with its findings reaching the verdict.
+    """
+
+    @staticmethod
+    def _mnemonic_switch():
+        """The mnemonic switch region only - never the whole 5,700-line file."""
+        code = strip_c_comments(read_source(DEBUGGER_EVASION_DETECTOR_CPP_PATH))
+        start = code.find("case Phantom::Disasm::Mnemonic::RDTSC:")
+        end = code.find("case Phantom::Disasm::Mnemonic::CPUID:")
+        if start == -1 or end == -1:
+            return None
+        tail = code.find("break;", end)
+        return code[start:tail + 6 if tail != -1 else end + 400]
+
+    def test_an_interrupt_is_attributed_by_its_number(self):
+        region = self._mnemonic_switch()
+        self.assertIsNotNone(region, "the mnemonic switch is gone; this guard is stale")
+
+        self.assertTrue(
+            "switch (buffer[offset + 1]) {" in region,
+            "the INT case no longer inspects the interrupt number. `INT n` encodes as CD n, "
+            "so without reading buffer[offset + 1] every interrupt is labelled the same - "
+            "and INT 0x29 is __fastfail, emitted by ordinary CFG-hardened Microsoft "
+            "binaries, so compiler-generated code gets attributed to the INT 2D anti-debug "
+            "trick. Region: %s" % region.strip()[:200])
+
+        for immediate, technique in (("0x2D", "EXCEPTION_INT2D"),
+                                     ("0x03", "EXCEPTION_INT3"),
+                                     ("0x01", "EXCEPTION_INT1")):
+            pattern = re.compile(r"case\s+" + immediate + r"\s*:\s*technique\s*=\s*"
+                                 r"EvasionTechnique::" + technique + r"\s*;")
+            self.assertTrue(
+                bool(pattern.search(region)),
+                "interrupt %s is no longer mapped to %s; each anti-debug interrupt must "
+                "carry its own technique rather than share one" % (immediate, technique))
+
+        # The unnamed interrupts must be SKIPPED, not recorded under a borrowed label.
+        self.assertTrue(
+            bool(re.search(r"default\s*:\s*continue\s*;", region)),
+            "an unrecognised interrupt number no longer skips the instruction. Recording it "
+            "under whichever technique happens to be in scope is the defect this closed.")
+
+    @staticmethod
+    def _case_body(code, marker):
+        """The case body, delimited by its own `break;`.
+
+        NOT a fixed character window. strip_c_comments turns each comment line into
+        whitespace, so a window sized for the original code silently truncated once
+        explanatory comments were added above the assignment - which is exactly how this
+        guard first failed against correct code.
+        """
+        index = code.find(marker)
+        if index == -1:
+            return None
+        end = code.find("break;", index)
+        return code[index:end + 6] if end != -1 else code[index:]
+
+    def test_a_cpuid_is_not_reported_as_an_rdtsc_timing_check(self):
+        code = strip_c_comments(read_source(DEBUGGER_EVASION_DETECTOR_CPP_PATH))
+        cpuid_case = self._case_body(code, "case Phantom::Disasm::Mnemonic::CPUID:")
+        self.assertIsNotNone(cpuid_case, "the CPUID case is gone; this guard is stale")
+
+        # WORD-BOUNDED: TIMING_RDTSC is a prefix of TIMING_RDTSCP, so a plain substring
+        # test cannot tell the two enumerators apart.
+        self.assertFalse(
+            bool(re.search(r"TIMING_RDTSC(?![A-Za-z0-9_])", cpuid_case)),
+            "a CPUID instruction is reported as an RDTSC timing technique again. The "
+            "original carried the comment 'Reuse timing category', so the mislabel was "
+            "known - and the technique drives the MITRE id, the category and the severity, "
+            "making it three wrong facts. Case: %s" % cpuid_case.strip()[:200])
+        self.assertTrue(
+            "ADVANCED_HypervisorDebug" in cpuid_case,
+            "the CPUID case no longer names a hypervisor probe. Case: %s"
+            % cpuid_case.strip()[:200])
+
+        # ANTI-VACUITY: the REAL RDTSC case must still use TIMING_RDTSC, which proves this
+        # test discriminates between the two cases rather than passing because the string
+        # vanished from the file entirely.
+        rdtsc_case = self._case_body(code, "case Phantom::Disasm::Mnemonic::RDTSC:")
+        self.assertIsNotNone(rdtsc_case, "the RDTSC case is gone")
+        self.assertTrue(
+            bool(re.search(r"TIMING_RDTSC(?![A-Za-z0-9_])", rdtsc_case)),
+            "the genuine RDTSC case no longer reports exactly TIMING_RDTSC, so this test "
+            "would pass for the wrong reason. Note TIMING_RDTSCP does NOT satisfy this - "
+            "the boundary is deliberate, because an unbounded substring test let a mutation "
+            "swap the enumerator undetected. Case: %s" % rdtsc_case.strip()[:200])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
