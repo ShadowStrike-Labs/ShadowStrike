@@ -11511,5 +11511,143 @@ class NetworkEvasionOutboundTrafficContractTests(unittest.TestCase):
             "removed from this layer for making." % ", ".join(leaked))
 
 
+
+
+class DisassemblerReadinessContractTests(unittest.TestCase):
+    """An uninitialized decoder must never be reported as an initialized one.
+
+    MEASURED. SandboxEvasionDetector::Impl::InitializeDisasm issued three
+    Phantom::Disasm Init calls, discarded all three results, set disasmInitialized = true
+    unconditionally and logged "PhantomDisassembler initialized".
+    TimeBasedEvasionDetector::Impl's CONSTRUCTOR issued the same three calls, discarded
+    all three, and kept no readiness state at all - its AnalyzeCodeWithPhantomDisasm then
+    decoded through whatever those members happened to contain.
+
+    WHY THIS IS A DETECTION DEFECT AND NOT A COMPILER WARNING: an uninitialized decoder
+    does not fail loudly, it decodes nothing. The analysis finds no instructions, reports
+    no techniques, and the target is recorded as showing no evasion behaviour - which is
+    indistinguishable from a clean target. MetamorphicDetector::Impl::Initialize in the
+    same folder already checked all three with Phantom::Disasm::IsFailed; these two had
+    drifted from that shape.
+
+    THE FORMATTER EXCLUSION IS DELIBERATE AND IS THE SUBTLE PART. In BOTH modules the
+    formatter appears only at its declaration and its Init - it has no consumer. Adding it
+    to the readiness condition looks like completeness and would DISABLE WORKING DETECTION
+    over a component that cannot affect a result. The third test exists so that
+    "tidy-up" fails instead of shipping.
+    """
+
+    _MODULES = (
+        ("SandboxEvasionDetector.cpp", "SANDBOX"),
+        ("TimeBasedEvasionDetector.cpp", "TIMEBASED"),
+    )
+
+    @staticmethod
+    def _sources():
+        return (
+            ("SandboxEvasionDetector.cpp",
+             strip_c_comments(read_source(SANDBOX_EVASION_DETECTOR_CPP_PATH))),
+            ("TimeBasedEvasionDetector.cpp",
+             strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))),
+        )
+
+    def test_every_disassembler_init_result_is_checked(self):
+        offenders = []
+        for name, code in self._sources():
+            calls = list(re.finditer(r"(\w+)\.Init\s*\(", code))
+            self.assertGreaterEqual(
+                len(calls), 3,
+                "%s makes only %d Init call(s); this guard exists to bound them, so "
+                "re-derive the floor if the module deliberately changed shape"
+                % (name, len(calls)))
+            for m in calls:
+                window = code[max(0, m.start() - 140):m.start()]
+                if "IsFailed(" not in window:
+                    line = code[:m.start()].count("\n") + 1
+                    offenders.append("%s:%d %s.Init" % (name, line, m.group(1)))
+        self.assertEqual(
+            [], offenders,
+            "a Phantom::Disasm Init result is discarded again: " + "; ".join(offenders)
+            + ". A failed Init leaves a decoder that decodes nothing, so the module "
+            "reports no techniques and the target looks clean rather than unexamined.")
+
+    def test_readiness_is_never_asserted_unconditionally(self):
+        sandbox = strip_c_comments(read_source(SANDBOX_EVASION_DETECTOR_CPP_PATH))
+        # the flag must be set AFTER the readiness values are computed, and a refusal
+        # must exist between them
+        flag = sandbox.find("disasmInitialized = true;")
+        ready = sandbox.find("decoder64Ready")
+        self.assertNotEqual(flag, -1, "SandboxEvasionDetector no longer sets its readiness flag")
+        self.assertNotEqual(
+            ready, -1,
+            "SandboxEvasionDetector no longer computes a per-decoder readiness value, so "
+            "nothing distinguishes a working disassembler from a failed one")
+        self.assertLess(
+            ready, flag,
+            "disasmInitialized is set before the decoder results are known, which is the "
+            "defect this guard exists for: a total initialization failure then presents "
+            "as a success and the DEBUG line claims the disassembler is ready")
+        # DO NOT assert the literal condition text here. The formatter-exclusion test
+        # locates the same statement, so pinning its exact spelling in both places made
+        # every edit to that line fail two tests and left neither able to discriminate
+        # its own invariant. What matters to THIS test is only that a refusal keyed on
+        # the DECODER results exists and precedes the flag.
+        gates = re.findall(r"if\s*\(([^)]*decoder64Ready[^)]*)\)", sandbox)
+        self.assertTrue(
+            gates,
+            "no refusal is keyed on the decoder results any more, so nothing keeps "
+            "disasmInitialized false when initialization fails")
+        refusal = sandbox.find("if (" + gates[0] + ")")
+        self.assertTrue(
+            -1 < refusal < flag,
+            "the decoder refusal no longer precedes the readiness flag, so the flag is "
+            "set before the failure can prevent it")
+
+        timebased = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))
+        self.assertTrue(
+            "bool m_disasmReady{ false };" in timebased,
+            "TimeBasedEvasionDetector's readiness flag is gone; without it the constructor "
+            "cannot report a failure, because a constructor has no return value")
+        self.assertTrue(
+            "if (!m_disasmReady) {" in timebased,
+            "nothing refuses to decode when TimeBasedEvasionDetector's decoders failed to "
+            "initialize, so AnalyzeCodeWithPhantomDisasm walks an uninitialized decoder")
+
+    def test_the_formatter_does_not_gate_decoding_in_either_module(self):
+        """DELIBERATE ASYMMETRY, NOT AN OVERSIGHT.
+
+        In both modules the formatter has no consumer - measured, it appears only at its
+        declaration and its Init. Including it in the readiness condition would refuse to
+        disassemble because a component nobody calls failed, which removes detection to
+        satisfy tidiness. That is the one trade this project does not make.
+        """
+        sandbox = strip_c_comments(read_source(SANDBOX_EVASION_DETECTOR_CPP_PATH))
+        timebased = strip_c_comments(read_source(TIME_BASED_EVASION_DETECTOR_CPP_PATH))
+
+        # Collect every expression that GATES readiness. A missing gate is
+        # test_readiness_is_never_asserted_unconditionally's failure, not this one - this
+        # test must not double-report it, or neither test discriminates its own invariant.
+        gating = [("SandboxEvasionDetector.cpp", g)
+                  for g in re.findall(r"if\s*\(([^)]*decoder64Ready[^)]*)\)", sandbox)]
+        gating += [("TimeBasedEvasionDetector.cpp", g)
+                   for g in re.findall(r"m_disasmReady\s*=\s*([^;]+);", timebased)]
+
+        offenders = ["%s: %s" % (name, " ".join(expr.split()))
+                     for name, expr in gating if "formatterReady" in expr]
+        self.assertEqual(
+            [], offenders,
+            "the formatter now gates decoding: " + "; ".join(offenders) + ". It has no "
+            "consumer in either module, so this refuses to disassemble because a "
+            "component nobody calls failed - removing detection to satisfy tidiness.")
+
+        # ANTI-VACUITY: the formatter must still be initialized and its failure reported,
+        # or this test would pass on a module that simply deleted it.
+        for name, code in self._sources():
+            self.assertTrue(
+                "formatterReady" in code,
+                "%s no longer computes a formatter result at all. Deleting it would satisfy "
+                "the assertions above while losing the report that it failed." % name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

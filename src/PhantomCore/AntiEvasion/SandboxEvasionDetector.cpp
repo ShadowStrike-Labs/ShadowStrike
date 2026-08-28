@@ -733,17 +733,54 @@ namespace ShadowStrike {
             // Utility Methods
             // -------------------------------------------------------------------------
 
+            // EVERY Init RESULT IS CHECKED, AND disasmInitialized IS NO LONGER SET
+            // UNCONDITIONALLY.
+            //
+            // An uninitialized decoder does not fail loudly - it decodes nothing. The
+            // analysis then finds no techniques and the process is reported as showing no
+            // sandbox-evasion behaviour, which is indistinguishable from a clean process.
+            // Previously all three results were discarded, disasmInitialized was set true on
+            // the next line regardless, and the DEBUG message claimed the disassembler was
+            // initialized, so a total failure presented as a success.
+            //
+            // MetamorphicDetector::Impl::Initialize checks all three the same way with
+            // Phantom::Disasm::IsFailed; this module had drifted from that shape.
+            //
+            // The calls are deliberately NOT short-circuited: each is issued regardless of
+            // the previous result, so a partial failure is reported in full rather than
+            // hidden behind whichever component failed first.
             void InitializeDisasm() noexcept {
                 if (disasmInitialized) return;
 
-                // Initialize 64-bit decoder (primary - our target platform)
-                decoder64.Init(Phantom::Disasm::MachineMode::Long64);
+                const bool decoder64Ready = !Phantom::Disasm::IsFailed(
+                    decoder64.Init(Phantom::Disasm::MachineMode::Long64));
+                const bool decoder32Ready = !Phantom::Disasm::IsFailed(
+                    decoder32.Init(Phantom::Disasm::MachineMode::Legacy32));
 
-                // Initialize 32-bit decoder (for analyzing 32-bit malware/WoW64 processes)
-                decoder32.Init(Phantom::Disasm::MachineMode::Legacy32);
+                // THE FORMATTER IS INITIALIZED BUT HAS NO CONSUMER IN THIS MODULE - measured,
+                // it appears only at its declaration and here. It is kept and initialized so a
+                // future consumer receives a working one, and a failure is reported, but it
+                // deliberately does NOT gate readiness: refusing to disassemble because a
+                // formatter nobody calls failed would disable working detection over a
+                // component that cannot affect a result.
+                const bool formatterReady = !Phantom::Disasm::IsFailed(
+                    formatter.Init(Phantom::Disasm::FormatterStyle::Intel));
 
-                // Initialize formatter for disassembly output
-                formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
+                if (!decoder64Ready || !decoder32Ready) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"PhantomDisassembler decoder initialization FAILED (64-bit=%ls, 32-bit=%ls). "
+                        L"Code-pattern analysis is DISABLED, which is not the same as finding no "
+                        L"evasion - any process examined while this holds is unexamined, not clean",
+                        decoder64Ready ? L"ok" : L"failed",
+                        decoder32Ready ? L"ok" : L"failed");
+                    return;
+                }
+
+                if (!formatterReady) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"PhantomDisassembler formatter initialization failed; it has no consumer "
+                        L"in this module today, so decoding proceeds unaffected");
+                }
 
                 disasmInitialized = true;
                 SS_LOG_DEBUG(LOG_CATEGORY, L"PhantomDisassembler initialized");

@@ -729,6 +729,21 @@ struct TimeBasedEvasionDetector::Impl {
     Phantom::Disasm::Decoder m_decoder64{};
     Phantom::Disasm::Formatter m_formatter{};
 
+    /**
+     * @brief True only when BOTH decoders initialized successfully.
+     *
+     * The constructor used to discard all three Init results and keep no state, so
+     * AnalyzeCodeWithPhantomDisasm decoded through an uninitialized decoder. That
+     * does not fail loudly - it decodes nothing, so an RDTSC timing-evasion scan
+     * found no instructions and the target was reported as showing no timing
+     * evasion, which is indistinguishable from a clean target.
+     *
+     * DELIBERATELY EXCLUDES m_formatter: measured, that member appears only at its
+     * declaration and its Init, so it has no consumer and cannot affect a result.
+     * Refusing to decode because of it would disable working detection.
+     */
+    bool m_disasmReady{ false };
+
     // Process monitoring contexts
     std::unordered_map<uint32_t, std::unique_ptr<ProcessMonitoringContext>> m_monitoredProcesses;
 
@@ -755,10 +770,32 @@ struct TimeBasedEvasionDetector::Impl {
     // ========================================================================
 
     Impl() {
-        // Initialize PhantomDisassembler decoders
-        m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32);
-        m_decoder64.Init(Phantom::Disasm::MachineMode::Long64);
-        m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
+        // EVERY Init RESULT IS CHECKED. The three calls are deliberately not
+        // short-circuited so a partial failure is reported in full rather than hidden
+        // behind whichever component failed first. MetamorphicDetector checks all
+        // three the same way; this module discarded every one of them.
+        const bool decoder32Ready = !Phantom::Disasm::IsFailed(
+            m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32));
+        const bool decoder64Ready = !Phantom::Disasm::IsFailed(
+            m_decoder64.Init(Phantom::Disasm::MachineMode::Long64));
+        const bool formatterReady = !Phantom::Disasm::IsFailed(
+            m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel));
+
+        m_disasmReady = decoder32Ready && decoder64Ready;
+
+        if (!m_disasmReady) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"PhantomDisassembler decoder initialization FAILED (32-bit=%ls, 64-bit=%ls). "
+                L"RDTSC code-pattern analysis is DISABLED, which is not the same as finding "
+                L"no timing evasion - a target examined while this holds is unexamined",
+                decoder32Ready ? L"ok" : L"failed",
+                decoder64Ready ? L"ok" : L"failed");
+        }
+        else if (!formatterReady) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"PhantomDisassembler formatter initialization failed; it has no consumer "
+                L"in this module today, so decoding proceeds unaffected");
+        }
     }
 
     ~Impl() {
@@ -2636,6 +2673,15 @@ public:
         bool is64Bit,
         RDTSCAnalysis& analysis)
     {
+        // REFUSE RATHER THAN DECODE THROUGH AN UNINITIALIZED DECODER. Returning here
+        // leaves the caller's analysis untouched, which is correct: it means nothing
+        // was examined. The constructor has already reported the failure at ERROR, so
+        // this is silent by design rather than by omission - logging per call would
+        // amplify the condition it describes.
+        if (!m_disasmReady) {
+            return;
+        }
+
         Phantom::Disasm::Decoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
 
         Phantom::Disasm::DecodedInstruction instruction;
