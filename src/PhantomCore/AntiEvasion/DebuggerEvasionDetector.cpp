@@ -2580,8 +2580,9 @@ namespace ShadowStrike::AntiEvasion {
                             // INT 0x29 is __fastfail, emitted by ordinary CFG-hardened
                             // Microsoft binaries, so compiler-generated code was
                             // attributed to the INT 2D debug-service trick. This function
-                            // is reached from :5135 and the detector's findings reach the
-                            // verdict, so the misattribution shipped.
+                            // is DebuggerEvasionDetector::ScanMemory, reached from :5205,
+                            // and the detector's findings reach the verdict, so the
+                            // misattribution shipped.
                             //
                             // PackerDetector already gates on the immediate; this is the
                             // same check. `INT n` encodes as CD n, so the immediate is the

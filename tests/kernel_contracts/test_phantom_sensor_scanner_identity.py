@@ -11978,13 +11978,20 @@ class DiscardedNodiscardClosureContractTests(unittest.TestCase):
 class TechniqueAttributionContractTests(unittest.TestCase):
     """A reported technique must name the instruction that was actually found.
 
-    DebuggerEvasionDetector::AnalyzeHandles decodes executable memory and maps each
-    anti-debug instruction to an EvasionTechnique. Two mappings named something that was
-    not observed, and because the technique drives the MITRE id, the category and the
-    severity, a wrong technique is three wrong facts.
+    DebuggerEvasionDetector::ScanMemory decodes executable memory and maps each anti-debug
+    instruction to an EvasionTechnique. Two mappings named something that was not observed,
+    and because the technique drives the MITRE id, the category and the severity, a wrong
+    technique is three wrong facts.
 
-    REACHABILITY WAS MEASURED, not assumed: AnalyzeHandles is called at :5135 and the
-    detector is wired at RealTimeProtection.cpp:4465 with its findings reaching the verdict.
+    REACHABILITY WAS MEASURED, not assumed: ScanMemory is defined at :2524 and called at
+    :5205, and the detector is wired at RealTimeProtection.cpp:4465 with its findings
+    reaching the verdict.
+
+    THE FUNCTION NAME HERE WAS WRONG ONCE. It said AnalyzeHandles, because the search walked
+    backwards for the nearest preceding signature instead of mapping the switch's offset into
+    each definition's byte range. AnalyzeHandles is a separate 61-line function that really
+    does analyse handles - SystemHandleInformation, OBJECT_ProcessHandleEnum - and its body
+    ends before this switch begins. Attribute by RANGE, never by proximity.
     """
 
     @staticmethod
