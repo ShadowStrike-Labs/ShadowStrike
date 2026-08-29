@@ -1884,6 +1884,20 @@ public:
             try {
                 auto& bb = BehaviorBlocker::Instance();
                 BehaviorBlockerConfig bbConfig = BehaviorBlockerConfig::CreateDefault();
+                // ONE control governs how aggressive this product is. A behaviour-chain
+                // escalation is inference-class evidence, so it may terminate only at the
+                // same threshold the file-scan verdict (:4152) and the process-creation
+                // verdict already require. The default mode is BLOCK_KNOWN, which is
+                // below it, so a default endpoint detects and reports the escalation
+                // without killing anything on an inferred score.
+                //
+                // KNOWN LIMITATION, stated rather than half-built: SetProtectionMode does
+                // not propagate to BehaviorBlocker, so a mode raised at runtime does not
+                // arm this until the component is initialised again. Wiring that needs a
+                // configuration-update path BehaviorBlocker does not currently expose.
+                bbConfig.allowChainEscalationTermination =
+                    m_mode.load(std::memory_order_acquire) >=
+                    ProtectionMode::BLOCK_SUSPICIOUS;
                 if (!bb.Initialize(bbConfig)) {
                     Utils::Logger::Error("RealTimeProtection: BehaviorBlocker::Initialize failed");
                     SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::ERROR);

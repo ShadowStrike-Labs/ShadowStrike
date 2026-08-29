@@ -88,6 +88,8 @@ TRAY_SOURCE_DIR = ROOT / "src/Products/Community/PhantomHome/UI/Tray"
 BEHAVIOR_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/BehaviorAnalyzer.cpp"
 REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
+BEHAVIOR_BLOCKER_CPP_PATH = ROOT / "src/PhantomCore/RealTime/BehaviorBlocker.cpp"
+BEHAVIOR_BLOCKER_HPP_PATH = ROOT / "src/PhantomCore/RealTime/BehaviorBlocker.hpp"
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
 TELEMETRY_COLLECTOR_HPP_PATH = ROOT / "src/PhantomCore/Communication/TelemetryCollector.hpp"
 SANDBOX_EVASION_DETECTOR_CPP_PATH = (
@@ -12429,6 +12431,151 @@ class CloudHydrationRescanContractTests(unittest.TestCase):
             "the stream context is no longer released exactly once. This callback now "
             "fetches a context on EVERY cleanup rather than only when ScanOnWrite is "
             "enabled, so a leaked reference here leaks per handle close.")
+
+
+class BehaviourChainEscalationContractTests(unittest.TestCase):
+    """A behaviour-chain escalation is inference, so it may not terminate by itself.
+
+    WHY THIS IS A SOURCE CONTRACT AND NOT A BEHAVIOURAL TEST: reaching the escalation
+    needs a stream of scored kernel behavioural events against a live pid, which needs a
+    loaded driver. No unit test can drive it, so the invariant that CAN be enforced is
+    the shape of the decision.
+
+    WHAT WENT WRONG, so a future reader does not undo it: this block upgraded ANY action
+    to TerminateProcess the instant the decayed composite score reached the threshold,
+    with no protection-mode gate and no evidence-class check, and the terminator takes
+    the whole process TREE. On the first boot of 1.0.95 it killed 37 processes in 26
+    seconds during logon under rule=CHAIN_ESCALATION and the session never reached a
+    desktop. The events only began arriving because e5be3e01 gave the kernel behavioural
+    alert a real payload, so shipping that fix armed a response nobody had calibrated.
+    """
+
+    @staticmethod
+    def _slice_body(code, needle):
+        """Brace-match the body of the definition introduced by `needle`.
+
+        The needle MUST carry the return-type prefix, not just the name: a call site can
+        precede its own definition in the file, and a name-only search would then slice a
+        call and the test would assert against the wrong text.
+        """
+        assert code.count(needle) == 1, (
+            "expected exactly one definition matching %r, found %d"
+            % (needle, code.count(needle)))
+        start = code.index(needle)
+        brace = code.index("{", start)
+        depth = 0
+        for i in range(brace, len(code)):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[brace:i + 1]
+        raise AssertionError("unterminated UpdateBehaviorChain body")
+
+    def test_chain_escalation_cannot_terminate_without_policy_permission(self):
+        code = strip_c_comments(read_source(BEHAVIOR_BLOCKER_CPP_PATH))
+        body = self._slice_body(code, "BlockAction UpdateBehaviorChain(")
+
+        sets = [m.start() for m in re.finditer(
+            r"escalated\s*=\s*BlockAction::TerminateProcess\s*;", body)]
+        self.assertEqual(
+            1, len(sets),
+            "expected exactly ONE place where the escalation promotes the action to "
+            "TerminateProcess, found %d. Every such promotion must sit behind the "
+            "policy gate, so a second one is either an ungated path or a duplicate."
+            % len(sets))
+
+        # Read the condition of the if-statement that ENCLOSES the promotion: scan back
+        # to the nearest opening if and forward from there. Do NOT search forward from
+        # the promotion for a gate - the gate precedes it, so that can never match and
+        # the test would pass while the promotion sat outside any gate at all.
+        preceding = body[:sets[0]]
+        gate_start = preceding.rfind("if (")
+        self.assertNotEqual(
+            -1, gate_start,
+            "the action promotion is not inside any if-statement; this guard is stale")
+        condition = preceding[gate_start:]
+        self.assertTrue(
+            "allowChainEscalationTermination" in condition,
+            "the escalation promotes an action to TerminateProcess without consulting "
+            "allowChainEscalationTermination. That makes an inference-class score kill "
+            "a process tree with no policy gate, which took a logon session down on "
+            "1.0.95. Enclosing condition: %s" % condition.strip()[:200])
+
+    def test_the_escalation_permission_defaults_to_withholding_the_kill(self):
+        hpp = strip_c_comments(read_source(BEHAVIOR_BLOCKER_HPP_PATH))
+        decls = re.findall(
+            r"bool\s+allowChainEscalationTermination\s*\{\s*(\w+)\s*\}", hpp)
+        self.assertEqual(
+            1, len(decls),
+            "expected exactly one declaration of allowChainEscalationTermination, "
+            "found %d" % len(decls))
+        self.assertEqual(
+            "false", decls[0],
+            "allowChainEscalationTermination defaults to %r. It MUST default to false: "
+            "a default that permits an inference-class termination is the defect this "
+            "guard exists to prevent, and a default is invisible to any search for an "
+            "assignment." % decls[0])
+
+    def test_the_single_aggressiveness_control_governs_the_escalation(self):
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        sites = [m for m in re.finditer(
+            r"bbConfig\.allowChainEscalationTermination\s*=([^;]*);", rtp, re.S)]
+        self.assertEqual(
+            1, len(sites),
+            "expected exactly one place where RealTimeProtection sets the escalation "
+            "permission, found %d" % len(sites))
+        expr = sites[0].group(1)
+        self.assertTrue(
+            "ProtectionMode::BLOCK_SUSPICIOUS" in expr and ">=" in expr,
+            "the escalation permission is not derived from the protection mode with a "
+            ">= BLOCK_SUSPICIOUS test. The product has ONE aggressiveness control and "
+            "inference-class enforcement must honour it, exactly as the file-scan and "
+            "process-creation verdict paths already do. Expression: %s"
+            % " ".join(expr.split())[:200])
+
+    def test_the_withheld_counter_cannot_become_a_structural_zero(self):
+        cpp = strip_c_comments(read_source(BEHAVIOR_BLOCKER_CPP_PATH))
+        hpp = strip_c_comments(read_source(BEHAVIOR_BLOCKER_HPP_PATH))
+        name = "chainEscalationTerminationsWithheld"
+        required = {
+            "public stats field (hpp)": ("uint64_t %s" % name) in hpp,
+            "atomic declaration": ("std::atomic<uint64_t> %s" % name) in cpp,
+            "Reset() store": ("%s.store(" % name) in cpp,
+            "snapshot load": ("%s.load(" % name) in cpp,
+            "ToJson key": ('j["%s"]' % name) in cpp,
+            "increment": ("%s.fetch_add(" % name) in cpp,
+        }
+        missing = sorted(k for k, v in required.items() if not v)
+        self.assertEqual(
+            [], missing,
+            "the withheld-escalation counter is not plumbed through every site, so it "
+            "would read zero regardless of what happened - the same always-healthy "
+            "number as pool=0/0 and pendingScanQueue. Missing: %s" % missing)
+
+    def test_a_rule_authored_termination_is_still_reachable(self):
+        # ANTI-VACUITY. The fix must withhold the INFERENCE upgrade without disabling
+        # enforcement generally: a rule that names TerminateProcess is a deliberate,
+        # authored decision and must still be carried out. If this fails, the change
+        # went too far and removed capability rather than gating an inference.
+        # SCOPED TO THE ENFORCEMENT FUNCTION, and that scoping is the whole point.
+        # An earlier version of this test searched the WHOLE FILE for
+        # "case BlockAction::TerminateProcess:" and therefore could not discriminate:
+        # that literal appears TWICE, once in a helper switch near the top of the file
+        # and once in HandleBlockAction. Deleting the enforcement case left the decoy
+        # behind and the test still passed, which the mutation proof caught.
+        cpp = strip_c_comments(read_source(BEHAVIOR_BLOCKER_CPP_PATH))
+        body = self._slice_body(cpp, "bool HandleBlockAction(")
+        self.assertTrue(
+            "case BlockAction::TerminateProcess:" in body,
+            "HandleBlockAction no longer handles TerminateProcess at all - rule-authored "
+            "terminations have been removed, which is a loss of enforcement rather than "
+            "a policy gate on inference")
+        self.assertTrue(
+            "TerminateProcessInternal(behavior.processId)" in body,
+            "the TerminateProcess case in HandleBlockAction no longer performs a "
+            "termination")
 
 
 if __name__ == "__main__":

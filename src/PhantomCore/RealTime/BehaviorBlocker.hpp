@@ -391,6 +391,25 @@ struct BehaviorBlockerConfig {
     uint32_t behaviorChainTimeoutSec{300};    ///< Chain window before auto-expiry (5 min)
     float escalationThreshold{0.7f};          ///< Chain score threshold for auto-escalation
 
+    /// @brief Permit a behaviour-chain escalation to terminate a process.
+    ///
+    /// DEFAULTS TO FALSE, DELIBERATELY. Chain escalation is INFERENCE: the composite
+    /// score is a decayed sum of per-event risk with no named referent, so reaching the
+    /// threshold says "several scored events landed on this pid" and not "this pid is a
+    /// threat". Terminating on that is irreversible, and TerminateProcessInternal takes
+    /// the whole process TREE.
+    ///
+    /// RealTimeProtection sets this from its ProtectionMode, so the product's single
+    /// aggressiveness control governs it: termination is permitted only at
+    /// BLOCK_SUSPICIOUS or above, which is the same threshold the file-scan and
+    /// process-creation verdict paths already use for inference-class evidence. The
+    /// default mode is BLOCK_KNOWN, which is below it.
+    ///
+    /// Setting this true does NOT add detection - detection is unconditional. It only
+    /// permits the kill. Read chainEscalationTerminationsWithheld first: that counter
+    /// exists so the decision can be made on field numbers rather than on a guess.
+    bool allowChainEscalationTermination{false};
+
     /// @brief Create a config suitable for development and testing.
     [[nodiscard]] static BehaviorBlockerConfig CreateDefault();
 
@@ -412,6 +431,7 @@ struct BehaviorBlockerStats {
     uint64_t behaviorsAnalyzed{0};     ///< Total events passed to AnalyzeBehavior
     uint64_t threatsBlocked{0};        ///< Events that resulted in action ≥ BlockOperation
     uint64_t processesTerminated{0};   ///< Successful TerminateProcess calls
+    uint64_t chainEscalationTerminationsWithheld{0};  ///< Inference-class escalations not enforced
     uint64_t processesSuspended{0};    ///< Successful SuspendProcess calls
     uint64_t rulesEvaluated{0};        ///< Total individual rule checks performed
     uint64_t analysisFailures{0};      ///< Regex or evaluation errors

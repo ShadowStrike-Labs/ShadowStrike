@@ -326,6 +326,7 @@ struct InternalStats {
     std::atomic<uint64_t> behaviorsAnalyzed{0};
     std::atomic<uint64_t> threatsBlocked{0};
     std::atomic<uint64_t> processesTerminated{0};
+    std::atomic<uint64_t> chainEscalationTerminationsWithheld{0};
     std::atomic<uint64_t> processesSuspended{0};
     std::atomic<uint64_t> rulesEvaluated{0};
     std::atomic<uint64_t> analysisFailures{0};
@@ -338,6 +339,7 @@ struct InternalStats {
         behaviorsAnalyzed.store(0, std::memory_order_relaxed);
         threatsBlocked.store(0, std::memory_order_relaxed);
         processesTerminated.store(0, std::memory_order_relaxed);
+        chainEscalationTerminationsWithheld.store(0, std::memory_order_relaxed);
         processesSuspended.store(0, std::memory_order_relaxed);
         rulesEvaluated.store(0, std::memory_order_relaxed);
         analysisFailures.store(0, std::memory_order_relaxed);
@@ -353,6 +355,8 @@ struct InternalStats {
         s.behaviorsAnalyzed    = behaviorsAnalyzed.load(std::memory_order_relaxed);
         s.threatsBlocked       = threatsBlocked.load(std::memory_order_relaxed);
         s.processesTerminated  = processesTerminated.load(std::memory_order_relaxed);
+        s.chainEscalationTerminationsWithheld =
+            chainEscalationTerminationsWithheld.load(std::memory_order_relaxed);
         s.processesSuspended   = processesSuspended.load(std::memory_order_relaxed);
         s.rulesEvaluated       = rulesEvaluated.load(std::memory_order_relaxed);
         s.analysisFailures     = analysisFailures.load(std::memory_order_relaxed);
@@ -1156,6 +1160,8 @@ public:
             j["behaviorsAnalyzed"]    = s.behaviorsAnalyzed;
             j["threatsBlocked"]       = s.threatsBlocked;
             j["processesTerminated"]  = s.processesTerminated;
+            j["chainEscalationTerminationsWithheld"] =
+                s.chainEscalationTerminationsWithheld;
             j["processesSuspended"]   = s.processesSuspended;
             j["rulesEvaluated"]       = s.rulesEvaluated;
             j["analysisFailures"]     = s.analysisFailures;
@@ -1492,16 +1498,59 @@ private:
             if (e.riskScore >= RiskToScore(RiskLevel::High)) ++highRiskCount;
         }
 
+        // CHAIN ESCALATION IS INFERENCE, SO IT MAY NOT TERMINATE UNLESS POLICY SAYS SO.
+        //
+        // This block used to upgrade ANY action to TerminateProcess the moment the
+        // decayed composite score reached escalationThreshold, with no protection-mode
+        // gate, no evidence-class check and no signature check - and
+        // TerminateProcessInternal kills the whole process TREE. Task 89 established
+        // that inference-class evidence must not take an irreversible action, and
+        // 182f6a85 applied exactly that rule to the process-creation verdict path. This
+        // escalation bypassed both.
+        //
+        // FIELD EVIDENCE, 1.0.95 first boot: 37 processes were terminated in 26 seconds
+        // during logon under rule=CHAIN_ESCALATION, every one at score=0.70 which is
+        // exactly the threshold, and the session never reached a desktop. The events
+        // only started arriving because e5be3e01 gave the kernel behavioural alert a
+        // real payload - the escalation had been armed and unfed since May, so shipping
+        // that fix armed a response nobody had calibrated.
+        //
+        // NO DETECTION IS LOST. The chain still scores, the escalation still logs, the
+        // caller still runs RecordBlockEvent and the callbacks. What is withheld is the
+        // kill, and the withholding is counted so the policy question can be answered
+        // with field numbers instead of a guess.
+        //
+        // The two log statements below are byte-for-byte the originals on purpose: this
+        // path has just been shown to storm, and our log writes traverse our own
+        // minifilter, so adding a per-event line would amplify the condition it reports.
+        // The withheld notice is therefore DEBUG and the COUNTER is the operator signal.
         BlockAction escalated = currentAction;
+        const bool alreadyTerminating = (currentAction == BlockAction::TerminateProcess);
+        const wchar_t* escalationReason = nullptr;
         if (chain.compositeScore >= m_config.escalationThreshold) {
-            escalated = BlockAction::TerminateProcess;
+            escalationReason = L"composite score";
             SS_LOG_WARN(kLogCategory, L"CHAIN ESCALATION: PID %u score=%.2f >= %.2f",
                 behavior.processId, chain.compositeScore, m_config.escalationThreshold);
-        }
-        if (highRiskCount >= kChainAutoEscalateCount && escalated != BlockAction::TerminateProcess) {
-            escalated = BlockAction::TerminateProcess;
+        } else if (highRiskCount >= kChainAutoEscalateCount && !alreadyTerminating) {
+            escalationReason = L"high-risk event count";
             SS_LOG_WARN(kLogCategory, L"CHAIN ESCALATION: PID %u %u high-risk events",
                 behavior.processId, highRiskCount);
+        }
+        // Not counted when the rule ITSELF already asked to terminate: nothing was
+        // upgraded in that case, so there is no withheld escalation to report. That
+        // decision is rule-authored and is deliberately left alone here.
+        if (escalationReason != nullptr && !alreadyTerminating) {
+            if (m_config.allowChainEscalationTermination) {
+                escalated = BlockAction::TerminateProcess;
+            } else {
+                m_stats.chainEscalationTerminationsWithheld.fetch_add(
+                    1, std::memory_order_relaxed);
+                SS_LOG_DEBUG(kLogCategory,
+                    L"CHAIN ESCALATION for PID %u (%ls) not enforced as a termination: "
+                    L"policy does not permit inference-class termination. Keeping the "
+                    L"rule's own action; the detection itself stands.",
+                    behavior.processId, escalationReason);
+            }
         }
         return escalated;
     }
