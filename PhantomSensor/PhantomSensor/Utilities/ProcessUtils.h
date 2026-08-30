@@ -645,6 +645,38 @@ ShadowStrikeGetProcessIntegrityLevel(
     );
 
 /**
+ * @brief Get a token's integrity RID using the documented query path.
+ *
+ * THIS EXISTS BECAUSE THE OBVIOUS CALL IS WRONG. Three modules queried the integrity
+ * level with SeQueryInformationToken(Token, TokenIntegrityLevel, &p) and then called
+ * ExFreePool(p). That out-parameter is NOT a pool allocation for this information
+ * class - it receives the integrity RID as a scalar. Freeing it is a BAD_POOL_CALLER
+ * bugcheck with Arg1=0x99, and the address reported is the RID itself: a SYSTEM
+ * integrity process yields 0x00004000, which is SECURITY_MANDATORY_SYSTEM_RID exactly.
+ * Dereferencing it as a PSID is an access violation on the same value.
+ *
+ * The supported path is a handle plus a two-call ZwQueryInformationToken, where the
+ * CALLER owns the buffer, which is what this routine does.
+ *
+ * @param Token          Token to query. Caller retains its own reference.
+ * @param IntegrityRid   Receives a SECURITY_MANDATORY_*_RID value. Set to
+ *                       SECURITY_MANDATORY_MEDIUM_RID before any work, so a caller
+ *                       that ignores the status still reads a defined, safe value.
+ *
+ * @return STATUS_SUCCESS when a RID was resolved. A token that carries no integrity
+ *         label is NOT an error - the RID stays at medium and STATUS_SUCCESS is
+ *         returned, because the absence of a label is a legitimate token shape.
+ *
+ * @irql PASSIVE_LEVEL - opens a handle and issues a Zw query.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeGetTokenIntegrityRid(
+    _In_ PACCESS_TOKEN Token,
+    _Out_ PULONG IntegrityRid
+    );
+
+/**
  * @brief Get process session ID.
  *
  * @param ProcessId     Process ID

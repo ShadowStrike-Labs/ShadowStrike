@@ -49,6 +49,7 @@ Security Hardening Applied:
 #include "EnvironmentMonitor.h"
 #include "../../Sync/TimerManager.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Utilities/ProcessUtils.h"
 #include <ntstrsafe.h>
 
 //
@@ -2340,27 +2341,19 @@ PapAnalyzeProcessToken(
         // SeQueryInformationToken allocates buffer; caller frees with ExFreePool
         //
         {
-            PVOID IntInfo = NULL;
+            ULONG IntegrityRid = SECURITY_MANDATORY_MEDIUM_RID;
 
-            Status = SeQueryInformationToken(
-                Token,
-                TokenIntegrityLevel,
-                &IntInfo
-                );
+            //
+            // See ShadowStrikeGetTokenIntegrityRid in ProcessUtils.h. The previous call
+            // freed a scalar RID as though it were a pool pointer, which is a
+            // BAD_POOL_CALLER bugcheck. The enclosing __except could NOT have contained
+            // it: a bad pool free bugchecks the machine, it does not raise an exception.
+            //
+            Status = ShadowStrikeGetTokenIntegrityRid(Token, &IntegrityRid);
 
-            if (NT_SUCCESS(Status) && IntInfo != NULL) {
-                PTOKEN_MANDATORY_LABEL MandatoryLabel = (PTOKEN_MANDATORY_LABEL)IntInfo;
-
-                if (MandatoryLabel->Label.Sid != NULL) {
-                    PISID Sid = (PISID)MandatoryLabel->Label.Sid;
-                    if (Sid->SubAuthorityCount > 0) {
-                        Analysis->Public.Security.IntegrityLevel =
-                            Sid->SubAuthority[Sid->SubAuthorityCount - 1];
-                        Analysis->Public.Security.HasIntegrityLevel = TRUE;
-                    }
-                }
-
-                ExFreePool(IntInfo);
+            if (NT_SUCCESS(Status)) {
+                Analysis->Public.Security.IntegrityLevel = IntegrityRid;
+                Analysis->Public.Security.HasIntegrityLevel = TRUE;
             }
         }
 

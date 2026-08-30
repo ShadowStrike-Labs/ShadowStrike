@@ -52,6 +52,7 @@
 #include "../Sync/TimerManager.h"
 #include "../Core/DriverEntry.h"
 #include "../ETW/TelemetryEvents.h"
+#include "../Utilities/ProcessUtils.h"
 
 // ============================================================================
 // SYSTEM STRUCTURES (for ZwQuerySystemInformation process enumeration)
@@ -2383,7 +2384,6 @@ HppGetProcessIntegrityLevel(
 {
     NTSTATUS status;
     PACCESS_TOKEN token = NULL;
-    PTOKEN_MANDATORY_LABEL label = NULL;
     BOOLEAN resolved = FALSE;
     ULONG resolvedRid = SECURITY_MANDATORY_MEDIUM_RID;
 
@@ -2414,64 +2414,25 @@ HppGetProcessIntegrityLevel(
     // Query token integrity level. SeQueryInformationToken allocates the
     // label buffer â€” we own the free.
     //
-    status = SeQueryInformationToken(
-        token,
-        TokenIntegrityLevel,
-        (PVOID*)&label
-    );
-
-    if (NT_SUCCESS(status) && label != NULL) {
-        //
-        // SEH-wrap the SID walk. During process teardown the token label
-        // structure has been observed to contain a SID whose SubAuthority
-        // count claims more sub-authorities than the pool allocation holds,
-        // which produces an out-of-bounds read when walking to the RID. We
-        // never let that escape this callback â€” the worst case is that we
-        // fall back to medium integrity, which is safe for downstream
-        // heuristics.
-        //
-        __try {
-            PSID sid = label->Label.Sid;
-
-            if (sid != NULL && RtlValidSid(sid)) {
-                PUCHAR countPtr = RtlSubAuthorityCountSid(sid);
-                if (countPtr != NULL) {
-                    UCHAR subAuthorityCount = *countPtr;
-
-                    //
-                    // SID_MAX_SUB_AUTHORITIES is 15 by spec. An integrity
-                    // SID in practice carries exactly one sub-authority.
-                    // Anything outside [1, 15] is malformed â€” drop it.
-                    //
-                    if (subAuthorityCount > 0 &&
-                        subAuthorityCount <= SID_MAX_SUB_AUTHORITIES) {
-                        PULONG ridPtr = RtlSubAuthoritySid(
-                            sid,
-                            (ULONG)(subAuthorityCount - 1)
-                        );
-                        if (ridPtr != NULL) {
-                            resolvedRid = *ridPtr;
-                            resolved = TRUE;
-                        }
-                    }
-                }
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            //
-            // Leave resolvedRid at SECURITY_MANDATORY_MEDIUM_RID. Do NOT
-            // propagate â€” we are inside an Ob pre-op callback chain and a
-            // raised exception here would bugcheck the system.
-            //
-            resolved = FALSE;
-        }
-
-        //
-        // ExFreePool on the label buffer is safe regardless of SID
-        // validity â€” the buffer itself is always a full pool allocation.
-        //
-        ExFreePool(label);
-    }
+    //
+    // Resolve the integrity RID through the shared primitive.
+    //
+    // THIS MODULE CAUSED A BUGCHECK. It called
+    // SeQueryInformationToken(token, TokenIntegrityLevel, &label) and then
+    // ExFreePool(label). That out-parameter is not a pool pointer for this class - it
+    // receives the integrity RID as a scalar - so the free was BAD_POOL_CALLER 0x99
+    // with the reported address 0x00004000, which is SECURITY_MANDATORY_SYSTEM_RID
+    // exactly, reached from NtDuplicateObject in csrss.exe (a SYSTEM process).
+    //
+    // The __try that used to wrap the SID walk here was masking the access violation
+    // from dereferencing that same scalar as a PSID. Its comment blamed a malformed SID
+    // during process teardown, which was a misreading of this defect. Because the free
+    // sat OUTSIDE the __try, the masked fault became a bugcheck instead of a wrong
+    // answer. The guard is removed rather than widened: with a caller-owned buffer and
+    // RtlValidSid there is nothing left to guard against.
+    //
+    status = ShadowStrikeGetTokenIntegrityRid(token, &resolvedRid);
+    resolved = NT_SUCCESS(status);
 
     PsDereferencePrimaryToken(token);
 

@@ -2481,44 +2481,40 @@ Return Value:
 {
     NTSTATUS Status;
     ULONG IntegrityLevel = PM_INTEGRITY_MEDIUM;
-    PTOKEN_MANDATORY_LABEL MandatoryLabel = NULL;
+    ULONG IntegrityRid = SECURITY_MANDATORY_MEDIUM_RID;
 
     //
     // SeQueryInformationToken(TokenIntegrityLevel) returns TOKEN_MANDATORY_LABEL*
     // which contains SID_AND_ATTRIBUTES Label â€” the SID is at Label.Sid.
     //
-    Status = SeQueryInformationToken(
-        Token,
-        TokenIntegrityLevel,
-        (PVOID*)&MandatoryLabel
-        );
+    //
+    // See ShadowStrikeGetTokenIntegrityRid in ProcessUtils.h for why the obvious call
+    // is wrong: querying this class with SeQueryInformationToken and then freeing the
+    // out-parameter is a BAD_POOL_CALLER bugcheck, because that parameter receives the
+    // RID as a scalar rather than a pool pointer. This module carried the identical
+    // defect and simply had not been reached yet.
+    //
+    Status = ShadowStrikeGetTokenIntegrityRid(Token, &IntegrityRid);
 
-    if (NT_SUCCESS(Status) && MandatoryLabel != NULL) {
-        PISID Sid = (PISID)MandatoryLabel->Label.Sid;
-        if (Sid != NULL && Sid->SubAuthorityCount > 0) {
-            ULONG IntegrityRid = Sid->SubAuthority[Sid->SubAuthorityCount - 1];
-
-            //
-            // Map RID to our integrity level values
-            //
-            if (IntegrityRid >= SECURITY_MANDATORY_PROTECTED_PROCESS_RID) {
-                IntegrityLevel = PM_INTEGRITY_PROTECTED;
-            } else if (IntegrityRid >= SECURITY_MANDATORY_SYSTEM_RID) {
-                IntegrityLevel = PM_INTEGRITY_SYSTEM;
-            } else if (IntegrityRid >= SECURITY_MANDATORY_HIGH_RID) {
-                IntegrityLevel = PM_INTEGRITY_HIGH;
-            } else if (IntegrityRid >= SECURITY_MANDATORY_MEDIUM_PLUS_RID) {
-                IntegrityLevel = PM_INTEGRITY_MEDIUM_PLUS;
-            } else if (IntegrityRid >= SECURITY_MANDATORY_MEDIUM_RID) {
-                IntegrityLevel = PM_INTEGRITY_MEDIUM;
-            } else if (IntegrityRid >= SECURITY_MANDATORY_LOW_RID) {
-                IntegrityLevel = PM_INTEGRITY_LOW;
-            } else {
-                IntegrityLevel = PM_INTEGRITY_UNTRUSTED;
-            }
+    if (NT_SUCCESS(Status)) {
+        //
+        // Map RID to our integrity level values
+        //
+        if (IntegrityRid >= SECURITY_MANDATORY_PROTECTED_PROCESS_RID) {
+            IntegrityLevel = PM_INTEGRITY_PROTECTED;
+        } else if (IntegrityRid >= SECURITY_MANDATORY_SYSTEM_RID) {
+            IntegrityLevel = PM_INTEGRITY_SYSTEM;
+        } else if (IntegrityRid >= SECURITY_MANDATORY_HIGH_RID) {
+            IntegrityLevel = PM_INTEGRITY_HIGH;
+        } else if (IntegrityRid >= SECURITY_MANDATORY_MEDIUM_PLUS_RID) {
+            IntegrityLevel = PM_INTEGRITY_MEDIUM_PLUS;
+        } else if (IntegrityRid >= SECURITY_MANDATORY_MEDIUM_RID) {
+            IntegrityLevel = PM_INTEGRITY_MEDIUM;
+        } else if (IntegrityRid >= SECURITY_MANDATORY_LOW_RID) {
+            IntegrityLevel = PM_INTEGRITY_LOW;
+        } else {
+            IntegrityLevel = PM_INTEGRITY_UNTRUSTED;
         }
-
-        ExFreePool(MandatoryLabel);
     }
 
     return IntegrityLevel;

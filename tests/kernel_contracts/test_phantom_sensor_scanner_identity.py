@@ -90,6 +90,9 @@ REAL_TIME_PROTECTION_CPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtect
 REAL_TIME_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.hpp"
 BEHAVIOR_BLOCKER_CPP_PATH = ROOT / "src/PhantomCore/RealTime/BehaviorBlocker.cpp"
 BEHAVIOR_BLOCKER_HPP_PATH = ROOT / "src/PhantomCore/RealTime/BehaviorBlocker.hpp"
+PROCESS_UTILS_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Utilities/ProcessUtils.c"
+PROCESS_UTILS_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Utilities/ProcessUtils.h"
+SENSOR_SOURCE_ROOT = ROOT / "PhantomSensor/PhantomSensor"
 COMMUNICATION_HPP_PATH = ROOT / "src/PhantomCore/Communication/Communication.hpp"
 TELEMETRY_COLLECTOR_HPP_PATH = ROOT / "src/PhantomCore/Communication/TelemetryCollector.hpp"
 SANDBOX_EVASION_DETECTOR_CPP_PATH = (
@@ -12576,6 +12579,134 @@ class BehaviourChainEscalationContractTests(unittest.TestCase):
             "TerminateProcessInternal(behavior.processId)" in body,
             "the TerminateProcess case in HandleBlockAction no longer performs a "
             "termination")
+
+
+class TokenIntegrityQueryContractTests(unittest.TestCase):
+    """The integrity-level query must not free a value it does not own.
+
+    THE BUGCHECK THIS PREVENTS, measured from 083026-7031-01.dmp:
+
+        BAD_POOL_CALLER (c2), Arg1=0x99 "free pool with invalid address"
+        Arg2=0x0000000000004000                      <- the address being freed
+        nt!ExFreePoolWithTag
+        PhantomSensor!HppGetProcessIntegrityLevel     <- HandleProtection.c:2476
+        PhantomSensor!HppCreateProcessContext
+        PhantomSensor!HpRecordDuplication
+        PhantomSensor!ShadowStrikeProcessPreCallback
+        nt!ObpCallPreOperationCallbacks
+        nt!NtDuplicateObject                          <- from csrss.exe
+
+    0x4000 is not a pointer. It is SECURITY_MANDATORY_SYSTEM_RID exactly
+    (winnt.h: 0x00004000L), and csrss.exe runs at SYSTEM integrity. So the
+    out-parameter of SeQueryInformationToken(..., TokenIntegrityLevel, &p) had
+    received the integrity RID as a SCALAR, and the code freed it as a pool
+    pointer. Three modules did this; the driver already contained two correct
+    implementations using the documented two-call ZwQueryInformationToken path.
+    """
+
+    _BROKEN = re.compile(
+        r"SeQueryInformationToken\s*\(\s*[^;]*?TokenIntegrityLevel", re.S)
+
+    def test_no_driver_source_queries_the_integrity_level_through_the_pool_returning_api(self):
+        # Comments are stripped FIRST and that is load-bearing: the fix's own
+        # explanatory comments necessarily quote the defective call, so a
+        # comment-blind scan is guaranteed to report offenders that do not exist.
+        offenders = []
+        for path in sorted(SENSOR_SOURCE_ROOT.rglob("*.c")):
+            code = strip_c_comments(read_source(path))
+            hits = len(self._BROKEN.findall(code))
+            if hits:
+                offenders.append("%s x%d" % (path.name, hits))
+        self.assertEqual(
+            [], offenders,
+            "these driver sources query TokenIntegrityLevel through "
+            "SeQueryInformationToken. That out-parameter receives the integrity RID as "
+            "a scalar, so dereferencing it is an access violation and freeing it is a "
+            "BAD_POOL_CALLER bugcheck. Use ShadowStrikeGetTokenIntegrityRid. "
+            "Offenders: %s" % offenders)
+
+    def test_the_shared_primitive_owns_the_buffer_it_frees(self):
+        # ANTI-VACUITY plus correctness: the replacement is only safe because the
+        # driver allocates the buffer itself. If it ever goes back to having the
+        # callee hand us a pointer, the whole defect returns.
+        code = strip_c_comments(read_source(PROCESS_UTILS_C_PATH))
+        needle = "ShadowStrikeGetTokenIntegrityRid("
+        self.assertIn(
+            needle, code,
+            "the shared integrity primitive is gone; the three call sites depend on it")
+        # ProcessUtils.c defines the primitive and does not call it, so the single
+        # occurrence is the definition. Asserted rather than assumed.
+        self.assertEqual(
+            1, code.count(needle),
+            "expected exactly one occurrence of the primitive in ProcessUtils.c "
+            "(its definition), found %d" % code.count(needle))
+        start = code.index(needle)
+        brace = code.index("{", start)
+        depth = 0
+        body = None
+        for i in range(brace, len(code)):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    body = code[brace:i + 1]
+                    break
+        self.assertIsNotNone(body, "could not brace-match the primitive's body")
+
+        required = {
+            "opens a token handle": "ObOpenObjectByPointer" in body,
+            "two-call size probe": "STATUS_BUFFER_TOO_SMALL" in body,
+            "driver-owned allocation": "ShadowStrikeAllocatePagedWithTag" in body,
+            "tagged free": "ShadowStrikeFreePoolWithTag" in body,
+            "validates the SID": "RtlValidSid" in body,
+            "closes the handle": "ZwClose" in body,
+        }
+        missing = sorted(k for k, v in required.items() if not v)
+        self.assertEqual([], missing, "the primitive lost: %s" % missing)
+
+        self.assertNotIn(
+            "SeQueryInformationToken", body,
+            "the shared primitive itself now uses the API that caused the bugcheck")
+
+    def test_every_converted_site_uses_the_shared_primitive(self):
+        # A regression guard, not a discriminator: it fails if a future edit removes
+        # the call rather than if the defect returns.
+        expected = ("HandleProtection.c", "PrivilegeMonitor.c", "ProcessAnalyzer.c")
+        found = {}
+        for name in expected:
+            matches = list(SENSOR_SOURCE_ROOT.rglob(name))
+            self.assertTrue(matches, "%s not found under the driver tree" % name)
+            code = strip_c_comments(read_source(matches[0]))
+            found[name] = len(re.findall(
+                r"ShadowStrikeGetTokenIntegrityRid\s*\(", code))
+        absent = sorted(n for n, c in found.items() if c == 0)
+        self.assertEqual(
+            [], absent,
+            "these modules no longer resolve the integrity RID through the shared "
+            "primitive: %s (counts: %s)" % (absent, found))
+
+    def test_the_primitive_is_declared_for_its_callers(self):
+        header = strip_c_comments(read_source(PROCESS_UTILS_H_PATH))
+
+        # WORD-BOUNDARY MATCH, and it is not pedantry. An earlier version of this test
+        # used a bare substring check, and the mutation that renames the declaration to
+        # ShadowStrikeGetTokenIntegrityRidRemoved PASSED - because the longer name
+        # contains the shorter one. Three of four mutations discriminated and this one
+        # did not, which is the only reason the defect was found.
+        #
+        # assertIn is also avoided deliberately: it dumps the entire header on failure.
+        declared = re.search(
+            r"(?<![A-Za-z0-9_])ShadowStrikeGetTokenIntegrityRid(?![A-Za-z0-9_])", header)
+        self.assertIsNotNone(
+            declared,
+            "ShadowStrikeGetTokenIntegrityRid is not declared in ProcessUtils.h, so the "
+            "three modules that resolve an integrity RID cannot reach it")
+        self.assertTrue(
+            "PASSIVE_LEVEL" in header,
+            "ProcessUtils.h no longer states an IRQL requirement anywhere. The primitive "
+            "opens a handle and issues a Zw query, so a caller at raised IRQL would "
+            "bugcheck, and the declaration is where that contract is published.")
 
 
 if __name__ == "__main__":

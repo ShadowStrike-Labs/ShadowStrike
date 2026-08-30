@@ -420,6 +420,156 @@ ShadowGetProcessToken(
 }
 
 /**
+ * @brief Get a token's integrity RID. See ProcessUtils.h for why this exists.
+ *
+ * Modelled on ShadowGetTokenIntegrityLevel below, which already used the correct
+ * two-call pattern, and on TokenAnalyzer's equivalent. Both of those were written
+ * correctly; three OTHER modules were not, and they now call this instead of
+ * repeating the mistake a fourth time.
+ *
+ * NOTE ON RE-ENTRANCY, checked before this was written rather than assumed: one caller
+ * is an ObRegisterCallbacks PRE-OPERATION callback, so opening a handle here would be
+ * unsafe if we filtered the token object type. We do not - ObjectCallback.c and
+ * AntiUnload.c register PsProcessType and PsThreadType only - so creating a token
+ * handle cannot re-enter our own callback.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeGetTokenIntegrityRid(
+    _In_ PACCESS_TOKEN Token,
+    _Out_ PULONG IntegrityRid
+)
+{
+    NTSTATUS status;
+    HANDLE tokenHandle = NULL;
+    PTOKEN_MANDATORY_LABEL label = NULL;
+    ULONG labelSize = 0;
+    ULONG returnLength = 0;
+    PUCHAR subAuthorityCount;
+    PULONG subAuthority;
+
+    PAGED_CODE();
+
+    if (IntegrityRid == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Establish the safe default FIRST. Medium is the correct fallback: it is what an
+    // ordinary interactive process carries, so a caller that treats a failure as
+    // "assume ordinary" is not handed something that reads as privileged.
+    //
+    *IntegrityRid = SECURITY_MANDATORY_MEDIUM_RID;
+
+    if (Token == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = ObOpenObjectByPointer(
+        Token,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        TOKEN_QUERY,
+        *SeTokenObjectType,
+        KernelMode,
+        &tokenHandle
+    );
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    //
+    // Ask for the size. STATUS_BUFFER_TOO_SMALL is the EXPECTED answer here; any
+    // success would mean the class wrote nothing into a zero-length buffer, which we
+    // must not interpret as a resolved level.
+    //
+    status = ZwQueryInformationToken(
+        tokenHandle,
+        TokenIntegrityLevel,
+        NULL,
+        0,
+        &returnLength
+    );
+
+    if (status != STATUS_BUFFER_TOO_SMALL || returnLength == 0) {
+        ZwClose(tokenHandle);
+        //
+        // A token with no integrity label is a legitimate shape, not a fault. Report
+        // success with the medium default rather than propagating an error a caller
+        // would have to special-case.
+        //
+        return STATUS_SUCCESS;
+    }
+
+    if (returnLength > SHADOW_MAX_TOKEN_INFO_SIZE) {
+        ZwClose(tokenHandle);
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    labelSize = returnLength;
+    label = (PTOKEN_MANDATORY_LABEL)ShadowStrikeAllocatePagedWithTag(
+        labelSize,
+        SHADOW_TOKEN_TAG
+    );
+
+    if (label == NULL) {
+        ZwClose(tokenHandle);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = ZwQueryInformationToken(
+        tokenHandle,
+        TokenIntegrityLevel,
+        label,
+        labelSize,
+        &returnLength
+    );
+
+    ZwClose(tokenHandle);
+    tokenHandle = NULL;
+
+    //
+    // From here every exit frees the buffer WE allocated, with the tag we allocated it
+    // under. That is the whole difference from the defect this replaces: the ownership
+    // is ours and it is unambiguous.
+    //
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeFreePoolWithTag(label, SHADOW_TOKEN_TAG);
+        return status;
+    }
+
+    //
+    // Validate the SID before walking it. No SEH is used or needed: the buffer is ours,
+    // its length came from the kernel, and RtlValidSid plus the sub-authority count
+    // bound the walk. The routine this replaces wrapped the walk in __try because it
+    // was dereferencing a RID as a pointer - that is a defect to remove, not a hazard
+    // to guard.
+    //
+    if (label->Label.Sid == NULL || !RtlValidSid(label->Label.Sid)) {
+        ShadowStrikeFreePoolWithTag(label, SHADOW_TOKEN_TAG);
+        return STATUS_SUCCESS;
+    }
+
+    subAuthorityCount = RtlSubAuthorityCountSid(label->Label.Sid);
+    if (subAuthorityCount == NULL || *subAuthorityCount == 0) {
+        ShadowStrikeFreePoolWithTag(label, SHADOW_TOKEN_TAG);
+        return STATUS_SUCCESS;
+    }
+
+    subAuthority = RtlSubAuthoritySid(label->Label.Sid, *subAuthorityCount - 1);
+    if (subAuthority == NULL) {
+        ShadowStrikeFreePoolWithTag(label, SHADOW_TOKEN_TAG);
+        return STATUS_SUCCESS;
+    }
+
+    *IntegrityRid = *subAuthority;
+
+    ShadowStrikeFreePoolWithTag(label, SHADOW_TOKEN_TAG);
+    return STATUS_SUCCESS;
+}
+
+/**
  * @brief Extract integrity level from token using ZwQueryInformationToken.
  *
  * CRITICAL FIX: Uses proper token query method instead of SeQueryInformationToken
