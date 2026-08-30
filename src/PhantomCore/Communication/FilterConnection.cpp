@@ -947,13 +947,63 @@ public:
             }
         }
 
+        //
+        // lpBytesReturned IS NOT OPTIONAL, AND PASSING nullptr CRASHED THE SERVICE.
+        //
+        // FilterSendMessage declares its sixth parameter _Out_, not _Out_opt_,
+        // and fltLib writes the returned byte count through it unconditionally.
+        // This site passed nullptr, so every no-reply send faulted inside
+        // FilterpDeviceIoControl with a NULL-pointer write. Proven from the
+        // 1.0.98 field dump rather than inferred:
+        //
+        //     mov dword ptr [rcx],eax    rcx = 0x0000000000000000
+        //     fltLib!FilterpDeviceIoControl+0x188
+        //       <- FilterConnectionImpl::SendMessageNoReply+0x15f
+        //       <- IPCManager::SendToKernel+0x34f
+        //       <- PowerShellScanner::Impl::notifyKernelBlock+0xc4
+        //       <- ScanEngine::ScanFile <- RealTimeProtectionImpl::OnKernelFileScan
+        //     FAILURE_BUCKET_ID:
+        //       NULL_POINTER_WRITE_c0000005_fltLib.dll!FilterpDeviceIoControl
+        //
+        // The distinction the old code missed is that lpOutBuffer and
+        // lpBytesReturned are not optional together. Four of the five
+        // FilterSendMessage sites in this tree already pass a real pointer, and
+        // two of those (FileSystemFilter.cpp) pass nullptr for the OUTPUT BUFFER
+        // while still supplying &bytesReturned - that pair is what establishes
+        // the convention this site broke.
+        //
+        // The value itself is meaningless here: with no output buffer the count
+        // is always zero. It is captured to satisfy the API contract, not to be
+        // read, and it is deliberately NOT logged - the reason this crash was
+        // reachable at all is a hot path, and a per-send line there is what the
+        // 1.0.97 log storm was made of.
+        //
+        // BLAST RADIUS, MEASURED: IPCManager.cpp is the sole caller of
+        // SendMessageNoReply, reached from IPCManager::SendToKernel, whose own
+        // comment records 31 call sites. Every one of them that took the
+        // no-reply path terminated the service. That includes the roughly
+        // sixteen modules which hand-build a headerless frame stamped with an
+        // invented message type - a population I had previously recorded as
+        // "inert because the driver's magic check refuses the frame". That note
+        // was wrong about the danger: the frame never reaches the driver's magic
+        // check, because the send itself faults first.
+        //
+        // THIS FIXES THE CRASH, NOT THE TRANSPORT. Those frames are still
+        // headerless and still carry a message type outside the enum, so they
+        // will once again be refused by the driver exactly as before. Restoring
+        // that refusal is the correct outcome here; delivering them needs the
+        // unified kernel enforcement request type, which is tracked separately
+        // and must not be improvised from this seam.
+        //
+        DWORD bytesReturned = 0;
+
         HRESULT hr = FilterSendMessage(
             guard.get(),
             const_cast<void*>(static_cast<const void*>(actualSend.data())),
             static_cast<DWORD>(actualSend.size()),
             nullptr,
             0,
-            nullptr
+            &bytesReturned
         );
 
         if (FAILED(hr)) {

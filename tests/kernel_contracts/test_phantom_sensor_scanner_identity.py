@@ -12926,5 +12926,160 @@ class BehaviouralAlertStormContractTests(unittest.TestCase):
             "and from chainEscalationTerminationsWithheld." % offenders)
 
 
+class FilterSendMessageContractTests(unittest.TestCase):
+    """lpBytesReturned is _Out_, not _Out_opt_, and fltLib writes through it.
+
+    FilterConnectionImpl::SendMessageNoReply passed nullptr for it, so every
+    no-reply kernel send faulted inside FilterpDeviceIoControl with a
+    NULL-pointer write and terminated the service. Proven from the 1.0.98 field
+    dump:
+
+        mov dword ptr [rcx],eax    rcx = 0x0000000000000000
+        fltLib!FilterpDeviceIoControl+0x188
+          <- FilterConnectionImpl::SendMessageNoReply+0x15f
+          <- IPCManager::SendToKernel+0x34f
+          <- PowerShellScanner::Impl::notifyKernelBlock+0xc4
+
+    This guard is deliberately TREE-WIDE rather than pinned to the one site
+    that was wrong, because the defect is a misreading of an API contract and
+    the next author can make it at any of the other call sites.
+    """
+
+    _SRC_ROOT = ROOT / "src"
+
+    @staticmethod
+    def _blank_string_literals(code):
+        """Replace the contents of string literals with spaces.
+
+        strip_c_comments does not touch strings, and this file logs
+        "FilterSendMessage (no reply) failed", so a walk over comment-stripped
+        source alone finds a call site inside a log message. Length is preserved
+        so reported line numbers stay accurate.
+        """
+        out = []
+        i = 0
+        n = len(code)
+        while i < n:
+            ch = code[i]
+            if ch == '"':
+                out.append('"')
+                i += 1
+                while i < n and code[i] != '"':
+                    if code[i] == "\\\\" and i + 1 < n:
+                        out.append("  ")
+                        i += 2
+                        continue
+                    out.append("\\n" if code[i] == "\\n" else " ")
+                    i += 1
+                if i < n:
+                    out.append('"')
+                    i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @classmethod
+    def _call_sites(cls):
+        """Yield (path, line, arglist) for every FilterSendMessage call in src."""
+        sites = []
+        for path in sorted(cls._SRC_ROOT.rglob("*.cpp")):
+            code = cls._blank_string_literals(strip_c_comments(read_source(path)))
+            for m in re.finditer(r"(?<![A-Za-z0-9_])FilterSendMessage\s*\(", code):
+                depth = 0
+                end = None
+                for j in range(m.end() - 1, min(m.end() + 2000, len(code))):
+                    if code[j] == "(":
+                        depth += 1
+                    elif code[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                if end is None:
+                    continue
+                inner = code[code.find("(", m.start()) + 1:end]
+                args = [a.strip() for a in re.split(r",(?![^(]*\))", inner)]
+                sites.append((path.name, code[:m.start()].count("\n") + 1, args))
+        return sites
+
+    def test_no_kernel_send_passes_a_null_bytes_returned(self):
+        sites = self._call_sites()
+        self.assertGreater(
+            len(sites), 0,
+            "no FilterSendMessage call sites were found at all, so this guard is "
+            "vacuous - the walk or the source layout has changed")
+
+        offenders = []
+        for name, line, args in sites:
+            if len(args) != 6:
+                offenders.append("%s:%d takes %d arguments, not 6" % (name, line, len(args)))
+                continue
+            if args[5] in ("nullptr", "NULL", "0"):
+                offenders.append("%s:%d passes %s as lpBytesReturned" % (name, line, args[5]))
+
+        self.assertEqual(
+            offenders, [],
+            "FilterSendMessage is called with a null lpBytesReturned. That "
+            "parameter is _Out_, not _Out_opt_, and fltLib writes the byte count "
+            "through it unconditionally, so this terminates the process rather "
+            "than failing the call: %s" % offenders)
+
+    def test_the_no_reply_sender_keeps_its_shape(self):
+        """Pin SendMessageNoReply's own argument shape.
+
+        An earlier version of this test asserted only that SOME call site passes
+        a null output buffer together with a real count. That was circular: the
+        very site being fixed satisfies it, so the assertion could never fail
+        while the fix was in place and it discriminated nothing. Mutating the two
+        FileSystemFilter sites produced zero failures, which is how the tautology
+        surfaced.
+
+        What is actually worth pinning is this sender's shape: no output buffer,
+        zero output size, real count. That fails if someone "fixes" the crash by
+        supplying an output buffer instead - which would silently turn a
+        fire-and-forget send into one that waits for a reply the driver does not
+        send on this path.
+        """
+        code = self._blank_string_literals(
+            strip_c_comments(read_source(FILTER_CONNECTION_CPP_PATH)))
+        start = code.find("bool SendMessageNoReply(")
+        self.assertGreater(
+            start, -1, "SendMessageNoReply definition not found")
+
+        m = re.search(r"(?<![A-Za-z0-9_])FilterSendMessage\s*\(", code[start:])
+        self.assertIsNotNone(
+            m, "SendMessageNoReply no longer calls FilterSendMessage")
+
+        abs_open = start + m.end() - 1
+        depth = 0
+        end = None
+        for j in range(abs_open, min(abs_open + 2000, len(code))):
+            if code[j] == "(":
+                depth += 1
+            elif code[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        self.assertIsNotNone(end, "could not brace-match the call")
+        args = [a.strip() for a in re.split(r",(?![^(]*\))", code[abs_open + 1:end])]
+
+        self.assertEqual(len(args), 6, "FilterSendMessage arity changed: %s" % args)
+        self.assertIn(
+            args[3], ("nullptr", "NULL"),
+            "the no-reply sender now passes an OUTPUT BUFFER (%s). This path is "
+            "fire-and-forget and the driver sends no reply on it, so supplying a "
+            "buffer would make the caller wait for something that never "
+            "arrives." % args[3])
+        self.assertEqual(
+            args[4], "0",
+            "the no-reply sender declares a non-zero output size (%s) while "
+            "passing no buffer" % args[4])
+        self.assertNotIn(
+            args[5], ("nullptr", "NULL", "0"),
+            "lpBytesReturned is null again, which terminates the process")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
