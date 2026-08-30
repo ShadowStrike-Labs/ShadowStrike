@@ -243,6 +243,19 @@ static PSSPM_MONITOR g_PerformanceMonitor = NULL;
 /// @brief Resource throttler handle (Phase 1B)
 static PRT_THROTTLER g_ResourceThrottler = NULL;
 
+//
+// Accounting for the ETW -> user-mode behavioural alert forward. These exist
+// because two different reasons for NOT forwarding an event must be told
+// apart: one is structural and permanent (the subject is our own service), the
+// other is load shedding and is the signal that the per-process budget below
+// needs tuning. A single "dropped" number could not distinguish them, and a
+// suppression path with no counter is indistinguishable from a path that never
+// runs. Reported on the unload path beside the other final statistics.
+//
+static volatile LONG64 g_EtwAlertsForwarded = 0;
+static volatile LONG64 g_EtwAlertsSuppressedSelf = 0;
+static volatile LONG64 g_EtwAlertsSuppressedBudget = 0;
+
 /// @brief Batch processor handle (Phase 1B)
 static PBP_PROCESSOR g_BatchProcessor = NULL;
 
@@ -497,6 +510,95 @@ ShadowStrikeEtwEventCallback(
         //    encrypted), and drops rather than faulting above APC_LEVEL.
         //
         SHADOWSTRIKE_BEHAVIORAL_ALERT alert;
+        HANDLE subjectPid = (HANDLE)(ULONG_PTR)Record->Header.ProcessId;
+
+        //
+        // DO NOT REPORT THE SCANNER'S OWN ACTIVITY BACK TO THE SCANNER.
+        //
+        // Every alert forwarded from here costs the user-mode service three
+        // WARN log writes (RealTimeProtection's BehavioralAlert case,
+        // BehaviorBlocker's chain escalation, and BufferOverflowProtection),
+        // and a log write is file I/O that re-enters our own minifilter, which
+        // produces further ETW events for this same callback. Forwarding our
+        // own events therefore closes a positive feedback loop that sustains
+        // itself once started, and it runs on the two user-mode threads that
+        // owe the kernel a scan verdict - so the machine stops answering file
+        // operations. The 1.0.97 field run measured 51,437 alerts in 4m02s, of
+        // which 19,825 named the service's own pid, with 27.7 MB of log written
+        // in the same window.
+        //
+        // This is the exact recursion ShadowStrikeIsScannerProcess was written
+        // for: its own contract in CommPort.h describes exempting the scanner's
+        // file I/O because it "would otherwise recurse into PreCreate ->
+        // SbSendScanRequest and exhaust the scanner worker pool". PreCreate has
+        // consulted it since the beginning; this producer never did.
+        //
+        // NO DETECTION IS LOST, and the reasoning matters because suppressing a
+        // detection feed is normally forbidden. What is suppressed is only the
+        // BEHAVIOURAL correlation feed for our own process, whose sole possible
+        // product is a decision about ourselves - and BehaviorBlocker acts on
+        // that by terminating the process tree, which is what took the 1.0.95
+        // logon session down. Attacks AGAINST this service keep their dedicated
+        // coverage: handle-based self-protection (ObjectCallback, ObRegisterCallbacks
+        // over PsProcessType/PsThreadType), HandleProtection, AntiDebug,
+        // AntiUnload, CallbackProtection, IntegrityMonitor and FileProtection in
+        // the kernel, plus SelfDefense / TamperProtection / ProcessProtection in
+        // user mode. None of those route through this callback. The event also
+        // still reaches the ETW telemetry stream; only the synchronous forward
+        // to the reply-blocking threads is withheld.
+        //
+        if (ShadowStrikeIsScannerProcess(subjectPid)) {
+            InterlockedIncrement64(&g_EtwAlertsSuppressedSelf);
+            return EcResult_Continue;
+        }
+
+        //
+        // BOUND THE PER-PROCESS RATE.
+        //
+        // Independently of the loop above, an unbounded forward is a denial of
+        // service: a process that generates ETW events in a tight loop starves
+        // the threads that answer kernel scan requests, which blinds the
+        // scanner without needing an exploit. The throttler exists for exactly
+        // this - DriverEntry's own configuration comment calls it "enterprise
+        // DoS mitigation" - and five hot callbacks already REPORT usage into
+        // it. Until now nothing anywhere in the driver ever asked it whether to
+        // proceed, so it measured everything and gated nothing.
+        //
+        // RtResourceEventQueue is used rather than RtResourceCallbackRate
+        // because ImageNotify.c already reports image-load volume into the
+        // latter; sharing one budget would let either producer exhaust the
+        // other's headroom.
+        //
+        // FAILS OPEN BY DESIGN: if the throttler is absent or the query fails
+        // the event is forwarded. A fault in a load-shedding mechanism must
+        // never be able to silence a detection feed.
+        //
+        {
+            PRT_THROTTLER throttler = ShadowStrikeGetResourceThrottler();
+
+            if (throttler != NULL) {
+                RT_THROTTLE_ACTION action = RtActionNone;
+                NTSTATUS throttleStatus;
+
+                (VOID)RtReportProcessUsage(
+                    throttler, subjectPid, RtResourceEventQueue, 1);
+
+                //
+                // Any action other than RtActionNone means the budget is
+                // exceeded. They are treated alike here deliberately: this path
+                // has exactly one sane response to being over budget, and
+                // honouring RtActionDelay literally would mean stalling an ETW
+                // callback that can run at DISPATCH_LEVEL.
+                //
+                throttleStatus = RtCheckProcessThrottle(
+                    throttler, subjectPid, RtResourceEventQueue, &action);
+
+                if (NT_SUCCESS(throttleStatus) && action != RtActionNone) {
+                    InterlockedIncrement64(&g_EtwAlertsSuppressedBudget);
+                    return EcResult_Continue;
+                }
+            }
+        }
 
         RtlZeroMemory(&alert, sizeof(alert));
 
@@ -527,6 +629,8 @@ ShadowStrikeEtwEventCallback(
             &alert,
             sizeof(alert)
         );
+
+        InterlockedIncrement64(&g_EtwAlertsForwarded);
     }
 
     return EcResult_Continue;
@@ -1724,6 +1828,31 @@ DriverEntry(
         RtSetRateConfig(g_ResourceThrottler, RtResourceHandleOps,
                         1000, 50000);
         RtEnableResource(g_ResourceThrottler, RtResourceHandleOps, TRUE);
+
+        //
+        // ETW -> user-mode behavioural alert forward, consulted by
+        // ShadowStrikeEtwEventCallback. This is the only resource in this block
+        // whose check is actually wired; the others are reported into and never
+        // queried.
+        //
+        // THESE NUMBERS ARE CHOSEN, NOT MEASURED, and the counters exist so the
+        // choice can be corrected with evidence rather than argued about. The
+        // soft limit is 600 per 10s monitoring interval, i.e. 60 events/second
+        // from any ONE process. Rationale: BehaviorBlocker escalates a chain
+        // from a handful of events, so 60/s is already far beyond what
+        // behavioural correlation can use, while remaining above the volume any
+        // single process was observed producing in the field once the feedback
+        // loop is removed (the busiest non-self process measured 57/s). The
+        // intent is to bound a runaway producer, not to discard traffic the
+        // product has actually been seen to handle. If
+        // g_EtwAlertsSuppressedBudget climbs on a healthy endpoint, this is the
+        // number to revisit - upward - after checking what is producing it.
+        //
+        RtSetLimits(g_ResourceThrottler, RtResourceEventQueue,
+                    600, 1200, 2400);
+        RtSetRateConfig(g_ResourceThrottler, RtResourceEventQueue,
+                        1000, 60);
+        RtEnableResource(g_ResourceThrottler, RtResourceEventQueue, TRUE);
 
         ShadowStrikeLogInitStatus("Resource Throttling", STATUS_SUCCESS);
     }
@@ -3921,6 +4050,18 @@ ShadowStrikeUnload(
                g_DriverData.Stats.FilesBlocked,
                g_DriverData.Stats.CacheHits,
                g_DriverData.TotalOperationsProcessed);
+
+    //
+    // Behavioural alert forward accounting. Emitted as its own line rather than
+    // appended to the statement above so the existing format string and its
+    // argument list stay paired.
+    //
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike] Final stats: BehavioralAlerts forwarded=%lld, "
+               "suppressed(self)=%lld, suppressed(budget)=%lld\n",
+               g_EtwAlertsForwarded,
+               g_EtwAlertsSuppressedSelf,
+               g_EtwAlertsSuppressedBudget);
 
     WriteBooleanRelease(&g_DriverData.Initialized, FALSE);
     g_InitFlags = InitFlag_None;

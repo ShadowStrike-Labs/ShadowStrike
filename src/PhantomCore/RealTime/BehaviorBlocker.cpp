@@ -104,6 +104,33 @@ constexpr size_t         kProcessKeyCacheMax       = 1024;
 constexpr float          kDecayLambda              = 0.01f;
 constexpr uint32_t       kChainAutoEscalateCount   = 3;
 
+//
+// Hard ceiling on retained events per correlation chain.
+//
+// The chain was previously bounded only by behaviorChainTimeoutSec, so its
+// length was set by whatever event rate the kernel happened to deliver. The
+// 1.0.97 field run accumulated roughly 20,000 entries for one pid inside the
+// 300 s window, each carrying a std::string ruleId, across 156 live pids. That
+// is unbounded per-process growth driven by an external rate.
+//
+// THIS CANNOT SUPPRESS AN ESCALATION THAT WOULD OTHERWISE FIRE, which is why it
+// is a safe bound rather than a calibration change. Worst case for a full
+// chain is every event at the lowest non-zero risk (Low = 0.15) and every event
+// aged the full 300 s, giving decay = exp(-0.01 * 300) = 0.0498 and a composite
+// of 256 * 0.15 * 0.0498 = 1.91, still comfortably above the 0.70 threshold.
+// Any chain shorter than this ceiling is unaffected in every respect. So the
+// only chains touched are ones already far past escalating.
+//
+constexpr size_t         kMaxChainEvents           = 256;
+
+//
+// Minimum spacing between chain-escalation WARN lines. Chosen, not measured:
+// long enough that a storming feed cannot turn our own logging into the load,
+// short enough to stay useful on a quiet machine. The suppressed count is
+// carried in the next line that does print, so no occurrence is lost.
+//
+constexpr int64_t        kEscalationLogIntervalMs  = 30000;
+
 constexpr float RiskToScore(RiskLevel r) noexcept {
     switch (r) {
         case RiskLevel::Safe:     return 0.0f;
@@ -1485,6 +1512,16 @@ private:
             chain.events.pop_front();
         }
 
+        //
+        // Count ceiling, applied after the time window. Oldest first, so the
+        // most recent evidence - the evidence a correlation decision is actually
+        // about - is what survives. See kMaxChainEvents for why this cannot
+        // change an escalation outcome.
+        //
+        while (chain.events.size() > kMaxChainEvents) {
+            chain.events.pop_front();
+        }
+
         // Recalculate composite score with time decay
         chain.compositeScore = 0.0f;
         for (const auto& e : chain.events) {
@@ -1520,21 +1557,60 @@ private:
         // kill, and the withholding is counted so the policy question can be answered
         // with field numbers instead of a guess.
         //
-        // The two log statements below are byte-for-byte the originals on purpose: this
-        // path has just been shown to storm, and our log writes traverse our own
-        // minifilter, so adding a per-event line would amplify the condition it reports.
-        // The withheld notice is therefore DEBUG and the COUNTER is the operator signal.
+        // THE ESCALATION NOTICE IS RATE-LIMITED, AND THAT CORRECTS MY OWN EARLIER
+        // REASONING RECORDED HERE.
+        //
+        // 11dd2e91 kept these two statements byte-for-byte identical to the
+        // originals and said so, on the grounds that adding a per-event line to a
+        // storming path would amplify the condition it reports. The reasoning was
+        // right and the conclusion was incomplete: the EXISTING line is itself
+        // one third of the storm. The 1.0.97 field run logged 51,184 escalation
+        // notices in 4m02s, part of 27.7 MB written in that window, and every one
+        // of those writes is file I/O that re-enters our own minifilter on the
+        // two threads that owe the kernel a scan verdict.
+        //
+        // Counted always, emitted at most once per interval with the suppressed
+        // total carried forward - the same treatment ReportQueueFull already
+        // applies to a bounded queue that is dropping. NOTHING IS HIDDEN: the
+        // volume of escalations is already recoverable from
+        // chainEscalationTerminationsWithheld, which is incremented per event
+        // below and is why no new statistic is added here.
         BlockAction escalated = currentAction;
         const bool alreadyTerminating = (currentAction == BlockAction::TerminateProcess);
         const wchar_t* escalationReason = nullptr;
+        bool scoreEscalation = false;
+        uint32_t escalationHighRisk = 0;
         if (chain.compositeScore >= m_config.escalationThreshold) {
             escalationReason = L"composite score";
-            SS_LOG_WARN(kLogCategory, L"CHAIN ESCALATION: PID %u score=%.2f >= %.2f",
-                behavior.processId, chain.compositeScore, m_config.escalationThreshold);
+            scoreEscalation = true;
         } else if (highRiskCount >= kChainAutoEscalateCount && !alreadyTerminating) {
             escalationReason = L"high-risk event count";
-            SS_LOG_WARN(kLogCategory, L"CHAIN ESCALATION: PID %u %u high-risk events",
-                behavior.processId, highRiskCount);
+            escalationHighRisk = highRiskCount;
+        }
+
+        if (escalationReason != nullptr) {
+            // Already holding m_chainMutex exclusively, so these two members need
+            // no separate synchronisation.
+            if ((now - m_lastEscalationLogMs) >= kEscalationLogIntervalMs) {
+                if (scoreEscalation) {
+                    SS_LOG_WARN(kLogCategory,
+                        L"CHAIN ESCALATION: PID %u score=%.2f >= %.2f "
+                        L"(%llu further escalation notice(s) suppressed since the last line)",
+                        behavior.processId, chain.compositeScore,
+                        m_config.escalationThreshold,
+                        static_cast<unsigned long long>(m_escalationLogsSuppressed));
+                } else {
+                    SS_LOG_WARN(kLogCategory,
+                        L"CHAIN ESCALATION: PID %u %u high-risk events "
+                        L"(%llu further escalation notice(s) suppressed since the last line)",
+                        behavior.processId, escalationHighRisk,
+                        static_cast<unsigned long long>(m_escalationLogsSuppressed));
+                }
+                m_lastEscalationLogMs = now;
+                m_escalationLogsSuppressed = 0;
+            } else {
+                ++m_escalationLogsSuppressed;
+            }
         }
         // Not counted when the rule ITSELF already asked to terminate: nothing was
         // upgraded in that case, so there is no withheld escalation to report. That
@@ -1751,6 +1827,10 @@ private:
 
     mutable std::shared_mutex       m_chainMutex;
     std::unordered_map<uint32_t, ProcessBehaviorChain> m_behaviorChains;
+    // Escalation-notice rate limiting. Guarded by m_chainMutex, which
+    // UpdateBehaviorChain already holds exclusively at every access.
+    int64_t                         m_lastEscalationLogMs{0};
+    uint64_t                        m_escalationLogsSuppressed{0};
 
     mutable std::shared_mutex       m_blockedMutex;
     // FIX: BB-N4 - see BlockedEntry. PID -> {creationTime, blockedAtMs}.

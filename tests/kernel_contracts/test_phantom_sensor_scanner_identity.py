@@ -9,6 +9,7 @@ vm_shrd/PhantomSensorScannerRecursion.
 
 from __future__ import annotations
 
+import math
 import re
 import unittest
 from dataclasses import dataclass
@@ -155,6 +156,9 @@ STACK_PIVOT_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/StackPivotDetec
 JIT_SPRAY_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/JITSprayDetector.cpp"
 JIT_SPRAY_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Exploits/JITSprayDetector.hpp"
 KERNEL_EXPLOIT_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Exploits/KernelExploitDetector.cpp"
+BUFFER_OVERFLOW_PROTECTION_CPP_PATH = (
+    ROOT / "src/PhantomCore/Exploits/BufferOverflowProtection.cpp"
+)
 ATOM_BOMBING_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombingDetector.cpp"
 ATOM_BOMBING_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Process/AtomBombingDetector.hpp"
 
@@ -12707,6 +12711,219 @@ class TokenIntegrityQueryContractTests(unittest.TestCase):
             "ProcessUtils.h no longer states an IRQL requirement anywhere. The primitive "
             "opens a handle and issues a Zw query, so a caller at raised IRQL would "
             "bugcheck, and the declaration is where that contract is published.")
+
+
+class BehaviouralAlertStormContractTests(unittest.TestCase):
+    """The 1.0.97 field failure: the product generated the events it reacted to.
+
+    The kernel ETW consumer forwarded a behavioural alert for every event with
+    Priority <= Normal, including events belonging to the scanner service
+    itself. Each alert cost three user-mode WARN lines, and a log write is file
+    I/O that re-enters our own minifilter and produces further ETW events, on
+    the two threads that owe the kernel a scan verdict. Measured: 51,437 alerts
+    and 27.7 MB of log in 4m02s, 19,825 of them naming our own pid.
+
+    Every assertion below is made against COMMENT-STRIPPED source, because the
+    comments written for this fix necessarily name every symbol being asserted -
+    a comment-blind check would be satisfied by prose alone.
+    """
+
+    @staticmethod
+    def _slice_definition(code, needle):
+        """Brace-match a definition located by a return-type-prefixed needle.
+
+        The needle must carry the return type. UpdateBehaviorChain in
+        particular is CALLED earlier in its own file than it is defined, so a
+        bare-name search would slice a call site instead.
+        """
+        start = code.find(needle)
+        if start < 0:
+            return None
+        brace = code.find("{", start)
+        if brace < 0:
+            return None
+        depth = 0
+        for i in range(brace, len(code)):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+        return None
+
+    def test_the_etw_producer_does_not_report_the_scanner_to_itself(self):
+        code = strip_c_comments(read_source(DRIVER_ENTRY_C_PATH))
+        body = extract_c_function(code, "ShadowStrikeEtwEventCallback")
+        self.assertIsNotNone(body, "ShadowStrikeEtwEventCallback not found")
+
+        send = body.find("ShadowStrikeBatchSendNotification")
+        self.assertGreater(
+            send, -1,
+            "the ETW callback no longer forwards a behavioural alert at all; this "
+            "guard is about WHICH events it forwards, not about removing the feed")
+
+        guard = body.find("ShadowStrikeIsScannerProcess")
+        self.assertGreater(
+            guard, -1,
+            "ShadowStrikeEtwEventCallback does not consult ShadowStrikeIsScannerProcess, "
+            "so the scanner service's own activity is forwarded back to the scanner "
+            "service as a behavioural alert. That closes a feedback loop: each alert "
+            "produces log writes, each log write is file I/O through our own "
+            "minifilter, and each of those produces more ETW events.")
+        self.assertLess(
+            guard, send,
+            "the scanner-process check appears AFTER the forward in "
+            "ShadowStrikeEtwEventCallback, so it cannot prevent one")
+
+    def test_the_etw_producer_bounds_the_per_process_rate(self):
+        code = strip_c_comments(read_source(DRIVER_ENTRY_C_PATH))
+        body = extract_c_function(code, "ShadowStrikeEtwEventCallback")
+        self.assertIsNotNone(body, "ShadowStrikeEtwEventCallback not found")
+
+        send = body.find("ShadowStrikeBatchSendNotification")
+        check = body.find("RtCheckProcessThrottle")
+        self.assertGreater(
+            check, -1,
+            "the ETW callback does not consult RtCheckProcessThrottle. Without it an "
+            "unbounded per-process event rate starves the threads that answer kernel "
+            "scan requests, which blinds the scanner without needing an exploit.")
+        self.assertLess(
+            check, send,
+            "the throttle check appears AFTER the forward, so it cannot prevent one")
+        self.assertTrue(
+            "RtResourceEventQueue" in body,
+            "the ETW callback no longer names RtResourceEventQueue. It must not share "
+            "RtResourceCallbackRate, which ImageNotify.c already reports image-load "
+            "volume into - one producer would exhaust the other's headroom.")
+        self.assertTrue(
+            "NT_SUCCESS(throttleStatus)" in body,
+            "the suppression is no longer conditional on the throttle query having "
+            "SUCCEEDED. A fault in a load-shedding mechanism must never be able to "
+            "silence a detection feed, so this path fails OPEN by design.")
+
+        self.assertTrue(
+            "RtEnableResource(g_ResourceThrottler, RtResourceEventQueue, TRUE)" in code,
+            "RtResourceEventQueue is never enabled, so the budget the callback "
+            "consults does not exist and the check can never bind")
+
+    def test_the_overflow_module_does_not_consume_a_behavioural_alert(self):
+        code = strip_c_comments(read_source(BUFFER_OVERFLOW_PROTECTION_CPP_PATH))
+        start = code.find('RegisterGenericHandler("BufferOverflowProtection"')
+        self.assertGreater(
+            start, -1,
+            "BufferOverflowProtection no longer registers a generic handler at all")
+        lam = code[start:start + 1500]
+
+        offenders = re.findall(
+            r"(?<![A-Za-z0-9_])FilterMessageType_BehavioralAlert(?![A-Za-z0-9_])", lam)
+        self.assertEqual(
+            offenders, [],
+            "BufferOverflowProtection accepts FilterMessageType_BehavioralAlert again. "
+            "It has no parser for that payload: HandleKernelMemoryAlert reads "
+            "[uint32 pid][uint32 exceptionCode][uint64 addr] while "
+            "SHADOWSTRIKE_BEHAVIORAL_ALERT is [ProcessId][ParentProcessId][ThreadId], "
+            "so exceptionCode is read out of ParentProcessId - which the driver "
+            "hardcodes to 0. Every alert then classifies as OverflowType::Unknown and "
+            "logs 'Exploit detected'. 51,437 of those were measured in 4m02s.")
+
+        self.assertTrue(
+            "FilterMessageType_MemoryAlert" in lam,
+            "BufferOverflowProtection no longer accepts FilterMessageType_MemoryAlert, "
+            "which is the only type it can parse. Removing it would delete the "
+            "module's kernel feed rather than correct it.")
+
+    def test_an_exception_analysis_refuses_a_zero_exception_code(self):
+        code = strip_c_comments(read_source(BUFFER_OVERFLOW_PROTECTION_CPP_PATH))
+        body = self._slice_definition(code, "void HandleKernelMemoryAlert(")
+        self.assertIsNotNone(body, "HandleKernelMemoryAlert definition not found")
+
+        # The zero must be a COMPLETE token. An earlier version of this
+        # assertion used ==\\s*0 with no trailing boundary, and a mutation
+        # changing the comparison to == 0xFFFFFFFFul still satisfied it because
+        # the pattern matched the leading 0 of the hex literal. The guard was
+        # undiscriminating on the one invariant it exists to protect.
+        self.assertTrue(
+            re.search(r"ctx\.exceptionCode\s*==\s*0(?![A-Za-z0-9_])", body) is not None,
+            "HandleKernelMemoryAlert no longer refuses a zero exception code. Zero is "
+            "not an NTSTATUS exception value, so the only verdict reachable from it is "
+            "OverflowType::Unknown - a fabricated finding rather than an absent one. "
+            "This guard is deliberately independent of the message-type filter: the "
+            "storm arrived through the wrong type, but it became a DETECTION because "
+            "this function was willing to classify a zero code.")
+
+    def test_the_correlation_chain_has_a_count_ceiling(self):
+        code = strip_c_comments(read_source(BEHAVIOR_BLOCKER_CPP_PATH))
+
+        m = re.search(r"kMaxChainEvents\s*=\s*(\d+)", code)
+        self.assertIsNotNone(
+            m,
+            "kMaxChainEvents is gone, so a correlation chain is bounded only by time. "
+            "At the field event rate that reached ~20,000 entries for one pid, each "
+            "holding a std::string, across 156 live pids.")
+        ceiling = int(m.group(1))
+
+        body = self._slice_definition(code, "BlockAction UpdateBehaviorChain(")
+        self.assertIsNotNone(body, "UpdateBehaviorChain definition not found")
+        self.assertTrue(
+            "kMaxChainEvents" in body,
+            "UpdateBehaviorChain does not apply kMaxChainEvents, so the ceiling is "
+            "declared and never enforced")
+
+        # The ceiling must not be able to suppress an escalation that would
+        # otherwise fire. Worst case is every retained event at the lowest
+        # non-zero risk and aged the full window.
+        worst = ceiling * 0.15 * math.exp(-0.01 * 300.0)
+        self.assertGreater(
+            worst, 0.70,
+            "a full chain at the lowest non-zero risk and maximum age now scores "
+            "%.3f, which is at or below the 0.70 escalation threshold. The count "
+            "ceiling has become a calibration change: it can now suppress an "
+            "escalation that would previously have fired." % worst)
+
+    def test_the_escalation_notice_is_rate_limited(self):
+        code = strip_c_comments(read_source(BEHAVIOR_BLOCKER_CPP_PATH))
+        self.assertTrue(
+            "kEscalationLogIntervalMs" in code,
+            "kEscalationLogIntervalMs is gone, so the chain-escalation notice is "
+            "emitted once per event again. That line was one third of a 27.7 MB log "
+            "storm, and our log writes traverse our own minifilter.")
+
+        body = self._slice_definition(code, "BlockAction UpdateBehaviorChain(")
+        self.assertIsNotNone(body, "UpdateBehaviorChain definition not found")
+
+        unguarded = []
+        for m in re.finditer(r"SS_LOG_WARN", body):
+            # Scan BACKWARD: the interval test necessarily precedes the emission.
+            if "kEscalationLogIntervalMs" not in body[:m.start()]:
+                unguarded.append(body[:m.start()].count("\n") + 1)
+        self.assertEqual(
+            unguarded, [],
+            "SS_LOG_WARN is reached in UpdateBehaviorChain without any preceding "
+            "kEscalationLogIntervalMs test, at body line(s) %s" % unguarded)
+
+        self.assertTrue(
+            "m_escalationLogsSuppressed" in body,
+            "the suppressed-notice count is no longer carried, so occurrences "
+            "between emitted lines are silently lost rather than summarised")
+
+    def test_the_per_alert_kernel_line_is_not_a_warning(self):
+        code = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        start = code.find("case FilterMessageType_BehavioralAlert:")
+        self.assertGreater(
+            start, -1, "the BehavioralAlert case is gone from the RTP dispatcher")
+        nxt = code.find("case FilterMessageType_", start + 10)
+        arm = code[start:nxt if nxt > 0 else start + 2500]
+
+        offenders = [ln.strip()[:90] for ln in arm.split("\n")
+                     if "Logger::Warn" in ln and "payload" in ln]
+        self.assertEqual(
+            offenders, [],
+            "the per-alert kernel line is a WARN again: %s. It reports a payload BYTE "
+            "COUNT and nothing else - no process, no behaviour, no verdict - and fired "
+            "51,169 times in 4m02s as one third of a 27.7 MB log storm. The alert "
+            "volume stays observable from the driver's forwarded/suppressed counters "
+            "and from chainEscalationTerminationsWithheld." % offenders)
 
 
 if __name__ == "__main__":

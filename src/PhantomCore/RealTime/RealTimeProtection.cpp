@@ -5951,7 +5951,25 @@ public:
             }
 
             case FilterMessageType_BehavioralAlert: {
-                Utils::Logger::Warn("RealTimeProtection: Behavioral alert from kernel (payload {} bytes)", size);
+                //
+                // DEBUG, NOT WARN, AND THE REASON IS THE LINE'S OWN CONTENT.
+                //
+                // This statement reports a payload BYTE COUNT and nothing else -
+                // it names no process, no behaviour and no verdict, so it cannot
+                // support a diagnosis on its own. It fired once per kernel
+                // behavioural alert: 51,169 times in 4m02s in the 1.0.97 field
+                // run, one third of a 27.7 MB log storm, and each write is file
+                // I/O that re-enters our own minifilter while this thread owes
+                // the kernel a scan verdict.
+                //
+                // The alert VOLUME remains observable without it, from the
+                // driver's own forwarded / suppressed(self) / suppressed(budget)
+                // accounting and from BehaviorBlocker's
+                // chainEscalationTerminationsWithheld. A third count of the same
+                // phenomenon would add no information, which is why one is not
+                // added here.
+                //
+                Utils::Logger::Debug("RealTimeProtection: Behavioral alert from kernel (payload {} bytes)", size);
                 m_stats.threatsDetected++;
 
                 if (data && size > 0) {
