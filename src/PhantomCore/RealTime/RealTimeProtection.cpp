@@ -5444,7 +5444,33 @@ public:
                 req.signatureLevel, static_cast<bool>(req.isSystemModule));
 
             // Stolen certificate or critical anomaly → immediate block
-            if (sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) {
+            // OUR OWN INSTALLED BINARIES CARRY A DEV CERTIFICATE THIS MACHINE
+            // DOES NOT TRUST, so the signature analyser scores them. The 1.0.99
+            // field log flagged ShadowStrikePhantomTray.exe at riskScore >= 60,
+            // and this branch BLOCKS at 90 - so blocking our own tray's module
+            // load was latent, not hypothetical.
+            //
+            // The guard that already exists for the file-scan path is applied
+            // here too. It withholds the BLOCK and nothing else: analysis
+            // continues through packer detection and the ScanEngine below, so an
+            // IDENTIFICATION can still convict our own binary if it really has
+            // been replaced. Path-based, which is a stated limitation rather than
+            // a hidden one - TamperProtection hashes these files, FileProtection
+            // hardens their ACLs, and the driver denies writes to them.
+            const bool ownBinary = IsOwnInstalledBinary(imagePath);
+
+            if ((sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) && ownBinary) {
+                m_stats.ownBinaryBlockWithheld++;
+                Utils::Logger::Warn(
+                    "RealTimeProtection: signature analysis scored our OWN installed "
+                    "binary in PID {}: {} [stolenCert={} riskScore={} anomalies={}] - "
+                    "withholding the block and continuing to full analysis, which can "
+                    "still convict on identification evidence",
+                    req.processId, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)),
+                    sigAnalysis.isStolenCert ? "YES" : "NO",
+                    sigAnalysis.riskScore, sigAnalysis.anomalies.size());
+            }
+            else if (sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) {
                 Utils::Logger::Error(
                     "RealTimeProtection: BLOCKED APT-signed module in PID {}: {} "
                     "[stolenCert={} riskScore={} anomalies={}]",
@@ -5469,12 +5495,24 @@ public:
             }
 
             // High-risk anomalies (but not critical) → log and flag for deeper scan
-            if (sigAnalysis.riskScore >= 60) {
+            if (sigAnalysis.riskScore >= 60 && !ownBinary) {
                 Utils::Logger::Warn(
                     "RealTimeProtection: High-risk signature on module in PID {}: {} "
                     "[riskScore={} anomalies={}]",
                     req.processId, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)),
                     sigAnalysis.riskScore, sigAnalysis.anomalies.size());
+            }
+            else if (sigAnalysis.riskScore >= 60) {
+                // Ours, and expected: an untrusted dev certificate scores here on
+                // every load. Recorded at Debug so it stays visible when someone
+                // is looking for it without asserting a finding on every module
+                // load of every one of our own binaries.
+                Utils::Logger::Debug(
+                    "RealTimeProtection: signature analysis scored our own binary in "
+                    "PID {}: {} [riskScore={}] - expected while the shipped signing "
+                    "certificate is not trusted by this machine",
+                    req.processId, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)),
+                    sigAnalysis.riskScore);
             }
 
             // Valid Microsoft/EV signature with no anomalies → fast-path allow
@@ -5858,23 +5896,53 @@ public:
             case FilterMessageType_HandleAlert: {
                 if (size >= sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION)) {
                     auto* alert = static_cast<const SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION*>(data);
-                    if (alert->SuspicionScore >= 70) {
-                        Utils::Logger::Warn("RealTimeProtection: Suspicious handle operation  -  "
-                            "Source PID: {} -> Target PID: {}, Score: {}, Access: 0x{:08X}",
-                            alert->SourceProcessId, alert->TargetProcessId,
-                            alert->SuspicionScore, alert->RequestedAccess);
-                    }
 
-                    // Route to ProcessProtection for access filtering,
-                    // telemetry, and coordinated kernel-user threat response
-                    if (Security::ProcessProtection::HasInstance()) {
-                        Security::ProcessProtection::Instance().OnKernelHandleAlert(
-                            alert->SourceProcessId,
-                            alert->TargetProcessId,
-                            alert->RequestedAccess,
-                            alert->GrantedAccess,
-                            alert->SuspicionScore,
-                            alert->SuspiciousFlags);
+                    // OUR OWN OUTBOUND HANDLE WORK IS NOT AN ATTACK.
+                    //
+                    // This service opens PROCESS_ALL_ACCESS handles to system
+                    // processes by design, and the kernel object callback scores
+                    // that shape as suspicious. Every one of the eight warnings in
+                    // the 1.0.99 field log named our own pid as the source.
+                    //
+                    // ONLY THE SOURCE SIDE IS EXEMPT, and the asymmetry is the
+                    // point: an alert whose TARGET is us is another process
+                    // reaching into this one, which is precisely what
+                    // ProcessProtection's protected-process filter exists to act
+                    // on. Exempting that direction would delete self-protection
+                    // rather than de-noise it. ProcessInjectionDetector exempts
+                    // both directions because it is an injection ANALYSER that
+                    // must not analyse itself; this consumer is the
+                    // self-protection path, so it must keep the inbound case.
+                    //
+                    // NO COVERAGE IS LOST. An attacker already executing inside
+                    // this process is covered by AntiDebug, MemoryProtection,
+                    // TamperProtection, the integrity verifier and the driver's
+                    // own self-protection. Handle-operation heuristics cannot
+                    // discriminate there anyway, because our legitimate work has
+                    // the same shape - which is why they fired on us and not on
+                    // anything else.
+                    if (alert->SourceProcessId == OwnProcessId()) {
+                        m_stats.ownHandleOperationsNotFlagged++;
+                    }
+                    else {
+                        if (alert->SuspicionScore >= 70) {
+                            Utils::Logger::Warn("RealTimeProtection: Suspicious handle operation  -  "
+                                "Source PID: {} -> Target PID: {}, Score: {}, Access: 0x{:08X}",
+                                alert->SourceProcessId, alert->TargetProcessId,
+                                alert->SuspicionScore, alert->RequestedAccess);
+                        }
+
+                        // Route to ProcessProtection for access filtering,
+                        // telemetry, and coordinated kernel-user threat response
+                        if (Security::ProcessProtection::HasInstance()) {
+                            Security::ProcessProtection::Instance().OnKernelHandleAlert(
+                                alert->SourceProcessId,
+                                alert->TargetProcessId,
+                                alert->RequestedAccess,
+                                alert->GrantedAccess,
+                                alert->SuspicionScore,
+                                alert->SuspiciousFlags);
+                        }
                     }
                 }
                 break;
@@ -6473,6 +6541,17 @@ public:
     // is admin-write-only and separately guarded by FileProtection, and the
     // alternative is a guaranteed self-inflicted denial of service against our
     // own UI weighed against a heuristic that was 32.7% confident.
+    /// @brief This process's own pid, resolved once.
+    ///
+    ///        ProcessInjectionDetector already guards its own consumer of the very
+    ///        same kernel handle alert this way (m_selfPid, ProcessInjectionDetector
+    ///        .cpp:1982), so the pattern is not new here - it was simply missing
+    ///        from this consumer.
+    [[nodiscard]] static uint32_t OwnProcessId() noexcept {
+        static const uint32_t s_pid = static_cast<uint32_t>(::GetCurrentProcessId());
+        return s_pid;
+    }
+
     [[nodiscard]] bool IsOwnInstalledBinary(const std::wstring& filePath) const noexcept {
         try {
             // Resolved once. The set is fixed for the process lifetime because it
@@ -7022,6 +7101,14 @@ public:
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
         const uint64_t notLocal     = m_stats.contentNotLocalNotExamined.load(std::memory_order_relaxed);
         const uint64_t sandboxCap   = m_stats.sandboxEvasionCapabilityDetected.load(std::memory_order_relaxed);
+        // Both are SELF-EXEMPTION counters. They are reported because an
+        // exemption nobody can see is how a de-noising guard quietly becomes a
+        // blind spot. ownBinaryBlockWithheld already existed and was never
+        // published anywhere, so it could only ever be read with a debugger.
+        const uint64_t ownBinWithheld =
+            m_stats.ownBinaryBlockWithheld.load(std::memory_order_relaxed);
+        const uint64_t ownHandleOps =
+            m_stats.ownHandleOperationsNotFlagged.load(std::memory_order_relaxed);
 
         // Saturation is "no worker free AND work waiting". Busy-with-nothing-queued
         // is a fully used pool keeping up, which is the desired state, not a
@@ -7070,13 +7157,14 @@ public:
             "contentNotLocalNotExamined={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
+            "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
             "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc);
+            exitBlockIgn, ownBinWithheld, ownHandleOps, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
@@ -7629,6 +7717,7 @@ void RTPStatistics::Reset() noexcept {
     threatsDetected = 0;
     kernelThreatAlerts = 0;
     kernelTelemetryEvents = 0;
+    ownHandleOperationsNotFlagged = 0;
     performance.Reset();
     lastReset = std::chrono::system_clock::now();
 }

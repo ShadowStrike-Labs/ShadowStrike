@@ -1134,6 +1134,27 @@ struct alignas(64) RTPStatistics {
     ///        dead", and a dead feed is invisible in every other statistic here.
     std::atomic<uint64_t> kernelTelemetryEvents{ 0 };
 
+    /// @brief Kernel handle alerts whose SOURCE was this process, not reported as
+    ///        suspicious.
+    ///
+    ///        This service opens full-access handles to system processes by
+    ///        design - ProcessProtection hardening them, memory scanning, trust
+    ///        determination - and the kernel's object callback scores exactly that
+    ///        shape as suspicious. The 1.0.99 field log shows the result: all
+    ///        EIGHT "Suspicious handle operation" warnings named our own pid as
+    ///        the source, with scores of 110 and 135 and PROCESS_ALL_ACCESS.
+    ///
+    ///        Not merely log noise. The alert was routed on to ProcessProtection,
+    ///        which filters it against the protected-process set and can raise a
+    ///        blocked-access alert - so the product could accuse itself of
+    ///        attacking itself. Feeding our own activity into a suspicion score is
+    ///        also how 1.0.95 terminated 37 process trees.
+    ///
+    ///        Counted rather than silently dropped: a self-exemption that grows
+    ///        without anybody seeing it is the failure mode this project has paid
+    ///        for repeatedly.
+    std::atomic<uint64_t> ownHandleOperationsNotFlagged{ 0 };
+
     // Performance metrics
     PerformanceMetrics performance;
 

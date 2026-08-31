@@ -13410,5 +13410,137 @@ class ThreatCounterEvidenceClassContractTests(unittest.TestCase):
             "the threatsDetected key must publish threatsDetected")
 
 
+class SelfActivityNotFlaggedContractTests(unittest.TestCase):
+    """The product must not report its own activity as an attack on itself.
+
+    TWO MEASURED INSTANCES in the 1.0.99 field log.
+
+    (1) All EIGHT "Suspicious handle operation" warnings named our own pid as the
+        SOURCE, scores 110 and 135, PROCESS_ALL_ACCESS. This service opens such
+        handles by design. The alert was also routed to ProcessProtection, which
+        filters it against the protected-process set and can raise a blocked-access
+        alert, so the product could accuse itself of attacking itself - and feeding
+        our own activity into a suspicion score is how 1.0.95 terminated 37 process
+        trees.
+
+    (2) "High-risk signature on module in PID 2300: ShadowStrikePhantomTray.exe" -
+        our own shipped binary, scored because its signing certificate is not
+        trusted by the machine. The same branch BLOCKS at riskScore >= 90, so
+        blocking our own tray's module load was latent.
+
+    IsOwnInstalledBinary already existed and was applied on the file-scan path but
+    not on image load; ProcessInjectionDetector already guarded the identical
+    handle alert with m_selfPid. Both fixes apply a pattern the tree already had.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.hpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+
+    def _definition_body(self, code, needle):
+        self.assertEqual(
+            code.count(needle), 1,
+            "expected exactly one definition matching %r, found %d"
+            % (needle, code.count(needle)))
+        start = code.index(needle)
+        depth = 0
+        i = code.index("{", start)
+        while i < len(code):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+            i += 1
+        self.fail("unterminated body for %r" % needle)
+
+    def _brace_block_from(self, code, marker):
+        """The braced block that opens at the first '{' at or after marker."""
+        k = code.find(marker)
+        self.assertNotEqual(k, -1, "marker %r not found" % marker)
+        i = code.index("{", k)
+        depth = 0
+        j = i
+        while j < len(code):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[i:j + 1]
+            j += 1
+        self.fail("unterminated block after %r" % marker)
+
+    def _handle_alert_case(self):
+        body = self._definition_body(self.cpp, "void OnKernelGenericEvent(")
+        start = body.find("case FilterMessageType_HandleAlert:")
+        self.assertNotEqual(start, -1, "the HandleAlert case is gone")
+        nxt = body.find("case FilterMessageType_", start + 1)
+        return body[start:nxt if nxt != -1 else len(body)]
+
+    def test_our_own_outbound_handle_work_is_not_reported_as_suspicious(self):
+        case = self._handle_alert_case()
+        self.assertTrue(
+            "alert->SourceProcessId == OwnProcessId()" in case,
+            "the HandleAlert case does not exempt alerts sourced from this "
+            "process, so our own handle work is reported as suspicious again")
+        self.assertTrue(
+            "m_stats.ownHandleOperationsNotFlagged++" in case,
+            "the exemption must be counted; a self-exemption nobody can see is "
+            "how a de-noising guard becomes a blind spot")
+
+    def test_the_exemption_is_source_only_so_self_protection_survives(self):
+        # THE ASYMMETRY IS THE WHOLE POINT. An alert whose TARGET is us is another
+        # process reaching into this one, which is exactly what ProcessProtection's
+        # protected-process filter exists to act on. Exempting that direction would
+        # delete self-protection rather than de-noise it.
+        case = self._handle_alert_case()
+        self.assertFalse(
+            "TargetProcessId == OwnProcessId" in case,
+            "the HandleAlert case now exempts alerts TARGETING this process; that "
+            "removes self-protection instead of removing noise")
+        self.assertTrue(
+            "OnKernelHandleAlert(" in case,
+            "the route to ProcessProtection was deleted; the inbound case must "
+            "still reach the access filter")
+
+    def test_our_own_binary_keeps_its_block_withheld_not_its_analysis(self):
+        body = self._definition_body(
+            self.cpp, "Communication::KernelVerdict OnKernelImageLoad(")
+        self.assertTrue(
+            "IsOwnInstalledBinary(imagePath)" in body,
+            "the image-load path does not consult IsOwnInstalledBinary, so our "
+            "own dev-signed binaries can still be blocked at module load")
+
+        withheld = self._brace_block_from(body, "&& ownBinary) {")
+        self.assertTrue(
+            "m_stats.ownBinaryBlockWithheld++" in withheld,
+            "the withheld block is not counted")
+        # Withholding a BLOCK must not withhold ANALYSIS. A return here would skip
+        # packer detection and the ScanEngine pass below, turning a de-noising
+        # guard into a blanket exemption for our own binaries.
+        self.assertFalse(
+            "return Communication::KernelVerdict::" in withheld,
+            "the withhold branch returns a verdict, which skips the remaining "
+            "analysis; it must fall through so an identification can still convict")
+
+    def test_the_self_exemption_counters_are_reported_and_reset(self):
+        for field in ("ownBinaryBlockWithheld", "ownHandleOperationsNotFlagged"):
+            self.assertTrue(
+                field + "={}" in self.cpp,
+                "%s is never published, so the exemption cannot be seen in the "
+                "field" % field)
+        reset = self._definition_body(self.cpp, "void RTPStatistics::Reset()")
+        self.assertTrue(
+            "ownHandleOperationsNotFlagged = 0;" in reset,
+            "ownHandleOperationsNotFlagged is not reset, so it keeps its "
+            "pre-reset value")
+        self.assertTrue(
+            "std::atomic<uint64_t> ownHandleOperationsNotFlagged" in self.hpp,
+            "ownHandleOperationsNotFlagged is not declared as an atomic counter")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
