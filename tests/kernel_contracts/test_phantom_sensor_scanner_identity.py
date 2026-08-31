@@ -244,6 +244,7 @@ TOR_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/TorDetector.cpp"
 TOR_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/TorDetector.hpp"
 VPN_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.cpp"
 VPN_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.hpp"
+HONEYPOT_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneyPotManager.cpp"
 
 # IPLeakProtection is the opposite case from Tor/VPN: its kill switch is REAL
 # (registered WFP sublayer, netsh via CreateProcessW, iphlpapi), so the defect
@@ -13540,6 +13541,157 @@ class SelfActivityNotFlaggedContractTests(unittest.TestCase):
         self.assertTrue(
             "std::atomic<uint64_t> ownHandleOperationsNotFlagged" in self.hpp,
             "ownHandleOperationsNotFlagged is not declared as an atomic counter")
+
+
+class HoneypotDeploymentContractTests(unittest.TestCase):
+    """A decoy must be created with the one operation that is allowed to succeed.
+
+    MEASURED IN THE 1.0.99 FIELD LOG. Eleven ransomware decoys failed to deploy
+    into C:\\Users\\Shado\\Downloads and C:\\Users\\Shado\\OneDrive\\Resimler. The chain
+    per decoy was identical:
+
+        ReplaceFileAtomic: MoveFileExW failed ... WinError 5 (access denied)
+        RemoveFile: DeleteFileW failed        ... WinError 5 (access denied)
+        TempFileGuard: Failed to remove       ... WinError 0 (success!)
+
+    So the temp file CREATION succeeded, the rename was denied, and the cleanup
+    delete was denied - leaving eleven undeletable .~*.tmp files in folders
+    belonging to the user. Running as SYSTEM, so this is not a privilege problem,
+    and error 5 rather than 32 means it is not a sharing violation either.
+
+    WriteAllBytesAtomic earns atomicity by writing a temp and renaming over the
+    target, which is right for REPLACING content and pointless for a file that
+    must not already exist. Creating the decoy in place uses only the operation
+    observed to work and strands nothing on failure.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fu_cpp = strip_c_comments(read_source(FILE_UTILS_CPP_PATH))
+        cls.fu_hpp = strip_c_comments(read_source(FILE_UTILS_HPP_PATH))
+        cls.hp_cpp = strip_c_comments(read_source(HONEYPOT_MANAGER_CPP_PATH))
+
+    def _definition_body(self, code, needle):
+        self.assertEqual(
+            code.count(needle), 1,
+            "expected exactly one definition matching %r, found %d"
+            % (needle, code.count(needle)))
+        start = code.index(needle)
+        depth = 0
+        i = code.index("{", start)
+        while i < len(code):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+            i += 1
+        self.fail("unterminated body for %r" % needle)
+
+    def test_the_decoy_is_created_in_place_not_renamed_over(self):
+        body = self._definition_body(
+            self.hp_cpp, "void HoneypotManagerImpl::CreateHoneypotFile(")
+        self.assertTrue(
+            "FileUtils::WriteNewFileExclusive(" in body,
+            "the decoy is not created in place; the temp-and-rename path is the "
+            "one the field proved is denied, and it is what strands .~*.tmp files "
+            "in the user's folders")
+        self.assertFalse(
+            "WriteAllBytesAtomic" in body,
+            "CreateHoneypotFile still uses the atomic replace primitive, which "
+            "performs a rename that buys no atomicity for a file that must not "
+            "already exist")
+
+    def _create_file_call_args(self, body):
+        """The argument list of the CreateFileW call, by parenthesis matching.
+
+        ASSERTING ON THE WHOLE BODY IS UNSOUND HERE and the mutation proof caught
+        it: strip_c_comments does not touch STRING LITERALS, and this function's
+        own failure message contains the text "CreateFileW(CREATE_NEW) failed".
+        A body-wide search for CREATE_NEW was therefore satisfied by the log
+        message, so replacing the real flag with CREATE_ALWAYS produced no
+        failure. The flags must be read from the call itself.
+        """
+        k = body.find("CreateFileW(")
+        self.assertNotEqual(k, -1, "the CreateFileW call is gone")
+        i = k + len("CreateFileW(")
+        depth = 1
+        while i < len(body) and depth:
+            if body[i] == "(":
+                depth += 1
+            elif body[i] == ")":
+                depth -= 1
+            i += 1
+        return body[k:i]
+
+    def test_the_new_primitive_keeps_the_properties_that_make_it_safe(self):
+        # These two flags are the reason this is a FileUtils primitive rather than
+        # a bare CreateFileW at the call site. Losing either turns a decoy write
+        # into either an overwrite of a real file or a redirected write.
+        body = self._definition_body(
+            self.fu_cpp, "bool WriteNewFileExclusive(std::wstring_view path, const std::byte* data, size_t len, Error* err)")
+        args = self._create_file_call_args(body)
+        self.assertTrue(
+            "CREATE_NEW" in args,
+            "the CreateFileW call in WriteNewFileExclusive no longer passes "
+            "CREATE_NEW, so it can overwrite an existing file the caller does not "
+            "own. Disposition passed: %r"
+            % (args[-160:] if len(args) > 160 else args))
+        self.assertTrue(
+            "FILE_FLAG_OPEN_REPARSE_POINT" in args,
+            "the CreateFileW call no longer passes FILE_FLAG_OPEN_REPARSE_POINT, "
+            "so a pre-planted link can redirect the write to a victim path")
+        self.assertTrue(
+            "ValidatePath(path)" in body,
+            "WriteNewFileExclusive does not validate its path")
+        self.assertTrue(
+            "RemoveFile(target, &rmErr)" in body,
+            "a partially written file is no longer removed, or its removal error "
+            "is no longer captured")
+        self.assertTrue(
+            "WriteNewFileExclusive" in self.fu_hpp,
+            "WriteNewFileExclusive is not declared in the header")
+
+    def test_a_failed_removal_reports_the_error_it_actually_got(self):
+        # Both guards previously read GetLastError() AFTER RemoveFile had already
+        # logged, and that logging resets the thread's last error - which is how a
+        # failure came to be reported as "WinError 0: the operation completed
+        # successfully". A cause that contradicts the failure is worse than none.
+        atomic = self._definition_body(
+            self.fu_cpp, "bool WriteAllBytesAtomic(std::wstring_view path, const std::byte* data, size_t len, Error* err)")
+        self.assertTrue(
+            "RemoveFile(tmp, &rmErr)" in atomic,
+            "TempFileGuard calls RemoveFile without capturing its error, so a "
+            "failed cleanup will again report whatever last error the logging "
+            "left behind")
+        self.assertFalse(
+            "if (!RemoveFile(tmp))" in atomic,
+            "the error-discarding RemoveFile call is back in TempFileGuard")
+
+    def test_the_deployment_failure_reason_is_not_discarded(self):
+        body = self._definition_body(
+            self.hp_cpp, "void HoneypotManagerImpl::CreateHoneypotFile(")
+        self.assertTrue(
+            "writeErr.win32" in body,
+            "the Win32 cause is captured into writeErr and then discarded again, "
+            "so a deployment failure names no reason and diagnosing it requires "
+            "correlating separate FileUtils log lines")
+
+    def test_the_cycle_summary_reports_failures_and_not_only_successes(self):
+        body = self._definition_body(self.hp_cpp, "bool HoneypotManagerImpl::DeployTraps(")
+        self.assertTrue(
+            "m_cycleDeployFailures" in body,
+            "DeployTraps does not consult the per-cycle failure count, so a cycle "
+            "in which decoys failed reads the same as one where none did")
+        self.assertTrue(
+            "FAILED" in body,
+            "the summary does not report failures; a location counts as seeded "
+            "when one decoy lands, and per-decoy success is logged at Debug which "
+            "production filters, so neither number was visible")
+        self.assertTrue(
+            "m_cycleDeployFailures.fetch_add" in self.hp_cpp,
+            "nothing increments the failure count, so it is a structural zero")
 
 
 if __name__ == "__main__":

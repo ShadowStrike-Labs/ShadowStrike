@@ -272,6 +272,15 @@ private:
     HoneypotStatusCallback m_statusCallback;
 
     mutable HoneypotStatistics m_stats;
+
+    // Per-cycle deployment failure accounting. DeployTraps used to report only
+    // how many LOCATIONS were seeded, so a cycle in which individual decoys
+    // failed looked identical to one in which they all succeeded - and the
+    // per-decoy success is logged at Debug, which production filters. Eleven
+    // decoys failed in the 1.0.99 field run and the summary said only
+    // "3 locations seeded".
+    std::atomic<uint64_t> m_cycleDeployFailures{0};
+    std::atomic<uint32_t> m_lastDeployWin32{0};
 };
 
 // ============================================================================
@@ -371,16 +380,41 @@ bool HoneypotManagerImpl::DeployTraps() {
             return a.priority > b.priority;
         });
 
+    m_cycleDeployFailures.store(0, std::memory_order_relaxed);
+    m_lastDeployWin32.store(0, std::memory_order_relaxed);
+
     size_t deployedCount = 0;
+    size_t enabledCount = 0;
     for (const auto& loc : locations) {
         if (loc.isEnabled) {
+            enabledCount++;
             if (DeployToLocation(loc)) {
                 deployedCount++;
             }
         }
     }
 
-    SS_LOG_INFO(kLogCategory, L"Deployment cycle complete: %zu locations seeded", deployedCount);
+    // REPORT THE FAILURES, NOT ONLY THE SUCCESSES. A location counts as seeded
+    // when at least ONE decoy landed in it, so the old line could read
+    // "3 locations seeded" while individual decoys were failing - and the
+    // per-decoy success is logged at Debug, which production filters, so neither
+    // number was visible. An operator could not tell that the decoy layer was
+    // thin, and a thin decoy layer is silent: ransomware that encrypts a folder
+    // holding no decoy raises no honeypot alert at all.
+    const uint64_t failures = m_cycleDeployFailures.load(std::memory_order_relaxed);
+    if (failures == 0) {
+        SS_LOG_INFO(kLogCategory,
+            L"Deployment cycle complete: %zu of %zu enabled location(s) seeded, no failures",
+            deployedCount, enabledCount);
+    } else {
+        SS_LOG_WARN(kLogCategory,
+            L"Deployment cycle complete: %zu of %zu enabled location(s) seeded, but %llu decoy "
+            L"file(s) FAILED (last WinError %lu). Those folders hold no decoy, so ransomware "
+            L"encrypting them raises no honeypot alert.",
+            deployedCount, enabledCount,
+            static_cast<unsigned long long>(failures),
+            static_cast<unsigned long>(m_lastDeployWin32.load(std::memory_order_relaxed)));
+    }
     return true;
 }
 
@@ -514,6 +548,7 @@ std::optional<std::string> HoneypotManagerImpl::DeployHoneypot(
         return honeyFile.honeypotId;
 
     } catch (const std::exception& e) {
+        m_cycleDeployFailures.fetch_add(1, std::memory_order_relaxed);
         SS_LOG_ERROR(kLogCategory, L"Deployment failed: %hs", e.what());
         return std::nullopt;
     }
@@ -1192,14 +1227,36 @@ void HoneypotManagerImpl::CreateHoneypotFile(
         content.resize(targetSize);
     }
 
-    // Atomic write via FileUtils
+    // A DECOY IS A NEW FILE, SO IT IS CREATED DIRECTLY RATHER THAN REPLACED.
+    //
+    // This used to call WriteAllBytesAtomic, which writes a sibling temp file and
+    // renames it over the target. For a path that must not already exist the
+    // rename buys no atomicity, and in the 1.0.99 field run it was the operation
+    // that failed: eleven decoys were refused with ERROR_ACCESS_DENIED on the
+    // rename into the user's Downloads and Pictures folders, and refused AGAIN on
+    // the cleanup delete - leaving eleven undeletable .~*.tmp files behind in
+    // folders belonging to the user. The temp CREATION had succeeded every time,
+    // which is what makes creating in place the evidence-directed choice: it uses
+    // only the operation observed to work.
+    //
+    // WriteNewFileExclusive keeps the properties that matter here - CREATE_NEW so
+    // an existing file is never clobbered, and no reparse-point following - and
+    // removes a partial file instead of stranding one.
     FileUtils::Error writeErr;
-    if (!FileUtils::WriteAllBytesAtomic(
+    if (!FileUtils::WriteNewFileExclusive(
             filePath,
             reinterpret_cast<const std::byte*>(content.data()),
             content.size(), &writeErr)) {
+        // The Win32 cause was previously captured into writeErr and then
+        // DISCARDED, so the only thing the operator saw was "Atomic write failed
+        // for: <path>" with no reason. Diagnosing the field failure required
+        // correlating three separate FileUtils lines to recover a single error
+        // code that was in hand at this point all along.
+        m_lastDeployWin32.store(writeErr.win32, std::memory_order_relaxed);
         throw std::runtime_error(
-            "Atomic write failed for: " + StringUtils::ToNarrow(filePath));
+            "Decoy creation failed for: " + StringUtils::ToNarrow(filePath) +
+            " (WinError " + std::to_string(writeErr.win32) +
+            (writeErr.message.empty() ? std::string() : ": " + writeErr.message) + ")");
     }
 }
 

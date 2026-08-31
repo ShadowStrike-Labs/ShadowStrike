@@ -1157,8 +1157,20 @@ namespace ShadowStrike {
                             h = INVALID_HANDLE_VALUE;
                         }
                         if (!success) {
-                            if (!RemoveFile(tmp)) {
-                                SS_LOG_LAST_ERROR(L"FileUtils", L"TempFileGuard: Failed to remove temp file: %s", tmp.c_str());
+                            // Capture the removal error rather than reading
+                            // GetLastError() after the fact. RemoveFile logs on its
+                            // own failure path, and that logging resets the thread's
+                            // last error, so this site used to report
+                            // "WinError 0: the operation completed successfully" as
+                            // the reason a removal had failed - a message that
+                            // contradicts itself and names nothing actionable. Seen
+                            // eleven times in the 1.0.99 field log.
+                            Error rmErr;
+                            if (!RemoveFile(tmp, &rmErr)) {
+                                SS_LOG_ERROR(L"FileUtils",
+                                    L"TempFileGuard: a temp file is left on disk because it could "
+                                    L"not be removed: %s (WinError %lu)",
+                                    tmp.c_str(), static_cast<unsigned long>(rmErr.win32));
                             }
                         }
                     }
@@ -1218,6 +1230,127 @@ namespace ShadowStrike {
 
             bool WriteAllTextUtf8Atomic(std::wstring_view path, std::string_view utf8, Error* err) {
                 return WriteAllBytesAtomic(path, reinterpret_cast<const std::byte*>(utf8.data()), utf8.size(), err);
+            }
+
+            bool WriteNewFileExclusive(std::wstring_view path, const std::byte* data, size_t len, Error* err) {
+                if (!data && len != 0) {
+                    if (err) {
+                        err->win32 = ERROR_INVALID_PARAMETER;
+                        err->message = "Null data pointer with non-zero length";
+                    }
+                    return false;
+                }
+
+                if (!ValidatePath(path)) {
+                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                    return false;
+                }
+
+                const std::wstring dst = ToW(path);
+                if (dst.empty()) {
+                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                    return false;
+                }
+
+                const auto lastSep = dst.find_last_of(L"\\/");
+                if (lastSep != std::wstring::npos) {
+                    if (!CreateDirectories(dst.substr(0, lastSep), err)) {
+                        SS_LOG_LAST_ERROR(L"FileUtils",
+                            L"WriteNewFileExclusive: creating directories failed: %s", dst.c_str());
+                        return false;
+                    }
+                }
+
+                const std::wstring longDst = AddLongPathPrefix(dst);
+                if (longDst.empty()) {
+                    if (err) err->win32 = ERROR_INVALID_PARAMETER;
+                    return false;
+                }
+
+                // CREATE_NEW and FILE_FLAG_OPEN_REPARSE_POINT are load-bearing, not
+                // stylistic: the first refuses to overwrite an existing file, the
+                // second refuses to follow a pre-planted reparse point that could
+                // redirect this write onto a file the caller does not own.
+                HANDLE h = CreateFileW(
+                    longDst.c_str(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_READ,
+                    nullptr,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH |
+                        FILE_FLAG_OPEN_REPARSE_POINT,
+                    nullptr
+                );
+                if (h == INVALID_HANDLE_VALUE) {
+                    if (err) err->win32 = GetLastError();
+                    SS_LOG_LAST_ERROR(L"FileUtils",
+                        L"WriteNewFileExclusive: CreateFileW(CREATE_NEW) failed: %s", longDst.c_str());
+                    return false;
+                }
+
+                bool success = false;
+                struct PartialFileGuard {
+                    HANDLE& h;
+                    const std::wstring& target;
+                    bool& success;
+                    ~PartialFileGuard() {
+                        if (h != INVALID_HANDLE_VALUE) {
+                            CloseHandle(h);
+                            h = INVALID_HANDLE_VALUE;
+                        }
+                        if (!success) {
+                            // Capture the removal error explicitly. Reading
+                            // GetLastError() here would report whatever the LOGGING
+                            // inside RemoveFile left behind, which is how the
+                            // equivalent guard below came to print WinError 0,
+                            // "the operation completed successfully", as the reason
+                            // a removal had failed.
+                            Error rmErr;
+                            if (!RemoveFile(target, &rmErr)) {
+                                SS_LOG_ERROR(L"FileUtils",
+                                    L"WriteNewFileExclusive: a partially written file could not be "
+                                    L"removed and is left on disk: %s (WinError %lu)",
+                                    target.c_str(), static_cast<unsigned long>(rmErr.win32));
+                            }
+                        }
+                    }
+                } guard{ h, dst, success };
+
+                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data);
+                size_t toWrite = len;
+                size_t offset = 0;
+                constexpr DWORD MAX_CHUNK_SIZE = 4 * 1024 * 1024;
+
+                while (toWrite > 0) {
+                    DWORD thisWrite = 0;
+                    const DWORD chunk = (toWrite > MAX_CHUNK_SIZE)
+                        ? MAX_CHUNK_SIZE : static_cast<DWORD>(toWrite);
+                    if (!WriteFile(h, ptr + offset, chunk, &thisWrite, nullptr)) {
+                        if (err) err->win32 = GetLastError();
+                        SS_LOG_LAST_ERROR(L"FileUtils",
+                            L"WriteNewFileExclusive: WriteFile failed: %s", longDst.c_str());
+                        return false;
+                    }
+                    if (thisWrite == 0) {
+                        if (err) {
+                            err->win32 = ERROR_WRITE_FAULT;
+                            err->message = "WriteFile reported zero bytes written";
+                        }
+                        return false;
+                    }
+                    offset += thisWrite;
+                    toWrite -= thisWrite;
+                }
+
+                if (!FlushFileBuffers(h)) {
+                    if (err) err->win32 = GetLastError();
+                    SS_LOG_LAST_ERROR(L"FileUtils",
+                        L"WriteNewFileExclusive: FlushFileBuffers failed: %s", longDst.c_str());
+                    return false;
+                }
+
+                success = true;
+                return true;
             }
 
             // ============================================================================

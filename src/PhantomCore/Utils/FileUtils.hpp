@@ -376,6 +376,43 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] bool WriteAllTextUtf8Atomic(std::wstring_view path, std::string_view utf8, Error* err = nullptr);
 
+			/**
+			 * @brief Create a NEW file and write it in place, without a temp-and-rename.
+			 *
+			 * WHY THIS EXISTS ALONGSIDE WriteAllBytesAtomic. The atomic writer exists to
+			 * REPLACE the contents of a file that may already exist, and it earns its
+			 * atomicity by writing a sibling temp file and renaming it over the target.
+			 * For a file that must NOT already exist there is nothing to replace, so the
+			 * rename buys no atomicity and costs two extra filesystem operations - a
+			 * rename and, on failure, a delete.
+			 *
+			 * That distinction stopped being academic in the 1.0.99 field run. Eleven
+			 * ransomware decoys failed to deploy into the user's Downloads and Pictures
+			 * folders because the rename was denied with ERROR_ACCESS_DENIED and the
+			 * cleanup delete was denied too - while the temp file CREATION had
+			 * succeeded. The result was eleven undeletable .~*.tmp files left in the
+			 * user's own folders. Creating the file directly uses only the operation
+			 * that was observed to work and leaves nothing behind when it does not.
+			 *
+			 * SECURITY PROPERTIES ARE THE SAME ONES THE TEMP OPEN RELIES ON, and they
+			 * are the reason this is not simply CreateFileW at the call site: CREATE_NEW
+			 * so an existing file is never overwritten, and FILE_FLAG_OPEN_REPARSE_POINT
+			 * so a pre-planted reparse point cannot redirect the write to a victim path.
+			 * A partially written file is removed, and if that removal is itself denied
+			 * the leftover is reported rather than left silent.
+			 *
+			 * NOT a substitute for WriteAllBytesAtomic. A reader can observe this file
+			 * while it is still being written, which is acceptable only when no reader
+			 * depends on its contents.
+			 *
+			 * @param path Target file path. Must not already exist.
+			 * @param data Data to write
+			 * @param len  Byte count
+			 * @param err  Optional error output
+			 * @return true on success. ERROR_FILE_EXISTS if the path is already present.
+			 */
+			[[nodiscard]] bool WriteNewFileExclusive(std::wstring_view path, const std::byte* data, size_t len, Error* err = nullptr);
+
 			// ============================================================================
 			// Atomic Operations
 			// ============================================================================
