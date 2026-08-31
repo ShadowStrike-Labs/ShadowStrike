@@ -86,12 +86,18 @@ TEST_F(RealTimeProtectionTest, ConfigFactoriesAndResetHelpersRemainStable) {
     stats.totalEvents.store(11, std::memory_order_relaxed);
     stats.filesBlocked.store(4, std::memory_order_relaxed);
     stats.threatsDetected.store(7, std::memory_order_relaxed);
+    stats.kernelThreatAlerts.store(5, std::memory_order_relaxed);
+    stats.kernelTelemetryEvents.store(6, std::memory_order_relaxed);
     stats.performance.cacheSize.store(9, std::memory_order_relaxed);
     stats.Reset();
 
     EXPECT_EQ(0u, stats.totalEvents.load(std::memory_order_relaxed));
     EXPECT_EQ(0u, stats.filesBlocked.load(std::memory_order_relaxed));
     EXPECT_EQ(0u, stats.threatsDetected.load(std::memory_order_relaxed));
+    // A counter absent from Reset() keeps its pre-reset value, which makes every
+    // rate computed after a reset wrong in a way nothing reports.
+    EXPECT_EQ(0u, stats.kernelThreatAlerts.load(std::memory_order_relaxed));
+    EXPECT_EQ(0u, stats.kernelTelemetryEvents.load(std::memory_order_relaxed));
     EXPECT_EQ(0u, stats.performance.cacheSize.load(std::memory_order_relaxed));
 }
 

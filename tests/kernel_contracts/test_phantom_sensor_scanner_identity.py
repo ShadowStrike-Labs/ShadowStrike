@@ -13291,5 +13291,124 @@ class KernelConfigPublisherContractTests(unittest.TestCase):
             "after it so registration cannot depend on construction order")
 
 
+class ThreatCounterEvidenceClassContractTests(unittest.TestCase):
+    """A detection counter must count detections, not message arrivals.
+
+    THE DEFECT. RTPStatistics::threatsDetected was documented "unified across all
+    detection methods" and five sites in OnKernelGenericEvent incremented it on
+    the mere ARRIVAL of a kernel message - a named-pipe create, a file rollback,
+    a kernel alert - with no analysis between the message and the count.
+
+    Measured in the 1.0.99 field log: threats=34933 alongside infected=0
+    suspicious=0 blocked=0, and one 5-second interval in which the counter
+    advanced by 8,492 while scans advanced by ZERO. A detection counter that
+    moves while nothing is scanned is not reporting detections.
+
+    The counter is now three counters by evidence class: what this product
+    convicted, what the kernel convicted, and non-detection telemetry.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.hpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+
+    def _definition_body(self, code, needle):
+        self.assertEqual(
+            code.count(needle), 1,
+            "expected exactly one definition matching %r, found %d"
+            % (needle, code.count(needle)))
+        start = code.index(needle)
+        depth = 0
+        i = code.index("{", start)
+        while i < len(code):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+            i += 1
+        self.fail("unterminated body for %r" % needle)
+
+    def _case_slice(self, body, label):
+        """Slice one switch case, label to next label. A character window would
+        bleed into the neighbouring case."""
+        start = body.find("case " + label + ":")
+        self.assertNotEqual(start, -1, "case %s not found" % label)
+        nxt = body.find("case FilterMessageType_", start + 1)
+        return body[start:nxt if nxt != -1 else len(body)]
+
+    def test_non_detection_kernel_events_do_not_count_as_threats(self):
+        body = self._definition_body(self.cpp, "void OnKernelGenericEvent(")
+
+        # Arrival of a kernel message is not a conviction by this product.
+        for label, expected in (
+            ("FilterMessageType_NamedPipeEvent", "kernelTelemetryEvents"),
+            ("FilterMessageType_FileRollbackEvent", "kernelTelemetryEvents"),
+            ("FilterMessageType_RansomwareAlert", "kernelThreatAlerts"),
+            ("FilterMessageType_BehavioralAlert", "kernelThreatAlerts"),
+            ("FilterMessageType_SelfProtectAlert", "kernelThreatAlerts"),
+        ):
+            case = self._case_slice(body, label)
+            self.assertFalse(
+                "m_stats.threatsDetected++" in case,
+                "%s increments threatsDetected again; arrival of a kernel "
+                "message is not a detection by this product" % label)
+            self.assertTrue(
+                "m_stats." + expected + "++" in case,
+                "%s must be counted in %s, otherwise the event becomes "
+                "invisible instead of merely reclassified" % (label, expected))
+
+    def test_the_generic_feed_keeps_exactly_one_real_detection_site(self):
+        # The suspicious-IOCTL case IS a detection and must keep counting. Pinning
+        # it at exactly one stops an arrival site creeping back in disguised as a
+        # detection, while leaving genuine detection sites elsewhere untouched.
+        body = self._definition_body(self.cpp, "void OnKernelGenericEvent(")
+        n = body.count("m_stats.threatsDetected++")
+        self.assertEqual(
+            n, 1,
+            "OnKernelGenericEvent has %d threatsDetected increments, expected "
+            "exactly 1 (the suspicious IOCTL detection)" % n)
+
+    def test_all_three_counters_survive_a_reset(self):
+        body = self._definition_body(self.cpp, "void RTPStatistics::Reset()")
+        for field in ("threatsDetected", "kernelThreatAlerts",
+                      "kernelTelemetryEvents"):
+            self.assertTrue(
+                field + " = 0;" in body,
+                "%s is not reset; a counter absent from Reset() keeps its "
+                "pre-reset value and every rate computed afterwards is wrong "
+                "in a way nothing reports" % field)
+            self.assertTrue(
+                "std::atomic<uint64_t> " + field in self.hpp,
+                "%s is not declared as an atomic counter" % field)
+
+    def test_the_periodic_report_publishes_every_class(self):
+        # The whole point of splitting is that the field log names which class is
+        # moving. A counter nobody reports is a counter nobody can act on.
+        for token in ("threats={}", "kernelThreatAlerts={}", "kernelTelemetry={}"):
+            self.assertTrue(
+                token in self.cpp,
+                "the on-access pipeline report does not publish %r, so the field "
+                "log cannot say which evidence class is moving" % token)
+
+        for arg in ("kThreats", "kTelemetry"):
+            self.assertTrue(
+                arg in self.cpp,
+                "%s is never loaded, so its placeholder would be fed the wrong "
+                "argument" % arg)
+
+    def test_the_exported_document_no_longer_mislabels_a_field(self):
+        self.assertFalse(
+            'stats["threatsDetected"] = m_stats.infectedFiles.load();' in self.cpp,
+            "the exported diagnostics publish infectedFiles under the "
+            "threatsDetected key again, so the document contradicts both the "
+            "field of that name and the periodic report")
+        self.assertTrue(
+            'stats["threatsDetected"] = m_stats.threatsDetected.load();' in self.cpp,
+            "the threatsDetected key must publish threatsDetected")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

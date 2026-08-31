@@ -1085,8 +1085,54 @@ struct alignas(64) RTPStatistics {
     ///        overstate the harm and hide the one number that does mean harm.
     std::atomic<uint64_t> sigDetermQueueDropped{ 0 };
 
-    // Threat detection counter (unified across all detection methods)
+    /// @brief Threats THIS PRODUCT identified.
+    ///
+    ///        Incremented only where analysis reached a conviction: a scan
+    ///        returning Infected, a metamorphic or malware-specific packer block,
+    ///        a vulnerable or unsigned driver refused at image load, a script
+    ///        scanner block, a suspicious IOCTL. One increment means one thing
+    ///        this product decided was a threat.
+    ///
+    ///        IT USED TO MEAN LESS THAN THAT. The declaration here read "unified
+    ///        across all detection methods", and five sites in
+    ///        OnKernelGenericEvent incremented it on the mere ARRIVAL of a kernel
+    ///        message - a named-pipe create, a file rollback - with no analysis
+    ///        between the message and the count. A named pipe existing is not a
+    ///        threat. The 1.0.99 field log shows the consequence: threats=34933
+    ///        alongside infected=0 suspicious=0 blocked=0, and one interval where
+    ///        it advanced by 8,492 while scans advanced by ZERO. A detection
+    ///        counter that moves while nothing is scanned is not reporting
+    ///        detections, and next to three zeroes it is actively misleading.
+    ///
+    ///        The three counters below are deliberately not summed into one. They
+    ///        answer different questions - what did we convict, what did the
+    ///        driver convict, and is the telemetry feed alive - and a reader
+    ///        cannot recover any of them from a total.
     std::atomic<uint64_t> threatsDetected{ 0 };
+
+    /// @brief Threats the KERNEL identified and reported to us.
+    ///
+    ///        The driver's own ransomware heuristics, its behavioural engine and
+    ///        its self-protection denials are real detections, but they are made
+    ///        below us and correspond to no file we scanned. Counting them in
+    ///        threatsDetected made that counter unable to answer "how much did
+    ///        our own pipeline find", and counting them nowhere would have hidden
+    ///        the driver's contribution entirely.
+    std::atomic<uint64_t> kernelThreatAlerts{ 0 };
+
+    /// @brief Kernel events forwarded for correlation that are NOT detections.
+    ///
+    ///        A named-pipe create or connect is ordinary Windows behaviour routed
+    ///        to BehaviorBlocker as context (T1570 / T1021.002 correlation). A
+    ///        file-rollback notification reports a recovery the kernel already
+    ///        performed, and the alert that triggered it was counted when it
+    ///        arrived - counting the rollback as well would double-count one
+    ///        incident.
+    ///
+    ///        Worth its own number rather than none: this is the counter that
+    ///        distinguishes "the kernel telemetry feed is alive" from "the feed is
+    ///        dead", and a dead feed is invisible in every other statistic here.
+    std::atomic<uint64_t> kernelTelemetryEvents{ 0 };
 
     // Performance metrics
     PerformanceMetrics performance;

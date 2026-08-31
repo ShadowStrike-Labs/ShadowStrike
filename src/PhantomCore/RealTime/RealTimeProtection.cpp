@@ -5886,7 +5886,9 @@ public:
                 // This is a HIGH-confidence signal from kernel-side heuristics.
                 Utils::Logger::Error(
                     "RealTimeProtection: RANSOMWARE ALERT from kernel (payload {} bytes)", size);
-                m_stats.threatsDetected++;
+                // The KERNEL convicted here, not our pipeline. Counted as such so
+                // threatsDetected keeps meaning "what our own analysis found".
+                m_stats.kernelThreatAlerts++;
 
                 // Forward raw alert payload to BehaviorBlocker for cross-correlation
                 // with user-mode behavioural score + optional runtime kill / rollback.
@@ -5913,7 +5915,11 @@ public:
                 // Named-pipe create / connect — relevant for C2 tunnels and lateral
                 // movement (MITRE T1570 / T1021.002). Route to BehaviorBlocker so
                 // the behavioural engine can correlate with process + network data.
-                m_stats.threatsDetected++;
+                //
+                // NOT A DETECTION. This incremented threatsDetected on arrival,
+                // before any analysis, so every named pipe on the machine counted
+                // as a threat. Named pipes are ordinary; this is context.
+                m_stats.kernelTelemetryEvents++;
                 if (data && size > 0) {
                     try {
                         auto& bb = BehaviorBlocker::Instance();
@@ -5946,7 +5952,10 @@ public:
                 // (user-facing in the Timeline panel).
                 Utils::Logger::Warn(
                     "RealTimeProtection: Kernel file-rollback recovery ({} bytes)", size);
-                m_stats.threatsDetected++;
+                // A recovery that already happened, not a new detection. The alert
+                // that caused the rollback was counted when it arrived, so
+                // counting this too would double-count one incident.
+                m_stats.kernelTelemetryEvents++;
                 break;
             }
 
@@ -5970,7 +5979,9 @@ public:
                 // added here.
                 //
                 Utils::Logger::Debug("RealTimeProtection: Behavioral alert from kernel (payload {} bytes)", size);
-                m_stats.threatsDetected++;
+                // Kernel-side behavioural conviction - a real detection, made
+                // below us. See kernelThreatAlerts.
+                m_stats.kernelThreatAlerts++;
 
                 if (data && size > 0) {
                     try {
@@ -6304,7 +6315,9 @@ public:
                         data, static_cast<uint32_t>(size));
                 }
 
-                m_stats.threatsDetected++;
+                // The kernel denied an access to us. A genuine detection, made by
+                // the driver rather than by our analysis.
+                m_stats.kernelThreatAlerts++;
                 break;
             }
 
@@ -7121,6 +7134,9 @@ public:
                 const uint64_t errors    = m_stats.scanErrors.load(std::memory_order_relaxed);
                 const uint64_t threats   = m_stats.threatsDetected.load(std::memory_order_relaxed);
                 const uint64_t blocked   = m_stats.filesBlocked.load(std::memory_order_relaxed);
+                const uint64_t kThreats  = m_stats.kernelThreatAlerts.load(std::memory_order_relaxed);
+                const uint64_t kTelemetry =
+                    m_stats.kernelTelemetryEvents.load(std::memory_order_relaxed);
 
                 if (scans != m_reportBaselineScans ||
                     deferred != m_reportBaselineDeferred ||
@@ -7133,12 +7149,13 @@ public:
                     Utils::Logger::Info(
                         "RealTimeProtection: on-access pipeline - scans={} (+{}) clean={} "
                         "suspicious={} infected={} errors={} threats={} blocked={} "
+                        "kernelThreatAlerts={} kernelTelemetry={} "
                         "deepScansDeferred={} (+{}) queueDepth={}",
                         scans, DeltaSince(scans, m_reportBaselineScans),
                         m_stats.cleanFiles.load(std::memory_order_relaxed),
                         m_stats.suspiciousFiles.load(std::memory_order_relaxed),
                         m_stats.infectedFiles.load(std::memory_order_relaxed),
-                        errors, threats, blocked,
+                        errors, threats, blocked, kThreats, kTelemetry,
                         deferred, DeltaSince(deferred, m_reportBaselineDeferred),
                         queueDepth);
 
@@ -7533,7 +7550,14 @@ public:
             stats["totalEvents"] = m_stats.totalEvents.load();
             stats["totalScans"] = m_stats.totalScans.load();
             stats["filesBlocked"] = m_stats.filesBlocked.load();
-            stats["threatsDetected"] = m_stats.infectedFiles.load();
+            // This published infectedFiles under the threatsDetected key, so the
+            // exported document disagreed with the field of that name and with
+            // the periodic report. Both are published now, because they are
+            // different measurements and neither can be derived from the other.
+            stats["threatsDetected"] = m_stats.threatsDetected.load();
+            stats["infectedFiles"] = m_stats.infectedFiles.load();
+            stats["kernelThreatAlerts"] = m_stats.kernelThreatAlerts.load();
+            stats["kernelTelemetryEvents"] = m_stats.kernelTelemetryEvents.load();
             j["statistics"] = stats;
 
             std::ofstream out(outputPath);
@@ -7603,6 +7627,8 @@ void RTPStatistics::Reset() noexcept {
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;
     threatsDetected = 0;
+    kernelThreatAlerts = 0;
+    kernelTelemetryEvents = 0;
     performance.Reset();
     lastReset = std::chrono::system_clock::now();
 }
