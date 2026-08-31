@@ -727,12 +727,15 @@ namespace ShadowStrike {
 			 * @param outSize Output file size.
 			 * @return true on success.
 			 */
-			static bool OpenFileForMap(const std::wstring& path, bool rw, HANDLE& hFile, size_t& outSize) {
+			static bool OpenFileForMap(const std::wstring& path, bool rw, HANDLE& hFile, size_t& outSize,
+				unsigned long& outErr) {
 #ifdef _WIN32
 				hFile = INVALID_HANDLE_VALUE;
 				outSize = 0;
+				outErr = ERROR_SUCCESS;
 
 				if (path.empty()) {
+					outErr = ERROR_INVALID_PARAMETER;
 					SS_LOG_ERROR(L"MemoryUtils", L"OpenFileForMap: Empty path");
 					return false;
 				}
@@ -748,12 +751,16 @@ namespace ShadowStrike {
 
 				HANDLE f = ::CreateFileW(path.c_str(), access, share, nullptr, disp, attrs, nullptr);
 				if (f == INVALID_HANDLE_VALUE) {
+					// Capture BEFORE logging. SS_LOG_LAST_ERROR reads and then resets the
+					// thread's last error, which is what left every caller reading zero.
+					outErr = ::GetLastError();
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileW failed: %ls", path.c_str());
 					return false;
 				}
 
 				LARGE_INTEGER li{};
 				if (!::GetFileSizeEx(f, &li)) {
+					outErr = ::GetLastError();
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"GetFileSizeEx failed: %ls", path.c_str());
 					::CloseHandle(f);
 					return false;
@@ -761,6 +768,7 @@ namespace ShadowStrike {
 
 				// Check for files too large to map (> SIZE_MAX)
 				if (li.QuadPart < 0 || static_cast<uint64_t>(li.QuadPart) > static_cast<uint64_t>(SIZE_MAX)) {
+					outErr = ERROR_FILE_TOO_LARGE;
 					SS_LOG_ERROR(L"MemoryUtils", L"File too large to map: %ls (size=%lld)", 
 						path.c_str(), li.QuadPart);
 					::CloseHandle(f);
@@ -783,9 +791,12 @@ namespace ShadowStrike {
 			bool MappedView::mapReadOnly(const std::wstring& path) {
 #ifdef _WIN32
 				close();
+				m_lastError = ERROR_SUCCESS;
 				
 				size_t sz = 0;
-				if (!OpenFileForMap(path, false, m_file, sz)) {
+				unsigned long openErr = ERROR_SUCCESS;
+				if (!OpenFileForMap(path, false, m_file, sz, openErr)) {
+					m_lastError = openErr;
 					return false;
 				}
 
@@ -799,6 +810,8 @@ namespace ShadowStrike {
 
 				m_mapping = ::CreateFileMappingW(m_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
 				if (m_mapping == nullptr) {
+					// Before BOTH the logging and the close(); either one would lose it.
+					m_lastError = ::GetLastError();
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileMappingW(PAGE_READONLY) failed: %ls", path.c_str());
 					close();
 					return false;
@@ -806,6 +819,7 @@ namespace ShadowStrike {
 
 				m_view = ::MapViewOfFile(m_mapping, FILE_MAP_READ, 0, 0, 0);
 				if (m_view == nullptr) {
+					m_lastError = ::GetLastError();
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"MapViewOfFile(FILE_MAP_READ) failed: %ls", path.c_str());
 					close();
 					return false;
@@ -820,9 +834,12 @@ namespace ShadowStrike {
 			bool MappedView::mapReadWrite(const std::wstring& path) {
 #ifdef _WIN32
 				close();
+				m_lastError = ERROR_SUCCESS;
 				
 				size_t sz = 0;
-				if (!OpenFileForMap(path, true, m_file, sz)) {
+				unsigned long openErr = ERROR_SUCCESS;
+				if (!OpenFileForMap(path, true, m_file, sz, openErr)) {
+					m_lastError = openErr;
 					return false;
 				}
 
@@ -837,6 +854,7 @@ namespace ShadowStrike {
 
 				m_mapping = ::CreateFileMappingW(m_file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
 				if (m_mapping == nullptr) {
+					m_lastError = ::GetLastError();
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileMappingW(PAGE_READWRITE) failed: %ls", path.c_str());
 					close();
 					return false;
@@ -844,6 +862,7 @@ namespace ShadowStrike {
 
 				m_view = ::MapViewOfFile(m_mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
 				if (m_view == nullptr) {
+					m_lastError = ::GetLastError();
 					SS_LOG_LAST_ERROR(L"MemoryUtils", L"MapViewOfFile(RW) failed: %ls", path.c_str());
 					close();
 					return false;
@@ -884,6 +903,7 @@ namespace ShadowStrike {
 				m_view = other.m_view;
 				m_size = other.m_size;
 				m_rw = other.m_rw;
+				m_lastError = other.m_lastError;
 
 				// Reset source to default state
 				other.m_file = INVALID_HANDLE_VALUE;
@@ -891,6 +911,7 @@ namespace ShadowStrike {
 				other.m_view = nullptr;
 				other.m_size = 0;
 				other.m_rw = false;
+				other.m_lastError = 0;
 			}
 
 			// ============================================================================

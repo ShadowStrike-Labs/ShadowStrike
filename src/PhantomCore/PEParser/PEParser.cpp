@@ -2131,8 +2131,11 @@ bool PEParser::ParseFile(const std::wstring& path, PEInfo& out, PEError* err) no
 
     // Memory map the file
     if (!m_impl->m_mappedFile.mapReadOnly(path)) {
-        // Capture GetLastError() BEFORE err->Set(), which may call OS functions
-        const uint32_t lastErr = static_cast<uint32_t>(GetLastError());
+        // The original note was right about err->Set() clobbering the value, but
+        // the map call had ALREADY reset it by logging its own failure, so this
+        // capture was too late no matter where it sat. Ask the object instead.
+        const uint32_t lastErr =
+            static_cast<uint32_t>(m_impl->m_mappedFile.lastError());
         if (err) {
             err->Set(ValidationResult::UnknownError,
                      L"Failed to open or map file",

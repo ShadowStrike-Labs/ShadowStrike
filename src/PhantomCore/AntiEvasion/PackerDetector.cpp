@@ -1132,8 +1132,12 @@ public:
 
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
-            // SECURITY FIX: Capture GetLastError() once; subsequent calls can clobber it.
-            const DWORD lastErr = ::GetLastError();
+            // The original note here was right that the value gets clobbered, but it
+            // guarded only against THIS function's later calls. The map call had
+            // already destroyed the value before returning, by logging its own
+            // failure through SS_LOG_LAST_ERROR, so capturing "once" here still
+            // captured a reset value. Ask the object that knows.
+            const DWORD lastErr = static_cast<DWORD>(mappedFile.lastError());
             if (err) {
                 err->win32Code = lastErr;
                 err->message = L"Failed to memory-map file";
@@ -1374,7 +1378,7 @@ public:
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = static_cast<DWORD>(mappedFile.lastError());
                 err->message = L"Failed to memory-map file";
             }
             return -1.0;
@@ -1420,7 +1424,7 @@ public:
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = static_cast<DWORD>(mappedFile.lastError());
                 err->message = L"Failed to memory-map file";
             }
             return false;
@@ -1594,7 +1598,7 @@ public:
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = static_cast<DWORD>(mappedFile.lastError());
                 err->message = L"Failed to memory-map file";
             }
             return false;
@@ -1706,7 +1710,7 @@ public:
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = static_cast<DWORD>(mappedFile.lastError());
                 err->message = L"Failed to memory-map file";
             }
             return false;

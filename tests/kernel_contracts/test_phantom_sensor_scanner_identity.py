@@ -78,6 +78,11 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
+MEMORY_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.cpp"
+METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
+PACKER_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/PackerDetector.cpp"
+PE_PARSER_CPP_PATH = ROOT / "src/PhantomCore/PEParser/PEParser.cpp"
 
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
@@ -13692,6 +13697,163 @@ class HoneypotDeploymentContractTests(unittest.TestCase):
         self.assertTrue(
             "m_cycleDeployFailures.fetch_add" in self.hp_cpp,
             "nothing increments the failure count, so it is a structural zero")
+
+
+class MappedViewErrorFidelityContractTests(unittest.TestCase):
+    """A primitive must not destroy the error it is about to be asked for.
+
+    MEASURED IN THE 1.0.99 FIELD LOG, on two adjacent lines:
+
+        [MemoryUtils]          OpenFileForMap - CreateFileW failed: <path>: WinError 32
+        [MetamorphicDetector]  Failed to map file: <path> (error 0)
+
+    Same file, same thread, same millisecond, two different causes - and the
+    second one says the operation succeeded. The mechanism: OpenFileForMap logs
+    its failure through SS_LOG_LAST_ERROR, whose own work RESETS the thread's
+    last-error value, and then returns a bare bool. Eleven call sites across five
+    modules then called GetLastError() and got whatever the logging left behind.
+
+    Two of those eleven even carried comments about capturing the value before it
+    could be clobbered - PackerDetector's said "SECURITY FIX: Capture
+    GetLastError() once", PEParser's said "Capture GetLastError() BEFORE
+    err->Set()". Both were guarding against their own later calls, and both were
+    already too late, because the callee had destroyed the value before returning.
+    That is why the fix belongs in the callee: eleven correct call sites cannot be
+    built on a primitive that forgets.
+
+    Same defect class as the TempFileGuard reporting "WinError 0: the operation
+    completed successfully" as the reason a delete had failed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mu_hpp = strip_c_comments(read_source(MEMORY_UTILS_HPP_PATH))
+        cls.mu_cpp = strip_c_comments(read_source(MEMORY_UTILS_CPP_PATH))
+        cls.sc_cpp = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        cls.consumers = [
+            ("metamorphic_polymorphicdetector.cpp", strip_c_comments(read_source(METAMORPHIC_DETECTOR_CPP_PATH))),
+            ("PackerDetector.cpp", strip_c_comments(read_source(PACKER_DETECTOR_CPP_PATH))),
+            ("PEParser.cpp", strip_c_comments(read_source(PE_PARSER_CPP_PATH))),
+        ]
+
+    @staticmethod
+    def _block_after(code, start):
+        """Slice the braced block that opens at or after `start`."""
+        i = code.find("{", start)
+        if i < 0:
+            return ""
+        depth = 0
+        j = i
+        while j < len(code):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[i:j + 1]
+            j += 1
+        return code[i:]
+
+    def _named_body(self, code, needle):
+        self.assertEqual(
+            code.count(needle), 1,
+            "expected exactly one %r, found %d" % (needle, code.count(needle)))
+        return self._block_after(code, code.index(needle))
+
+    def test_the_open_captures_the_error_before_it_logs(self):
+        # ORDERING IS THE INVARIANT, so the test pins the order rather than mere
+        # presence: a capture placed after the logging reads the reset value and
+        # would satisfy any test that only checked both lines exist.
+        body = self._named_body(self.mu_cpp, "static bool OpenFileForMap(")
+        k = body.find("INVALID_HANDLE_VALUE) {")
+        self.assertNotEqual(k, -1, "the CreateFileW failure branch is gone")
+        branch = self._block_after(body, k)
+        cap = branch.find("outErr = ::GetLastError();")
+        log = branch.find("SS_LOG_LAST_ERROR")
+        self.assertNotEqual(cap, -1,
+                            "the open no longer captures the Win32 error, so every "
+                            "caller is back to reading a value the logging reset")
+        self.assertNotEqual(log, -1, "the failure is no longer logged at all")
+        self.assertLess(cap, log,
+                        "the error is captured AFTER the logging that resets it, "
+                        "which reads back the wrong value - the exact defect the "
+                        "field log caught as \"(error 0)\"")
+
+    def test_the_view_exposes_the_error_and_close_does_not_clear_it(self):
+        self.assertTrue("lastError()" in self.mu_hpp,
+                        "MappedView no longer exposes the error it captured")
+        self.assertTrue("m_lastError" in self.mu_hpp,
+                        "the preserved-error member is gone")
+        # close() runs on mapReadOnly's own failure paths, so clearing there would
+        # discard the value the caller is about to ask for.
+        close_body = self._named_body(self.mu_cpp, "void MappedView::close() noexcept")
+        self.assertFalse(
+            "m_lastError" in close_body,
+            "close() now touches m_lastError; mapReadOnly calls close() on its "
+            "failure paths, so the caller would read a cleared value")
+        move_body = self._named_body(self.mu_cpp, "void MappedView::moveFrom(")
+        self.assertTrue(
+            "m_lastError = other.m_lastError" in move_body,
+            "moveFrom does not carry the error, so a moved-from view loses it")
+
+    def test_no_caller_reads_the_thread_error_after_a_failed_map(self):
+        # THE POPULATION GUARD. Eleven sites were wrong; this refuses a twelfth,
+        # and it is what makes the callee-side fix stick.
+        offenders = []
+        seen_calls = 0
+        for name, code in self.consumers:
+            for meth in ("mapReadOnly(", "mapReadWrite("):
+                pos = 0
+                while True:
+                    k = code.find(meth, pos)
+                    if k < 0:
+                        break
+                    pos = k + 1
+                    line_start = code.rfind("\n", 0, k) + 1
+                    head = code[line_start:k]
+                    if "if (!" not in head:
+                        continue          # not a failure branch
+                    seen_calls += 1
+                    branch = self._block_after(code, k)
+                    if "GetLastError" in branch:
+                        ln = code[:k].count("\n") + 1
+                        offenders.append("%s:%d" % (name, ln))
+        self.assertGreater(seen_calls, 5,
+                           "found only %d guarded map calls; the scan is not "
+                           "reaching the code it is meant to police" % seen_calls)
+        self.assertEqual(
+            offenders, [],
+            "these sites read GetLastError() after a failed map, which returns "
+            "whatever the map call's own logging left behind: %s" % offenders)
+
+    def test_an_unreadable_file_is_not_reported_as_a_missing_one(self):
+        body = self._named_body(self.sc_cpp, "EngineResult ScanEngine::ScanFile(")
+        k = body.find("fs::exists(filePath, ec)")
+        self.assertNotEqual(k, -1, "the existence check is gone")
+        branch = self._block_after(body, k)
+        self.assertTrue(
+            "if (ec)" in branch,
+            "the error_code is captured and never read again, so fs::exists's "
+            "'false on any failure' makes a locked or permission-denied file "
+            "report as 'File not found'")
+        self.assertTrue(
+            "NOT scanned" in branch,
+            "the inaccessible branch does not say the file went unscanned")
+
+    def test_neither_existence_branch_softens_the_verdict(self):
+        # A file we could not examine is an UNSCANNED file. Turning either branch
+        # into Clean would quieten the log by lying about coverage.
+        body = self._named_body(self.sc_cpp, "EngineResult ScanEngine::ScanFile(")
+        k = body.find("fs::exists(filePath, ec)")
+        branch = self._block_after(body, k)
+        self.assertEqual(
+            branch.count("ScanVerdict::Error"), 1,
+            "expected exactly one Error verdict covering both branches of the "
+            "existence check, found %d" % branch.count("ScanVerdict::Error"))
+        self.assertFalse(
+            "ScanVerdict::Clean" in branch,
+            "an unexaminable file is being reported Clean, which counts an "
+            "unscanned file as a scanned one")
 
 
 if __name__ == "__main__":

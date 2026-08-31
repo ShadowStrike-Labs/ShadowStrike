@@ -1392,11 +1392,29 @@ EngineResult ScanEngine::ScanFile(
             return result;
         }
 
-        // Check file existence
+        // DISTINGUISH AN ABSENT FILE FROM ONE WE ARE NOT ALLOWED TO LOOK AT.
+        //
+        // fs::exists reports BOTH as false: the error_code overload swallows any
+        // failure and answers "does not exist". ec was captured here and then never
+        // read, so a file held open by another process, or one whose parent denies
+        // traversal, was announced as "File not found" - sending whoever reads the
+        // log hunting for a deleted file instead of an unreadable one.
+        //
+        // THE VERDICT STAYS Error ON BOTH BRANCHES, DELIBERATELY. An absent file
+        // needs no scan, but a file we could not examine is an UNSCANNED file, and
+        // Error is what keeps it out of the clean count. Neither branch may be
+        // softened to Clean to quieten the log.
         std::error_code ec;
         if (!fs::exists(filePath, ec)) {
-            SS_LOG_WARN(L"ScanEngine", L"File not found: %hs",
-                StringUtils::ToNarrow(filePath).c_str());
+            if (ec) {
+                SS_LOG_WARN(L"ScanEngine",
+                    L"File could not be examined, so it is NOT scanned: %hs (%hs, code %d)",
+                    StringUtils::ToNarrow(filePath).c_str(),
+                    ec.message().c_str(), ec.value());
+            } else {
+                SS_LOG_WARN(L"ScanEngine", L"File not found: %hs",
+                    StringUtils::ToNarrow(filePath).c_str());
+            }
             result.verdict = ScanVerdict::Error;
             return result;
         }

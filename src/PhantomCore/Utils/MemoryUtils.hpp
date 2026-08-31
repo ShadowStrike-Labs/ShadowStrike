@@ -391,6 +391,25 @@ namespace ShadowStrike {
 				 */
 				[[nodiscard]] bool isReadWrite() const noexcept { return m_rw; }
 
+				/**
+				 * @brief The Win32 error that made the last map attempt fail.
+				 *
+				 * WHY THIS EXISTS. mapReadOnly and mapReadWrite log their own failures
+				 * through SS_LOG_LAST_ERROR, and that logging performs work which RESETS
+				 * the thread's last-error value. Every caller that returned to
+				 * GetLastError() after a failed map therefore read a value this class had
+				 * already destroyed. The 1.0.99 field log caught it exactly: MemoryUtils
+				 * reported "WinError 32" for a locked file and the calling detector, on the
+				 * very next line, reported the same failure as "(error 0)".
+				 *
+				 * The code is captured BEFORE any logging and survives close(), so a
+				 * caller can still ask what went wrong after the object has cleaned up.
+				 *
+				 * @return The captured Win32 code, or ERROR_SUCCESS if the last attempt
+				 *         succeeded or none has been made.
+				 */
+				[[nodiscard]] unsigned long lastError() const noexcept { return m_lastError; }
+
 			private:
 				void moveFrom(MappedView&& other) noexcept;
 
@@ -399,6 +418,12 @@ namespace ShadowStrike {
 				void* m_view = nullptr;
 				size_t m_size = 0;
 				bool m_rw = false;
+
+				// Deliberately NOT cleared by close(). mapReadOnly calls close() on its
+				// own failure paths, so clearing it there would discard the very value
+				// the caller is about to ask for. Declared unsigned long rather than
+				// DWORD so the member needs no Windows header of its own.
+				unsigned long m_lastError = 0;
 			};
 
 			// ============================================================================

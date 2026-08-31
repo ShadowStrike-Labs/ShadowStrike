@@ -1774,7 +1774,11 @@ MetamorphicResult MetamorphicDetector::AnalyzeFile(
 
     Utils::MemoryUtils::MappedView mappedFile;
     if (!mappedFile.mapReadOnly(filePath)) {
-        DWORD error = GetLastError();
+        // Was GetLastError(), which the map call had already reset by logging
+        // its own failure. The 1.0.99 field log shows the consequence on two
+        // adjacent lines: MemoryUtils reported WinError 32 and this site
+        // reported the same failure as "(error 0)".
+        DWORD error = static_cast<DWORD>(mappedFile.lastError());
         if (err) {
             err->win32Code = error;
             err->message = L"Failed to map file";
@@ -2574,7 +2578,7 @@ bool MetamorphicDetector::AnalyzePEStructure(
     Utils::MemoryUtils::MappedView mappedFile;
     if (!mappedFile.mapReadOnly(filePath)) {
         if (err) {
-            err->win32Code = GetLastError();
+            err->win32Code = static_cast<DWORD>(mappedFile.lastError());
             err->message = L"Failed to map file";
         }
         return false;
@@ -2642,7 +2646,7 @@ std::optional<std::wstring> MetamorphicDetector::DetectPacker(
     Utils::MemoryUtils::MappedView mappedFile;
     if (!mappedFile.mapReadOnly(filePath)) {
         if (err) {
-            err->win32Code = GetLastError();
+            err->win32Code = static_cast<DWORD>(mappedFile.lastError());
             err->message = L"Failed to map file";
         }
         return std::nullopt;
@@ -3093,7 +3097,7 @@ std::optional<std::string> MetamorphicDetector::ComputeFuzzyHash(
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = static_cast<DWORD>(mappedFile.lastError());
                 err->message = L"Failed to map file for fuzzy hashing: " + filePath;
             }
             return std::nullopt;
@@ -3182,7 +3186,7 @@ std::optional<std::string> MetamorphicDetector::ComputeTLSH(
         Utils::MemoryUtils::MappedView mappedFile;
         if (!mappedFile.mapReadOnly(filePath)) {
             if (err) {
-                err->win32Code = GetLastError();
+                err->win32Code = static_cast<DWORD>(mappedFile.lastError());
                 err->message = L"Failed to map file for TLSH: " + filePath;
             }
             return std::nullopt;
