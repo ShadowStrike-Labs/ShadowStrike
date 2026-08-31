@@ -844,6 +844,12 @@ bool IPCManager::ConnectFilterPort() {
     }
     if (encryptedChannelUp) {
         Utils::Logger::Info("[IPCManager] Filter port connected; encrypted primary scanner channel established");
+        // The channel is up, either for the first time or again after a
+        // reconnect. Either way every module owning kernel-side configuration
+        // must re-publish it now: its own Initialize ran before this point and
+        // was refused. Invoked with no IPCManager lock held - see
+        // PublishKernelConfiguration.
+        PublishKernelConfiguration();
     } else {
         Utils::Logger::Warn("[IPCManager] Filter port connected (control handle only) — encrypted primary "
                             "scanner channel NOT established; kernel scan I/O degraded until reconnect");
@@ -945,26 +951,27 @@ bool IPCManager::SendToKernel(
         m_everConnected = m_everConnected ||
                           (m_primaryConnection && m_primaryConnection->IsConnected());
     }
-    if (!m_everConnected) {
-        constexpr auto kStartupChannelWait = std::chrono::milliseconds(2000);
-        constexpr auto kPollInterval       = std::chrono::milliseconds(25);
-        const auto deadline = Clock::now() + kStartupChannelWait;
-        while (Clock::now() < deadline) {
-            {
-                std::lock_guard lock(m_primaryConnMutex);
-                if (m_primaryConnection && m_primaryConnection->IsConnected()) {
-                    m_everConnected = true;
-                    break;
-                }
-            }
-            if (!m_running.load(std::memory_order_acquire)) break;
-            std::this_thread::sleep_for(kPollInterval);
-        }
-        if (m_everConnected) {
-            Utils::Logger::Info("[IPCManager] SendToKernel: waited for the encrypted channel "
-                                "at startup rather than dropping a {}-byte message", messageSize);
-        }
-    }
+    // THERE IS DELIBERATELY NO WAIT HERE - see PublishKernelConfiguration.
+    //
+    // This used to spin up to 2000 ms whenever the channel had never come up, on
+    // the reasoning that the observed drops were a startup race a brief wait
+    // would absorb. Measurement disproved that. The three configuration pushes
+    // being lost - RegistryProtection's key list, FileProtection's path set,
+    // SelfDefense's process registration - all run from their own Initialize on
+    // the boot-init thread, the SAME thread that goes on to call
+    // IPCManager::Start, and the encrypted channel is only established after
+    // Start. Blocking here therefore POSTPONED THE VERY EVENT IT WAITED FOR, so
+    // the wait could never succeed for any sender on that thread. The field log
+    // confirms it: all three refusals are stamped on the boot-init thread with
+    // no elapsed delay between the send and the refusal.
+    //
+    // It was also a latency hazard for the senders it could in principle have
+    // helped. A one-shot block request issued before the first connect - a
+    // ransomware response, a script block - would stall up to 2000 ms on the
+    // process-notify path, five times its own kProcessFanOutBudgetMs of 400 ms.
+    //
+    // Configuration is now restored correctly, and with CURRENT state, by the
+    // publishers, so refusing immediately here is both honest and cheaper.
 
     // Route through FilterConnection for encryption
     {
@@ -1025,11 +1032,53 @@ bool IPCManager::SendToKernel(
         if (messageSize >= sizeof(SHADOWSTRIKE_MESSAGE_HEADER)) {
             msgType = reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(message)->MessageType;
         }
-        Utils::Logger::Error("[IPCManager] SendToKernel: encrypted channel unavailable; "
-                             "refusing plaintext fallback - DROPPED messageType={} size={} "
-                             "everConnected={}. If this carried protection configuration, that "
-                             "configuration is now absent kernel-side until it is re-pushed.",
-                             msgType, messageSize, m_everConnected ? "yes" : "no");
+        // Distinguish a DEFERRED configuration push from a genuinely LOST
+        // one-shot event. Configuration is re-published by its owning module the
+        // moment the channel comes up, so calling it lost would be false and
+        // would send the next reader hunting a gap that repairs itself. A
+        // one-shot event has no such repair and stays an error.
+        //
+        // The classification is the enum's OWN partition rather than a
+        // hand-picked list, and that buys a property worth stating: every
+        // invented constant used by the hand-rolled block-request senders
+        // (0x30, 0x31, 0x35, 0x36 and friends) fails
+        // SHADOWSTRIKE_VALID_MESSAGE_TYPE, so a stale block request can never be
+        // mistaken for replayable configuration. The two query types are
+        // excluded by name because an answer nobody is waiting for any more is
+        // worthless, and they are the only reply-bearing members of the policy
+        // group.
+        //
+        // Classified through a signed copy so the comparisons against the
+        // enumerators cannot raise a signed/unsigned mismatch; every enumerator
+        // is small and non-negative and msgType comes from a UINT16 field, so
+        // the conversion is exact.
+        const int msgTypeForClass = static_cast<int>(msgType);
+        const bool isConfiguration =
+            SHADOWSTRIKE_VALID_MESSAGE_TYPE(msgTypeForClass) &&
+            !SHADOWSTRIKE_IS_CONTROL_MESSAGE(msgTypeForClass) &&
+            msgTypeForClass != static_cast<int>(FilterMessageType_QueryDriverStatus) &&
+            msgTypeForClass != static_cast<int>(FilterMessageType_ExclusionQuery) &&
+            (SHADOWSTRIKE_IS_POLICY_MESSAGE(msgTypeForClass) ||
+             SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE(msgTypeForClass));
+
+        const size_t publisherCount = KernelConfigPublisherCount();
+
+        if (isConfiguration && publisherCount > 0) {
+            Utils::Logger::Warn("[IPCManager] SendToKernel: encrypted channel unavailable; "
+                                "refusing plaintext fallback - DEFERRED configuration "
+                                "messageType={} size={} everConnected={}. {} publisher(s) will "
+                                "re-push current configuration when the channel is established.",
+                                msgType, messageSize, m_everConnected ? "yes" : "no",
+                                publisherCount);
+        } else {
+            Utils::Logger::Error("[IPCManager] SendToKernel: encrypted channel unavailable; "
+                                 "refusing plaintext fallback - DROPPED messageType={} size={} "
+                                 "everConnected={} configuration={}. A one-shot message is not "
+                                 "recoverable; if this carried configuration then no publisher "
+                                 "is registered to re-push it.",
+                                 msgType, messageSize, m_everConnected ? "yes" : "no",
+                                 isConfiguration ? "yes" : "no");
+        }
     }
     m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -1614,6 +1663,79 @@ size_t IPCManager::RegistrySubscriberCount() const noexcept {
         return m_registrySubscribers ? m_registrySubscribers->size() : 0;
     } catch (...) {
         return 0;
+    }
+}
+
+void IPCManager::RegisterKernelConfigPublisher(std::string publisher,
+                                               KernelConfigPublisher handler) {
+    // The refusal of an unnamed publisher, same-name replacement and the
+    // nullptr-removes-only-me idiom all live in UpsertNamedSubscriber, which is
+    // the single implementation shared with the four notification feeds.
+    std::lock_guard lock(m_handlerMutex);
+    UpsertNamedSubscriber(m_kernelConfigPublishers, std::move(publisher), std::move(handler),
+                          "KernelConfig");
+}
+
+void IPCManager::UnregisterKernelConfigPublisher(std::string_view publisher) {
+    std::lock_guard lock(m_handlerMutex);
+    EraseNamedSubscriber(m_kernelConfigPublishers, publisher, "KernelConfig");
+}
+
+size_t IPCManager::KernelConfigPublisherCount() const noexcept {
+    try {
+        std::lock_guard lock(m_handlerMutex);
+        return m_kernelConfigPublishers ? m_kernelConfigPublishers->size() : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+void IPCManager::PublishKernelConfiguration() {
+    // Snapshot under the lock, invoke outside it. A publisher calls SendToKernel,
+    // which takes m_primaryConnMutex, and is permitted to register or remove
+    // publishers; holding m_handlerMutex across the call would couple the
+    // configuration path to both and is not needed once the snapshot is taken.
+    std::shared_ptr<const std::vector<KernelConfigPublication>> publishers;
+    {
+        std::lock_guard lock(m_handlerMutex);
+        publishers = m_kernelConfigPublishers;
+    }
+
+    if (!publishers || publishers->empty()) {
+        // Not an error in itself, but it does mean nothing restores kernel-side
+        // configuration on this connect, which is exactly the silent gap this
+        // mechanism exists to prevent. Say so rather than staying quiet.
+        Utils::Logger::Warn("[IPCManager] Encrypted channel established with NO kernel "
+                            "configuration publishers registered - kernel-side protection "
+                            "configuration is whatever the driver defaults to");
+        return;
+    }
+
+    // Each publisher owns a DIFFERENT kernel-side protection, so one throwing
+    // must neither stop the others nor fail the connect. Hence a guard per call
+    // rather than one around the loop.
+    size_t failed = 0;
+    for (const auto& entry : *publishers) {
+        try {
+            entry.handler();
+        } catch (const std::exception& e) {
+            ++failed;
+            Utils::Logger::Error("[IPCManager] Kernel configuration publisher '{}' threw: {}",
+                                 entry.name, e.what());
+        } catch (...) {
+            ++failed;
+            Utils::Logger::Error("[IPCManager] Kernel configuration publisher '{}' threw a "
+                                 "non-standard exception", entry.name);
+        }
+    }
+
+    if (failed == 0) {
+        Utils::Logger::Info("[IPCManager] Republished kernel configuration from {} publisher(s)",
+                            publishers->size());
+    } else {
+        Utils::Logger::Error("[IPCManager] Republished kernel configuration from {} publisher(s), "
+                             "{} FAILED - the kernel-side configuration those modules own is "
+                             "absent until the next reconnect", publishers->size(), failed);
     }
 }
 

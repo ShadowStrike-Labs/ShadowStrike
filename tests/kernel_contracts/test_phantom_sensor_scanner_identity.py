@@ -13081,5 +13081,215 @@ class FilterSendMessageContractTests(unittest.TestCase):
             "lpBytesReturned is null again, which terminates the process")
 
 
+class KernelConfigPublisherContractTests(unittest.TestCase):
+    """Kernel-side configuration must survive a channel that comes up late.
+
+    THE DEFECT. Three modules push configuration the driver needs for the whole
+    session - RegistryProtection's protected key list, FileProtection's protected
+    path set, SelfDefense's protected process registration. All three push it
+    from their own Initialize, on the boot-init thread, which runs before
+    IPCManager::Start and therefore before ConnectFilterPort establishes the
+    encrypted channel. Every push was refused and lost, so on EVERY BOOT the
+    kernel held none of that configuration, silently, for the whole session.
+
+    Measured in the 1.0.99 field log: messageType=23 size=1796 (registry keys),
+    messageType=23 size=136 (protected paths) and messageType=26 size=48
+    (protected processes), all three stamped on the boot-init thread with
+    everConnected=no, and the channel establishing 1.96 s later.
+
+    These tests are source contracts because reaching the defect at runtime needs
+    a loaded driver and a live filter port, which no unit test has.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ipc_cpp = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        cls.ipc_hpp = strip_c_comments(read_source(IPC_MANAGER_HPP_PATH))
+        cls.svc_cpp = strip_c_comments(read_source(ANTIVIRUS_SERVICE_CPP_PATH))
+
+    # -- helpers ------------------------------------------------------------
+    def _definition_body(self, code, needle):
+        """Slice a function body anchored on its RETURN-TYPE-PREFIXED header.
+
+        Anchoring on the bare name is unsound here: ConnectFilterPort is CALLED
+        at four sites, one of which precedes its definition, so a first-occurrence
+        match would slice a call.
+        """
+        self.assertEqual(
+            code.count(needle), 1,
+            "expected exactly one definition matching %r, found %d"
+            % (needle, code.count(needle)))
+        start = code.index(needle)
+        depth = 0
+        i = code.index("{", start)
+        while i < len(code):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+            i += 1
+        self.fail("unterminated body for %r" % needle)
+
+    def _call_args(self, code, callee):
+        """Every call to `callee`, sliced by parenthesis matching."""
+        out = []
+        idx = 0
+        token = callee + "("
+        while True:
+            k = code.find(token, idx)
+            if k < 0:
+                return out
+            i = k + len(token)
+            depth = 1
+            while i < len(code) and depth:
+                if code[i] == "(":
+                    depth += 1
+                elif code[i] == ")":
+                    depth -= 1
+                i += 1
+            out.append(code[k:i])
+            idx = i
+
+    # -- the mechanism exists and shares the one subscription implementation --
+    def test_the_publisher_registry_exists_and_reuses_the_shared_semantics(self):
+        for sym in ("RegisterKernelConfigPublisher",
+                    "UnregisterKernelConfigPublisher",
+                    "KernelConfigPublisherCount"):
+            self.assertTrue(
+                sym in self.ipc_hpp,
+                "%s is not declared; the publisher API is incomplete" % sym)
+            self.assertTrue(
+                sym in self.ipc_cpp,
+                "%s is not defined" % sym)
+
+        reg = self._definition_body(
+            self.ipc_cpp, "void IPCManager::RegisterKernelConfigPublisher(")
+        self.assertTrue(
+            "UpsertNamedSubscriber(m_kernelConfigPublishers" in reg,
+            "registration must route through UpsertNamedSubscriber so the "
+            "empty-name refusal and same-name-replaces rules have exactly one "
+            "implementation rather than a private copy")
+
+        unreg = self._definition_body(
+            self.ipc_cpp, "void IPCManager::UnregisterKernelConfigPublisher(")
+        self.assertTrue(
+            "EraseNamedSubscriber(m_kernelConfigPublishers" in unreg,
+            "removal must route through EraseNamedSubscriber so unregistering "
+            "one publisher cannot clear the whole feed")
+
+    # -- the wiring that makes it work ---------------------------------------
+    def test_configuration_is_republished_when_the_channel_comes_up(self):
+        body = self._definition_body(self.ipc_cpp, "bool IPCManager::ConnectFilterPort(")
+        self.assertTrue(
+            "PublishKernelConfiguration();" in body,
+            "ConnectFilterPort does not republish kernel configuration, so the "
+            "configuration refused during Initialize is never restored - and a "
+            "reconnect leaves the kernel unconfigured too")
+
+        # It must sit in the branch that ran because the channel IS up. Calling
+        # it when the channel is down would send every publisher into the same
+        # refusal that caused the defect.
+        gate = body.find("if (encryptedChannelUp)")
+        call = body.find("PublishKernelConfiguration();")
+        self.assertNotEqual(gate, -1, "the encryptedChannelUp gate is gone")
+        self.assertGreater(
+            call, gate,
+            "PublishKernelConfiguration must be inside the encryptedChannelUp "
+            "branch; publishing while the channel is down reproduces the defect")
+        opened = body.count("{", gate, call)
+        closed = body.count("}", gate, call)
+        self.assertGreater(
+            opened, closed,
+            "PublishKernelConfiguration is not nested inside the "
+            "encryptedChannelUp branch (brace depth did not increase)")
+
+    def test_the_self_defeating_startup_wait_is_not_reintroduced(self):
+        # The wait could never help the senders it was written for: they run on
+        # the same thread that later calls Start, so blocking postponed the very
+        # connect it waited for. It also stalled one-shot block requests up to
+        # 2000 ms against a 400 ms process fan-out budget.
+        for banned in ("kStartupChannelWait",
+                       "waited for the encrypted channel"):
+            self.assertFalse(
+                banned in self.ipc_cpp,
+                "%r is back in SendToKernel; that wait postpones the connect it "
+                "waits for and stalls one-shot responses" % banned)
+
+        send = self._definition_body(self.ipc_cpp, "bool IPCManager::SendToKernel(")
+        self.assertFalse(
+            "sleep_for" in send,
+            "SendToKernel sleeps again; a send that blocks on the kernel channel "
+            "delays startup and the process-notify fan-out")
+
+    def test_deferral_is_classified_by_the_enums_own_partition(self):
+        send = self._definition_body(self.ipc_cpp, "bool IPCManager::SendToKernel(")
+        for macro in ("SHADOWSTRIKE_VALID_MESSAGE_TYPE",
+                      "SHADOWSTRIKE_IS_POLICY_MESSAGE",
+                      "SHADOWSTRIKE_IS_DATA_PUSH_MESSAGE",
+                      "SHADOWSTRIKE_IS_CONTROL_MESSAGE"):
+            self.assertTrue(
+                macro in send,
+                "SendToKernel must classify a deferrable message with %s rather "
+                "than a hand-picked list of type numbers; the enum partition is "
+                "what keeps every invented 0x30-style constant out" % macro)
+
+        # The two reply-bearing policy members must not be treated as
+        # replayable: an answer nobody waits for any more is worthless.
+        for query in ("FilterMessageType_QueryDriverStatus",
+                      "FilterMessageType_ExclusionQuery"):
+            self.assertTrue(
+                query in send,
+                "%s must be excluded from deferral by name - it is a query, not "
+                "configuration" % query)
+
+    # -- every publisher is wired, and none can be silently dropped ----------
+    def test_all_three_configuration_owners_register_a_publisher(self):
+        calls = self._call_args(self.svc_cpp, "ipc.RegisterKernelConfigPublisher")
+        self.assertEqual(
+            len(calls), 3,
+            "expected exactly 3 kernel configuration publishers in "
+            "AntivirusService.cpp, found %d - a module was added or dropped"
+            % len(calls))
+
+        expected = {
+            "RegistryProtection": "SyncProtectedKeysToKernel",
+            "FileProtection": "SyncProtectedPathsToKernel",
+            "SelfDefense": "SyncProtectedProcessesToKernel",
+        }
+        seen = {}
+        for call in calls:
+            for name, sync in expected.items():
+                if '"%s"' % name in call:
+                    seen[name] = call
+
+        missing = sorted(set(expected) - set(seen))
+        self.assertEqual(
+            missing, [],
+            "these configuration owners have no publisher, so their kernel-side "
+            "protection stays unconfigured: %s" % missing)
+
+        for name, call in seen.items():
+            self.assertTrue(
+                expected[name] + "(" in call,
+                "the '%s' publisher must call %s so it republishes CURRENT state "
+                "rather than a stale snapshot" % (name, expected[name]))
+            self.assertTrue(
+                "IsInitialized()" in call,
+                "the '%s' publisher must not ask an uninitialised module to "
+                "publish" % name)
+
+    def test_publishers_are_registered_after_the_ipc_manager_is_initialized(self):
+        init = self.svc_cpp.find("Communication::IPCManager::Instance().Initialize()")
+        first = self.svc_cpp.find("ipc.RegisterKernelConfigPublisher")
+        self.assertNotEqual(init, -1, "IPCManager::Initialize call site not found")
+        self.assertNotEqual(first, -1, "no publisher registration found")
+        self.assertGreater(
+            first, init,
+            "publishers are registered before IPCManager::Initialize; register "
+            "after it so registration cannot depend on construction order")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

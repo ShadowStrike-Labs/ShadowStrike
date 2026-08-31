@@ -606,6 +606,49 @@ public:
                 return false;
             }
             SS_LOG_INFO(LOG_CATEGORY, L"IPCManager init returned");
+
+            // Restore kernel-side configuration on every channel establishment.
+            //
+            // WHY THESE THREE AND WHY HERE. RegistryProtection (above, step 3),
+            // FileProtection and SelfDefense each push configuration the driver
+            // needs for the whole session, and each pushes it from its own
+            // Initialize - all of which ran earlier on THIS thread, before
+            // IPCManager even existed, let alone before its encrypted channel
+            // came up. Every one of those pushes was refused and lost, so the
+            // kernel held no protected key list, no protected path set and no
+            // protected process registration for the entire session, on every
+            // boot. Registering here is provably after IPCManager::Initialize
+            // succeeded, and the publishers fire later still, when the channel
+            // is actually established.
+            //
+            // Each publisher re-reads its module's CURRENT state, so it is
+            // correct to call repeatedly and it cannot ship a stale snapshot.
+            // Each guards on its own module being initialized, because a module
+            // whose Initialize failed above must not be asked to publish.
+            {
+                auto& ipc = Communication::IPCManager::Instance();
+
+                ipc.RegisterKernelConfigPublisher("RegistryProtection", [] {
+                    if (Security::RegistryProtection::HasInstance() &&
+                        Security::RegistryProtection::Instance().IsInitialized()) {
+                        (void)Security::RegistryProtection::Instance().SyncProtectedKeysToKernel();
+                    }
+                });
+
+                ipc.RegisterKernelConfigPublisher("FileProtection", [] {
+                    if (Security::FileProtection::HasInstance() &&
+                        Security::FileProtection::Instance().IsInitialized()) {
+                        Security::FileProtection::Instance().SyncProtectedPathsToKernel();
+                    }
+                });
+
+                ipc.RegisterKernelConfigPublisher("SelfDefense", [] {
+                    if (Security::SelfDefense::HasInstance() &&
+                        Security::SelfDefense::Instance().IsInitialized()) {
+                        Security::SelfDefense::Instance().SyncProtectedProcessesToKernel();
+                    }
+                });
+            }
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-IPCManager-leave");
 
             // Initialize Communication subsystems (singletons — all depend on IPCManager)

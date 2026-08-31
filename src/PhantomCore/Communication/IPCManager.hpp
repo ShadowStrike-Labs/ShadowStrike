@@ -766,6 +766,48 @@ struct RegistrySubscription {
 };
 
 /**
+ * @brief One module's re-publication of the kernel configuration it owns.
+ *
+ * WHY A PUBLISHER AND NOT A BUFFERED MESSAGE. Three modules push configuration
+ * the kernel needs for the whole session - RegistryProtection's protected key
+ * list, FileProtection's protected path set, SelfDefense's protected process
+ * registration - and all three push it from their own Initialize, which runs on
+ * the boot-init thread BEFORE IPCManager::Start and therefore long before
+ * ConnectFilterPort establishes the encrypted channel. Every one of those pushes
+ * was refused and lost, silently leaving the matching kernel-side protection
+ * unconfigured for the entire session.
+ *
+ * Buffering the REFUSED BYTES and replaying them later was rejected for two
+ * measured reasons. First, it replays a STALE snapshot: a key protected after
+ * the failed push would be missing from the replayed list, whereas asking the
+ * module to publish again sends its CURRENT state. Second, it cannot repair the
+ * sender's own bookkeeping - SelfDefense marks every entry kernelProtected only
+ * when its own send reports success, so a replay performed behind its back would
+ * leave that flag false forever even though the kernel did receive the
+ * registration.
+ *
+ * Invoking the module's own publisher fixes both, and closes a second hole in
+ * the same defect: nothing re-pushed this configuration after a RECONNECT
+ * either, so a dropped and re-established channel left the kernel unconfigured
+ * exactly as a cold boot did. ConnectFilterPort is the single place the primary
+ * connection is created, so publishing there covers the first connect and every
+ * reconnect with one call.
+ */
+using KernelConfigPublisher = std::function<void()>;
+
+/**
+ * @brief One named publisher of kernel-side configuration.
+ *
+ * Same shape and the same copy-on-write discipline as the notification feeds
+ * above. The name is the module identity, so a re-registration replaces rather
+ * than duplicates and a failure can be attributed in a log.
+ */
+struct KernelConfigPublication {
+    std::string           name;
+    KernelConfigPublisher handler;
+};
+
+/**
  * @brief One named subscriber to the kernel image-load notification feed.
  *
  * SAME SHAPE, SAME REASON, AND THE SAME NO-WAITER ARGUMENT AS
@@ -1087,6 +1129,32 @@ public:
     [[nodiscard]] size_t RegistrySubscriberCount() const noexcept;
 
     /**
+     * @brief Register a module's re-publication of the kernel configuration it owns.
+     *
+     * Invoked once per successful establishment of the encrypted primary channel
+     * - the first connect AND every reconnect - so a module never has to know
+     * when the channel came up. Publishers run OUTSIDE every IPCManager lock, so
+     * a publisher may call SendToKernel directly.
+     *
+     * The handler must send the module's CURRENT configuration rather than a
+     * snapshot captured at registration time; that is the whole reason this is a
+     * callback and not a buffered message. It must also tolerate being called
+     * more than once, because every reconnect calls it again.
+     *
+     * @param publisher Stable module identity. Must be non-empty - an unnamed
+     *                  publisher cannot be removed and cannot be attributed.
+     * @param handler   Pass nullptr to remove only this publisher.
+     */
+    void RegisterKernelConfigPublisher(std::string publisher, KernelConfigPublisher handler);
+
+    /// @brief Remove one named configuration publisher. Unknown names are ignored.
+    void UnregisterKernelConfigPublisher(std::string_view publisher);
+
+    /// @brief Number of live configuration publishers. Zero means nothing restores
+    ///        kernel-side configuration on connect or reconnect.
+    [[nodiscard]] size_t KernelConfigPublisherCount() const noexcept;
+
+    /**
      * @brief Combine two kernel verdicts, most severe wins.
      *
      * ONE POLICY WITH THREE USERS, NOT THREE COPIES. Every fanned-out
@@ -1312,6 +1380,17 @@ private:
     // does not have to defend against a null list.
     std::shared_ptr<const std::vector<RegistrySubscription>> m_registrySubscribers{
         std::make_shared<const std::vector<RegistrySubscription>>() };
+
+    // Kernel configuration publishers, same copy-on-write snapshot discipline as
+    // the notification feeds. Rebuilt on registration (a startup event), copied
+    // by refcount when the channel comes up. Never null once constructed.
+    std::shared_ptr<const std::vector<KernelConfigPublication>> m_kernelConfigPublishers{
+        std::make_shared<const std::vector<KernelConfigPublication>>() };
+
+    /// @brief Invoke every registered configuration publisher. Called from
+    ///        ConnectFilterPort once the encrypted channel is established, with
+    ///        no IPCManager lock held.
+    void PublishKernelConfiguration();
 
     // Generic (non-verdict) subscribers, held as an immutable snapshot behind a
     // shared_ptr so the DISPATCH path copies one refcount instead of N
