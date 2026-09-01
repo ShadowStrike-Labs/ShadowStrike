@@ -707,11 +707,46 @@ public:
                 }
             }
 
-            // Get version info
-            if (options.parseResources) {
-                SS_DIAG_SCOPE("OnAccess", "Analyze.GetVersionInfo");
-                info.versionInfo = GetVersionInfoImpl(filePath);
-            }
+            // Version info is NOT queried here, and that is a correctness fix
+            // rather than an optimisation.
+            //
+            // MEASURED in the 1.0.101 field trace: this call blocked 91.1 s once
+            // and 139.9 s twice, on vaultcli.dll, UserDeviceRegistration.dll and
+            // Windows.Security.Authentication.Web.Core.dll - 280 s of a 469 s
+            // run spent inside one Win32 call, with two of the three landing on
+            // the same figure to within 50 ms, which is a fixed timeout rather
+            // than variable work. On the same thread and immediately before it,
+            // Analyze.WinVerifyTrust completed in 338 us, so CryptSvc was not
+            // what was slow.
+            //
+            // GetFileVersionInfoSizeW and GetFileVersionInfoW load the target as
+            // an image resource, which opens and maps the file and takes the
+            // loader lock. That serialises against every other module load in
+            // this process, and the 139.9 s figure is very close to four
+            // consecutive 35 s cycles of the lock being held elsewhere.
+            //
+            // AND NOTHING READ THE RESULT. ExecutableInfo::versionInfo was
+            // written here and consumed nowhere in the tree - the only other
+            // matches for the name are unrelated locals in VulnScanner and
+            // SystemUtils, plus GetVersionInfoImpl populating its own return
+            // value. So the analysis path paid a multi-minute blocking call, on
+            // a worker holding a scan slot, to fill a structure no detector,
+            // report or telemetry field ever looked at.
+            //
+            // NO DETECTION IS LOST: there is no reader to lose. Resource parsing
+            // itself is unaffected and still runs from the buffer already in
+            // memory, further down, via ParseResourcesImpl.
+            //
+            // GetVersionInfoImpl and the public ExecutableAnalyzer::GetVersionInfo
+            // accessor are DELIBERATELY KEPT. Version metadata is real latent
+            // detection value - a binary claiming CompanyName "Microsoft
+            // Corporation" without a matching signature is a genuine signal -
+            // and an explicit caller that can afford to block may still ask for
+            // it. What must not happen is this call returning to the analysis
+            // path as it stood. If that signal is ever wanted during a scan, it
+            // has to be parsed from the buffer this function already holds,
+            // because VS_VERSIONINFO is a resource and the bytes are present;
+            // going back to the file is what made this a freeze.
 
             // Update statistics
             m_stats.filesAnalyzed.fetch_add(1, std::memory_order_relaxed);

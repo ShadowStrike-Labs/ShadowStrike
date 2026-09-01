@@ -253,6 +253,7 @@ VPN_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.cpp"
 VPN_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.hpp"
 HONEYPOT_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneyPotManager.cpp"
 HONEYPOT_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneypotManager.hpp"
+EXECUTABLE_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/FileSystem/ExecutableAnalyzer.cpp"
 
 # IPLeakProtection is the opposite case from Tor/VPN: its kill switch is REAL
 # (registered WFP sublayer, netsh via CreateProcessW, iphlpapi), so the defect
@@ -14376,6 +14377,56 @@ class HoneypotConcealmentContractTests(unittest.TestCase):
         self.assertEqual(
             self.hpp.count("bool isHidden = false;"), 1,
             "HoneyFile::isHidden must default to false and be set on success")
+
+
+class BlockingVersionInfoRemovalContractTests(unittest.TestCase):
+    """The analysis path must not query file version info through Win32.
+
+    MEASURED in the 1.0.101 field trace: GetVersionInfoImpl blocked 91.1 s once
+    and 139.9 s twice - 280 s of a 469 s run - because
+    GetFileVersionInfoSizeW/GetFileVersionInfoW load the target as an image
+    resource, which maps the file and takes the loader lock. Nothing read the
+    result: ExecutableInfo::versionInfo had no consumer anywhere in the tree.
+
+    The capability is kept rather than deleted, because version metadata is real
+    latent detection value. What must not come back is the analysis path going
+    to the FILE for it; the bytes are already in the buffer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Comments are stripped because the removal's own comment necessarily
+        # names GetVersionInfoImpl, versionInfo and GetFileVersionInfoSizeW.
+        cls.cpp = strip_c_comments(read_source(EXECUTABLE_ANALYZER_CPP_PATH))
+
+    def test_the_analysis_path_does_not_query_version_info(self):
+        self.assertEqual(
+            self.cpp.count("info.versionInfo = GetVersionInfoImpl("), 0,
+            "the analysis path must not call GetVersionInfoImpl: it blocked for "
+            "up to 139.9 s per file and no code reads the result")
+        self.assertEqual(
+            self.cpp.count('SS_DIAG_SCOPE("OnAccess", "Analyze.GetVersionInfo")'), 0,
+            "the scope should go with the call it timed")
+
+    def test_the_version_info_capability_is_kept(self):
+        # This assertion is what stops the guard being satisfied by deletion.
+        self.assertEqual(
+            self.cpp.count(
+                "VersionInfo GetVersionInfoImpl(const std::wstring& filePath) const {"), 1,
+            "GetVersionInfoImpl must be KEPT - version metadata is latent "
+            "detection value and an explicit caller may still ask for it")
+        self.assertEqual(
+            self.cpp.count("return m_impl->GetVersionInfoImpl(filePath);"), 1,
+            "the public accessor must keep forwarding to it")
+
+    def test_resource_parsing_still_runs_from_the_buffer(self):
+        self.assertEqual(
+            self.cpp.count("info.resources = ParseResourcesImpl(buffer, info);"), 1,
+            "resource parsing from the in-memory buffer is the correct mechanism "
+            "and must survive; removing it would lose real coverage")
+        self.assertEqual(
+            self.cpp.count("} else if (options.allowBlockingSignatureVerification) {"), 1,
+            "the sibling blocking gate must be untouched")
 
 
 if __name__ == "__main__":
