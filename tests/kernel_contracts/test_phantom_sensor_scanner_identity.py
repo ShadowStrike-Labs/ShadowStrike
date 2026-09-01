@@ -13856,5 +13856,139 @@ class MappedViewErrorFidelityContractTests(unittest.TestCase):
             "unscanned file as a scanned one")
 
 
+class AeadAadIntegrityContractTests(unittest.TestCase):
+    """The GCM AAD must equal the header actually transmitted.
+
+    FilterConnection encrypts every user-mode kernel frame with AES-256-GCM and
+    passes SHADOWSTRIKE_MESSAGE_HEADER as additional authenticated data. The tag
+    therefore binds those exact header bytes, and the driver re-derives the AAD
+    from the header it received. Any mutation of the wire header after the tag is
+    computed silently invalidates it.
+
+    That defect shipped: SHADOWSTRIKE_MSG_FLAG_HMAC was OR-ed into the wire
+    header after encryption, so the kernel's BCryptDecrypt returned
+    STATUS_AUTH_TAG_MISMATCH, surfacing as HRESULT 0x80070017 (ERROR_CRC), and
+    every encrypted frame on the no-reply path was refused. The measured
+    consequence was that no kernel-side protection list was ever populated.
+
+    These tests pin the ORDERING, because presence alone cannot express the
+    invariant: the flags must be final BEFORE the encrypt call, and the wire
+    header must be written FROM the authenticated value and never touched again.
+    """
+
+    @staticmethod
+    def _encrypt_send_message_body():
+        """Return the comment-stripped body of EncryptSendMessage.
+
+        The definition is located on its RETURN-TYPE PREFIX: the two call sites
+        read `EncryptSendMessage(sendBuffer, ...)` with no `bool`, so
+        `bool EncryptSendMessage(` identifies the definition uniquely and this
+        cannot latch onto a caller.
+
+        Comments are stripped FIRST and that is load-bearing: the fix's own
+        comments necessarily name SHADOWSTRIKE_MSG_FLAG_HMAC while describing the
+        defect, so a raw-text search would be satisfied by prose.
+        """
+        source = read_source(FILTER_CONNECTION_CPP_PATH)
+        matches = list(re.finditer(r"bool\s+EncryptSendMessage\s*\(", source))
+        if len(matches) != 1:
+            raise AssertionError(
+                "expected exactly 1 definition of EncryptSendMessage keyed on its "
+                "return type, found %d" % len(matches))
+        start = matches[0].start()
+        brace = source.index("{", start)
+        depth = 0
+        end = None
+        for i in range(brace, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            raise AssertionError("unbalanced braces in EncryptSendMessage")
+        return strip_c_comments(source[brace:end])
+
+    def test_every_wire_flag_is_set_before_the_gcm_tag_is_computed(self):
+        body = self._encrypt_send_message_body()
+
+        encrypt_at = body.find("crypto.Encrypt(")
+        self.assertNotEqual(
+            encrypt_at, -1,
+            "EncryptSendMessage no longer calls crypto.Encrypt; this guard "
+            "describes an ordering around that call and must be revisited")
+
+        for flag in ("SHADOWSTRIKE_MSG_FLAG_ENCRYPTED", "SHADOWSTRIKE_MSG_FLAG_HMAC"):
+            needle = "aadHeader.Flags |= %s;" % flag
+            at = body.find(needle)
+            self.assertNotEqual(
+                at, -1,
+                "%s must be OR-ed into aadHeader so the GCM tag authenticates it; "
+                "a flag set on the wire header instead is the ERROR_CRC defect" % flag)
+            self.assertLess(
+                at, encrypt_at,
+                "%s is set at offset %d but crypto.Encrypt is called at offset %d: "
+                "the flag is not covered by the tag it must be covered by"
+                % (flag, at, encrypt_at))
+
+    def test_the_wire_header_is_never_mutated_after_the_tag(self):
+        body = self._encrypt_send_message_body()
+
+        offenders = [
+            line.strip()
+            for line in body.split("\n")
+            if re.search(r"outHeader\s*->\s*Flags\s*(\|=|&=|\^=|=)", line)
+        ]
+        self.assertEqual(
+            offenders, [],
+            "the wire header must never be mutated after the GCM tag is computed; "
+            "found %d mutation(s): %s" % (len(offenders), offenders))
+
+        # Anti-vacuity: an empty or deleted function would also satisfy the
+        # assertion above, so pin the work this function must still do.
+        #
+        # Bounded deliberately: assertIn would print the whole function body on
+        # failure (6,028 characters measured), which buries the finding.
+        self.assertTrue(
+            "ComputeKernelMessageHMAC" in body,
+            "EncryptSendMessage no longer computes the outgoing HMAC (searched "
+            "%d chars of comment-stripped body); the no-mutation assertion above "
+            "would then be vacuously true" % len(body))
+
+    def test_the_wire_header_is_written_from_the_authenticated_value(self):
+        body = self._encrypt_send_message_body()
+
+        self.assertEqual(
+            body.count("*outHeader = aadHeader;"), 1,
+            "the wire header must be assigned exactly once, from the same value "
+            "that was passed to the cipher as AAD")
+
+        assign_at = body.find("*outHeader = aadHeader;")
+        encrypt_at = body.find("crypto.Encrypt(")
+        self.assertGreater(
+            assign_at, encrypt_at,
+            "the wire header is written at offset %d, before crypto.Encrypt at "
+            "offset %d; it must be written from the value the tag authenticated"
+            % (assign_at, encrypt_at))
+
+    def test_a_failed_hmac_refuses_the_send_rather_than_downgrading(self):
+        body = self._encrypt_send_message_body()
+
+        guard_at = body.find("hmac.size() != 32")
+        self.assertNotEqual(
+            guard_at, -1,
+            "the outgoing HMAC length must be checked; without it a short tag "
+            "would be appended and the frame would be self-inconsistent")
+
+        tail = body[guard_at:guard_at + 900]
+        self.assertTrue(
+            "return false;" in tail,
+            "a failed HMAC must refuse the send: the flag advertising the HMAC is "
+            "inside the authenticated AAD, so clearing it to 'send anyway' would "
+            "invalidate the GCM tag and reintroduce the ERROR_CRC defect. Searched "
+            "the %d chars following the length check." % len(tail))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

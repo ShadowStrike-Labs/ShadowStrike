@@ -1584,9 +1584,33 @@ private:
         memcpy(nonce.data(), m_sessionNoncePrefix.data(), 4);
         memcpy(nonce.data() + 4, &counter, sizeof(counter));
 
-        // Compute AAD from header with FINAL flags/size (as receiver will see it)
+        // Compute AAD from header with FINAL flags/size (as receiver will see it).
+        //
+        // WIRE-INTEGRITY FIX: every flag this frame will carry must be set HERE,
+        // before the GCM tag is computed. The tag authenticates these exact bytes
+        // and the receiver re-derives the AAD from the header it actually
+        // received, so a later mutation of the header silently invalidates the
+        // tag. Setting SHADOWSTRIKE_MSG_FLAG_HMAC after the fact - which is what
+        // this function used to do, a few lines below - changed a byte the tag
+        // covered, so the kernel's BCryptDecrypt returned
+        // STATUS_AUTH_TAG_MISMATCH, which surfaces to user mode as HRESULT
+        // 0x80070017 (ERROR_CRC). EVERY encrypted frame on this path was refused.
+        //
+        // MEASURED, 1.0.100 field log: the three startup configuration pushes -
+        // FileProtection's protected paths, RegistryProtection's protected keys
+        // and SelfDefense's protected-process registration - failed with exactly
+        // that HRESULT, three failures at the one instant the channel came up.
+        // That is why no kernel-side protection list had ever been populated and
+        // why the driver, not holding our service in its exclusion list, went on
+        // to deny our own honeypot's decoy writes as ransomware activity.
+        //
+        // The header is finalised once, copied to the wire buffer, and never
+        // mutated again. Keeping the HMAC flag inside the AAD has a second
+        // benefit: the flag cannot be stripped in flight without breaking the
+        // GCM tag, so an attacker cannot downgrade the frame silently.
         SHADOWSTRIKE_MESSAGE_HEADER aadHeader = *header;
         aadHeader.Flags |= SHADOWSTRIKE_MSG_FLAG_ENCRYPTED;
+        aadHeader.Flags |= SHADOWSTRIKE_MSG_FLAG_HMAC;
         aadHeader.DataSize = static_cast<ULONG>(encPayloadSize);
         aadHeader.TotalSize = static_cast<ULONG>(
             sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + encPayloadSize);
@@ -1644,25 +1668,43 @@ private:
         crypto.SecureZero(nonce.data(), nonce.size());
 
         // ── APT DEFENSE: Append HMAC-SHA256 for message integrity ────
-        // Set the HMAC flag and append a 32-byte HMAC over the entire
-        // SHADOWSTRIKE_MESSAGE_HEADER + encrypted payload. The kernel
-        // verifies this before decrypting, blocking injection attacks.
+        // Appends a 32-byte HMAC over the SHADOWSTRIKE_MESSAGE_HEADER plus the
+        // encrypted payload. The flag advertising it is already part of the GCM
+        // AAD above, so THE HEADER IS DELIBERATELY NOT TOUCHED HERE.
+        //
+        // HONEST SCOPE, MEASURED: the kernel does NOT verify this HMAC today.
+        // SHADOWSTRIKE_MSG_FLAG_HMAC occurs exactly once in the entire driver and
+        // that occurrence is a comment, so no verification code exists. The
+        // previous comment here claimed "the kernel verifies this before
+        // decrypting, blocking injection attacks"; that was false, and stating it
+        // hid the fact that the only integrity actually protecting this frame is
+        // AES-256-GCM, whose tag covers both the ciphertext and this header as
+        // AAD. The HMAC is retained as defence-in-depth for a driver-side
+        // verifier; whether to implement that verification or drop the field is a
+        // protocol decision tracked separately. It is not load-bearing today and
+        // must not be described as though it were.
         {
-            outHeader->Flags |= SHADOWSTRIKE_MSG_FLAG_HMAC;
-
             std::span<const uint8_t> msgSpan(
                 encryptedBuffer.data() + 0,  // Start from SHADOWSTRIKE_MESSAGE_HEADER
                 encryptedBuffer.size());
             std::span<const uint8_t> keySpan(m_sessionKey.data(), m_sessionKey.size());
 
             auto hmac = crypto.ComputeKernelMessageHMAC(msgSpan, keySpan);
-            if (hmac.size() == 32) {
-                encryptedBuffer.insert(encryptedBuffer.end(), hmac.begin(), hmac.end());
-            } else {
-                Utils::Logger::Warn("[FilterConnection] Failed to compute outgoing HMAC — "
-                                    "sending without integrity tag");
-                outHeader->Flags &= ~SHADOWSTRIKE_MSG_FLAG_HMAC;
+            if (hmac.size() != 32) {
+                // A silent downgrade is NOT available and must not be attempted.
+                // The flag lives inside the authenticated AAD, so clearing it
+                // here would invalidate the GCM tag and the kernel would refuse
+                // the frame - which is precisely the defect this function used to
+                // ship. Refusing the send is both correct and consistent with the
+                // caller's documented no-plaintext-fallback policy.
+                Utils::Logger::Error("[FilterConnection] Failed to compute outgoing HMAC "
+                                     "(got {} bytes, need 32) - dropping message rather than "
+                                     "sending a frame whose header does not match its tag",
+                                     hmac.size());
+                return false;
             }
+
+            encryptedBuffer.insert(encryptedBuffer.end(), hmac.begin(), hmac.end());
         }
 
         return true;
