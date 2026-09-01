@@ -445,7 +445,7 @@ public:
 
     // Kernel bridge + auth (called by public FileProtection facade)
     [[nodiscard]] std::string GenerateAuthorizationToken() const;
-    void SyncProtectedPathsToKernel();
+    [[nodiscard]] bool SyncProtectedPathsToKernel();
     void OnKernelBlockEventInternal(const void* data, uint32_t size);
 
 private:
@@ -722,7 +722,15 @@ FileProtectionImpl::~FileProtectionImpl() {
     // WIRE-02: Sync protected paths to kernel driver after initialization
     // Release lock first — kernel bridge may block on filter port I/O
     lock.unlock();
-    SyncProtectedPathsToKernel();
+    if (!SyncProtectedPathsToKernel()) {
+        // Expected at this point on a cold start: the filter port is usually not
+        // up yet. Said plainly so the line is not mistaken for a defect, and so
+        // its ABSENCE of a follow-up confirmation would be.
+        SS_LOG_WARN(L"FileProtection",
+                    L"Initial protected-path sync to the kernel did not confirm; the kernel "
+                    L"enforces no path protection until the IPC channel is established and "
+                    L"the registered publisher re-pushes this list");
+    }
 
     // WIRE-03: Register handler for kernel-side file protection block events
     try {
@@ -2833,7 +2841,7 @@ void FileProtectionImpl::TrackFileModification(std::wstring_view path, uint32_t 
 // KERNEL BRIDGE IMPLEMENTATION (WIRE-01, WIRE-03)
 // ============================================================================
 
-void FileProtectionImpl::SyncProtectedPathsToKernel() {
+bool FileProtectionImpl::SyncProtectedPathsToKernel() {
     // WIRE-01: Serialize all user-mode protected paths and push to kernel driver
     // via IPCManager so FpCheckAccess() in PreCreate.c can enforce them.
     try {
@@ -2851,8 +2859,11 @@ void FileProtectionImpl::SyncProtectedPathsToKernel() {
         }
 
         if (paths.empty()) {
+            // Nothing to deliver, so the kernel's (empty) state already matches
+            // ours. Reporting this as a failure would send the next reader
+            // hunting a transport problem that does not exist.
             SS_LOG_DEBUG(L"FileProtection", L"No paths to sync to kernel");
-            return;
+            return true;
         }
 
         // Build the payload: uint32_t count, then count null-terminated wide strings
@@ -2875,7 +2886,7 @@ void FileProtectionImpl::SyncProtectedPathsToKernel() {
         // Guard against payload exceeding UINT32_MAX (message header fields are 32-bit)
         if (totalSize > static_cast<size_t>(UINT32_MAX)) {
             SS_LOG_ERROR(L"FileProtection", L"Kernel sync payload too large (%zu bytes)", totalSize);
-            return;
+            return false;
         }
 
         std::vector<uint8_t> message(totalSize, 0);
@@ -2902,12 +2913,14 @@ void FileProtectionImpl::SyncProtectedPathsToKernel() {
 
         if (sent) {
             SS_LOG_INFO(L"FileProtection", L"Synced %u protected paths to kernel driver", count);
-        } else {
-            SS_LOG_WARN(L"FileProtection", L"Failed to sync paths to kernel (driver may not be loaded)");
+            return true;
         }
+        SS_LOG_WARN(L"FileProtection", L"Failed to sync paths to kernel (driver may not be loaded)");
+        return false;
     } catch (const std::exception& e) {
         SS_LOG_WARN(L"FileProtection", L"Kernel path sync exception: %hs", e.what());
     }
+    return false;
 }
 
 void FileProtectionImpl::OnKernelBlockEventInternal(const void* data, uint32_t size) {
@@ -3282,8 +3295,8 @@ void FileProtection::ClearEventHistory(std::string_view authorizationToken) {
     return m_impl->GenerateAuthorizationToken();
 }
 
-void FileProtection::SyncProtectedPathsToKernel() {
-    m_impl->SyncProtectedPathsToKernel();
+bool FileProtection::SyncProtectedPathsToKernel() {
+    return m_impl->SyncProtectedPathsToKernel();
 }
 
 void FileProtection::OnKernelBlockEvent(const void* data, uint32_t size) {

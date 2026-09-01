@@ -1290,8 +1290,14 @@ public:
      * This pushes every currently-registered path/extension rule into the
      * kernel-mode FileProtection engine so the minifilter's PreCreate and
      * PreSetInfo callbacks enforce the same protection policy.
+     *
+     * @return true if the kernel holds the current path set (including the
+     *         vacuous case of an empty set); false if the push was refused or
+     *         could not be attempted. Mirrors
+     *         RegistryProtection::SyncProtectedKeysToKernel, which has always
+     *         reported its outcome.
      */
-    void SyncProtectedPathsToKernel();
+    [[nodiscard]] bool SyncProtectedPathsToKernel();
 
     /**
      * @brief Handle a blocked-operation event received from the kernel driver.

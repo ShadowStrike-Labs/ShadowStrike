@@ -438,7 +438,7 @@ public:
     std::string GenerateAuthorizationToken(std::string_view purpose, uint32_t validitySeconds);
 
     // Kernel bridge
-    void SyncProtectedProcessesToKernel();
+    [[nodiscard]] bool SyncProtectedProcessesToKernel();
     void OnKernelSelfProtectEventInternal(const void* data, uint32_t size);
 
 private:
@@ -643,7 +643,7 @@ std::string SelfDefense::GetVersionString() noexcept {
            std::to_string(SelfDefenseConstants::VERSION_PATCH);
 }
 
-void SelfDefense::SyncProtectedProcessesToKernel() { m_impl->SyncProtectedProcessesToKernel(); }
+bool SelfDefense::SyncProtectedProcessesToKernel() { return m_impl->SyncProtectedProcessesToKernel(); }
 void SelfDefense::OnKernelSelfProtectEvent(const void* data, uint32_t size) { m_impl->OnKernelSelfProtectEventInternal(data, size); }
 
 // ============================================================================
@@ -950,7 +950,15 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
     // Kernel bridge: sync protected processes and register alert handler
     if (config.enableKernelProtection) {
         SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: SyncProtectedProcessesToKernel...");
-        SyncProtectedProcessesToKernel();
+        if (!SyncProtectedProcessesToKernel()) {
+            // Expected on a cold start before the filter port is up. Stated so
+            // the line reads as a known ordering fact rather than a defect, and
+            // so a missing later confirmation stands out.
+            SS_LOG_WARN(LOG_CATEGORY,
+                        L"Initial protected-process sync to the kernel did not confirm; the "
+                        L"kernel treats our processes as unregistered until the IPC channel is "
+                        L"established and the registered publisher re-pushes this list");
+        }
         SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: RegisterKernelHandler...");
         RegisterKernelHandler();
     }
@@ -3044,8 +3052,8 @@ void SelfDefenseImpl::UnregisterKernelHandler() {
     SS_LOG_INFO(LOG_CATEGORY, L"Kernel SelfProtectAlert handler unregistered");
 }
 
-void SelfDefenseImpl::SyncProtectedProcessesToKernel() {
-    if (!Communication::IPCManager::HasInstance()) return;
+bool SelfDefenseImpl::SyncProtectedProcessesToKernel() {
+    if (!Communication::IPCManager::HasInstance()) return false;
 
     // Gather PIDs under shared lock
     std::vector<uint32_t> pids;
@@ -3057,7 +3065,14 @@ void SelfDefenseImpl::SyncProtectedProcessesToKernel() {
         }
     }
 
-    if (pids.empty()) return;
+    if (pids.empty()) {
+        // The kernel's (empty) state matches ours, so this is not a delivery
+        // failure. It IS worth a line: an empty protected-process set means our
+        // own service is not registered for kernel self-protection, and that
+        // used to return silently.
+        SS_LOG_DEBUG(LOG_CATEGORY, L"No protected processes to sync to kernel");
+        return true;
+    }
 
     // Build payload: [uint32_t count][uint32_t pid1][uint32_t pid2]...
     uint32_t count = static_cast<uint32_t>(std::min<size_t>(pids.size(), 4096));
@@ -3073,7 +3088,7 @@ void SelfDefenseImpl::SyncProtectedProcessesToKernel() {
     size_t totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + payload.size();
     if (totalSize > 64 * 1024) {
         SS_LOG_WARN(LOG_CATEGORY, L"Kernel sync payload too large: %zu bytes", totalSize);
-        return;
+        return false;
     }
 
     std::vector<uint8_t> message(totalSize, 0);
@@ -3100,9 +3115,10 @@ void SelfDefenseImpl::SyncProtectedProcessesToKernel() {
         for (auto& [pid, entry] : m_protectedProcesses) {
             entry->kernelProtected = true;
         }
-    } else {
-        SS_LOG_WARN(LOG_CATEGORY, L"Failed to sync protected processes to kernel");
+        return true;
     }
+    SS_LOG_WARN(LOG_CATEGORY, L"Failed to sync protected processes to kernel");
+    return false;
 }
 
 void SelfDefenseImpl::OnKernelSelfProtectEventInternal(const void* data, uint32_t size) {

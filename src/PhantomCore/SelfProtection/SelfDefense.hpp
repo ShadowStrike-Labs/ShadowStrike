@@ -1635,8 +1635,11 @@ public:
     /**
      * @brief Sync all protected processes to kernel driver
      * @note Sends current protected PID list to kernel SelfProtect module
+     * @return true if the kernel holds the current PID set (including the
+     *         vacuous case of an empty set); false if the push was refused or
+     *         could not be attempted.
      */
-    void SyncProtectedProcessesToKernel();
+    [[nodiscard]] bool SyncProtectedProcessesToKernel();
     
     /**
      * @brief Handle incoming kernel self-protection alert

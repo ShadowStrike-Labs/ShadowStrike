@@ -628,25 +628,39 @@ public:
             {
                 auto& ipc = Communication::IPCManager::Instance();
 
+                // Each publisher RETURNS whether the kernel took its configuration,
+                // and the aggregator counts confirmations rather than calls. The
+                // RegistryProtection sync already returned bool and this site used
+                // to discard it with an explicit (void) - the answer was available
+                // and thrown away, which is why the 1.0.100 summary could claim
+                // success while all three pushes were being refused.
+                //
+                // An uninitialized module returns false: it genuinely has no
+                // configuration in the kernel. The aggregator reports that as
+                // "not confirmed" rather than as a failed send, because it does
+                // not know which of the two it was and must not guess.
                 ipc.RegisterKernelConfigPublisher("RegistryProtection", [] {
                     if (Security::RegistryProtection::HasInstance() &&
                         Security::RegistryProtection::Instance().IsInitialized()) {
-                        (void)Security::RegistryProtection::Instance().SyncProtectedKeysToKernel();
+                        return Security::RegistryProtection::Instance().SyncProtectedKeysToKernel();
                     }
+                    return false;
                 });
 
                 ipc.RegisterKernelConfigPublisher("FileProtection", [] {
                     if (Security::FileProtection::HasInstance() &&
                         Security::FileProtection::Instance().IsInitialized()) {
-                        Security::FileProtection::Instance().SyncProtectedPathsToKernel();
+                        return Security::FileProtection::Instance().SyncProtectedPathsToKernel();
                     }
+                    return false;
                 });
 
                 ipc.RegisterKernelConfigPublisher("SelfDefense", [] {
                     if (Security::SelfDefense::HasInstance() &&
                         Security::SelfDefense::Instance().IsInitialized()) {
-                        Security::SelfDefense::Instance().SyncProtectedProcessesToKernel();
+                        return Security::SelfDefense::Instance().SyncProtectedProcessesToKernel();
                     }
+                    return false;
                 });
             }
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-IPCManager-leave");

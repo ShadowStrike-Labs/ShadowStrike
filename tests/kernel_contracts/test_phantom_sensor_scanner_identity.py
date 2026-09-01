@@ -36,6 +36,7 @@ PROCESS_NOTIFY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/Process/Pr
 # against source text rather than behaviour.
 IPC_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.cpp"
 IPC_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/Communication/IPCManager.hpp"
+FILE_PROTECTION_HPP_PATH = ROOT / "src" / "PhantomCore" / "SelfProtection" / "FileProtection.hpp"
 
 # THE SCM SERVICE-NAME CONTRACT spans the WiX installer, five C++ modules across three
 # separate vcxproj targets, and operator documentation. No C++ test can read a .wxs file,
@@ -14153,6 +14154,118 @@ class ScannerWritePathExemptionContractTests(unittest.TestCase):
             "nested inside another block; found indent %d. A configuration in "
             "which the product blocks its own writes must not be selectable."
             % indent)
+
+class KernelConfigDeliveryReportingContractTests(unittest.TestCase):
+    """A republish summary must report deliveries, not invocations.
+
+    The kernel-config publisher mechanism exists so that a module whose startup
+    push was refused gets it re-pushed when the channel comes up. In 1.0.100 that
+    mechanism fired at exactly the right instant and all three sends were still
+    refused by the driver - and the log read "Republished kernel configuration
+    from 3 publisher(s)" anyway, because the handler returned void so the loop
+    could only count itself.
+
+    Three "Failed to sync" warnings sat immediately above that line. A summary
+    that contradicts the lines above it is worse than no summary, because it is
+    the line a reader trusts.
+    """
+
+    @staticmethod
+    def _publish_body():
+        source = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        m = re.search(r"void\s+IPCManager::PublishKernelConfiguration\s*\(\s*\)", source)
+        if m is None:
+            raise AssertionError("PublishKernelConfiguration definition not found")
+        brace = source.index("{", m.end())
+        depth = 0
+        for i in range(brace, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[brace:i + 1]
+        raise AssertionError("unbalanced braces in PublishKernelConfiguration")
+
+    def test_the_publisher_signature_carries_a_result(self):
+        source = strip_c_comments(read_source(IPC_MANAGER_HPP_PATH))
+
+        self.assertTrue(
+            "using KernelConfigPublisher = std::function<bool()>;" in source,
+            "KernelConfigPublisher must return a result; with std::function<void()> "
+            "the aggregator can only count invocations and will report success "
+            "even when every push was refused")
+        self.assertFalse(
+            "using KernelConfigPublisher = std::function<void()>;" in source,
+            "the void publisher alias must not come back")
+
+    def test_the_summary_counts_the_handler_result(self):
+        body = self._publish_body()
+
+        # Anti-vacuity: the loop must still call the handler at all.
+        self.assertTrue(
+            "entry.handler()" in body,
+            "PublishKernelConfiguration no longer invokes its publishers; every "
+            "assertion in this class would then be vacuous")
+
+        offenders = [
+            line.strip() for line in body.split("\n")
+            if re.search(r"^\s*entry\.handler\(\)\s*;", line)
+        ]
+        self.assertEqual(
+            offenders, [],
+            "the handler result must be captured, not discarded as a bare "
+            "statement; found %d discarding call(s): %s" % (len(offenders), offenders))
+
+        self.assertTrue(
+            re.search(r"=\s*entry\.handler\(\)\s*;", body) is not None,
+            "the handler result must be assigned so the summary can count "
+            "confirmations rather than loop iterations")
+
+    def test_the_summary_names_what_did_not_confirm(self):
+        body = self._publish_body()
+
+        self.assertTrue(
+            "NOT CONFIRMED" in body,
+            "the failure branch must say which publishers did not confirm; a bare "
+            "count cannot tell the reader WHICH kernel-side protection is missing, "
+            "and each publisher owns a different one")
+        self.assertFalse(
+            "Republished kernel configuration from {} publisher(s)" in body,
+            "the old invocation-counting message must not come back")
+
+    def test_no_registration_discards_its_sync_result(self):
+        source = strip_c_comments(read_source(ANTIVIRUS_SERVICE_CPP_PATH))
+
+        registrations = source.count("RegisterKernelConfigPublisher(")
+        self.assertGreaterEqual(
+            registrations, 3,
+            "expected at least the 3 measured kernel-config registrations, found "
+            "%d; the discard assertion below would otherwise be vacuous"
+            % registrations)
+
+        offenders = [
+            line.strip() for line in source.split("\n")
+            if "ToKernel()" in line and re.search(r"\(\s*void\s*\)", line)
+        ]
+        self.assertEqual(
+            offenders, [],
+            "no registration may discard its sync result: the answer is what the "
+            "summary reports. Found %d discard(s): %s" % (len(offenders), offenders))
+
+    def test_both_kernel_syncs_are_nodiscard(self):
+        for label, path, decl in (
+            ("FileProtection", FILE_PROTECTION_HPP_PATH,
+             "[[nodiscard]] bool SyncProtectedPathsToKernel();"),
+            ("SelfDefense", SELF_DEFENSE_HPP_PATH,
+             "[[nodiscard]] bool SyncProtectedProcessesToKernel();"),
+        ):
+            source = strip_c_comments(read_source(path))
+            self.assertTrue(
+                decl in source,
+                "%s's kernel sync must be declared [[nodiscard]] bool so a future "
+                "caller cannot silently drop the delivery result, matching "
+                "RegistryProtection which has always reported its outcome" % label)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

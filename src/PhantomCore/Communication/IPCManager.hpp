@@ -793,7 +793,28 @@ struct RegistrySubscription {
  * connection is created, so publishing there covers the first connect and every
  * reconnect with one call.
  */
-using KernelConfigPublisher = std::function<void()>;
+/**
+ * @brief Publishes one module's kernel-side configuration and reports the
+ *        outcome.
+ *
+ * @return true if the kernel now holds this module's configuration; false if it
+ *         does not.
+ *
+ * THE RETURN VALUE IS THE POINT AND IT USED TO BE void. With no result the
+ * republish summary could only count invocations, so it reported success
+ * whenever the loop completed. That is exactly what happened in 1.0.100: all
+ * three publishers were invoked at the right instant, all three sends were
+ * refused by the driver, and the log still read "Republished kernel
+ * configuration from 3 publisher(s)" while three "Failed to sync" warnings sat
+ * immediately above it. A summary that cannot fail is not a summary.
+ *
+ * An empty configuration set counts as true: the kernel's state then matches the
+ * module's state, which is the property being confirmed. A module that is not
+ * initialized counts as false, because it has no configuration in place - that
+ * is not a delivery failure, and the summary says "not confirmed" rather than
+ * claiming to know why.
+ */
+using KernelConfigPublisher = std::function<bool()>;
 
 /**
  * @brief One named publisher of kernel-side configuration.

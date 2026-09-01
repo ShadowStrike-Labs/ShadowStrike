@@ -1714,28 +1714,47 @@ void IPCManager::PublishKernelConfiguration() {
     // Each publisher owns a DIFFERENT kernel-side protection, so one throwing
     // must neither stop the others nor fail the connect. Hence a guard per call
     // rather than one around the loop.
-    size_t failed = 0;
+    // Count CONFIRMATIONS, not invocations. The handler now returns whether the
+    // kernel actually holds its configuration, which is the only thing worth
+    // reporting: the previous version counted loop iterations and therefore
+    // announced success in the one field run where every single push was refused.
+    size_t confirmed = 0;
+    std::vector<std::string> notConfirmed;
     for (const auto& entry : *publishers) {
+        bool ok = false;
         try {
-            entry.handler();
+            ok = entry.handler();
         } catch (const std::exception& e) {
-            ++failed;
             Utils::Logger::Error("[IPCManager] Kernel configuration publisher '{}' threw: {}",
                                  entry.name, e.what());
         } catch (...) {
-            ++failed;
             Utils::Logger::Error("[IPCManager] Kernel configuration publisher '{}' threw a "
                                  "non-standard exception", entry.name);
         }
+        if (ok) {
+            ++confirmed;
+        } else {
+            notConfirmed.push_back(entry.name);
+        }
     }
 
-    if (failed == 0) {
-        Utils::Logger::Info("[IPCManager] Republished kernel configuration from {} publisher(s)",
-                            publishers->size());
+    if (notConfirmed.empty()) {
+        Utils::Logger::Info("[IPCManager] Kernel configuration republished: {} of {} publisher(s) "
+                            "confirmed", confirmed, publishers->size());
     } else {
-        Utils::Logger::Error("[IPCManager] Republished kernel configuration from {} publisher(s), "
-                             "{} FAILED - the kernel-side configuration those modules own is "
-                             "absent until the next reconnect", publishers->size(), failed);
+        // Name them. A count alone cannot tell the next reader WHICH kernel-side
+        // protection is missing, and each of these owns a different one.
+        std::string names;
+        for (const auto& n : notConfirmed) {
+            if (!names.empty()) {
+                names += ", ";
+            }
+            names += n;
+        }
+        Utils::Logger::Error("[IPCManager] Kernel configuration republished: {} of {} publisher(s) "
+                             "confirmed; NOT CONFIRMED: {} - the kernel-side protection those "
+                             "modules own is absent for this session unless a later reconnect "
+                             "succeeds", confirmed, publishers->size(), names);
     }
 }
 
