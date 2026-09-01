@@ -445,6 +445,12 @@ typedef struct _PC_STATISTICS {
     volatile LONG64 ScanTimeouts;           ///< Scan timeouts
     volatile LONG64 ScanErrors;             ///< Scan errors
     volatile LONG64 SelfProtectBlocks;      ///< Self-protection blocks
+    volatile LONG64 CatalogStoreExemptions; ///< Catalog-store creates not routed
+                                            ///< to the scanner. Counted separately
+                                            ///< from OperationsExcluded because a
+                                            ///< configured exclusion and a
+                                            ///< deadlock-breaking exemption are
+                                            ///< different facts about one file.
 
     //
     // Threat detection

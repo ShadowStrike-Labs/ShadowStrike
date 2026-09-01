@@ -1049,6 +1049,65 @@ Return Value:
         SHADOW_FS_BOOT_TRACE("PreCreate", "skip-boot-phase-postsp");
         goto CleanupAllow;
     }
+    //
+    // ====================================================================
+    // CATALOG STORE EXEMPTION (breaks a deadlock against our own scanner)
+    // ====================================================================
+    //
+    // The Windows catalog store must never be routed to the user-mode
+    // scanner, because scanning it deadlocks this product against itself.
+    //
+    // MEASURED in the 1.0.102 field run: the signature-determination worker
+    // spent 285 seconds of a 563 second run inside trust determination, 35
+    // seconds at its worst, and was still inside it when the trace ended -
+    // 51% of the entire run on one thread. The cycle is closed: our own
+    // trust determination calls WinVerifyTrust, which RPCs into CryptSvc,
+    // which reads the catalog store under System32\CatRoot and its ESE
+    // database under System32\catroot2 - and this callback then asks the
+    // user-mode scanner about those very reads. The scanner is waiting on
+    // CryptSvc; CryptSvc is waiting on us. It resolves only when the RPC
+    // times out, and every other process that needs CryptSvc - winlogon,
+    // userinit, explorer - queues behind it. That is the grey screen: in
+    // the field, explorer.exe sat at 5.4 MB and 0% CPU, blocked, while our
+    // own scan queue was idle and using 1.7% of wall time.
+    //
+    // ONE PATTERN COVERS BOTH DIRECTORIES ON PURPOSE. "catroot2" begins
+    // with "catroot", so a case-insensitive substring test for
+    // "\System32\CatRoot" matches System32\CatRoot and System32\catroot2
+    // alike, in both NT and DOS path form. Do NOT "complete" this by
+    // anchoring the pattern or adding a second one: anchoring would stop
+    // matching catroot2 and reintroduce the deadlock through the ESE
+    // database, which is the half the field trace actually caught us
+    // reading (catroot2\edb.log appeared repeatedly among analysed files).
+    //
+    // NO DETECTION IS LOST, and that is structural rather than argued.
+    // These directories hold OS catalog signatures and CryptSvc's own
+    // database. They are data consumed by the signature verifier, not an
+    // execution vector, and Windows guards them with its own ACLs. What is
+    // given up is scanning the bytes our verifier reads - which could never
+    // yield a verdict we could act on, because producing that verdict
+    // requires the verifier we would be blocking.
+    //
+    // DELIBERATELY NOT CONFIGURABLE, and deliberately not delivered through
+    // the kernel configuration sync. A configuration in which the product
+    // deadlocks its own signature verification must not be selectable, and
+    // the sync is independently broken - the same field run reported "0 of
+    // 3 publisher(s) confirmed" with six "Failed to sync" lines, so an
+    // exclusion pushed that way would not have arrived at all. This is the
+    // same reasoning that made the scanner self-exemption unconditional.
+    //
+    // PLACED AFTER PHASE 6b ON PURPOSE, and it skips only what the
+    // boot-phase gate above skips. Validation, the kernel-mode and
+    // system-PID skips, path exclusion, self-protection and the
+    // file-protection engine have all already run and remain in effect;
+    // this reaches CleanupAllow, which still returns
+    // FLT_PREOP_SUCCESS_WITH_CALLBACK, so the post-create callback is
+    // preserved. Self-protection of these paths is unaffected.
+    //
+    if (PcpContainsPatternCaseInsensitive(&NameInfo->Name, L"\\System32\\CatRoot")) {
+        InterlockedIncrement64(&g_PcState.Stats.CatalogStoreExemptions);
+        goto CleanupAllow;
+    }
 
     // ========================================================================
     // PHASE 7: THREAT DETECTION ANALYSIS

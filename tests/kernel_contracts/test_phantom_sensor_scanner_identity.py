@@ -254,6 +254,8 @@ VPN_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.hpp"
 HONEYPOT_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneyPotManager.cpp"
 HONEYPOT_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneypotManager.hpp"
 EXECUTABLE_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/FileSystem/ExecutableAnalyzer.cpp"
+PRE_CREATE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreCreate.c"
+PRE_CREATE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreCreate.h"
 
 # IPLeakProtection is the opposite case from Tor/VPN: its kill switch is REAL
 # (registered WFP sublayer, netsh via CreateProcessW, iphlpapi), so the defect
@@ -14427,6 +14429,102 @@ class BlockingVersionInfoRemovalContractTests(unittest.TestCase):
         self.assertEqual(
             self.cpp.count("} else if (options.allowBlockingSignatureVerification) {"), 1,
             "the sibling blocking gate must be untouched")
+
+
+class CatalogStoreExemptionContractTests(unittest.TestCase):
+    """The Windows catalog store must not be routed to the user-mode scanner.
+
+    Scanning it deadlocks the product against itself: our trust determination
+    calls WinVerifyTrust, which RPCs into CryptSvc, which reads
+    System32\\CatRoot and System32\\catroot2 - and PreCreate then asks the
+    scanner about those reads. MEASURED in the 1.0.102 field run as 285 s of a
+    563 s run, 35 s at worst, with explorer.exe blocked at 5.4 MB and 0% CPU.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Comments stripped: the fix's own comment necessarily names CatRoot,
+        # catroot2, CleanupAllow and the counter, so a comment-blind assertion
+        # would be satisfied or broken by prose.
+        cls.c = strip_c_comments(read_source(PRE_CREATE_C_PATH))
+        cls.h = strip_c_comments(read_source(PRE_CREATE_H_PATH))
+        cls.test_off = cls.c.find('PcpContainsPatternCaseInsensitive(&NameInfo->Name, '
+                                  'L"\\\\System32\\\\CatRoot")')
+        cls.selfprot_off = cls.c.find(
+            "InterlockedIncrement64(&g_PcState.Stats.SelfProtectBlocks);")
+        cls.boot_off = cls.c.find("if (ShadowFsIsBootPhase()) {")
+        cls.send_off = cls.c.find("SbSendScanRequest(")
+
+    def test_the_catalog_store_is_exempt_from_scan_routing(self):
+        self.assertGreaterEqual(
+            self.test_off, 0,
+            "PreCreate must test the catalog-store path before routing a create "
+            "to the user-mode scanner, or the CryptSvc deadlock returns")
+        # The predicate must be the WHOLE condition. A mutation round proved this
+        # guard could not see "if (0 && PcpContains...)" - the exemption present
+        # in the source and unreachable in the build - so require the condition to
+        # open with the predicate and nothing else.
+        line_start = self.c.rfind(chr(10), 0, self.test_off) + 1
+        condition = self.c[line_start:self.test_off].strip()
+        self.assertEqual(
+            condition, "if (",
+            "the catalog-store test must be the entire if-condition; found %r "
+            "before it, which can disable the exemption while leaving it visible"
+            % (condition,))
+
+    def test_the_exemption_also_covers_the_ese_database(self):
+        # The pattern must stay an UNANCHORED substring. "catroot2" begins with
+        # "catroot", so this one pattern covers CatRoot and catroot2 alike.
+        # Anchoring it would stop matching catroot2\edb.log, which is the half
+        # the field trace actually caught us reading.
+        self.assertEqual(
+            self.c.count('L"\\\\System32\\\\CatRoot"'), 1,
+            "the pattern must remain exactly \"\\System32\\CatRoot\" - adding a "
+            "trailing separator or anchoring it re-opens the deadlock via catroot2")
+        self.assertEqual(
+            self.c.count('L"\\\\System32\\\\catroot2"'), 0,
+            "a second pattern is unnecessary and its presence suggests the first "
+            "was anchored")
+
+    def test_the_exemption_preserves_the_protection_phases(self):
+        # THE LOAD-BEARING ORDERING ASSERTION. A blanket early return placed
+        # before self-protection would skip protection along with the scan -
+        # the over-reach this project already made once in PreWrite.
+        self.assertGreater(
+            self.selfprot_off, 0, "self-protection site not found; guard would be vacuous")
+        self.assertGreater(
+            self.test_off, self.selfprot_off,
+            "the exemption must come AFTER the self-protection phase (self-protect "
+            "at %d, exemption at %d) so protection stays in effect"
+            % (self.selfprot_off, self.test_off))
+        self.assertGreater(
+            self.test_off, self.boot_off,
+            "it belongs beside the boot-phase gate, after it")
+        self.assertLess(
+            self.test_off, self.send_off,
+            "and BEFORE the synchronous scan send, or it prevents nothing")
+
+    def test_the_exemption_releases_through_the_common_exit(self):
+        # goto CleanupAllow releases NameInfo and the rundown reference and
+        # returns FLT_PREOP_SUCCESS_WITH_CALLBACK, so the post-create callback
+        # survives. A bare return would leak both and drop the post-op.
+        window = self.c[self.test_off:self.test_off + 400]
+        self.assertIn(
+            "goto CleanupAllow;", window,
+            "the exemption must exit through CleanupAllow, not return directly")
+        self.assertNotIn(
+            "FLT_PREOP_SUCCESS_NO_CALLBACK", window,
+            "returning directly leaks NameInfo and the rundown reference and "
+            "drops the post-create callback")
+
+    def test_the_exemption_is_observable(self):
+        self.assertEqual(
+            self.h.count("volatile LONG64 CatalogStoreExemptions;"), 1,
+            "the counter must be declared, or the exemption is invisible in the "
+            "field and reads as though it never fired")
+        self.assertEqual(
+            self.c.count("InterlockedIncrement64(&g_PcState.Stats.CatalogStoreExemptions);"), 1,
+            "and incremented exactly once")
 
 
 if __name__ == "__main__":
