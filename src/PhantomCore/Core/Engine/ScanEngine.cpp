@@ -556,6 +556,74 @@ public:
                     registered);
             }
 
+            // ================================================================
+            // WINDOWS CATALOG STORE - PREFIX EXCLUSION
+            // ================================================================
+            //
+            // SEPARATE FROM THE BLOCK ABOVE AND DELIBERATELY NOT MERGED INTO IT.
+            // That list is matched EXACTLY and its header states why it carries
+            // no directory entry; this one is a PREFIX match over OS directories.
+            // The justifications differ, the blast radii differ, and the
+            // exact-path invariant above is asserted by a test that must stay
+            // true. Merging them would quietly convert our own data directory
+            // into a drop zone.
+            //
+            // REGISTERED AT THIS CHOKEPOINT FOR A MEASURED REASON: every path
+            // that opens, hashes or memory-maps a file arrives through ScanFile,
+            // whose FIRST pre-flight step is this exclusion check, and the
+            // analyzer scopes nest inside it. So one gate here covers the
+            // on-access path, the deferred deep-scan worker and the directory
+            // walk. The field defect was reached by the deep-scan workers, which
+            // no driver-side exemption can see.
+            //
+            // See DataStorePaths::GetCatalogStoreDirectoryPrefixes for the
+            // measured deadlock this prevents and why no detection is lost.
+            {
+                const auto catalogPrefixes =
+                    Utils::DataStorePaths::GetCatalogStoreDirectoryPrefixes();
+
+                if (catalogPrefixes.empty()) {
+                    // REPORTED, NOT PASSED OVER. An empty list means the Windows
+                    // directory could not be resolved, so the catalog store is
+                    // NOT excluded and the signature-verification stall is live.
+                    // Initialization still continues: refusing to start would
+                    // leave the endpoint with no protection at all, which is a
+                    // worse outcome than a known freeze risk that is now on the
+                    // record and in the log.
+                    SS_LOG_ERROR(L"ScanEngine",
+                        L"Could not resolve the Windows catalog store; it is NOT "
+                        L"excluded from scanning and signature verification may stall");
+                } else {
+                    size_t catalogRegistered = 0;
+
+                    for (const auto& prefix : catalogPrefixes) {
+                        if (prefix.empty()) continue;
+
+                        ExclusionRule rule{};
+                        rule.type = ExclusionRule::Type::PathPrefix;
+                        rule.pattern = prefix;
+                        rule.enabled = true;
+                        rule.caseSensitive = false;
+                        rule.recursive = true;
+                        // Wording deliberately avoids the phrase used by the
+                        // block above, which a test keys on to scope its
+                        // exact-path assertion to our own files.
+                        rule.description =
+                            "Windows catalog store (the signature verifier we "
+                            "depend on reads it)";
+
+                        std::unique_lock lock(m_exclusionMutex);
+                        m_exclusions.push_back(std::move(rule));
+                        ++catalogRegistered;
+                    }
+
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"Registered %zu catalog-store prefix exclusion(s) to keep "
+                        L"signature verification from deadlocking",
+                        catalogRegistered);
+                }
+            }
+
             // Initialize SignatureStore (YARA + Patterns + Hashes)
             if (!m_config.signatureDbPath.empty()) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing SignatureStore at %hs",

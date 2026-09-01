@@ -234,6 +234,47 @@ std::vector<std::wstring> GetOwnedDataFiles() {
     return files;
 }
 
+std::vector<std::wstring> GetCatalogStoreDirectoryPrefixes() {
+    std::vector<std::wstring> prefixes;
+
+    // Resolved through the API rather than hardcoding "C:\Windows" and rather
+    // than reading %SystemRoot%: the environment block can be reshaped by
+    // whoever launched the process, and on a Terminal Services host the
+    // per-session Windows directory is not the system one. GetSystemWindowsDirectoryW
+    // is the variant that always names the system copy, which is the one holding
+    // the catalog store CryptSvc actually uses.
+    wchar_t winDir[MAX_PATH] = {};
+    const UINT len = ::GetSystemWindowsDirectoryW(winDir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        // Empty means "could not establish", never "nothing to exclude". The
+        // caller reports it; see the header for why that distinction matters.
+        return prefixes;
+    }
+
+    std::wstring root(winDir, len);
+    while (!root.empty() && root.back() == L'\\') {
+        root.pop_back();
+    }
+
+    // CatRoot holds the OS catalog signature files. catroot2 holds CryptSvc's
+    // ESE database - edb.log, tmp.edb, catdb.jfm and the per-GUID subdirectories
+    // - and is where the measured stall occurred. Both are listed: a scan of
+    // either reaches the same service, so excluding only the one that happened
+    // to be caught in the field would leave the other able to reproduce it.
+    const std::wstring directories[] = {
+        root + L"\\System32\\CatRoot\\",
+        root + L"\\System32\\catroot2\\",
+    };
+
+    prefixes.reserve(4);
+    for (const auto& directory : directories) {
+        prefixes.push_back(directory);
+        prefixes.push_back(L"\\\\?\\" + directory);
+    }
+
+    return prefixes;
+}
+
 namespace {
 
 // Signature database header, as written by phantom-sigbuild. Only the two fields

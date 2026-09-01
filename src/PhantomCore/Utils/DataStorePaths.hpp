@@ -124,4 +124,64 @@ namespace ShadowStrike::Utils::DataStorePaths {
 ///    worst possible exclusion in this product.
 [[nodiscard]] std::vector<std::wstring> GetOwnedDataFiles();
 
+/// @brief Absolute directory prefixes of the Windows catalog store, which this
+///        product must never scan because its own signature verification depends
+///        on the service that owns them.
+///
+/// HOUSED HERE DELIBERATELY, THOUGH THESE ARE NOT OUR FILES, and the distinction
+/// is kept rather than blurred: GetOwnedDataFiles names files we OWN and is
+/// matched EXACTLY; this names OS directories and is matched as a PREFIX. Both
+/// consumers of GetOwnedDataFiles already include this header, so no new
+/// translation unit is needed - and a new .cpp would have to be added to five
+/// project files in a tree with nine measured MSB8027 object-name collisions,
+/// which is the riskier change. A reviewer may relocate this at zero behavioural
+/// cost; what must not happen is the two lists being merged.
+///
+/// THE DEFECT THIS PREVENTS, MEASURED IN THE FIELD (1.0.103, 803-second run).
+/// The scan pipeline reached C:\Windows\System32\catroot2\edb.log - the
+/// write-ahead transaction log of the ESE database behind the Windows catalog
+/// store - and memory-mapped it:
+///     "Opened memory-mapped view: ...catroot2\edb.log (2097152 bytes, read-only)"
+/// A section object on that file prevents ESE from rolling the log over, so
+/// CryptSvc stalled. Our own trust determination then called IsMicrosoftSigned
+/// -> verifyCatalogSignature -> CryptCATAdminAcquireContext, which waits on the
+/// very CryptSvc we had just jammed: ten consecutive 35.0-second stalls, 283
+/// seconds of blocking in an 803-second run, four service threads stalling in
+/// the same windows, and a desktop that never composed because winlogon and
+/// Explorer need CryptSvc too. The trust queue backed up to 21 entries and then
+/// drained 20 of them in 90 ms the moment one 35-second call returned.
+///
+/// ONE DIRECTION OF THAT CYCLE WAS ALREADY CLOSED IN THE DRIVER (PreCreate.c,
+/// CatalogStoreExemptions) so the kernel stopped ASKING us about these files;
+/// the measured call count fell from 228 to 40. This closes the other direction
+/// - the scanner opening them on its own initiative - which no driver-side
+/// exemption can prevent and which is sufficient on its own to wedge the machine.
+///
+/// NO DETECTION IS LOST, STRUCTURALLY. These directories hold OS catalog
+/// signatures and CryptSvc's own database. They are data consumed by the
+/// verifier, not an execution vector, and Windows restricts writes to SYSTEM and
+/// Administrators. A verdict about them could never be acted on, because
+/// producing that verdict requires the verifier we would be blocking.
+///
+/// THESE PREFIXES ARE TIGHTER THAN THE DRIVER'S PATTERN ON PURPOSE, AND MUST NOT
+/// BE "UNIFIED" WITH IT. The driver tests an NT path mid-create with a single
+/// case-insensitive substring "\System32\CatRoot", which also matches catroot2
+/// because "catroot2" begins with "catroot" - the cheapest correct test available
+/// at that point in a create callback. Here we hold the full DOS path, so each
+/// directory is named explicitly WITH a trailing separator. That is strictly
+/// narrower: unlike the driver's substring it cannot match a sibling such as
+/// ...\System32\CatRootOther. Widening this side to match the driver would buy
+/// nothing and cost a drop zone.
+///
+/// BOTH PATH FORMS ARE RETURNED. The scan path is reached with plain DOS paths
+/// ("C:\Windows\...") while parts of the pipeline extend them ("\\?\C:\Windows\...");
+/// a prefix comparison against one form does not match the other, and the field
+/// log shows both forms for the same file in the same scan.
+///
+/// AN EMPTY RESULT MEANS FAILURE, NOT "NOTHING TO EXCLUDE". It can only happen if
+/// the Windows directory could not be resolved, in which case the catalog store
+/// is NOT excluded and the stall above is live; the caller must report that
+/// rather than proceed as though the exemption were in place.
+[[nodiscard]] std::vector<std::wstring> GetCatalogStoreDirectoryPrefixes();
+
 }  // namespace ShadowStrike::Utils::DataStorePaths

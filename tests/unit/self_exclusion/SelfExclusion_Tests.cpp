@@ -274,3 +274,155 @@ TEST_F(SelfExclusion_EngineWiring, UnrelatedPathIsNotExcluded) {
     ASSERT_TRUE(s_initialized);
     EXPECT_FALSE(ScanEngine::Instance().IsExcluded(L"C:\\Windows\\System32\\cmd.exe"));
 }
+
+// ============================================================================
+// WINDOWS CATALOG STORE
+//
+// Scanning the catalog store deadlocks our own signature verification: the
+// pipeline memory-mapped C:\Windows\System32\catroot2\edb.log, which stopped ESE
+// rolling that log over, which stalled CryptSvc, which our trust determination
+// then waited on for 35.0 seconds at a time. Measured in the field on 1.0.103.
+//
+// These assert the WIRING, not the list, for the same reason the tests above do:
+// a test over the returned strings would have passed throughout the entire period
+// nothing was registered.
+// ============================================================================
+
+namespace {
+
+// Derive a sibling path from a catalog prefix so these tests need no hardcoded
+// volume and stay correct on a machine whose Windows directory is not C:\Windows.
+std::wstring System32DirectoryOf(const std::wstring& prefix) {
+    const std::wstring marker = L"\\system32\\";
+    const std::wstring lowered = ToLower(prefix);
+    const auto pos = lowered.rfind(marker);
+    if (pos == std::wstring::npos) {
+        return L"";
+    }
+    return prefix.substr(0, pos + marker.size());
+}
+
+}  // namespace
+
+TEST(SelfExclusion_CatalogStore, PrefixesAreProvidedAndWellFormed) {
+    const auto prefixes = Paths::GetCatalogStoreDirectoryPrefixes();
+
+    ASSERT_FALSE(prefixes.empty())
+        << "empty means the Windows directory could not be resolved, so the "
+           "catalog store is not excluded and the verification stall is live";
+
+    size_t plain = 0;
+    size_t extended = 0;
+
+    for (const auto& p : prefixes) {
+        ASSERT_FALSE(p.empty());
+
+        // A prefix match is only safe if it cannot run past the directory it
+        // names, so every entry must end at a separator.
+        EXPECT_EQ(p.back(), L'\\')
+            << "a prefix not ending at a separator would match sibling directories";
+
+        if (p.rfind(L"\\\\?\\", 0) == 0) {
+            ++extended;
+        } else {
+            ++plain;
+            EXPECT_NE(p.find(L':'), std::wstring::npos) << "expected an absolute path";
+        }
+    }
+
+    // Both forms are required: the pipeline uses plain DOS paths in some places
+    // and \\?\-extended paths in others for the same file.
+    EXPECT_GT(plain, 0u);
+    EXPECT_GT(extended, 0u);
+    EXPECT_EQ(plain, extended);
+}
+
+TEST_F(SelfExclusion_EngineWiring, CatalogStoreIsExcludedFromScanning) {
+    ASSERT_TRUE(s_initialized);
+
+    const auto prefixes = Paths::GetCatalogStoreDirectoryPrefixes();
+    ASSERT_FALSE(prefixes.empty());
+
+    for (const auto& prefix : prefixes) {
+        // edb.log is the exact file the field run memory-mapped.
+        EXPECT_TRUE(ScanEngine::Instance().IsExcluded(prefix + L"edb.log"))
+            << "the catalog store is still scannable; this is the field defect";
+
+        // A per-GUID subdirectory, to prove the exclusion is recursive rather
+        // than covering only files sitting directly in the directory.
+        EXPECT_TRUE(ScanEngine::Instance().IsExcluded(
+            prefix + L"{127D0A1D-4EF2-11D1-8608-00C04FC295EE}\\catdb.jfm"))
+            << "catalog subdirectories must be covered too";
+    }
+}
+
+TEST_F(SelfExclusion_EngineWiring, CatalogRulesArePrefixRulesAndNothingElseIs) {
+    ASSERT_TRUE(s_initialized);
+
+    size_t catalogRules = 0;
+
+    for (const auto& r : ScanEngine::Instance().GetExclusions()) {
+        const bool isCatalog = r.description.find("catalog store") != std::string::npos;
+        if (!isCatalog) {
+            // Nothing outside the catalog category may be a prefix rule. This is
+            // what stops a future change from turning our own data directory, the
+            // log directory or the quarantine vault into a drop zone.
+            EXPECT_NE(r.type, ExclusionRule::Type::PathPrefix)
+                << "an unexpected prefix exclusion was registered";
+            continue;
+        }
+        ++catalogRules;
+        EXPECT_EQ(r.type, ExclusionRule::Type::PathPrefix);
+        EXPECT_TRUE(r.enabled);
+        EXPECT_TRUE(r.recursive);
+        ASSERT_FALSE(r.pattern.empty());
+        EXPECT_EQ(r.pattern.back(), L'\\');
+    }
+
+    EXPECT_EQ(catalogRules, Paths::GetCatalogStoreDirectoryPrefixes().size())
+        << "every provided prefix must reach the engine";
+}
+
+TEST_F(SelfExclusion_EngineWiring, SiblingSystem32ContentIsStillScanned) {
+    ASSERT_TRUE(s_initialized);
+
+    const auto prefixes = Paths::GetCatalogStoreDirectoryPrefixes();
+    ASSERT_FALSE(prefixes.empty());
+
+    const std::wstring system32 = System32DirectoryOf(prefixes.front());
+    ASSERT_FALSE(system32.empty()) << "could not derive System32 from the prefix";
+
+    // The exclusion must cover the catalog store and nothing more. If the
+    // prefixes ever lose their trailing separator, or are widened to the
+    // driver's substring form, these two fail.
+    EXPECT_FALSE(ScanEngine::Instance().IsExcluded(system32 + L"kernel32.dll"))
+        << "excluding System32 at large would blind the scanner";
+    EXPECT_FALSE(ScanEngine::Instance().IsExcluded(system32 + L"CatRootOther\\payload.exe"))
+        << "a sibling directory whose name merely starts with CatRoot must be scanned";
+    EXPECT_FALSE(ScanEngine::Instance().IsExcluded(system32 + L"catroot2backup\\payload.exe"))
+        << "a sibling directory whose name merely starts with catroot2 must be scanned";
+}
+
+TEST(SelfExclusion_CatalogStore, IsDisjointFromTheOwnedFileList) {
+    // The two lists exist for different reasons and are matched differently.
+    // Merging them is the one change that would silently reintroduce a drop zone,
+    // so their disjointness is pinned here rather than left to review.
+    const auto owned = Paths::GetOwnedDataFiles();
+    const auto catalog = Paths::GetCatalogStoreDirectoryPrefixes();
+
+    for (const auto& o : owned) {
+        const std::wstring lo = ToLower(o);
+        for (const auto& c : catalog) {
+            EXPECT_NE(lo, ToLower(c));
+            EXPECT_FALSE(lo.rfind(ToLower(c), 0) == 0)
+                << "an owned data file must not sit under a catalog prefix";
+        }
+    }
+
+    // And no catalog prefix may be an owned-file path, which would make it
+    // subject to the exact-match rule and silently stop covering the directory.
+    for (const auto& c : catalog) {
+        EXPECT_NE(c.back(), L'b');  // cheap shape check: ends at a separator
+        EXPECT_EQ(c.back(), L'\\');
+    }
+}
