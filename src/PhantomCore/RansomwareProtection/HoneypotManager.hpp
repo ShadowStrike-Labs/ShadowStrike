@@ -385,7 +385,7 @@ struct HoneyFile {
     bool isDirectory = false;
     
     /// @brief Is hidden
-    bool isHidden = true;
+    bool isHidden = false;
     
     /// @brief Is system file
     bool isSystem = false;

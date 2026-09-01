@@ -252,6 +252,7 @@ TOR_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/TorDetector.hpp"
 VPN_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.cpp"
 VPN_DETECTOR_HPP_PATH = ROOT / "src/PhantomCore/Core/Network/VPNDetector.hpp"
 HONEYPOT_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneyPotManager.cpp"
+HONEYPOT_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneypotManager.hpp"
 
 # IPLeakProtection is the opposite case from Tor/VPN: its kill switch is REAL
 # (registered WFP sublayer, netsh via CreateProcessW, iphlpapi), so the defect
@@ -14266,6 +14267,116 @@ class KernelConfigDeliveryReportingContractTests(unittest.TestCase):
                 "%s's kernel sync must be declared [[nodiscard]] bool so a future "
                 "caller cannot silently drop the delivery result, matching "
                 "RegistryProtection which has always reported its outcome" % label)
+
+class HoneypotConcealmentContractTests(unittest.TestCase):
+    """Decoy concealment must be verified, and recorded as achieved not requested.
+
+    A decoy that stays visible is not a detection failure - directory
+    enumeration returns hidden and system entries without any special flag, so
+    an encryptor finds a concealed decoy exactly as easily. It is a product
+    defect of a different kind: an unopenable file named like a real document
+    appearing on someone's Desktop reads as an infection. The original code
+    discarded SetFileAttributes' result and copied the CONFIGURED intent into
+    the honeypot record, so a decoy sitting in plain sight reported itself as
+    concealed and there was no evidence either way.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp_raw = read_source(HONEYPOT_MANAGER_CPP_PATH)
+        cls.hpp_raw = read_source(HONEYPOT_MANAGER_HPP_PATH)
+        # Comment stripping is load-bearing: the fix's own comments necessarily
+        # name SetFileAttributes, honeyFile.isHidden and m_config.hideFiles, so a
+        # comment-blind count is satisfied or broken by prose.
+        cls.cpp = strip_c_comments(cls.cpp_raw)
+        cls.hpp = strip_c_comments(cls.hpp_raw)
+
+        # Slice the definition on its qualified form. The declaration appears
+        # EARLIER in the file, so anchoring on the bare name would extract a
+        # declaration and every assertion below would pass vacuously.
+        marker = "bool HoneypotManagerImpl::ApplyFileAttributes("
+        cls.def_offset = cls.cpp.find(marker)
+        if cls.def_offset < 0:
+            cls.body = ""
+        else:
+            brace = cls.cpp.find("{", cls.def_offset)
+            end = _matching_delimiter(cls.cpp, brace, "{", "}")
+            cls.body = cls.cpp[brace:end + 1]
+
+    def test_concealment_reports_its_outcome(self):
+        self.assertEqual(
+            self.cpp.count("[[nodiscard]] bool ApplyFileAttributes("), 1,
+            "ApplyFileAttributes must be declared [[nodiscard]] bool so a caller "
+            "cannot silently ignore a decoy that stayed visible")
+        self.assertEqual(
+            self.cpp.count("bool HoneypotManagerImpl::ApplyFileAttributes("), 1,
+            "the out-of-class definition must return bool")
+        self.assertEqual(
+            self.cpp.count("void HoneypotManagerImpl::ApplyFileAttributes("), 0,
+            "no void definition may remain, or the outcome is unobservable again")
+
+    def test_no_call_site_discards_the_concealment_result(self):
+        assigned = self.cpp.count("= ApplyFileAttributes(")
+        self.assertEqual(
+            assigned, 2,
+            "both call sites - initial deployment and regeneration - must capture "
+            "the result; found %d assigned call site(s)" % assigned)
+        bare = [m.start() for m in
+                re.finditer(r"^[ \t]*ApplyFileAttributes\(", self.cpp, re.M)]
+        self.assertEqual(
+            bare, [],
+            "a bare ApplyFileAttributes call discards the concealment outcome; "
+            "offending offset(s): %r" % (bare,))
+
+    def test_concealment_is_verified_by_reading_the_attributes_back(self):
+        self.assertNotEqual(
+            self.body, "",
+            "could not slice the ApplyFileAttributes definition; the guard would "
+            "pass vacuously")
+
+        set_at = self.body.find("SetFileAttributesW(")
+        read_back_at = self.body.find("const DWORD after = GetFileAttributesW(")
+        self.assertGreaterEqual(
+            set_at, 0, "ApplyFileAttributes must still set the attributes")
+        self.assertGreaterEqual(
+            read_back_at, 0,
+            "ApplyFileAttributes must read the attributes back; trusting "
+            "SetFileAttributesW's return is exactly what hid this - a sync "
+            "engine or filter can accept the call and drop the bits")
+        self.assertLess(
+            set_at, read_back_at,
+            "the read-back must come AFTER the set (set at %d, read-back at %d), "
+            "otherwise it verifies the state we started from" % (set_at, read_back_at))
+
+        # The read-back has to be COMPARED, not merely performed.
+        self.assertEqual(
+            self.body.count("(after & wanted) != wanted"), 1,
+            "the read-back value must be COMPARED against the requested bits; "
+            "performing the read and then ignoring it verifies nothing")
+
+    def test_the_record_stores_achieved_concealment_not_the_request(self):
+        self.assertEqual(
+            self.cpp.count("honeyFile.isHidden = concealed && m_config.hideFiles;"), 1,
+            "the deployed record must store the VERIFIED concealment state")
+        self.assertEqual(
+            self.cpp.count("honeyFile.isSystem = concealed && m_config.makeSystemFiles;"), 1,
+            "the same applies to the system attribute")
+        direct = re.findall(r"honeyFile\.isHidden\s*=\s*m_config\.hideFiles", self.cpp)
+        self.assertEqual(
+            direct, [],
+            "copying the configuration into the record is the defect: it made a "
+            "plainly visible decoy report itself as concealed")
+
+    def test_a_honeypot_record_does_not_default_to_claiming_concealment(self):
+        self.assertEqual(
+            self.hpp.count("bool isHidden = true;"), 0,
+            "HoneyFile::isHidden must not default to true - a default that "
+            "claims an outcome reads as a measurement, which is how "
+            "ShadowCopyProtector's wasBlocked defect worked")
+        self.assertEqual(
+            self.hpp.count("bool isHidden = false;"), 1,
+            "HoneyFile::isHidden must default to false and be set on success")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

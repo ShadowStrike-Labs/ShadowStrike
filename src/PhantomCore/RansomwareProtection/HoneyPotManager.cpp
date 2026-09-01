@@ -251,7 +251,7 @@ private:
     void NotifyStatus(const HoneyFile& file, HoneypotStatus status);
     void HandleDetectedAccess(std::wstring_view path, uint32_t pid,
                               HoneypotAccessType accessType);
-    void ApplyFileAttributes(const std::wstring& path) const;
+    [[nodiscard]] bool ApplyFileAttributes(const std::wstring& path) const;
     void RandomizeTimestamps(const std::wstring& path) const;
 
     mutable std::shared_mutex m_mutex;
@@ -281,6 +281,16 @@ private:
     // "3 locations seeded".
     std::atomic<uint64_t> m_cycleDeployFailures{0};
     std::atomic<uint32_t> m_lastDeployWin32{0};
+
+    // Concealment is counted separately from deployment because the two fail
+    // for different reasons and have different consequences. A decoy that was
+    // never written leaves a folder unprotected; a decoy that was written but
+    // stayed visible protects the folder perfectly well and merely alarms the
+    // person using the machine - which is its own defect, and one that until
+    // now produced no evidence at all because SetFileAttributes' result was
+    // discarded. Mutable because concealment is applied from a const method.
+    mutable std::atomic<uint64_t> m_cycleConcealFailures{0};
+    mutable std::atomic<uint32_t> m_lastConcealWin32{0};
 };
 
 // ============================================================================
@@ -382,6 +392,8 @@ bool HoneypotManagerImpl::DeployTraps() {
 
     m_cycleDeployFailures.store(0, std::memory_order_relaxed);
     m_lastDeployWin32.store(0, std::memory_order_relaxed);
+    m_cycleConcealFailures.store(0, std::memory_order_relaxed);
+    m_lastConcealWin32.store(0, std::memory_order_relaxed);
 
     size_t deployedCount = 0;
     size_t enabledCount = 0;
@@ -414,6 +426,25 @@ bool HoneypotManagerImpl::DeployTraps() {
             deployedCount, enabledCount,
             static_cast<unsigned long long>(failures),
             static_cast<unsigned long>(m_lastDeployWin32.load(std::memory_order_relaxed)));
+    }
+
+    // Report concealment as its own outcome. A visible decoy is not a detection
+    // failure, so it must not be reported as one - but it is the difference
+    // between a trap and a folder full of unopenable files that look like an
+    // infection, so silence is not acceptable either.
+    const uint64_t concealFailures =
+        m_cycleConcealFailures.load(std::memory_order_relaxed);
+    if (concealFailures == 0) {
+        SS_LOG_INFO(kLogCategory,
+            L"Decoy concealment verified: every deployed decoy reports the "
+            L"hidden/system attributes it was given.");
+    } else {
+        SS_LOG_WARN(kLogCategory,
+            L"Decoy concealment FAILED for %llu file(s) (last WinError %lu). Those "
+            L"decoys are visible in the user's folders and will look like "
+            L"unopenable junk documents. Detection is unaffected.",
+            static_cast<unsigned long long>(concealFailures),
+            static_cast<unsigned long>(m_lastConcealWin32.load(std::memory_order_relaxed)));
     }
     return true;
 }
@@ -515,8 +546,10 @@ std::optional<std::string> HoneypotManagerImpl::DeployHoneypot(
         honeyFile.status        = HoneypotStatus::Active;
         honeyFile.creationTime  = std::chrono::system_clock::now();
         honeyFile.lastVerified  = Clock::now();
-        honeyFile.isHidden      = m_config.hideFiles;
-        honeyFile.isSystem      = m_config.makeSystemFiles;
+        // isHidden and isSystem are assigned from the VERIFIED outcome further
+        // down, not from the configuration. Recording the request would let a
+        // decoy sitting in plain sight on the user's Desktop report itself as
+        // concealed, which is exactly how this went unnoticed.
         honeyFile.autoRegenerate = m_config.autoRegenerate;
 
         std::error_code ec;
@@ -529,8 +562,19 @@ std::optional<std::string> HoneypotManagerImpl::DeployHoneypot(
             SS_LOG_WARN(kLogCategory, L"Hash failed for %ls", fullPath.c_str());
         }
 
-        // Stealth: randomize timestamps and set attributes
-        ApplyFileAttributes(fullPath.wstring());
+        // Stealth: conceal first, then randomise timestamps.
+        //
+        // Concealment costs NO detection and that is what makes it the right
+        // answer here: FindFirstFile and FindNextFile return hidden and system
+        // entries without any special flag, so a concealed decoy is exactly as
+        // discoverable to an encryptor enumerating the folder as a visible one.
+        // What it removes is a genuine product defect - an unopenable file
+        // named like a real document appearing on someone's Desktop reads as an
+        // infection, and the first person it frightened was the owner of this
+        // codebase.
+        const bool concealed = ApplyFileAttributes(fullPath.wstring());
+        honeyFile.isHidden = concealed && m_config.hideFiles;
+        honeyFile.isSystem = concealed && m_config.makeSystemFiles;
         RandomizeTimestamps(fullPath.wstring());
 
         // Register under lock
@@ -554,14 +598,66 @@ std::optional<std::string> HoneypotManagerImpl::DeployHoneypot(
     }
 }
 
-void HoneypotManagerImpl::ApplyFileAttributes(const std::wstring& path) const {
+bool HoneypotManagerImpl::ApplyFileAttributes(const std::wstring& path) const {
 #ifdef _WIN32
-    if (!m_config.hideFiles && !m_config.makeSystemFiles) return;
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) return;
-    if (m_config.hideFiles)       attrs |= FILE_ATTRIBUTE_HIDDEN;
-    if (m_config.makeSystemFiles) attrs |= FILE_ATTRIBUTE_SYSTEM;
-    SetFileAttributesW(path.c_str(), attrs);
+    DWORD wanted = 0;
+    if (m_config.hideFiles)       wanted |= FILE_ATTRIBUTE_HIDDEN;
+    if (m_config.makeSystemFiles) wanted |= FILE_ATTRIBUTE_SYSTEM;
+
+    // Nothing requested is not a failure. Returning false here would report a
+    // concealment problem to an operator who switched concealment off.
+    if (wanted == 0) {
+        return true;
+    }
+
+    const DWORD before = GetFileAttributesW(path.c_str());
+    if (before == INVALID_FILE_ATTRIBUTES) {
+        const DWORD gle = ::GetLastError();
+        m_cycleConcealFailures.fetch_add(1, std::memory_order_relaxed);
+        m_lastConcealWin32.store(gle, std::memory_order_relaxed);
+        SS_LOG_WARN(kLogCategory,
+            L"Cannot read the attributes of %ls (WinError %lu), so it cannot be "
+            L"concealed and will be visible to the user. The trap still works.",
+            path.c_str(), static_cast<unsigned long>(gle));
+        return false;
+    }
+
+    if (!SetFileAttributesW(path.c_str(), before | wanted)) {
+        const DWORD gle = ::GetLastError();
+        m_cycleConcealFailures.fetch_add(1, std::memory_order_relaxed);
+        m_lastConcealWin32.store(gle, std::memory_order_relaxed);
+        SS_LOG_WARN(kLogCategory,
+            L"SetFileAttributes failed for %ls (WinError %lu); the decoy stays "
+            L"visible to the user. The trap still works.",
+            path.c_str(), static_cast<unsigned long>(gle));
+        return false;
+    }
+
+    // READ THE ATTRIBUTES BACK instead of trusting the success return.
+    //
+    // Two of the four default decoy locations - Desktop and Documents - are
+    // OneDrive-backed on a stock Windows install, and a sync engine or any
+    // filter above us can accept the attribute change and then drop the bits.
+    // In that case SetFileAttributesW reports success while the file remains
+    // plainly visible, which is indistinguishable from working correctly unless
+    // the value is read back. That is the whole reason this function previously
+    // appeared to work: it never asked whether it had.
+    const DWORD after = GetFileAttributesW(path.c_str());
+    if (after == INVALID_FILE_ATTRIBUTES || (after & wanted) != wanted) {
+        m_cycleConcealFailures.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_WARN(kLogCategory,
+            L"Concealment did not stick for %ls: asked for 0x%08lX, the file "
+            L"reports 0x%08lX. The decoy is visible to the user; detection is "
+            L"unaffected because directory enumeration returns hidden entries.",
+            path.c_str(), static_cast<unsigned long>(wanted),
+            static_cast<unsigned long>(after));
+        return false;
+    }
+
+    return true;
+#else
+    (void)path;
+    return false;
 #endif
 }
 
@@ -755,7 +851,7 @@ void HoneypotManagerImpl::RegenerateTrap(const std::wstring& filePath) {
 
     try {
         CreateHoneypotFile(tmpl, honeypot->path);
-        ApplyFileAttributes(honeypot->path);
+        const bool reconcealed = ApplyFileAttributes(honeypot->path);
         RandomizeTimestamps(honeypot->path);
 
         {
@@ -764,6 +860,10 @@ void HoneypotManagerImpl::RegenerateTrap(const std::wstring& filePath) {
             if (it != m_honeypots.end()) {
                 it->second.status = HoneypotStatus::Active;
                 it->second.lastVerified = Clock::now();
+                // A regenerated decoy is a newly created file, so its
+                // concealment is newly determined too and must be re-recorded.
+                it->second.isHidden = reconcealed && m_config.hideFiles;
+                it->second.isSystem = reconcealed && m_config.makeSystemFiles;
                 FileUtils::Error err;
                 if (!FileUtils::ComputeFileSHA256(it->second.path, it->second.contentHash, &err)) {
                     SS_LOG_WARN(kLogCategory,
