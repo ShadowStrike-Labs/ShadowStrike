@@ -79,6 +79,7 @@ MITRE ATT&CK Coverage:
 #include "../../Behavioral/BehaviorEngine.h"
 #include "../../Utilities/FileUtils.h"
 #include "../../Utilities/MemoryUtils.h"
+#include "../../Communication/CommPort.h"
 #include "../../Communication/ScanBridge.h"
 #include "../../Callbacks/Process/ClipboardMonitor.h"
 #include "../../Context/InstanceContext.h"
@@ -282,6 +283,7 @@ typedef struct _PW_GLOBAL_STATE {
         volatile LONG64 CanaryFileHits;
         volatile LONG64 DocumentEncryptionBlocks;
         volatile LONG64 SkippedExcluded;
+        volatile LONG64 SkippedScannerSelf;
     } Stats;
 
     //
@@ -852,6 +854,60 @@ Return Value:
     }
 
     RequestorPid = PsGetCurrentProcessId();
+
+    // =========================================================================
+    // SCANNER SELF-EXEMPTION - MUST PRECEDE EVERY DENIAL IN THIS FUNCTION
+    // =========================================================================
+    //
+    // Our own service is the one process whose writes this callback must never
+    // analyse. It writes quarantine copies, signature and pattern databases,
+    // rollback backups, logs, and ransomware honeypot decoys - bulk, often
+    // high-entropy writes, some of them into user document folders. That is
+    // indistinguishable from ransomware by design, because the decoys are built
+    // to look exactly like the files ransomware goes after.
+    //
+    // PreCreate.c has exempted this process on the create path for a long time
+    // (ShadowStrikeIsScannerProcess, PreCreate.c:864). The write path had no
+    // such exemption at all, so the product analysed and then BLOCKED its own
+    // file I/O.
+    //
+    // MEASURED, 1.0.100 field log: 27 honeypot decoy writes denied with
+    // STATUS_ACCESS_DENIED, surfacing to user mode as WinError 5, leaving four
+    // document folders with no decoy in them - so ransomware encrypting those
+    // folders would have raised no honeypot alert whatsoever. The denial came
+    // from PwpShouldBlockWrite below, and its only upstream escape was the
+    // user-configurable process-exclusion list, which our own service is not in
+    // and should not have to be in.
+    //
+    // ORDERING IS THE WHOLE POINT. This sits before FltGetFileNameInformation
+    // and therefore before all four STATUS_ACCESS_DENIED sites in this function,
+    // including the self-protection check, which would otherwise deny our own
+    // writes to our own protected files. Placing it after any of them would
+    // leave that denial reachable, which is precisely the defect being fixed.
+    // It is also cheaper here: our own bulk I/O no longer pays for a name query
+    // and parse before being skipped.
+    //
+    // IDENTITY, NOT NAME. ShadowStrikeIsScannerProcess matches only a process
+    // holding an ACCEPTED primary scanner connection, so an impostor that merely
+    // looks like our service cannot satisfy it.
+    //
+    // DELIBERATELY NOT CONFIGURABLE. Every other check here is gated on a config
+    // flag; this one is not, because a configuration in which the product blocks
+    // its own writes is not a configuration anyone should be able to select.
+    //
+    // ACCEPTED COVERAGE COST, stated rather than hidden: code executing inside
+    // our own service writes without write-path analysis. That is inherent - a
+    // filter cannot analyse its owner's I/O without risking blocking or
+    // deadlocking it - and the same exposure already exists on the create path.
+    // The countermeasure is the self-protection surface (handle stripping,
+    // protected-process registration, image-load verification), not this
+    // callback.
+    //
+    if (ShadowStrikeIsScannerProcess(RequestorPid)) {
+        InterlockedIncrement64(&g_PwState.Stats.SkippedScannerSelf);
+        PwpLeaveOperation();
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
 
     //
     // Get file name information

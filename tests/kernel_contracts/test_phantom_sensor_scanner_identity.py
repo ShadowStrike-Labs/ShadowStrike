@@ -24,6 +24,7 @@ SCAN_BRIDGE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/ScanBridg
 COMM_PORT_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.c"
 COMM_PORT_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.h"
 DRIVER_ENTRY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Core/DriverEntry.c"
+PRE_WRITE_C_PATH = ROOT / "PhantomSensor" / "PhantomSensor" / "Callbacks" / "FileSystem" / "PreWrite.c"
 ERROR_CODES_H_PATH = ROOT / "PhantomSensor/Shared/ErrorCodes.h"
 PROCESS_NOTIFY_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/Process/ProcessNotify.c"
 # The USER-MODE half of the kernel reply contract. It lives here, beside the
@@ -13989,6 +13990,169 @@ class AeadAadIntegrityContractTests(unittest.TestCase):
             "inside the authenticated AAD, so clearing it to 'send anyway' would "
             "invalidate the GCM tag and reintroduce the ERROR_CRC defect. Searched "
             "the %d chars following the length check." % len(tail))
+
+class ScannerWritePathExemptionContractTests(unittest.TestCase):
+    """Our own service must be exempt from write analysis BEFORE any denial.
+
+    PreWrite analyses every write and can complete the I/O with
+    STATUS_ACCESS_DENIED from four different places. Our own service writes
+    quarantine copies, signature databases, rollback backups and ransomware
+    honeypot decoys - bulk, high-entropy writes, some into user document folders
+    - which is indistinguishable from ransomware by construction.
+
+    The create path has exempted this process for a long time. The write path had
+    no exemption at all, so in 1.0.100 the driver denied 27 of our own honeypot
+    decoy writes, leaving four document folders with no decoy and therefore no
+    honeypot alert if ransomware encrypted them.
+
+    Ordering is the invariant, not presence: the previous shape had the exclusion
+    escape at PreWrite.c:935 sitting DOWNSTREAM of the self-protection denial at
+    :890, so an exemption placed there could never save the earlier branch.
+    """
+
+    @staticmethod
+    def _prewrite_operation_body():
+        """Comment-stripped body of the function containing the exemption.
+
+        Comments are stripped FIRST and that is load-bearing here: the fix's own
+        comment block quotes STATUS_ACCESS_DENIED while explaining the defect, and
+        it sits ABOVE the exemption. Without stripping, that prose would read as a
+        denial preceding the exemption and invert the very ordering under test.
+
+        The enclosing function is located by scanning BACKWARD from the exemption
+        to the nearest brace alone at column 0, so the test does not depend on the
+        callback's name.
+        """
+        source = strip_c_comments(read_source(PRE_WRITE_C_PATH))
+
+        needle = "ShadowStrikeIsScannerProcess(RequestorPid)"
+        at = source.find(needle)
+        if at < 0:
+            raise AssertionError(
+                "the scanner self-exemption is gone from PreWrite.c; the write "
+                "path would once again analyse and block our own file I/O")
+
+        start = source.rfind("\n{", 0, at)
+        if start < 0:
+            raise AssertionError("could not locate the enclosing function brace")
+        depth = 0
+        end = None
+        for i in range(start + 1, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            raise AssertionError("unbalanced braces around the exemption")
+        return source[start:end]
+
+    @classmethod
+    def _exemption_block(cls):
+        """Return the exemption's OWN braced block.
+
+        A fixed character window is wrong here and was measured wrong: moving the
+        exemption next to the user-exclusion block put that block's
+        SkippedExcluded increment inside a 400-character window, so the test
+        reported a conflated counter when nothing was conflated. Brace matching
+        scopes the assertion to the statement it is actually about.
+        """
+        body = cls._prewrite_operation_body()
+        at = body.index("ShadowStrikeIsScannerProcess(RequestorPid)")
+        open_at = body.index("{", at)
+        depth = 0
+        for i in range(open_at, len(body)):
+            if body[i] == "{":
+                depth += 1
+            elif body[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return body[open_at:i + 1]
+        raise AssertionError("unbalanced braces in the exemption block")
+
+    def test_the_exemption_precedes_every_access_denial(self):
+        body = self._prewrite_operation_body()
+
+        exempt_at = body.index("ShadowStrikeIsScannerProcess(RequestorPid)")
+        denials = [m.start() for m in re.finditer(r"STATUS_ACCESS_DENIED", body)]
+
+        # Anti-vacuity: with no denials left the ordering claim is empty, and the
+        # measured population of this function is four.
+        self.assertGreaterEqual(
+            len(denials), 4,
+            "expected at least the 4 measured STATUS_ACCESS_DENIED sites in this "
+            "callback, found %d; the ordering guarantee below would otherwise be "
+            "vacuous" % len(denials))
+
+        early = [d for d in denials if d < exempt_at]
+        self.assertEqual(
+            early, [],
+            "the scanner self-exemption is at offset %d but %d denial(s) precede "
+            "it at %s; a denial upstream of the exemption can still refuse our "
+            "own writes, which is the defect this guards"
+            % (exempt_at, len(early), early))
+
+    def test_the_exemption_precedes_the_file_name_query(self):
+        body = self._prewrite_operation_body()
+
+        exempt_at = body.index("ShadowStrikeIsScannerProcess(RequestorPid)")
+        name_at = body.find("FltGetFileNameInformation(")
+        self.assertNotEqual(
+            name_at, -1,
+            "FltGetFileNameInformation is gone from this callback; this test "
+            "describes an ordering around it and must be revisited")
+        self.assertLess(
+            exempt_at, name_at,
+            "our own bulk I/O must be skipped before paying for a name query and "
+            "parse: exemption at %d, name query at %d" % (exempt_at, name_at))
+
+    def test_the_exemption_releases_the_operation_reference(self):
+        block = self._exemption_block()
+        leave_at = block.find("PwpLeaveOperation();")
+        ret_at = block.find("return FLT_PREOP_SUCCESS_NO_CALLBACK;")
+
+        self.assertNotEqual(
+            leave_at, -1,
+            "the exemption must call PwpLeaveOperation() before returning; "
+            "PwpEnterOperation() was already taken, so returning without it leaks "
+            "an operation reference and can stall driver unload")
+        self.assertNotEqual(ret_at, -1, "the exemption must return from the callback")
+        self.assertLess(
+            leave_at, ret_at,
+            "PwpLeaveOperation() must come before the return, not after it")
+
+    def test_the_exemption_is_counted_under_its_own_reason(self):
+        block = self._exemption_block()
+
+        self.assertTrue(
+            "SkippedScannerSelf" in block,
+            "the exemption must be counted so it can be verified in the field; "
+            "searched its own %d-char block" % len(block))
+        self.assertFalse(
+            "SkippedExcluded" in block,
+            "the exemption must NOT reuse SkippedExcluded: a self-exemption and a "
+            "user-configured exclusion are different reasons and conflating them "
+            "makes both unreadable")
+
+    def test_the_exemption_is_not_gated_on_configuration(self):
+        body = self._prewrite_operation_body()
+
+        line = None
+        for candidate in body.split("\n"):
+            if "ShadowStrikeIsScannerProcess(RequestorPid)" in candidate:
+                line = candidate
+                break
+        self.assertIsNotNone(line, "the exemption line vanished")
+
+        indent = len(line) - len(line.lstrip(" "))
+        self.assertEqual(
+            indent, 4,
+            "the exemption must sit at the callback's top level (indent 4), not "
+            "nested inside another block; found indent %d. A configuration in "
+            "which the product blocks its own writes must not be selectable."
+            % indent)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
