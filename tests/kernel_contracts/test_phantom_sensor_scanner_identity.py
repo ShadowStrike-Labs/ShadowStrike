@@ -82,6 +82,7 @@ DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
 MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
 MEMORY_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.cpp"
+SIGNATURE_FORMAT_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/SignatureFormat.cpp"
 METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
 PACKER_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/PackerDetector.cpp"
 PE_PARSER_CPP_PATH = ROOT / "src/PhantomCore/PEParser/PEParser.cpp"
@@ -14525,6 +14526,107 @@ class CatalogStoreExemptionContractTests(unittest.TestCase):
         self.assertEqual(
             self.c.count("InterlockedIncrement64(&g_PcState.Stats.CatalogStoreExemptions);"), 1,
             "and incremented exactly once")
+
+
+
+class ScannerReadShareModeContractTests(unittest.TestCase):
+    r"""A scanner must never deny its target's owner a write.
+
+    MEASURED, 1.0.103 field run over 803 seconds. The read-only memory-mapping
+    helper opened C:\Windows\System32\catroot2\edb.log - the write-ahead log of
+    the ESE database behind the Windows catalog store - with FILE_SHARE_READ,
+    which denies every other process a write for as long as our handle is open.
+    ESE was locked out of its own log, CryptSvc stalled, and our own signature
+    verification then waited on CryptSvc for 35.0 seconds a call, ten times.
+
+    The behavioural half of this contract lives in
+    tests/unit/scan_target_mapping, which holds a real mapping and asks the
+    operating system whether an owner could still write. These assertions cover
+    the three sites that suite cannot reach, because reaching them needs either
+    a live scan or a caller this product does not expose.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fu_raw = read_source(FILE_UTILS_HPP_PATH)
+        cls.sf_raw = read_source(SIGNATURE_FORMAT_CPP_PATH)
+        cls.mu_raw = read_source(MEMORY_UTILS_CPP_PATH)
+        cls.se_raw = read_source(SCAN_ENGINE_CPP_PATH)
+        # Comment-stripped for every assertion about CODE. This is load-bearing
+        # here: the doc block introduced with this policy necessarily QUOTES the
+        # flag names and the rationale it replaces, so a comment-blind count
+        # would be satisfied by prose.
+        cls.fu = strip_c_comments(cls.fu_raw)
+        cls.sf = strip_c_comments(cls.sf_raw)
+        cls.mu = strip_c_comments(cls.mu_raw)
+        cls.se = strip_c_comments(cls.se_raw)
+
+    def test_the_policy_is_defined_once_as_full_sharing(self):
+        decls = re.findall(r"inline\s+constexpr\s+DWORD\s+SCANNER_READ_SHARE_MODE\s*=",
+                           self.fu)
+        self.assertEqual(len(decls), 1,
+                         "the scanner read share mode must have exactly one definition, "
+                         "found %d" % len(decls))
+
+        m = re.search(r"inline\s+constexpr\s+DWORD\s+SCANNER_READ_SHARE_MODE\s*=([^;]*);",
+                      self.fu)
+        self.assertIsNotNone(m, "could not read the policy definition")
+        value = " ".join(m.group(1).split())
+        for flag in ("FILE_SHARE_READ", "FILE_SHARE_WRITE", "FILE_SHARE_DELETE"):
+            self.assertIn(flag, value,
+                          "%s missing from the scanner read share mode: %s" % (flag, value))
+
+    def test_both_mapping_helpers_use_the_shared_policy(self):
+        # The field-proven site.
+        self.assertEqual(
+            self.sf.count("Utils::FileUtils::SCANNER_READ_SHARE_MODE"), 1,
+            "SignatureFormat.cpp must take its read share mode from the shared policy")
+        self.assertEqual(
+            len(re.findall(r"readOnly\s*\?\s*FILE_SHARE_READ\s*:", self.sf)), 0,
+            "the restrictive read-only share mode was reintroduced in SignatureFormat.cpp")
+
+        # The sibling helper, which carried the same defect with a rationale.
+        self.assertEqual(
+            self.mu.count("Utils::FileUtils::SCANNER_READ_SHARE_MODE"), 1,
+            "MemoryUtils.cpp must take its read share mode from the shared policy")
+        self.assertEqual(
+            len(re.findall(r":\s*\(FILE_SHARE_READ\s*\|\s*FILE_SHARE_DELETE\)\s*;", self.mu)), 0,
+            "the write-denying read share mode was reintroduced in MemoryUtils.cpp")
+        self.assertEqual(
+            self.mu.count('#include "FileUtils.hpp"'), 1,
+            "MemoryUtils.cpp needs the FileUtils include for the shared policy")
+
+    def test_the_read_write_branch_stays_exclusive(self):
+        # Anti-over-reach. The read-WRITE branch of the mapper is reached only
+        # for our own databases, where excluding other writers is the point.
+        # Widening that to full sharing would let anything modify a database
+        # while we rewrite it.
+        self.assertEqual(
+            self.sf.count("SCANNER_READ_SHARE_MODE : 0;"), 1,
+            "the read-write mapping branch must stay exclusive (share mode 0)")
+
+    def test_the_scan_target_reads_use_the_shared_policy(self):
+        self.assertEqual(
+            self.se.count("Utils::FileUtils::SCANNER_READ_SHARE_MODE"), 2,
+            "both ScanEngine scan-target reads must use the shared policy")
+        # Neither of those two reads may go back to naming a restrictive mode.
+        bad = [ln.strip() for ln in self.se.splitlines()
+               if "CreateFileW(filePath.c_str(), GENERIC_READ" in ln
+               and "SCANNER_READ_SHARE_MODE" not in ln
+               and "FILE_SHARE_READ" in ln]
+        self.assertEqual(bad, [],
+                         "a scan-target read names a restrictive share mode: %s" % bad)
+
+    def test_the_mistaken_toctou_rationale_is_not_reinstated(self):
+        # Scoped to the file that carried it. FileUtils.hpp deliberately QUOTES
+        # the old rationale in order to explain why it was wrong, so the raw
+        # text there is expected to contain it and must not be asserted against.
+        self.assertEqual(
+            self.mu_raw.count("deny concurrent writes to prevent TOCTOU"), 0,
+            "the mistaken TOCTOU rationale was restored in MemoryUtils.cpp")
+        self.assertEqual(
+            self.fu_raw.count("deny concurrent writes to prevent TOCTOU"), 1,
+            "FileUtils.hpp should keep quoting the rationale it replaces, exactly once")
 
 
 if __name__ == "__main__":

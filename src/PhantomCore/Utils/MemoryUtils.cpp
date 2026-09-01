@@ -31,6 +31,9 @@
  */
 #include"pch.h"
 #include "MemoryUtils.hpp"
+// FileUtils owns the shared scanner read share-mode policy; see
+// Utils::FileUtils::SCANNER_READ_SHARE_MODE.
+#include "FileUtils.hpp"
 
 #include <algorithm>
 #include <new>
@@ -741,11 +744,11 @@ namespace ShadowStrike {
 				}
 
 				const DWORD access = rw ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
-				// Read-only: deny concurrent writes to prevent TOCTOU during scanning.
-				// Read-write: allow sharing since caller expects concurrent access.
+				// Both modes take FULL sharing. Denying writes on the read path was a documented
+				// but mistaken TOCTOU defence; see Utils::FileUtils::SCANNER_READ_SHARE_MODE.
 				const DWORD share = rw
 					? (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-					: (FILE_SHARE_READ | FILE_SHARE_DELETE);
+					: Utils::FileUtils::SCANNER_READ_SHARE_MODE;
 				const DWORD disp = rw ? OPEN_ALWAYS : OPEN_EXISTING;
 				const DWORD attrs = FILE_ATTRIBUTE_NORMAL | (rw ? 0 : FILE_FLAG_SEQUENTIAL_SCAN);
 

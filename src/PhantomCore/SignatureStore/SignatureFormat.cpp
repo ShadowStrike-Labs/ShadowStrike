@@ -886,7 +886,14 @@ namespace {
 // Helper: Open file for memory mapping
 HANDLE OpenFileForMapping(const std::wstring& path, bool readOnly, DWORD& outError) noexcept {
     DWORD desiredAccess = readOnly ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
-    DWORD shareMode = readOnly ? FILE_SHARE_READ : 0;
+    // Read-only takes FULL sharing: this helper maps a SCAN TARGET, and holding
+    // it against its owner is what stalled CryptSvc in the field. See
+    // Utils::FileUtils::SCANNER_READ_SHARE_MODE for the measurement.
+    //
+    // The read-write branch stays EXCLUSIVE and that asymmetry is deliberate: it
+    // is reached only for our OWN databases, where excluding every other writer
+    // is the entire point rather than a side effect.
+    DWORD shareMode = readOnly ? Utils::FileUtils::SCANNER_READ_SHARE_MODE : 0;
     DWORD creationDisposition = OPEN_EXISTING;
     DWORD flagsAndAttributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS;
 

@@ -71,6 +71,46 @@ namespace ShadowStrike {
 			/// Maximum file size for in-memory operations (1GB default)
 			inline constexpr uint64_t MAX_READ_FILE_SIZE = 1ULL * 1024 * 1024 * 1024;
 
+			/// Share mode a SCANNER must use when it opens a file only to read it.
+			///
+			/// A scanner is an observer. It must never deny the file's owner the right
+			/// to keep writing, and must never block a delete: for as long as our
+			/// handle is open, a restrictive share mode makes every write or delete by
+			/// anyone else fail with ERROR_SHARING_VIOLATION.
+			///
+			/// MEASURED CONSEQUENCE, 1.0.103 field run over 803 seconds. The
+			/// memory-mapping helper opened C:\Windows\System32\catroot2\edb.log - the
+			/// write-ahead transaction log of the ESE database behind the Windows
+			/// catalog store - with FILE_SHARE_READ, which locked ESE out of its own
+			/// log for the whole scan. CryptSvc stalled; our own signature
+			/// verification then waited on CryptSvc for 35.0 seconds per call, ten
+			/// times over, 283 seconds of blocking in total; winlogon and Explorer
+			/// queued behind the same service and the desktop never composed.
+			///
+			/// THIS REPLACES AN EXPLICIT BUT MISTAKEN RATIONALE, restated here so it
+			/// is not reinstated. MemoryUtils::OpenFileForMap carried the comment
+			/// "Read-only: deny concurrent writes to prevent TOCTOU during scanning".
+			/// Denying writes does not prevent that TOCTOU: the substitution can happen
+			/// the instant our handle closes and before the verdict is consumed. The
+			/// product already defends against it where the defence actually belongs,
+			/// by re-reading size and last-write time before publishing a cached
+			/// verdict and by keying the verdict cache on that identity. What the
+			/// restrictive share mode bought was not integrity; it was the ability to
+			/// freeze other processes.
+			///
+			/// It was also self-defeating. The same scan reads the same bytes through
+			/// HashUtils::ComputeFile and FileUtils::ReadAllBytes, and both of those
+			/// already pass full sharing, so the restriction never covered a whole
+			/// scan - it only ever added a way to stall the file's owner.
+			///
+			/// RESIDUAL, STATED RATHER THAN HIDDEN: a concurrent write can now give a
+			/// torn read, which is a possibly wrong verdict on one file instead of a
+			/// stalled machine. Truncation cannot fault a mapped view, because a
+			/// section object blocks SetEndOfFile while it exists, and the file is
+			/// re-examined when its last handle closes.
+			inline constexpr DWORD SCANNER_READ_SHARE_MODE =
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
 			/**
 			 * @brief Error information structure for file operations.
 			 * 

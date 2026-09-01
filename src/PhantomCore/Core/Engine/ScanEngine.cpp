@@ -2059,7 +2059,7 @@ EngineResult ScanEngine::ScanFile(
 
                                 // Read script content (cap at AMSI max: 64 MiB)
                                 HANDLE hScriptFile = CreateFileW(filePath.c_str(), GENERIC_READ,
-                                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                    Utils::FileUtils::SCANNER_READ_SHARE_MODE, nullptr,
                                     OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
 
                                 if (hScriptFile != INVALID_HANDLE_VALUE) {
@@ -2604,7 +2604,8 @@ EngineResult ScanEngine::ScanFile(
             // --- 6c: Compute normalized fuzzy hash for PE files if not already available ---
             if (result.fuzzyHash.empty()) {
                 try {
-                    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+                        Utils::FileUtils::SCANNER_READ_SHARE_MODE,
                         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
                     if (hFile != INVALID_HANDLE_VALUE) {
                         LARGE_INTEGER fileSize{};

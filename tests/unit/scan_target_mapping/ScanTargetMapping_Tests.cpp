@@ -44,6 +44,7 @@
 #include <gtest/gtest.h>
 
 #include "../../../src/PhantomCore/SignatureStore/SignatureFormat.hpp"
+#include "../../../src/PhantomCore/Utils/FileUtils.hpp"
 
 #include <Windows.h>
 #include <filesystem>
@@ -365,4 +366,124 @@ TEST(ScanTargetMappingTest, TheSameFileCanBeMappedTwiceAtOnce) {
 
     if (secondOpened) MM::CloseView(second);
     MM::CloseView(first);
+}
+
+// ============================================================================
+// SHARE MODE - A SCANNER MUST NOT DENY ITS TARGET'S OWNER A WRITE
+//
+// The read-only mapping path used to open with FILE_SHARE_READ, which denies
+// every other process a write or a delete for as long as our handle is open.
+// Measured in the field on 1.0.103: the pipeline mapped
+// C:\Windows\System32\catroot2\edb.log, the write-ahead log of the ESE database
+// behind the Windows catalog store. That locked ESE out of its own log, CryptSvc
+// stalled, and our own signature verification then waited on CryptSvc for 35.0
+// seconds per call, ten times, while winlogon and Explorer queued behind the
+// same service.
+//
+// These are behavioural: they hold a real mapping on a real file and then ask
+// the operating system whether an owner could still write. A test over the
+// constant alone would not have caught the defect, because the constant did not
+// exist - the flags were spelled out at the call site.
+// ============================================================================
+
+TEST(ScanTargetMappingTest, MappingAScanTargetDoesNotDenyItsOwnerAWrite) {
+    TempFile file(L"share_write_probe.bin", MakeMzBytes(4096));
+
+    MemoryMappedView view{};
+    StoreError err{};
+    ASSERT_TRUE(MM::OpenFileView(file.path(), view, err))
+        << "precondition: mapping the scan target must succeed, otherwise this "
+           "test proves nothing: " << err.message;
+
+    // While WE hold the mapping, the file's owner must still be able to write.
+    HANDLE writer = ::CreateFileW(
+        file.path().c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD gle = (writer == INVALID_HANDLE_VALUE) ? ::GetLastError() : 0u;
+
+    EXPECT_NE(writer, INVALID_HANDLE_VALUE)
+        << "a mapped scan target denied its owner a write (win32=" << gle
+        << "). This is the defect that locked ESE out of the Windows catalog "
+           "store and stalled signature verification for 35 seconds a call.";
+
+    if (writer != INVALID_HANDLE_VALUE) ::CloseHandle(writer);
+    MM::CloseView(view);
+}
+
+TEST(ScanTargetMappingTest, MappingAScanTargetDoesNotDenyADelete) {
+    TempFile file(L"share_delete_probe.bin", MakeMzBytes(4096));
+
+    MemoryMappedView view{};
+    StoreError err{};
+    ASSERT_TRUE(MM::OpenFileView(file.path(), view, err)) << err.message;
+
+    // DELETE access is requested but FILE_FLAG_DELETE_ON_CLOSE deliberately is
+    // not, so this probes the share mode without removing the fixture's file.
+    HANDLE deleter = ::CreateFileW(
+        file.path().c_str(), DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD gle = (deleter == INVALID_HANDLE_VALUE) ? ::GetLastError() : 0u;
+
+    EXPECT_NE(deleter, INVALID_HANDLE_VALUE)
+        << "a mapped scan target blocked a delete (win32=" << gle
+        << "). A scanner holding a file undeletable is how an installer or an "
+           "updater gets stuck behind us.";
+
+    if (deleter != INVALID_HANDLE_VALUE) ::CloseHandle(deleter);
+    MM::CloseView(view);
+}
+
+TEST(ScanTargetMappingTest, AMappedScanTargetStillCannotBeTruncatedUnderUs) {
+    // This VERIFIES the safety claim recorded at
+    // Utils::FileUtils::SCANNER_READ_SHARE_MODE rather than asserting it. The
+    // residual cost of permitting concurrent writes is a torn read - a possibly
+    // wrong verdict on one file - and NOT an in-page fault, because a section
+    // object blocks a shrink for as long as it exists. If that ever stops being
+    // true, reads through a mapped view need SEH protection and this fails first.
+    TempFile file(L"share_truncate_probe.bin", MakeMzBytes(8192));
+
+    MemoryMappedView view{};
+    StoreError err{};
+    ASSERT_TRUE(MM::OpenFileView(file.path(), view, err)) << err.message;
+
+    HANDLE writer = ::CreateFileW(
+        file.path().c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_NE(writer, INVALID_HANDLE_VALUE)
+        << "precondition: the owner must be able to open for write";
+
+    LARGE_INTEGER zero{};
+    zero.QuadPart = 0;
+    const BOOL moved = ::SetFilePointerEx(writer, zero, nullptr, FILE_BEGIN);
+    EXPECT_TRUE(moved);
+
+    const BOOL truncated = ::SetEndOfFile(writer);
+    const DWORD gle = truncated ? 0u : ::GetLastError();
+
+    EXPECT_FALSE(truncated)
+        << "a mapped file was truncated under an open view; reads through the "
+           "view can now raise an in-page error, which is an SEH exception and "
+           "not catchable as a C++ exception";
+    EXPECT_EQ(gle, static_cast<DWORD>(ERROR_USER_MAPPED_FILE))
+        << "expected ERROR_USER_MAPPED_FILE (" << ERROR_USER_MAPPED_FILE
+        << "), got win32=" << gle;
+
+    ::CloseHandle(writer);
+    MM::CloseView(view);
+}
+
+TEST(ScannerReadSharePolicy, ThePolicyConstantPermitsWriteAndDelete) {
+    constexpr DWORD mode = ShadowStrike::Utils::FileUtils::SCANNER_READ_SHARE_MODE;
+
+    EXPECT_NE(mode & FILE_SHARE_READ, 0u)   << "a scanner must be able to read";
+    EXPECT_NE(mode & FILE_SHARE_WRITE, 0u)  << "denying a write freezes the owner";
+    EXPECT_NE(mode & FILE_SHARE_DELETE, 0u) << "denying a delete blocks updaters";
+
+    // Pinned as an exact value as well: adding a further bit here would be a
+    // change of policy, not a tidy-up, and should have to be stated.
+    EXPECT_EQ(mode,
+              static_cast<DWORD>(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE));
 }
