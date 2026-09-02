@@ -90,22 +90,26 @@ BuildHeadlineStateChanged(std::string_view state);
  * @brief Serialise a ScanProgressEvent push-event envelope.
  *
  * JSON payload:
- *   { "scanId": <uint64>, "percent": <int>,
+ *   { "scanId": "<scanId>", "percent": <int>,
  *     "itemsScanned": <uint64>, "threatsFound": <uint64> }
  * CommandType: ScanProgressEvent (103)
  * requestId:   0
  *
- * @param scanId        Unique identifier of the in-progress scan.
+ * @param scanId        Unique identifier of the in-progress scan, as issued by
+ *                      StartScan. A STRING, not a number: ids are minted as
+ *                      "scan-<n>", so a numeric parameter could not carry one and
+ *                      the only caller passed a literal 0 instead. The UI keys
+ *                      its progress polling on this value.
  * @param percent       Completion percentage [0, 100].  Clamped if out-of-range.
  * @param itemsScanned  Number of items inspected so far.
  * @param threatsFound  Number of threats detected so far.
  * @return Serialised wire buffer, or empty on internal failure.
  */
 [[nodiscard]] std::vector<std::uint8_t>
-BuildScanProgressEvent(std::uint64_t scanId,
-                       int           percent,
-                       std::uint64_t itemsScanned,
-                       std::uint64_t threatsFound);
+BuildScanProgressEvent(std::string_view scanId,
+                       int              percent,
+                       std::uint64_t    itemsScanned,
+                       std::uint64_t    threatsFound);
 
 /**
  * @brief Serialise a PgtiFeedUpdated push-event envelope.

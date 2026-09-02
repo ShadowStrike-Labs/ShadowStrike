@@ -3553,6 +3553,60 @@ std::future<DirectoryScanResult> ScanEngine::ScanDirectoryAsync(
     });
 }
 
+namespace {
+
+// A multi-root scan returns ONE DirectoryScanResult, so per-root statistics have
+// to be folded together. Without this the caller receives a result whose results
+// vector is populated and whose statistics block is entirely zero, and
+// statistics.filesInfected is the ONLY place the number of confirmed detections
+// is carried - so a scan that found malware was indistinguishable from one that
+// found nothing. One implementation with two callers, deliberately: two copies of
+// a merge like this is how the two YARA metadata builders drifted apart.
+void MergeScanStatistics(ScanStatistics& into, const ScanStatistics& from) noexcept {
+    into.filesScanned        += from.filesScanned;
+    into.filesInfected       += from.filesInfected;
+    into.filesSuspicious     += from.filesSuspicious;
+    into.filesCleaned        += from.filesCleaned;
+    into.filesQuarantined    += from.filesQuarantined;
+    into.filesSkipped        += from.filesSkipped;
+    into.filesErrors         += from.filesErrors;
+    into.totalBytesScanned   += from.totalBytesScanned;
+    into.infectedBytesFound  += from.infectedBytesFound;
+    into.scanDuration        += from.scanDuration;
+    into.whitelistHits       += from.whitelistHits;
+    into.cacheHits           += from.cacheHits;
+    into.hashMatches         += from.hashMatches;
+    into.signatureMatches    += from.signatureMatches;
+    into.heuristicDetections += from.heuristicDetections;
+    into.mlDetections        += from.mlDetections;
+    into.archivesScanned     += from.archivesScanned;
+    into.archiveFilesScanned += from.archiveFilesScanned;
+    // avgFileTimeMs is deliberately NOT summed. It is a mean, and the sum of two
+    // means is neither of them; it is derived below once every root is folded in.
+}
+
+// The file branch of a custom scan does not go through ScanDirectory, so without
+// this a custom scan of a single file - which is exactly what the Explorer
+// context-menu entry produces - returns one result beside a zeroed statistics
+// block. Mirrors ScanDirectory's own accounting (filesScanned, filesInfected,
+// filesSuspicious) rather than inventing a wider set, so the two paths cannot
+// disagree about what a counter means.
+void AccountSingleResult(ScanStatistics& into, const EngineResult& r) noexcept {
+    into.filesScanned++;
+    if (r.verdict == ScanVerdict::Infected)   into.filesInfected++;
+    if (r.verdict == ScanVerdict::Suspicious) into.filesSuspicious++;
+}
+
+// Derive the mean once, from totals, after every root has been merged.
+void FinaliseScanStatistics(ScanStatistics& s) noexcept {
+    s.avgFileTimeMs = (s.filesScanned > 0)
+        ? std::chrono::milliseconds{ s.scanDuration.count() /
+                                     static_cast<long long>(s.filesScanned) }
+        : std::chrono::milliseconds{ 0 };
+}
+
+}  // namespace
+
 DirectoryScanResult ScanEngine::QuickScan(ScanProgressCallback progressCallback) {
     DirectoryScanRequest request{};
     request.context.type = ScanType::OnDemand;
@@ -3580,9 +3634,12 @@ DirectoryScanResult ScanEngine::QuickScan(ScanProgressCallback progressCallback)
                 result.results.begin(),
                 result.results.end()
             );
+            MergeScanStatistics(combinedResult.statistics, result.statistics);
+            combinedResult.directoriesScanned += result.directoriesScanned;
         }
     }
 
+    FinaliseScanStatistics(combinedResult.statistics);
     return combinedResult;
 }
 
@@ -3620,15 +3677,19 @@ DirectoryScanResult ScanEngine::CustomScan(
                 result.results.begin(),
                 result.results.end()
             );
+            MergeScanStatistics(combinedResult.statistics, result.statistics);
+            combinedResult.directoriesScanned += result.directoriesScanned;
         } else if (fs::is_regular_file(target)) {
             ScanContext context{};
             context.type = ScanType::OnDemand;
 
             auto result = ScanFile(target, context);
+            AccountSingleResult(combinedResult.statistics, result);
             combinedResult.results.push_back(result);
         }
     }
 
+    FinaliseScanStatistics(combinedResult.statistics);
     return combinedResult;
 }
 

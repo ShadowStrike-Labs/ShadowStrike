@@ -1025,11 +1025,21 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                     std::lock_guard<std::mutex> lk(r->stateMutex);
                     r->currentPath = p.currentFile;
                 }
+                // THE REAL ID, NOT A LITERAL. The UI stores whatever this event
+                // carries as its current scan id, so a 0 here overwrote the id
+                // StartScan had just returned and every later GetScanProgress
+                // asked for a scan that does not exist - which fails, and the
+                // poll then stops updating silently.
+                //
+                // threatsFound is read from the record rather than from p:
+                // ScanProgress carries no verdict information at all, which is
+                // why a literal was there. The engine reports detections per root
+                // in ScanStatistics, and the watcher below folds that in.
                 const auto ev = Events::BuildScanProgressEvent(
-                    0,
+                    scanId,
                     static_cast<int>(p.percentComplete),
                     p.filesScanned,
-                    0);
+                    r->threatsFound.load(std::memory_order_relaxed));
                 if (!ev.empty()) {
                     const auto delivered = svc.BroadcastEvent(CommandType::ScanProgressEvent, ev);
                     LogBroadcastResult(L"scan progress", delivered);
@@ -1079,14 +1089,50 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 });
         }
 
-        // Watcher thread: mark scan done when future completes.
+        // Watcher thread: COLLECT the outcome once the scan finishes.
+        //
+        // THE RESULT MUST BE TAKEN, NOT MERELY WAITED FOR. This called
+        // future.wait() and returned, so the DirectoryScanResult - the only
+        // object carrying what the scan actually found - was destroyed unread.
+        // ScanRecord::threatsFound was declared and written by nothing, so
+        // GetScanProgress reported a field with no producer and every on-demand
+        // scan announced zero detections whatever it had found.
+        //
+        // NO TERMINAL EVENT IS BROADCAST FROM HERE, deliberately. The poll reply
+        // already carries state and threatsFound, and with the id fixed above the
+        // UI polling works, so a push would add nothing while capturing a
+        // reference to the service in a DETACHED thread that may outlive it.
         std::thread([impl, localId = scanId]() mutable {
             auto r = impl->FindScan(localId);
             if (!r || !r->future.valid()) return;
-            r->future.wait();
+
+            std::uint64_t infected = 0;
+            bool failed = false;
+            try {
+                const DirectoryScanResult out = r->future.get();
+                infected = out.statistics.filesInfected;
+            } catch (const std::exception& ex) {
+                // std::async re-throws the task's exception from get(). This
+                // thread is detached, so letting one escape would terminate the
+                // process - and reporting "completed" for a scan that threw is
+                // exactly the over-claimed outcome this change removes.
+                failed = true;
+                SS_LOG_ERROR(kLogCat, L"Scan [%hs] failed: %hs",
+                             localId.c_str(), ex.what());
+            } catch (...) {
+                failed = true;
+                SS_LOG_ERROR(kLogCat, L"Scan [%hs] failed with a non-standard "
+                             L"exception", localId.c_str());
+            }
+
+            // Only CONFIRMED detections are reported as threats. Suspicious is a
+            // deliberately separate class - monitored and counted, never
+            // quarantined - so folding it in here would tell a user that a
+            // heuristic hit is malware. Surfacing it needs its own UI field.
+            r->threatsFound.store(infected, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(r->stateMutex);
-                r->stateStr = "completed";
+                r->stateStr = failed ? "failed" : "completed";
             }
             r->percent.store(100.0f, std::memory_order_relaxed);
         }).detach();

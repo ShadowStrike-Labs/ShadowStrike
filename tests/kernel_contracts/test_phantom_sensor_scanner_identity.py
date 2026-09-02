@@ -52,6 +52,11 @@ FILE_PROTECTION_HPP_PATH = ROOT / "src" / "PhantomCore" / "SelfProtection" / "Fi
 # "not found", which is why ServiceManager watched a nonexistent service undetected.
 INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
 INSTALLER_PRODUCT_WXS_PATH = ROOT / "packaging/installer/Product.wxs"
+EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
+EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
+HOME_IPC_DISPATCHER_CPP_PATH = (
+    ROOT / "src/PhantomCore/Service/HomeIpcDispatcher.cpp"
+)
 TRAY_UI_ARGS_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Shared/TrayUiArgs.hpp"
 )
@@ -15431,6 +15436,132 @@ class ExplorerScanVerbContractTests(unittest.TestCase):
             self.svm_h.count("void drainPendingCustomScan();"), 1,
             "the drain is not declared, so the definition is unreachable")
 
+
+class OnDemandScanOutcomeContractTests(unittest.TestCase):
+    """What an on-demand scan FOUND must reach the user.
+
+    MEASURED. Three sites conspired so that every on-demand scan reported zero
+    detections whatever it had found, and each one alone was enough:
+
+      1. CustomScan and QuickScan build one DirectoryScanResult by concatenating
+         per-root results and never folded the per-root STATISTICS in, so the
+         statistics block - the only carrier of the detection count - stayed
+         zero. A custom scan of a single file did not even count the file.
+      2. The dispatcher's watcher thread called future.wait() and returned, so
+         the DirectoryScanResult was destroyed unread. ScanRecord::threatsFound
+         was declared and written by NOTHING, which made GetScanProgress report
+         a field with no producer.
+      3. The progress push passed a literal 0 as the scan id. The UI stores
+         whatever the event carries, so it overwrote the real id and every later
+         poll asked for a scan that does not exist - killing the one channel
+         that reports the terminal state.
+
+    The literal 0 was not laziness: ids are minted as "scan-<n>" and the event
+    builder took a std::uint64_t, so it could not carry one. Fixing the count
+    without fixing the id would have left it unobservable.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.se = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        cls.hd = strip_c_comments(read_source(HOME_IPC_DISPATCHER_CPP_PATH))
+        cls.eph = strip_c_comments(read_source(EVENT_PUSH_HPP_PATH))
+        cls.epc = strip_c_comments(read_source(EVENT_PUSH_CPP_PATH))
+
+    def test_the_engine_producer_of_the_detection_count_still_exists(self):
+        # ANTI-VACUITY. Everything below folds statistics together; if
+        # ScanDirectory stopped producing them there would be nothing to fold
+        # and every assertion here would pass over zeros.
+        self.assertEqual(
+            self.se.count("batchResult.statistics = stats;"), 1,
+            "ScanDirectory no longer publishes its statistics, so the detection "
+            "count has no producer and folding it is meaningless")
+        self.assertEqual(
+            self.se.count("stats.filesInfected++;"), 1,
+            "the confirmed-detection counter is no longer incremented per file")
+
+    def test_a_multi_root_scan_folds_its_per_root_statistics(self):
+        self.assertEqual(
+            self.se.count("void MergeScanStatistics("), 1,
+            "the statistics merge is gone or duplicated; two copies of a merge "
+            "like this is how the two YARA metadata builders drifted apart")
+        self.assertEqual(
+            self.se.count("MergeScanStatistics(combinedResult.statistics,"), 2,
+            "both multi-root scans (QuickScan and CustomScan) must fold their "
+            "per-root statistics, or the caller receives a populated results "
+            "vector beside an all-zero statistics block")
+        self.assertEqual(
+            self.se.count("FinaliseScanStatistics(combinedResult.statistics);"), 2,
+            "the derived mean must be computed once per aggregate; summing means "
+            "produces a number that is neither of them")
+
+    def test_a_single_file_custom_scan_counts_the_file_it_scanned(self):
+        # This is the Explorer context-menu case: exactly one regular file, which
+        # does not go through ScanDirectory at all.
+        self.assertEqual(
+            self.se.count("void AccountSingleResult("), 1,
+            "the single-file accounting helper is gone")
+        self.assertEqual(
+            self.se.count("AccountSingleResult(combinedResult.statistics, result);"), 1,
+            "the file branch of CustomScan must account its own result, or a "
+            "scan of one file reports one result and zero files scanned")
+
+    def test_the_watcher_takes_the_result_instead_of_discarding_it(self):
+        watcher = self.hd[self.hd.find("std::thread([impl, localId = scanId]"):]
+        watcher = watcher[:watcher.find(").detach();")]
+        self.assertTrue(watcher, "the scan watcher thread could not be located")
+        self.assertEqual(
+            watcher.count("r->future.get()"), 1,
+            "the watcher must TAKE the result. future.wait() leaves the "
+            "DirectoryScanResult to be destroyed unread, which is what made "
+            "every scan report zero detections")
+        self.assertEqual(
+            watcher.count("r->future.wait()"), 0,
+            "a bare future.wait() is back, so the outcome is discarded again")
+        self.assertEqual(
+            watcher.count("out.statistics.filesInfected"), 1,
+            "the detection count must come from the returned statistics")
+        self.assertEqual(
+            watcher.count("r->threatsFound.store("), 1,
+            "ScanRecord::threatsFound must be written, or GetScanProgress "
+            "reports a field with no producer")
+        self.assertEqual(
+            watcher.count("catch"), 2,
+            "get() re-throws the task's exception and this thread is DETACHED, "
+            "so an escaping exception terminates the process; both a typed and "
+            "a catch-all arm are required")
+        self.assertIn(
+            'failed ? "failed" : "completed"', watcher,
+            "a scan that threw must not be reported as completed")
+
+    def test_the_progress_event_carries_the_real_scan_id(self):
+        self.assertEqual(
+            self.eph.count("BuildScanProgressEvent(std::string_view scanId,"), 1,
+            "the event must take the id as a STRING; ids are minted as "
+            "'scan-<n>', so a numeric parameter cannot carry one and the caller "
+            "is forced to invent a value")
+        self.assertEqual(
+            self.epc.count("BuildScanProgressEvent(std::string_view scanId,"), 1,
+            "the definition no longer matches the declaration")
+        self.assertEqual(
+            self.epc.count("safeI64(scanId)"), 0,
+            "the id is being narrowed to an integer again, which cannot "
+            "represent it")
+        call = self.hd[self.hd.find("Events::BuildScanProgressEvent("):]
+        call = call[:call.find(";")]
+        self.assertIn(
+            "scanId", call,
+            "the progress event must carry the real scan id. A literal there "
+            "overwrites the id the UI received from StartScan, and every later "
+            "GetScanProgress then asks for a scan that does not exist")
+        self.assertNotIn(
+            "0,\n", call.replace("100", ""),
+            "a bare literal argument remains in the progress event call")
+        self.assertIn(
+            "r->threatsFound.load(", call,
+            "the detection count must be read from the record; ScanProgress "
+            "carries no verdict information at all, which is why a literal was "
+            "there in the first place")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

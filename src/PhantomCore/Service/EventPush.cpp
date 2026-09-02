@@ -176,10 +176,10 @@ BuildHeadlineStateChanged(std::string_view state)
 }
 
 std::vector<std::uint8_t>
-BuildScanProgressEvent(std::uint64_t scanId,
-                       int           percent,
-                       std::uint64_t itemsScanned,
-                       std::uint64_t threatsFound)
+BuildScanProgressEvent(std::string_view scanId,
+                       int              percent,
+                       std::uint64_t    itemsScanned,
+                       std::uint64_t    threatsFound)
 {
     // Clamp percent to [0, 100].
     const int clampedPct = std::clamp(percent, 0, 100);
@@ -196,8 +196,13 @@ BuildScanProgressEvent(std::uint64_t scanId,
         return static_cast<std::int64_t>(v <= kI64Max ? v : kI64Max);
     };
 
+    if (scanId.empty()) {
+        SS_LOG_WARN(kLog, L"BuildScanProgressEvent: empty scanId; the receiver "
+                          L"keys its progress polling on this value.");
+    }
+
     nlohmann::json payload = {
-        { "scanId",       safeI64(scanId)       },
+        { "scanId",       std::string(scanId)   },
         { "percent",      clampedPct            },
         { "itemsScanned", safeI64(itemsScanned) },
         { "threatsFound", safeI64(threatsFound) }
