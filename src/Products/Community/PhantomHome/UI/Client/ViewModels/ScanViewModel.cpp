@@ -55,6 +55,10 @@ struct ScanViewModel::Impl {
 
     std::uint64_t subScanProgress{0};
 
+    /// Targets requested while a scan was already active.  Drained when the
+    /// active scan reaches Completed or Failed; cleared by an explicit cancel.
+    QStringList pendingPaths;
+
     void startPollTimer(int intervalMs)
     {
         if (!pollTimer) return;
@@ -155,9 +159,18 @@ void ScanViewModel::applyProgressUpdate(const QJsonObject& ev)
         case Completed:
             m_impl->stopPollTimer();
             emit scanCompleted(m_impl->scanId, m_impl->threatsFound);
+            // Queued targets start on the NEXT event-loop turn, not here.
+            // doStartScan rewrites the very state this switch is reacting to
+            // and emits from it, so starting inline would re-enter this
+            // transition while it is still in progress.
+            QTimer::singleShot(0, this, &ScanViewModel::drainPendingCustomScan);
             break;
         case Failed:
-            [[fallthrough]];
+            // A failed scan does not cancel a DIFFERENT request that arrived
+            // while it was running, so the queue is drained here as well.
+            m_impl->stopPollTimer();
+            QTimer::singleShot(0, this, &ScanViewModel::drainPendingCustomScan);
+            break;
         case Idle:
             m_impl->stopPollTimer();
             break;
@@ -241,12 +254,48 @@ void ScanViewModel::startFullScan()
 
 void ScanViewModel::startCustomScan(const QStringList& paths)
 {
+    // Filter blanks HERE rather than at the wire.  The service rejects the
+    // whole request when "paths" is empty, so one stray blank from a caller
+    // would fail an entire selection instead of the single unusable item.
+    QStringList targets;
+    for (const QString& p : paths) {
+        const QString trimmed = p.trimmed();
+        if (!trimmed.isEmpty() && !targets.contains(trimmed))
+            targets.append(trimmed);
+    }
+    if (targets.isEmpty())
+        return;
+
+    // A scan is already in flight.  QUEUE, never discard - see the header.
+    if (m_impl->state == Running || m_impl->state == Preparing) {
+        for (const QString& t : targets) {
+            if (!m_impl->pendingPaths.contains(t))
+                m_impl->pendingPaths.append(t);
+        }
+        return;
+    }
+
     QJsonArray arr;
-    for (const QString& p : paths)
+    for (const QString& p : targets)
         arr.append(p);
     doStartScan(QJsonObject{
         {QLatin1String("scope"), QLatin1String("custom")},
         {QLatin1String("paths"), arr}});
+}
+
+void ScanViewModel::drainPendingCustomScan()
+{
+    if (m_impl->pendingPaths.isEmpty())
+        return;
+    if (m_impl->state == Running || m_impl->state == Preparing)
+        return;
+
+    // Detach the list BEFORE starting.  startCustomScan re-enters this object
+    // and, if the queue were still populated, would observe its own targets as
+    // pending and append them a second time.
+    QStringList next;
+    next.swap(m_impl->pendingPaths);
+    startCustomScan(next);
 }
 
 void ScanViewModel::pause()
@@ -277,6 +326,11 @@ void ScanViewModel::cancel()
         || m_impl->state == Completed
         || m_impl->state == Failed)
         return;
+
+    // "Stop scanning" includes whatever is queued behind the active scan.
+    // Draining after an explicit cancel would restart work the user just
+    // asked to stop.
+    m_impl->pendingPaths.clear();
 
     (void)PipeClient::Instance().SendAndExpect(
         kStopScanV2,

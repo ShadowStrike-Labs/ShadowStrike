@@ -150,6 +150,11 @@ struct StartupArgs {
     bool    pauseProtection   = false;
     bool    resumeProtection  = false;
     bool    checkForUpdates   = false;
+
+    /// Explicit scan targets collected from every --scan-path occurrence, in
+    /// command-line order.  Non-empty means the user named a specific target
+    /// (the Explorer verb), which is a more specific request than a scope flag.
+    QStringList scanPaths;
 };
 
 // ---------------------------------------------------------------------------
@@ -184,6 +189,28 @@ struct StartupArgs {
             args.minimized = true;
         } else if (arg == L"--from-tray") {
             args.fromTray = true;
+        } else if (arg.starts_with(
+                       ShadowStrike::PhantomHome::UI::TrayArgs::kScanPathPrefix)) {
+            // Prefix, not equality - see the note in TrayUiArgs.hpp.
+            std::wstring_view value = arg.substr(std::wcslen(
+                ShadowStrike::PhantomHome::UI::TrayArgs::kScanPathPrefix));
+
+            // The shell verb wraps %1 in quotes so targets containing spaces
+            // survive.  CommandLineToArgvW normally consumes those quotes, but a
+            // target whose text ends in a backslash makes the closing quote look
+            // escaped and one can survive into this value.  Strip it rather than
+            // hand the scanner a path that cannot exist: that path would be
+            // reported as "not found" and read as a scan that ran and found
+            // nothing, which is the worst of the available outcomes.
+            while (!value.empty() && (value.front() == L'"' || value.front() == L' '))
+                value.remove_prefix(1);
+            while (!value.empty() && (value.back() == L'"' || value.back() == L' '))
+                value.remove_suffix(1);
+
+            if (!value.empty()) {
+                args.scanPaths.append(QString::fromWCharArray(
+                    value.data(), static_cast<qsizetype>(value.size())));
+            }
         }
     }
 
@@ -445,11 +472,14 @@ int main(int argc, char* argv[])
     const StartupArgs startArgs = ParseArgs();
 
     SS_LOG_INFO(L"PhantomHome.Main",
-                L"Startup args: minimized=%d fromTray=%d route=%ls quickScan=%d",
+                L"Startup args: minimized=%d fromTray=%d route=%ls quickScan=%d "
+                L"fullScan=%d scanPaths=%d",
                 startArgs.minimized,
                 startArgs.fromTray,
                 startArgs.initialRoute.toStdWString().c_str(),
-                startArgs.quickScan);
+                startArgs.quickScan,
+                startArgs.fullScan,
+                static_cast<int>(startArgs.scanPaths.size()));
 
     // ── Step 6: Localisation ───────────────────────────────────────────────
     const QString effectiveLocale = Translator::LoadFromConfigOrSystem();
@@ -632,7 +662,22 @@ int main(int argc, char* argv[])
             navigateToRoute(QStringLiteral("settings"));
         }
 
-        if (args.quickScan) {
+        // PRECEDENCE IS DELIBERATE: an explicit target beats a scope flag.
+        // --scan-path names exactly what the user right-clicked, which is more
+        // specific than "quick" or "full", and the three are mutually exclusive
+        // in practice because doStartScan refuses to start while another scan is
+        // active.  Without a stated order, which request won would depend on the
+        // order the arguments happened to appear in.
+        if (!args.scanPaths.isEmpty()) {
+            SS_LOG_INFO(L"PhantomHome.Main",
+                        L"Explorer scan request: %d target(s), first=%ls",
+                        static_cast<int>(args.scanPaths.size()),
+                        args.scanPaths.front().toStdWString().c_str());
+            QMetaObject::invokeMethod(&scanViewModel,
+                                      "startCustomScan",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QStringList, args.scanPaths));
+        } else if (args.quickScan) {
             QMetaObject::invokeMethod(&scanViewModel,
                                       "startFastScan",
                                       Qt::QueuedConnection);

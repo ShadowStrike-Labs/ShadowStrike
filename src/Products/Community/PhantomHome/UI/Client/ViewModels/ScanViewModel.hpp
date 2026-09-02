@@ -73,6 +73,19 @@ public:
 
     Q_INVOKABLE void startFastScan();
     Q_INVOKABLE void startFullScan();
+    /**
+     * @brief Scan an explicit set of files and/or directories.
+     *
+     * Reached from the Scan page custom-path field and from the Explorer
+     * "Scan with ShadowStrike" verb via the scan-path argument declared in
+     * TrayUiArgs.hpp.  Directories are walked recursively by the service.
+     *
+     * IF A SCAN IS ALREADY ACTIVE the targets are QUEUED and started when it
+     * finishes, rather than discarded.  doStartScan returns early while another
+     * scan runs, so without the queue a second request would be accepted and
+     * produce nothing.  That is not an edge case: Explorer invokes a verb ONCE
+     * PER SELECTED ITEM, so it is the normal multi-selection path.
+     */
     Q_INVOKABLE void startCustomScan(const QStringList& paths);
 
     /**
@@ -110,6 +123,11 @@ private:
     void doStartScan(const QJsonObject& payload);
     void applyProgressUpdate(const QJsonObject& ev);
     void pollProgress();
+
+    /// Starts a scan for targets queued while an earlier scan was running.
+    /// Invoked on the next event-loop turn after a scan reaches Completed or
+    /// Failed, never inline from the state transition that observed it.
+    void drainPendingCustomScan();
 };
 
 } // namespace ShadowStrike::PhantomHome::UI::ViewModels

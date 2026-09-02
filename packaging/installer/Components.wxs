@@ -343,5 +343,87 @@
                      KeyPath="yes"/>
     </Component>
 
+    <!-- ==================================================================
+         EXPLORER SHELL INTEGRATION  "Scan with ShadowStrike"
+
+         WHY THIS COMPONENT EXISTS.  Every scan the product could perform on
+         demand was reachable only by typing or pasting a path into a text
+         field on the Scan page.  The engine, the service handler and the
+         wire command for a custom scan were all present and correct; the
+         only missing link was a way for the shell to hand us a target.
+
+         The verb launches the UI rather than the service on purpose: a scan
+         the user asked for by hand needs somewhere to show progress and a
+         result, and the UI already owns that view.  A second invocation
+         while the UI is open is forwarded to the running instance by the
+         single-instance activation pipe, so no extra process survives.
+
+         TWO ROOTS, DELIBERATELY.  "*" matches files of every type, which is
+         what makes archives, executables, documents and extensionless files
+         all work from one registration instead of an extension list that
+         would need maintaining.  "Directory" covers folders.
+
+         DRIVE IS DELIBERATELY NOT REGISTERED.  A drive root substitutes as
+         "C:\" and the trailing separator makes the closing quote of the
+         quoted argument look escaped, so the target would arrive corrupted.
+         The parser strips a stray quote defensively, but registering a root
+         whose value is known to be malformed would be relying on that.
+
+         ON WINDOWS 11 a classic verb appears under "Show more options"
+         rather than in the compact menu.  Reaching the compact menu needs
+         an IExplorerCommand handler with package identity, which is a
+         separate piece of work and a separate binary.
+
+         Component GUID is permanent.  The first registry value is the
+         KeyPath, so removing the component removes the entry, and the two
+         RemoveRegistryKey rows below take the verb keys with it.  Leaving a
+         command behind that names a deleted executable would give the user
+         a menu entry that fails forever.
+    ================================================================== -->
+    <Component Id="CmpShellIntegration"
+               Directory="INSTALLFOLDER"
+               Guid="{CAEBE005-EF68-42D7-8E66-F02DD5A28320}"
+               Bitness="always64">
+
+      <!-- Files of every type, including archives. -->
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Classes\*\shell\ShadowStrikeScan"
+                     Value="Scan with ShadowStrike"
+                     Type="string"
+                     KeyPath="yes"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Classes\*\shell\ShadowStrikeScan"
+                     Name="Icon"
+                     Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomUI.exe&quot;,0"
+                     Type="string"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Classes\*\shell\ShadowStrikeScan\command"
+                     Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomUI.exe&quot; --scan-path=&quot;%1&quot;"
+                     Type="string"/>
+
+      <!-- Filesystem folders. -->
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Classes\Directory\shell\ShadowStrikeScan"
+                     Value="Scan with ShadowStrike"
+                     Type="string"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Classes\Directory\shell\ShadowStrikeScan"
+                     Name="Icon"
+                     Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomUI.exe&quot;,0"
+                     Type="string"/>
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\Classes\Directory\shell\ShadowStrikeScan\command"
+                     Value="&quot;[INSTALLFOLDER]ShadowStrikePhantomUI.exe&quot; --scan-path=&quot;%1&quot;"
+                     Type="string"/>
+
+      <!-- Take the verb keys themselves, not just their values. -->
+      <RemoveRegistryKey Root="HKLM"
+                         Key="SOFTWARE\Classes\*\shell\ShadowStrikeScan"
+                         Action="removeOnUninstall"/>
+      <RemoveRegistryKey Root="HKLM"
+                         Key="SOFTWARE\Classes\Directory\shell\ShadowStrikeScan"
+                         Action="removeOnUninstall"/>
+    </Component>
+
   </Fragment>
 </Wix>

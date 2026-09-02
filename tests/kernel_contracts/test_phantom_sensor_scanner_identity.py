@@ -51,6 +51,21 @@ FILE_PROTECTION_HPP_PATH = ROOT / "src" / "PhantomCore" / "SelfProtection" / "Fi
 # loudly - OpenServiceW returns ERROR_SERVICE_DOES_NOT_EXIST and the caller reports
 # "not found", which is why ServiceManager watched a nonexistent service undetected.
 INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
+INSTALLER_PRODUCT_WXS_PATH = ROOT / "packaging/installer/Product.wxs"
+TRAY_UI_ARGS_HPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/UI/Shared/TrayUiArgs.hpp"
+)
+UI_CLIENT_MAIN_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/UI/Client/main.cpp"
+)
+SCAN_VIEW_MODEL_HPP_PATH = (
+    ROOT
+    / "src/Products/Community/PhantomHome/UI/Client/ViewModels/ScanViewModel.hpp"
+)
+SCAN_VIEW_MODEL_CPP_PATH = (
+    ROOT
+    / "src/Products/Community/PhantomHome/UI/Client/ViewModels/ScanViewModel.cpp"
+)
 SELF_DEFENSE_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.hpp"
 ANTIVIRUS_SERVICE_HPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.hpp"
 ANTIVIRUS_SERVICE_CPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.cpp"
@@ -15150,6 +15165,271 @@ class PreCreateCallbackLatencyContractTests(unittest.TestCase):
         self.assertEqual(
             self.rtp.count("ds.PcTotalCallbackTimeUs / ds.PcOperationsScanned"), 0,
             "dividing callback time by scans overstates the per-create cost")
+
+
+class ExplorerScanVerbContractTests(unittest.TestCase):
+    """A user must be able to scan a file from Explorer, and the entry must not
+    be able to become silently inert.
+
+    MEASURED BEFORE THIS GUARD EXISTED. Every link of the on-demand custom scan
+    was already present and correct - ScanEngine::CustomScan walks both files and
+    directories, HomeIpcDispatcher registers a handler for scope "custom" that
+    validates the path list, and ScanViewModel::startCustomScan sends it over the
+    v2 StartScan command. The ONLY missing link was a way for the shell to hand
+    us a target, so the sole route to an on-demand scan of one file was typing
+    its path into a text field on the Scan page.
+
+    THREE WAYS THIS FEATURE CAN DIE SILENTLY, one assertion each:
+      1. The registry keys are authored but the component is never referenced by
+         a Feature, so nothing installs. Nothing in a build can notice.
+      2. The two sides spell the argument differently. Explorer then launches the
+         UI, the UI ignores an argument it does not recognise, and a window opens
+         with no scan - indistinguishable from a slow scan.
+      3. The argument is compared with == instead of a prefix test. It carries a
+         value, so equality never matches and the menu entry is inert.
+    """
+
+    WIX = "{http://wixtoolset.org/schemas/v4/wxs}"
+    FILES_KEY = r"SOFTWARE\Classes\*\shell\ShadowStrikeScan"
+    DIRS_KEY = r"SOFTWARE\Classes\Directory\shell\ShadowStrikeScan"
+
+    @classmethod
+    def setUpClass(cls):
+        import xml.etree.ElementTree as ET
+
+        # strip_c_comments FIRST: the change deliberately documents itself at
+        # every site, so its own prose names kScanPathPrefix, startCustomScan,
+        # pendingPaths and doStartScan. A comment-blind assertion here would be
+        # satisfied by the explanation instead of by the code.
+        cls.args_h = strip_c_comments(read_source(TRAY_UI_ARGS_HPP_PATH))
+        cls.ui_main = strip_c_comments(read_source(UI_CLIENT_MAIN_CPP_PATH))
+        cls.svm_h = strip_c_comments(read_source(SCAN_VIEW_MODEL_HPP_PATH))
+        cls.svm_c = strip_c_comments(read_source(SCAN_VIEW_MODEL_CPP_PATH))
+        cls.product = read_source(INSTALLER_PRODUCT_WXS_PATH)
+
+        # DERIVE the argument from its declaration instead of restating it here.
+        # A literal copied into this file could agree with neither side while
+        # every assertion still passed.
+        m = re.search(r'kScanPathPrefix\[\]\s*=\s*L"([^"]+)"', cls.args_h)
+        cls.prefix = m.group(1) if m else None
+
+        root = ET.parse(str(INSTALLER_COMPONENTS_WXS_PATH)).getroot()
+        cls.component = None
+        for comp in root.iter(cls.WIX + "Component"):
+            if comp.get("Id") == "CmpShellIntegration":
+                cls.component = comp
+        cls.values = {}
+        cls.removed = []
+        cls.keypaths = 0
+        if cls.component is not None:
+            for rv in cls.component.iter(cls.WIX + "RegistryValue"):
+                cls.values[(rv.get("Key"), rv.get("Name"))] = rv.get("Value")
+                if (rv.get("KeyPath") or "").lower() == "yes":
+                    cls.keypaths += 1
+            cls.removed = [
+                rk.get("Key") for rk in cls.component.iter(cls.WIX + "RemoveRegistryKey")
+            ]
+
+        # applyStartupAction is a lambda, so extract_c_function cannot slice it.
+        cls.apply_body = cls._slice_lambda(
+            cls.ui_main, "auto applyStartupAction = [&](const StartupArgs& args) {"
+        )
+
+    @staticmethod
+    def _slice_lambda(source, intro):
+        start = source.find(intro)
+        if start < 0:
+            return ""
+        brace = source.find("{", start + len(intro) - 1)
+        end = _matching_delimiter(source, brace, "{", "}")
+        return source[start:end + 1]
+
+    # -- the argument contract ------------------------------------------------
+
+    def test_the_scan_path_argument_is_declared_as_a_value_carrying_prefix(self):
+        self.assertIsNotNone(
+            self.prefix,
+            "kScanPathPrefix is not declared in TrayUiArgs.hpp, so the Explorer "
+            "verb has no argument to pass a target in")
+        self.assertTrue(
+            self.prefix.endswith("="),
+            "the scan-path argument must end in '=' because the target follows "
+            "it; got %r" % self.prefix)
+        self.assertGreaterEqual(
+            len(self.prefix), 8,
+            "derived prefix %r is too short to be the real argument - the regex "
+            "is matching something else" % self.prefix)
+
+    def test_the_ui_matches_the_argument_by_prefix_and_never_by_equality(self):
+        body = extract_c_function(self.ui_main, "ParseArgsFromArgv")
+        self.assertEqual(
+            body.count("starts_with("), 1,
+            "ParseArgsFromArgv must test the scan-path argument as a PREFIX; a "
+            "value-carrying argument compared with == never matches and the "
+            "Explorer entry becomes inert")
+        self.assertIn(
+            "kScanPathPrefix", body,
+            "ParseArgsFromArgv no longer references the shared argument constant")
+        self.assertEqual(
+            body.count("arg == ShadowStrike::PhantomHome::UI::TrayArgs::kScanPathPrefix"),
+            0,
+            "the scan-path argument is compared with == somewhere in "
+            "ParseArgsFromArgv, which can never match")
+        self.assertEqual(
+            body.count("args.scanPaths.append("), 1,
+            "every occurrence of the argument must contribute a target; a single "
+            "assignment would keep only one of a multi-item selection")
+        for token in ("remove_prefix(1)", "remove_suffix(1)"):
+            self.assertEqual(
+                body.count(token), 1,
+                "the defensive quote strip (%s) is gone. The shell verb quotes "
+                "its target, and a target whose text ends in a separator leaves "
+                "a quote in the value; without this the scanner is handed a path "
+                "that cannot exist and reports it as simply not found" % token)
+
+    def test_an_explicit_target_outranks_a_scope_flag(self):
+        self.assertTrue(
+            self.apply_body,
+            "applyStartupAction could not be located, so the dispatch order "
+            "cannot be checked")
+        i_path = self.apply_body.find("args.scanPaths.isEmpty()")
+        i_quick = self.apply_body.find("args.quickScan")
+        self.assertNotEqual(
+            i_path, -1,
+            "applyStartupAction never consults args.scanPaths, so a target "
+            "delivered by Explorer is parsed and then dropped")
+        self.assertNotEqual(i_quick, -1, "the quick-scan branch has disappeared")
+        self.assertLess(
+            i_path, i_quick,
+            "ORDER IS THE INVARIANT: the explicit-target branch must be tested "
+            "before the scope flags, or which request wins depends on the order "
+            "the arguments happened to arrive in (offsets %d vs %d)"
+            % (i_path, i_quick))
+        self.assertEqual(
+            self.apply_body.count('"startCustomScan"'), 1,
+            "the explicit-target branch must invoke startCustomScan")
+        self.assertEqual(
+            self.apply_body.count("Q_ARG(QStringList, args.scanPaths)"), 1,
+            "the whole target list must be passed; a queued invocation with no "
+            "argument would start an empty custom scan, which the service "
+            "rejects as a missing field")
+        # Regression guard: adding the path route must not displace the tray's
+        # existing two entry points.
+        for kept in ('"startFastScan"', '"startFullScan"'):
+            self.assertEqual(
+                self.apply_body.count(kept), 1,
+                "%s is no longer dispatched, so a tray scan request is now "
+                "ignored" % kept)
+
+    # -- the installer contract ----------------------------------------------
+
+    def test_the_installer_registers_the_verb_for_files_and_for_folders(self):
+        self.assertIsNotNone(
+            self.component,
+            "component CmpShellIntegration is absent from Components.wxs, so no "
+            "Explorer entry is registered at all")
+        for key, label in ((self.FILES_KEY, "files of every type"),
+                           (self.DIRS_KEY, "filesystem folders")):
+            self.assertIn(
+                (key, None), self.values,
+                "no display text registered for %s (key %s)" % (label, key))
+            self.assertEqual(
+                self.values[(key, None)], "Scan with ShadowStrike",
+                "the menu text for %s changed; the user-visible string is part "
+                "of this contract" % label)
+            cmd_key = key + r"\command"
+            self.assertIn(
+                (cmd_key, None), self.values,
+                "no command registered for %s, so the entry would appear and do "
+                "nothing" % label)
+            self.assertIn(
+                "ShadowStrikePhantomUI.exe", self.values[(cmd_key, None)],
+                "the command for %s does not launch the UI, which is the only "
+                "process that can show scan progress" % label)
+        self.assertEqual(
+            self.keypaths, 1,
+            "a registry-only component needs exactly one KeyPath value or MSI "
+            "cannot track and remove it; found %d" % self.keypaths)
+        for key in (self.FILES_KEY, self.DIRS_KEY):
+            self.assertIn(
+                key, self.removed,
+                "%s is not removed on uninstall; a command naming a deleted "
+                "executable leaves the user a menu entry that fails forever"
+                % key)
+
+    def test_every_registered_verb_passes_its_target_quoted(self):
+        cmds = [(k, v) for (k, n), v in self.values.items()
+                if k.endswith(r"\command") and n is None]
+        self.assertGreaterEqual(
+            len(cmds), 2,
+            "expected a command for at least the file and folder roots, found %d"
+            % len(cmds))
+        quoted = self.prefix + '"%1"'
+        for key, value in cmds:
+            self.assertIn(
+                quoted, value,
+                "the command for %s must pass its target as %s. Unquoted, every "
+                "path containing a space arrives split across arguments and the "
+                "scan silently targets the first fragment" % (key, quoted))
+
+    def test_the_shell_component_is_referenced_so_it_is_actually_installed(self):
+        ref = '<ComponentRef Id="CmpShellIntegration"/>'
+        self.assertEqual(
+            self.product.count(ref), 1,
+            "CmpShellIntegration is not referenced exactly once in Product.wxs. "
+            "An unreferenced component is authored, ships in no Feature, and "
+            "installs nothing - and no build step can detect that")
+        i_ref = self.product.find(ref)
+        i_main = self.product.find('<Feature Id="FeatureMain"')
+        i_next = self.product.find('<Feature Id="FeatureDesktopShortcut"')
+        self.assertNotEqual(i_main, -1, "FeatureMain is gone from Product.wxs")
+        self.assertNotEqual(i_next, -1, "FeatureDesktopShortcut is gone")
+        self.assertTrue(
+            i_main < i_ref < i_next,
+            "the reference must sit inside FeatureMain, which installs by "
+            "default; in the optional desktop-shortcut feature it would be off "
+            "unless the user opted in (offsets main=%d ref=%d next=%d)"
+            % (i_main, i_ref, i_next))
+
+    # -- not losing a request ------------------------------------------------
+
+    def test_a_target_arriving_during_a_scan_is_queued_not_discarded(self):
+        # Anti-vacuity: this is only worth guarding while doStartScan still
+        # refuses to start concurrently. If that early return goes, the queue
+        # becomes dead code and this test must be revisited rather than passing
+        # for the wrong reason.
+        start_body = extract_c_function(self.svm_c, "ScanViewModel::doStartScan")
+        self.assertEqual(
+            start_body.count("if (m_impl->state == Running || m_impl->state == Preparing) return;"),
+            1,
+            "doStartScan no longer refuses to start while a scan is active, so "
+            "the premise of the pending queue has changed")
+
+        custom = extract_c_function(self.svm_c, "ScanViewModel::startCustomScan")
+        self.assertEqual(
+            custom.count("m_impl->pendingPaths.append(t)"), 1,
+            "startCustomScan must QUEUE a target that arrives during a scan. "
+            "Explorer invokes a verb once per selected item, so discarding is "
+            "the normal multi-selection path, not an edge case")
+        self.assertEqual(
+            self.svm_c.count("void ScanViewModel::drainPendingCustomScan()"), 1,
+            "the drain that starts queued targets is gone, so anything queued "
+            "would never run")
+        self.assertEqual(
+            self.svm_c.count(
+                "QTimer::singleShot(0, this, &ScanViewModel::drainPendingCustomScan);"),
+            2,
+            "the queue must be drained from BOTH the Completed and the Failed "
+            "transition; a failed scan does not cancel a different request that "
+            "arrived while it ran")
+        cancel = extract_c_function(self.svm_c, "ScanViewModel::cancel")
+        self.assertEqual(
+            cancel.count("m_impl->pendingPaths.clear()"), 1,
+            "an explicit cancel must clear the queue, or stopping a scan would "
+            "immediately start the work the user just stopped")
+        self.assertEqual(
+            self.svm_h.count("void drainPendingCustomScan();"), 1,
+            "the drain is not declared, so the definition is unreachable")
 
 
 if __name__ == "__main__":

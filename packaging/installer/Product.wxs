@@ -213,6 +213,14 @@
       <!-- Start Menu shortcut for the UI. -->
       <ComponentRef Id="CmpStartMenuShortcut"/>
 
+      <!--
+        Explorer context menu verb for files and folders.  Without this
+        reference the component is authored but never installed, and the
+        product ships with no way to scan a file on demand except by typing
+        its path into the Scan page.
+      -->
+      <ComponentRef Id="CmpShellIntegration"/>
+
       <!-- ProgramData directories with correct ACLs. -->
       <ComponentRef Id="CmpProgramDataLogs"/>
       <ComponentRef Id="CmpProgramDataQuarantine"/>
