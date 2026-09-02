@@ -7150,6 +7150,42 @@ public:
                           pool.queuedTasks, pool.queueCapacity)
             : std::string("pool=unavailable");
 
+        // Kernel-side PreCreate counters.
+        //
+        // Queried here because this periodic line is the one place driver state
+        // reaches a field log. IRP_MJ_CREATE is the highest-volume callback the
+        // product owns, and its counters were previously readable only with a
+        // kernel debugger - which meant every question about in-kernel cost had
+        // to be answered by inference from user-mode timings. One round trip per
+        // sample interval, on the stats thread, never on a scan path.
+        //
+        // Reported as unavailable rather than as zeroes when the channel is down:
+        // a zeroed block reads as a driver doing nothing, which is the opposite
+        // of what an absent answer means.
+        std::string kernelPart = "kernelPreCreate=unavailable";
+        {
+            SHADOWSTRIKE_DRIVER_STATUS ds{};
+            if (Communication::IPCManager::Instance().QueryDriverStatus(ds)) {
+                const long long avgScanMs =
+                    ds.PcOperationsScanned > 0
+                        ? ds.PcTotalScanTimeMs / ds.PcOperationsScanned
+                        : 0;
+                kernelPart = std::format(
+                    "kernelPreCreate: total={} scanned={} blocked={} excluded={} "
+                    "cached={} timeouts={} errors={} selfProt={} catalogExempt={} "
+                    "honeypot={} ads={} dblExt={} suspPath={} ransomCorr={} "
+                    "exe={} script={} doc={} archive={} avgScanMs={} maxScanMs={}",
+                    ds.PcTotalOperations, ds.PcOperationsScanned,
+                    ds.PcOperationsBlocked, ds.PcOperationsExcluded,
+                    ds.PcOperationsCached, ds.PcScanTimeouts, ds.PcScanErrors,
+                    ds.PcSelfProtectBlocks, ds.PcCatalogStoreExemptions,
+                    ds.PcHoneypotDetections, ds.PcAdsDetections,
+                    ds.PcDoubleExtDetections, ds.PcSuspiciousPathDetections,
+                    ds.PcRansomwareCorrelations, ds.PcExecutablesScanned,
+                    ds.PcScriptsScanned, ds.PcDocumentsScanned,
+                    ds.PcArchivesScanned, avgScanMs, ds.PcMaxScanTimeMs);
+            }
+        }
         const auto line = std::format(
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
@@ -7159,12 +7195,14 @@ public:
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
-            "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={}",
+            "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={} "
+            "| {}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, ownBinWithheld, ownHandleOps, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc);
+            exitBlockIgn, ownBinWithheld, ownHandleOps, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
+            kernelPart);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is

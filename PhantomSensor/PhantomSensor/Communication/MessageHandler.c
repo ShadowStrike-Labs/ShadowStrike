@@ -87,6 +87,7 @@
 #include "ScanBridge.h"
 #include "TelemetryBuffer.h"
 #include "../Context/InstanceContext.h"
+#include "../Callbacks/FileSystem/PreCreate.h"
 #include "../ETW/ETWProvider.h"
 #include "../ETW/EventSchema.h"
 #include "../ETW/ManifestGenerator.h"
@@ -2060,6 +2061,24 @@ MhpHandleDriverStatusQuery(
             }
         }
     }
+
+    //
+    // PreCreate callback statistics.
+    //
+    // NOTE FOR WHOEVER READS THIS NEXT: this handler is registered for
+    // FilterMessageType_QueryDriverStatus but is currently UNREACHABLE for that
+    // type. ShadowStrikeMessageNotify in CommPort.c switches on the message type
+    // and answers QueryDriverStatus itself, breaking before it reaches the
+    // MessageHandler dispatch in its default arm. So every block above - the
+    // compression, queue, ScanBridge, telemetry, ETW, exclusion, hollowing,
+    // injection and memory statistics - is assembled here and never delivered.
+    // That is filed as its own defect and is NOT fixed here.
+    //
+    // The Pc block is filled anyway, through the same shared projection the live
+    // handler uses, precisely so that whenever the shadowing is resolved this
+    // path does not start returning a silently zeroed block.
+    //
+    ShadowStrikePcFillDriverStatus(&driverStatus);
 
     //
     // Copy to output buffer (already validated as kernel memory by caller)

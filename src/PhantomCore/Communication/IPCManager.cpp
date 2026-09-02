@@ -1084,6 +1084,84 @@ bool IPCManager::SendToKernel(
     return false;
 }
 
+bool IPCManager::QueryDriverStatus(SHADOWSTRIKE_DRIVER_STATUS& outStatus) noexcept {
+    //
+    // The driver answers this on two different code paths that produce two
+    // DIFFERENT reply shapes, and that divergence is filed as its own defect:
+    //
+    //   CommPort.c        ShadowStrikeHandleQueryDriverStatus -> [header][status]
+    //   MessageHandler.c  MhpHandleDriverStatusQuery          -> [status]
+    //
+    // The CommPort one is the live path. ShadowStrikeMessageNotify switches on
+    // the message type, answers QueryDriverStatus there and breaks before it
+    // reaches the MessageHandler dispatch in its default arm, so the framed
+    // shape is the one to parse. Requiring the header rather than guessing at
+    // the layout means that if the shadowing is ever resolved this function
+    // fails loudly instead of quietly reading the first 40 bytes of a status
+    // block as a header and returning plausible nonsense.
+    //
+    SHADOWSTRIKE_MESSAGE_HEADER query{};
+    query.Magic       = SHADOWSTRIKE_MESSAGE_MAGIC;
+    query.Version     = SHADOWSTRIKE_PROTOCOL_VERSION;
+    query.MessageType = static_cast<UINT16>(FilterMessageType_QueryDriverStatus);
+    query.TotalSize   = sizeof(query);
+    query.DataSize    = 0;
+
+    constexpr size_t kHeaderSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+    constexpr size_t kStatusSize = sizeof(SHADOWSTRIKE_DRIVER_STATUS);
+
+    std::array<uint8_t, kHeaderSize + kStatusSize> replyBuffer{};
+    size_t replySize = replyBuffer.size();
+
+    if (!SendToKernel(&query, sizeof(query), replyBuffer.data(), &replySize,
+                      IPCConstants::REPLY_TIMEOUT_MS)) {
+        return false;
+    }
+
+    //
+    // VALIDATED BY CONTENT, NOT BY LENGTH, and that is deliberate: SendToKernel
+    // never writes the number of bytes actually returned back through its
+    // replySize parameter, so a caller comparing that value against its own
+    // buffer size is comparing a number to itself. That is filed separately;
+    // here the reply is judged on what it says about itself.
+    //
+    const auto* replyHeader =
+        reinterpret_cast<const SHADOWSTRIKE_MESSAGE_HEADER*>(replyBuffer.data());
+
+    if (replyHeader->Magic != SHADOWSTRIKE_MESSAGE_MAGIC) {
+        Utils::Logger::Warn("[IPCManager] Driver status reply carried magic {:#010x}, "
+                            "expected {:#010x} - reply not accepted",
+                            replyHeader->Magic,
+                            static_cast<uint32_t>(SHADOWSTRIKE_MESSAGE_MAGIC));
+        return false;
+    }
+
+    if (replyHeader->MessageType !=
+        static_cast<UINT16>(FilterMessageType_QueryDriverStatus)) {
+        Utils::Logger::Warn("[IPCManager] Driver status reply carried message type {}, "
+                            "expected {} - reply not accepted",
+                            static_cast<unsigned>(replyHeader->MessageType),
+                            static_cast<unsigned>(FilterMessageType_QueryDriverStatus));
+        return false;
+    }
+
+    //
+    // An exact size match is required rather than a minimum. A short block means
+    // the driver and this build disagree about the structure, and copying the
+    // prefix would silently leave zeroes for every field past the divergence -
+    // indistinguishable from a genuinely idle subsystem.
+    //
+    if (replyHeader->DataSize != kStatusSize) {
+        Utils::Logger::Warn("[IPCManager] Driver status reply declared {} payload byte(s), "
+                            "this build expects {} - structure mismatch, not accepted",
+                            static_cast<size_t>(replyHeader->DataSize), kStatusSize);
+        return false;
+    }
+
+    std::memcpy(&outStatus, replyBuffer.data() + kHeaderSize, kStatusSize);
+    return true;
+}
+
 // ============================================================================
 // NAMED PIPE OPERATIONS
 // ============================================================================

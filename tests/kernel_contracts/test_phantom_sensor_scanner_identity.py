@@ -14629,5 +14629,211 @@ class ScannerReadShareModeContractTests(unittest.TestCase):
             "FileUtils.hpp should keep quoting the rationale it replaces, exactly once")
 
 
+class PreCreateCounterObservabilityContractTests(unittest.TestCase):
+    """The driver's PreCreate counters must remain observable from user mode.
+
+    IRP_MJ_CREATE is the highest-volume callback the product owns. Its counters
+    lived in PC_STATISTICS and were projected nowhere, so every question about
+    in-kernel cost had to be answered by inference from user-mode timings. This
+    class pins the whole path: the wire block, its layout, both driver handlers
+    that fill it, the accessor they must read through, and the user-mode query
+    plus the one periodic line that carries the numbers into a field log.
+
+    Every assertion below reads COMMENT-STRIPPED source. The change that created
+    this path documents itself by naming the very symbols asserted here, so a
+    comment-blind check would be satisfiable by prose alone.
+    """
+
+    PC_FIELDS = [
+        "PcTotalOperations", "PcOperationsScanned", "PcOperationsBlocked",
+        "PcOperationsExcluded", "PcOperationsCached", "PcScanTimeouts",
+        "PcScanErrors", "PcSelfProtectBlocks", "PcCatalogStoreExemptions",
+        "PcAdsDetections", "PcDoubleExtDetections", "PcHoneypotDetections",
+        "PcSuspiciousPathDetections", "PcRansomwareCorrelations",
+        "PcExecutablesScanned", "PcScriptsScanned", "PcDocumentsScanned",
+        "PcArchivesScanned", "PcTotalScanTimeMs", "PcMaxScanTimeMs",
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shared_raw = read_source(SHARED_DEFS_H_PATH)
+        cls.shared = strip_c_comments(cls.shared_raw)
+        cls.pc_c = strip_c_comments(read_source(PRE_CREATE_C_PATH))
+        cls.pc_h = strip_c_comments(read_source(PRE_CREATE_H_PATH))
+        cls.cp_c = strip_c_comments(read_source(COMM_PORT_C_PATH))
+        cls.mh_c = strip_c_comments(read_source(MESSAGE_HANDLER_C_PATH))
+        cls.ipc_c = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        cls.ipc_h = strip_c_comments(read_source(IPC_MANAGER_HPP_PATH))
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+    @staticmethod
+    def _body(src, name):
+        """Brace-matched body of the first definition of name (not a prototype)."""
+        idx = -1
+        pos = 0
+        while True:
+            pos = src.find(name, pos)
+            if pos < 0:
+                return None
+            close = src.find(")", pos)
+            brace = src.find("{", close) if close > 0 else -1
+            semi = src.find(";", close) if close > 0 else -1
+            if brace > 0 and (semi < 0 or brace < semi):
+                idx = pos
+                break
+            pos += len(name)
+        depth = 0
+        k = src.find("{", idx)
+        while k < len(src):
+            if src[k] == "{":
+                depth += 1
+            elif src[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[idx:k + 1]
+            k += 1
+        return None
+
+    def test_the_precreate_block_is_present_in_the_shared_wire_structure(self):
+        missing = [f for f in self.PC_FIELDS
+                   if not re.search(r"\bLONG64\s+" + f + r"\s*;", self.shared)]
+        self.assertEqual(
+            missing, [],
+            "SHADOWSTRIKE_DRIVER_STATUS lost PreCreate field(s): " + ", ".join(missing))
+
+    def test_the_precreate_block_layout_is_pinned_by_assertion(self):
+        # The block is APPENDED with no padding. This is the assertion that
+        # replaced a false one, so it is required by shape, not merely counted.
+        self.assertEqual(
+            self.shared.count(
+                "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, MsScannerReserved) + sizeof(ULONG)"),
+            1,
+            "the packing assertion that pins the PreCreate block as appended is gone")
+
+        # Nineteen consecutive-offset assertions, one per adjacent pair.
+        consecutive = 0
+        for a, z in zip(self.PC_FIELDS, self.PC_FIELDS[1:]):
+            needle = ("FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, " + z + ") ==")
+            tail = ("FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, " + a + ") + sizeof(LONG64))")
+            if needle in self.shared and tail in self.shared:
+                consecutive += 1
+        self.assertEqual(
+            consecutive, len(self.PC_FIELDS) - 1,
+            "expected %d consecutive-offset assertions over the PreCreate block, found %d"
+            % (len(self.PC_FIELDS) - 1, consecutive))
+
+        # Nothing may follow the block. PcMaxScanTimeMs is the LEFT operand of the
+        # last consecutive assertion and the right operand only here, so exactly
+        # one occurrence of this form is correct.
+        self.assertEqual(
+            self.shared.count(
+                "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxScanTimeMs) + sizeof(LONG64))"),
+            1,
+            "the no-tail assertion (sizeof == last field + 8) is missing or duplicated")
+        self.assertEqual(
+            self.shared.count("sizeof(SHADOWSTRIKE_DRIVER_STATUS) =="), 1,
+            "the total-size assertion over SHADOWSTRIKE_DRIVER_STATUS is missing")
+
+        # The structure is under #pragma pack(1); an 8-byte ALIGNMENT assertion
+        # over it is false and previously broke every translation unit.
+        self.assertEqual(
+            self.shared.count(
+                "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalOperations) % 8"),
+            0,
+            "an alignment assertion returned; this structure is byte-packed so that "
+            "assertion is false and fails 176 translation units")
+
+    def test_both_driver_status_handlers_fill_the_precreate_block(self):
+        # Two handlers exist for one message type. Whichever runs must deliver
+        # the block, so a future resolution of that shadowing cannot start
+        # returning a silently zeroed block.
+        for label, src in (("CommPort.c", self.cp_c), ("MessageHandler.c", self.mh_c)):
+            self.assertEqual(
+                src.count("ShadowStrikePcFillDriverStatus(&driverStatus)"), 1,
+                "%s must fill the PreCreate block exactly once" % label)
+            self.assertEqual(
+                src.count("Callbacks/FileSystem/PreCreate.h"), 1,
+                "%s must include PreCreate.h to reach the projection" % label)
+
+    def test_the_projection_reads_through_the_torn_free_accessor(self):
+        body = self._body(self.pc_c, "ShadowStrikePcFillDriverStatus")
+        self.assertIsNotNone(body, "ShadowStrikePcFillDriverStatus has no definition")
+        self.assertEqual(
+            body.count("PcGetStatistics(&snapshot)"), 1,
+            "the projection must read through PcGetStatistics, which takes StatsLock; "
+            "LONG64 reads are not atomic on x86")
+        self.assertEqual(
+            body.count("g_PcState.Stats"), 0,
+            "the projection reads g_PcState.Stats directly, reintroducing the torn "
+            "reads PcGetStatistics exists to prevent")
+        # Must be declared, or no other translation unit can call it.
+        self.assertEqual(
+            self.pc_h.count("ShadowStrikePcFillDriverStatus"), 1,
+            "the projection is not declared in PreCreate.h")
+
+    def test_the_live_handler_fills_before_it_copies_out(self):
+        body = self._body(self.cp_c, "ShadowStrikeHandleQueryDriverStatus")
+        self.assertIsNotNone(body, "ShadowStrikeHandleQueryDriverStatus has no definition")
+        fill = body.find("ShadowStrikePcFillDriverStatus")
+        copy = body.find("ProbeForWrite")
+        self.assertGreater(fill, 0, "the live handler does not fill the PreCreate block")
+        self.assertGreater(copy, 0, "the live handler no longer probes its output buffer")
+        self.assertLess(
+            fill, copy,
+            "the PreCreate block is filled AFTER the reply is copied out, so the "
+            "copy carries zeroes (fill at %d, copy at %d)" % (fill, copy))
+
+    def test_the_user_mode_query_validates_the_reply_by_content(self):
+        body = self._body(self.ipc_c, "IPCManager::QueryDriverStatus")
+        self.assertIsNotNone(body, "IPCManager::QueryDriverStatus has no definition")
+
+        for needle, why in (
+            ("replyHeader->Magic != SHADOWSTRIKE_MESSAGE_MAGIC",
+             "the reply magic is not checked"),
+            ("replyHeader->MessageType !=",
+             "the reply message type is not checked"),
+            ("replyHeader->DataSize != kStatusSize",
+             "the reply payload size is not checked for EXACT equality"),
+        ):
+            self.assertEqual(body.count(needle), 1, why)
+
+        # A minimum-size check would silently accept a short block and leave
+        # every field past the divergence reading zero.
+        self.assertEqual(
+            body.count("DataSize >= "), 0,
+            "the payload size is accepted as a MINIMUM; a short block would leave "
+            "later fields zeroed, which is indistinguishable from an idle subsystem")
+
+        # The copy must skip the framing header.
+        self.assertEqual(
+            body.count("replyBuffer.data() + kHeaderSize"), 1,
+            "the status block is copied from the start of the reply, which is the "
+            "framing header, not the payload")
+
+        self.assertEqual(
+            self.ipc_h.count("QueryDriverStatus(SHADOWSTRIKE_DRIVER_STATUS& outStatus)"), 1,
+            "QueryDriverStatus is not declared on IPCManager's public surface")
+
+    def test_the_counters_reach_the_periodic_capacity_line(self):
+        # This periodic line is the only place driver state reaches a field log.
+        self.assertEqual(
+            self.rtp.count("QueryDriverStatus(ds)"), 1,
+            "RealTimeProtection no longer queries the driver status")
+        self.assertGreaterEqual(
+            self.rtp.count("kernelPart"), 3,
+            "the kernel statistics string is built but not passed to the report")
+        self.assertEqual(
+            self.rtp.count("kernelPreCreate=unavailable"), 1,
+            "an unreachable driver must be reported as unavailable, never as zeroes")
+
+        # A representative subset must actually be formatted, so emptying the
+        # format string cannot satisfy this test.
+        for field in ("PcTotalOperations", "PcOperationsBlocked",
+                      "PcCatalogStoreExemptions", "PcScanTimeouts",
+                      "PcHoneypotDetections", "PcMaxScanTimeMs"):
+            self.assertEqual(
+                self.rtp.count("ds." + field), 1,
+                "the capacity line stopped publishing ds.%s" % field)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

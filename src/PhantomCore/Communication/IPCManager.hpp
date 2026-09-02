@@ -1046,6 +1046,29 @@ public:
     void CloseSharedMemory(const std::wstring& name);
 
     // ========================================================================
+    // DRIVER STATUS
+    // ========================================================================
+
+    /**
+     * @brief Read the kernel driver's own statistics block.
+     *
+     * Sends FilterMessageType_QueryDriverStatus and returns the driver's
+     * SHADOWSTRIKE_DRIVER_STATUS. This is the only way the driver's internal
+     * counters - notably the PreCreate block, which belongs to the highest
+     * volume callback in the product - can be read outside a kernel debugger.
+     *
+     * The reply is validated by CONTENT (magic, message type, exact payload
+     * size) rather than by a returned length, because SendToKernel does not
+     * write the actual byte count back through its replySize parameter.
+     *
+     * @param outStatus     Receives the status block. Left untouched on failure,
+     *                      so a false return can never leave a half-filled block
+     *                      that reads like a measurement.
+     *
+     * @return true when a well-formed reply was received and copied.
+     */
+    [[nodiscard]] bool QueryDriverStatus(SHADOWSTRIKE_DRIVER_STATUS& outStatus) noexcept;
+    // ========================================================================
     // HANDLER REGISTRATION
     // ========================================================================
     

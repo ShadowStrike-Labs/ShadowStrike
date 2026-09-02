@@ -2615,6 +2615,62 @@ Routine Description:
 
 _Use_decl_annotations_
 VOID
+ShadowStrikePcFillDriverStatus(
+    struct _SHADOWSTRIKE_DRIVER_STATUS* Status
+    )
+/*++
+Routine Description:
+    Projects the PreCreate counters into the shared driver-status structure.
+
+    Reads through PcGetStatistics rather than touching g_PcState.Stats
+    directly. That function already takes StatsLock to produce a torn-free
+    snapshot, and LONG64 reads are not atomic on x86, so reading the fields
+    here would reintroduce exactly the tearing its comment describes.
+
+    Leaves the block untouched on failure. A half-filled statistics block is
+    indistinguishable from a measurement, which is worse than an absent one.
+--*/
+{
+    PC_STATISTICS snapshot;
+    PSHADOWSTRIKE_DRIVER_STATUS status = (PSHADOWSTRIKE_DRIVER_STATUS)Status;
+
+    PAGED_CODE();
+
+    if (status == NULL) {
+        return;
+    }
+
+    RtlZeroMemory(&snapshot, sizeof(snapshot));
+
+    if (!NT_SUCCESS(PcGetStatistics(&snapshot))) {
+        return;
+    }
+
+    status->PcTotalOperations          = snapshot.TotalOperations;
+    status->PcOperationsScanned        = snapshot.OperationsScanned;
+    status->PcOperationsBlocked        = snapshot.OperationsBlocked;
+    status->PcOperationsExcluded       = snapshot.OperationsExcluded;
+    status->PcOperationsCached         = snapshot.OperationsCached;
+    status->PcScanTimeouts             = snapshot.ScanTimeouts;
+    status->PcScanErrors               = snapshot.ScanErrors;
+    status->PcSelfProtectBlocks        = snapshot.SelfProtectBlocks;
+    status->PcCatalogStoreExemptions   = snapshot.CatalogStoreExemptions;
+    status->PcAdsDetections            = snapshot.AdsDetections;
+    status->PcDoubleExtDetections      = snapshot.DoubleExtDetections;
+    status->PcHoneypotDetections       = snapshot.HoneypotDetections;
+    status->PcSuspiciousPathDetections = snapshot.SuspiciousPathDetections;
+    status->PcRansomwareCorrelations   = snapshot.RansomwareCorrelations;
+    status->PcExecutablesScanned       = snapshot.ExecutablesScanned;
+    status->PcScriptsScanned           = snapshot.ScriptsScanned;
+    status->PcDocumentsScanned         = snapshot.DocumentsScanned;
+    status->PcArchivesScanned          = snapshot.ArchivesScanned;
+    status->PcTotalScanTimeMs          = snapshot.TotalScanTimeMs;
+    status->PcMaxScanTimeMs            = snapshot.MaxScanTimeMs;
+}
+
+
+_Use_decl_annotations_
+VOID
 PcResetStatistics(
     VOID
     )

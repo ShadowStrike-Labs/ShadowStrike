@@ -468,7 +468,107 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     ULONG  MsScannerAvgScanTimeMs;
     ULONG  MsScannerReserved;
 
+    //
+    // PreCreate callback statistics (v4 extension)
+    //
+    // IRP_MJ_CREATE is the highest-volume callback this driver owns and it was
+    // the ONLY subsystem with no block here, so its counters could be read only
+    // with a kernel debugger. Every field below already exists in PC_STATISTICS
+    // (PreCreate.h) and is maintained by the callback; this block is a
+    // projection, not a second set of counters, so the two cannot disagree
+    // about a number.
+    //
+    // The Pc prefix matches the Ic/Excl/Sb/Tb/Mq/Te convention already used
+    // above: one prefix per owning module, so a reader can attribute any field
+    // to the code that maintains it without consulting a map.
+    //
+    LONG64 PcTotalOperations;           // Total PreCreate invocations
+    LONG64 PcOperationsScanned;         // Routed to the user-mode scanner
+    LONG64 PcOperationsBlocked;         // Completed with STATUS_ACCESS_DENIED
+    LONG64 PcOperationsExcluded;        // Matched a configured exclusion
+    LONG64 PcOperationsCached;          // Answered from the kernel scan cache
+    LONG64 PcScanTimeouts;              // Scanner did not answer in time
+    LONG64 PcScanErrors;                // Scan request failed outright
+    LONG64 PcSelfProtectBlocks;         // Denied to protect our own files
+    LONG64 PcCatalogStoreExemptions;    // Catalog-store creates not routed
+    LONG64 PcAdsDetections;             // Alternate data stream abuse
+    LONG64 PcDoubleExtDetections;       // Double/hidden extension
+    LONG64 PcHoneypotDetections;        // Decoy file touched
+    LONG64 PcSuspiciousPathDetections;  // Temp/recycle/public path
+    LONG64 PcRansomwareCorrelations;    // Correlated with ransomware activity
+    LONG64 PcExecutablesScanned;        // By file class
+    LONG64 PcScriptsScanned;
+    LONG64 PcDocumentsScanned;
+    LONG64 PcArchivesScanned;
+    LONG64 PcTotalScanTimeMs;           // Sum, for deriving an average
+    LONG64 PcMaxScanTimeMs;             // Worst single scan observed
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
+
+//
+// Layout assertions for the PreCreate block.
+//
+// This structure crosses the kernel/user boundary and carried NO size or
+// offset assertion of any kind before this block was added. That is exactly how
+// ProcessNotificationData, RegistryNotificationData and DriverStatisticsData
+// drifted away from the layouts the driver actually emits, so the block is
+// pinned on arrival rather than after the first misparse.
+//
+// The BASE offset of the block is deliberately NOT asserted as an absolute: it
+// moves whenever an earlier extension block is added, and pinning it would turn
+// every future extension into a false failure. What is pinned is that the block
+// is APPENDED with no padding, that its internal layout is contiguous, and that
+// nothing follows it - which is what a reader of these fields depends on.
+//
+// Note this structure is under #pragma pack(push, 1) (see the top of this
+// region), so the LONG64 fields are byte-packed and are NOT 8-byte aligned.
+// That is deliberate and correct for a wire structure - the layout must not
+// depend on a compiler's alignment choices - and it is why the assertion below
+// is about packing rather than alignment. An earlier version of this block
+// asserted 8-byte alignment and was simply wrong about its own format.
+//
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalOperations) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, MsScannerReserved) + sizeof(ULONG));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsScanned) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalOperations) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsBlocked) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsScanned) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsExcluded) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsBlocked) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsCached) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsExcluded) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanTimeouts) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcOperationsCached) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanErrors) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanTimeouts) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcSelfProtectBlocks) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanErrors) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcCatalogStoreExemptions) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcSelfProtectBlocks) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcAdsDetections) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcCatalogStoreExemptions) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcDoubleExtDetections) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcAdsDetections) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcHoneypotDetections) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcDoubleExtDetections) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcSuspiciousPathDetections) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcHoneypotDetections) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcRansomwareCorrelations) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcSuspiciousPathDetections) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcExecutablesScanned) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcRansomwareCorrelations) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScriptsScanned) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcExecutablesScanned) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcDocumentsScanned) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScriptsScanned) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcArchivesScanned) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcDocumentsScanned) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalScanTimeMs) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcArchivesScanned) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxScanTimeMs) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalScanTimeMs) + sizeof(LONG64));
+C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxScanTimeMs) + sizeof(LONG64));
 
 // ============================================================================
 // POLICY UPDATE STRUCTURE

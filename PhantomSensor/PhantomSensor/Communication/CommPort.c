@@ -47,6 +47,7 @@
 #include "../../Shared/MessageTypes.h"
 #include "../../Shared/ErrorCodes.h"
 #include "../Context/InstanceContext.h"
+#include "../Callbacks/FileSystem/PreCreate.h"
 #include "../Utilities/FileUtils.h"
 
 //
@@ -3251,6 +3252,13 @@ ShadowStrikeHandleQueryDriverStatus(
         }
     }
 
+    //
+    // PreCreate callback statistics.
+    //
+    // Called after the config pushlock is released: PcGetStatistics acquires a
+    // spinlock and would otherwise nest one lock inside another for no reason.
+    //
+    ShadowStrikePcFillDriverStatus(&driverStatus);
     //
     // Copy to user buffer with try/except
     //

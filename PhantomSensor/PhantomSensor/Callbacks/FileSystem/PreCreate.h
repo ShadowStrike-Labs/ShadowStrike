@@ -712,6 +712,34 @@ PcResetStatistics(
     VOID
     );
 
+/**
+ * @brief Project PreCreate statistics into the shared driver-status structure.
+ *
+ * Fills the Pc* block of SHADOWSTRIKE_DRIVER_STATUS from the live counters.
+ * Exists so the two driver-status handlers cannot drift: both call this, so a
+ * counter added here reaches user mode by whichever handler runs.
+ *
+ * The parameter is a forward-declared pointer on purpose. This header includes
+ * only fltKernel.h and ntifs.h, and pulling Shared/SharedDefs.h in to name one
+ * parameter type would add an include-order dependency to every translation
+ * unit that consumes the PreCreate interface.
+ *
+ * Does nothing when Status is NULL. Never partially fills: on a failure to read
+ * the counters the block is left as the caller zeroed it, because a partially
+ * written statistics block reads as real measurement.
+ *
+ * @param Status            Receives the Pc* fields. Must be zeroed by caller.
+ *
+ * @irql <= APC_LEVEL
+ */
+struct _SHADOWSTRIKE_DRIVER_STATUS;
+
+_IRQL_requires_max_(APC_LEVEL)
+VOID
+ShadowStrikePcFillDriverStatus(
+    _Inout_opt_ struct _SHADOWSTRIKE_DRIVER_STATUS* Status
+    );
+
 // ============================================================================
 // FUNCTION PROTOTYPES - CORRELATION
 // ============================================================================
