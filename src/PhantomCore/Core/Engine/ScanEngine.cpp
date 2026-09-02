@@ -568,13 +568,26 @@ public:
             // true. Merging them would quietly convert our own data directory
             // into a drop zone.
             //
-            // REGISTERED AT THIS CHOKEPOINT FOR A MEASURED REASON: every path
-            // that opens, hashes or memory-maps a file arrives through ScanFile,
-            // whose FIRST pre-flight step is this exclusion check, and the
-            // analyzer scopes nest inside it. So one gate here covers the
-            // on-access path, the deferred deep-scan worker and the directory
-            // walk. The field defect was reached by the deep-scan workers, which
-            // no driver-side exemption can see.
+            // REGISTERED HERE BECAUSE THIS IS THE SCANNER'S OWN GATE, AND THIS
+            // COMMENT PREVIOUSLY OVER-CLAIMED WHAT THAT COVERS.
+            //
+            // It used to say that every path which opens, hashes or maps a file
+            // arrives through ScanFile, so one gate here was enough. THAT IS
+            // FALSE, and the 1.0.104 field log disproves it: on the on-access
+            // path RealTimeProtection::OnKernelFileScan invokes
+            // MetamorphicDetector, PackerDetector and ExecutableAnalyzer
+            // directly, hundreds of lines before it calls ScanFile, so all
+            // three touched System32\catroot2\edb.log and only afterwards did
+            // this gate exclude it. Thirty-five analyzer touches had no ScanFile
+            // entry near them.
+            //
+            // WHAT THIS GATE DOES COVER: ScanFile itself - so the deferred
+            // deep-scan worker and the directory walk, which is where the
+            // originally measured stall was reached and which no driver-side
+            // exemption can see. The on-access analyzers are covered by
+            // OnKernelFileScan consulting IsExcluded() at its first gate, which
+            // is why that accessor is public and why this rule set is the single
+            // authoritative one rather than being copied into that module.
             //
             // See DataStorePaths::GetCatalogStoreDirectoryPrefixes for the
             // measured deadlock this prevents and why no detection is lost.

@@ -14835,5 +14835,185 @@ class PreCreateCounterObservabilityContractTests(unittest.TestCase):
                 self.rtp.count("ds." + field), 1,
                 "the capacity line stopped publishing ds.%s" % field)
 
+class OnAccessExclusionGapContractTests(unittest.TestCase):
+    """The on-access analyzers run from OnKernelFileScan, not from ScanFile.
+
+    A rule registered only in ScanEngine's list is therefore honoured HUNDREDS
+    OF LINES TOO LATE on the on-access path.  The 1.0.104 field log recorded the
+    consequence in file order: MetamorphicDetector, then PackerDetector, then
+    ExecutableAnalyzer each touched System32\\catroot2\\edb.log, and only
+    afterwards did ScanEngine log "Scanning file:" followed by "excluded by
+    rule".  Thirty-five analyzer touches had no ScanFile entry near them at all.
+
+    These tests are source contracts rather than behavioural ones because
+    RealTimeProtection exposes no public exclusion query, and reaching the real
+    gate needs a loaded driver delivering a kernel scan request.  What is
+    enforceable without one is the ORDERING and the SINGLE-REGISTRY property,
+    which is exactly what broke.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rtp_raw = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        cls.se_raw = read_source(SCAN_ENGINE_CPP_PATH)
+        # Comment-stripped for every assertion about CODE.  The fix's own
+        # comments name IsExcluded, the three analyzers and ScanFile, so a
+        # comment-blind assertion would be satisfied by prose.
+        cls.rtp = strip_c_comments(cls.rtp_raw)
+        cls.se = strip_c_comments(cls.se_raw)
+
+    @staticmethod
+    def _body(source, name):
+        """Brace-matched body of a definition, skipping declarations and calls."""
+        for match in re.finditer(re.escape(name) + r"\s*\(", source):
+            close = source.find(")", match.end() - 1)
+            if close < 0:
+                continue
+            cursor = close + 1
+            while cursor < len(source) and source[cursor] in " \t\r\n":
+                cursor += 1
+            trailing = re.match(r"(?:const|noexcept|override|final|&&|&)\s*",
+                                source[cursor:cursor + 32])
+            while trailing:
+                cursor += trailing.end()
+                trailing = re.match(r"(?:const|noexcept|override|final|&&|&)\s*",
+                                    source[cursor:cursor + 32])
+            if cursor >= len(source) or source[cursor] != "{":
+                continue
+            depth = 0
+            for end in range(cursor, len(source)):
+                if source[end] == "{":
+                    depth += 1
+                elif source[end] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return source[match.start():end + 1]
+        return ""
+
+    def test_the_first_on_access_gate_consults_the_scanner_exclusions(self):
+        body = self._body(self.rtp, "OnKernelFileScan")
+        self.assertTrue(body, "could not locate the OnKernelFileScan definition")
+
+        position = body.find("IsExcludedByScanner(filePath)")
+        self.assertNotEqual(
+            position, -1,
+            "the on-access gate no longer consults the scanner's exclusions, so "
+            "the catalog store is scanned by three analyzers before ScanFile "
+            "excludes it")
+
+        statement = enclosing_statement(body, position)
+        self.assertEqual(
+            statement.count("IsExcluded(filePath, req.ProcessId)"), 1,
+            "both exclusion tiers must be decided by ONE condition; splitting "
+            "them lets a later edit drop one arm without failing anything")
+
+        # The gate must still be a gate: it has to end the request.
+        window = body[position:position + 400]
+        self.assertEqual(
+            window.count("m_stats.excludedByPath++"), 1,
+            "an excluded file must still be counted")
+        self.assertEqual(
+            window.count("KernelVerdict::Allow"), 1,
+            "an excluded file must still short-circuit the handler")
+
+    def test_the_scanner_consult_precedes_every_on_access_analyzer(self):
+        body = self._body(self.rtp, "OnKernelFileScan")
+        self.assertTrue(body, "could not locate the OnKernelFileScan definition")
+
+        markers = (
+            ("the scanner exclusion consult", "IsExcludedByScanner(filePath)"),
+            ("MetamorphicDetector::AnalyzeFile", "m_metamorphicDetector->AnalyzeFile"),
+            ("PackerDetector::AnalyzeFile", "m_packerDetector->AnalyzeFile"),
+            ("ExecutableAnalyzer", "ExecutableAnalyzer::Instance()"),
+            ("ScanEngine::ScanFile", "ScanEngine::Instance().ScanFile"),
+        )
+
+        offsets = []
+        for label, needle in markers:
+            offset = body.find(needle)
+            # ANTI-VACUITY, AND IT IS THE POINT OF THIS ARM: deleting an analyzer
+            # would satisfy an ordering assertion trivially.  Every stage this
+            # guard orders must still be present on the path.
+            self.assertNotEqual(
+                offset, -1,
+                "%s is no longer invoked from the on-access handler; this guard "
+                "must not be satisfiable by removing a stage" % label)
+            offsets.append((label, offset))
+
+        consult = offsets[0][1]
+        for label, offset in offsets[1:]:
+            self.assertLess(
+                consult, offset,
+                "the exclusion consult must run before %s" % label)
+
+        # And the reason the late gate cannot cover them: the analyzers really do
+        # precede ScanFile inside this one handler.  If that ever stops being
+        # true the ordering above is no longer load-bearing and this guard should
+        # be revisited rather than deleted.
+        self.assertLess(
+            offsets[1][1], offsets[4][1],
+            "the metamorphic analyzer is expected to run before ScanFile")
+
+    def test_the_consult_reads_the_authoritative_rule_set_not_a_copy(self):
+        helper = self._body(self.rtp, "IsExcludedByScanner")
+        self.assertTrue(helper, "IsExcludedByScanner is gone")
+        self.assertEqual(
+            helper.count("Core::Engine::ScanEngine::Instance().IsExcluded"), 1,
+            "the consult must ask the scanner rather than re-implement matching")
+
+        # ONE REGISTRY.  Copying the catalog rules into RealTimeProtection is
+        # precisely the drift that produced the field defect: the rule existed in
+        # one list and the earliest gate read the other.
+        self.assertEqual(
+            self.rtp.count("GetCatalogStoreDirectoryPrefixes"), 0,
+            "the catalog-store rules must not be copied into RealTimeProtection")
+
+        # ANTI-VACUITY: the assertion above is also satisfied by deleting the
+        # rules everywhere, so the scanner must still register them.
+        self.assertEqual(
+            self.se.count("GetCatalogStoreDirectoryPrefixes"), 1,
+            "the scanner must remain the one place the catalog store is excluded")
+
+    def test_an_exclusion_we_could_not_establish_is_not_an_exclusion(self):
+        helper = self._body(self.rtp, "IsExcludedByScanner")
+        self.assertTrue(helper, "IsExcludedByScanner is gone")
+
+        self.assertEqual(
+            helper.count("return true"), 0,
+            "IsExcludedByScanner must never assert an exclusion of its own; it "
+            "only relays the scanner's answer")
+
+        catch_at = helper.find("catch")
+        self.assertNotEqual(
+            catch_at, -1,
+            "a throw out of this call would abandon the whole scan request")
+        self.assertEqual(
+            helper[catch_at:].count("return false"), 1,
+            "a failure to establish an exclusion must not become an exclusion")
+
+    def test_the_scanner_gate_no_longer_claims_to_cover_the_on_access_path(self):
+        # RAW source deliberately: this is a contract about a COMMENT, and
+        # stripping comments would remove the very text under assertion.
+        self.assertEqual(
+            self.se_raw.count("REGISTERED AT THIS CHOKEPOINT FOR A MEASURED REASON"), 0,
+            "the claim that every file-opening path arrives through ScanFile is "
+            "false and must not return; the on-access analyzers bypass it")
+
+        marker = "THIS\n            // COMMENT PREVIOUSLY OVER-CLAIMED WHAT THAT COVERS."
+        anchor = self.se_raw.find("COMMENT PREVIOUSLY OVER-CLAIMED")
+        # ANTI-DELETION: the assertion above passes if the whole comment is
+        # removed, so the correction itself must be present and must still name
+        # the three stages that bypass this gate.
+        self.assertNotEqual(
+            anchor, -1,
+            "the correction recording why this gate does not cover the "
+            "on-access path was removed")
+        block = self.se_raw[anchor:anchor + 1600]
+        for stage in ("MetamorphicDetector", "PackerDetector", "ExecutableAnalyzer"):
+            self.assertGreaterEqual(
+                block.count(stage), 1,
+                "the correction must name %s as bypassing this gate" % stage)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

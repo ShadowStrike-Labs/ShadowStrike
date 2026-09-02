@@ -3423,9 +3423,46 @@ public:
         SS_DIAG("OnAccess", "step.DevicePathToDosPath");
         filePath = Utils::FileUtils::DevicePathToDosPath(filePath);
 
-        // 1. Check Exclusions
+        // 1. EXCLUSIONS - BOTH TIERS, AND THE SECOND ONE IS THE POINT.
+        //
+        // There are two exclusion registries in this product and they answer
+        // different questions. IsExcluded below is the ON-ACCESS POLICY tier:
+        // what an administrator excluded, plus our own database files. The
+        // scanner keeps a separate tier of its own SAFETY INVARIANTS - paths it
+        // must never touch for correctness reasons rather than for policy.
+        //
+        // THE FIELD DEFECT THIS CLOSES, AND IT WAS MINE. When the Windows
+        // catalog store was excluded to stop the signature-verification
+        // deadlock, the rule was registered into the scanner tier ONLY, on the
+        // stated basis that "every path that opens, hashes or maps a file
+        // arrives through ScanFile". That claim is false on this path and the
+        // 1.0.104 field log disproves it in file order: MetamorphicDetector,
+        // then PackerDetector, then ExecutableAnalyzer all touched
+        // System32\catroot2\edb.log, and only afterwards did ScanEngine log
+        // "Scanning file:" followed by "excluded by rule". Thirty-five analyzer
+        // touches had no ScanFile entry near them at all. The three analyzers
+        // below run from THIS handler, several hundred lines above the ScanFile
+        // call at the end of it, so a gate that lives inside ScanFile cannot
+        // cover them.
+        //
+        // WHY CONSULTING THE SCANNER RATHER THAN COPYING ITS RULES. Copying
+        // would fix this one rule and leave the mechanism that broke it intact:
+        // the next invariant added to the scanner would again be honoured at
+        // the late gate and missed at the early one. One authoritative registry
+        // consulted from both places cannot drift. It also inherits the
+        // scanner's matcher, which already implements the recursive prefix
+        // semantics these directory rules need and is already covered by
+        // behavioural tests, instead of re-expressing them here as a wildcard
+        // pattern in a list whose own contract is exact-match-only.
+        //
+        // NO COVERAGE IS LOST. Every path this newly excludes was ALREADY
+        // excluded a few hundred lines later by the same rule set - the file
+        // was never going to be scanned. What changes is only how much failed
+        // work happens first. In the field all thirty-five of those analyzer
+        // touches ended in WinError 32, because the files are held open by the
+        // service whose stall the exclusion exists to prevent.
         SS_DIAG("OnAccess", "step.IsExcluded");
-        if (IsExcluded(filePath, req.ProcessId)) {
+        if (IsExcluded(filePath, req.ProcessId) || IsExcludedByScanner(filePath)) {
             m_stats.excludedByPath++;
             return Communication::KernelVerdict::Allow;
         }
@@ -6445,6 +6482,46 @@ public:
         }
 
         return false;
+    }
+
+    // Does the SCANNER consider this path excluded?
+    //
+    // Separate from IsExcluded above, and deliberately not merged into it. That
+    // list is on-access policy owned by this module; this one asks the scanner
+    // about its own safety invariants - today our detection databases (exact
+    // paths) and the Windows catalog store (recursive directory prefixes).
+    // Keeping them apart preserves the exact-match contract the policy list
+    // documents, which a test asserts, while still honouring a rule kind that
+    // list cannot express.
+    //
+    // Called at the FIRST gate of OnKernelFileScan, before the identity cache,
+    // before the trust tier and before the metamorphic, packer and executable
+    // analyzers, because those three run from that handler and not from
+    // ScanFile. See the comment at that call site for the field evidence.
+    //
+    // NO LOCK IS HELD ACROSS THIS CALL. The scanner takes its own mutex, and
+    // invoking another module while holding ours is a deadlock shape this
+    // codebase has already had to remove once.
+    //
+    // SAFE BEFORE THE SCANNER IS READY: ScanEngine::IsExcluded is null-safe on
+    // its implementation pointer and answers from an empty rule set until
+    // Initialize registers them. InitializeScanEngine runs inside Start()
+    // before StartComponents() reaches FileSystemFilter::Start(), so the rules
+    // are in place before the kernel can deliver a single request; an
+    // unexpectedly early request degrades to today's behaviour rather than to
+    // a wrong answer.
+    bool IsExcludedByScanner(const std::wstring& filePath) const {
+        if (filePath.empty()) {
+            return false;
+        }
+        try {
+            return Core::Engine::ScanEngine::Instance().IsExcluded(filePath);
+        }
+        catch (...) {
+            // An exclusion we could not establish must not become an exclusion.
+            // Failing this way costs a scan; failing the other way skips one.
+            return false;
+        }
     }
 
     bool IsProcessExcluded(const std::wstring& processPath, uint32_t pid) {
