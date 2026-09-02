@@ -660,6 +660,42 @@ PcpInitializeDefaultConfig(
 
 _IRQL_requires_(PASSIVE_LEVEL)
 _IRQL_requires_same_
+//
+// Fold one invocation's in-callback duration into the module statistics.
+//
+// Mirrors the existing TotalScanTimeMs/MaxScanTimeMs accounting exactly,
+// including the reason the initial maximum is read with
+// InterlockedCompareExchange64(&x, 0, 0): that guarantees a torn-free 8-byte
+// load rather than assuming an aligned 64-bit read is atomic.
+//
+// A zero duration is still counted as a sample. It means the clock did not
+// advance within its resolution, which is a real observation about a cheap
+// callback; dropping it would bias the average upward by discarding exactly
+// the fastest invocations.
+//
+static VOID
+PcpAccountCallbackLatency(
+    _In_ ULONG64 ElapsedUs
+    )
+{
+    LONG64 Duration = (LONG64)min(ElapsedUs, (ULONG64)MAXLONG64);
+    LONG64 OldMax;
+
+    InterlockedIncrement64(&g_PcState.Stats.CallbackSamples);
+    InterlockedAdd64(&g_PcState.Stats.TotalCallbackTimeUs, Duration);
+
+    OldMax = InterlockedCompareExchange64(&g_PcState.Stats.MaxCallbackTimeUs, 0, 0);
+    while (Duration > OldMax) {
+        LONG64 Prev = InterlockedCompareExchange64(
+            &g_PcState.Stats.MaxCallbackTimeUs,
+            Duration,
+            OldMax
+            );
+        if (Prev == OldMax) break;
+        OldMax = Prev;
+    }
+}
+
 FLT_PREOP_CALLBACK_STATUS
 ShadowStrikePreCreate(
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -1882,8 +1918,32 @@ Return Value:
     }
 
 CleanupAllow:
-    SSPM_LATENCY_END(ShadowStrikeGetPerformanceMonitor(),
-                     SsPmMetric_CallbackLatencyUs, pc);
+    //
+    // ACCOUNT THIS CALLBACK'S OWN COST, then feed the shared metric from the
+    // same clock read.
+    //
+    // SsPmMetric_CallbackLatencyUs is shared by all four registered callbacks,
+    // and ProcessNotify deliberately waits up to PN_VERDICT_REPLY_TIMEOUT_MS
+    // (500 ms) for a user-mode verdict, so its samples are five orders of
+    // magnitude larger than a file create's. A mean or percentile over that
+    // mixture describes neither, which is why this callback keeps its own
+    // numbers. The shared metric is still fed, unchanged, so nothing that reads
+    // it loses a sample.
+    //
+    // One clock read serves both, so this costs no more than the single
+    // KeQueryPerformanceCounter the previous SSPM_LATENCY_END already spent.
+    //
+    {
+        const ULONG64 CallbackUs = SSPM_LATENCY_ELAPSED_US(pc);
+        PSSPM_MONITOR PerfMonitor;
+
+        PcpAccountCallbackLatency(CallbackUs);
+
+        PerfMonitor = ShadowStrikeGetPerformanceMonitor();
+        if (PerfMonitor != NULL) {
+            SsPmRecordSample(PerfMonitor, SsPmMetric_CallbackLatencyUs, CallbackUs);
+        }
+    }
     if (NameInfo != NULL) {
         FltReleaseFileNameInformation(NameInfo);
     }
@@ -2666,6 +2726,9 @@ Routine Description:
     status->PcArchivesScanned          = snapshot.ArchivesScanned;
     status->PcTotalScanTimeMs          = snapshot.TotalScanTimeMs;
     status->PcMaxScanTimeMs            = snapshot.MaxScanTimeMs;
+    status->PcCallbackSamples          = snapshot.CallbackSamples;
+    status->PcTotalCallbackTimeUs      = snapshot.TotalCallbackTimeUs;
+    status->PcMaxCallbackTimeUs        = snapshot.MaxCallbackTimeUs;
 }
 
 

@@ -488,6 +488,54 @@ Routine Description:
 //=============================================================================
 
 _Use_decl_annotations_
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG64
+SsPmElapsedMicroseconds(
+    _In_ LARGE_INTEGER StartTick
+    )
+/*++
+Routine Description:
+    Converts the interval since StartTick (captured with
+    KeQueryPerformanceCounter) into microseconds.
+
+    Extracted so the conversion, including its overflow guard, exists exactly
+    once. It has two consumers: SsPmRecordLatency, which files the value under
+    the shared SsPmMetric_CallbackLatencyUs metric, and a callback that also
+    keeps its own latency statistics because that shared metric mixes callbacks
+    whose costs differ by orders of magnitude. Two copies of this arithmetic
+    would be free to disagree about the same interval.
+
+Return Value:
+    Elapsed microseconds. Zero when the frequency is unavailable or the clock
+    did not advance - never a negative or wrapped value, because a nonsense
+    duration folded into a maximum would misreport that maximum forever.
+--*/
+{
+    LARGE_INTEGER EndTick;
+    LARGE_INTEGER Freq;
+    ULONG64 DeltaTicks;
+    ULONG64 FreqVal;
+
+    EndTick = KeQueryPerformanceCounter(&Freq);
+
+    if (Freq.QuadPart == 0 || EndTick.QuadPart <= StartTick.QuadPart) {
+        return 0;
+    }
+
+    DeltaTicks = (ULONG64)(EndTick.QuadPart - StartTick.QuadPart);
+    FreqVal = (ULONG64)Freq.QuadPart;
+
+    if (DeltaTicks <= (MAXULONG64 / 1000000ULL)) {
+        return (DeltaTicks * 1000000ULL) / FreqVal;
+    }
+
+    //
+    // Large delta: divide first and lose sub-microsecond precision rather than
+    // overflow the multiply.
+    //
+    return (DeltaTicks / FreqVal) * 1000000ULL;
+}
+
 NTSTATUS
 SsPmRecordLatency(
     _In_ PSSPM_MONITOR Monitor,
@@ -498,44 +546,16 @@ SsPmRecordLatency(
 Routine Description:
     Computes elapsed time since StartTick (from KeQueryPerformanceCounter)
     and records it as microseconds.
+
+    The conversion lives in SsPmElapsedMicroseconds so that a callback keeping
+    its own latency statistics measures the same interval the same way.
 --*/
 {
-    LARGE_INTEGER EndTick;
-    LARGE_INTEGER Freq;
-    ULONG64 ElapsedUs;
-
     if (Monitor == NULL || !SspmiIsValidMetric(Metric)) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    EndTick = KeQueryPerformanceCounter(&Freq);
-
-    //
-    // Guard against backward time or zero frequency
-    //
-    if (Freq.QuadPart == 0 || EndTick.QuadPart <= StartTick.QuadPart) {
-        return SsPmRecordSample(Monitor, Metric, 0);
-    }
-
-    //
-    // Convert QPC ticks to microseconds:
-    // ElapsedUs = (EndTick - StartTick) * 1,000,000 / Frequency
-    //
-    // To avoid overflow with large tick deltas, divide first if possible:
-    //
-    {
-        ULONG64 DeltaTicks = (ULONG64)(EndTick.QuadPart - StartTick.QuadPart);
-        ULONG64 FreqVal = (ULONG64)Freq.QuadPart;
-
-        if (DeltaTicks <= (MAXULONG64 / 1000000ULL)) {
-            ElapsedUs = (DeltaTicks * 1000000ULL) / FreqVal;
-        } else {
-            // Large delta: divide first, lose sub-microsecond precision
-            ElapsedUs = (DeltaTicks / FreqVal) * 1000000ULL;
-        }
-    }
-
-    return SsPmRecordSample(Monitor, Metric, ElapsedUs);
+    return SsPmRecordSample(Monitor, Metric, SsPmElapsedMicroseconds(StartTick));
 }
 
 

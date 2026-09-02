@@ -7247,11 +7247,23 @@ public:
                     ds.PcOperationsScanned > 0
                         ? ds.PcTotalScanTimeMs / ds.PcOperationsScanned
                         : 0;
+
+                // In-callback microseconds, averaged over invocations actually
+                // timed rather than over scans. Most creates never reach a scan
+                // - they are excluded, cached, exempted or declined - so
+                // dividing by PcOperationsScanned would inflate the average by
+                // the ratio between the two, which is the whole quantity under
+                // investigation.
+                const long long cbAvgUs =
+                    ds.PcCallbackSamples > 0
+                        ? ds.PcTotalCallbackTimeUs / ds.PcCallbackSamples
+                        : 0;
                 kernelPart = std::format(
                     "kernelPreCreate: total={} scanned={} blocked={} excluded={} "
                     "cached={} timeouts={} errors={} selfProt={} catalogExempt={} "
                     "honeypot={} ads={} dblExt={} suspPath={} ransomCorr={} "
-                    "exe={} script={} doc={} archive={} avgScanMs={} maxScanMs={}",
+                    "exe={} script={} doc={} archive={} avgScanMs={} maxScanMs={} "
+                    "cbSamples={} cbAvgUs={} cbMaxUs={}",
                     ds.PcTotalOperations, ds.PcOperationsScanned,
                     ds.PcOperationsBlocked, ds.PcOperationsExcluded,
                     ds.PcOperationsCached, ds.PcScanTimeouts, ds.PcScanErrors,
@@ -7260,7 +7272,8 @@ public:
                     ds.PcDoubleExtDetections, ds.PcSuspiciousPathDetections,
                     ds.PcRansomwareCorrelations, ds.PcExecutablesScanned,
                     ds.PcScriptsScanned, ds.PcDocumentsScanned,
-                    ds.PcArchivesScanned, avgScanMs, ds.PcMaxScanTimeMs);
+                    ds.PcArchivesScanned, avgScanMs, ds.PcMaxScanTimeMs,
+                    ds.PcCallbackSamples, cbAvgUs, ds.PcMaxCallbackTimeUs);
             }
         }
         const auto line = std::format(

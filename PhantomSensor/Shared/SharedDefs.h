@@ -503,6 +503,22 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG64 PcTotalScanTimeMs;           // Sum, for deriving an average
     LONG64 PcMaxScanTimeMs;             // Worst single scan observed
 
+    //
+    // In-callback cost of ShadowStrikePreCreate itself, in MICROSECONDS.
+    //
+    // Distinct from PcTotalScanTimeMs/PcMaxScanTimeMs above, which time the
+    // user-mode scan round trip only. The field run measured that round trip
+    // fast and idle while the machine still stalled, so what was missing is the
+    // in-kernel work performed on every create before a scan is considered.
+    //
+    // Microseconds because a create is expected to cost microseconds; a
+    // millisecond field would round nearly every sample to zero and report the
+    // callback as free.
+    //
+    LONG64 PcCallbackSamples;
+    LONG64 PcTotalCallbackTimeUs;
+    LONG64 PcMaxCallbackTimeUs;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 //
@@ -567,8 +583,14 @@ C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalScanTimeMs) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcArchivesScanned) + sizeof(LONG64));
 C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxScanTimeMs) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalScanTimeMs) + sizeof(LONG64));
-C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcCallbackSamples) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxScanTimeMs) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalCallbackTimeUs) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcCallbackSamples) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxCallbackTimeUs) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalCallbackTimeUs) + sizeof(LONG64));
+C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxCallbackTimeUs) + sizeof(LONG64));
 
 // ============================================================================
 // POLICY UPDATE STRUCTURE

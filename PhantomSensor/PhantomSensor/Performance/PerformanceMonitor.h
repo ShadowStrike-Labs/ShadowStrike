@@ -207,6 +207,11 @@ SsPmDisableCollection(
     _In_ PSSPM_MONITOR Monitor
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG64
+SsPmElapsedMicroseconds(
+    _In_ LARGE_INTEGER StartTick
+    );
 //=============================================================================
 // Convenience Macros for Callback Latency Instrumentation
 //=============================================================================
@@ -219,6 +224,28 @@ SsPmDisableCollection(
 // Cost: one KeQueryPerformanceCounter (< 100ns) per callback invocation.
 // The END macro is safe to call with NULL monitor (no-ops gracefully).
 //
+
+//
+// Elapsed microseconds since a matching SSPM_LATENCY_BEGIN, WITHOUT recording
+// a sample.
+//
+// WHY A CALLBACK NEEDS THIS AS WELL AS SSPM_LATENCY_END. All four registered
+// callbacks - PreCreate, ProcessNotify, ImageNotify and RegistryCallback -
+// record into the single SsPmMetric_CallbackLatencyUs metric. Their cost
+// profiles differ by orders of magnitude: a file create is expected to be
+// microseconds of in-kernel work, while a process-creation notification
+// deliberately waits for a user-mode verdict bounded by
+// PN_VERDICT_REPLY_TIMEOUT_MS (500 ms), contributing samples near 500,000 us
+// to the same distribution. A mean or a percentile over that mixture
+// describes neither callback, so a callback that needs its OWN latency must
+// keep its own accounting. Whether to give each callback a distinct metric is
+// a separate decision, because SsPmSetThreshold and SsPmRegisterAlertCallback
+// are keyed on the metric type.
+//
+// Pairs with SSPM_LATENCY_BEGIN. Feed the result to SsPmRecordSample if the
+// shared metric is also wanted, so one clock read serves both consumers.
+//
+#define SSPM_LATENCY_ELAPSED_US(tag) SsPmElapsedMicroseconds(_sspmStart_##tag)
 
 #define SSPM_LATENCY_BEGIN(tag) \
     LARGE_INTEGER _sspmStart_##tag = KeQueryPerformanceCounter(NULL)

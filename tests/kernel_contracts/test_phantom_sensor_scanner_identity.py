@@ -292,6 +292,8 @@ REGISTRY_PROTECTION_CPP_PATH = (
 # actually run: the magic check, the MH_MAX_HANDLERS bound, and the build-time
 # C_ASSERT tying that bound to this enum.
 MESSAGE_TYPES_PATH = ROOT / "PhantomSensor/Shared/MessageTypes.h"
+PERFORMANCE_MONITOR_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Performance/PerformanceMonitor.h"
+PERFORMANCE_MONITOR_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Performance/PerformanceMonitor.c"
 MESSAGE_HANDLER_C_PATH = (
     ROOT / "PhantomSensor/PhantomSensor/Communication/MessageHandler.c"
 )
@@ -14644,15 +14646,25 @@ class PreCreateCounterObservabilityContractTests(unittest.TestCase):
     comment-blind check would be satisfiable by prose alone.
     """
 
-    PC_FIELDS = [
-        "PcTotalOperations", "PcOperationsScanned", "PcOperationsBlocked",
-        "PcOperationsExcluded", "PcOperationsCached", "PcScanTimeouts",
-        "PcScanErrors", "PcSelfProtectBlocks", "PcCatalogStoreExemptions",
-        "PcAdsDetections", "PcDoubleExtDetections", "PcHoneypotDetections",
-        "PcSuspiciousPathDetections", "PcRansomwareCorrelations",
-        "PcExecutablesScanned", "PcScriptsScanned", "PcDocumentsScanned",
-        "PcArchivesScanned", "PcTotalScanTimeMs", "PcMaxScanTimeMs",
-    ]
+    # DERIVED FROM THE STRUCT, NOT LISTED HERE, AND THAT MATTERS.
+    #
+    # This was a hardcoded list of the twenty fields the block shipped with, and
+    # every assertion below counted against its length. So the block could be
+    # EXTENDED with fields carrying no layout assertion at all and every test
+    # still passed - which is exactly what happened when the callback-latency
+    # fields were appended. Parsing the declaration order out of the header makes
+    # the assertion count a property of the struct, so a field cannot be added
+    # without also adding the assertion that pins it.
+    @staticmethod
+    def _pc_fields(shared_source):
+        block = re.search(
+            r"typedef struct _SHADOWSTRIKE_DRIVER_STATUS\s*\{(.*?)\}\s*SHADOWSTRIKE_DRIVER_STATUS",
+            shared_source, re.S)
+        if block is None:
+            return []
+        names = re.findall(r"\bLONG64\s+(Pc\w+)\s*;", block.group(1))
+        return names
+
 
     @classmethod
     def setUpClass(cls):
@@ -14665,6 +14677,7 @@ class PreCreateCounterObservabilityContractTests(unittest.TestCase):
         cls.ipc_c = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
         cls.ipc_h = strip_c_comments(read_source(IPC_MANAGER_HPP_PATH))
         cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.PC_FIELDS = cls._pc_fields(cls.shared)
 
     @staticmethod
     def _body(src, name):
@@ -14722,14 +14735,31 @@ class PreCreateCounterObservabilityContractTests(unittest.TestCase):
             "expected %d consecutive-offset assertions over the PreCreate block, found %d"
             % (len(self.PC_FIELDS) - 1, consecutive))
 
-        # Nothing may follow the block. PcMaxScanTimeMs is the LEFT operand of the
-        # last consecutive assertion and the right operand only here, so exactly
-        # one occurrence of this form is correct.
+        # ANTI-VACUITY: the count above is derived from the parsed field list, so
+        # a parse that silently returned nothing would make it trivially true.
+        self.assertGreaterEqual(
+            len(self.PC_FIELDS), 20,
+            "the Pc* field parse found %d fields; the block shipped with twenty, "
+            "so this is a parse failure rather than a shrunken struct"
+            % len(self.PC_FIELDS))
+
+        # NOTHING MAY FOLLOW THE BLOCK, asserted against the field the struct
+        # actually ends with rather than against a name written down here.
+        #
+        # The previous form named PcMaxScanTimeMs and claimed it was the right
+        # operand of exactly one assertion - the no-tail one. That stopped being
+        # true the moment the block was extended: PcMaxScanTimeMs became the right
+        # operand of a CONSECUTIVE assertion instead, the count stayed at one, and
+        # the test passed while asserting something that was no longer the case.
+        last = self.PC_FIELDS[-1]
         self.assertEqual(
             self.shared.count(
-                "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxScanTimeMs) + sizeof(LONG64))"),
+                "sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==\n"
+                "         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, " + last +
+                ") + sizeof(LONG64));"),
             1,
-            "the no-tail assertion (sizeof == last field + 8) is missing or duplicated")
+            "the total-size assertion must name %s, the last Pc* field in the "
+            "struct, so appending a field forces it to move" % last)
         self.assertEqual(
             self.shared.count("sizeof(SHADOWSTRIKE_DRIVER_STATUS) =="), 1,
             "the total-size assertion over SHADOWSTRIKE_DRIVER_STATUS is missing")
@@ -15013,6 +15043,113 @@ class OnAccessExclusionGapContractTests(unittest.TestCase):
             self.assertGreaterEqual(
                 block.count(stage), 1,
                 "the correction must name %s as bypassing this gate" % stage)
+
+
+class PreCreateCallbackLatencyContractTests(unittest.TestCase):
+    """PreCreate must measure its OWN cost, not share a metric with a callback
+    that deliberately blocks for half a second.
+
+    All four registered callbacks record into SsPmMetric_CallbackLatencyUs.
+    ProcessNotify waits for a user-mode verdict bounded by
+    PN_VERDICT_REPLY_TIMEOUT_MS = 500, so it contributes samples near 500,000 us
+    to the same distribution as a file create, whose in-kernel work is expected to
+    be microseconds. A mean or percentile over that mixture describes neither, and
+    SsPmGetStats has no caller anywhere in the driver, so nothing ever read it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pc_c = strip_c_comments(read_source(PRE_CREATE_C_PATH))
+        cls.pc_h = strip_c_comments(read_source(PRE_CREATE_H_PATH))
+        cls.pm_h = strip_c_comments(read_source(PERFORMANCE_MONITOR_H_PATH))
+        cls.pm_c = strip_c_comments(read_source(PERFORMANCE_MONITOR_C_PATH))
+        cls.shared = strip_c_comments(read_source(SHARED_DEFS_H_PATH))
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+    def test_the_callback_accounts_its_own_latency(self):
+        self.assertEqual(
+            self.pc_c.count("PcpAccountCallbackLatency(CallbackUs);"), 1,
+            "PreCreate no longer folds its own duration into its statistics, so "
+            "its per-operation cost is unmeasurable again")
+        self.assertEqual(
+            self.pc_c.count("static VOID\nPcpAccountCallbackLatency("), 1,
+            "the accounting helper is gone")
+
+        for field in ("CallbackSamples", "TotalCallbackTimeUs", "MaxCallbackTimeUs"):
+            self.assertEqual(
+                self.pc_h.count("volatile LONG64 " + field + ";"), 1,
+                "PC_STATISTICS lost %s" % field)
+
+    def test_the_shared_metric_still_receives_every_sample(self):
+        # Keeping its own numbers must not remove a sample from the shared metric,
+        # or anything reading that metric silently loses this callback.
+        self.assertEqual(
+            self.pc_c.count("SsPmRecordSample(PerfMonitor, SsPmMetric_CallbackLatencyUs, CallbackUs)"),
+            1,
+            "PreCreate stopped feeding the shared callback-latency metric")
+
+        # ONE clock read serves both consumers.
+        self.assertEqual(
+            self.pc_c.count("SSPM_LATENCY_ELAPSED_US(pc)"), 1,
+            "the elapsed value must be taken once and used twice")
+        self.assertEqual(
+            self.pc_c.count("SSPM_LATENCY_END("), 0,
+            "SSPM_LATENCY_END would add a second clock read for the same interval")
+
+        # ANTI-VACUITY: the begin marker must survive, because the elapsed macro
+        # is defined in terms of the variable it declares.
+        self.assertEqual(
+            self.pc_c.count("SSPM_LATENCY_BEGIN(pc)"), 1,
+            "the latency start marker is gone, so nothing is being measured")
+
+    def test_the_elapsed_conversion_has_exactly_one_implementation(self):
+        # The macro lives in the header that owns the variable it names, rather
+        # than being hand-rolled at the call site.
+        self.assertEqual(
+            self.pm_h.count("#define SSPM_LATENCY_ELAPSED_US(tag)"), 1,
+            "the elapsed-microseconds macro must be declared beside the BEGIN "
+            "macro whose variable it references")
+        self.assertEqual(
+            self.pm_c.count("SsPmElapsedMicroseconds("), 2,
+            "expected exactly the definition and its one use inside "
+            "SsPmRecordLatency; a second copy of the conversion is free to "
+            "disagree about the same interval")
+
+        # SsPmRecordLatency must DELEGATE, not keep its own arithmetic.
+        body = extract_c_function(self.pm_c, "SsPmRecordLatency")
+        self.assertEqual(
+            body.count("SsPmElapsedMicroseconds(StartTick)"), 1,
+            "SsPmRecordLatency must convert through the shared helper")
+        self.assertEqual(
+            body.count("KeQueryPerformanceCounter"), 0,
+            "the duplicated conversion returned to SsPmRecordLatency")
+
+    def test_the_callback_cost_is_reported_in_microseconds(self):
+        # A create is expected to cost microseconds. A millisecond field rounds
+        # nearly every sample to zero and reports the callback as free, which is
+        # a measurement that cannot show what it exists to show.
+        for field in ("PcTotalCallbackTimeUs", "PcMaxCallbackTimeUs"):
+            self.assertEqual(
+                self.shared.count("LONG64 " + field + ";"), 1,
+                "%s must exist on the wire" % field)
+        self.assertEqual(
+            self.shared.count("PcTotalCallbackTimeMs"), 0,
+            "a millisecond spelling would round a microsecond-scale callback to zero")
+        self.assertEqual(
+            self.shared.count("PcMaxCallbackTimeMs"), 0,
+            "a millisecond spelling would round a microsecond-scale callback to zero")
+
+    def test_the_average_is_taken_over_invocations_not_over_scans(self):
+        # Most creates never reach a scan, so dividing by PcOperationsScanned
+        # would inflate the average by the ratio between the two - which is the
+        # quantity under investigation.
+        self.assertEqual(
+            self.rtp.count("ds.PcTotalCallbackTimeUs / ds.PcCallbackSamples"), 1,
+            "the in-callback average must divide by the number of invocations "
+            "timed, not by the number of scans")
+        self.assertEqual(
+            self.rtp.count("ds.PcTotalCallbackTimeUs / ds.PcOperationsScanned"), 0,
+            "dividing callback time by scans overstates the per-create cost")
 
 
 if __name__ == "__main__":

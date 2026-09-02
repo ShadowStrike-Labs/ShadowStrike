@@ -476,6 +476,30 @@ typedef struct _PC_STATISTICS {
     volatile LONG64 TotalScanTimeMs;        ///< Total scan time (for average)
     volatile LONG64 MaxScanTimeMs;          ///< Maximum scan time
 
+    //
+    // In-callback cost, which is NOT the scan time above.
+    //
+    // TotalScanTimeMs/MaxScanTimeMs measure the user-mode round trip only, and
+    // that round trip was measured fast and idle in the field (p50 0.11 ms over
+    // 2,655 requests) while the machine still stalled. What was never measured
+    // is the in-kernel work this callback performs on EVERY create before any
+    // scan is even considered: a normalized name resolution plus roughly two
+    // hundred pattern comparisons across the suspicious-path, extension,
+    // reserved-name and honeypot tables.
+    //
+    // MICROSECONDS, DELIBERATELY. A create is expected to cost microseconds, so
+    // a millisecond field would round nearly every sample to zero and report
+    // the callback as free - a measurement that cannot show the thing it exists
+    // to show.
+    //
+    // The two self-protection block paths return before the accounting point,
+    // so a denied create is not sampled. That is stated rather than hidden:
+    // those paths are rare and are not the cost being investigated.
+    //
+    volatile LONG64 CallbackSamples;        ///< Invocations actually timed
+    volatile LONG64 TotalCallbackTimeUs;    ///< Total in-callback microseconds
+    volatile LONG64 MaxCallbackTimeUs;      ///< Worst single invocation, us
+
 } PC_STATISTICS, *PPC_STATISTICS;
 
 /**
