@@ -15563,5 +15563,86 @@ class OnDemandScanOutcomeContractTests(unittest.TestCase):
             "carries no verdict information at all, which is why a literal was "
             "there in the first place")
 
+class QuickScanCriticalPathContractTests(unittest.TestCase):
+    """A Quick Scan must actually examine the places it claims to.
+
+    MEASURED. The critical-path list held two literal wildcard paths,
+    "C:\\Users\\*\\AppData\\Local\\Temp" and "C:\\Users\\*\\Downloads", each gated
+    on fs::exists. std::filesystem performs NO glob expansion, so both tests were
+    always false: a Quick Scan covered only the two Windows directories and never
+    looked at per-user Downloads or per-user Temp - the two highest-yield
+    locations on a consumer machine. It reported success either way, because a
+    scan that examines nothing is indistinguishable from one that finds nothing.
+
+    strip_c_comments is load-bearing here: the fix documents itself by quoting
+    the very literals it removed, so a comment-blind count is guaranteed to
+    report them as still present.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.se = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        cls.raw = read_source(SCAN_ENGINE_CPP_PATH)
+        start = cls.se.find("ScanEngine::QuickScan(")
+        cls.quick = cls.se[start:cls.se.find("ScanEngine::FullScan(")]
+        fs_start = cls.se.find("ScanEngine::FullScan(")
+        cls.full = cls.se[fs_start:cls.se.find("ScanEngine::CustomScan(")]
+
+    def test_no_wildcard_path_survives_in_code(self):
+        hits = [m.start() for m in re.finditer(r"Users\\\\\*", self.se)]
+        self.assertEqual(
+            hits, [],
+            "a wildcard path literal is back in CODE at offsets %s. "
+            "std::filesystem does not expand '*', so such a path can only ever "
+            "fail its existence test and silently remove itself from the scan"
+            % hits[:5])
+        # The explanation must survive, because the next reader has to know why
+        # a plain-looking path list is not allowed here.
+        self.assertIn(
+            r"Users\\*", self.raw,
+            "the comment recording why wildcard paths cannot work has been "
+            "removed, so the trap is undocumented and will be reintroduced")
+
+    def test_the_user_directories_are_resolved_per_profile(self):
+        self.assertEqual(
+            self.quick.count("GetKnownFolderForAllUsersOrSelf(FOLDERID_Downloads)"), 1,
+            "per-user Downloads must be resolved through the helper built for "
+            "this: the service runs as LocalSystem, so a null-token known-folder "
+            "call would resolve the SERVICE profile, not each user's")
+        self.assertEqual(
+            self.quick.count("GetKnownFolderForAllUsersOrSelf(FOLDERID_LocalAppData)"), 1,
+            "per-user Temp must be resolved the same way")
+
+    def test_the_windows_locations_are_not_a_hardcoded_drive(self):
+        self.assertEqual(
+            self.quick.count('L"C:\\\\Windows'), 0,
+            "a hardcoded Windows path is back; on a system installed anywhere "
+            "other than C: it matches nothing and the Quick Scan examines no "
+            "system files at all")
+        self.assertEqual(
+            self.quick.count("::GetSystemDirectoryW("), 1,
+            "the system directory must be resolved from the API")
+        self.assertEqual(
+            self.quick.count("::GetWindowsDirectoryW("), 1,
+            "the Windows directory must be resolved from the API")
+        self.assertEqual(
+            self.full.count("::GetWindowsDirectoryW("), 1,
+            "a full scan must derive the system drive rather than assume C:")
+
+    def test_the_existence_gate_survives(self):
+        # ANTI-VACUITY: resolving paths is only half of it. If the existence
+        # check were dropped, a profile that legitimately has no Downloads
+        # directory would be handed to ScanDirectory as a missing root.
+        self.assertEqual(
+            self.quick.count("fs::exists(path)"), 1,
+            "the resolved paths must still be checked for existence before "
+            "being scanned")
+        self.assertEqual(
+            self.quick.count("criticalPaths.size()"), 1,
+            "the resolved count must be reported, or a Quick Scan that resolves "
+            "nothing looks exactly like one that found nothing")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -44,6 +44,7 @@
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/ProcessUtils.hpp"
+#include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
 #include "HeuristicAnalyzer.hpp"
 #include "../FileSystem/ExecutableAnalyzer.hpp"
@@ -3613,13 +3614,59 @@ DirectoryScanResult ScanEngine::QuickScan(ScanProgressCallback progressCallback)
     request.context.deepScan = false;
     request.recursive = false;
 
-    // Critical areas only
-    std::vector<std::wstring> criticalPaths = {
-        L"C:\\Windows\\System32",
-        L"C:\\Windows\\Temp",
-        L"C:\\Users\\*\\AppData\\Local\\Temp",
-        L"C:\\Users\\*\\Downloads"
-    };
+    // CRITICAL AREAS, RESOLVED RATHER THAN GUESSED.
+    //
+    // This list held two literal WILDCARD paths - "C:\\Users\\*\\AppData\\Local\\Temp"
+    // and "C:\\Users\\*\\Downloads" - each gated below on fs::exists.
+    // std::filesystem performs NO glob expansion, so both tests were always false
+    // and a Quick Scan silently covered only the two Windows directories. Per-user
+    // Downloads and per-user Temp, the two highest-yield locations on a consumer
+    // machine, were never examined, and the scan reported success either way
+    // because examining nothing looks exactly like finding nothing.
+    //
+    // SystemUtils::GetKnownFolderForAllUsersOrSelf exists for this exact problem
+    // and its own documentation says why: the service runs as LocalSystem, so
+    // SHGetKnownFolderPath with a null token resolves the SERVICE profile rather
+    // than each interactive user's. It returns one path per profile and falls back
+    // to the caller only when no interactive user exists.
+    std::vector<std::wstring> criticalPaths;
+
+    // Windows locations come from the API, not a hardcoded drive letter: on a
+    // system installed anywhere other than C: the two literals below matched
+    // nothing, so a Quick Scan examined no system files whatsoever.
+    {
+        wchar_t sysDir[MAX_PATH]{};
+        const UINT n = ::GetSystemDirectoryW(sysDir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            criticalPaths.emplace_back(sysDir, n);
+        }
+    }
+    {
+        wchar_t winDir[MAX_PATH]{};
+        const UINT n = ::GetWindowsDirectoryW(winDir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring temp(winDir, n);
+            if (temp.back() != L'\\') temp.push_back(L'\\');
+            criticalPaths.push_back(temp + L"Temp");
+        }
+    }
+
+    for (const auto& downloads :
+         SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_Downloads)) {
+        criticalPaths.push_back(downloads);
+    }
+    for (auto localAppData :
+         SystemUtils::GetKnownFolderForAllUsersOrSelf(FOLDERID_LocalAppData)) {
+        if (localAppData.empty()) continue;
+        if (localAppData.back() != L'\\') localAppData.push_back(L'\\');
+        criticalPaths.push_back(localAppData + L"Temp");
+    }
+
+    // Reported because a Quick Scan that resolves nothing is otherwise
+    // indistinguishable from one that found nothing - the failure mode above.
+    SS_LOG_INFO(L"ScanEngine",
+                L"QuickScan resolved %zu critical path(s) to examine",
+                criticalPaths.size());
 
     DirectoryScanResult combinedResult{};
 
@@ -3645,7 +3692,19 @@ DirectoryScanResult ScanEngine::QuickScan(ScanProgressCallback progressCallback)
 
 DirectoryScanResult ScanEngine::FullScan(ScanProgressCallback progressCallback) {
     DirectoryScanRequest request{};
+
+    // The SYSTEM drive, not a hardcoded C:. Same wrong assumption as the Quick
+    // Scan roots above: on a machine whose Windows lives elsewhere this scanned a
+    // drive that may not exist. Scanning EVERY fixed drive is a separate decision
+    // with a large cost attached and is deliberately not made here.
     request.rootPath = L"C:\\";
+    {
+        wchar_t winDir[MAX_PATH]{};
+        const UINT n = ::GetWindowsDirectoryW(winDir, MAX_PATH);
+        if (n >= 3 && n < MAX_PATH && winDir[1] == L':' && winDir[2] == L'\\') {
+            request.rootPath.assign(winDir, 3);
+        }
+    }
     request.recursive = true;
     request.maxDepth = 100;
     request.context.type = ScanType::OnDemand;
