@@ -15642,6 +15642,71 @@ class QuickScanCriticalPathContractTests(unittest.TestCase):
             "the resolved count must be reported, or a Quick Scan that resolves "
             "nothing looks exactly like one that found nothing")
 
+class SingleInstanceHandoverContractTests(unittest.TestCase):
+    """A second launch must not drop the command line it was started with.
+
+    MEASURED IN main(). The single-instance mutex is created at step 3; the
+    activation pipe SERVER does not start until step 9, after QApplication, the
+    logger, localisation and the perf budget. A second launch sees
+    ERROR_ALREADY_EXISTS almost immediately, so with one attempt it found no
+    pipe, logged a warning nobody reads, and exited - discarding its arguments.
+
+    Previously that window was reachable only by an impatient double launch.
+    Explorer invokes a context-menu verb ONCE PER SELECTED ITEM, so it is now
+    the ordinary multi-selection path.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.main = strip_c_comments(read_source(UI_CLIENT_MAIN_CPP_PATH))
+
+    def test_the_handover_waits_for_the_pipe(self):
+        self.assertEqual(
+            self.main.count("HANDLE OpenActivationPipeWithRetry() noexcept"), 1,
+            "the retrying open is gone, so a handover during UI startup loses "
+            "the command line again")
+        self.assertEqual(
+            self.main.count("::WaitNamedPipeW("), 1,
+            "ERROR_PIPE_BUSY must be waited on with WaitNamedPipeW, which is "
+            "the documented wait for a server whose instances are all busy")
+
+    def test_the_wait_is_bounded(self):
+        body = extract_c_function(self.main, "OpenActivationPipeWithRetry")
+        self.assertIn(
+            "kTotalWaitMs", body,
+            "the retry must have a stated ceiling; this process exists only to "
+            "hand over its arguments and must never outlive that job")
+        self.assertEqual(
+            body.count("waited <= kTotalWaitMs"), 1,
+            "the loop is no longer bounded by the ceiling")
+        self.assertEqual(
+            body.count("return INVALID_HANDLE_VALUE;"), 2,
+            "both giving-up paths must return a failure: the unrecoverable "
+            "error and the exhausted budget")
+
+    def test_an_unrecoverable_error_is_not_retried(self):
+        body = extract_c_function(self.main, "OpenActivationPipeWithRetry")
+        self.assertIn(
+            "err != ERROR_FILE_NOT_FOUND", body,
+            "only a not-yet-created pipe is worth retrying; a denial will not "
+            "resolve itself and retrying only delays the report")
+
+    def test_the_caller_no_longer_opens_the_pipe_itself(self):
+        body = extract_c_function(self.main, "SignalFirstInstance")
+        self.assertEqual(
+            body.count("::CreateFileW("), 0,
+            "SignalFirstInstance opens the pipe directly again, bypassing the "
+            "wait")
+        self.assertEqual(
+            body.count("OpenActivationPipeWithRetry()"), 1,
+            "SignalFirstInstance must obtain its handle from the retrying open")
+        # ANTI-VACUITY: the handover must still actually send the command line.
+        self.assertIn(
+            "kActivationFrameMagic", body,
+            "the framed command-line payload is gone, so the handover would "
+            "connect and transmit nothing")
+
+
 
 
 if __name__ == "__main__":

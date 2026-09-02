@@ -258,21 +258,83 @@ struct StartupArgs {
 // Attempt to signal the first instance to show its window.
 // Best-effort: any failure is logged at WARN and ignored.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Open the first instance's activation pipe, waiting for it to appear.
+//
+// WHY A RETRY IS REQUIRED AND IS NOT DEFENSIVE PADDING. The single-instance
+// mutex is created at step 3 of main(); the pipe SERVER does not start until
+// step 9, after QApplication, the logger, localisation and the perf budget. A
+// second launch therefore sees ERROR_ALREADY_EXISTS almost immediately and, with
+// a single attempt, finds no pipe yet - so it logged a warning nobody reads and
+// exited, discarding the command line it was started with.
+//
+// That window used to be reachable only by an impatient double launch. It is now
+// the ordinary path: Explorer invokes a context-menu verb ONCE PER SELECTED
+// ITEM, so selecting several files while the UI is not already running produced
+// one process that scanned the first target and N-1 that dropped theirs in
+// silence.
+//
+// BOUNDED ON PURPOSE. This process exists only to hand over its arguments, so it
+// must never outlive that job. If the first instance is wedged rather than
+// starting, giving up and saying so is the correct outcome.
+[[nodiscard]] HANDLE OpenActivationPipeWithRetry() noexcept
+{
+    constexpr int   kTotalWaitMs = 10000;
+    constexpr DWORD kSliceMs     = 100;
+
+    for (int waited = 0; waited <= kTotalWaitMs;
+         waited += static_cast<int>(kSliceMs)) {
+
+        HANDLE pipe = ::CreateFileW(WindowActivator::kPipeName,
+                                    GENERIC_WRITE,
+                                    0,
+                                    nullptr,
+                                    OPEN_EXISTING,
+                                    0,
+                                    nullptr);
+        if (pipe != INVALID_HANDLE_VALUE) {
+            if (waited > 0) {
+                SS_LOG_INFO(L"PhantomHome.Main",
+                            L"Activation pipe became available after %d ms",
+                            waited);
+            }
+            return pipe;
+        }
+
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_PIPE_BUSY) {
+            // The server exists but every instance is serving another client.
+            // WaitNamedPipeW is the documented wait for exactly this state and
+            // returns as soon as one is free, so it replaces the sleep rather
+            // than adding to it.
+            if (::WaitNamedPipeW(WindowActivator::kPipeName, kSliceMs)) {
+                continue;
+            }
+        } else if (err != ERROR_FILE_NOT_FOUND) {
+            // A denial or a malformed name will not resolve itself; retrying
+            // would only delay the report.
+            SS_LOG_WARN(L"PhantomHome.Main",
+                        L"Activation pipe cannot be opened (error=%lu); "
+                        L"not retrying",
+                        err);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        ::Sleep(kSliceMs);
+    }
+
+    SS_LOG_WARN(L"PhantomHome.Main",
+                L"Activation pipe did not appear within %d ms; the command line "
+                L"this process was started with has been dropped",
+                kTotalWaitMs);
+    return INVALID_HANDLE_VALUE;
+}
+
 void SignalFirstInstance() noexcept
 {
-    HANDLE pipe = ::CreateFileW(
-        WindowActivator::kPipeName,
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        OPEN_EXISTING,
-        0,
-        nullptr);
-
+    HANDLE pipe = OpenActivationPipeWithRetry();
     if (pipe == INVALID_HANDLE_VALUE) {
-        SS_LOG_WARN(L"PhantomHome.Main",
-                    L"Could not open activation pipe to first instance (error=%lu)",
-                    ::GetLastError());
+        // OpenActivationPipeWithRetry has already reported the reason.
         return;
     }
 
