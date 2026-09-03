@@ -3261,6 +3261,13 @@ BatchScanResult ScanEngine::ScanBatch(
 
             auto result = ScanFile(filePath, request.context);
 
+            // Snapshotted INSIDE this lock, not read from stats afterwards.
+            // Every worker mutates stats.totalBytesScanned here under
+            // resultMutex, so reading that member from the progress block
+            // below - which deliberately runs OUTSIDE the lock so a slow
+            // consumer cannot serialise the scan - would be a data race.
+            uint64_t bytesSoFar = 0;
+
             {
                 std::lock_guard lock(resultMutex);
                 batchResult.results.push_back(result);
@@ -3277,11 +3284,34 @@ BatchScanResult ScanEngine::ScanBatch(
                 if (!fsSizeEc) {
                     stats.totalBytesScanned += fsz;
                 }
+
+                bytesSoFar = stats.totalBytesScanned;
             }
 
             completed.fetch_add(1, std::memory_order_relaxed);
 
             // Progress callback
+            //
+            // FIVE OF ScanProgress'S TEN FIELDS HAD NO PRODUCER ANYWHERE, and
+            // this is the only progress emitter the on-demand scan path reaches:
+            // QuickScan, FullScan and CustomScan all delegate to ScanDirectory,
+            // which delegates the actual work to ScanBatch. So bytesScanned,
+            // filesPerSecond, bytesPerSecond and estimatedRemaining were
+            // structurally zero for every scan a user can start, and any UI
+            // that displayed them would have been reporting a constant.
+            //
+            // All four are derived here from values this loop already holds -
+            // no new state, no extra I/O, no additional lock. The byte total is
+            // the snapshot taken above; the two rates come from the elapsed
+            // clock that was already being read; the estimate is the remaining
+            // file count over the observed file rate.
+            //
+            // totalBytes IS LEFT AT ZERO ON PURPOSE. Knowing it means stat-ing
+            // every file BEFORE the scan starts, which on a full-disk scan is a
+            // second complete directory walk ahead of the first byte scanned.
+            // That is a cost decision with a visible latency consequence, so it
+            // is not something to slip in behind a progress field - and a wrong
+            // denominator is worse than an absent one. Nothing reports it.
             if (progressCallback) {
                 ScanProgress progress{};
                 progress.filesScanned = completed.load();
@@ -3291,9 +3321,36 @@ BatchScanResult ScanEngine::ScanBatch(
                           / static_cast<float>(totalFiles)
                     : 0.0f;
                 progress.currentFile = filePath;
+                progress.bytesScanned = bytesSoFar;
                 progress.elapsed = duration_cast<milliseconds>(
                     steady_clock::now() - batchStart
                 );
+
+                // Guarded on a non-zero clock rather than assuming one: the
+                // first completion can land inside the same millisecond the
+                // batch started, and dividing by that would be undefined.
+                const uint64_t elapsedMs =
+                    static_cast<uint64_t>(progress.elapsed.count() > 0
+                                          ? progress.elapsed.count()
+                                          : 0);
+                if (elapsedMs > 0) {
+                    progress.filesPerSecond =
+                        (progress.filesScanned * 1000ull) / elapsedMs;
+                    progress.bytesPerSecond =
+                        (progress.bytesScanned * 1000ull) / elapsedMs;
+                }
+
+                // Only projected forward from a rate actually observed, and
+                // only while files remain. A zero rate yields no estimate at
+                // all rather than an infinite or a fabricated one.
+                if (progress.filesPerSecond > 0 &&
+                    totalFiles > progress.filesScanned) {
+                    progress.estimatedRemaining = milliseconds{
+                        static_cast<milliseconds::rep>(
+                            ((totalFiles - progress.filesScanned) * 1000ull)
+                            / progress.filesPerSecond)
+                    };
+                }
 
                 progressCallback(progress);
             }

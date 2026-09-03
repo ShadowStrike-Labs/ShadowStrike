@@ -16428,5 +16428,135 @@ class ScanSendLatencyInstrumentationContractTests(unittest.TestCase):
             "the average wait is no longer divided by the number of sends")
 
 
+
+class ScanProgressProducerContractTests(unittest.TestCase):
+    """Every ScanProgress field the on-demand path reports must have a producer.
+
+    THE ROUTE IS THE REASON THIS IS ONE EMITTER AND NOT THREE. ScanEngine has
+    three progress emitters - ScanFileAsync, ScanBatch and ScanAllProcesses -
+    and QuickScan, FullScan and CustomScan all reach exactly one of them:
+    each delegates to ScanDirectory, which delegates the work to ScanBatch. So
+    ScanBatch's emitter is the only one a user-started scan can observe, and
+    five of ScanProgress's ten fields were never assigned by any emitter at all.
+
+    A field with no producer is worse than an absent field, because zero is a
+    legitimate value: a UI showing "0 bytes/sec" is indistinguishable from a
+    stalled scan. This suite exists so those four stay derived and the fifth
+    stays absent.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        m = re.search(r"\bScanEngine::ScanBatch\s*\(", cls.src)
+        if m is None:
+            raise AssertionError("ScanEngine::ScanBatch definition not found")
+        brace = cls.src.index("{", m.start())
+        cls.batch = cls.src[m.start():_matching_delimiter(cls.src, brace, "{", "}") + 1]
+
+    def _critical_section(self):
+        """The resultMutex critical section, by brace match rather than by window."""
+        k = self.batch.index("std::lock_guard lock(resultMutex)")
+        open_brace = self.batch.rindex("{", 0, k)
+        return self.batch[open_brace:
+                          _matching_delimiter(self.batch, open_brace, "{", "}") + 1]
+
+    def _emitter(self):
+        """The progress block, anchored on the callback invocation it ends with."""
+        k = self.batch.index("progressCallback(progress)")
+        start = self.batch.rindex("ScanProgress progress{}", 0, k)
+        return self.batch[start:k]
+
+    def test_the_byte_total_is_snapshotted_under_the_lock(self):
+        # LOAD-BEARING. Every worker mutates stats.totalBytesScanned under
+        # resultMutex, and the progress block runs OUTSIDE that lock on purpose
+        # so a slow consumer cannot serialise the scan. Reading the member from
+        # the emitter would therefore be a data race, not merely untidy.
+        section = self._critical_section()
+        self.assertIn(
+            "bytesSoFar = stats.totalBytesScanned", section,
+            "the running byte total is no longer snapshotted inside the "
+            "resultMutex critical section")
+
+        emitter = self._emitter()
+        self.assertEqual(
+            emitter.count("stats."), 0,
+            "the progress emitter reads %d stats member(s) directly; it runs "
+            "outside resultMutex, so every one of those is a data race with the "
+            "other workers" % emitter.count("stats."))
+        self.assertIn(
+            "progress.bytesScanned = bytesSoFar", emitter,
+            "the emitter no longer publishes the snapshotted byte total")
+
+    def test_the_four_derivable_fields_are_produced(self):
+        emitter = self._emitter()
+        # ASSIGNMENTS, not occurrences. Two of these four are read back within
+        # the same block - bytesScanned feeds the byte rate and filesPerSecond
+        # feeds the remaining-time estimate - so a plain substring count sees
+        # two hits for one producer and rejects correct code.
+        for field in ("bytesScanned", "filesPerSecond",
+                      "bytesPerSecond", "estimatedRemaining"):
+            n = len(re.findall(r"progress\." + field + r"\s*=[^=]", emitter))
+            self.assertEqual(
+                n, 1,
+                "expected exactly one assignment of progress.%s in the only "
+                "emitter the on-demand scan path reaches, found %d"
+                % (field, n))
+
+        # Anti-vacuity: the emitter must still be the real one, not a husk that
+        # trivially satisfies the counts above.
+        self.assertIn("progress.filesScanned = completed.load()", emitter,
+                      "this is no longer the batch emitter")
+        self.assertIn("progressCallback", self.batch,
+                      "ScanBatch no longer invokes the callback at all")
+
+    def test_the_rates_are_not_divided_by_an_unchecked_clock(self):
+        # The first completion can land inside the same millisecond the batch
+        # started, so the divisor is genuinely reachable at zero.
+        emitter = self._emitter()
+        self.assertTrue(
+            re.search(r"if\s*\(\s*elapsedMs\s*>\s*0\s*\)", emitter),
+            "the throughput rates are no longer guarded against a zero elapsed "
+            "time, which is reachable on the first completion")
+
+        rate_at = emitter.index("progress.filesPerSecond")
+        guard_at = emitter.index("elapsedMs > 0")
+        self.assertLess(
+            guard_at, rate_at,
+            "the zero-clock guard sits at offset %d but the division at %d, so "
+            "the guard cannot be protecting it" % (guard_at, rate_at))
+
+    def test_the_estimate_is_only_projected_from_an_observed_rate(self):
+        emitter = self._emitter()
+        self.assertTrue(
+            re.search(r"progress\.filesPerSecond\s*>\s*0", emitter),
+            "the remaining-time estimate no longer requires a rate that was "
+            "actually observed, so it would fabricate or divide by zero")
+        self.assertTrue(
+            re.search(r"totalFiles\s*>\s*progress\.filesScanned", emitter),
+            "the estimate no longer checks that files remain, so a finished "
+            "scan would report time still to run")
+
+    def test_the_unknowable_total_is_left_alone(self):
+        # totalBytes cannot be known without stat-ing every file BEFORE the scan
+        # starts - a second full directory walk on a full-disk scan. A wrong
+        # denominator is worse than an absent one, so the honest state is unset.
+        # Guarding it matters because the tempting "fix" for a zero field is to
+        # invent a value for it.
+        emitter = self._emitter()
+        self.assertEqual(
+            emitter.count("progress.totalBytes"), 0,
+            "progress.totalBytes is being assigned in the batch emitter, which "
+            "cannot know it: the file sizes are only discovered as each file is "
+            "reached. Either it is fabricated, or a pre-pass was added without "
+            "accounting for its latency")
+
+        # Not vacuous: the sibling field it would be confused with IS assigned.
+        self.assertEqual(
+            len(re.findall(r"progress\.bytesScanned\s*=[^=]", emitter)), 1,
+            "the running byte counter is missing, so the absence above proves "
+            "nothing")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
