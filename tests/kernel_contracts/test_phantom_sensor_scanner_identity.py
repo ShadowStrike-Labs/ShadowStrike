@@ -16091,5 +16091,145 @@ class PathKeyedScanCacheContractTests(unittest.TestCase):
             "PreCreate no longer restricts path keying to local file systems")
 
 
+
+class ScanCircuitRefusalAccountingContractTests(unittest.TestCase):
+    """A scan that was never attempted must not be reported as one that failed.
+
+    THE DEFECT. SbSendScanRequestEx returns SHADOWSTRIKE_ERROR_CIRCUIT_OPEN
+    before it touches FltSendMessage when the scanner's circuit breaker is open,
+    which happens after six reply timeouts inside two seconds. That value is a
+    severity-3 customer failure code, so NT_SUCCESS is false, and it is not
+    STATUS_TIMEOUT - which put it in the create path's generic scan-error branch.
+
+    The consequence was a statistic that answered the wrong question. Field run
+    1.0.107 reported errors=27961 against scanned=40392 with timeouts=60: a 69
+    percent apparent error rate that read as a broken transport, when what it
+    actually described was 27,961 files allowed through UNSCANNED while the
+    breaker recovered. One of those readings points at a bug in the channel; the
+    other points at a coverage gap. They need different names.
+    """
+
+    def test_a_circuit_refusal_is_not_counted_as_a_scan_error(self):
+        # strip_c_comments FIRST: the comments added with this fix quote both the
+        # constant and both counter names, so a comment-blind scan is the only
+        # kind that can tell whether the CODE classifies them apart.
+        src = strip_c_comments(read_source(PRECREATE_PATH))
+
+        self.assertEqual(
+            src.count("SHADOWSTRIKE_ERROR_CIRCUIT_OPEN"), 1,
+            "expected exactly one classification of SHADOWSTRIKE_ERROR_CIRCUIT_OPEN "
+            "on the create path, found %d"
+            % src.count("SHADOWSTRIKE_ERROR_CIRCUIT_OPEN"))
+        self.assertEqual(
+            src.count("Stats.ScanCircuitOpen"), 1,
+            "expected exactly one increment of the circuit-refusal counter, found "
+            "%d" % src.count("Stats.ScanCircuitOpen"))
+
+        # ORDERING IS THE INVARIANT, not mere presence. The generic error branch
+        # is an else, so a circuit refusal is only classified correctly while its
+        # test comes first. Move it after and the specific counter silently stops
+        # incrementing while every assertion about presence still passes.
+        circuit_at = src.index("SHADOWSTRIKE_ERROR_CIRCUIT_OPEN")
+        error_at = src.index("Stats.ScanErrors")
+        self.assertLess(
+            circuit_at, error_at,
+            "the circuit-open test appears at offset %d, after the first "
+            "scan-error increment at %d, so refusals fall through into the "
+            "generic error count again" % (circuit_at, error_at))
+
+        # ANTI-VACUITY: genuine scan errors must still be counted, or this test
+        # would pass if the error counter had simply been deleted.
+        self.assertGreaterEqual(
+            src.count("Stats.ScanErrors"), 1,
+            "no scan-error counter remains, so the split would be satisfied by "
+            "removing the thing it distinguishes from")
+
+    def test_the_circuit_branch_preserves_the_fail_closed_policy(self):
+        # REGRESSION GUARD. Before the split a refusal reached the generic branch
+        # and therefore honoured FailOpenOnError, so a fail-closed configuration
+        # blocked on it. The tempting simplification is to let a refusal always
+        # allow, since the breaker exists to keep the machine moving - but that
+        # silently overrides an administrator's explicit choice.
+        src = strip_c_comments(read_source(PRECREATE_PATH))
+        start = src.index("SHADOWSTRIKE_ERROR_CIRCUIT_OPEN")
+        # Brace-matched, NOT a fixed character window. strip_c_comments replaces
+        # comments with whitespace rather than removing them, so the explanatory
+        # block above this branch leaves roughly a thousand blank columns behind
+        # and a windowed slice never reached the code it was meant to inspect.
+        brace = src.index("{", start)
+        branch = src[start:_matching_delimiter(src, brace, "{", "}") + 1]
+
+        self.assertGreaterEqual(
+            branch.count("FailOpenOnError"), 1,
+            "the circuit-refusal branch no longer consults FailOpenOnError, so a "
+            "fail-closed configuration is silently overridden (0 occurrences in "
+            "a %d-char branch)" % len(branch))
+
+        # And it must not re-introduce the conflation one level down: the breaker
+        # is global to the scanner connection, so charging it to a volume spreads
+        # one global fact across every mounted volume.
+        self.assertEqual(
+            branch.count("ShadowInstanceRecordScanError"), 0,
+            "the circuit-refusal branch records a per-volume SCAN ERROR, which "
+            "moves the same mislabelling into the per-volume counters")
+
+    def test_the_refusal_counter_is_published_on_the_wire(self):
+        # SCOPED DELIBERATELY NARROW. The BLOCK LAYOUT is already pinned, better
+        # than this test could, by PreCreateCounterObservabilityContractTests:
+        # that test DERIVES the last Pc* field from the struct and requires the
+        # total-size assertion to name whatever it finds, so it picked up this
+        # field's offset assertion automatically and would fail if the assertion
+        # were dropped. Restating those checks here with the field name written
+        # down would be a weaker copy of a stronger guard, and would make two
+        # tests key on one literal.
+        #
+        # What that derived guard CANNOT see is whether this particular counter
+        # exists at all - it only requires at least twenty Pc* fields, and there
+        # were twenty before this one - or whether anything ever writes it. A wire
+        # field nobody populates reads zero forever, which is indistinguishable
+        # from a breaker that never opened.
+        shared = strip_c_comments(read_source(SHARED_DEFS_H_PATH))
+        driver = strip_c_comments(read_source(PRECREATE_PATH))
+
+        self.assertEqual(
+            shared.count("LONG64 PcScanCircuitOpen;"), 1,
+            "expected exactly one PcScanCircuitOpen field on the wire, found %d"
+            % shared.count("LONG64 PcScanCircuitOpen;"))
+
+        self.assertEqual(
+            driver.count("status->PcScanCircuitOpen"), 1,
+            "the wire field is never populated from the driver's statistics, so "
+            "it would report zero regardless of how many creates were refused "
+            "(found %d assignments)" % driver.count("status->PcScanCircuitOpen"))
+
+    def test_the_report_emits_the_refusal_beside_the_error(self):
+        # CROSS-ARTIFACT, and positional: std::format matches arguments to
+        # placeholders by order, so the format text and the argument list have to
+        # agree on WHERE the new value sits, not merely that both mention it.
+        src = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+        self.assertEqual(
+            src.count("circuitOpen={}"), 1,
+            "expected exactly one circuitOpen placeholder in the capacity report, "
+            "found %d" % src.count("circuitOpen={}"))
+        self.assertEqual(
+            src.count("ds.PcScanCircuitOpen"), 1,
+            "expected exactly one PcScanCircuitOpen argument, found %d"
+            % src.count("ds.PcScanCircuitOpen"))
+
+        fmt_err = src.index("errors={}")
+        fmt_circ = src.index("circuitOpen={}")
+        self.assertLess(
+            fmt_err, fmt_circ,
+            "the circuitOpen placeholder precedes errors={} in the format string")
+
+        arg_err = src.index("ds.PcScanErrors")
+        arg_circ = src.index("ds.PcScanCircuitOpen")
+        self.assertLess(
+            arg_err, arg_circ,
+            "the arguments are ordered the other way round from the placeholders, "
+            "so the two values would be reported under each other's names")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -519,6 +519,16 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     LONG64 PcTotalCallbackTimeUs;
     LONG64 PcMaxCallbackTimeUs;
 
+    //
+    // Creates the scanner was never asked about, because its circuit breaker
+    // was open. NOT a scan error, which is what these used to be counted as:
+    // an error means a scan was attempted and failed, while this means the
+    // attempt was deliberately skipped and the file was allowed unscanned.
+    // Field run 1.0.107 reported errors=27961 against scanned=40392, and the
+    // overwhelming majority of that 69 percent was this, mislabelled.
+    //
+    LONG64 PcScanCircuitOpen;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 //
@@ -589,8 +599,10 @@ C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalCallbackTimeUs) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcCallbackSamples) + sizeof(LONG64));
 C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxCallbackTimeUs) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalCallbackTimeUs) + sizeof(LONG64));
-C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanCircuitOpen) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxCallbackTimeUs) + sizeof(LONG64));
+C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanCircuitOpen) + sizeof(LONG64));
 
 // ============================================================================
 // POLICY UPDATE STRUCTURE

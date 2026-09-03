@@ -7260,13 +7260,15 @@ public:
                         : 0;
                 kernelPart = std::format(
                     "kernelPreCreate: total={} scanned={} blocked={} excluded={} "
-                    "cached={} timeouts={} errors={} selfProt={} catalogExempt={} "
+                    "cached={} timeouts={} errors={} circuitOpen={} selfProt={} "
+                    "catalogExempt={} "
                     "honeypot={} ads={} dblExt={} suspPath={} ransomCorr={} "
                     "exe={} script={} doc={} archive={} avgScanMs={} maxScanMs={} "
                     "cbSamples={} cbAvgUs={} cbMaxUs={}",
                     ds.PcTotalOperations, ds.PcOperationsScanned,
                     ds.PcOperationsBlocked, ds.PcOperationsExcluded,
                     ds.PcOperationsCached, ds.PcScanTimeouts, ds.PcScanErrors,
+                    ds.PcScanCircuitOpen,
                     ds.PcSelfProtectBlocks, ds.PcCatalogStoreExemptions,
                     ds.PcHoneypotDetections, ds.PcAdsDetections,
                     ds.PcDoubleExtDetections, ds.PcSuspiciousPathDetections,

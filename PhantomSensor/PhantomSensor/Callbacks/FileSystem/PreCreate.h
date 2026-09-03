@@ -493,7 +493,19 @@ typedef struct _PC_STATISTICS {
     volatile LONG64 OperationsExcluded;     ///< Files excluded
     volatile LONG64 OperationsCached;       ///< Cache hits
     volatile LONG64 ScanTimeouts;           ///< Scan timeouts
-    volatile LONG64 ScanErrors;             ///< Scan errors
+    volatile LONG64 ScanErrors;             ///< Scan requests that were made
+                                            ///< and failed.
+    volatile LONG64 ScanCircuitOpen;        ///< Scan requests never made
+                                            ///< because the scanner's circuit
+                                            ///< breaker was open. Counted apart
+                                            ///< from ScanErrors for the same
+                                            ///< reason CatalogStoreExemptions is
+                                            ///< counted apart from
+                                            ///< OperationsExcluded: a failed
+                                            ///< attempt and a skipped attempt
+                                            ///< are different facts about one
+                                            ///< file, and only one of them says
+                                            ///< the scanner is broken.
     volatile LONG64 SelfProtectBlocks;      ///< Self-protection blocks
     volatile LONG64 CatalogStoreExemptions; ///< Catalog-store creates not routed
                                             ///< to the scanner. Counted separately

@@ -1883,6 +1883,53 @@ Return Value:
                             SsPathCacheActionAnnotate,
                             CachePathVolumeSerial);
                     }
+                } else if (Status == SHADOWSTRIKE_ERROR_CIRCUIT_OPEN) {
+                    //
+                    // THE SCANNER WAS NEVER ASKED. SbSendScanRequestEx returns
+                    // this before touching FltSendMessage when the circuit
+                    // breaker is open, which happens after six reply timeouts
+                    // inside two seconds. The file is allowed UNSCANNED for the
+                    // recovery window, and that is deliberate - the breaker
+                    // exists so a saturated scanner degrades to "not scanned"
+                    // instead of serializing every file open behind it.
+                    //
+                    // What was NOT deliberate is calling it a scan error. An
+                    // error says an attempt failed and therefore points at a
+                    // broken scanner; this says no attempt was made and points
+                    // at a coverage gap. Field run 1.0.107 reported
+                    // errors=27961 against scanned=40392 and timeouts=60: the
+                    // 69 percent "error rate" was overwhelmingly this, and it
+                    // read as a transport fault for as long as it was conflated.
+                    //
+                    // ShadowInstanceRecordScanError is deliberately NOT called.
+                    // The breaker is global to the scanner connection, not a
+                    // property of the volume, so attributing it per volume
+                    // would spread one global fact across every mounted volume
+                    // and make the per-volume error counts wrong in the
+                    // opposite direction.
+                    //
+                    InterlockedIncrement64(&g_PcState.Stats.ScanCircuitOpen);
+
+                    if (PcpShouldLogOperation()) {
+                        DbgPrintEx(
+                            DPFLTR_IHVDRIVER_ID,
+                            DPFLTR_WARNING_LEVEL,
+                            "[ShadowStrike/PreCreate] Allowed unscanned: scanner "
+                            "circuit open for %wZ\n",
+                            &NameInfo->Name
+                            );
+                    }
+
+                    //
+                    // POLICY UNCHANGED, DELIBERATELY. Before this split a
+                    // circuit-open landed in the branch below and therefore
+                    // honoured FailOpenOnError, so a fail-closed configuration
+                    // blocked on it. Preserved exactly: this split is about what
+                    // gets counted, not about what gets allowed.
+                    //
+                    if (!g_PcState.Config.FailOpenOnError) {
+                        ShouldBlock = TRUE;
+                    }
                 } else {
                     InterlockedIncrement64(&g_PcState.Stats.ScanErrors);
 
@@ -2816,6 +2863,7 @@ Routine Description:
     status->PcCallbackSamples          = snapshot.CallbackSamples;
     status->PcTotalCallbackTimeUs      = snapshot.TotalCallbackTimeUs;
     status->PcMaxCallbackTimeUs        = snapshot.MaxCallbackTimeUs;
+    status->PcScanCircuitOpen          = snapshot.ScanCircuitOpen;
 }
 
 
