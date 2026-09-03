@@ -440,6 +440,25 @@ typedef struct _POC_COMPLETION_CONTEXT {
     HANDLE ProcessId;                   ///< Requesting process
     HANDLE ThreadId;                    ///< Requesting thread
 
+    //
+    // PATH-KEYED SCAN CACHE HANDOFF
+    //
+    // The create pre-operation cannot read a file's identity, because the file
+    // is not open yet - which is why the scan cache went unused on the create
+    // path entirely. It can only key on the path. Whichever of the two follow-up
+    // actions that leaves owing must happen here, where the file IS open.
+    //
+    // Carried as scalars on purpose: no cache type appears in this header, so
+    // the callback contract does not depend on the cache's internal layout.
+    //
+
+    /// @brief Which follow-up is owed. An SS_PATH_CACHE_ACTION value, declared
+    /// in PreCreate.h because both halves of IRP_MJ_CREATE must agree on it.
+    ULONG PathCacheAction;
+
+    /// @brief Volume serial the path key was built from. Zero means unusable.
+    ULONG PathCacheVolumeSerial;
+
 } POC_COMPLETION_CONTEXT, *PPOC_COMPLETION_CONTEXT;
 
 #define POC_COMPLETION_SIGNATURE        'pCcP'  // PcCp

@@ -596,6 +596,115 @@ Return Value:
     }
 
     // ========================================================================
+    // PHASE 2b: PATH-KEYED SCAN CACHE HANDOFF
+    // ========================================================================
+    //
+    // The create pre-operation cannot read a file's identity, because the file
+    // is not open yet. It can only key the scan cache on the path. Whatever that
+    // leaves owing is settled here, where the file IS open:
+    //
+    //   Annotate - a real scan produced a verdict and inserted a path entry that
+    //              has no identity witness. Until it gets one it cannot satisfy
+    //              a lookup, so failing to annotate costs a re-scan, not safety.
+    //
+    //   Verify   - a path-keyed verdict was TRUSTED and a scan was SKIPPED. The
+    //              identity behind that verdict is confirmed against the file
+    //              that was actually opened, and on any disagreement the open is
+    //              revoked before the caller ever receives a handle.
+    //
+    if (completionCtx != NULL &&
+        completionCtx->PathCacheAction != (ULONG)SsPathCacheActionNone &&
+        completionCtx->PathCacheVolumeSerial != 0 &&
+        NT_SUCCESS(Data->IoStatus.Status)) {
+
+        PFLT_FILE_NAME_INFORMATION pcNameInfo = NULL;
+
+        if (NT_SUCCESS(FltGetFileNameInformation(
+                           Data,
+                           FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+                           &pcNameInfo)) &&
+            NT_SUCCESS(FltParseFileNameInformation(pcNameInfo))) {
+
+            if (completionCtx->PathCacheAction == (ULONG)SsPathCacheActionAnnotate) {
+                ShadowStrikeCacheAnnotatePathEntry(
+                    FltObjects,
+                    completionCtx->PathCacheVolumeSerial,
+                    &pcNameInfo->Name
+                    );
+            } else if (completionCtx->PathCacheAction == (ULONG)SsPathCacheActionVerify) {
+                BOOLEAN pcMismatch = TRUE;
+
+                ShadowStrikeCacheVerifyPathEntry(
+                    FltObjects,
+                    completionCtx->PathCacheVolumeSerial,
+                    &pcNameInfo->Name,
+                    &pcMismatch
+                    );
+
+                if (pcMismatch) {
+                    FltReleaseFileNameInformation(pcNameInfo);
+                    pcNameInfo = NULL;
+
+                    //
+                    // REVOKE THE OPEN. FltCancelFileOpen's documented
+                    // preconditions, each satisfied explicitly:
+                    //
+                    //   IRQL <= APC_LEVEL - guaranteed, because for
+                    //   IRP_MJ_CREATE the post-operation callback runs at
+                    //   PASSIVE_LEVEL in the originating thread's context.
+                    //
+                    //   Not draining - this function already returned early on
+                    //   FLTFL_POST_OPERATION_DRAINING before PAGED_CODE(), so
+                    //   reaching here means the flag is clear and Data is the
+                    //   real callback data rather than a copy.
+                    //
+                    //   No handle yet - checked below. Once a handle exists the
+                    //   file object cannot be cancelled, and calling anyway is
+                    //   a bugcheck rather than a failed call.
+                    //
+                    if (FltObjects->FileObject != NULL &&
+                        !FlagOn(FltObjects->FileObject->Flags, FO_HANDLE_CREATED)) {
+
+                        FltCancelFileOpen(FltObjects->Instance,
+                                          FltObjects->FileObject);
+
+                        //
+                        // ACCESS_DENIED, not VIRUS_INFECTED. A mismatch means we
+                        // could not substantiate a skipped scan, which is not the
+                        // same as having judged the file hostile. The stale entry
+                        // was already removed, so the caller's retry is scanned
+                        // normally instead of failing again.
+                        //
+                        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                        Data->IoStatus.Information = 0;
+
+                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                   "[ShadowStrike/PostCreate] Open revoked: path "
+                                   "cache identity mismatch\n");
+
+                        PocFreeCompletionContext(&completionCtx);
+                        return FLT_POSTOP_FINISHED_PROCESSING;
+                    }
+
+                    //
+                    // A handle already exists, so the open cannot be revoked.
+                    // Logged at ERROR level because it is the one path on which
+                    // an unverified hit survives, and it must be visible rather
+                    // than absorbed.
+                    //
+                    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                               "[ShadowStrike/PostCreate] Path cache mismatch "
+                               "could NOT be revoked: handle already created\n");
+                }
+            }
+        }
+
+        if (pcNameInfo != NULL) {
+            FltReleaseFileNameInformation(pcNameInfo);
+        }
+    }
+
+    // ========================================================================
     // PHASE 3: CHECK FOR EXISTING STREAM CONTEXT
     // ========================================================================
 
@@ -1438,6 +1547,48 @@ PocReleaseHandleContext(
 // ============================================================================
 // PUBLIC API - COMPLETION CONTEXT
 // ============================================================================
+
+NTSTATUS
+PcRequestPathCacheAction(
+    _Inout_ PVOID *CompletionContext,
+    _In_ ULONG Action,
+    _In_ ULONG VolumeSerial
+    )
+{
+    PPOC_COMPLETION_CONTEXT context = NULL;
+
+    PAGED_CODE();
+
+    if (CompletionContext == NULL || VolumeSerial == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (Action == (ULONG)SsPathCacheActionNone ||
+        Action > (ULONG)SsPathCacheActionAnnotate) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (*CompletionContext != NULL) {
+        context = (PPOC_COMPLETION_CONTEXT)*CompletionContext;
+
+        if (!PocIsValidCompletionContext(context)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    } else {
+        NTSTATUS status = PocAllocateCompletionContext(&context);
+
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        *CompletionContext = context;
+    }
+
+    context->PathCacheAction = Action;
+    context->PathCacheVolumeSerial = VolumeSerial;
+
+    return STATUS_SUCCESS;
+}
 
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS

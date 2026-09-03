@@ -185,6 +185,56 @@ extern "C" {
 #define PC_FAILOPEN_CACHE_TTL_SEC       15
 
 /**
+ * @brief Follow-up the create POST-operation owes the path-keyed scan cache.
+ *
+ * DECLARED HERE, NOT IN PostCreate.h, AND THAT IS NOT ARBITRARY. This is a
+ * contract between the pre- and post-operation halves of IRP_MJ_CREATE, so both
+ * must see it. PostCreate.h cannot be included by PreCreate.c: it carries its
+ * own definition of SHADOWSTRIKE_STREAM_CONTEXT, and when a translation unit has
+ * already picked up the shared definition, PostCreate.h's inline helpers compile
+ * against the wrong structure (four C2039 errors, which is how this was found).
+ * PostCreate.c already includes PreCreate.h, so putting the contract on this
+ * side reaches both halves without anyone including a header they cannot.
+ */
+typedef enum _SS_PATH_CACHE_ACTION {
+
+    /// @brief Nothing owed - the create never consulted the path cache.
+    SsPathCacheActionNone = 0,
+
+    /// @brief A path-keyed verdict was TRUSTED and a scan was SKIPPED. The
+    /// identity behind it MUST be confirmed before the caller receives a
+    /// handle, or the open MUST be revoked.
+    SsPathCacheActionVerify = 1,
+
+    /// @brief A real scan inserted a path entry that has no identity witness.
+    /// It cannot satisfy a lookup until it gets one, so failing to annotate
+    /// costs a re-scan rather than safety.
+    SsPathCacheActionAnnotate = 2,
+
+} SS_PATH_CACHE_ACTION;
+
+/**
+ * @brief Record a path-cache follow-up on the create completion context.
+ *
+ * Defined in PostCreate.c because that is where the completion context type and
+ * its allocator live. Allocates the context on first use so the pre-operation
+ * never needs the layout, only this entry point.
+ *
+ * @param CompletionContext  The pre-operation's *CompletionContext slot.
+ * @param Action             An SS_PATH_CACHE_ACTION value.
+ * @param VolumeSerial       Volume serial the path key was built from.
+ * @return STATUS_SUCCESS when the follow-up was recorded. On failure the caller
+ *         MUST treat the cache result as untrustworthy, because nothing will
+ *         verify or annotate it.
+ */
+NTSTATUS
+PcRequestPathCacheAction(
+    _Inout_ PVOID *CompletionContext,
+    _In_ ULONG Action,
+    _In_ ULONG VolumeSerial
+    );
+
+/**
  * @brief Quick scan timeout for cached/low-priority files
  */
 #define PC_QUICK_SCAN_TIMEOUT_MS        5000

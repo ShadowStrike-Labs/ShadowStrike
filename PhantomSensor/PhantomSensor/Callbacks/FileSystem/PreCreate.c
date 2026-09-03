@@ -735,6 +735,7 @@ Return Value:
     BOOLEAN IsScannerRequest = FALSE;
     SHADOWSTRIKE_CACHE_KEY CacheKey;
     SHADOWSTRIKE_CACHE_RESULT CacheResult;
+    ULONG CachePathVolumeSerial = 0;
     PSHADOWSTRIKE_MESSAGE_HEADER RequestMsg = NULL;
     ULONG RequestSize = 0;
     SHADOWSTRIKE_SCAN_VERDICT_REPLY ReplyMsg = {0};
@@ -1485,9 +1486,46 @@ Return Value:
     //
     if (!IsScannerRequest && SHADOWSTRIKE_USER_MODE_CONNECTED()) {
         //
-        // Build cache key - track validity for later use
+        // WHY THIS IS A PATH KEY AND NOT ShadowStrikeCacheBuildKey.
         //
-        Status = ShadowStrikeCacheBuildKey(FltObjects, &CacheKey);
+        // BuildKey derives its key from the NTFS file ID, size and last-write
+        // time, all read with FltQueryInformationFile against the target file
+        // object. In IRP_MJ_CREATE pre-operation the file is not open yet, so
+        // all three queries fail and BuildKey returns STATUS_UNSUCCESSFUL - on
+        // EVERY create, without exception. CacheKeyValid therefore never became
+        // TRUE here, which disabled both the lookup and all three inserts below.
+        // Field measurement on 1.0.107: cached=0 against total=829958 in a 330
+        // second run, while the same run paid four doomed synchronous
+        // information IRPs per create for the attempt.
+        //
+        // A path key needs no I/O at all. The volume serial comes from the
+        // instance context, which cached it at instance setup, and the path is
+        // already in hand from Phase 1.
+        //
+        {
+            PSHADOW_INSTANCE_CONTEXT pkInstCtx = NULL;
+            if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance,
+                                                 (PFLT_CONTEXT*)&pkInstCtx))) {
+                //
+                // LOCAL FILE SYSTEMS ONLY. A remote volume's serial is not a
+                // stable namespace and ShadowStrikeCacheInvalidateVolume could
+                // not flush it meaningfully; the identity queries the
+                // verification depends on are also the ones that bugcheck MUP
+                // on a redirector volume. Declining here costs a scan, which is
+                // the safe direction.
+                //
+                if (pkInstCtx->Initialized &&
+                    (pkInstCtx->FilesystemType == FLT_FSTYPE_NTFS ||
+                     pkInstCtx->FilesystemType == FLT_FSTYPE_REFS)) {
+                    CachePathVolumeSerial = pkInstCtx->VolumeSerialNumber;
+                }
+                FltReleaseContext((PFLT_CONTEXT)pkInstCtx);
+            }
+        }
+
+        Status = ShadowStrikeCacheBuildPathKey(CachePathVolumeSerial,
+                                              &NameInfo->Name,
+                                              &CacheKey);
         if (NT_SUCCESS(Status)) {
             CacheKeyValid = TRUE;
 
@@ -1534,9 +1572,29 @@ Return Value:
                     return FLT_PREOP_COMPLETE;
                 } else {
                     //
-                    // Cache hit: ALLOW
+                    // Cache hit: ALLOW, but PROVISIONALLY.
                     //
-                    goto CleanupAllow;
+                    // A path key proves nothing about the bytes behind the path,
+                    // so this verdict is not trusted on its own. The open is
+                    // allowed and post-create compares the identity recorded
+                    // with this verdict against the file that was actually
+                    // opened, revoking the open before the caller sees a handle
+                    // if they disagree. That comparison is the ONLY reason path
+                    // keying is acceptable here.
+                    //
+                    if (NT_SUCCESS(PcRequestPathCacheAction(
+                                       CompletionContext,
+                                       SsPathCacheActionVerify,
+                                       CachePathVolumeSerial))) {
+                        goto CleanupAllow;
+                    }
+
+                    //
+                    // No handoff means no verification is possible, and an
+                    // unverifiable hit must not be honoured. Drop the entry and
+                    // fall through to a real scan rather than trust it.
+                    //
+                    ShadowStrikeCacheRemove(&CacheKey);
                 }
             }
         }
@@ -1739,6 +1797,17 @@ Return Value:
                     // Update cache only if key was successfully built
                     //
                     if (CacheKeyValid) {
+                        //
+                        // Deliberately NOT annotated with an identity witness.
+                        // This create is completed with STATUS_ACCESS_DENIED, so
+                        // no post-create callback runs and none could be taken.
+                        // The consequence is intentional and conservative: a
+                        // witness-less malicious entry still blocks on the next
+                        // open, because the block arm above does not consult the
+                        // witness. Erring towards blocking a replaced file until
+                        // the TTL expires is the correct direction for a verdict
+                        // of Malicious.
+                        //
                         ShadowStrikeCacheInsert(
                             &CacheKey,
                             Verdict_Malicious,
@@ -1757,6 +1826,15 @@ Return Value:
                             0,
                             ReplyMsg.CacheTTL
                             );
+
+                        //
+                        // The entry has no identity witness yet, so it cannot
+                        // satisfy a lookup until post-create supplies one.
+                        //
+                        (VOID)PcRequestPathCacheAction(
+                            CompletionContext,
+                            SsPathCacheActionAnnotate,
+                            CachePathVolumeSerial);
                     }
                 }
             } else {
@@ -1795,6 +1873,15 @@ Return Value:
                             0,
                             PC_FAILOPEN_CACHE_TTL_SEC
                             );
+
+                        //
+                        // The entry has no identity witness yet, so it cannot
+                        // satisfy a lookup until post-create supplies one.
+                        //
+                        (VOID)PcRequestPathCacheAction(
+                            CompletionContext,
+                            SsPathCacheActionAnnotate,
+                            CachePathVolumeSerial);
                     }
                 } else {
                     InterlockedIncrement64(&g_PcState.Stats.ScanErrors);

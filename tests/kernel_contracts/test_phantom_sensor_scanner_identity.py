@@ -107,6 +107,10 @@ METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_
 PACKER_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/PackerDetector.cpp"
 PE_PARSER_CPP_PATH = ROOT / "src/PhantomCore/PEParser/PEParser.cpp"
 BOOT_TIME_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/System/BootTimeAnalyzer.cpp"
+SCAN_CACHE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Cache/ScanCache.c"
+SCAN_CACHE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Cache/ScanCache.h"
+PRE_CREATE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreCreate.h"
+POST_CREATE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PostCreate.c"
 
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
@@ -15888,6 +15892,203 @@ class DriverStatusQueryFramingContractTests(unittest.TestCase):
             "the payload copy no longer passes the trust flag, so a "
             "pre-key-exchange frame would be dereferenced without probing "
             "(0 uses in a %d-char case body)" % len(case_body))
+
+
+
+class PathKeyedScanCacheContractTests(unittest.TestCase):
+    """The create path must be able to use the scan cache, and every path-keyed
+    verdict it trusts must be substantiated before a handle escapes.
+
+    THE DEFECT. ShadowStrikeCacheBuildKey derives its key from the NTFS file id,
+    size and last-write time, all read with FltQueryInformationFile against the
+    target file object. In IRP_MJ_CREATE PRE-operation the file is not open, so
+    all three queries fail and the key build returns STATUS_UNSUCCESSFUL on every
+    single create. CacheKeyValid therefore never became TRUE on the create path,
+    which disabled the lookup AND all three inserts. Measured in the field on
+    1.0.107: cached=0 against total=829958 over 330 seconds, while the same run
+    paid four doomed synchronous information IRPs per create for the attempt.
+
+    WHY THE FIX NEEDS GUARDING RATHER THAN JUST TESTING. The repair keys the
+    create path on volume serial plus path, and a path is not content-derived.
+    That is only sound because the entry also records the identity observed when
+    the verdict was produced, and post-create revokes the open when it disagrees.
+    Delete the revocation and you are left with a cache that answers from a path
+    alone - strictly weaker than the broken-but-safe state it replaced. That is
+    the regression these tests exist to make impossible.
+    """
+
+    @staticmethod
+    def _definition_body(src, name):
+        """Brace-matched body of a function DEFINITION.
+
+        Anchored on the name at the START of a line, which is where a definition
+        puts it. A plain index() would have found the #pragma alloc_text line
+        that names the same function first, and then brace-matched from the wrong
+        place - which is exactly how this helper came to exist.
+        """
+        m = re.search(r"^%s\s*\(" % re.escape(name), src, re.M)
+        if m is None:
+            raise AssertionError("no definition of %s found" % name)
+        brace = src.index("{", m.start())
+        return src[m.start():_matching_delimiter(src, brace, "{", "}") + 1]
+
+    @staticmethod
+    def _callers_of(symbol):
+        """Driver .c files containing a CALL to symbol, comments stripped.
+
+        The declaring module is excluded so its own definition is not mistaken
+        for a call. Derived rather than hardcoded so a new caller appearing
+        cannot silently escape the invariant.
+        """
+        found = {}
+        root = ROOT / "PhantomSensor"
+        for path in sorted(root.rglob("*.c")):
+            if path.name in ("ScanCache.c",):
+                continue
+            src = strip_c_comments(read_source(path))
+            count = len(re.findall(r"\b%s\s*\(" % re.escape(symbol), src))
+            if count:
+                found[path.name] = count
+        return found
+
+    def test_the_create_path_does_not_use_the_unbuildable_identity_key(self):
+        pre = strip_c_comments(read_source(PRECREATE_PATH))
+        identity = len(re.findall(r"\bShadowStrikeCacheBuildKey\s*\(", pre))
+        path_keyed = len(re.findall(r"\bShadowStrikeCacheBuildPathKey\s*\(", pre))
+
+        self.assertEqual(
+            identity, 0,
+            "PreCreate.c calls ShadowStrikeCacheBuildKey %d time(s). That builder "
+            "cannot succeed before the create completes, so every call disables "
+            "the cache for the hottest path in the driver" % identity)
+        self.assertGreaterEqual(
+            path_keyed, 1,
+            "PreCreate.c no longer builds a path key, so the create path has no "
+            "way to consult the scan cache at all")
+
+        # ANTI-VACUITY, and it is what stops this being satisfied by DELETION:
+        # the identity builder must still serve the callers whose file IS open.
+        # The subject list is derived from the tree, not written down here.
+        others = self._callers_of("ShadowStrikeCacheBuildKey")
+        others.pop("PreCreate.c", None)
+        self.assertGreaterEqual(
+            len(others), 1,
+            "no caller of ShadowStrikeCacheBuildKey remains, so this test would "
+            "pass if the identity-keyed cache had simply been deleted")
+
+    def test_the_key_kind_separates_the_two_domains(self):
+        h = strip_c_comments(read_source(SCAN_CACHE_H_PATH))
+        c = strip_c_comments(read_source(SCAN_CACHE_C_PATH))
+
+        for needle in ("SsCacheKeyKindIdentity = 0",
+                       "SsCacheKeyKindPath = 1",
+                       "ULONG KeyKind;"):
+            self.assertEqual(
+                h.count(needle), 1,
+                "ScanCache.h: expected exactly one '%s', found %d"
+                % (needle, h.count(needle)))
+
+        self.assertTrue(
+            re.search(r"C_ASSERT\(\s*FIELD_OFFSET\(\s*SHADOWSTRIKE_CACHE_KEY\s*,"
+                      r"\s*KeyKind\s*\)\s*==\s*28\s*\)", h),
+            "the discriminator's offset is no longer pinned, so it could move "
+            "back into padding without anything failing")
+
+        # BOTH mechanisms, because either alone lets one domain answer for the
+        # other: a path key carries its hash in FileId with size and write-time
+        # zero, which is byte-identical to an identity key for a never-written
+        # zero-length file.
+        self.assertGreaterEqual(
+            h.count("&Key->KeyKind"), 1,
+            "ShadowStrikeCacheHash no longer folds the discriminator in, so the "
+            "two key domains share buckets")
+        self.assertGreaterEqual(
+            c.count("Key1->KeyKind == Key2->KeyKind"), 1,
+            "ShadowStrikeCacheKeyEquals no longer compares the discriminator, so "
+            "a path key can alias an identity key")
+
+    def test_verification_defaults_to_revoking(self):
+        c = strip_c_comments(read_source(SCAN_CACHE_C_PATH))
+        body = self._definition_body(c, "ShadowStrikeCacheVerifyPathEntry")
+
+        self.assertGreater(len(body), 400,
+                           "sliced body is only %d chars - the anchor moved" % len(body))
+
+        # The fail-secure default. Every early return inherits it, so an edit that
+        # adds a return without considering the security question revokes rather
+        # than silently trusting an unverified hit.
+        mismatch_true = body.count("*IdentityMismatch = TRUE;")
+        self.assertEqual(
+            mismatch_true, 1,
+            "expected exactly one unconditional revoke default, found %d - if it "
+            "is gone or duplicated the fail-secure property is no longer "
+            "structural" % mismatch_true)
+
+        # Ordered against the start of cache work rather than against the very
+        # first return: the parameter-validation return legitimately precedes the
+        # default, because a NULL out-pointer cannot be written at all. What
+        # matters is that by the time anything could conclude "trust this", the
+        # flag already says revoke.
+        default_at = body.index("*IdentityMismatch = TRUE;")
+        work_at = body.index("ShadowStrikeCacheBuildPathKey")
+        self.assertLess(
+            default_at, work_at,
+            "the revoke default is set after cache work begins, so an early exit "
+            "in between would leave the caller trusting an unverified hit")
+
+        # And it must still be able to say "verified", or it would revoke
+        # everything and the cache would be worse than useless.
+        self.assertGreaterEqual(
+            body.count("*IdentityMismatch = FALSE;"), 1,
+            "verification can never succeed, so every path-keyed hit would "
+            "revoke its own open")
+
+    def test_a_mismatch_revokes_the_open(self):
+        # THE LOAD-BEARING TEST. If path-cache revocation ever looks like the
+        # cause of a field problem, the tempting change is to drop the cancel and
+        # merely log. That would leave a cache keyed on a path with nothing
+        # checking the bytes behind it.
+        c = strip_c_comments(read_source(POST_CREATE_C_PATH))
+
+        self.assertGreaterEqual(
+            c.count("FltCancelFileOpen"), 1,
+            "PostCreate no longer revokes an open on a path-cache identity "
+            "mismatch, so a path-keyed verdict is trusted with nothing "
+            "substantiating it")
+
+        position = c.index("FltCancelFileOpen")
+        window = c[max(0, position - 900):position]
+
+        self.assertIn(
+            "FO_HANDLE_CREATED", window,
+            "FltCancelFileOpen is not guarded by an FO_HANDLE_CREATED check "
+            "within the 900 chars before it; the API documents that it must be "
+            "called before any handle exists for the file")
+
+        after = c[position:position + 600]
+        self.assertIn(
+            "Data->IoStatus.Status", after,
+            "the create status is not set after cancelling, so the caller would "
+            "be told the open succeeded")
+
+    def test_a_path_entry_is_always_invalidatable(self):
+        # Volume-serial zero is refused rather than accepted as a namespace.
+        # ShadowStrikeCacheInvalidateVolume flushes by serial on dismount, so an
+        # entry stored under zero could outlive the volume it describes.
+        c = strip_c_comments(read_source(SCAN_CACHE_C_PATH))
+        body = self._definition_body(c, "ShadowStrikeCacheBuildPathKey")
+
+        self.assertTrue(
+            re.search(r"if\s*\(\s*VolumeSerial\s*==\s*0\s*\)", body),
+            "ShadowStrikeCacheBuildPathKey no longer refuses a zero volume "
+            "serial, so it can mint entries that a volume dismount cannot flush")
+
+        # And the create path must only offer a serial for local file systems:
+        # a redirector volume's identity queries are the ones that bugcheck MUP.
+        pre = strip_c_comments(read_source(PRECREATE_PATH))
+        self.assertIn(
+            "FLT_FSTYPE_NTFS", pre,
+            "PreCreate no longer restricts path keying to local file systems")
 
 
 if __name__ == "__main__":

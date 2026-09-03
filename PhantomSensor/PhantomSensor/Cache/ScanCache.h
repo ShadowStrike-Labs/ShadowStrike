@@ -124,6 +124,47 @@ extern "C" {
  * caller-controlled. Hashing now operates on individual fields and
  * never reads tail padding.
  */
+/**
+ * @brief Which identity domain a cache key addresses.
+ *
+ * The cache was born with a single kind of key: NTFS file ID plus size plus
+ * last-write time plus volume serial. That key is CONTENT-DERIVED, which is
+ * what makes it safe - modifying a file changes the key, so a stale entry can
+ * never be matched by the modified file.
+ *
+ * It has one hard limitation. Every one of those three file-level fields comes
+ * from FltQueryInformationFile against the target file object, and in the
+ * IRP_MJ_CREATE PRE-operation the file is not open yet, so all three queries
+ * fail. ShadowStrikeCacheBuildKey therefore returned STATUS_UNSUCCESSFUL on
+ * every create, which meant the create path - the single hottest path in the
+ * product, measured at 829,958 operations in a 330 second run - could neither
+ * read nor write this cache. The field measurement was cached=0 against
+ * total=829958, and it also paid four doomed synchronous information IRPs per
+ * create for the privilege.
+ *
+ * A second kind of key exists to close that gap: volume serial plus a hash of
+ * the normalised path, both of which ARE available before the create is issued.
+ * A path is not content-derived, so a path key ALONE would be weaker than what
+ * it replaces. It is not used alone - see the IdentityWitness fields on
+ * SHADOWSTRIKE_CACHE_ENTRY and the post-create verification that consumes
+ * them.
+ */
+typedef enum _SS_CACHE_KEY_KIND {
+
+    /// @brief File ID + size + last-write-time + volume serial. Content-derived.
+    /// Zero by construction, so every caller that zero-initialises its key
+    /// keeps exactly the behaviour it had before this field carried meaning.
+    SsCacheKeyKindIdentity = 0,
+
+    /// @brief Volume serial + normalised-path hash. Available pre-create.
+    /// Entries under this kind MUST carry an identity witness.
+    SsCacheKeyKindPath = 1,
+
+    /// @brief Bound for validation. Not a usable kind.
+    SsCacheKeyKindMax
+
+} SS_CACHE_KEY_KIND;
+
 typedef struct _SHADOWSTRIKE_CACHE_KEY {
     /// @brief File ID (from FileInternalInformation)
     UINT64 FileId;
@@ -137,9 +178,13 @@ typedef struct _SHADOWSTRIKE_CACHE_KEY {
     /// @brief Volume serial number (actual serial, not pointer)
     ULONG VolumeSerial;
 
-    /// @brief Explicit tail padding. MUST be zero-initialized by callers.
-    /// Reserved for future expansion (e.g. file generation/version counter).
-    ULONG Reserved;
+    /// @brief Which identity domain this key addresses (SS_CACHE_KEY_KIND).
+    ///
+    /// MUST be zero-initialized by callers, which yields SsCacheKeyKindIdentity.
+    /// It participates in BOTH ShadowStrikeCacheHash and
+    /// ShadowStrikeCacheKeyEquals, so a path key can never alias an identity
+    /// key even if their remaining bytes coincide.
+    ULONG KeyKind;
 
 } SHADOWSTRIKE_CACHE_KEY, *PSHADOWSTRIKE_CACHE_KEY;
 
@@ -156,6 +201,15 @@ C_ASSERT(sizeof(SHADOWSTRIKE_CACHE_KEY) % sizeof(ULONG) == 0);
 C_ASSERT(sizeof(SHADOWSTRIKE_CACHE_KEY) ==
          (sizeof(UINT64) + sizeof(UINT64) + sizeof(LARGE_INTEGER) +
           sizeof(ULONG) + sizeof(ULONG)));
+
+//
+// 4) The discriminator occupies the former tail slot. Pinned because both the
+//    hash and the equality test read it by name: if it ever moved or was
+//    renamed back to a padding role, path and identity keys would start
+//    sharing a namespace silently.
+//
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_CACHE_KEY, KeyKind) == 28);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_CACHE_KEY, VolumeSerial) == 24);
 
 /**
  * @brief Cached verdict entry.
@@ -187,6 +241,36 @@ typedef struct _SHADOWSTRIKE_CACHE_ENTRY {
 
     /// @brief Hit count for this entry
     volatile LONG HitCount;
+
+    //
+    // IDENTITY WITNESS - what makes a path-keyed entry safe.
+    //
+    // A path key says nothing about the bytes behind the path, so an entry
+    // reached by one records the content identity that was observed when the
+    // verdict was produced. The create path hands these three values to its
+    // post-operation callback, which CAN query the now-open file, and any
+    // disagreement means the path no longer names the file we scanned: the
+    // entry is removed and the open is cancelled rather than trusted.
+    //
+    // Consequence worth stating plainly: a path-keyed hit never grants access
+    // on the strength of the path. It only avoids re-scanning bytes we have
+    // already judged, and it is revoked before the caller receives a handle.
+    //
+
+    /// @brief TRUE once the witness below has been populated.
+    BOOLEAN IdentityWitnessed;
+
+    /// @brief Alignment padding.
+    BOOLEAN WitnessReserved[3];
+
+    /// @brief NTFS file ID observed when this verdict was produced.
+    UINT64 WitnessFileId;
+
+    /// @brief File size observed when this verdict was produced.
+    UINT64 WitnessFileSize;
+
+    /// @brief Last-write time observed when this verdict was produced.
+    LARGE_INTEGER WitnessLastWriteTime;
 
 } SHADOWSTRIKE_CACHE_ENTRY, *PSHADOWSTRIKE_CACHE_ENTRY;
 
@@ -298,6 +382,23 @@ typedef struct _SHADOWSTRIKE_CACHE_RESULT {
 
     /// @brief Entry hit count
     LONG HitCount;
+
+    /// @brief TRUE if the identity witness below is meaningful.
+    /// Always FALSE for an identity-keyed hit, because such a key IS the
+    /// identity and needs no separate witness.
+    BOOLEAN IdentityWitnessed;
+
+    /// @brief Alignment padding.
+    BOOLEAN WitnessReserved[3];
+
+    /// @brief File ID observed when the cached verdict was produced.
+    UINT64 WitnessFileId;
+
+    /// @brief File size observed when the cached verdict was produced.
+    UINT64 WitnessFileSize;
+
+    /// @brief Last-write time observed when the cached verdict was produced.
+    LARGE_INTEGER WitnessLastWriteTime;
 
 } SHADOWSTRIKE_CACHE_RESULT, *PSHADOWSTRIKE_CACHE_RESULT;
 
@@ -450,6 +551,106 @@ ShadowStrikeCacheBuildKey(
     );
 
 /**
+ * @brief Build a PATH-domain cache key, usable before a create completes.
+ *
+ * Issues no I/O at all, which is the point: ShadowStrikeCacheBuildKey costs
+ * three FltQueryInformationFile calls plus one FltQueryVolumeInformation, and
+ * on the create path all three of the file-level ones are guaranteed to fail
+ * because the file is not open yet.
+ *
+ * The hash is computed over the UPCASED path because Windows file names are
+ * case-insensitive: hashing raw characters would give the same file two keys
+ * depending on how the caller happened to spell it, silently halving the hit
+ * rate and letting one spelling answer from a stale entry the other refreshed.
+ *
+ * @param VolumeSerial  Volume serial number. MUST be non-zero - see the body.
+ * @param Path          Normalised path, typically NameInfo->Name.
+ * @param Key           Receives the key. Zeroed on every path, including error.
+ * @return STATUS_SUCCESS, or STATUS_NOT_SUPPORTED when no usable volume serial
+ *         is available, or STATUS_INVALID_PARAMETER for a malformed path.
+ */
+NTSTATUS
+ShadowStrikeCacheBuildPathKey(
+    _In_ ULONG VolumeSerial,
+    _In_ PCUNICODE_STRING Path,
+    _Out_ PSHADOWSTRIKE_CACHE_KEY Key
+    );
+
+/**
+ * @brief Attach the content identity observed for an already-inserted entry.
+ *
+ * Split from ShadowStrikeCacheInsert deliberately rather than folded into it.
+ * The verdict is known at the moment the scan answers, but the identity is only
+ * obtainable once the file is open, which on the create path is a different
+ * callback. Forcing both into one call would mean either delaying the insert
+ * until post-create - losing the verdict if the open fails - or passing an
+ * identity that is not yet knowable.
+ *
+ * A path-keyed entry with no witness is treated as unusable by design, so an
+ * insert that is never followed by this call fails safe: the next open re-scans.
+ *
+ * @param Key            Key of the entry to annotate.
+ * @param FileId         Observed NTFS file ID.
+ * @param FileSize       Observed file size.
+ * @param LastWriteTime  Observed last-write time.
+ * @return TRUE if a live entry was found and annotated.
+ */
+BOOLEAN
+ShadowStrikeCacheSetEntryIdentity(
+    _In_ PSHADOWSTRIKE_CACHE_KEY Key,
+    _In_ UINT64 FileId,
+    _In_ UINT64 FileSize,
+    _In_ LARGE_INTEGER LastWriteTime
+    );
+
+/**
+ * @brief Record the identity of a just-scanned file against its path entry.
+ *
+ * Called from a POST-create callback, where the file is open and its identity
+ * is obtainable - which is exactly what the pre-create callback cannot do.
+ *
+ * @param FltObjects    Filter objects from the post-create callback.
+ * @param VolumeSerial  Volume serial used to build the path key.
+ * @param Path          Same normalised path used to build the path key.
+ * @return STATUS_SUCCESS if the entry was annotated.
+ */
+NTSTATUS
+ShadowStrikeCacheAnnotatePathEntry(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG VolumeSerial,
+    _In_ PCUNICODE_STRING Path
+    );
+
+/**
+ * @brief Confirm that a path-keyed hit still describes the file now open.
+ *
+ * This is the whole safety argument for path keying. A path says nothing about
+ * the bytes behind it, so a verdict reached through a path key is provisional
+ * until the identity observed when that verdict was produced is compared
+ * against the file the create actually opened.
+ *
+ * FAIL-SECURE IN EVERY DIRECTION. Mismatch sets *IdentityMismatch. So does an
+ * identity that cannot be read at all, and so does an entry carrying no witness:
+ * in each of those cases a scan was skipped on the strength of a claim that
+ * could not be substantiated, and the only safe conclusion is that the open must
+ * not stand. The stale entry is removed on every one of those paths, so the
+ * caller's retry is scanned normally instead of failing a second time.
+ *
+ * @param FltObjects        Filter objects from the post-create callback.
+ * @param VolumeSerial      Volume serial used to build the path key.
+ * @param Path              Same normalised path used to build the path key.
+ * @param IdentityMismatch  Set TRUE when the caller MUST revoke the open.
+ * @return STATUS_SUCCESS when the verification ran to a conclusion.
+ */
+NTSTATUS
+ShadowStrikeCacheVerifyPathEntry(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG VolumeSerial,
+    _In_ PCUNICODE_STRING Path,
+    _Out_ PBOOLEAN IdentityMismatch
+    );
+
+/**
  * @brief Validate that a verdict value is within valid range.
  *
  * @param Verdict  Verdict value to validate.
@@ -506,7 +707,7 @@ ShadowStrikeCacheHash(
     )
 {
     ULONG hash = 2166136261u;
-    UINT8 buffer[sizeof(UINT64) * 3 + sizeof(ULONG)];
+    UINT8 buffer[sizeof(UINT64) * 3 + sizeof(ULONG) * 2];
     SIZE_T offset = 0;
     SIZE_T i;
 
@@ -522,6 +723,13 @@ ShadowStrikeCacheHash(
     RtlCopyMemory(buffer + offset, &Key->LastWriteTime.QuadPart, sizeof(UINT64));
     offset += sizeof(UINT64);
     RtlCopyMemory(buffer + offset, &Key->VolumeSerial, sizeof(ULONG));
+    offset += sizeof(ULONG);
+    //
+    // The discriminator is hashed, not merely compared. Hashing it spreads the
+    // two key kinds across different buckets instead of relying on the equality
+    // test alone to separate collided entries.
+    //
+    RtlCopyMemory(buffer + offset, &Key->KeyKind, sizeof(ULONG));
     offset += sizeof(ULONG);
 
     for (i = 0; i < offset; i++) {

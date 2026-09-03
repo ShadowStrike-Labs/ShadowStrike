@@ -54,6 +54,10 @@
 #pragma alloc_text(PAGE, ShadowStrikeCacheClear)
 #pragma alloc_text(PAGE, ShadowStrikeCacheCleanup)
 #pragma alloc_text(PAGE, ShadowStrikeCacheBuildKey)
+#pragma alloc_text(PAGE, ShadowStrikeCacheBuildPathKey)
+#pragma alloc_text(PAGE, ShadowStrikeCacheSetEntryIdentity)
+#pragma alloc_text(PAGE, ShadowStrikeCacheAnnotatePathEntry)
+#pragma alloc_text(PAGE, ShadowStrikeCacheVerifyPathEntry)
 #endif
 
 // ============================================================================
@@ -117,9 +121,23 @@ ShadowStrikeCacheCleanupInternal(
     VOID
     );
 
+//
+// Declared here rather than only defined below because alloc_text requires the
+// declaration to precede the pragma naming it (C2157).
+//
+static
+NTSTATUS
+SspCacheQueryIdentity(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PUINT64 FileId,
+    _Out_ PUINT64 FileSize,
+    _Out_ PLARGE_INTEGER LastWriteTime
+    );
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeCacheClearInternal)
 #pragma alloc_text(PAGE, ShadowStrikeCacheCleanupInternal)
+#pragma alloc_text(PAGE, SspCacheQueryIdentity)
 #endif
 
 // ============================================================================
@@ -573,6 +591,18 @@ ShadowStrikeCacheLookup(
             Result->Verdict = entry->Verdict;
             Result->ThreatScore = entry->ThreatScore;
             Result->HitCount = InterlockedIncrement(&entry->HitCount);
+
+            //
+            // Copied under the bucket lock together with the verdict. Reading
+            // the witness in a second pass would let a concurrent
+            // ShadowStrikeCacheSetEntryIdentity or an eviction separate the
+            // verdict from the identity it was produced against, which is
+            // exactly the pairing the caller is about to verify.
+            //
+            Result->IdentityWitnessed = entry->IdentityWitnessed;
+            Result->WitnessFileId = entry->WitnessFileId;
+            Result->WitnessFileSize = entry->WitnessFileSize;
+            Result->WitnessLastWriteTime = entry->WitnessLastWriteTime;
             found = TRUE;
 
             InterlockedIncrement64(&g_ScanCache.Stats.Hits);
@@ -1404,10 +1434,366 @@ ShadowStrikeCacheKeyEquals(
     _In_ PSHADOWSTRIKE_CACHE_KEY Key2
     )
 {
-    return (Key1->VolumeSerial == Key2->VolumeSerial &&
+    //
+    // KeyKind FIRST, and it is not cosmetic. A path key carries its hash in
+    // FileId with FileSize and LastWriteTime zero; an identity key for a
+    // zero-length file that has never been written carries the same two zeros.
+    // Without this comparison those two could satisfy the remaining three tests
+    // and one domain would answer a lookup from the other.
+    //
+    return (Key1->KeyKind == Key2->KeyKind &&
+            Key1->VolumeSerial == Key2->VolumeSerial &&
             Key1->FileId == Key2->FileId &&
             Key1->FileSize == Key2->FileSize &&
             Key1->LastWriteTime.QuadPart == Key2->LastWriteTime.QuadPart);
+}
+
+NTSTATUS
+ShadowStrikeCacheBuildPathKey(
+    _In_ ULONG VolumeSerial,
+    _In_ PCUNICODE_STRING Path,
+    _Out_ PSHADOWSTRIKE_CACHE_KEY Key
+    )
+{
+    UINT64 hash = 14695981039346656037ULL;   // FNV-1a 64-bit offset basis
+    USHORT chars;
+    USHORT i;
+
+    PAGED_CODE();
+
+    if (Key == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Zeroed before any early return so a caller that ignores the status can
+    // never carry a partially built key into a lookup.
+    //
+    RtlZeroMemory(Key, sizeof(SHADOWSTRIKE_CACHE_KEY));
+
+    if (Path == NULL || Path->Buffer == NULL || Path->Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // A zero volume serial is refused rather than accepted as a namespace.
+    // ShadowStrikeCacheInvalidateVolume flushes by serial on dismount, so an
+    // entry stored under serial zero could not be flushed: swap a removable
+    // volume for another and its stale path entries would keep answering for a
+    // file the machine can no longer see. Refusing costs a scan; accepting
+    // would cost correctness.
+    //
+    if (VolumeSerial == 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    chars = (USHORT)(Path->Length / sizeof(WCHAR));
+
+    //
+    // Upcased per character rather than via RtlUpcaseUnicodeString, which would
+    // allocate. This runs on IRP_MJ_CREATE for every file open on the system, so
+    // it must not touch the allocator. Both bytes of each UTF-16 code unit are
+    // folded in so that characters differing only in their high byte cannot
+    // collide.
+    //
+    for (i = 0; i < chars; i++) {
+        WCHAR c = RtlUpcaseUnicodeChar(Path->Buffer[i]);
+
+        hash ^= (UINT64)(c & 0xFF);
+        hash *= 1099511628211ULL;              // FNV-1a 64-bit prime
+        hash ^= (UINT64)((c >> 8) & 0xFF);
+        hash *= 1099511628211ULL;
+    }
+
+    Key->FileId = hash;
+    Key->FileSize = 0;
+    Key->LastWriteTime.QuadPart = 0;
+    Key->VolumeSerial = VolumeSerial;
+    Key->KeyKind = SsCacheKeyKindPath;
+
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN
+ShadowStrikeCacheSetEntryIdentity(
+    _In_ PSHADOWSTRIKE_CACHE_KEY Key,
+    _In_ UINT64 FileId,
+    _In_ UINT64 FileSize,
+    _In_ LARGE_INTEGER LastWriteTime
+    )
+{
+    ULONG bucketIndex;
+    PSHADOWSTRIKE_CACHE_BUCKET bucket;
+    PSHADOWSTRIKE_CACHE_ENTRY entry;
+    BOOLEAN annotated = FALSE;
+
+    PAGED_CODE();
+
+    if (Key == NULL) {
+        return FALSE;
+    }
+
+    if (!ReadBooleanAcquire(&g_ScanCache.Initialized) ||
+        ReadBooleanAcquire(&g_ScanCache.ShutdownInProgress)) {
+        return FALSE;
+    }
+
+    if (!ReadBooleanAcquire(&g_DriverData.Initialized)) {
+        return FALSE;
+    }
+
+    if (!g_DriverData.Config.CacheEnabled) {
+        return FALSE;
+    }
+
+    //
+    // Same shutdown reference the lookup and insert paths take. Without it
+    // teardown can free the entries under the bucket lock we are about to hold.
+    //
+    if (!ShadowStrikeCacheAcquireReference()) {
+        return FALSE;
+    }
+
+    bucketIndex = ShadowStrikeCacheHash(Key) & SHADOWSTRIKE_CACHE_BUCKET_MASK;
+    bucket = &g_ScanCache.Buckets[bucketIndex];
+
+    //
+    // EXCLUSIVE, unlike the lookup: this mutates the entry.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&bucket->Lock);
+
+    entry = ShadowStrikeCacheFindEntry(bucket, Key);
+
+    if (entry != NULL && entry->Valid) {
+        entry->WitnessFileId = FileId;
+        entry->WitnessFileSize = FileSize;
+        entry->WitnessLastWriteTime = LastWriteTime;
+
+        //
+        // Flag published LAST, after the three values it advertises. Ordering
+        // is enforced by the bucket lock today; writing it last means a
+        // lock-free reader introduced later still cannot observe the flag
+        // ahead of the payload.
+        //
+        entry->IdentityWitnessed = TRUE;
+        annotated = TRUE;
+    }
+
+    ExReleasePushLockExclusive(&bucket->Lock);
+    KeLeaveCriticalRegion();
+
+    ShadowStrikeCacheReleaseReference();
+
+    return annotated;
+}
+
+//
+// Read the content identity of a file that is ALREADY OPEN.
+//
+// Deliberately not shared with ShadowStrikeCacheBuildKey even though the three
+// queries look the same. BuildKey runs in pre-operation paths where the file may
+// not be open and has a documented MUP bugcheck guard for exactly that reason;
+// this runs only from post-create, where the queries are expected to SUCCEED and
+// a failure is a security-relevant event rather than a normal outcome. Folding
+// them together would mean one of the two callers silently inherits the other's
+// failure policy.
+//
+static
+NTSTATUS
+SspCacheQueryIdentity(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Out_ PUINT64 FileId,
+    _Out_ PUINT64 FileSize,
+    _Out_ PLARGE_INTEGER LastWriteTime
+    )
+{
+    NTSTATUS status;
+    FILE_INTERNAL_INFORMATION internalInfo;
+    FILE_BASIC_INFORMATION basicInfo;
+    FILE_STANDARD_INFORMATION stdInfo;
+
+    PAGED_CODE();
+
+    if (FileId == NULL || FileSize == NULL || LastWriteTime == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *FileId = 0;
+    *FileSize = 0;
+    LastWriteTime->QuadPart = 0;
+
+    if (FltObjects == NULL ||
+        FltObjects->Instance == NULL ||
+        FltObjects->FileObject == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = FltQueryInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &internalInfo,
+        sizeof(internalInfo),
+        FileInternalInformation,
+        NULL
+        );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = FltQueryInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &basicInfo,
+        sizeof(basicInfo),
+        FileBasicInformation,
+        NULL
+        );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = FltQueryInformationFile(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        &stdInfo,
+        sizeof(stdInfo),
+        FileStandardInformation,
+        NULL
+        );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    *FileId = (UINT64)internalInfo.IndexNumber.QuadPart;
+    *FileSize = (UINT64)stdInfo.EndOfFile.QuadPart;
+    *LastWriteTime = basicInfo.LastWriteTime;
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+ShadowStrikeCacheAnnotatePathEntry(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG VolumeSerial,
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    NTSTATUS status;
+    SHADOWSTRIKE_CACHE_KEY key;
+    UINT64 fileId = 0;
+    UINT64 fileSize = 0;
+    LARGE_INTEGER lastWrite;
+
+    PAGED_CODE();
+
+    lastWrite.QuadPart = 0;
+
+    status = ShadowStrikeCacheBuildPathKey(VolumeSerial, Path, &key);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = SspCacheQueryIdentity(FltObjects, &fileId, &fileSize, &lastWrite);
+    if (!NT_SUCCESS(status)) {
+        //
+        // The verdict is already in the cache but its identity cannot be
+        // established, which leaves an entry no verification could ever accept.
+        // Remove it rather than leave a witness-less entry to be rejected on
+        // every future open - that would cancel opens indefinitely for a file
+        // whose only fault is an unreadable attribute query.
+        //
+        ShadowStrikeCacheRemove(&key);
+        return status;
+    }
+
+    if (!ShadowStrikeCacheSetEntryIdentity(&key, fileId, fileSize, lastWrite)) {
+        return STATUS_NOT_FOUND;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+ShadowStrikeCacheVerifyPathEntry(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ ULONG VolumeSerial,
+    _In_ PCUNICODE_STRING Path,
+    _Out_ PBOOLEAN IdentityMismatch
+    )
+{
+    NTSTATUS status;
+    SHADOWSTRIKE_CACHE_KEY key;
+    SHADOWSTRIKE_CACHE_RESULT result;
+    UINT64 fileId = 0;
+    UINT64 fileSize = 0;
+    LARGE_INTEGER lastWrite;
+
+    PAGED_CODE();
+
+    if (IdentityMismatch == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Default is TRUE. Every early exit below therefore revokes, so a future
+    // edit that adds a return without considering the security question fails
+    // closed instead of silently trusting an unverified hit.
+    //
+    *IdentityMismatch = TRUE;
+    lastWrite.QuadPart = 0;
+
+    status = ShadowStrikeCacheBuildPathKey(VolumeSerial, Path, &key);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (!ShadowStrikeCacheLookup(&key, &result) || !result.Found) {
+        //
+        // The entry expired or was evicted between the pre-create hit and now.
+        // Nothing was trusted that still needs substantiating, and there is no
+        // stale entry left to mislead the next open, so this is not a mismatch.
+        //
+        *IdentityMismatch = FALSE;
+        return STATUS_SUCCESS;
+    }
+
+    if (!result.IdentityWitnessed) {
+        //
+        // A path entry with no witness must never satisfy a lookup. Reaching
+        // here means one did, so the entry is unusable: drop it and revoke.
+        //
+        ShadowStrikeCacheRemove(&key);
+        return STATUS_SUCCESS;
+    }
+
+    status = SspCacheQueryIdentity(FltObjects, &fileId, &fileSize, &lastWrite);
+    if (!NT_SUCCESS(status)) {
+        ShadowStrikeCacheRemove(&key);
+        return status;
+    }
+
+    if (fileId == result.WitnessFileId &&
+        fileSize == result.WitnessFileSize &&
+        lastWrite.QuadPart == result.WitnessLastWriteTime.QuadPart) {
+        *IdentityMismatch = FALSE;
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // The path now names different bytes than the ones this verdict was formed
+    // against. Remove the entry FIRST so the caller's retry is scanned properly
+    // rather than cancelled a second time.
+    //
+    ShadowStrikeCacheRemove(&key);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+               "[ShadowStrike] ScanCache: path entry revoked, identity changed "
+               "(id %I64u->%I64u size %I64u->%I64u)\n",
+               result.WitnessFileId, fileId,
+               result.WitnessFileSize, fileSize);
+
+    return STATUS_SUCCESS;
 }
 
 static
