@@ -2120,16 +2120,68 @@ private:
     // ========================================================================
 
     [[nodiscard]] bool enableDEPInternal() noexcept {
-        // Enable permanent DEP
-        DWORD flags = PROCESS_DEP_ENABLE | PROCESS_DEP_DISABLE_ATL_THUNK_EMULATION;
+        //
+        // VERIFY FIRST, THEN ENABLE - and that order is the whole fix.
+        //
+        // This function used to call SetProcessDEPPolicy and return false when
+        // it failed. On the binary this product actually ships that call CANNOT
+        // SUCCEED, for two documented reasons: SetProcessDEPPolicy changes DEP
+        // for 32-BIT PROCESSES (its sibling GetProcessDEPPolicy is documented as
+        // failing with ERROR_NOT_SUPPORTED on a 64-bit process), and it also
+        // errors when the system DEP policy is AlwaysOn - which is the state a
+        // 64-bit process is already in, because DEP is permanently enabled for
+        // x64 and cannot be turned off.
+        //
+        // So the strongest possible DEP state was being reported as a failure.
+        // That is not a cosmetic defect: this is the FIRST gate in Initialize,
+        // and its failure returned false from the whole module, so W^X policy,
+        // guard pages, the secure allocator, anti-dump, ROP/shellcode/reflective
+        // DLL detection and code-integrity monitoring - every stage below it -
+        // never initialised. A field log line reading "Failed to enable DEP" was
+        // the only visible trace of an entire subsystem being dark.
+        //
+        // The correct API was already used TWICE in this same class:
+        // enableASLRInternal and enableCFGInternal both QUERY their mitigation
+        // policy rather than trying to set it. This brings DEP into line with
+        // its two siblings instead of inventing a third pattern.
+        //
+        PROCESS_MITIGATION_DEP_POLICY depPolicy = {};
 
-        if (SetProcessDEPPolicy(flags)) {
-            m_depEnabled = true;
-            SS_LOG_INFO(LOG_CATEGORY, L"DEP enabled");
-            return true;
+        if (GetProcessMitigationPolicy(GetCurrentProcess(),
+            ProcessDEPPolicy, &depPolicy, sizeof(depPolicy))) {
+
+            if (depPolicy.Enable) {
+                m_depEnabled = true;
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"DEP is enabled (permanent: %hs, ATL thunk emulation disabled: %hs)",
+                    depPolicy.Permanent ? "yes" : "no",
+                    depPolicy.DisableAtlThunkEmulation ? "yes" : "no");
+                return true;
+            }
+
+            // Genuinely off. Only here is there anything to enable, and only a
+            // process whose system policy is OptIn/OptOut can honour it.
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"DEP reports disabled; attempting to enable it for this process");
+
+            const DWORD flags =
+                PROCESS_DEP_ENABLE | PROCESS_DEP_DISABLE_ATL_THUNK_EMULATION;
+            if (SetProcessDEPPolicy(flags)) {
+                m_depEnabled = true;
+                SS_LOG_INFO(LOG_CATEGORY, L"DEP enabled for this process");
+                return true;
+            }
+
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"DEP is disabled and could not be enabled: %lu", GetLastError());
+            return false;
         }
 
-        SS_LOG_WARN(LOG_CATEGORY, L"Failed to enable DEP: %lu", GetLastError());
+        // The QUERY itself failed, which is different from DEP being off and is
+        // reported as such rather than folded into it. m_depEnabled stays false
+        // because nothing was established.
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Could not query the process DEP policy: %lu", GetLastError());
         return false;
     }
 

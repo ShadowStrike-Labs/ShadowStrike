@@ -109,6 +109,9 @@ FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
 MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
+MEMORY_PROTECTION_CPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/MemoryProtection.cpp"
+)
 MEMORY_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.cpp"
 SIGNATURE_FORMAT_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/SignatureFormat.cpp"
 METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
@@ -16981,6 +16984,129 @@ class DashboardHealthVerdictContractTests(unittest.TestCase):
         self.assertEqual(
             self.page.count('qsTr("Your device is protected")'), 0,
             "the superseded wording is back")
+
+
+
+class ProcessHardeningVerificationContractTests(unittest.TestCase):
+    """DEP must be VERIFIED, not enabled, on a process where it is permanent.
+
+    enableDEPInternal called SetProcessDEPPolicy and returned false when it
+    failed. On the binary this product ships that call cannot succeed:
+    SetProcessDEPPolicy is documented as changing DEP for 32-BIT processes, its
+    sibling GetProcessDEPPolicy is documented as failing with
+    ERROR_NOT_SUPPORTED on a 64-bit process, and it additionally errors when the
+    system DEP policy is AlwaysOn - which is the state a 64-bit process is
+    already in, because DEP is permanently enabled for x64.
+
+    So the STRONGEST possible DEP state was reported as a failure. This is the
+    FIRST gate in MemoryProtection::Initialize, and its failure returned false
+    from the whole module, so every stage below it - W^X policy, guard pages,
+    the secure allocator, anti-dump, and code-integrity monitoring - never
+    initialised. One log line was the only trace of a dark subsystem.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(MEMORY_PROTECTION_CPP_PATH))
+
+    def _fn(self, name):
+        for m in re.finditer(r"\b" + re.escape(name) + r"\s*\(\s*\)", cls_src := self.src):
+            k = m.end()
+            tail = re.sub(r"(const|noexcept|\s)+", " ", cls_src[k:k + 140])
+            if tail.lstrip().startswith("{"):
+                brace = cls_src.index("{", k)
+                return cls_src[m.start():
+                               _matching_delimiter(cls_src, brace, "{", "}") + 1]
+        raise AssertionError("no definition of %s" % name)
+
+    def test_the_dep_state_is_queried_before_anything_is_set(self):
+        body = self._fn("enableDEPInternal")
+        self.assertGreater(len(body), 400,
+                           "sliced body is only %d chars - the anchor moved" % len(body))
+
+        # SUBSTRING COLLISION, and it is not hypothetical - it failed this
+        # assertion on arrival: SetProcessDEPPolicy CONTAINS ProcessDEPPolicy,
+        # so a plain count sees the enable call as a second query. The lookbehind
+        # is what separates the enum argument from the function name.
+        queries = re.findall(r"(?<![A-Za-z])ProcessDEPPolicy", body)
+        self.assertEqual(
+            len(queries), 1,
+            "expected exactly one ProcessDEPPolicy query argument, found %d"
+            % len(queries))
+        self.assertIn(
+            "GetProcessMitigationPolicy", body,
+            "DEP is no longer queried through GetProcessMitigationPolicy, so it "
+            "cannot tell an already-permanent DEP from a failure")
+
+        # ORDERING IS THE INVARIANT. A set attempted before the query is the
+        # defect: on x64 it fails, and its failure was taken as the answer.
+        query_at = body.index("GetProcessMitigationPolicy")
+        self.assertIn("SetProcessDEPPolicy", body,
+                      "the enable path was deleted; see the anti-overcorrection arm")
+        set_at = body.index("SetProcessDEPPolicy")
+        self.assertLess(
+            query_at, set_at,
+            "SetProcessDEPPolicy is called at offset %d but the query only at "
+            "%d, so a process whose DEP is already permanent still reports a "
+            "failure" % (set_at, query_at))
+
+    def test_an_enabled_policy_succeeds_without_setting_anything(self):
+        body = self._fn("enableDEPInternal")
+
+        # The success return for the enabled case must precede the set call, or
+        # an already-hardened process still takes the enable path.
+        enable_gate = re.search(r"if\s*\(\s*depPolicy\.Enable\s*\)", body)
+        self.assertIsNotNone(
+            enable_gate,
+            "the queried policy's Enable field is no longer what decides "
+            "success, so DEP state is being inferred from something else")
+        self.assertLess(
+            enable_gate.start(), body.index("SetProcessDEPPolicy"),
+            "the enabled-state check must precede the enable attempt")
+        self.assertTrue(
+            re.search(r"m_depEnabled\s*=\s*true", body),
+            "nothing records that DEP was established")
+
+    def test_the_enable_path_is_kept_for_a_process_that_can_use_it(self):
+        # ANTI-OVERCORRECTION. Deleting SetProcessDEPPolicy would be the easy
+        # reading of this defect and it would be wrong: a 32-bit process on an
+        # OptIn/OptOut system genuinely can enable DEP, and that is the one case
+        # where there is something to do rather than something to observe.
+        body = self._fn("enableDEPInternal")
+        self.assertEqual(
+            body.count("SetProcessDEPPolicy"), 1,
+            "expected exactly one enable attempt, found %d"
+            % body.count("SetProcessDEPPolicy"))
+        self.assertTrue(
+            re.search(r"PROCESS_DEP_ENABLE", body),
+            "the enable attempt no longer requests DEP")
+
+    def test_an_unanswerable_query_is_not_reported_as_dep_being_off(self):
+        # Two different facts: "DEP is disabled" and "we could not find out".
+        # Folding them loses the distinction that decides whether there is
+        # anything to act on - the same class as counting a refused scan as a
+        # failed one.
+        body = self._fn("enableDEPInternal")
+        errs = re.findall(r"SS_LOG_ERROR\(", body)
+        self.assertGreaterEqual(
+            len(errs), 2,
+            "expected at least two distinct failure reports (disabled, and "
+            "unqueryable), found %d" % len(errs))
+        self.assertTrue(
+            re.search(r"could not query", body, re.I),
+            "a failed policy query is no longer reported distinctly from DEP "
+            "being disabled")
+
+    def test_all_three_hardening_checks_use_the_same_mechanism(self):
+        # The correct API was already used twice in this class. DEP inventing a
+        # third pattern is how the drift happened, so the three are pinned
+        # together rather than DEP alone.
+        for fn in ("enableDEPInternal", "enableASLRInternal", "enableCFGInternal"):
+            body = self._fn(fn)
+            self.assertIn(
+                "GetProcessMitigationPolicy", body,
+                "%s no longer queries its mitigation policy, so the three "
+                "hardening checks have diverged again" % fn)
 
 
 if __name__ == "__main__":
