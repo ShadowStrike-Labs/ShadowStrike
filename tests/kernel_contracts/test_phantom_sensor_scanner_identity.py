@@ -16841,5 +16841,147 @@ class ScanSurfaceHonestyContractTests(unittest.TestCase):
             "would bind a permanent zero into the UI")
 
 
+
+class DashboardHealthVerdictContractTests(unittest.TestCase):
+    """The hero card must answer one question from one set of evidence.
+
+    Three surfaces in that card each decided "are you protected?" from a
+    different source: the shield from protectionViewModel.headlineState, the
+    primary headline from protectionViewModel.criticalCount/atRiskCount, and
+    the sensor chip plus the secondary line from the modules model's per-module
+    health. Nothing reconciled them, so the card could render a red shield,
+    "Your device is protected", and "N of M sensor(s) require review" at the
+    same time, inches apart.
+
+    A reassuring headline over a red badge is the failure mode worth
+    preventing, which is why the fold is worst-of rather than symmetric and why
+    the service's own headline is consulted last.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = strip_c_comments(read_source(MAIN_PAGE_QML_PATH))
+
+    def _fn(self, name):
+        m = re.search(r"function\s+" + re.escape(name) + r"\s*\(", self.page)
+        if m is None:
+            raise AssertionError("MainPage has no function %s" % name)
+        brace = self.page.index("{", m.start())
+        return self.page[m.start():_matching_delimiter(self.page, brace, "{", "}") + 1]
+
+    def test_all_three_surfaces_read_the_same_folded_counts(self):
+        # The shield and the headline are functions; the chip is a binding, so
+        # it is checked by counting rather than by slicing.
+        for fn in ("dashboardState", "dashboardPrimaryHeadline"):
+            body = self._fn(fn)
+            self.assertIn(
+                "root._criticalCount()", body,
+                "%s no longer reads the folded critical count, so it can "
+                "disagree with the sensor badge" % fn)
+            self.assertIn(
+                "root._atRiskCount()", body,
+                "%s no longer reads the folded at-risk count" % fn)
+
+        # The chip must use the folded counts, NOT the raw per-health tally it
+        # used to, or it is a fourth independent answer.
+        self.assertEqual(
+            len(re.findall(r"root\._moduleCountByHealth\(\s*[12]\s*\)", self.page)), 2,
+            "expected exactly two raw per-health reads left in the page - the "
+            "two inside the fold helpers - found %d, so a surface is reading "
+            "sensor health directly again"
+            % len(re.findall(r"root\._moduleCountByHealth\(\s*[12]\s*\)", self.page)))
+
+    def test_the_fold_takes_the_worst_and_never_sums(self):
+        # The two sources describe the SAME modules, so summing them would
+        # double-count every module they agree on and report twice the real
+        # number of problems.
+        for fn, reported, sensed in (("_criticalCount", "_reportedCritical", "_sensorCritical"),
+                                     ("_atRiskCount", "_reportedAtRisk", "_sensorAtRisk")):
+            body = self._fn(fn)
+            self.assertTrue(
+                re.search(r"Math\.max\s*\(", body),
+                "%s no longer folds with Math.max" % fn)
+            self.assertEqual(
+                body.count("+"), 0,
+                "%s contains an addition; the two sources describe the same "
+                "modules, so summing double-counts every agreement" % fn)
+            self.assertIn("root." + reported, body,
+                          "%s no longer consults the service-reported count" % fn)
+            self.assertIn("root." + sensed, body,
+                          "%s no longer consults the per-sensor count" % fn)
+
+    def test_the_service_headline_can_only_worsen_the_verdict(self):
+        # It used to be returned verbatim, which is precisely how a red shield
+        # ended up beside a protected headline.
+        body = self._fn("dashboardState")
+        self.assertEqual(
+            body.count("protectionViewModel.headlineState"), 1,
+            "expected exactly one read of the service headline, found %d"
+            % body.count("protectionViewModel.headlineState"))
+
+        crit_at = body.index("root._criticalCount()")
+        head_at = body.index("protectionViewModel.headlineState")
+        self.assertLess(
+            crit_at, head_at,
+            "the service headline is read at offset %d but the folded counts at "
+            "%d, so the headline can still promote the card to healthy over "
+            "sensors that disagree" % (head_at, crit_at))
+
+        # And it may only ever return a WORSE state, never healthy.
+        tail = body[head_at:]
+        self.assertTrue(
+            re.search(r'reported\s*===\s*"critical"', tail)
+            and re.search(r'reported\s*===\s*"atRisk"', tail),
+            "the service headline is no longer filtered to the states that "
+            "worsen the verdict")
+        self.assertEqual(
+            len(re.findall(r'return\s+reported', tail)), 1,
+            "expected exactly one guarded return of the reported state")
+
+    def test_nothing_reporting_is_not_reported_as_health(self):
+        # A field run showed "Sensors: 0 healthy / 0 total" and
+        # "Modules: 0 loaded" for its whole duration while the card claimed
+        # protection. A zero that reads exactly like a healthy machine is the
+        # defect class this codebase keeps producing.
+        state = self._fn("dashboardState")
+        headline = self._fn("dashboardPrimaryHeadline")
+        for fn, body in (("dashboardState", state),
+                         ("dashboardPrimaryHeadline", headline)):
+            self.assertTrue(
+                re.search(r"root\._moduleCount\(\)\s*===\s*0", body),
+                "%s no longer distinguishes an empty sensor set, so zero "
+                "modules would render as protected" % fn)
+
+        # The empty case must precede the reassuring answer in both.
+        self.assertLess(
+            state.index("root._moduleCount() === 0"), state.rindex('"healthy"'),
+            "the empty-sensor check must precede the healthy verdict")
+        self.assertLess(
+            headline.index("root._moduleCount() === 0"),
+            headline.index("We are Protecting You"),
+            "the empty-sensor check must precede the protected headline")
+
+    def test_the_secondary_line_sums_because_it_has_one_source(self):
+        # DELIBERATELY THE OPPOSITE RULE to the fold above, and the distinction
+        # is the point: these two counts come from ONE source and describe
+        # DISJOINT sets, so at-risk plus critical is the number of sensors
+        # needing review. Guarding it stops the fold's no-addition rule being
+        # applied here by a reader who saw only that rule.
+        body = self._fn("dashboardSecondaryHeadline")
+        self.assertTrue(
+            re.search(r"root\._sensorAtRisk\(\)\s*\+\s*root\._sensorCritical\(\)", body),
+            "the secondary line no longer sums the two disjoint per-sensor "
+            "counts, so it would under-report the sensors needing review")
+
+    def test_the_protected_wording_is_the_agreed_one(self):
+        self.assertEqual(
+            self.page.count('qsTr("We are Protecting You.")'), 1,
+            "expected exactly one protected headline, found %d"
+            % self.page.count('qsTr("We are Protecting You.")'))
+        self.assertEqual(
+            self.page.count('qsTr("Your device is protected")'), 0,
+            "the superseded wording is back")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

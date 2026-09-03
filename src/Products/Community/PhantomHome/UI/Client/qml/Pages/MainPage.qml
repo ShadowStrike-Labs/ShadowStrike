@@ -118,15 +118,73 @@ PageHost {
         }
     }
 
+    /// THE HERO CARD ANSWERS ONE QUESTION, SO IT NOW USES ONE SET OF EVIDENCE.
+    ///
+    /// Three surfaces in that card each decided "are you protected?" from a
+    /// DIFFERENT source: the shield from protectionViewModel.headlineState, the
+    /// primary headline from protectionViewModel.criticalCount/atRiskCount, and
+    /// the sensor chip plus the secondary line from the modules model's
+    /// per-module health. Nothing reconciled them, so the card could render a
+    /// red shield, "Your device is protected", and "N of M sensor(s) require
+    /// review" at the same time, inches apart.
+    ///
+    /// The fold takes the WORST of every source, and that direction is
+    /// deliberate rather than symmetric: a reassuring headline over a red badge
+    /// is the failure mode worth preventing, and no source here can certify
+    /// health that another source denies.
+    function _sensorCritical() { return root._moduleCountByHealth(2) }
+    function _sensorAtRisk()   { return root._moduleCountByHealth(1) }
+
+    function _reportedCritical() {
+        if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+            return 0
+        return protectionViewModel.criticalCount
+    }
+
+    function _reportedAtRisk() {
+        if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+            return 0
+        return protectionViewModel.atRiskCount
+    }
+
+    /// Folded with Math.max and NOT summed: the two sources describe the SAME
+    /// modules, so adding them would double-count every module they agree on
+    /// and report twice the real number of problems.
+    function _criticalCount() {
+        return Math.max(root._reportedCritical(), root._sensorCritical())
+    }
+
+    function _atRiskCount() {
+        return Math.max(root._reportedAtRisk(), root._sensorAtRisk())
+    }
+
     function dashboardState() {
         if (!root._serviceConnected)
             return "unknown"
         if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null &&
             protectionViewModel.protectionPaused)
             return "paused"
-        if (typeof protectionViewModel !== "undefined" && protectionViewModel !== null)
-            return protectionViewModel.headlineState
-        return "unknown"
+        if (root._criticalCount() > 0) return "critical"
+        if (root._atRiskCount() > 0)   return "atRisk"
+        if (typeof protectionViewModel === "undefined" || protectionViewModel === null)
+            return "unknown"
+
+        // The service's own headline is consulted LAST and only to make the
+        // verdict worse. It cannot promote the card to healthy over sensors
+        // that say otherwise, which is exactly what it used to do.
+        var reported = protectionViewModel.headlineState
+        if (reported === "critical" || reported === "atRisk" || reported === "paused")
+            return reported
+
+        // NO SENSOR REPORTING IS NOT HEALTH. A field run showed
+        // "Sensors: 0 healthy / 0 total" and "Modules: 0 loaded" for its whole
+        // duration while the card claimed protection - a zero that reads
+        // exactly like a healthy machine is the defect class this codebase
+        // keeps producing, so it gets its own state instead of a green tick.
+        if (root._moduleCount() === 0)
+            return "unknown"
+
+        return "healthy"
     }
 
     function dashboardPrimaryHeadline() {
@@ -136,20 +194,29 @@ PageHost {
             return qsTr("Protection telemetry is loading")
         if (protectionViewModel.protectionPaused)
             return qsTr("Protection is paused")
-        var crit = protectionViewModel.criticalCount
-        var risk = protectionViewModel.atRiskCount
+        var crit = root._criticalCount()
+        var risk = root._atRiskCount()
         if (crit > 0) return qsTr("%1 critical issue(s) require action.").arg(crit)
         if (risk > 0) return qsTr("%1 module(s) need your attention.").arg(risk)
-        return qsTr("Your device is protected")
+
+        // Same reasoning as the shield: nothing reporting is not protection.
+        if (root._moduleCount() === 0)
+            return qsTr("Waiting for protection modules to report")
+
+        return qsTr("We are Protecting You.")
     }
 
     function dashboardSecondaryHeadline() {
         if (!root._serviceConnected)
             return qsTr("Live protection state will refresh when the service reconnects.")
         var modules = root._moduleCount()
-        var unhealthy = root._moduleCountByHealth(1) + root._moduleCountByHealth(2)
+
+        // Summed here on purpose, unlike the folded verdict above: these two
+        // counts come from ONE source and describe DISJOINT sets, so at-risk
+        // plus critical is the number of sensors needing review.
+        var unhealthy = root._sensorAtRisk() + root._sensorCritical()
         if (modules === 0)
-            return qsTr("Waiting for protection modules to report sensor health.")
+            return qsTr("The service is connected but no sensor has reported yet.")
         if (unhealthy > 0)
             return qsTr("%1 of %2 sensor(s) require review.").arg(unhealthy).arg(modules)
         return qsTr("%1 protection sensor(s) are reporting healthy state.").arg(modules)
@@ -410,9 +477,11 @@ PageHost {
                             }
 
                             StatusChip {
+                                // Reads the SAME folded counts as the shield and
+                                // the headline, so the three cannot disagree.
                                 state: root._serviceConnected
-                                       ? ((root._moduleCountByHealth(2) > 0) ? "critical" :
-                                          ((root._moduleCountByHealth(1) > 0) ? "warning" :
+                                       ? ((root._criticalCount() > 0) ? "critical" :
+                                          ((root._atRiskCount() > 0) ? "warning" :
                                            (root._moduleCount() > 0 ? "on" : "loading")))
                                        : "offline"
                                 label: qsTr("Sensors: %1 healthy / %2 total").arg(root._moduleCountByHealth(0)).arg(root._moduleCount())
