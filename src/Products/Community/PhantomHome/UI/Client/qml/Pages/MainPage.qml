@@ -271,6 +271,62 @@ PageHost {
         return st === 1 || st === 2 || st === 3
     }
 
+    /// Names the scan that is actually running.  The scope comes from the
+    /// service, which recorded it at StartScan before the record was even
+    /// published, so this cannot disagree with what is executing.
+    function scanScopeLabel(scope, target) {
+        if (scope === "full")   return qsTr("Full Scan")
+        if (scope === "custom")
+            return target !== "" ? qsTr("Scanning %1").arg(target)
+                                 : qsTr("Custom Scan")
+        return qsTr("Quick Scan")
+    }
+
+    /// m:ss for a millisecond duration.  Returns "" for zero so a caller can
+    /// OMIT an unknown figure instead of printing 0:00, which would read as a
+    /// real measurement.
+    function scanDuration(ms) {
+        if (!ms || ms <= 0) return ""
+        var total = Math.floor(ms / 1000)
+        var m = Math.floor(total / 60)
+        var s = total % 60
+        return m + ":" + (s < 10 ? "0" + s : "" + s)
+    }
+
+    /// A byte count in the largest unit that keeps it readable.  Also returns
+    /// "" for zero, for the same reason.
+    function scanBytes(b) {
+        if (!b || b <= 0) return ""
+        var units = ["B", "KB", "MB", "GB", "TB"]
+        var i = 0
+        var v = b
+        while (v >= 1024 && i < units.length - 1) { v = v / 1024; i++ }
+        return (i === 0 ? v : v.toFixed(1)) + " " + units[i]
+    }
+
+    /// The detail line under the progress ring.
+    ///
+    /// EVERY PART IS DROPPED WHEN ITS SOURCE IS ZERO.  The engine leaves a
+    /// figure it has not computed at zero - totalBytes is never computed at
+    /// all - so printing every field unconditionally would show "0 B" and
+    /// "0:00 left" beside real numbers and make the real ones untrustworthy.
+    function scanDetailLine(vm) {
+        if (typeof vm === "undefined") return ""
+        var parts = []
+        if (vm.totalFiles > 0)
+            parts.push(qsTr("%1 of %2 files").arg(vm.itemsScanned)
+                                             .arg(vm.totalFiles))
+        else if (vm.itemsScanned > 0)
+            parts.push(qsTr("%1 files").arg(vm.itemsScanned))
+        var bytes = root.scanBytes(vm.bytesScanned)
+        if (bytes !== "") parts.push(bytes)
+        var el = root.scanDuration(vm.elapsedMs)
+        if (el !== "") parts.push(qsTr("%1 elapsed").arg(el))
+        var rem = root.scanDuration(vm.estimatedRemainingMs)
+        if (rem !== "") parts.push(qsTr("about %1 left").arg(rem))
+        return parts.join("   -   ")
+    }
+
     /// ProtectionViewModel.globalMode → StatusChip state.
     function modeChipState(mode) {
         if (mode === 0) return "off"
@@ -549,6 +605,15 @@ PageHost {
                                          ? scanViewModel.percent : 0
                         threatsFound:    (typeof scanViewModel !== "undefined")
                                          ? scanViewModel.threatsFound : 0
+
+                        activeScanLabel: (typeof scanViewModel !== "undefined")
+                                         ? root.scanScopeLabel(
+                                               scanViewModel.scope,
+                                               scanViewModel.targetSummary)
+                                         : ""
+                        activeScanDetail: (typeof scanViewModel !== "undefined")
+                                          ? root.scanDetailLine(scanViewModel)
+                                          : ""
 
                         onStartRequested: {
                             if (typeof scanViewModel !== "undefined")

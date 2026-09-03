@@ -49,6 +49,18 @@ struct ScanViewModel::Impl {
     QString currentPath;
     QString scanId;
 
+    // Seeded from the request payload at doStartScan so the surface is
+    // correct from the first frame, then confirmed by every poll reply.
+    QString scope{QStringLiteral("fast")};
+    QString targetSummary;
+
+    quint64 totalFiles{0};
+    quint64 bytesScanned{0};
+    quint64 elapsedMs{0};
+    quint64 estimatedRemainingMs{0};
+    quint64 filesPerSecond{0};
+    quint64 bytesPerSecond{0};
+
     // QTimer owned by unique_ptr; no Qt parent required because ScanViewModel's
     // destructor will reset m_impl, dropping the timer safely.
     std::unique_ptr<QTimer> pollTimer;
@@ -109,6 +121,19 @@ quint64 ScanViewModel::threatsFound() const noexcept { return m_impl->threatsFou
 QString ScanViewModel::currentPath()  const noexcept { return m_impl->currentPath; }
 QString ScanViewModel::scanId()       const noexcept { return m_impl->scanId; }
 
+QString ScanViewModel::scope()         const noexcept { return m_impl->scope; }
+QString ScanViewModel::targetSummary() const noexcept { return m_impl->targetSummary; }
+quint64 ScanViewModel::totalFiles()    const noexcept { return m_impl->totalFiles; }
+quint64 ScanViewModel::bytesScanned()  const noexcept { return m_impl->bytesScanned; }
+quint64 ScanViewModel::elapsedMs()     const noexcept { return m_impl->elapsedMs; }
+quint64 ScanViewModel::filesPerSecond() const noexcept { return m_impl->filesPerSecond; }
+quint64 ScanViewModel::bytesPerSecond() const noexcept { return m_impl->bytesPerSecond; }
+
+quint64 ScanViewModel::estimatedRemainingMs() const noexcept
+{
+    return m_impl->estimatedRemainingMs;
+}
+
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 void ScanViewModel::applyProgressUpdate(const QJsonObject& ev)
@@ -135,6 +160,45 @@ void ScanViewModel::applyProgressUpdate(const QJsonObject& ev)
     m_impl->threatsFound = static_cast<quint64>(
         ev.value(QLatin1String("threatsFound")).toDouble(static_cast<double>(m_impl->threatsFound)));
     m_impl->currentPath  = ev.value(QLatin1String("currentPath")).toString(m_impl->currentPath);
+
+    // EACH FIELD KEEPS ITS PREVIOUS VALUE WHEN ABSENT, matching the fields
+    // above. A progress event and a poll reply do not carry the same key
+    // set - the broadcast event is deliberately small - so defaulting an
+    // absent key to zero would make every value flicker between the real
+    // figure and nothing as the two sources interleaved.
+    m_impl->scope = ev.value(QLatin1String("scope")).toString(m_impl->scope);
+
+    // targetCount is authoritative even though the list is capped, so the
+    // summary is built from the count and only NAMES a target when exactly
+    // one was requested. Saying "3 items" is honest; naming one of three
+    // as though it were the whole selection is not.
+    if (ev.contains(QLatin1String("targetCount"))) {
+        const auto count = static_cast<quint64>(
+            ev.value(QLatin1String("targetCount")).toDouble(0.0));
+        const QJsonArray targets =
+            ev.value(QLatin1String("targets")).toArray();
+        if (count == 1 && targets.size() == 1) {
+            m_impl->targetSummary = targets.at(0).toString();
+        } else if (count > 1) {
+            m_impl->targetSummary = tr("%1 items").arg(count);
+        } else {
+            m_impl->targetSummary.clear();
+        }
+    }
+
+    const auto readCounter = [&ev](const char* key, quint64 previous) -> quint64 {
+        return static_cast<quint64>(
+            ev.value(QLatin1String(key)).toDouble(static_cast<double>(previous)));
+    };
+    m_impl->totalFiles           = readCounter("totalFiles", m_impl->totalFiles);
+    m_impl->bytesScanned         = readCounter("bytesScanned", m_impl->bytesScanned);
+    m_impl->elapsedMs            = readCounter("elapsedMs", m_impl->elapsedMs);
+    m_impl->estimatedRemainingMs = readCounter("estimatedRemainingMs",
+                                               m_impl->estimatedRemainingMs);
+    m_impl->filesPerSecond       = readCounter("filesPerSecond",
+                                               m_impl->filesPerSecond);
+    m_impl->bytesPerSecond       = readCounter("bytesPerSecond",
+                                               m_impl->bytesPerSecond);
     if (ev.contains(QLatin1String("scanId"))) {
         const QJsonValue idValue = ev.value(QLatin1String("scanId"));
         if (idValue.isString()) {
@@ -208,6 +272,34 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
     m_impl->threatsFound = 0;
     m_impl->currentPath.clear();
     m_impl->scanId.clear();
+
+    m_impl->totalFiles           = 0;
+    m_impl->bytesScanned         = 0;
+    m_impl->elapsedMs            = 0;
+    m_impl->estimatedRemainingMs = 0;
+    m_impl->filesPerSecond       = 0;
+    m_impl->bytesPerSecond       = 0;
+
+    // SEEDED FROM THE PAYLOAD BEING SENT, not from the caller that built it.
+    // Reading the request means the label cannot disagree with the scope the
+    // service is about to record, and it puts one derivation here instead of
+    // one in each of the three entry points.
+    //
+    // This matters before the first reply arrives: the tile switches to its
+    // running state as soon as StartScan is acknowledged, which is earlier
+    // than the first progress poll, so without a seed it would show the
+    // previous scan's label for one interval.
+    m_impl->scope = payload.value(QLatin1String("scope"))
+                        .toString(QStringLiteral("fast"));
+
+    const QJsonArray requested = payload.value(QLatin1String("paths")).toArray();
+    if (requested.size() == 1) {
+        m_impl->targetSummary = requested.at(0).toString();
+    } else if (requested.size() > 1) {
+        m_impl->targetSummary = tr("%1 items").arg(requested.size());
+    } else {
+        m_impl->targetSummary.clear();
+    }
     emit stateChanged();
     emit progressChanged();
 

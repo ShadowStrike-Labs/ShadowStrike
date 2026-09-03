@@ -71,6 +71,14 @@ SCAN_VIEW_MODEL_CPP_PATH = (
     ROOT
     / "src/Products/Community/PhantomHome/UI/Client/ViewModels/ScanViewModel.cpp"
 )
+FAST_SCAN_TILE_QML_PATH = (
+    ROOT
+    / "src/Products/Community/PhantomHome/UI/Client/qml/Components/FastScanTile.qml"
+)
+MAIN_PAGE_QML_PATH = (
+    ROOT
+    / "src/Products/Community/PhantomHome/UI/Client/qml/Pages/MainPage.qml"
+)
 SELF_DEFENSE_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.hpp"
 ANTIVIRUS_SERVICE_HPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.hpp"
 ANTIVIRUS_SERVICE_CPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.cpp"
@@ -16694,6 +16702,143 @@ class ScanProgressReportingContractTests(unittest.TestCase):
                 assign, block,
                 "%r happens outside the stateMutex critical section, racing the "
                 "custom branch that writes it" % assign)
+
+
+
+class ScanSurfaceHonestyContractTests(unittest.TestCase):
+    """The one progress surface must name the scan it is actually showing.
+
+    FastScanTile is the ONLY progress surface in the product, and MainPage is
+    the only page that instantiates it. A scan started from the Explorer
+    "Scan with ShadowStrike" verb therefore arrives here too - and the tile had
+    nothing to name it, so its accessible name and its completed heading both
+    said "Quick Scan" for every scan a user could start, including a
+    single-file one that is neither quick-scan scope nor machine-wide.
+
+    THE IDLE HEADING IS DELIBERATELY STILL "Quick Scan" and an arm below pins
+    that, because the button under it does start a quick scan. Changing it would
+    be a different inaccuracy, not a fix.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tile = strip_c_comments(read_source(FAST_SCAN_TILE_QML_PATH))
+        cls.page = strip_c_comments(read_source(MAIN_PAGE_QML_PATH))
+        cls.vm_h = strip_c_comments(read_source(SCAN_VIEW_MODEL_HPP_PATH))
+
+    def _qml_function(self, name):
+        m = re.search(r"function\s+" + re.escape(name) + r"\s*\(", self.page)
+        if m is None:
+            raise AssertionError("MainPage has no function %s" % name)
+        brace = self.page.index("{", m.start())
+        return self.page[m.start():_matching_delimiter(self.page, brace, "{", "}") + 1]
+
+    def test_the_tile_accepts_what_is_running_and_hides_it_when_absent(self):
+        for prop in ("activeScanLabel", "activeScanDetail"):
+            self.assertEqual(
+                len(re.findall(r"property\s+string\s+" + prop + r"\s*:", self.tile)), 1,
+                "expected exactly one %s property declaration on the tile" % prop)
+            # Empty default plus a visibility gate is what makes this additive:
+            # a page that supplies neither renders exactly what it did before,
+            # rather than showing a blank line where a heading should be.
+            self.assertTrue(
+                re.search(r"visible:\s*root\." + prop + r'\s*!==\s*""', self.tile),
+                "%s is not gated on being non-empty, so a page that does not "
+                "supply it renders an empty line" % prop)
+
+    def test_the_accessible_name_prefers_the_running_scan(self):
+        # A screen reader was told "Quick Scan" during a custom scan.
+        self.assertTrue(
+            re.search(r"Accessible\.name:\s*root\.activeScanLabel\s*!==\s*""",
+                      self.tile),
+            "the accessible name no longer prefers the active scan label, so it "
+            "announces the wrong scan")
+
+    def test_the_idle_heading_still_offers_a_quick_scan(self):
+        # ANTI-OVERCORRECTION. The idle state's heading and button are accurate:
+        # that button starts a quick scan. Removing the phrase entirely would
+        # leave the tile unable to say what it does.
+        self.assertGreaterEqual(
+            self.tile.count('qsTr("Quick Scan")'), 1,
+            "the idle heading no longer names the scan its own button starts")
+        self.assertEqual(
+            self.tile.count('qsTr("Run Quick Scan")'), 1,
+            "the idle action button no longer names what it does")
+
+    def test_the_page_supplies_both_from_the_view_model(self):
+        for prop, helper in (("activeScanLabel", "scanScopeLabel"),
+                             ("activeScanDetail", "scanDetailLine")):
+            self.assertEqual(
+                len(re.findall(prop + r"\s*:", self.page)), 1,
+                "expected exactly one %s binding on the tile instance" % prop)
+            self.assertIn(
+                "root." + helper, self.page,
+                "%s is not derived through %s, so the page is formatting it "
+                "inline where it cannot be checked" % (prop, helper))
+        self.assertIn(
+            "scanViewModel.scope", self.page,
+            "the label is not derived from the scope the service reports")
+        self.assertIn(
+            "scanViewModel.targetSummary", self.page,
+            "the label cannot name a custom scan's target")
+
+    def test_every_scope_gets_its_own_label(self):
+        body = self._qml_function("scanScopeLabel")
+        for literal in ('qsTr("Full Scan")', 'qsTr("Custom Scan")',
+                        'qsTr("Quick Scan")', 'qsTr("Scanning %1")'):
+            self.assertEqual(
+                body.count(literal), 1,
+                "expected exactly one %s in scanScopeLabel, found %d - a scope "
+                "sharing another's label is the defect this replaced"
+                % (literal, body.count(literal)))
+        self.assertIn('"full"', body, "the full scope is no longer recognised")
+        self.assertIn('"custom"', body, "the custom scope is no longer recognised")
+
+    def test_an_unknown_figure_is_omitted_rather_than_printed_as_zero(self):
+        # THE WHOLE POINT. The engine leaves a figure it has not computed at
+        # zero, and totalBytes is never computed at all, so printing every field
+        # unconditionally would put "0 B" and "0:00 left" beside real numbers and
+        # make the real ones untrustworthy.
+        for name in ("scanDuration", "scanBytes"):
+            body = self._qml_function(name)
+            self.assertTrue(
+                re.search(r'return\s*""', body),
+                "%s no longer returns an empty string for a non-positive "
+                "input, so a caller cannot tell absent from measured" % name)
+
+        detail = self._qml_function("scanDetailLine")
+        for guard in (r"vm\.totalFiles\s*>\s*0",
+                      r"vm\.itemsScanned\s*>\s*0",
+                      r'bytes\s*!==\s*""',
+                      r'el\s*!==\s*""',
+                      r'rem\s*!==\s*""'):
+            self.assertTrue(
+                re.search(guard, detail),
+                "scanDetailLine no longer guards %s, so an unmeasured figure "
+                "would be printed as a real one" % guard)
+
+    def test_the_new_properties_notify_on_every_update(self):
+        # stateChanged fires only on a state TRANSITION while these values
+        # arrive on ordinary poll replies, so binding them to stateChanged
+        # would leave them stale for the whole run of a scan.
+        for prop in ("scope", "targetSummary", "totalFiles", "bytesScanned",
+                     "elapsedMs", "estimatedRemainingMs", "filesPerSecond",
+                     "bytesPerSecond"):
+            m = re.search(r"Q_PROPERTY\s*\([^)]*\b" + prop +
+                          r"\b[^)]*?NOTIFY\s+(\w+)\s*\)", self.vm_h, re.S)
+            self.assertIsNotNone(
+                m, "no Q_PROPERTY declares %s" % prop)
+            self.assertEqual(
+                m.group(1), "progressChanged",
+                "%s notifies %s; it must notify progressChanged, which is "
+                "emitted on every reply, or the binding goes stale between "
+                "state transitions" % (prop, m.group(1)))
+
+        # And totalBytes must NOT be exposed: no emitter produces it.
+        self.assertEqual(
+            self.vm_h.count("totalBytes"), 0,
+            "the view model exposes totalBytes, which no producer sets, so it "
+            "would bind a permanent zero into the UI")
 
 
 if __name__ == "__main__":

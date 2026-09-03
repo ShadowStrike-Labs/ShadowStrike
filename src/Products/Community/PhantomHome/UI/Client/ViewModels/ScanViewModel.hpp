@@ -50,6 +50,39 @@ class ScanViewModel final : public QObject {
     Q_PROPERTY(QString currentPath  READ currentPath  NOTIFY progressChanged)
     Q_PROPERTY(QString scanId       READ scanId       NOTIFY stateChanged)
 
+    //
+    // WHAT THE SCAN IS. Without these the model could describe a scan only
+    // as a percentage, so the one progress surface in the product labelled
+    // every scan "Quick Scan" - including a right-click scan of a single
+    // file, which is neither quick-scan scope nor machine-wide.
+    //
+    // NOTIFIED BY progressChanged, NOT stateChanged, and that is deliberate:
+    // stateChanged is emitted only on a state TRANSITION, while these values
+    // arrive on ordinary poll replies. Binding them to stateChanged would
+    // leave them stale for the whole run of a scan.
+    //
+    Q_PROPERTY(QString scope         READ scope         NOTIFY progressChanged)
+    Q_PROPERTY(QString targetSummary READ targetSummary NOTIFY progressChanged)
+
+    //
+    // THE ENGINE'S OWN FIGURES, each with a producer in ScanBatch's emitter.
+    // totalBytes is absent because no emitter sets it - the engine cannot
+    // know it without stat-ing every file before scanning - so there is
+    // deliberately no property for a value that would always read zero.
+    //
+    Q_PROPERTY(quint64 totalFiles    READ totalFiles    NOTIFY progressChanged)
+    Q_PROPERTY(quint64 bytesScanned  READ bytesScanned  NOTIFY progressChanged)
+    Q_PROPERTY(quint64 elapsedMs     READ elapsedMs     NOTIFY progressChanged)
+    Q_PROPERTY(quint64 estimatedRemainingMs
+                                     READ estimatedRemainingMs
+                                     NOTIFY progressChanged)
+    Q_PROPERTY(quint64 filesPerSecond
+                                     READ filesPerSecond
+                                     NOTIFY progressChanged)
+    Q_PROPERTY(quint64 bytesPerSecond
+                                     READ bytesPerSecond
+                                     NOTIFY progressChanged)
+
 public:
     enum ScanState {
         Idle      = 0,
@@ -70,6 +103,15 @@ public:
     [[nodiscard]] quint64 threatsFound() const noexcept;
     [[nodiscard]] QString currentPath()  const noexcept;
     [[nodiscard]] QString scanId()       const noexcept;
+
+    [[nodiscard]] QString scope()         const noexcept;
+    [[nodiscard]] QString targetSummary() const noexcept;
+    [[nodiscard]] quint64 totalFiles()    const noexcept;
+    [[nodiscard]] quint64 bytesScanned()  const noexcept;
+    [[nodiscard]] quint64 elapsedMs()     const noexcept;
+    [[nodiscard]] quint64 estimatedRemainingMs() const noexcept;
+    [[nodiscard]] quint64 filesPerSecond() const noexcept;
+    [[nodiscard]] quint64 bytesPerSecond() const noexcept;
 
     Q_INVOKABLE void startFastScan();
     Q_INVOKABLE void startFullScan();
