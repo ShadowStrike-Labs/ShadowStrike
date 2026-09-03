@@ -16558,5 +16558,143 @@ class ScanProgressProducerContractTests(unittest.TestCase):
             "nothing")
 
 
+
+class ScanProgressReportingContractTests(unittest.TestCase):
+    """A progress reply must say WHAT is being scanned, and only what is real.
+
+    Two independent defects met in this reply. It described every scan
+    identically, because the scope was known at StartScan and discarded one
+    statement later - so a right-click scan of a single file reached the only
+    progress surface with nothing to distinguish it from a machine-wide Quick
+    Scan, and that surface duly called it a Quick Scan. And it dropped six
+    fields the engine produces on the very path that feeds it.
+
+    The reply also has a documented history of the opposite mistake: it once
+    reported ScanRecord::threatsFound, a field written by nothing, so every scan
+    announced zero detections whatever it had found. Both failure modes are
+    guarded here - fields with producers must be carried, and the one field
+    without a producer must stay absent.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(HOME_IPC_DISPATCHER_CPP_PATH))
+
+    def _reply(self):
+        """The GetScanProgress reply object, brace-matched from its own opening."""
+        k = self.src.index("std::string state, currentPath, scanScope;")
+        start = self.src.index("nlohmann::json resp{", k)
+        return self.src[start:_matching_delimiter(self.src, start +
+                                                  self.src[start:].index("{"),
+                                                  "{", "}") + 1]
+
+    def _snapshot_block(self):
+        """The critical section the reply reads its string state from."""
+        k = self.src.index("std::string state, currentPath, scanScope;")
+        brace = self.src.index("{", k)
+        return self.src[brace:_matching_delimiter(self.src, brace, "{", "}") + 1]
+
+    def test_the_scope_is_recorded_before_the_record_is_published(self):
+        # ORDERING IS THE INVARIANT. AddScan publishes the record into the map
+        # that every later lookup uses; a scope written after it means a poll
+        # arriving in between reports the DEFAULT, which is "fast" - the exact
+        # wrong answer for a custom scan, and silently plausible.
+        self.assertEqual(
+            self.src.count("rec->scope = scope;"), 1,
+            "expected exactly one scope assignment on the new record, found %d"
+            % self.src.count("rec->scope = scope;"))
+        self.assertEqual(
+            self.src.count("impl->AddScan(rec);"), 1,
+            "expected exactly one AddScan publication, found %d"
+            % self.src.count("impl->AddScan(rec);"))
+        self.assertLess(
+            self.src.index("rec->scope = scope;"),
+            self.src.index("impl->AddScan(rec);"),
+            "the scope is recorded AFTER the record is published, so a lookup "
+            "between the two reports the default scope instead of the real one")
+
+    def test_the_engine_progress_fields_are_stored(self):
+        # Each of these is produced by ScanBatch's emitter, which is the only
+        # emitter QuickScan, FullScan and CustomScan reach.
+        for field in ("totalFiles", "bytesScanned", "filesPerSecond",
+                      "bytesPerSecond", "elapsedMs", "estimatedRemainingMs"):
+            n = len(re.findall(r"r->" + field + r"\.store\(", self.src))
+            self.assertEqual(
+                n, 1,
+                "expected exactly one store of %s in the progress callback, "
+                "found %d - a field the engine computes and the service drops "
+                "is invisible to every client" % (field, n))
+
+    def test_the_reply_carries_what_the_scan_is(self):
+        reply = self._reply()
+        self.assertGreater(len(reply), 200,
+                           "sliced reply is only %d chars - the anchor moved"
+                           % len(reply))
+        for key in ('"scope"', '"targets"', '"targetCount"', '"totalFiles"',
+                    '"bytesScanned"', '"elapsedMs"', '"estimatedRemainingMs"',
+                    '"filesPerSecond"', '"bytesPerSecond"'):
+            self.assertEqual(
+                reply.count(key), 1,
+                "expected exactly one %s key in the progress reply, found %d"
+                % (key, reply.count(key)))
+
+        # Anti-vacuity: the pre-existing keys must survive, so this cannot pass
+        # by the reply having been rewritten into something else entirely.
+        for key in ('"state"', '"percent"', '"itemsScanned"',
+                    '"threatsFound"', '"currentPath"'):
+            self.assertEqual(
+                reply.count(key), 1,
+                "the pre-existing key %s is no longer reported exactly once "
+                "(found %d)" % (key, reply.count(key)))
+
+    def test_the_reply_does_not_report_a_total_it_cannot_know(self):
+        # ScanProgress::totalBytes is assigned by NO emitter, on purpose: the
+        # engine would have to stat every file before scanning to know it. A
+        # progress bar fed a constant zero denominator is exactly the defect
+        # this reply already carries a comment about from the threatsFound case.
+        reply = self._reply()
+        self.assertEqual(
+            reply.count('"totalBytes"'), 0,
+            "the reply reports totalBytes, which no producer sets - so it is "
+            "either a constant zero being sent to a client that will divide by "
+            "it, or a pre-pass was added without accounting for its latency")
+
+        # Not vacuous: the byte counter that IS produced must be present.
+        self.assertEqual(
+            reply.count('"bytesScanned"'), 1,
+            "the produced byte counter is missing, so the absence above proves "
+            "nothing")
+
+    def test_the_target_count_is_exact_while_the_list_is_capped(self):
+        # BOTH HALVES MATTER. Capping the count would misreport the selection;
+        # not capping the list puts the whole path set on the wire twice a
+        # second for a several-hundred-file selection.
+        self.assertTrue(
+            re.search(r"kMaxReportedScanTargets\s*=\s*\d+u?\s*;", self.src),
+            "the reported-target cap constant is gone")
+        self.assertTrue(
+            re.search(r"targets\.size\(\)\s*>=\s*kMaxReportedScanTargets", self.src),
+            "the target list is no longer bounded by the cap, so a large "
+            "selection is echoed in full on every poll")
+        self.assertTrue(
+            re.search(r"targetCount\s*=\s*paths\.size\(\)", self.src),
+            "the target COUNT is no longer taken from the full path set, so a "
+            "capped list would be reported as the whole selection")
+
+    def test_the_string_state_is_read_under_the_lock(self):
+        # scope and targets are strings guarded by stateMutex, not atomics.
+        block = self._snapshot_block()
+        self.assertIn(
+            "std::lock_guard<std::mutex> lk(r->stateMutex)", block,
+            "the reply no longer takes stateMutex before reading the scan's "
+            "string state")
+        for assign in ("scanScope = r->scope", "scanTargets = r->targets",
+                       "scanTargetCount = r->targetCount"):
+            self.assertIn(
+                assign, block,
+                "%r happens outside the stateMutex critical section, racing the "
+                "custom branch that writes it" % assign)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

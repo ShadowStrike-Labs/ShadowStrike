@@ -118,6 +118,13 @@ using ShadowStrike::Config::ConfigManager;
 static constexpr const wchar_t* kLogCat        = L"HomeIpc";
 static constexpr std::uint32_t  kProtocolVer   = 1u;
 static constexpr std::size_t    kMaxListItems  = 200u;
+
+// Scan targets NAMED in a progress reply. The COUNT reported alongside is
+// always exact; this caps only the list, because the reply is polled about
+// twice a second and a several-hundred-file selection would otherwise put the
+// whole path set on the wire on every poll. A caller needs enough to name
+// what is being scanned, not to reconstruct the selection.
+static constexpr std::size_t    kMaxReportedScanTargets = 8u;
 static constexpr std::size_t    kMaxResponseBytes = 512u * 1024u;  // 512 KiB
 static constexpr std::uint32_t  kMaxJsonDepth  = 8u;
 static constexpr std::uint32_t  kMaxJsonNodes  = 4096u;
@@ -369,6 +376,39 @@ struct HomeIpcDispatcher::Impl {
         std::atomic<uint64_t> itemsScanned{0};
         std::atomic<uint64_t> threatsFound{0};
         std::atomic<bool>     cancelRequested{false};
+
+        //
+        // WHAT THE SCAN IS, not merely how far along it is.
+        //
+        // Without these the only progress surface can describe any scan in one
+        // way, and it picked "Quick Scan" - so a right-click scan of a single
+        // file was reported to the user as a Quick Scan of their whole machine.
+        // The scope was known at StartScan and thrown away one statement later.
+        //
+        // Guarded by stateMutex rather than made atomic because they are
+        // strings, and the reply already takes that lock to read stateStr.
+        //
+        std::string              scope{"fast"};
+        std::vector<std::string> targets;
+        std::size_t              targetCount{0};
+
+        //
+        // THE ENGINE'S OWN PROGRESS FIELDS. Every one of these is produced by
+        // ScanBatch's emitter - the only emitter QuickScan, FullScan and
+        // CustomScan reach - and every one was discarded here.
+        //
+        // totalBytes IS ABSENT DELIBERATELY. The engine cannot know it without
+        // stat-ing every file before the scan begins, so it is genuinely
+        // unset rather than merely unreported, and carrying a constant zero
+        // to a progress bar would be the defect this change removes.
+        //
+        std::atomic<uint64_t> totalFiles{0};
+        std::atomic<uint64_t> bytesScanned{0};
+        std::atomic<uint64_t> elapsedMs{0};
+        std::atomic<uint64_t> estimatedRemainingMs{0};
+        std::atomic<uint64_t> filesPerSecond{0};
+        std::atomic<uint64_t> bytesPerSecond{0};
+
         mutable std::mutex    stateMutex;
         std::string           stateStr{"running"};
         std::wstring          currentPath;
@@ -1008,6 +1048,12 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         rec->scanId = impl->NewScanId();
         const std::string scanId = rec->scanId;
 
+        // Set BEFORE AddScan publishes the record, so no lookup can ever
+        // observe a scan whose scope is still the default. The target list
+        // cannot be set here because it is only parsed inside the custom
+        // branch below, which is why that branch takes the lock.
+        rec->scope = scope;
+
         // Register the record in the activeScans map *before* spawning the
         // async task or the watcher thread. The progress callback and the
         // watcher both look the record up by id via FindScan; if AddScan
@@ -1021,6 +1067,26 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 if (!r) return;
                 r->percent.store(p.percentComplete, std::memory_order_relaxed);
                 r->itemsScanned.store(p.filesScanned, std::memory_order_relaxed);
+
+                // Relaxed for the same reason percent and itemsScanned are:
+                // these are independent progress readings polled on a timer,
+                // not a set of values that must be mutually consistent. A
+                // reply that pairs one poll's file count with the next poll's
+                // byte count is indistinguishable to a user from a reply that
+                // arrived a few milliseconds later.
+                r->totalFiles.store(p.totalFiles, std::memory_order_relaxed);
+                r->bytesScanned.store(p.bytesScanned, std::memory_order_relaxed);
+                r->filesPerSecond.store(p.filesPerSecond, std::memory_order_relaxed);
+                r->bytesPerSecond.store(p.bytesPerSecond, std::memory_order_relaxed);
+                r->elapsedMs.store(
+                    static_cast<uint64_t>(p.elapsed.count() > 0 ? p.elapsed.count() : 0),
+                    std::memory_order_relaxed);
+                r->estimatedRemainingMs.store(
+                    static_cast<uint64_t>(p.estimatedRemaining.count() > 0
+                                          ? p.estimatedRemaining.count()
+                                          : 0),
+                    std::memory_order_relaxed);
+
                 {
                     std::lock_guard<std::mutex> lk(r->stateMutex);
                     r->currentPath = p.currentFile;
@@ -1077,6 +1143,24 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                         "paths required for custom scope").dump());
                 return;
             }
+            // WHAT the user asked for, recorded before the work starts so the
+            // first poll can already name it.
+            //
+            // The full count is always exact; the list itself is capped,
+            // because this reply is polled roughly twice a second and a
+            // multi-hundred-file selection would put the entire path set on
+            // the wire on every single poll. A UI needs enough to name the
+            // target, not the whole selection.
+            {
+                std::lock_guard<std::mutex> lk(rec->stateMutex);
+                rec->targetCount = paths.size();
+                rec->targets.clear();
+                for (const auto& w : paths) {
+                    if (rec->targets.size() >= kMaxReportedScanTargets) break;
+                    rec->targets.push_back(WideToNarrow(w));
+                }
+            }
+
             rec->future = std::async(std::launch::async,
                 [p2 = std::move(paths), progressCb = std::move(progressCb)]() mutable {
                     return ScanEngine::Instance().CustomScan(p2, std::move(progressCb));
@@ -1208,18 +1292,40 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             return;
         }
 
-        std::string state, currentPath;
+        std::string state, currentPath, scanScope;
+        std::vector<std::string> scanTargets;
+        std::size_t scanTargetCount = 0;
         {
             std::lock_guard<std::mutex> lk(r->stateMutex);
             state = r->stateStr;
             currentPath = WideToNarrow(r->currentPath);
+            scanScope = r->scope;
+            scanTargets = r->targets;
+            scanTargetCount = r->targetCount;
         }
 
+        // EVERY FIELD HERE HAS A PRODUCER, which is why totalBytes is not
+        // among them: the engine leaves it unset because it cannot know the
+        // total without a full pre-pass, and reporting a constant zero to a
+        // progress bar is the defect this reply already carries a comment
+        // about from the threatsFound case.
         nlohmann::json resp{
             {"ok",           true},
             {"state",        state},
+            {"scope",        scanScope},
+            {"targets",      scanTargets},
+            {"targetCount",  scanTargetCount},
             {"percent",      static_cast<int>(r->percent.load(std::memory_order_relaxed))},
             {"itemsScanned", r->itemsScanned.load(std::memory_order_relaxed)},
+            {"totalFiles",   r->totalFiles.load(std::memory_order_relaxed)},
+            {"bytesScanned", r->bytesScanned.load(std::memory_order_relaxed)},
+            {"elapsedMs",    r->elapsedMs.load(std::memory_order_relaxed)},
+            {"estimatedRemainingMs",
+                             r->estimatedRemainingMs.load(std::memory_order_relaxed)},
+            {"filesPerSecond",
+                             r->filesPerSecond.load(std::memory_order_relaxed)},
+            {"bytesPerSecond",
+                             r->bytesPerSecond.load(std::memory_order_relaxed)},
             {"threatsFound", r->threatsFound.load(std::memory_order_relaxed)},
             {"currentPath",  currentPath}
         };
