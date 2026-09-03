@@ -529,6 +529,16 @@ typedef struct _SHADOWSTRIKE_DRIVER_STATUS {
     //
     LONG64 PcScanCircuitOpen;
 
+    //
+    // SCAN-PATH TRANSPORT LATENCY, measured around the raw FltSendMessage wait
+    // and nothing else. See the block on SHADOWSTRIKE_STATISTICS in Globals.h
+    // for why the create-path counters cannot answer this on their own.
+    //
+    LONG64 TxScanSendSamples;
+    LONG64 TxScanSendTotalUs;
+    LONG64 TxScanSendMaxUs;
+    LONG64 TxScanSendDeadlineOverruns;
+
 } SHADOWSTRIKE_DRIVER_STATUS, *PSHADOWSTRIKE_DRIVER_STATUS;
 
 //
@@ -601,8 +611,16 @@ C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxCallbackTimeUs) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcTotalCallbackTimeUs) + sizeof(LONG64));
 C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanCircuitOpen) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcMaxCallbackTimeUs) + sizeof(LONG64));
-C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendSamples) ==
          FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, PcScanCircuitOpen) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendTotalUs) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendSamples) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendMaxUs) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendTotalUs) + sizeof(LONG64));
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendDeadlineOverruns) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendMaxUs) + sizeof(LONG64));
+C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==
+         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, TxScanSendDeadlineOverruns) + sizeof(LONG64));
 
 // ============================================================================
 // POLICY UPDATE STRUCTURE

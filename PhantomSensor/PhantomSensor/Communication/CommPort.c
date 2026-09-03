@@ -49,6 +49,7 @@
 #include "../Context/InstanceContext.h"
 #include "../Callbacks/FileSystem/PreCreate.h"
 #include "../Utilities/FileUtils.h"
+#include "../Performance/PerformanceMonitor.h"   // SSPM_LATENCY_* for the send bracket
 
 //
 // Pointer-sized PID identity for every accepted primary scanner slot. A single
@@ -3263,6 +3264,19 @@ ShadowStrikeHandleQueryDriverStatus(
     driverStatus.ConnectedClients = g_DriverData.ConnectedClients;
 
     //
+    // Read with InterlockedOr64(&x, 0) for the same reason the counters above
+    // are: a torn-free 64-bit load rather than an assumption about alignment.
+    //
+    driverStatus.TxScanSendSamples = InterlockedOr64(
+        &g_DriverData.Stats.ScanSendSamples, 0);
+    driverStatus.TxScanSendTotalUs = InterlockedOr64(
+        &g_DriverData.Stats.ScanSendTotalUs, 0);
+    driverStatus.TxScanSendMaxUs = InterlockedOr64(
+        &g_DriverData.Stats.ScanSendMaxUs, 0);
+    driverStatus.TxScanSendDeadlineOverruns = InterlockedOr64(
+        &g_DriverData.Stats.ScanSendDeadlineOverruns, 0);
+
+    //
     // Instance context aggregate statistics
     //
     {
@@ -3800,6 +3814,55 @@ ShadowStrikeReleaseClientPort(
     }
 }
 
+//
+// Fold one scan-path FltSendMessage wait into the driver statistics.
+//
+// Mirrors PcpAccountCallbackLatency exactly, including reading the initial
+// maximum with InterlockedCompareExchange64(&x, 0, 0) rather than assuming an
+// aligned 64-bit load is atomic.
+//
+// A zero duration is still counted as a sample: it means the reply was already
+// waiting, which is a real observation about a fast scanner, and discarding it
+// would bias the average upward by dropping exactly the fastest calls.
+//
+// TimeoutMs is the EFFECTIVE deadline, after the boot-phase clamp, so the
+// overrun test compares each wait against what it actually asked for rather
+// than against a constant.
+//
+static VOID
+ShadowStrikeAccountScanSendLatency(
+    _In_ ULONG64 ElapsedUs,
+    _In_ ULONG TimeoutMs
+    )
+{
+    LONG64 duration = (LONG64)min(ElapsedUs, (ULONG64)MAXLONG64);
+    LONG64 oldMax;
+
+    InterlockedIncrement64(&g_DriverData.Stats.ScanSendSamples);
+    InterlockedAdd64(&g_DriverData.Stats.ScanSendTotalUs, duration);
+
+    oldMax = InterlockedCompareExchange64(&g_DriverData.Stats.ScanSendMaxUs, 0, 0);
+    while (duration > oldMax) {
+        LONG64 prev = InterlockedCompareExchange64(
+            &g_DriverData.Stats.ScanSendMaxUs,
+            duration,
+            oldMax
+            );
+        if (prev == oldMax) break;
+        oldMax = prev;
+    }
+
+    //
+    // Twice the deadline, not merely over it: FltSendMessage's interval is a
+    // floor on when it MAY return, and a wait that lands a little past it has
+    // simply been scheduled late. A wait past double its own budget cannot be
+    // explained that way.
+    //
+    if (TimeoutMs != 0 && ElapsedUs > ((ULONG64)TimeoutMs * 1000ULL * 2ULL)) {
+        InterlockedIncrement64(&g_DriverData.Stats.ScanSendDeadlineOverruns);
+    }
+}
+
 NTSTATUS
 ShadowStrikeSendScanRequest(
     _In_reads_bytes_(RequestSize) PSHADOWSTRIKE_MESSAGE_HEADER Request,
@@ -4073,6 +4136,14 @@ ShadowStrikeSendScanRequest(
     //
     // Send message and wait for reply
     //
+    // BRACKETED DELIBERATELY TIGHT. Everything above this point - the pending
+    // limit, the port acquire, the GCM encryption - is excluded, because the
+    // question these counters answer is whether the WAIT honours its deadline.
+    // Widening the bracket would reintroduce exactly the ambiguity that made a
+    // 5.42 second callback unattributable in the first place.
+    //
+    SSPM_LATENCY_BEGIN(scanSend);
+
     status = FltSendMessage(
         g_DriverData.FilterHandle,
         &clientPort,
@@ -4082,6 +4153,8 @@ ShadowStrikeSendScanRequest(
         &replySize,
         &timeout
     );
+
+    ShadowStrikeAccountScanSendLatency(SSPM_LATENCY_ELAPSED_US(scanSend), TimeoutMs);
 
     //
     // A REPLY, NOT MERELY A SUCCESS CODE.

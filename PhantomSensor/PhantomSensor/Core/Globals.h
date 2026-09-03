@@ -198,6 +198,44 @@ typedef struct _SHADOWSTRIKE_STATISTICS {
     /// @brief Messages dropped (queue full)
     volatile LONG64 MessagesDropped;
 
+    //
+    // SCAN-PATH TRANSPORT LATENCY.
+    //
+    // These exist to answer ONE question that could not be answered from the
+    // create-path counters alone. PreCreate already reports the whole callback
+    // (PcCallbackSamples/PcTotalCallbackTimeUs/PcMaxCallbackTimeUs) and the
+    // scan bracket (PcTotalScanTimeMs/PcMaxScanTimeMs), and a 1.0.107 field run
+    // reported cbMaxUs=5423037 against maxScanMs=5423 - so 5,423,000 of those
+    // 5,423,037 microseconds were inside the scan bracket, bounding all other
+    // work in that callback at 37 us.
+    //
+    // What those numbers CANNOT distinguish is why: the create path asks for a
+    // deadline of at most PC_SCAN_TIMEOUT_EXECUTE_MS (500) with zero retries,
+    // so either the deadline is not reaching the FltSendMessage wait, or the
+    // wait honoured it and the thread was descheduled for the remainder. Those
+    // have different fixes, and guessing between them is what these counters
+    // exist to make unnecessary.
+    //
+    // The bracket is the RAW FltSendMessage call and nothing else, so
+    // ScanSendMaxUs near the requested deadline means the wait is bounded and
+    // the time is elsewhere, while ScanSendMaxUs near the callback maximum
+    // means the wait itself overran.
+    //
+
+    /// @brief Scan-path FltSendMessage calls actually timed
+    volatile LONG64 ScanSendSamples;
+
+    /// @brief Total microseconds spent inside scan-path FltSendMessage
+    volatile LONG64 ScanSendTotalUs;
+
+    /// @brief Worst single scan-path FltSendMessage wait, microseconds
+    volatile LONG64 ScanSendMaxUs;
+
+    /// @brief Waits that exceeded their OWN requested deadline by over 2x.
+    /// Non-zero is direct evidence that the deadline is not being honoured;
+    /// zero with a large ScanSendMaxUs points at scheduling instead.
+    volatile LONG64 ScanSendDeadlineOverruns;
+
     /// @brief Driver start time
     LARGE_INTEGER StartTime;
 

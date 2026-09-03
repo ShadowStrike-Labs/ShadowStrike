@@ -7258,13 +7258,22 @@ public:
                     ds.PcCallbackSamples > 0
                         ? ds.PcTotalCallbackTimeUs / ds.PcCallbackSamples
                         : 0;
+
+                // Averaged over sends, not over creates: most creates never
+                // reach a send at all, so dividing by anything else would
+                // understate the wait by the ratio between the two.
+                const long long txAvgUs =
+                    ds.TxScanSendSamples > 0
+                        ? ds.TxScanSendTotalUs / ds.TxScanSendSamples
+                        : 0;
                 kernelPart = std::format(
                     "kernelPreCreate: total={} scanned={} blocked={} excluded={} "
                     "cached={} timeouts={} errors={} circuitOpen={} selfProt={} "
                     "catalogExempt={} "
                     "honeypot={} ads={} dblExt={} suspPath={} ransomCorr={} "
                     "exe={} script={} doc={} archive={} avgScanMs={} maxScanMs={} "
-                    "cbSamples={} cbAvgUs={} cbMaxUs={}",
+                    "cbSamples={} cbAvgUs={} cbMaxUs={} "
+                    "txSends={} txAvgUs={} txMaxUs={} txOverruns={}",
                     ds.PcTotalOperations, ds.PcOperationsScanned,
                     ds.PcOperationsBlocked, ds.PcOperationsExcluded,
                     ds.PcOperationsCached, ds.PcScanTimeouts, ds.PcScanErrors,
@@ -7275,7 +7284,9 @@ public:
                     ds.PcRansomwareCorrelations, ds.PcExecutablesScanned,
                     ds.PcScriptsScanned, ds.PcDocumentsScanned,
                     ds.PcArchivesScanned, avgScanMs, ds.PcMaxScanTimeMs,
-                    ds.PcCallbackSamples, cbAvgUs, ds.PcMaxCallbackTimeUs);
+                    ds.PcCallbackSamples, cbAvgUs, ds.PcMaxCallbackTimeUs,
+                    ds.TxScanSendSamples, txAvgUs, ds.TxScanSendMaxUs,
+                    ds.TxScanSendDeadlineOverruns);
             }
         }
         const auto line = std::format(

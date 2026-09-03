@@ -14776,15 +14776,47 @@ class PreCreateCounterObservabilityContractTests(unittest.TestCase):
         # true the moment the block was extended: PcMaxScanTimeMs became the right
         # operand of a CONSECUTIVE assertion instead, the count stayed at one, and
         # the test passed while asserting something that was no longer the case.
-        last = self.PC_FIELDS[-1]
+        # DERIVED FROM THE STRUCT'S FINAL FIELD, not from the last Pc* one. The
+        # PreCreate block was last when this test was written and is not any
+        # more; the invariant it means to enforce is that the total-size
+        # assertion names whatever ENDS the struct, so an append cannot escape
+        # it. Appending the transport-latency block is precisely the case this
+        # test was built to catch, and it caught it.
+        struct_start = self.shared.index("typedef struct _SHADOWSTRIKE_DRIVER_STATUS")
+        struct_end = self.shared.index("} SHADOWSTRIKE_DRIVER_STATUS", struct_start)
+        all_fields = re.findall(r"\bLONG64\s+(\w+)\s*;",
+                                self.shared[struct_start:struct_end])
+        self.assertGreaterEqual(
+            len(all_fields), len(self.PC_FIELDS),
+            "the LONG64 field parse found %d fields against %d Pc* fields, so "
+            "this is a parse failure rather than a shrunken struct"
+            % (len(all_fields), len(self.PC_FIELDS)))
+        last = all_fields[-1]
         self.assertEqual(
             self.shared.count(
                 "sizeof(SHADOWSTRIKE_DRIVER_STATUS) ==\n"
                 "         FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, " + last +
                 ") + sizeof(LONG64));"),
             1,
-            "the total-size assertion must name %s, the last Pc* field in the "
+            "the total-size assertion must name %s, the final field in the "
             "struct, so appending a field forces it to move" % last)
+
+        # AND ANY BLOCK APPENDED AFTER THE PreCreate BLOCK MUST BE CHAINED TOO.
+        # Without this a new group could sit in the struct with nothing tying it
+        # to its predecessor - the same unasserted-region gap this whole block
+        # exists to close, one level further out.
+        tail = all_fields[all_fields.index(self.PC_FIELDS[-1]):]
+        chained = 0
+        for a, z in zip(tail, tail[1:]):
+            if ("FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, " + z + ") ==" in self.shared
+                    and "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS, " + a
+                        + ") + sizeof(LONG64))" in self.shared):
+                chained += 1
+        self.assertEqual(
+            chained, len(tail) - 1,
+            "expected %d offset assertion(s) chaining the %d field(s) that "
+            "follow the PreCreate block, found %d"
+            % (len(tail) - 1, len(tail), chained))
         self.assertEqual(
             self.shared.count("sizeof(SHADOWSTRIKE_DRIVER_STATUS) =="), 1,
             "the total-size assertion over SHADOWSTRIKE_DRIVER_STATUS is missing")
@@ -16229,6 +16261,171 @@ class ScanCircuitRefusalAccountingContractTests(unittest.TestCase):
             arg_err, arg_circ,
             "the arguments are ordered the other way round from the placeholders, "
             "so the two values would be reported under each other's names")
+
+
+
+class ScanSendLatencyInstrumentationContractTests(unittest.TestCase):
+    """The scan-path send wait must be measured tightly enough to be attributable.
+
+    WHY THIS EXISTS AT ALL. A 1.0.107 field run reported cbMaxUs=5423037 with
+    maxScanMs=5423, and because the scan bracket is nested inside the callback
+    bracket that arithmetic bounds all non-scan work in that callback at 37 us -
+    so 99.9993 percent of a 5.42 second file create was the scan send. What it
+    could NOT establish is why, because the create path asks for a deadline of at
+    most 500 ms with zero retries. Either the deadline is not reaching the
+    FltSendMessage wait, or the wait honoured it and the thread was descheduled
+    for the remainder. Those have different fixes.
+
+    THE MEASUREMENT IS ONLY DECISIVE WHILE IT STAYS TIGHT. Widen the bracket to
+    include the port acquire or the GCM encryption and it stops distinguishing
+    the two hypotheses, which is the entire reason it was added rather than
+    reasoned about.
+    """
+
+    @staticmethod
+    def _definition_body(src, name):
+        m = re.search(r"^%s\s*\(" % re.escape(name), src, re.M)
+        if m is None:
+            raise AssertionError("no definition of %s found" % name)
+        brace = src.index("{", m.start())
+        return src[m.start():_matching_delimiter(src, brace, "{", "}") + 1]
+
+    def test_the_send_bracket_contains_only_the_wait(self):
+        # Comments stripped first: the explanatory comments added with this
+        # instrumentation quote the bracket macros and the surrounding stages by
+        # name, so a comment-blind read is the only one that describes the code.
+        src = strip_c_comments(read_source(COMM_PORT_C_PATH))
+        body = self._definition_body(src, "ShadowStrikeSendScanRequest")
+
+        self.assertEqual(
+            body.count("SSPM_LATENCY_BEGIN(scanSend)"), 1,
+            "expected exactly one send-bracket start, found %d"
+            % body.count("SSPM_LATENCY_BEGIN(scanSend)"))
+        self.assertEqual(
+            body.count("SSPM_LATENCY_ELAPSED_US(scanSend)"), 1,
+            "expected exactly one send-bracket read, found %d"
+            % body.count("SSPM_LATENCY_ELAPSED_US(scanSend)"))
+
+        begin = body.index("SSPM_LATENCY_BEGIN(scanSend)")
+        end = body.index("SSPM_LATENCY_ELAPSED_US(scanSend)")
+        self.assertLess(
+            begin, end,
+            "the bracket is read before it starts, so the elapsed time would be "
+            "measured from an uninitialised value")
+
+        region = body[begin:end]
+
+        # THE LOAD-BEARING ASSERTION. Exactly two statements may sit between the
+        # two macros: the macro's own declaration and the send. Anything else -
+        # an acquire, an allocation, an encrypt - and the number stops answering
+        # the question it was added for.
+        statements = region.count(";")
+        self.assertEqual(
+            statements, 2,
+            "the send bracket spans %d statements; only the bracket declaration "
+            "and the FltSendMessage call may sit inside it, or the measurement "
+            "cannot separate the wait from the work around it" % statements)
+        self.assertEqual(
+            region.count("FltSendMessage("), 1,
+            "the bracket does not enclose exactly one FltSendMessage call "
+            "(found %d)" % region.count("FltSendMessage("))
+
+    def test_the_overrun_test_uses_the_callers_own_deadline(self):
+        # A comparison against a constant could not discriminate: the create path
+        # passes 500 / 150 / 50 ms depending on access type and the boot phase
+        # clamps to 250, so a fixed threshold would misjudge four of five cases.
+        src = strip_c_comments(read_source(COMM_PORT_C_PATH))
+        body = self._definition_body(src, "ShadowStrikeAccountScanSendLatency")
+
+        self.assertGreater(len(body), 300,
+                           "sliced body is only %d chars - the anchor moved" % len(body))
+        self.assertEqual(
+            body.count("Stats.ScanSendDeadlineOverruns"), 1,
+            "expected exactly one overrun increment, found %d"
+            % body.count("Stats.ScanSendDeadlineOverruns"))
+
+        # SCOPED TO THE GATE, not to the body. TimeoutMs also names the function
+        # parameter, so a body-wide count is satisfied by the signature alone and
+        # would pass with a hardcoded threshold in the comparison - which is the
+        # one substitution that would make this counter undiagnostic.
+        before = body[:body.index("Stats.ScanSendDeadlineOverruns")]
+        gate = before[before.rindex("if ("):]
+        self.assertIn(
+            "TimeoutMs", gate,
+            "the overrun gate no longer consults the caller's deadline, so it "
+            "cannot tell an unhonoured deadline from a late schedule")
+
+        # And the maximum must be a real maximum, not the last sample.
+        self.assertGreaterEqual(
+            body.count("InterlockedCompareExchange64"), 2,
+            "the worst-case is no longer published through a compare-exchange "
+            "loop, so a concurrent send can lose the maximum")
+
+    def test_the_counters_reach_user_mode(self):
+        # A counter nobody reads is a structural zero, which reads identically to
+        # a healthy machine - the defect class that made pool=0/0 and
+        # pendingScanQueue argue against their own symptoms.
+        shared = strip_c_comments(read_source(SHARED_DEFS_H_PATH))
+        driver = strip_c_comments(read_source(COMM_PORT_C_PATH))
+
+        for field in ("TxScanSendSamples", "TxScanSendTotalUs",
+                      "TxScanSendMaxUs", "TxScanSendDeadlineOverruns"):
+            self.assertEqual(
+                shared.count("LONG64 %s;" % field), 1,
+                "expected exactly one %s field on the wire, found %d"
+                % (field, shared.count("LONG64 %s;" % field)))
+            self.assertEqual(
+                driver.count("driverStatus.%s" % field), 1,
+                "%s is never populated from the driver statistics, so it would "
+                "report zero regardless of what the transport did" % field)
+
+        # The total-size assertion must name the LAST field, so appending another
+        # counter without extending it fails the build.
+        self.assertTrue(
+            re.search(r"C_ASSERT\(\s*sizeof\(SHADOWSTRIKE_DRIVER_STATUS\)\s*==\s*"
+                      r"FIELD_OFFSET\(\s*SHADOWSTRIKE_DRIVER_STATUS\s*,"
+                      r"\s*TxScanSendDeadlineOverruns\s*\)\s*\+\s*sizeof\(LONG64\)\s*\)",
+                      shared),
+            "the total-size assertion no longer names the last field")
+
+    def test_the_report_emits_the_wait_beside_the_callback(self):
+        # std::format matches by POSITION, so the format text and the argument
+        # list must agree on where the new values sit, not merely both mention
+        # them. Reported next to cbMaxUs on purpose: the comparison between the
+        # two numbers is the whole diagnosis.
+        src = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+        for placeholder in ("txSends={}", "txAvgUs={}", "txMaxUs={}", "txOverruns={}"):
+            self.assertEqual(
+                src.count(placeholder), 1,
+                "expected exactly one %s placeholder, found %d"
+                % (placeholder, src.count(placeholder)))
+
+        order = [
+            ("cbMaxUs={}", "txSends={}"),
+            ("ds.PcMaxCallbackTimeUs,", "ds.TxScanSendSamples,"),
+            ("ds.TxScanSendMaxUs,", "ds.TxScanSendDeadlineOverruns)"),
+        ]
+        # Counted and reported by OFFSET, never by containment: this source is
+        # ~394 KB, and an assertIn failure against it prints the whole file.
+        for earlier, later in order:
+            self.assertEqual(
+                src.count(earlier), 1,
+                "expected exactly one %r, found %d" % (earlier, src.count(earlier)))
+            self.assertEqual(
+                src.count(later), 1,
+                "expected exactly one %r, found %d" % (later, src.count(later)))
+            self.assertLess(
+                src.index(earlier), src.index(later),
+                "%r sits at offset %d but %r at %d, so the values would be "
+                "reported under each other's names"
+                % (earlier, src.index(earlier), later, src.index(later)))
+
+        # The average must be per SEND, not per create: most creates never reach
+        # a send, so any other divisor understates the wait.
+        self.assertTrue(
+            re.search(r"ds\.TxScanSendTotalUs\s*/\s*ds\.TxScanSendSamples", src),
+            "the average wait is no longer divided by the number of sends")
 
 
 if __name__ == "__main__":
