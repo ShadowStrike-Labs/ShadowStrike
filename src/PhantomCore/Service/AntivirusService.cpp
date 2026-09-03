@@ -48,7 +48,8 @@
 #include "../Utils/ThreadPool.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/FileUtils.hpp"
-#include "../Utils/DataStorePaths.hpp"   // SeedSignatureDatabaseFromBaseline
+#include "../Utils/DataStorePaths.hpp"
+#include "../../Products/Community/PhantomHome/Reports/HomeReportsStore.hpp"   // SeedSignatureDatabaseFromBaseline
 #include "ServiceMonitor.hpp"
 
 // ============================================================================
@@ -729,6 +730,22 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize UpdateManager");
             }
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-UpdateManager-leave");
+
+            // Give the reports store its general producer.
+            //
+            // HomeReportsStore had readers and no writers: a bounded ring, a
+            // Query filter, IPC command 240, a view model with CSV export and
+            // a QML page, all fed by nothing. The scan watcher now records
+            // completions; this bridge supplies everything else by way of the
+            // AlertSystem callback seam, which had no production registrant.
+            //
+            // Registered HERE rather than inside AlertSystem because that
+            // class is PhantomCore and is built into EDR and XDR too, so the
+            // dependency has to point product -> core, never the reverse.
+            //
+            // Order-independent: registration only stores a callback, and
+            // RaiseAlert refuses to run before AlertSystem is initialized.
+            ShadowStrike::PhantomHome::Reports::InstallAlertSystemBridge();
 
             // 6. Wire Update callbacks for hot-reload and telemetry
             if (Update::UpdateManager::Instance().IsInitialized()) {

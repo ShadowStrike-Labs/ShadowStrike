@@ -2,6 +2,8 @@
 
 #include "HomeReportsStore.hpp"
 
+#include "../../../../PhantomCore/Communication/AlertSystem.hpp"
+
 #include <algorithm>
 #include <chrono>
 
@@ -155,6 +157,132 @@ void HomeReportsStore::Clear() noexcept {
         entries_.clear();
     } catch (...) {
     }
+}
+
+// ===========================================================================
+// THE ALERTSYSTEM BRIDGE
+//
+// AlertSystem::RaiseAlert has 101 call sites across 33 files and was the
+// only chokepoint wide enough to give this store a general producer. See the
+// header for why this is a registered callback rather than a call placed
+// inside RaiseAlert itself.
+// ===========================================================================
+namespace {
+
+std::atomic<std::uint64_t> g_bridged{0};
+std::atomic<std::uint64_t> g_skippedInfo{0};
+std::atomic<bool>          g_installed{false};
+
+ReportSeverity MapSeverity(Communication::AlertSeverity s) noexcept {
+    using AS = Communication::AlertSeverity;
+    switch (s) {
+        case AS::Info:      return ReportSeverity::Info;
+        case AS::Low:       return ReportSeverity::Low;
+        case AS::Medium:    return ReportSeverity::Medium;
+        case AS::High:      return ReportSeverity::High;
+        case AS::Critical:  return ReportSeverity::Critical;
+        case AS::Emergency: return ReportSeverity::Critical;
+        // Emergency FOLDS to Critical rather than being truncated: Critical
+        // is the top of ReportSeverity, so an Emergency alert still lands in
+        // the highest bucket the page can render and nothing is understated.
+        // Adding a sixth ReportSeverity would change a type the UI maps to
+        // colours, which is not a change to make as a side effect of this one.
+    }
+    return ReportSeverity::Info;
+}
+
+ReportKind MapKind(Communication::AlertType t) noexcept {
+    using AT = Communication::AlertType;
+    switch (t) {
+        case AT::ThreatDetection: return ReportKind::ThreatDetected;
+        case AT::Security:        return ReportKind::ThreatDetected;
+        case AT::PolicyViolation: return ReportKind::PolicyChanged;
+        case AT::SystemHealth:
+        case AT::Operational:
+        case AT::Performance:     return ReportKind::ModuleStateChange;
+        case AT::ComplianceAlert:
+        case AT::AuditEvent:
+        case AT::Custom:          break;
+        // These three fall through to Unknown DELIBERATELY. ReportKind has no
+        // bucket for them, and filing an audit event as a ModuleStateChange
+        // would state that a module changed state when none did. An honest
+        // Unknown alongside a real title and description is worth more than a
+        // confident wrong label - the same reasoning that keeps a stopped scan
+        // out of RecordScanCompleted.
+    }
+    return ReportKind::Unknown;
+}
+
+}  // namespace
+
+void InstallAlertSystemBridge() noexcept {
+    bool expected = false;
+    if (!g_installed.compare_exchange_strong(expected, true,
+                                             std::memory_order_acq_rel)) {
+        return;  // Already installed; registering twice would replace it.
+    }
+    try {
+        Communication::AlertSystem::Instance().RegisterAlertCallback(
+            [](const Communication::Alert& alert) {
+                const ReportSeverity sev = MapSeverity(alert.severity);
+
+                // INFO IS DROPPED, AND THE ARITHMETIC IS THE REASON.
+                //
+                // entries_ holds kMaxEntries = 1024 rows and evicts the
+                // oldest, so the ring is a scarce resource shared with scan
+                // rows and threat rows. The 1.0.104 field run recorded 46,185
+                // kernel threat alerts in 329 seconds - about 140 a second -
+                // and at that rate an unfiltered bridge would churn the whole
+                // page in roughly seven seconds, leaving a user looking at the
+                // last few moments of chatter instead of their security
+                // history. Adding a producer that destroys the surface it
+                // feeds is not an improvement.
+                //
+                // Info is the one class that is pure chatter. Scan completions
+                // are Info-flavoured but genuinely user-meaningful, and they
+                // come from the dedicated scan producer, not from here.
+                //
+                // BOTH SIDES ARE COUNTED. The right threshold is a field
+                // question and the counters are how the next run answers it,
+                // rather than this comment being the last word on it.
+                if (sev == ReportSeverity::Info) {
+                    g_skippedInfo.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+
+                ReportEntry e;
+                e.kind        = MapKind(alert.type);
+                e.severity    = sev;
+                e.module      = alert.source.empty() ? std::string("AlertSystem")
+                                                     : alert.source;
+                e.title       = alert.subject;
+                e.description = alert.details;
+
+                // target AND action ARE LEFT EMPTY ON PURPOSE. Alert carries no
+                // subject path - correlationId is a dedup key and metadata is
+                // opaque JSON - and an alert states that something was OBSERVED,
+                // not what was done about it. Putting a dedup key in a field the
+                // header documents as "subject path / URL / indicator", or
+                // writing an action nothing performed, would be inventing
+                // evidence. A blank column is the honest rendering, and it is
+                // also the measurement that says a quarantine-side producer is
+                // still owed.
+
+                HomeReportsStore::Instance().Record(std::move(e));
+                g_bridged.fetch_add(1, std::memory_order_relaxed);
+            });
+    } catch (...) {
+        // Leave the flag clear so a later attempt can retry rather than the
+        // bridge being permanently believed installed.
+        g_installed.store(false, std::memory_order_release);
+    }
+}
+
+AlertBridgeStats GetAlertBridgeStats() noexcept {
+    AlertBridgeStats s;
+    s.bridged      = g_bridged.load(std::memory_order_relaxed);
+    s.skipped_info = g_skippedInfo.load(std::memory_order_relaxed);
+    return s;
 }
 
 }  // namespace ShadowStrike::PhantomHome::Reports

@@ -143,4 +143,44 @@ private:
     std::atomic<std::uint64_t>  next_id_{1};
 };
 
+/**
+ * Installs the AlertSystem -> reports bridge.
+ *
+ * WHY A CALLBACK AND NOT A CALL INSIDE RaiseAlert: AlertSystem lives in
+ * PhantomCore, which PhantomEDR and PhantomXDR also build against, so a
+ * HomeReportsStore call inside it would make shared core code depend on a
+ * Home product header. RegisterAlertCallback is the seam that already
+ * exists for this, and it is invoked on the accept path AFTER suppression,
+ * deduplication and rate limiting - so a suppressed alert correctly
+ * produces no row, and a duplicate correctly produces no second row.
+ *
+ * MEASURED BEFORE USE: the seam had ZERO production registrants. All 27
+ * other RegisterAlertCallback calls in the tree are each module's OWN
+ * method (BotnetDetector::, TorDetector:: and so on), not this one, so
+ * m_alertCb was null in the field and the callback had never fired.
+ *
+ * THE SEAM HOLDS ONE CALLBACK, NOT A LIST. A future second registrant
+ * would silently displace this bridge and the reports page would go quiet
+ * with nothing logged. That is a latent hazard in AlertSystem, recorded
+ * here because this is the first code to depend on it.
+ *
+ * Idempotent, noexcept, and safe to call before AlertSystem::Initialize:
+ * registration only stores the callback, and RaiseAlert refuses to run at
+ * all until initialized.
+ */
+void InstallAlertSystemBridge() noexcept;
+
+/**
+ * Bridge counters. These exist because the correct Info threshold is a
+ * field question, not an armchair one: the ring holds kMaxEntries rows and
+ * evicts the oldest, so the real alert rate decides whether the page shows
+ * a history or the last few seconds. Reported, not guessed.
+ */
+struct AlertBridgeStats {
+    std::uint64_t bridged      = 0;  ///< Alerts that became report rows.
+    std::uint64_t skipped_info = 0;  ///< Info-severity alerts dropped.
+};
+
+[[nodiscard]] AlertBridgeStats GetAlertBridgeStats() noexcept;
+
 }  // namespace ShadowStrike::PhantomHome::Reports

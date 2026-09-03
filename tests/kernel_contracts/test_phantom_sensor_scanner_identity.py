@@ -91,6 +91,11 @@ UPDATE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/UpdateManager.cpp"
 HOME_REPORTS_STORE_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/Reports/HomeReportsStore.hpp"
 )
+HOME_REPORTS_STORE_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/Reports/HomeReportsStore.cpp"
+)
+ALERT_SYSTEM_CPP_PATH = ROOT / "src/PhantomCore/Communication/AlertSystem.cpp"
+ALERT_SYSTEM_HPP_PATH = ROOT / "src/PhantomCore/Communication/AlertSystem.hpp"
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
@@ -17329,6 +17334,134 @@ class ReportsStoreProducerContractTests(unittest.TestCase):
         self.assertGreaterEqual(
             len(re.findall(r"HomeReportsStore::Instance\(\)\.Query\(", self.disp)), 1,
             "the dispatcher no longer reads the store it now writes")
+
+
+
+class AlertBridgeContractTests(unittest.TestCase):
+    """The reports bridge must not invert the product/core dependency.
+
+    AlertSystem lives in PhantomCore, which PhantomEDR and PhantomXDR also build
+    against. A HomeReportsStore call placed inside RaiseAlert would make shared
+    core code depend on a Home product header. RegisterAlertCallback is the seam
+    that already exists for this, and it had ZERO production registrants - all 27
+    other RegisterAlertCallback calls in the tree are each module's own method.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.store = strip_c_comments(read_source(HOME_REPORTS_STORE_CPP_PATH))
+        cls.alert_cpp = strip_c_comments(read_source(ALERT_SYSTEM_CPP_PATH))
+        cls.alert_hpp = strip_c_comments(read_source(ALERT_SYSTEM_HPP_PATH))
+
+    def _bridge(self):
+        k = self.store.index("void InstallAlertSystemBridge() noexcept {")
+        brace = self.store.index("{", k)
+        return self.store[k:_matching_delimiter(self.store, brace, "{", "}") + 1]
+
+    def test_core_never_depends_on_the_home_reports_store(self):
+        # THE ARCHITECTURAL ARM. Checked on BOTH AlertSystem translation units,
+        # because an include in either one is the inversion.
+        for name, body in (("AlertSystem.cpp", self.alert_cpp),
+                           ("AlertSystem.hpp", self.alert_hpp)):
+            self.assertEqual(
+                body.count("HomeReportsStore"), 0,
+                "%s names HomeReportsStore, so PhantomCore now depends on a "
+                "Home product header and EDR/XDR inherit it" % name)
+            self.assertEqual(
+                body.count("PhantomHome"), 0,
+                "%s names PhantomHome, inverting the product/core dependency"
+                % name)
+
+    def test_the_bridge_uses_the_existing_callback_seam(self):
+        bridge = self._bridge()
+        self.assertGreater(len(bridge), 300,
+                           "sliced bridge is %d chars - anchor moved" % len(bridge))
+        self.assertIn(
+            "RegisterAlertCallback", bridge,
+            "the bridge no longer registers on AlertSystem's callback seam")
+        self.assertIn(
+            "compare_exchange_strong", bridge,
+            "the install is no longer idempotent, and the seam holds ONE "
+            "callback - registering twice replaces it silently")
+
+    def test_an_info_alert_is_dropped_and_counted_not_silently_lost(self):
+        # The ring holds kMaxEntries rows and evicts the oldest. An unfiltered
+        # bridge would churn the page, but a SILENT drop is how a surface comes
+        # to disagree with reality with nothing to show why.
+        bridge = self._bridge()
+        self.assertIn("ReportSeverity::Info", bridge,
+                      "the Info threshold is gone, so the bridge can churn the "
+                      "whole 1024-row ring in seconds")
+        self.assertIn(
+            "g_skippedInfo.fetch_add", bridge,
+            "Info alerts are dropped without being counted, so the next field "
+            "run cannot report the real rate and the threshold stays a guess")
+
+    def test_no_severity_is_understated(self):
+        # Emergency has no ReportSeverity of its own. It must fold UP to
+        # Critical, never down into a middle bucket.
+        k = self.store.index("ReportSeverity MapSeverity(")
+        brace = self.store.index("{", k)
+        body = self.store[k:_matching_delimiter(self.store, brace, "{", "}") + 1]
+        m = re.search(r"case\s+AS::Emergency\s*:\s*return\s+ReportSeverity::(\w+)\s*;",
+                      body)
+        self.assertIsNotNone(m, "AlertSeverity::Emergency is no longer mapped")
+        self.assertEqual(
+            m.group(1), "Critical",
+            "Emergency maps to %s, understating the most severe alert the "
+            "product can raise" % m.group(1))
+
+        # Every enumerator must be present, DERIVED from the header rather than
+        # from a list written here, so a new AlertSeverity cannot map to Info by
+        # falling off the end of the switch.
+        eh = strip_c_comments(read_source(ALERT_SYSTEM_HPP_PATH))
+        blk = eh[eh.index("enum class AlertSeverity"):]
+        blk = blk[:blk.index("};")]
+        names = re.findall(r"^\s*(\w+)\s*=", blk, re.M)
+        self.assertGreaterEqual(len(names), 6,
+                                "derived only %d AlertSeverity names" % len(names))
+        for n in names:
+            self.assertIn(
+                "AS::%s" % n, body,
+                "AlertSeverity::%s is not handled by MapSeverity, so it would "
+                "silently become Info" % n)
+
+    def test_the_bridge_invents_no_evidence(self):
+        # Alert carries no subject path: correlationId is a dedup key and
+        # metadata is opaque JSON. Putting either in a field the header
+        # documents as "subject path / URL / indicator" would be fabricating
+        # evidence, and an alert says what was OBSERVED, not what was DONE.
+        bridge = self._bridge()
+        self.assertNotIn(
+            "correlationId", bridge,
+            "the bridge writes a dedup key into a report field, inventing a "
+            "target the alert never carried")
+        self.assertNotIn(
+            "alert.metadata", bridge,
+            "the bridge writes opaque JSON into a report field")
+        self.assertFalse(
+            re.search(r"e\.target\s*=", bridge),
+            "the bridge populates target, which no Alert field can honestly "
+            "supply")
+        self.assertFalse(
+            re.search(r"e\.action\s*=", bridge),
+            "the bridge populates action, claiming something was done that it "
+            "did not do")
+
+    def test_an_unmapped_alert_type_is_not_given_a_confident_wrong_label(self):
+        k = self.store.index("ReportKind MapKind(")
+        brace = self.store.index("{", k)
+        body = self.store[k:_matching_delimiter(self.store, brace, "{", "}") + 1]
+        self.assertIn(
+            "return ReportKind::Unknown;", body,
+            "MapKind no longer falls back to Unknown, so an AlertType with no "
+            "matching ReportKind is filed under a bucket that misdescribes it")
+        for t in ("ComplianceAlert", "AuditEvent", "Custom"):
+            self.assertFalse(
+                re.search(r"case\s+AT::%s\s*:\s*return\s+ReportKind::(?!Unknown)" % t,
+                          body),
+                "AlertType::%s is mapped to a concrete ReportKind it does not "
+                "match" % t)
 
 
 if __name__ == "__main__":
