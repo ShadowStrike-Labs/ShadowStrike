@@ -2403,13 +2403,32 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             }
 
             // Query driver status to get ELAM and boot driver info from kernel
+            //
+            // Framed with a request payload for the same reason IPCManager's own
+            // driver-status query is: a payload-less frame cannot be encrypted
+            // and the driver refuses plaintext after key exchange, so a bare
+            // header never reached the driver at all. See
+            // SHADOWSTRIKE_DRIVER_STATUS_REQUEST.
+            //
+            constexpr size_t kQHeader  = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+            constexpr size_t kQRequest = sizeof(SHADOWSTRIKE_DRIVER_STATUS_REQUEST);
+
             SHADOWSTRIKE_MESSAGE_HEADER queryMsg{};
             queryMsg.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
             queryMsg.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
             queryMsg.MessageType = static_cast<UINT16>(FilterMessageType_QueryDriverStatus);
-            queryMsg.TotalSize = sizeof(queryMsg);
-            queryMsg.DataSize = 0;
+            queryMsg.TotalSize = static_cast<UINT32>(kQHeader + kQRequest);
+            queryMsg.DataSize = static_cast<UINT32>(kQRequest);
             queryMsg.Flags = SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH;
+
+            SHADOWSTRIKE_DRIVER_STATUS_REQUEST queryRequest{};
+            queryRequest.ExpectedStatusSize =
+                static_cast<UINT32>(sizeof(SHADOWSTRIKE_DRIVER_STATUS));
+            queryRequest.Reserved = 0;
+
+            std::array<uint8_t, kQHeader + kQRequest> queryFrame{};
+            std::memcpy(queryFrame.data(), &queryMsg, kQHeader);
+            std::memcpy(queryFrame.data() + kQHeader, &queryRequest, kQRequest);
 
             // Send query and receive kernel response
             struct DriverStatusReply {
@@ -2421,7 +2440,7 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             } reply{};
 
             size_t replySize = sizeof(reply);
-            bool sent = ipcMgr.SendToKernel(&queryMsg, sizeof(queryMsg), &reply, &replySize,
+            bool sent = ipcMgr.SendToKernel(queryFrame.data(), queryFrame.size(), &reply, &replySize,
                                             Communication::IPCConstants::REPLY_TIMEOUT_MS);
             
             if (sent && replySize >= sizeof(reply)) {

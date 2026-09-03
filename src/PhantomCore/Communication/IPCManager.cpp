@@ -1100,21 +1100,45 @@ bool IPCManager::QueryDriverStatus(SHADOWSTRIKE_DRIVER_STATUS& outStatus) noexce
     // fails loudly instead of quietly reading the first 40 bytes of a status
     // block as a header and returning plausible nonsense.
     //
+    constexpr size_t kHeaderSize  = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
+    constexpr size_t kRequestSize = sizeof(SHADOWSTRIKE_DRIVER_STATUS_REQUEST);
+    constexpr size_t kStatusSize  = sizeof(SHADOWSTRIKE_DRIVER_STATUS);
+
+    //
+    // THE QUERY CARRIES A PAYLOAD BECAUSE A PAYLOAD-LESS ONE CANNOT BE SENT AT
+    // ALL on this channel - see SHADOWSTRIKE_DRIVER_STATUS_REQUEST for the full
+    // reasoning. In short: the encryption primitive refuses a zero-length
+    // plaintext, so a bare header is never encrypted, and the driver refuses
+    // plaintext once the key exchange has completed. A bare header therefore
+    // failed with 0x80070005 on every single sample.
+    //
     SHADOWSTRIKE_MESSAGE_HEADER query{};
     query.Magic       = SHADOWSTRIKE_MESSAGE_MAGIC;
     query.Version     = SHADOWSTRIKE_PROTOCOL_VERSION;
     query.MessageType = static_cast<UINT16>(FilterMessageType_QueryDriverStatus);
-    query.TotalSize   = sizeof(query);
-    query.DataSize    = 0;
+    query.TotalSize   = static_cast<UINT32>(kHeaderSize + kRequestSize);
+    query.DataSize    = static_cast<UINT32>(kRequestSize);
 
-    constexpr size_t kHeaderSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER);
-    constexpr size_t kStatusSize = sizeof(SHADOWSTRIKE_DRIVER_STATUS);
+    SHADOWSTRIKE_DRIVER_STATUS_REQUEST request{};
+    request.ExpectedStatusSize = static_cast<UINT32>(kStatusSize);
+    request.Reserved           = 0;
+
+    //
+    // Assembled byte-wise rather than as a struct pair on purpose: the wire
+    // layout is packed, so a locally declared { header; request; } would be
+    // subject to THIS translation unit's default alignment and any padding the
+    // compiler chose to insert between the two members would travel as declared
+    // payload bytes that the driver reads as the request.
+    //
+    std::array<uint8_t, kHeaderSize + kRequestSize> queryFrame{};
+    std::memcpy(queryFrame.data(), &query, kHeaderSize);
+    std::memcpy(queryFrame.data() + kHeaderSize, &request, kRequestSize);
 
     std::array<uint8_t, kHeaderSize + kStatusSize> replyBuffer{};
     size_t replySize = replyBuffer.size();
 
-    if (!SendToKernel(&query, sizeof(query), replyBuffer.data(), &replySize,
-                      IPCConstants::REPLY_TIMEOUT_MS)) {
+    if (!SendToKernel(queryFrame.data(), queryFrame.size(), replyBuffer.data(),
+                      &replySize, IPCConstants::REPLY_TIMEOUT_MS)) {
         return false;
     }
 

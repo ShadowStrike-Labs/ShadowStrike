@@ -862,4 +862,48 @@ typedef struct _SHADOWSTRIKE_CONNECTION_CONTEXT {
     UCHAR  ClientImageHash[SHADOWSTRIKE_CLIENT_IMAGE_HASH_SIZE];
 } SHADOWSTRIKE_CONNECTION_CONTEXT, *PSHADOWSTRIKE_CONNECTION_CONTEXT;
 
+//
+// Driver-status query request payload.
+//
+// WHY A QUERY THAT NEEDS NO INPUT CARRIES A PAYLOAD, stated because the next
+// reader will otherwise delete it as dead weight: the transport wraps the data
+// portion of a message as [ENC_HEADER][ciphertext] with the plaintext
+// SHADOWSTRIKE_MESSAGE_HEADER as the AAD, and the encryption primitive refuses
+// a zero-length plaintext (ENC_MIN_PLAINTEXT_SIZE is 1). A payload-less message
+// is therefore UNENCRYPTABLE, and ShadowStrikeMessageNotify refuses plaintext
+// once the key exchange has completed. Before this payload existed the
+// driver-status query was a bare header, so it was always sent in the clear and
+// always refused with STATUS_ENCRYPTION_FAILED; user mode observed 0x80070005
+// and reported kernelPreCreate=unavailable on every sample, which is why the
+// in-kernel PreCreate counters could never be read from a field log.
+//
+// ExpectedStatusSize IS READ BY THE DRIVER and is not padding. It states the
+// sizeof() of the SHADOWSTRIKE_DRIVER_STATUS the CALLER was compiled against,
+// and ShadowStrikeHandleQueryDriverStatus compares it before populating
+// anything. That turns a structure disagreement across the kernel boundary from
+// something the caller discovers after a successful round trip into something
+// the producer refuses by name - the same drift class that let two declarations
+// of the file-scan request disagree about whether a length was bytes or
+// characters.
+//
+typedef struct _SHADOWSTRIKE_DRIVER_STATUS_REQUEST {
+    UINT32 ExpectedStatusSize;  // sizeof(SHADOWSTRIKE_DRIVER_STATUS) at the caller
+    UINT32 Reserved;            // Must be zero
+} SHADOWSTRIKE_DRIVER_STATUS_REQUEST, *PSHADOWSTRIKE_DRIVER_STATUS_REQUEST;
+
+C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS_REQUEST) == 8);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS_REQUEST, ExpectedStatusSize) == 0);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS_REQUEST, Reserved) == 4);
+
+//
+// The framed query must EXCEED a bare header, because that comparison is
+// literally the transport's encryption gate - FilterConnection encrypts only
+// when the send buffer is LARGER than the header. Asserting it here means
+// emptying this payload fails the build on both sides of the boundary instead
+// of silently restoring a frame the driver refuses in the clear.
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+         sizeof(SHADOWSTRIKE_DRIVER_STATUS_REQUEST) >
+         sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
 #pragma pack(pop)

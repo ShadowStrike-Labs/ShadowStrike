@@ -418,6 +418,7 @@ ShadowStrikeValidateInputBuffer(
 static NTSTATUS
 ShadowStrikeHandleQueryDriverStatus(
     _In_ PSHADOWSTRIKE_MESSAGE_HEADER InputHeader,
+    _In_ PSHADOWSTRIKE_DRIVER_STATUS_REQUEST Request,
     _Out_writes_bytes_(OutputBufferLength) PVOID OutputBuffer,
     _In_ ULONG OutputBufferLength,
     _Out_ PULONG ReturnLength
@@ -2993,6 +2994,9 @@ ShadowStrikeMessageNotify(
     switch (header->MessageType) {
 
         case ShadowStrikeMessageQueryDriverStatus:
+        {
+            SHADOWSTRIKE_DRIVER_STATUS_REQUEST statusRequest;
+
             //
             // Query status - requires QueryStatus capability
             //
@@ -3000,13 +3004,37 @@ ShadowStrikeMessageNotify(
                 status = STATUS_ACCESS_DENIED;
                 break;
             }
+
+            //
+            // COPIED THROUGH THE SHARED HELPER RATHER THAN DEREFERENCED, and the
+            // trust flag is what makes that mandatory: on an encrypted frame the
+            // dispatch buffer is our own decrypted kernel copy, but a frame that
+            // arrived before the key exchange is still the CALLER'S USER BUFFER,
+            // and only the helper knows which of the two needs probing. Reading
+            // the payload directly would be a user-mode dereference at
+            // PASSIVE_LEVEL with no __try around it.
+            //
+            status = ShadowStrikeCopyMessagePayload(
+                dispatchBuffer,
+                dispatchBufferLength,
+                sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                &statusRequest,
+                sizeof(statusRequest),
+                dispatchBufferTrusted
+            );
+            if (!NT_SUCCESS(status)) {
+                break;
+            }
+
             status = ShadowStrikeHandleQueryDriverStatus(
                 header,
+                &statusRequest,
                 OutputBuffer,
                 OutputBufferLength,
                 ReturnOutputBufferLength
             );
             break;
+        }
 
         case ShadowStrikeMessageUpdatePolicy:
             //
@@ -3149,6 +3177,7 @@ Cleanup:
 static NTSTATUS
 ShadowStrikeHandleQueryDriverStatus(
     _In_ PSHADOWSTRIKE_MESSAGE_HEADER InputHeader,
+    _In_ PSHADOWSTRIKE_DRIVER_STATUS_REQUEST Request,
     _Out_writes_bytes_(OutputBufferLength) PVOID OutputBuffer,
     _In_ ULONG OutputBufferLength,
     _Out_ PULONG ReturnLength
@@ -3162,6 +3191,28 @@ ShadowStrikeHandleQueryDriverStatus(
 
     *ReturnLength = 0;
     requiredSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + sizeof(SHADOWSTRIKE_DRIVER_STATUS);
+
+    if (Request == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // REFUSE A CALLER BUILT AGAINST A DIFFERENT STATUS STRUCTURE, and refuse
+    // it BEFORE reading a single counter. A caller cannot use a block whose
+    // layout it does not share, and filling one anyway hands it a prefix that
+    // parses as plausible zeroes past the point of divergence - which is
+    // indistinguishable from a genuinely idle subsystem. Naming the mismatch
+    // here is what makes a version skew diagnosable from one line instead of
+    // from a counter that reads zero for no visible reason.
+    //
+    if (Request->ExpectedStatusSize != sizeof(SHADOWSTRIKE_DRIVER_STATUS)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                   "[ShadowStrike] Driver status query refused: caller expects "
+                   "%u byte(s), this driver publishes %u\n",
+                   Request->ExpectedStatusSize,
+                   (ULONG)sizeof(SHADOWSTRIKE_DRIVER_STATUS));
+        return STATUS_REVISION_MISMATCH;
+    }
 
     if (OutputBuffer == NULL || OutputBufferLength < requiredSize) {
         return STATUS_BUFFER_TOO_SMALL;

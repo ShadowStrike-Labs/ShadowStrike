@@ -106,6 +106,7 @@ SIGNATURE_FORMAT_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/SignatureForm
 METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
 PACKER_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/PackerDetector.cpp"
 PE_PARSER_CPP_PATH = ROOT / "src/PhantomCore/PEParser/PEParser.cpp"
+BOOT_TIME_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/System/BootTimeAnalyzer.cpp"
 
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
@@ -15707,6 +15708,186 @@ class SingleInstanceHandoverContractTests(unittest.TestCase):
             "connect and transmit nothing")
 
 
+
+
+
+class DriverStatusQueryFramingContractTests(unittest.TestCase):
+    """The driver-status query must be framed so it can actually be encrypted.
+
+    THE DEFECT THIS EXISTS TO PREVENT, because nothing about it is visible from
+    either side alone: the transport wraps the data portion of a message as
+    [ENC_HEADER][ciphertext] with the plaintext SHADOWSTRIKE_MESSAGE_HEADER as
+    the AAD, FilterConnection encrypts only when the send buffer is LARGER than
+    that header, and the encryption primitive refuses a zero-length plaintext.
+    So a payload-less frame is unencryptable, and ShadowStrikeMessageNotify
+    refuses plaintext once the key exchange has completed. The driver-status
+    query used to be a bare header, so it was refused on every single sample and
+    the in-kernel PreCreate counters reported 'unavailable' for the entire
+    freeze campaign while every capability check involved was correct.
+    """
+
+    @staticmethod
+    def _function_body(source, anchor):
+        """Brace-matched slice starting at a caller-verified unique anchor."""
+        start = source.index(anchor)
+        brace = source.index("{", start)
+        end = _matching_delimiter(source, brace, "{", "}")
+        return source[start:end + 1]
+
+    def test_no_kernel_query_is_framed_with_an_empty_payload(self):
+        # Comments are stripped FIRST: the explanatory comments added with this
+        # fix necessarily contain the words DataSize and payload-less, so a
+        # comment-blind scan is guaranteed to report the defect as present.
+        for label, path, anchor, marker in (
+            ("IPCManager",
+             IPC_MANAGER_CPP_PATH,
+             "bool IPCManager::QueryDriverStatus(",
+             "FilterMessageType_QueryDriverStatus"),
+            ("BootTimeAnalyzer",
+             BOOT_TIME_ANALYZER_CPP_PATH,
+             "bool QueryKernelBootTelemetryImpl()",
+             "FilterMessageType_QueryDriverStatus"),
+        ):
+            src = strip_c_comments(read_source(path))
+            self.assertEqual(
+                src.count(anchor), 1,
+                "%s: expected exactly one '%s', found %d"
+                % (label, anchor, src.count(anchor)))
+            body = self._function_body(src, anchor)
+
+            # ANTI-VACUITY: the slice must actually be the sender, otherwise
+            # every assertion below passes over nothing.
+            self.assertGreater(
+                len(body), 400,
+                "%s: sliced body is only %d chars - the anchor moved"
+                % (label, len(body)))
+            self.assertGreaterEqual(
+                body.count(marker), 1,
+                "%s: the sliced body is not the driver-status sender "
+                "(%s occurs %d times in it)" % (label, marker, body.count(marker)))
+
+            offenders = [ln.strip() for ln in body.splitlines()
+                         if re.search(r"DataSize\s*=\s*0\s*;", ln)]
+            self.assertEqual(
+                offenders, [],
+                "%s frames the kernel query with DataSize = 0, which cannot be "
+                "encrypted and is refused by the driver after key exchange: %s"
+                % (label, offenders))
+
+            # And it must positively declare a payload, not merely avoid zero.
+            self.assertTrue(
+                re.search(r"DataSize\s*=\s*static_cast<UINT32>", body),
+                "%s no longer declares a payload size on the query" % label)
+
+    def test_the_request_payload_is_pinned_and_cannot_be_emptied(self):
+        src = read_source(MESSAGE_PROTOCOL_H_PATH)
+        for needle in (
+            "typedef struct _SHADOWSTRIKE_DRIVER_STATUS_REQUEST {",
+            "UINT32 ExpectedStatusSize;",
+            "C_ASSERT(sizeof(SHADOWSTRIKE_DRIVER_STATUS_REQUEST) == 8);",
+            "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS_REQUEST, ExpectedStatusSize) == 0",
+            "FIELD_OFFSET(SHADOWSTRIKE_DRIVER_STATUS_REQUEST, Reserved) == 4",
+        ):
+            self.assertEqual(
+                src.count(needle), 1,
+                "MessageProtocol.h: expected exactly one '%s', found %d"
+                % (needle, src.count(needle)))
+
+        # THE LOAD-BEARING ARM. This assertion is the transport's encryption
+        # gate restated as a compile-time fact, so emptying the payload fails
+        # the build on both sides of the boundary instead of silently restoring
+        # a frame the driver refuses in the clear.
+        stripped = strip_c_comments(src)
+        self.assertTrue(
+            re.search(
+                r"C_ASSERT\(\s*sizeof\(SHADOWSTRIKE_MESSAGE_HEADER\)\s*\+\s*"
+                r"sizeof\(SHADOWSTRIKE_DRIVER_STATUS_REQUEST\)\s*>\s*"
+                r"sizeof\(SHADOWSTRIKE_MESSAGE_HEADER\)\s*\)",
+                stripped),
+            "the assertion that the framed query exceeds a bare header is gone; "
+            "without it the payload can be emptied and the query silently "
+            "returns to being unencryptable")
+
+    def test_the_driver_reads_the_expected_status_size(self):
+        # A field the producer never reads is padding, and padding is exactly
+        # what a later reader deletes. Requiring the read is what keeps this a
+        # capability rather than a workaround for the size threshold.
+        src = strip_c_comments(read_source(COMM_PORT_C_PATH))
+        # Three occurrences by construction: the forward declaration, the call
+        # inside the dispatch switch, and the definition - which is LAST because
+        # the switch precedes it in the file. Pinning the count means a fourth
+        # appearing forces this lookup to be re-derived rather than silently
+        # selecting the wrong one.
+        self.assertEqual(
+            src.count("ShadowStrikeHandleQueryDriverStatus("), 3,
+            "expected 3 references to the handler, found %d"
+            % src.count("ShadowStrikeHandleQueryDriverStatus("))
+        definition = src.rindex("ShadowStrikeHandleQueryDriverStatus(")
+        brace = src.index("{", definition)
+        body = src[definition:_matching_delimiter(src, brace, "{", "}") + 1]
+        self.assertEqual(
+            body.count("_In_ PSHADOWSTRIKE_DRIVER_STATUS_REQUEST Request,"), 1,
+            "the handler no longer accepts the request payload (found %d "
+            "occurrences in a %d-char body)"
+            % (body.count("_In_ PSHADOWSTRIKE_DRIVER_STATUS_REQUEST Request,"),
+               len(body)))
+        self.assertGreaterEqual(
+            body.count("Request->ExpectedStatusSize"), 1,
+            "the driver no longer reads ExpectedStatusSize, so the request "
+            "payload has decayed into padding (0 reads in a %d-char body)"
+            % len(body))
+        self.assertGreaterEqual(
+            body.count("STATUS_REVISION_MISMATCH"), 1,
+            "the driver no longer refuses a caller built against a different "
+            "status structure (0 occurrences in a %d-char body)" % len(body))
+
+    def test_the_driver_still_refuses_plaintext_after_key_exchange(self):
+        # REGRESSION GUARD, and the most important test in this class. The
+        # tempting wrong fix for the original defect is to delete this refusal
+        # so the bare header is accepted. That would remove the only thing
+        # making encryption mandatory on the whole user-to-kernel message path,
+        # which is the property task 114 established by removing every
+        # legitimate cleartext sender.
+        src = strip_c_comments(read_source(COMM_PORT_C_PATH))
+        # Anchored on the ELSE-IF form, not on the predicate alone: the same
+        # predicate is also used by the queue drain to decide whether it may
+        # send, and anchoring on the bare call selected that unrelated site.
+        gate = "else if (ShadowStrikeIsClientEncryptionEstablished(clientRef))"
+        self.assertEqual(
+            src.count(gate), 1,
+            "expected exactly one plaintext-refusal branch on the receive "
+            "path, found %d - encryption may no longer be mandatory after "
+            "key exchange" % src.count(gate))
+        position = src.index(gate)
+        following = src[position:position + 500]
+        self.assertGreaterEqual(
+            following.count("STATUS_ENCRYPTION_FAILED"), 1,
+            "the receive path's plaintext branch no longer fails (branch at "
+            "offset %d, no failure status within 500 chars)" % position)
+
+    def test_the_request_is_copied_through_the_trust_aware_helper(self):
+        # KERNEL SAFETY, not style. On an encrypted frame the dispatch buffer is
+        # the driver's own decrypted copy, but a frame that arrives before the
+        # key exchange is still the caller's USER buffer. Only the shared helper
+        # knows which needs probing, so dereferencing the payload directly would
+        # be an unguarded user-mode read at PASSIVE_LEVEL.
+        src = strip_c_comments(read_source(COMM_PORT_C_PATH))
+        marker = "case ShadowStrikeMessageQueryDriverStatus:"
+        self.assertEqual(
+            src.count(marker), 1,
+            "expected exactly one QueryDriverStatus case, found %d"
+            % src.count(marker))
+        start = src.index(marker)
+        case_body = src[start:src.index("case ", start + len(marker))]
+        self.assertGreaterEqual(
+            case_body.count("ShadowStrikeCopyMessagePayload"), 1,
+            "the request payload is no longer copied through the trust-aware "
+            "helper (0 calls in a %d-char case body)" % len(case_body))
+        self.assertGreaterEqual(
+            case_body.count("dispatchBufferTrusted"), 1,
+            "the payload copy no longer passes the trust flag, so a "
+            "pre-key-exchange frame would be dereferenced without probing "
+            "(0 uses in a %d-char case body)" % len(case_body))
 
 
 if __name__ == "__main__":
