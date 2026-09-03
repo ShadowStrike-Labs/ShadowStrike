@@ -87,6 +87,7 @@ ANTIVIRUS_SERVICE_CPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.cp
 # contract between a C++ source and a PowerShell harness that no compiler checks.
 VERSION_INFO_H_PATH = ROOT / "src/VersionInfo.h"
 PROGRAM_UPDATER_CPP_PATH = ROOT / "src/PhantomCore/Update/ProgramUpdater.cpp"
+UPDATE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/UpdateManager.cpp"
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
@@ -17107,6 +17108,118 @@ class ProcessHardeningVerificationContractTests(unittest.TestCase):
                 "GetProcessMitigationPolicy", body,
                 "%s no longer queries its mitigation policy, so the three "
                 "hardening checks have diverged again" % fn)
+
+
+
+class UpdateStagingDirectoryContractTests(unittest.TestCase):
+    """An empty staging directory must not become a relative one.
+
+    UpdateConfiguration::stagingDirectory has no default and the service passed
+    a default-constructed config, so the path was empty. UpdateManager then
+    handed stagingDirectory / "signatures" to SignatureUpdater and
+    stagingDirectory / "program" to ProgramUpdater - and an EMPTY path joined
+    with a subdirectory is the RELATIVE path "signatures", not an empty one.
+
+    That is the whole defect, and it is subtle in a specific way: BOTH
+    sub-modules already carry a fallback for an empty staging directory, so the
+    correct behaviour was present and unreachable. A relative path is non-empty,
+    so it silently defeated the .empty() guard that would have saved them, and
+    they resolved against the process working directory - C:\\Windows\\System32
+    for a service. Either the create failed and took the whole update subsystem
+    down, or it succeeded and wrote into a system directory.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.svc = strip_c_comments(read_source(ANTIVIRUS_SERVICE_CPP_PATH))
+        cls.upd = strip_c_comments(read_source(UPDATE_MANAGER_CPP_PATH))
+
+    def test_the_service_supplies_a_staging_directory(self):
+        # A default-constructed config is what produced the empty path, so the
+        # no-argument call is the thing that must not come back.
+        self.assertEqual(
+            self.svc.count("UpdateManager::Instance().Initialize()"), 0,
+            "the service calls UpdateManager::Initialize with no configuration "
+            "again, so stagingDirectory is empty and both sub-modules receive a "
+            "relative path")
+        self.assertTrue(
+            re.search(r"UpdateManager::Instance\(\)\.Initialize\(\s*updateConfig\s*\)",
+                      self.svc),
+            "the service no longer passes a configuration to UpdateManager")
+
+    def test_the_directory_comes_from_the_path_owner(self):
+        # Not a spelled-out literal: DataStorePaths owns every path decision in
+        # this product, and a second spelling is how two owners disagree.
+        self.assertTrue(
+            re.search(r"updateConfig\.stagingDirectory\s*=\s*"
+                      r"Utils::DataStorePaths::GetDataDirectory\(\)", self.svc),
+            "the staging directory is no longer derived from DataStorePaths, so "
+            "it can diverge from where the product keeps its data")
+        self.assertTrue(
+            re.search(r'updateConfig\.stagingDirectory\s*/=\s*L"Updates"', self.svc),
+            "the staging directory is no longer a child of the data directory, "
+            "so it does not inherit its hardened ACL")
+
+        # And it must not be the data directory ITSELF - that holds our own
+        # databases, which the self-exclusion set deliberately covers.
+        self.assertEqual(
+            len(re.findall(r"updateConfig\.stagingDirectory\s*=", self.svc)), 1,
+            "expected exactly one assignment of the staging directory, found %d"
+            % len(re.findall(r"updateConfig\.stagingDirectory\s*=", self.svc)))
+
+    def test_neither_submodule_receives_a_relative_path(self):
+        # THE LOAD-BEARING ARM, and it SCANS BACKWARD to the innermost gate
+        # rather than pattern-matching the statement. A regex over the
+        # assignment cannot tell a guarded one from an unconditional one,
+        # because \\s* matches the newline between the gate and the statement -
+        # it matched the CORRECT code on arrival, which is how that was found.
+        for module, leaf in (("sigConfig", "signatures"), ("progConfig", "program")):
+            assign = re.search(r"%s\.stagingDirectory\s*=" % module, self.upd)
+            self.assertIsNotNone(
+                assign, "no %s.stagingDirectory assignment found at all" % module)
+
+            before = self.upd[:assign.start()]
+            self.assertIn("if (", before,
+                          "no enclosing gate anywhere above %s" % module)
+            gate = before[before.rindex("if ("):]
+            self.assertIn(
+                "m_config.stagingDirectory.empty()", gate,
+                "the innermost gate above %s.stagingDirectory does not test the "
+                "parent path for emptiness, so an empty parent becomes the "
+                "relative path %r and defeats the sub-module fallback. Gate "
+                "found: %r" % (module, leaf, " ".join(gate[:90].split())))
+
+    def test_the_submodule_fallbacks_are_still_there_to_be_reached(self):
+        # The guard above is only correct BECAUSE these fallbacks exist. If a
+        # sub-module stopped deriving its own staging directory, leaving the
+        # parent path empty would become the WRONG answer rather than the right
+        # one, so the two halves are pinned against each other.
+        #
+        # PINS THE DERIVATION, NOT AN EMPTY CHECK: "stagingDirectory.empty()"
+        # occurs twice in SignatureUpdater - once for the fallback and once to
+        # decide whether to create the directory - so a test keying on that
+        # phrase cannot tell which of the two it found.
+        sig = strip_c_comments(read_source(
+            ROOT / "src/PhantomCore/Update/SignatureUpdater.cpp"))
+        prog = strip_c_comments(read_source(
+            ROOT / "src/PhantomCore/Update/ProgramUpdater.cpp"))
+
+        self.assertTrue(
+            re.search(r"stagingDirectory\s*=\s*\w+\.databaseDirectory\s*/", sig),
+            "SignatureUpdater no longer derives its staging directory from its "
+            "database directory, so an empty parent path would leave it with "
+            "nowhere to stage")
+
+        prog_gate = re.search(
+            r"if\s*\(\s*config\.stagingDirectory\.empty\(\)\s*\)", prog)
+        self.assertIsNotNone(
+            prog_gate,
+            "ProgramUpdater no longer branches on an empty staging directory")
+        window = prog[prog_gate.start():prog_gate.start() + 400]
+        self.assertTrue(
+            re.search(r"m_stagingDir\s*=", window),
+            "ProgramUpdater branches on an empty staging directory but no longer "
+            "assigns one, so the empty case would leave it unset")
 
 
 if __name__ == "__main__":

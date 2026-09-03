@@ -354,7 +354,17 @@ public:
             auto& sigUpdater = SignatureUpdater::Instance();
             if (!sigUpdater.IsInitialized()) {
                 SignatureUpdaterConfiguration sigConfig;
-                sigConfig.stagingDirectory = m_config.stagingDirectory / "signatures";
+
+                // LEFT EMPTY WHEN WE HAVE NOTHING TO GIVE, so the sub-module's
+                // own fallback can fire. Joining an empty path with a
+                // subdirectory yields the RELATIVE path "signatures", which is
+                // NOT empty - so it silently defeated the .empty() guard
+                // SignatureUpdater already has and handed it a path that
+                // resolves against the process working directory instead.
+                if (!m_config.stagingDirectory.empty()) {
+                    sigConfig.stagingDirectory =
+                        m_config.stagingDirectory / "signatures";
+                }
                 if (!sigUpdater.Initialize(sigConfig)) {
                     SS_LOG_ERROR(kLogCategory,
                         L"SignatureUpdater initialization failed");
@@ -368,7 +378,13 @@ public:
             auto& progUpdater = ProgramUpdater::Instance();
             if (!progUpdater.IsInitialized()) {
                 ProgramUpdaterConfiguration progConfig;
-                progConfig.stagingDirectory = m_config.stagingDirectory / "program";
+
+                // Same rule as SignatureUpdater above: an empty parent path must
+                // stay empty rather than becoming the relative path "program".
+                if (!m_config.stagingDirectory.empty()) {
+                    progConfig.stagingDirectory =
+                        m_config.stagingDirectory / "program";
+                }
                 if (!progUpdater.Initialize(progConfig)) {
                     SS_LOG_ERROR(kLogCategory,
                         L"ProgramUpdater initialization failed");

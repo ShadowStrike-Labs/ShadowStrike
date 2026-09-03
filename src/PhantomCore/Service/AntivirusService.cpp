@@ -694,7 +694,38 @@ public:
 
             // 5. Initialize Update Manager
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-UpdateManager-enter");
-            if (!Update::UpdateManager::Instance().Initialize()) {
+
+            //
+            // THE STAGING DIRECTORY IS NAMED HERE BECAUSE THIS IS WHERE IT IS
+            // KNOWN. UpdateConfiguration::stagingDirectory has no default, and
+            // this call used to pass a default-constructed config, so the path
+            // was empty. UpdateManager then handed
+            // stagingDirectory / "signatures" to SignatureUpdater and
+            // stagingDirectory / "program" to ProgramUpdater - and an EMPTY path
+            // joined with a subdirectory is the RELATIVE path "signatures", not
+            // an empty one. Both sub-modules carry their own fallback for an
+            // empty staging directory; a relative path is non-empty, so neither
+            // fallback fired and both tried to create a directory relative to
+            // the process working directory, which for a service is
+            // C:\Windows\System32. Either they failed - taking the whole update
+            // subsystem down with them - or they succeeded and wrote into a
+            // system directory.
+            //
+            // DataStorePaths owns every path decision in this product, so the
+            // answer comes from there rather than being spelled out again. The
+            // directory is a CHILD of the data directory so it inherits its
+            // hardened ACL (SYSTEM and Administrators only).
+            //
+            // DELIBERATELY NOT SELF-EXCLUDED: task 55's exclusion set covers our
+            // own databases because they contain malware indicators verbatim. A
+            // downloaded update package is the opposite case - it is untrusted
+            // content that arrived from the network and MUST be scanned.
+            //
+            Update::UpdateConfiguration updateConfig{};
+            updateConfig.stagingDirectory = Utils::DataStorePaths::GetDataDirectory();
+            updateConfig.stagingDirectory /= L"Updates";
+
+            if (!Update::UpdateManager::Instance().Initialize(updateConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize UpdateManager");
             }
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-UpdateManager-leave");
