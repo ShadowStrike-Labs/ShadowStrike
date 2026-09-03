@@ -1219,6 +1219,70 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 r->stateStr = failed ? "failed" : "completed";
             }
             r->percent.store(100.0f, std::memory_order_relaxed);
+
+            //
+            // THE FIRST PRODUCER HomeReportsStore HAS EVER HAD.
+            //
+            // The store, its bounded ring, its Query filter, IPC command 240,
+            // the view model with CSV export and a 340-line QML page were all
+            // built and none of them had a writer: Record, RecordScanCompleted
+            // and RecordThreatDetected had exactly four matches across the
+            // whole tree - two declarations and two definitions - and ZERO
+            // callers. So the Reports page rendered "No results" permanently,
+            // and RecommendationsEngine rules R4 and R6, which both read this
+            // store, could never fire.
+            //
+            // RecordScanCompleted's own declaration says "Fast-path helper used
+            // by the IPC scan worker". This IS the IPC scan worker, so the
+            // helper is finally called from the site it was written for rather
+            // than a new one being invented beside it.
+            //
+            // WHY THIS SITE IS SAFE, stated because it is the question that
+            // matters most here: this body runs on a DETACHED std::thread after
+            // future.get() has already returned, so it is not on any kernel
+            // callback. AlertSystem::RaiseAlert - the other obvious chokepoint
+            // for a producer - IS reachable from
+            // RealTimeProtection::OnKernelProcessNotify through the ransomware
+            // fan-out, which is the callback the kernel blocks CreateProcess on,
+            // so a producer there needs a non-blocking hand-off and is
+            // deliberately left for its own change.
+            //
+            const auto scanned = r->itemsScanned.load(std::memory_order_relaxed);
+            const auto elapsed =
+                static_cast<std::int64_t>(r->elapsedMs.load(std::memory_order_relaxed));
+
+            if (!failed) {
+                HomeReportsStore::Instance().RecordScanCompleted(
+                    localId, scanned, infected, elapsed);
+            } else {
+                // A SCAN THAT DID NOT FINISH IS RECORDED TOO, because "my scan
+                // stopped" is exactly what a user opens this page to find out,
+                // and an absent entry is indistinguishable from a scan that was
+                // never started.
+                //
+                // RecordScanCompleted is NOT used for it: that helper's name is
+                // its contract, and routing a failure through it would file the
+                // failure as a completion. ReportKind has no failure member, so
+                // the outcome is carried by the severity and the title instead -
+                // an honest use of the vocabulary that exists rather than a new
+                // enumerator added to a wire type as a side effect of this
+                // change. That gap is real and named here rather than papered
+                // over.
+                ReportEntry entry{};
+                entry.kind          = ReportKind::ScanCompleted;
+                entry.severity      = ReportSeverity::Medium;
+                entry.module        = "ScanEngine";
+                entry.title         = "Scan did not finish";
+                entry.description   =
+                    "The scan stopped before completing, so its results cover "
+                    "only the files reached up to that point.";
+                entry.action        = "None";
+                entry.scan_id       = localId;
+                entry.files_scanned = scanned;
+                entry.threats_found = infected;
+                entry.duration_ms   = elapsed;
+                HomeReportsStore::Instance().Record(std::move(entry));
+            }
         }).detach();
 
         nlohmann::json resp{{"ok", true}, {"scanId", scanId}};

@@ -88,6 +88,9 @@ ANTIVIRUS_SERVICE_CPP_PATH = ROOT / "src/PhantomCore/Service/AntivirusService.cp
 VERSION_INFO_H_PATH = ROOT / "src/VersionInfo.h"
 PROGRAM_UPDATER_CPP_PATH = ROOT / "src/PhantomCore/Update/ProgramUpdater.cpp"
 UPDATE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/UpdateManager.cpp"
+HOME_REPORTS_STORE_HPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/Reports/HomeReportsStore.hpp"
+)
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
@@ -17220,6 +17223,112 @@ class UpdateStagingDirectoryContractTests(unittest.TestCase):
             re.search(r"m_stagingDir\s*=", window),
             "ProgramUpdater branches on an empty staging directory but no longer "
             "assigns one, so the empty case would leave it unset")
+
+
+
+class ReportsStoreProducerContractTests(unittest.TestCase):
+    """A store with readers and no writers renders "No results" forever.
+
+    HomeReportsStore, its bounded ring, its Query filter, IPC command 240, a
+    view model with CSV export and a 340-line QML page were all built, and none
+    of them had a writer: Record, RecordScanCompleted and RecordThreatDetected
+    had four matches across the whole tree - two declarations and two
+    definitions - and ZERO callers. Four consumers read a store nothing wrote,
+    and two RecommendationsEngine rules that depend on it could never fire.
+
+    This is the same shape as the empty Bloom filter and the unreachable B+tree
+    leaves: every part present, correct in isolation, and unreachable as a whole.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.disp = strip_c_comments(read_source(HOME_IPC_DISPATCHER_CPP_PATH))
+
+    def _watcher(self):
+        """The detached completion thread, by brace match from its own lambda."""
+        k = self.disp.index("std::thread([impl, localId = scanId]() mutable {")
+        brace = self.disp.index("{", self.disp.index("mutable", k))
+        return self.disp[k:_matching_delimiter(self.disp, brace, "{", "}") + 1]
+
+    def test_the_store_has_at_least_one_production_writer(self):
+        # DERIVED REPO-WIDE rather than pinning one line: the invariant is that
+        # a writer EXISTS somewhere in the product, not that it lives at a
+        # particular call site.
+        writers = 0
+        sites = []
+        for pattern in ("src/PhantomCore/**/*.cpp",
+                        "src/Products/**/*.cpp"):
+            for f in ROOT.glob(pattern):
+                if f.name == "HomeReportsStore.cpp":
+                    continue          # the definitions, not callers
+                try:
+                    body = strip_c_comments(read_source(f))
+                except Exception:
+                    continue
+                n = len(re.findall(
+                    r"HomeReportsStore::Instance\(\)\.Record\w*\(", body))
+                if n:
+                    writers += n
+                    sites.append("%s x%d" % (f.name, n))
+
+        self.assertGreater(
+            writers, 0,
+            "HomeReportsStore has no production writer, so every consumer of it "
+            "reads an empty store and the Reports page renders \"No results\" "
+            "whatever the machine did")
+        self.assertGreaterEqual(
+            len(sites), 1, "writer sites: %s" % sites)
+
+    def test_the_producer_runs_off_the_kernel_callback(self):
+        # THE FREEZE-ISOLATION ARM. AlertSystem::RaiseAlert is reachable from
+        # RealTimeProtection::OnKernelProcessNotify through the ransomware
+        # fan-out, which is the callback the kernel blocks CreateProcess on, so
+        # a producer there would need a non-blocking hand-off. This one is on a
+        # DETACHED thread that runs after future.get() has returned, and that
+        # placement is the property being pinned.
+        watcher = self._watcher()
+        self.assertGreater(len(watcher), 400,
+                           "sliced watcher is only %d chars - anchor moved" % len(watcher))
+        self.assertIn(
+            "future.get()", watcher,
+            "this is no longer the completion watcher, so the producer may have "
+            "moved onto a thread that owes the kernel an answer")
+        self.assertGreaterEqual(
+            len(re.findall(r"HomeReportsStore::Instance\(\)\.Record\w*\(", watcher)), 1,
+            "the reports producer is no longer inside the detached completion "
+            "thread")
+
+    def test_a_scan_that_did_not_finish_is_recorded_too(self):
+        # An absent entry is indistinguishable from a scan that was never
+        # started, which is the reading a user would take from the page.
+        watcher = self._watcher()
+        self.assertEqual(
+            len(re.findall(r"HomeReportsStore::Instance\(\)\.Record\w*\(", watcher)), 2,
+            "expected exactly two record paths - one for a completed scan and "
+            "one for a scan that stopped - found %d"
+            % len(re.findall(r"HomeReportsStore::Instance\(\)\.Record\w*\(", watcher)))
+
+        # AND THE FAILURE MUST NOT GO THROUGH THE COMPLETION HELPER. Its name is
+        # its contract; filing a failure as a completion is the over-claimed
+        # outcome this codebase keeps producing.
+        fail_at = watcher.index("if (!failed)")
+        else_at = watcher.index("} else {", fail_at)
+        success_arm = watcher[fail_at:else_at]
+        failure_arm = watcher[else_at:]
+        self.assertIn(
+            "RecordScanCompleted", success_arm,
+            "the completed arm no longer uses the documented completion helper")
+        self.assertNotIn(
+            "RecordScanCompleted", failure_arm,
+            "a scan that did not finish is filed through RecordScanCompleted, "
+            "so a failure is recorded as a completion")
+
+    def test_the_consumers_are_still_there_to_read_it(self):
+        # Anti-vacuity in the other direction: writers with no readers would be
+        # equally useless, and this store's whole defect was a one-sided graph.
+        self.assertGreaterEqual(
+            len(re.findall(r"HomeReportsStore::Instance\(\)\.Query\(", self.disp)), 1,
+            "the dispatcher no longer reads the store it now writes")
 
 
 if __name__ == "__main__":
