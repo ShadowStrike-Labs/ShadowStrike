@@ -1050,6 +1050,26 @@ $job = [ordered]@{
         #
         # PhantomHomeUI*.log and PhantomHomeTray*.log land here.
         '%LOCALAPPDATA%\ShadowStrike\Logs'
+        # AND THE SAME PLACE AGAIN WITHOUT AN ENVIRONMENT VARIABLE.
+        #
+        # The line above has been present since the 1.0.93 investigation and no
+        # client log has EVER arrived in a bundle - checked across every
+        # collected run, where the only PhantomHomeUI.log in existence is a
+        # local dev-run artifact. The path is configured; the file never lands.
+        #
+        # The agent that expands this runs inside the VM and is not in this
+        # repo, so its account cannot be read from here. The most probable
+        # cause is the one this codebase has already been bitten by twice: a
+        # LocalSystem process expanding %LOCALAPPDATA% gets
+        # C:\Windows\system32\config\systemprofile\AppData\Local, not the
+        # interactive user's directory. IpcAuthToken.cpp:296 and
+        # ChromeExtensionScanner.cpp:968 both carry that exact warning, and
+        # SystemUtils::GetKnownFolderForAllUsersOrSelf exists because of it.
+        #
+        # A literal user-profile glob cannot be wrong about whose profile it
+        # means, so it is added ALONGSIDE rather than INSTEAD OF the variable -
+        # if the expansion does work on this agent, nothing is lost.
+        'C:\Users\*\AppData\Local\ShadowStrike\Logs'
     )
     extraCommands  = @(
         @{ label='service-status';    script='Get-Service ShadowStrikePhantomService -ErrorAction SilentlyContinue | Select Status,DisplayName | ConvertTo-Json' }
@@ -1066,6 +1086,43 @@ $job = [ordered]@{
         # Does the per-session auth token the UI must read actually exist? An
         # empty read is the tray's own reported reason for failing to authenticate.
         @{ label='ui-auth-token';     script='$p = Join-Path $env:LOCALAPPDATA "ShadowStrike\ui.token"; $e = Test-Path $p; $len = 0; if ($e) { $len = (Get-Item $p).Length }; [ordered]@{ path=$p; exists=$e; length=$len } | ConvertTo-Json' }
+        # PUT EVERY LOG IN ONE DIRECTORY ON THE MACHINE ITSELF.
+        #
+        # Owner's request, and it is the right one: hunting logs across a
+        # machine-wide directory and one per-user directory per account is
+        # needless work during an incident.
+        #
+        # WHY THIS IS DONE BY THE AGENT AND NOT BY THE PRODUCT: the UI and tray
+        # run as the interactive user, and the installer deliberately grants
+        # Users only GenericRead + GenericExecute on
+        # %ProgramData%\ShadowStrike\Logs (Components.wxs CmpProgramDataLogs).
+        # That is not an oversight to route around - the service writes security
+        # telemetry there and withholding write from unprivileged accounts is
+        # what makes clearing it a privileged act rather than a user-level one.
+        # Anti-forensic log clearing is T1070.001, a technique this product's own
+        # TimelineAnalyzer detects, so widening that ACL to make a log easier to
+        # find would trade a real protection for a convenience.
+        #
+        # The agent, however, already runs with enough privilege to read every
+        # user profile, so IT can do the consolidation without anything being
+        # relaxed. Files are prefixed with the owning username so two accounts'
+        # logs cannot collide in the destination.
+        #
+        # A product-side fix (a Logs\Client subdirectory carrying its own
+        # narrower ACL, created by the MSI) is the better long-term answer and
+        # is filed as such - it is deliberately NOT being rushed into an
+        # installer hours before a field run, because getting an ACL wrong here
+        # breaks UI logging entirely and would cost the very diagnostic this run
+        # exists to collect.
+        @{ label='consolidate-client-logs'; script='$dst = Join-Path $env:ProgramData "ShadowStrike\Logs\Client"; New-Item -ItemType Directory -Force -Path $dst | Out-Null; $bs = [char]92; $copied = @(); $failed = @(); foreach ($f in (Get-ChildItem -Path "C:\Users\*\AppData\Local\ShadowStrike\Logs\*.log" -ErrorAction SilentlyContinue)) { $parts = $f.FullName.Split($bs); $who = if ($parts.Length -gt 2) { $parts[2] } else { "unknown" }; $name = $who + "." + $f.Name; try { Copy-Item $f.FullName (Join-Path $dst $name) -Force -ErrorAction Stop; $copied += $name } catch { $failed += ($name + " :: " + $_.Exception.Message) } }; [ordered]@{ dest=$dst; copied=$copied.Count; names=$copied; failures=$failed } | ConvertTo-Json -Depth 3' }
+        # AND THE CONTENT INLINE, because a copy that fails silently leaves this
+        # run with nothing and the answer needs another 15 minutes of the owner's
+        # time. An extraCommand's output is a PROVEN channel - service-status,
+        # pipe-names and client-processes have all come back on it - whereas file
+        # collection from a per-user directory is precisely the thing that has
+        # never once worked here. Bounded at 400 lines per file so a rotated 10
+        # MiB log cannot swamp the bundle.
+        @{ label='client-log-tail'; script='$out = @(); foreach ($f in (Get-ChildItem -Path "C:\Users\*\AppData\Local\ShadowStrike\Logs\*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)) { $out += ("===== " + $f.FullName + " | " + $f.Length + " bytes | " + $f.LastWriteTime.ToString("o") + " ====="); $out += (Get-Content $f.FullName -Tail 400 -ErrorAction SilentlyContinue) }; if ($out.Count -eq 0) { $out = @("NO CLIENT LOG FOUND under C:\Users\*\AppData\Local\ShadowStrike\Logs - the UI either never initialised its logger or never started") }; $out -join [Environment]::NewLine' }
     ) + $extraCmds
     submittedAt    = (Get-Date -Format 'o')
     submittedBy    = $env:COMPUTERNAME

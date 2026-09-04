@@ -51,6 +51,7 @@ FILE_PROTECTION_HPP_PATH = ROOT / "src" / "PhantomCore" / "SelfProtection" / "Fi
 # loudly - OpenServiceW returns ERROR_SERVICE_DOES_NOT_EXIST and the caller reports
 # "not found", which is why ServiceManager watched a nonexistent service undetected.
 INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
+DEPLOY_HARNESS_PS1_PATH = ROOT / "tools/vm-harness/Invoke-PhantomDeploy.ps1"
 INSTALLER_PRODUCT_WXS_PATH = ROOT / "packaging/installer/Product.wxs"
 EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
@@ -18464,6 +18465,123 @@ class RejectedRegistryFrameIsDiagnosableContractTests(unittest.TestCase):
             re.search(r"\{\} payload bytes", self.ipc),
             "the dump does not state the real payload size, so a truncated dump "
             "reads as the whole frame")
+
+
+
+class ClientLogCollectionContractTests(unittest.TestCase):
+    """The client logs must become collectable WITHOUT relaxing the log ACL.
+
+    The owner asked for every log to land in one directory, which is the right
+    request - hunting logs across a machine-wide directory plus one per-user
+    directory per account is needless work during an incident.
+
+    The tempting fix is to widen the ACL on %ProgramData%\\ShadowStrike\\Logs so
+    the UI can write there directly. That trade must not be made. The service
+    writes security telemetry into that directory, and withholding write from
+    unprivileged accounts is what makes clearing it a privileged act. Anti-
+    forensic log clearing is T1070.001 - a technique this product's own
+    TimelineAnalyzer detects - so making a log easier to find by making it
+    easier to erase would be a net loss.
+
+    The deploy agent already runs with enough privilege to read every user
+    profile, so it can consolidate without anything being relaxed. These tests
+    pin that the consolidation exists AND that the ACL stayed shut.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.wxs = read_source(INSTALLER_COMPONENTS_WXS_PATH)
+        cls.harness = read_source(DEPLOY_HARNESS_PS1_PATH)
+        # Slice the ONE component under discussion rather than asserting against
+        # the whole authoring file - Quarantine carries a deliberately IDENTICAL
+        # Users ACE (measured: the exact ACE text occurs twice) and would satisfy
+        # a file-wide search.
+        start = cls.wxs.index('<Component Id="CmpProgramDataLogs"')
+        cls.logs_component = cls.wxs[start:cls.wxs.index("</Component>", start)]
+        # And slice collectPaths, because an assertIn against the whole harness
+        # dumps 65 KB into one output line on failure. Measured at 69,887
+        # characters before this was bounded.
+        cp = cls.harness.index("collectPaths")
+        cls.collect_paths = cls.harness[cp:cls.harness.index("extraCommands", cp)]
+
+    def test_the_logs_acl_was_not_widened_to_make_a_log_findable(self):
+        # THE SECURITY INVARIANT. Users get read + traverse so a support bundle
+        # is collectable, and nothing more.
+        users = re.search(
+            r'<util:PermissionEx\s+User="Users"(.*?)/>',
+            self.logs_component, re.S)
+        self.assertIsNotNone(
+            users, "the Users ACE on the Logs directory is gone entirely - "
+                   "read access is needed for support bundle collection")
+        grant = users.group(1)
+        self.assertLess(len(grant), 400, "unexpectedly large ACE body")
+        for forbidden in ("GenericAll", "GenericWrite", "CreateFile",
+                          "Append", "Delete", "WriteAttributes",
+                          "ChangePermission", "TakeOwnership"):
+            self.assertNotIn(
+                forbidden, grant,
+                "the Logs directory now grants Users '%s'. The service writes "
+                "security telemetry there; letting an unprivileged account "
+                "write or erase it turns T1070.001 log clearing into a "
+                "user-level act. Consolidate logs via the privileged agent "
+                "instead." % forbidden)
+        self.assertIn('GenericRead="yes"', grant)
+
+    def test_collection_does_not_rely_only_on_an_environment_variable(self):
+        # %LOCALAPPDATA% has been in collectPaths since the 1.0.93
+        # investigation and no client log has EVER arrived, because a
+        # LocalSystem expansion resolves to systemprofile rather than the
+        # interactive user. A literal profile glob cannot be wrong about whose
+        # profile it means.
+        self.assertLess(len(self.collect_paths), 3000, "collectPaths slice too large")
+        self.assertIn(r"'C:\Users\*\AppData\Local\ShadowStrike\Logs'",
+                      self.collect_paths,
+                      "the literal user-profile collect path is gone, so client "
+                      "log collection depends again on an environment variable "
+                      "expanded in an unknown account's context")
+        self.assertIn(r"'%LOCALAPPDATA%\ShadowStrike\Logs'", self.collect_paths,
+                      "the variable form was REPLACED rather than supplemented; "
+                      "keep both so a working expansion still contributes")
+
+    def test_the_consolidation_targets_the_shared_log_root(self):
+        m = re.search(r"label='consolidate-client-logs';\s*script='(.*?)'\s*\}",
+                      self.harness, re.S)
+        self.assertIsNotNone(m, "the client-log consolidation probe is gone")
+        body = m.group(1)
+        self.assertLess(len(body), 2000, "unexpectedly large probe body")
+        self.assertIn("ShadowStrike\\Logs\\Client", body,
+                      "the consolidation no longer writes under the shared log "
+                      "root, which was the entire point")
+        self.assertIn("C:\\Users\\*\\AppData\\Local", body)
+        # Two accounts' logs must not collide in one flat destination.
+        self.assertTrue(
+            re.search(r"\$who", body),
+            "copied files are no longer prefixed with the owning username, so "
+            "two accounts' PhantomHomeUI.log would overwrite each other")
+
+    def test_the_client_log_content_also_arrives_inline_and_is_bounded(self):
+        # A copy that fails silently leaves the run with nothing and costs
+        # another 15 minutes of the owner's time. An extraCommand's output is a
+        # proven channel; per-user file collection is the thing that has never
+        # worked.
+        m = re.search(r"label='client-log-tail';\s*script='(.*?)'\s*\}",
+                      self.harness, re.S)
+        self.assertIsNotNone(m, "the inline client-log tail probe is gone")
+        body = m.group(1)
+        self.assertLess(len(body), 2000, "unexpectedly large probe body")
+        # A BOUND MUST ACTUALLY BOUND. An earlier version of this arm only
+        # required "-Tail <digits>" to be present, which "-Tail 999999999"
+        # satisfies while inlining the entire log - the mutation proof caught
+        # that and it was a real hole, not a mislabelled prediction.
+        tail = re.search(r"-Tail\s+(\d+)", body)
+        self.assertIsNotNone(
+            tail,
+            "the tail probe is no longer bounded, so a rotated 10 MiB log would "
+            "be inlined whole into the bundle")
+        self.assertLessEqual(
+            int(tail.group(1)), 5000,
+            "the tail bound is %s lines, which is not a bound - a rotated log "
+            "would be inlined whole" % tail.group(1))
 
 
 
