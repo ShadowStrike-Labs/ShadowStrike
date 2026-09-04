@@ -16858,6 +16858,68 @@ class ScanSurfaceHonestyContractTests(unittest.TestCase):
             "the view model exposes totalBytes, which no producer sets, so it "
             "would bind a permanent zero into the UI")
 
+    def test_the_completed_heading_claims_only_what_was_scanned(self):
+        """A finished scan must not report a verdict wider than its scope.
+
+        The heading read qsTr("Your device is clean.") for EVERY completed
+        scan, so checking a single folder announced a machine-wide result while
+        the label directly above it named that one folder. Two lines of the
+        same tile contradicted each other and nothing told the user which to
+        believe.
+
+        This arm exists separately from the running-state arms above because
+        the running label was corrected first and this heading was not: the
+        scope was fixed on one of the two surfaces that carried the claim.
+        """
+        # Gone from BOTH the visible heading and the accessibility tree.
+        # Comments are stripped in setUpClass, which is load-bearing here: the
+        # replacement's own comment necessarily QUOTES the string it removed,
+        # so a comment-blind count would report the defect as still present.
+        banned = re.findall(r"[Dd]evice is clean", self.tile)
+        self.assertEqual(
+            banned, [],
+            "the tile still makes a machine-wide cleanliness claim, which is "
+            "false for every scan narrower than the whole machine")
+
+        # ANTI-VACUITY. Deleting the verdict outright would also remove the
+        # banned phrase, so the scoped replacement has to be present on BOTH
+        # surfaces and the non-zero branch has to survive beside it.
+        self.assertEqual(
+            self.tile.count('qsTr("No threats found.")'), 2,
+            "expected the scoped verdict in exactly two places - the visible "
+            "heading and Accessible.description - so a screen reader is never "
+            "given a different claim from the one on screen")
+        self.assertEqual(
+            self.tile.count('qsTr("%1 threat(s) found")'), 1,
+            "the non-zero branch is gone, so a scan that found something has "
+            "no heading at all")
+
+        # THE PAIRING IS WHAT MAKES A SHORT VERDICT COMPLETE. "No threats
+        # found" is only fully informative because the scope is stated
+        # immediately above it, so that label must still render in the
+        # COMPLETED state and must come BEFORE the verdict.
+        complete = self.tile[self.tile.index('root.scanState === "complete"'):]
+        verdict_at = complete.index('qsTr("No threats found.")')
+        above = complete[:verdict_at]
+        self.assertIn(
+            "root.activeScanLabel", above,
+            "the completed state no longer displays the scan label above the "
+            "verdict, so the verdict has no subject anywhere on screen")
+
+        # A SECURITY CLAIM MUST NOT DEPEND ON THE DISPLAY LOCALE. MainPage
+        # builds activeScanLabel with qsTr(), so a heading that switched on it
+        # would be comparing a TRANSLATED string and would stop matching,
+        # silently, in every language but one. The verdict may switch on the
+        # measured count and on nothing else.
+        expr = above[above.rindex("Text {"):]
+        self.assertNotIn(
+            "activeScanLabel", expr,
+            "the verdict expression inspects the localised scan label, so its "
+            "meaning changes under translation")
+        self.assertIn(
+            "root.threatsFound > 0", expr,
+            "the verdict no longer switches on the measured threat count")
+
 
 
 class DashboardHealthVerdictContractTests(unittest.TestCase):

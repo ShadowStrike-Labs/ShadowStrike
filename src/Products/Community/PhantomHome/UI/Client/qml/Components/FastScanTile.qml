@@ -179,9 +179,9 @@ Item {
                 spacing:  Theme.spacingS
                 anchors.horizontalCenter: parent.horizontalCenter
 
-                // WHICH scan finished. A verdict with no subject is the same
-                // defect as the running state had: "Your device is clean"
-                // after scanning one file claims far more than was checked.
+                // WHICH scan finished. A verdict with no subject was the same
+                // defect the running state carried: a machine-wide claim after
+                // scanning one file states far more than was checked.
                 Text {
                     horizontalAlignment: Text.AlignHCenter
                     visible: root.activeScanLabel !== ""
@@ -194,11 +194,42 @@ Item {
                     width:            260
                 }
 
+                // WHAT WAS ESTABLISHED, NOT WHAT WOULD BE REASSURING.
+                //
+                // This heading read "Your device is clean." for every
+                // completed scan, so checking a single folder - or one file
+                // through the Explorer verb - announced a machine-wide
+                // verdict. The label directly above already states the real
+                // scope, and a heading that contradicts it is worse than no
+                // heading at all: the user has no way to tell which of the
+                // two lines to believe.
+                //
+                // THERE IS DELIBERATELY NO FULL-SCAN SPECIAL CASE, for two
+                // independent reasons.
+                //
+                // First, the only scope signal this tile receives is
+                // activeScanLabel, and MainPage builds it with qsTr() - so
+                // keying a security claim on it would compare a TRANSLATED
+                // string and stop matching, silently, in every language but
+                // one. A claim about coverage must never depend on the
+                // display locale.
+                //
+                // Second, and this is the substantive reason: a full scan
+                // finding nothing does not establish a clean device. A create
+                // the kernel circuit breaker admitted without scanning, a
+                // cloud placeholder that cannot be read, and anything outside
+                // the detection content we ship are all absent from this
+                // count by construction. Reporting their absence as proof of
+                // cleanliness is the same over-claim as counting a block that
+                // was requested and never performed.
+                //
+                // "No threats found" is exactly what a zero count supports:
+                // the stated scope was examined and nothing matched.
                 Text {
                     horizontalAlignment: Text.AlignHCenter
                     text:  root.threatsFound > 0
                            ? qsTr("%1 threat(s) found").arg(root.threatsFound)
-                           : qsTr("Your device is clean.")
+                           : qsTr("No threats found.")
                     color: root.threatsFound > 0 ? Theme.crit : Theme.ok
                     font.family:    Theme.fontFamily
                     font.pixelSize: Theme.fontSizeTitle
@@ -229,7 +260,11 @@ Item {
         switch (root.scanState) {
         case "idle":     return qsTr("Ready to scan.")
         case "running":  return qsTr("Scanning, %1 percent complete.").arg(root.progressPercent)
-        case "complete": return root.threatsFound > 0 ? qsTr("%1 threats found.").arg(root.threatsFound) : qsTr("Clean.")
+        // Scoped for the same reason as the visible heading. Accessible.name
+        // above already carries the scan label, so a screen reader hears the
+        // scope and then the verdict; a bare "Clean." here would put the
+        // machine-wide claim back into the accessibility tree only.
+        case "complete": return root.threatsFound > 0 ? qsTr("%1 threats found.").arg(root.threatsFound) : qsTr("No threats found.")
         default:         return ""
         }
     }
