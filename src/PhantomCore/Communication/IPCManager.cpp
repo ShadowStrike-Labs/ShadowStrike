@@ -2900,6 +2900,83 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                     static_cast<uint32_t>(req->keyPathLength) +
                     static_cast<uint32_t>(req->valueNameLength) + req->dataSize;
 
+                //
+                // THE RAW FRAME, BECAUSE THE FIELD VALUES HAVE PROVED
+                // INSUFFICIENT TO EXPLAIN IT.
+                //
+                // The named values were added after an earlier run produced
+                // unexplained rejections, and they narrowed the problem without
+                // solving it. Field run 1.0.108 reported five of these, all
+                // identical apart from the pid:
+                //     valueNameLength=512 remaining=23 DataSize=44
+                //     keyPathLength=0 dataSize=0 declaredTotal=512 op=2
+                //
+                // That frame CANNOT be produced by the driver as written, and
+                // both halves of that statement were checked:
+                //
+                //   * ScanBridge.c computes totalSize from the SAME clamped
+                //     keyPathLen / valueNameLen it later writes into the header
+                //     (SbpSafeAddUlong chain, then notification->KeyPathLength =
+                //     (UINT16)keyPathLen). A declared 512 implies a payload of at
+                //     least 537 bytes; this one carries 44. Working backwards,
+                //     the size was computed from 19 bytes of variable data while
+                //     the header declares 512.
+                //   * Both layouts are pinned: SHADOWSTRIKE_REGISTRY_NOTIFICATION
+                //     and RegistryOpRequest are each asserted at 21 bytes with
+                //     every field offset fixed, so a silent layout drift is not
+                //     available as an explanation either.
+                //
+                // 512 is also exactly SHADOWSTRIKE_MAX_REG_PATH_LENGTH, and a
+                // MAX constant turning up where a LENGTH belongs is a strong
+                // hint - but a hint is not a diagnosis, and guessing at a wire
+                // defect is how the file-scan length unit stayed wrong for
+                // months.
+                //
+                // So this dumps the bytes. It is the only thing that can
+                // distinguish "the driver wrote this" from "the frame was
+                // altered or misaligned in transit", and it costs nothing on a
+                // healthy channel because it only runs on a rejection.
+                //
+                // BOUNDED AND RATE-LIMITED: at most 64 bytes, and at most one
+                // dump every 30 seconds. Our own log writes traverse our own
+                // minifilter, so an unthrottled per-frame dump would amplify
+                // exactly the condition it is reporting - the mistake already
+                // paid for once on the deferred-queue drop warning.
+                //
+                const auto DumpRejectedFrame =
+                    [pPayload, pAppHeader](const char* which) {
+                        static std::atomic<std::int64_t> lastDumpMs{0};
+                        const auto nowMs =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                        auto prev = lastDumpMs.load(std::memory_order_relaxed);
+                        if (prev != 0 && (nowMs - prev) < 30000) {
+                            return;
+                        }
+                        if (!lastDumpMs.compare_exchange_strong(
+                                prev, nowMs, std::memory_order_relaxed)) {
+                            return;
+                        }
+
+                        const uint32_t cap =
+                            (pAppHeader->DataSize < 64u) ? pAppHeader->DataSize : 64u;
+                        std::string hex;
+                        hex.reserve(static_cast<size_t>(cap) * 3u);
+                        static constexpr char kDigits[] = "0123456789ABCDEF";
+                        const auto* bytes = reinterpret_cast<const std::uint8_t*>(pPayload);
+                        for (uint32_t i = 0; i < cap; ++i) {
+                            if (i != 0) {
+                                hex.push_back(' ');
+                            }
+                            hex.push_back(kDigits[(bytes[i] >> 4) & 0x0F]);
+                            hex.push_back(kDigits[bytes[i] & 0x0F]);
+                        }
+                        Utils::Logger::Error(
+                            "[IPCManager] Rejected RegistryNotify frame ({}), first {} of "
+                            "{} payload bytes: {}",
+                            which, cap, pAppHeader->DataSize, hex);
+                    };
+
                 if (req->keyPathLength > remaining) {
                     Utils::Logger::Error("[IPCManager] RegistryNotify keyPath exceeds buffer: "
                                          "keyPathLength={} remaining={} DataSize={} "
@@ -2907,6 +2984,7 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                                          req->keyPathLength, remaining, pAppHeader->DataSize,
                                          req->valueNameLength, req->dataSize, declaredTotal,
                                          req->processId);
+                    DumpRejectedFrame("keyPath");
                     break;
                 }
                 remaining -= req->keyPathLength;
@@ -2917,6 +2995,7 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                                          req->valueNameLength, remaining, pAppHeader->DataSize,
                                          req->keyPathLength, req->dataSize, declaredTotal,
                                          req->processId, static_cast<unsigned>(req->operation));
+                    DumpRejectedFrame("valueName");
                     break;
                 }
                 remaining -= req->valueNameLength;
@@ -2927,6 +3006,7 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
                                          req->dataSize, remaining, pAppHeader->DataSize,
                                          req->keyPathLength, req->valueNameLength, declaredTotal,
                                          req->processId);
+                    DumpRejectedFrame("data");
                     break;
                 }
 

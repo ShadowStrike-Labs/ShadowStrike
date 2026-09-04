@@ -18378,5 +18378,94 @@ class ScanCountedOnlyWhenPerformedContractTests(unittest.TestCase):
 
 
 
+class RejectedRegistryFrameIsDiagnosableContractTests(unittest.TestCase):
+    """A refused kernel frame must be refused, and must leave enough to diagnose.
+
+    Field run 1.0.108 produced five RegistryNotify rejections, all identical
+    apart from the pid:
+        valueNameLength=512 remaining=23 DataSize=44 keyPathLength=0
+        dataSize=0 declaredTotal=512 op=2
+
+    That frame cannot be produced by the driver as written, and both halves were
+    checked before adding anything: ScanBridge.c computes totalSize from the
+    SAME clamped lengths it writes into the header, so a declared 512 implies a
+    payload of at least 537 bytes rather than 44; and both layouts are pinned at
+    21 bytes with fixed field offsets, so a silent layout drift is not available
+    as an explanation either. 512 is exactly SHADOWSTRIKE_MAX_REG_PATH_LENGTH,
+    which is a strong hint and not a diagnosis.
+
+    So the bytes are dumped. This class pins the two properties that make that
+    safe, because diagnostic code that weakens a guard or floods a log is worse
+    than no diagnostic at all.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ipc = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        at = cls.ipc.index("RegistryNotify keyPath exceeds buffer")
+        end = cls.ipc.index("verdict = registryHandler(*req)", at)
+        cls.region = cls.ipc[cls.ipc.rindex("DumpRejectedFrame", 0, at):end]
+
+    def test_every_rejection_still_refuses_the_frame(self):
+        # THE INVARIANT THAT MATTERS. A length overrunning the payload must never
+        # be trusted, and adding a dump must not turn a rejection into a warning
+        # that falls through to the handler.
+        self.assertEqual(
+            len(re.findall(r"exceeds buffer", self.region)), 3,
+            "expected all three bounds rejections (keyPath, valueName, data) to "
+            "survive")
+        self.assertEqual(
+            len(re.findall(r"\bbreak;", self.region)), 3,
+            "a rejection path no longer breaks out of the case, so a frame whose "
+            "declared lengths overrun the payload would reach the handler")
+        # Three CALL sites plus one definition. The definition is
+        # `const auto DumpRejectedFrame =`, with no parenthesis after the name,
+        # so counting "DumpRejectedFrame(" finds the calls only - checked rather
+        # than assumed, because an earlier version of this arm expected four and
+        # was wrong about my own code.
+        self.assertEqual(
+            len(re.findall(r"DumpRejectedFrame\(", self.region)), 3,
+            "expected the dump to be called from all three rejection paths")
+        self.assertEqual(
+            len(re.findall(r"const auto DumpRejectedFrame\s*=", self.ipc)), 1,
+            "expected exactly one definition of the dump helper, so the three "
+            "call sites cannot drift apart")
+
+    def test_the_dump_is_bounded_and_rate_limited(self):
+        # Our own log writes traverse our own minifilter, so an unthrottled
+        # per-frame dump amplifies exactly the condition it reports - the
+        # mistake already paid for once on the deferred-queue drop warning.
+        m = re.search(r"lastDumpMs", self.ipc)
+        self.assertIsNotNone(
+            m, "the dump has no rate-limit state, so it would emit once per "
+               "rejected frame")
+        self.assertTrue(
+            re.search(r"nowMs\s*-\s*prev\)\s*<\s*30000", self.ipc),
+            "the 30-second rate limit is gone")
+        self.assertTrue(
+            re.search(r"compare_exchange_strong", self.region)
+            or re.search(r"compare_exchange_strong", self.ipc),
+            "the rate-limit stamp is not claimed atomically, so two receive "
+            "threads could both dump")
+        self.assertTrue(
+            re.search(r"<\s*64u\)\s*\?\s*pAppHeader->DataSize\s*:\s*64u", self.ipc),
+            "the dump is no longer capped at 64 bytes, so a large frame would "
+            "write an unbounded hex string into the log")
+
+    def test_the_dump_reports_the_true_payload_size_as_well(self):
+        # A capped dump that does not say what it capped invites the reader to
+        # conclude the frame was 64 bytes.
+        # The format string is split across two C++ literals, so the two
+        # fragments are matched separately rather than as one contiguous phrase.
+        self.assertTrue(
+            re.search(r"first \{\} of", self.ipc),
+            "the dump does not state how many bytes it printed")
+        self.assertTrue(
+            re.search(r"\{\} payload bytes", self.ipc),
+            "the dump does not state the real payload size, so a truncated dump "
+            "reads as the whole frame")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
