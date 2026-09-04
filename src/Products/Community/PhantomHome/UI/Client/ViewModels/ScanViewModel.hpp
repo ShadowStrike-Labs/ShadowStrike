@@ -64,6 +64,21 @@ class ScanViewModel final : public QObject {
     Q_PROPERTY(QString scope         READ scope         NOTIFY progressChanged)
     Q_PROPERTY(QString targetSummary READ targetSummary NOTIFY progressChanged)
 
+    /// WHY THE LAST ATTEMPT FAILED, as a readable property rather than only as
+    /// a signal.
+    ///
+    /// requestError() already carried this, and nothing consumed it for the
+    /// scan surface - measured, MainPage declares no onRequestError handler on
+    /// this object - so the reason was emitted into the void. A transient
+    /// signal also cannot be rendered by a declarative binding, which is what
+    /// the tile needs in order to SHOW the failure instead of implying one.
+    ///
+    /// Notified by its own signal, not by stateChanged: cancel() can fail
+    /// without changing state, and folding the two would leave that reason
+    /// unpublished.
+    Q_PROPERTY(QString lastErrorCode    READ lastErrorCode    NOTIFY lastErrorChanged)
+    Q_PROPERTY(QString lastErrorMessage READ lastErrorMessage NOTIFY lastErrorChanged)
+
     //
     // THE ENGINE'S OWN FIGURES, each with a producer in ScanBatch's emitter.
     // totalBytes is absent because no emitter sets it - the engine cannot
@@ -106,6 +121,8 @@ public:
 
     [[nodiscard]] QString scope()         const noexcept;
     [[nodiscard]] QString targetSummary() const noexcept;
+    [[nodiscard]] QString lastErrorCode()    const noexcept;
+    [[nodiscard]] QString lastErrorMessage() const noexcept;
     [[nodiscard]] quint64 totalFiles()    const noexcept;
     [[nodiscard]] quint64 bytesScanned()  const noexcept;
     [[nodiscard]] quint64 elapsedMs()     const noexcept;
@@ -156,6 +173,10 @@ signals:
     void progressChanged();
     void scanCompleted(QString id, quint64 threats);
     void requestError(QString code, QString message);
+    /// Emitted whenever lastErrorCode/lastErrorMessage change, including when
+    /// they are CLEARED at the start of a new attempt - so a stale reason
+    /// cannot outlive the failure it described.
+    void lastErrorChanged();
 
 private:
     struct Impl;

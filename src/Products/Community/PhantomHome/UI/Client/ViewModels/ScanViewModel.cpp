@@ -54,6 +54,12 @@ struct ScanViewModel::Impl {
     QString scope{QStringLiteral("fast")};
     QString targetSummary;
 
+    // WHY THE LAST ATTEMPT FAILED. Held rather than only signalled, because a
+    // declarative binding cannot render a transient signal - and because the
+    // signal had no consumer on this surface, so the reason was being lost.
+    QString lastErrorCode;
+    QString lastErrorMessage;
+
     quint64 totalFiles{0};
     quint64 bytesScanned{0};
     quint64 elapsedMs{0};
@@ -123,6 +129,8 @@ QString ScanViewModel::scanId()       const noexcept { return m_impl->scanId; }
 
 QString ScanViewModel::scope()         const noexcept { return m_impl->scope; }
 QString ScanViewModel::targetSummary() const noexcept { return m_impl->targetSummary; }
+QString ScanViewModel::lastErrorCode()    const noexcept { return m_impl->lastErrorCode; }
+QString ScanViewModel::lastErrorMessage() const noexcept { return m_impl->lastErrorMessage; }
 quint64 ScanViewModel::totalFiles()    const noexcept { return m_impl->totalFiles; }
 quint64 ScanViewModel::bytesScanned()  const noexcept { return m_impl->bytesScanned; }
 quint64 ScanViewModel::elapsedMs()     const noexcept { return m_impl->elapsedMs; }
@@ -280,6 +288,12 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
     m_impl->filesPerSecond       = 0;
     m_impl->bytesPerSecond       = 0;
 
+    // CLEARED HERE so a reason cannot outlive the attempt it described. A
+    // stale "timeout" beside a running scan would be worse than none.
+    m_impl->lastErrorCode.clear();
+    m_impl->lastErrorMessage.clear();
+    emit lastErrorChanged();
+
     // SEEDED FROM THE PAYLOAD BEING SENT, not from the caller that built it.
     // Reading the request means the label cannot disagree with the scope the
     // service is about to record, and it puts one derivation here instead of
@@ -309,7 +323,15 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
         [self = QPointer<ScanViewModel>(this)](const Response& r) {
             if (!self) return;
             if (!r.ok) {
+                // PipeClient synthesises ok=false on timeout, disconnect and
+                // backpressure as well as on a service-side error, so this is
+                // the one place that learns the request did not take effect.
+                // Recording the reason is what lets the tile say what went
+                // wrong instead of showing a finished scan.
+                self->m_impl->lastErrorCode    = r.errorCode;
+                self->m_impl->lastErrorMessage = r.errorMessage;
                 self->m_impl->state = Failed;
+                emit self->lastErrorChanged();
                 emit self->stateChanged();
                 emit self->requestError(r.errorCode, r.errorMessage);
                 return;
@@ -320,10 +342,14 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
             } else if (idValue.isDouble()) {
                 self->m_impl->scanId = QString::number(static_cast<qulonglong>(idValue.toDouble(0.0)));
             } else {
+                self->m_impl->lastErrorCode = QStringLiteral("invalid_response");
+                self->m_impl->lastErrorMessage =
+                    QStringLiteral("StartScan response did not include scanId");
                 self->m_impl->state = Failed;
+                emit self->lastErrorChanged();
                 emit self->stateChanged();
-                emit self->requestError(QStringLiteral("invalid_response"),
-                                        QStringLiteral("StartScan response did not include scanId"));
+                emit self->requestError(self->m_impl->lastErrorCode,
+                                        self->m_impl->lastErrorMessage);
                 return;
             }
             self->m_impl->state = Running;

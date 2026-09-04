@@ -7,7 +7,7 @@ import ShadowStrike.Accessibility
 Item {
     id: root
 
-    required property string scanState      // "idle"|"running"|"complete"
+    required property string scanState      // "idle"|"running"|"complete"|"failed"
     property int  progressPercent:  0
     property int  threatsFound:     0
 
@@ -27,6 +27,11 @@ Item {
     property string activeScanLabel:  ""
     property string activeScanDetail: ""
 
+    // WHY THE LAST ATTEMPT FAILED. Empty in every other state, and the failed
+    // state omits the line rather than printing an empty one, so a failure the
+    // service could not explain still says that the scan did not complete.
+    property string failureReason: ""
+
     signal startRequested()
     signal stopRequested()
     signal openResults()
@@ -34,8 +39,10 @@ Item {
     implicitWidth:  340
 
     // The running state carries two extra lines the other states do not, so
-    // the tile grows for it instead of clipping them.
-    implicitHeight: root.scanState === "running" ? 250 : 180
+    // the tile grows for it instead of clipping them. The failed state carries
+    // a reason line and needs the same room.
+    implicitHeight: (root.scanState === "running" || root.scanState === "failed")
+                    ? 250 : 180
 
     Rectangle {
         anchors.fill: parent
@@ -247,6 +254,62 @@ Item {
                     onClicked: root.startRequested()
                 }
             }
+
+            // Failed state
+            //
+            // THIS STATE EXISTS BECAUSE ITS ABSENCE WAS THE DEFECT. A failed
+            // scan used to be mapped to "complete", so it rendered the verdict
+            // above - and with threatsFound at 0 for a scan that never ran, the
+            // tile reported the machine clean. Nothing here derives from
+            // threatsFound, because a count from a scan that did not finish
+            // describes nothing.
+            Column {
+                visible:  root.scanState === "failed"
+                spacing:  Theme.spacingS
+                anchors.horizontalCenter: parent.horizontalCenter
+
+                // WHICH scan failed, on the same footing as the completed
+                // state: a failure with no subject is as unhelpful as a
+                // verdict with none.
+                Text {
+                    horizontalAlignment: Text.AlignHCenter
+                    visible: root.activeScanLabel !== ""
+                    text:    root.activeScanLabel
+                    color:   Theme.textSecondary
+                    font.family:    Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeBody
+                    elide:            Text.ElideMiddle
+                    maximumLineCount: 1
+                    width:            260
+                }
+
+                Text {
+                    horizontalAlignment: Text.AlignHCenter
+                    text:  qsTr("Scan did not complete.")
+                    color: Theme.warn
+                    font.family:    Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeTitle
+                    font.weight:    Theme.fontWeightBold
+                }
+
+                // OMITTED WHEN UNKNOWN rather than shown blank, the same rule
+                // the running state's detail line follows.
+                Text {
+                    horizontalAlignment: Text.AlignHCenter
+                    visible: root.failureReason !== ""
+                    text:    root.failureReason
+                    color:   Theme.textSecondary
+                    font.family:    Theme.fontFamily
+                    font.pixelSize: Theme.fontSizeBody
+                    wrapMode: Text.WordWrap
+                    width:    260
+                }
+
+                PrimaryButton {
+                    text:      qsTr("Try Again")
+                    onClicked: root.startRequested()
+                }
+            }
         }
     }
 
@@ -265,6 +328,10 @@ Item {
         // scope and then the verdict; a bare "Clean." here would put the
         // machine-wide claim back into the accessibility tree only.
         case "complete": return root.threatsFound > 0 ? qsTr("%1 threats found.").arg(root.threatsFound) : qsTr("No threats found.")
+        // A screen reader must not be told a scan finished when it failed.
+        case "failed":   return root.failureReason !== ""
+                                ? qsTr("Scan did not complete. %1").arg(root.failureReason)
+                                : qsTr("Scan did not complete.")
         default:         return ""
         }
     }

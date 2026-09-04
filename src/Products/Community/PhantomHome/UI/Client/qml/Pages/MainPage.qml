@@ -319,9 +319,30 @@ PageHost {
 
     /// ScanViewModel.ScanState int → FastScanTile scanState string.
     /// ScanState: Idle=0 Preparing=1 Running=2 Paused=3 Completed=4 Failed=5
+    /// ScanViewModel.ScanState -> FastScanTile state string.
+    ///
+    /// FAILED IS ITS OWN STATE, and conflating it with Completed is the defect
+    /// this mapping used to carry. ScanState is
+    ///     Idle 0, Preparing 1, Running 2, Paused 3, Completed 4, Failed 5
+    /// and this function returned "complete" for BOTH 4 and 5. The tile's
+    /// completed state renders a verdict derived from threatsFound, which is 0
+    /// for a scan that never ran - so a failed scan told the user their machine
+    /// was clean.
+    ///
+    /// FIELD-PROVEN, 1.0.108: the dashboard showed a completed scan of
+    /// C:\ProgramData\eicar_com with no threats, while the service log contains
+    /// no StartScan line at all. HomeIpcDispatcher logs every accepted command
+    /// on the category that produced nineteen other entries that run, so the
+    /// request demonstrably never reached the service; PipeClient synthesised a
+    /// timeout after 5 s, the view model went to Failed, and this line
+    /// presented that as a clean result.
+    ///
+    /// scanChipState below already treated 5 as "critical", so the file
+    /// disagreed with itself about whether a failure was distinguishable.
     function scanStateStr(st) {
         if (st === 1 || st === 2 || st === 3) return "running"
-        if (st === 4 || st === 5)             return "complete"
+        if (st === 4)                         return "complete"
+        if (st === 5)                         return "failed"
         return "idle"
     }
 
@@ -347,6 +368,25 @@ PageHost {
             return target !== "" ? qsTr("Scanning %1").arg(target)
                                  : qsTr("Custom Scan")
         return qsTr("Quick Scan")
+    }
+
+    /// A readable cause for a scan that did not start or did not finish.
+    ///
+    /// The pipe's own codes are what a user actually sees when the service is
+    /// unreachable, so the two that mean "we never got an answer" are named
+    /// explicitly rather than shown raw. Anything else falls through to the
+    /// service's message, and an empty pair yields "" so the tile omits the
+    /// line rather than printing a blank label.
+    function scanFailureText(code, message) {
+        if (!code && !message) return ""
+        if (code === "timeout")
+            return qsTr("The service did not answer the request.")
+        if (code === "backpressure")
+            return qsTr("Too many requests are already in flight.")
+        if (code === "disconnected" || code === "not_connected")
+            return qsTr("Not connected to the ShadowStrike service.")
+        if (message && message !== "") return message
+        return code
     }
 
     /// m:ss for a millisecond duration.  Returns "" for zero so a caller can
@@ -683,6 +723,15 @@ PageHost {
                         activeScanDetail: (typeof scanViewModel !== "undefined")
                                           ? root.scanDetailLine(scanViewModel)
                                           : ""
+
+                        // WHY it failed, so the failed state can name the cause
+                        // instead of leaving the user to guess. Empty for every
+                        // other state because doStartScan clears it.
+                        failureReason: (typeof scanViewModel !== "undefined")
+                                       ? root.scanFailureText(
+                                             scanViewModel.lastErrorCode,
+                                             scanViewModel.lastErrorMessage)
+                                       : ""
 
                         onStartRequested: {
                             if (typeof scanViewModel !== "undefined")

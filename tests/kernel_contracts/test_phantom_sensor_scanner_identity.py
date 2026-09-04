@@ -18044,5 +18044,191 @@ class ProcessMitigationVerificationContractTests(unittest.TestCase):
 
 
 
+class ScanFailureIsNotACleanResultContractTests(unittest.TestCase):
+    """A scan that failed must never be presented as a scan that finished.
+
+    THE FIELD SEQUENCE, 1.0.108, reconstructed end to end:
+
+      1. The owner started a custom scan of C:\\ProgramData\\eicar_com.
+      2. ScanViewModel::doStartScan seeded scope="custom" and targetSummary
+         from its OWN request payload and set state = Preparing, so the tile
+         immediately displayed the target.
+      3. The StartScan request never reached the service. That is PROVEN, not
+         inferred: HomeIpcDispatcher logs "StartScan scope=[..] clientId=.."
+         at INFO on the same category that emitted nineteen other commands in
+         that run, and the 4,247-line service log contains no such line.
+      4. PipeClient synthesised ok=false after its 5000 ms default timeout.
+      5. The callback set state = Failed (5).
+      6. MainPage.scanStateStr mapped BOTH 4 and 5 to "complete".
+      7. The tile rendered its completed state, whose verdict derives from
+         threatsFound - zero, for a scan that never ran - and told the owner
+         the device was clean.
+
+    So the product reported a clean machine on the strength of a scan it never
+    performed. Same class as a counter reporting a block nobody carried out,
+    on the surface a user is most likely to trust.
+
+    The file already disagreed with itself: scanChipState returned "critical"
+    for state 5 while scanStateStr called it complete.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = strip_c_comments(read_source(MAIN_PAGE_QML_PATH))
+        cls.tile = strip_c_comments(read_source(FAST_SCAN_TILE_QML_PATH))
+        cls.vm_h = strip_c_comments(read_source(SCAN_VIEW_MODEL_HPP_PATH))
+        cls.vm_c = strip_c_comments(read_source(SCAN_VIEW_MODEL_CPP_PATH))
+
+    def _fn(self, name):
+        m = re.search(r"function\s+" + re.escape(name) + r"\s*\(", self.page)
+        self.assertIsNotNone(m, "MainPage has no function %s" % name)
+        brace = self.page.index("{", m.start())
+        return self.page[m.start():_matching_delimiter(self.page, brace, "{", "}") + 1]
+
+    def _enum(self):
+        """ScanState name -> value, read from the header rather than restated."""
+        m = re.search(r"enum\s+ScanState\s*\{([^}]*)\}", self.vm_h)
+        self.assertIsNotNone(m, "ScanViewModel no longer declares enum ScanState")
+        out = {}
+        for name, value in re.findall(r"(\w+)\s*=\s*(\d+)", m.group(1)):
+            out[name] = int(value)
+        return out
+
+    def test_the_failed_state_is_not_reported_as_complete(self):
+        # THE DEFECT ITSELF. The enum value is DERIVED from the header so that
+        # renumbering the enum cannot silently move which state is checked.
+        enum = self._enum()
+        self.assertIn("Failed", enum, "ScanState no longer has a Failed member")
+        self.assertIn("Completed", enum, "ScanState no longer has a Completed member")
+        failed, completed = enum["Failed"], enum["Completed"]
+        self.assertNotEqual(failed, completed, "Failed and Completed collide")
+
+        body = self._fn("scanStateStr")
+        # The arm that returns "complete" must not mention the Failed value.
+        for line in body.split("\n"):
+            if '"complete"' in line:
+                self.assertNotIn(
+                    str(failed), line,
+                    "scanStateStr maps ScanState %d (Failed) to \"complete\", so "
+                    "a scan that never ran renders as one that finished: %s"
+                    % (failed, line.strip()))
+        # ANTI-VACUITY: Completed must still map to "complete", so the fix
+        # cannot be satisfied by making nothing complete.
+        self.assertTrue(
+            re.search(r"===\s*" + str(completed) + r"\b[^\n]*\"complete\"", body),
+            "scanStateStr no longer maps Completed to \"complete\"")
+
+        # Failed must map to SOME state of its own, and this arm is
+        # DELIBERATELY SPELLING-AGNOSTIC. Requiring the literal "failed" here
+        # would key two tests on one literal: the sibling census arm already
+        # owns whether the tile renders whatever string is produced, and an
+        # earlier version of this assertion pinned the spelling, which made a
+        # mutation that renamed the state fail both arms instead of isolating
+        # the one it broke.
+        m = re.search(r"===\s*" + str(failed) + r"\b[^\n]*return\s+\"(\w+)\"", body)
+        self.assertIsNotNone(
+            m, "scanStateStr does not map Failed to any state string of its own")
+        self.assertNotEqual(
+            m.group(1), "complete",
+            "Failed maps to the completed state under another name")
+
+    def test_every_state_the_page_can_report_is_rendered_by_the_tile(self):
+        # THE CROSS-ARTIFACT RULE, and the reason this class is not just about
+        # one line: the SET of strings the mapping can produce is derived from
+        # the mapping, and each one must have a visible branch in the tile.
+        # Without this, adding a state to the mapping renders an EMPTY tile -
+        # silently, with no build or lint failure.
+        body = self._fn("scanStateStr")
+        produced = set(re.findall(r'return\s+"(\w+)"', body))
+        self.assertGreaterEqual(
+            len(produced), 4,
+            "scanStateStr produces only %d states, so this census is not "
+            "seeing the real mapping" % len(produced))
+        handled = set(re.findall(r'root\.scanState\s*===\s*"(\w+)"', self.tile))
+        missing = sorted(produced - handled)
+        self.assertEqual(
+            missing, [],
+            "the page can report these states and the tile renders nothing for "
+            "them, so the tile would be blank: %s" % missing)
+
+    def test_the_failed_state_derives_nothing_from_the_threat_count(self):
+        # A count from a scan that did not finish describes nothing, and it is
+        # exactly what produced the false clean verdict.
+        #
+        # ANCHORED ON THE visible: BINDING, not on the first mention of the
+        # state name: implicitHeight also tests for "failed", and slicing from
+        # there walked back to the root Item's brace and swallowed the whole
+        # file - which reported six threatsFound reads and a false positive.
+        m = re.search(r'visible:\s*root\.scanState\s*===\s*"failed"', self.tile)
+        self.assertIsNotNone(
+            m, "the tile has no visible branch for the failed state")
+        at = m.start()
+        block = self.tile[at:_matching_delimiter(
+            self.tile, self.tile.rindex("{", 0, at), "{", "}") + 1]
+        # Sanity-bound the slice so a future anchor change cannot silently make
+        # this arm vacuous by selecting almost nothing or almost everything.
+        self.assertTrue(
+            200 < len(block) < 4000,
+            "the failed-state slice is %d chars, which is not a plausible "
+            "single Column - the anchor has drifted" % len(block))
+        self.assertEqual(
+            len(re.findall(r"threatsFound", block)), 0,
+            "the failed state reads threatsFound; a threat count from a scan "
+            "that did not complete cannot support any verdict")
+        self.assertTrue(
+            "Scan did not complete" in block,
+            "the failed state does not say that the scan did not complete")
+
+    def test_the_reason_is_a_readable_property_not_only_a_signal(self):
+        # requestError already existed and NOTHING consumed it on this surface,
+        # so the reason was emitted into the void - and a transient signal
+        # cannot be rendered by a declarative binding in any case.
+        for prop in ("lastErrorCode", "lastErrorMessage"):
+            self.assertTrue(
+                re.search(r"Q_PROPERTY\s*\(\s*QString\s+" + prop, self.vm_h),
+                "%s is not exposed as a property, so the tile cannot render "
+                "the reason a scan failed" % prop)
+        self.assertTrue(
+            "failureReason" in self.tile,
+            "the tile has no failure-reason property")
+        self.assertTrue(
+            re.search(r"failureReason\s*:", self.page),
+            "MainPage does not supply the failure reason to the tile")
+
+    def test_every_failed_transition_records_a_reason(self):
+        # Both Failed transitions in doStartScan must record WHY, or the tile
+        # shows a bare failure with no cause - which is what the field run
+        # would have produced even with the state fixed.
+        at = self.vm_c.index("void ScanViewModel::doStartScan")
+        brace = self.vm_c.index("{", at)
+        body = self.vm_c[brace:_matching_delimiter(self.vm_c, brace, "{", "}") + 1]
+        transitions = re.findall(r"state\s*=\s*Failed", body)
+        self.assertEqual(
+            len(transitions), 2,
+            "expected exactly two Failed transitions in doStartScan (request "
+            "failed, and a reply with no scanId), found %d" % len(transitions))
+        self.assertEqual(
+            len(re.findall(r"lastErrorCode\s*=", body)), 2,
+            "a Failed transition does not record its error code")
+        self.assertEqual(
+            len(re.findall(r"lastErrorMessage\s*=", body)), 2,
+            "a Failed transition does not record its error message")
+        # CLEARED ON A NEW ATTEMPT so a reason cannot outlive its failure.
+        self.assertTrue(
+            re.search(r"lastErrorCode\.clear\(\)", body),
+            "doStartScan does not clear the previous reason, so a stale cause "
+            "would be displayed beside a running scan")
+
+    def test_the_chip_still_treats_a_failure_as_critical(self):
+        # REGRESSION GUARD, not a discriminator: this arm was already correct
+        # and is what proved the file disagreed with itself.
+        enum = self._enum()
+        body = self._fn("scanChipState")
+        self.assertTrue(
+            re.search(r"===\s*" + str(enum["Failed"]) + r"\b[^\n]*\"critical\"", body),
+            "the status chip no longer reports a failed scan as critical")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
