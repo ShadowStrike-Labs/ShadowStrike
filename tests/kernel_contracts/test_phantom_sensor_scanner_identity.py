@@ -18230,5 +18230,153 @@ class ScanFailureIsNotACleanResultContractTests(unittest.TestCase):
 
 
 
+class ScanCountedOnlyWhenPerformedContractTests(unittest.TestCase):
+    """The create-path scan counter must count scans, not attempts.
+
+    OperationsScanned and the four per-class counters were incremented as soon
+    as SbBuildFileScanRequest succeeded - when the request had been BUILT, before
+    SbSendScanRequest was called. So every request the circuit breaker refused,
+    every reply timeout and every transport error was counted as a scan.
+
+    THE FIELD ARITHMETIC IS EXACT, 1.0.108:
+        scanned     = 22,527
+        circuitOpen = 21,917
+        txSends     =    610
+        21,917 + 610 = 22,527
+    Only 610 creates were ever sent to the scanner, so the counter named
+    "scanned" over-stated real coverage by a factor of 37, and the per-class
+    figures with it - exe=19,029 against 610 sends. The sample deltas remove any
+    doubt: for the first ninety seconds scanned and circuitOpen rose by
+    IDENTICAL amounts (+2852/+2852, +2119/+2119, +4905/+4905).
+
+    6589f10e split the FAILURE modes apart, which is why circuitOpen exists as
+    its own counter, and left the SUCCESS counter still including those
+    refusals - half the accounting fixed, the numerator left wrong.
+
+    NO NEW STATUS FIELD was added: attempts stay derivable as
+        scanned + circuitOpen + timeouts + errors
+    since those are mutually exclusive branches on the send result. An arm below
+    pins that all four remain published, because the derivation is the reason no
+    field was added and it would break silently if one were dropped.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pre = strip_c_comments(read_source(PRE_CREATE_C_PATH))
+        cls.shared = strip_c_comments(read_source(SHARED_DEFS_H_PATH))
+
+    def _offsets(self):
+        """Ordered positions of the three landmarks, each verified unique."""
+        out = {}
+        for key, needle in (
+                ("build", "SbBuildFileScanRequest("),
+                ("send", "SbSendScanRequest("),
+                ("answered", "if (ScanAnswered)"),
+                ("counted", "InterlockedIncrement64(&g_PcState.Stats.OperationsScanned)")):
+            n = self.pre.count(needle)
+            self.assertEqual(
+                n, 1,
+                "expected exactly one %r in PreCreate.c, found %d - this "
+                "census cannot order landmarks it cannot locate uniquely"
+                % (needle, n))
+            out[key] = self.pre.index(needle)
+        return out
+
+    def test_a_scan_is_counted_only_after_the_scanner_answered(self):
+        # Offsets only in the failure text: the haystack is a 3,500-line
+        # translation unit.
+        o = self._offsets()
+        self.assertLess(
+            o["build"], o["send"],
+            "the request is no longer built before it is sent")
+        self.assertLess(
+            o["send"], o["counted"],
+            "OperationsScanned is incremented at offset %d, BEFORE "
+            "SbSendScanRequest at offset %d - so a create the circuit breaker "
+            "refuses is still counted as a scan"
+            % (o["counted"], o["send"]))
+        self.assertLess(
+            o["answered"], o["counted"],
+            "OperationsScanned is incremented at offset %d, outside the "
+            "ScanAnswered gate at offset %d - a timeout would be counted as a "
+            "scan" % (o["counted"], o["answered"]))
+
+    def test_the_per_class_counters_move_with_it(self):
+        # Fixing the total and leaving exe/script/doc/archive counting attempts
+        # would leave the same over-claim in four more numbers.
+        o = self._offsets()
+        for counter in ("ExecutablesScanned", "ScriptsScanned",
+                        "DocumentsScanned", "ArchivesScanned"):
+            needle = "InterlockedIncrement64(&g_PcState.Stats.%s)" % counter
+            n = self.pre.count(needle)
+            self.assertEqual(
+                n, 1,
+                "expected exactly one increment of %s, found %d" % (counter, n))
+            at = self.pre.index(needle)
+            self.assertGreater(
+                at, o["answered"],
+                "%s is incremented at offset %d, outside the ScanAnswered gate "
+                "at offset %d, so it counts attempts rather than scans"
+                % (counter, at, o["answered"]))
+
+    def test_the_failure_modes_are_still_counted_separately(self):
+        # ANTI-VACUITY IN BOTH DIRECTIONS. Deleting the counters entirely would
+        # satisfy an ordering-only guard, and losing the failure split would
+        # undo 6589f10e and make the attempt count underivable.
+        for counter in ("ScanCircuitOpen", "ScanTimeouts"):
+            self.assertEqual(
+                self.pre.count("InterlockedIncrement64(&g_PcState.Stats.%s)"
+                               % counter), 1,
+                "%s is no longer incremented exactly once, so a breaker refusal "
+                "and a reply timeout can no longer be told apart" % counter)
+        self.assertGreaterEqual(
+            self.pre.count("InterlockedIncrement64(&g_PcState.Stats.ScanErrors)"), 2,
+            "the scan-error counter lost a site; both the send-failure and the "
+            "build-failure paths must record one")
+
+    def test_the_attempt_count_stays_derivable_from_published_fields(self):
+        # This is WHY no new status field was added. If any of the four stops
+        # being published, attempts becomes unknowable and the next reader has
+        # no way to see the coverage gap at all.
+        for field in ("PcOperationsScanned", "PcScanCircuitOpen",
+                      "PcScanTimeouts", "PcScanErrors"):
+            self.assertTrue(
+                field in self.shared,
+                "SHADOWSTRIKE_DRIVER_STATUS no longer publishes %s, so "
+                "attempts = scanned + circuitOpen + timeouts + errors can no "
+                "longer be computed by any reader" % field)
+
+    def test_the_class_is_resolved_once_and_reused(self):
+        # The classification stayed where NameInfo->Extension is in scope and
+        # only the counting moved, so nothing in the send path may reclassify.
+        #
+        # THE REGION IS ANCHORED ON THE BUILD CALL AND BRACE-MATCHED, NOT
+        # SLICED UP TO THE COUNTER. An earlier version ended the slice at the
+        # OperationsScanned increment, which coupled this arm to where counting
+        # happens: a mutation that MOVED the counter changed this region and
+        # failed this arm for a reason that has nothing to do with
+        # reclassification. The brace-matched form covers the whole scan block,
+        # including the success branch, so a reclassify anywhere in it is seen.
+        at = self.pre.index("SbBuildFileScanRequest(")
+        gate = self.pre.index("if (NT_SUCCESS(Status))", at)
+        brace = self.pre.index("{", gate)
+        region = self.pre[at:_matching_delimiter(self.pre, brace, "{", "}") + 1]
+        self.assertTrue(
+            2000 < len(region) < 30000,
+            "the scan-block slice is %d chars, which is not a plausible region "
+            "- the anchor has drifted" % len(region))
+        self.assertEqual(
+            region.count("PcClassifyFile("), 1,
+            "expected exactly one PcClassifyFile call in the scan block, found "
+            "%d - the class is meant to be resolved once into a local and "
+            "reused, not recomputed on the send path"
+            % region.count("PcClassifyFile("))
+        self.assertTrue(
+            "HaveClass" in self.pre,
+            "the resolved-class flag is gone, so an unclassifiable file cannot "
+            "be distinguished from one classified as the zero enumerator")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

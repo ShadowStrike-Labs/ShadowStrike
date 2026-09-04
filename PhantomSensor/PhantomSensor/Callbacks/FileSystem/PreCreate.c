@@ -1654,32 +1654,20 @@ Return Value:
             );
 
         if (NT_SUCCESS(Status)) {
-            InterlockedIncrement64(&g_PcState.Stats.OperationsScanned);
-
             //
-            // Track by file class
+            // CLASSIFY NOW, COUNT LATER.
             //
+            // The class is derived here because NameInfo->Extension is in scope
+            // and the work is a table lookup, but the per-class counters are
+            // NOT incremented yet - see the accounting note below. Held in a
+            // local so the success branch does not have to reclassify.
+            //
+            PC_FILE_CLASS CountedClass = (PC_FILE_CLASS)0;
+            BOOLEAN       HaveClass    = FALSE;
             {
-                PC_FILE_CLASS FileClass;
-                ULONG Priority;
-                if (NT_SUCCESS(PcClassifyFile(&NameInfo->Extension, &FileClass, &Priority))) {
-                    switch (FileClass) {
-                        case PcFileClassExecutable:
-                            InterlockedIncrement64(&g_PcState.Stats.ExecutablesScanned);
-                            break;
-                        case PcFileClassScript:
-                            InterlockedIncrement64(&g_PcState.Stats.ScriptsScanned);
-                            break;
-                        case PcFileClassDocument:
-                            InterlockedIncrement64(&g_PcState.Stats.DocumentsScanned);
-                            break;
-                        case PcFileClassArchive:
-                            InterlockedIncrement64(&g_PcState.Stats.ArchivesScanned);
-                            break;
-                        default:
-                            break;
-                    }
-                }
+                ULONG CountedPriority = 0;
+                HaveClass = NT_SUCCESS(PcClassifyFile(
+                    &NameInfo->Extension, &CountedClass, &CountedPriority));
             }
 
             //
@@ -1780,6 +1768,63 @@ Return Value:
                 (Status != STATUS_TIMEOUT) && NT_SUCCESS(Status);
 
             if (ScanAnswered) {
+                //
+                // COUNTED HERE BECAUSE THIS IS WHERE A SCAN ACTUALLY HAPPENED.
+                //
+                // OperationsScanned and the four per-class counters used to be
+                // incremented immediately after SbBuildFileScanRequest
+                // succeeded - that is, when the request had been BUILT, before
+                // it was sent. Every request the circuit breaker then refused,
+                // every one that timed out and every transport error was
+                // therefore counted as a scan.
+                //
+                // FIELD ARITHMETIC, 1.0.108, and it is exact:
+                //     scanned      = 22,527
+                //     circuitOpen  = 21,917
+                //     txSends      =    610
+                //     21,917 + 610 = 22,527
+                // Only 610 creates were ever sent to the scanner. The counter
+                // named "scanned" over-stated real scan coverage by 37x, and
+                // the per-class figures with it (exe=19,029 against 610 sends).
+                // The sample-by-sample deltas make it unmistakable: for the
+                // first ninety seconds `scanned` and `circuitOpen` rose by
+                // IDENTICAL amounts, +2852/+2852, +2119/+2119, +4905/+4905.
+                //
+                // 6589f10e SPLIT THE FAILURE MODES APART - it stopped a breaker
+                // refusal being reported as a scan error, which is why
+                // circuitOpen exists as its own counter at all - and it left
+                // the SUCCESS counter still including those refusals. Half of
+                // the accounting was corrected and the numerator was not.
+                //
+                // NO NEW STATUS FIELD IS NEEDED and none is added: the attempt
+                // count remains derivable from figures already published, as
+                //     attempts = scanned + circuitOpen + timeouts + errors
+                // because those four are mutually exclusive branches on the
+                // send result. That keeps SHADOWSTRIKE_DRIVER_STATUS byte-for-
+                // byte unchanged, which matters on a packed struct whose layout
+                // is asserted relatively.
+                //
+                InterlockedIncrement64(&g_PcState.Stats.OperationsScanned);
+
+                if (HaveClass) {
+                    switch (CountedClass) {
+                        case PcFileClassExecutable:
+                            InterlockedIncrement64(&g_PcState.Stats.ExecutablesScanned);
+                            break;
+                        case PcFileClassScript:
+                            InterlockedIncrement64(&g_PcState.Stats.ScriptsScanned);
+                            break;
+                        case PcFileClassDocument:
+                            InterlockedIncrement64(&g_PcState.Stats.DocumentsScanned);
+                            break;
+                        case PcFileClassArchive:
+                            InterlockedIncrement64(&g_PcState.Stats.ArchivesScanned);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+
                 //
                 // Handle scan verdict
                 //
