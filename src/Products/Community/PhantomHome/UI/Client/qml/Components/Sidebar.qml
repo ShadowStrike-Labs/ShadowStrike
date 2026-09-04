@@ -8,16 +8,53 @@ Item {
     id: root
 
     property bool collapsed:      false
-    property int  selectedIndex:  0
 
-    // Ordered route keys aligned 1:1 with the nav model below.  Kept as a
-    // property so Main.qml's route map and this file remain in sync without
-    // duplicating the strings in two places.
-    readonly property var navRoutes: [
-        "dashboard",
-        "security",
-        "privacy"
+    // THE ROUTE CURRENTLY SHOWN, supplied by Main.qml. Single source of truth.
+    //
+    // The highlight used to be local mutable state written by the click
+    // handler, so it only ever tracked clicks ON THIS BAR. Every other way of
+    // reaching a page - an in-page card, a recommendation, the tray verb, the
+    // -route command line - left the bar pointing at whatever was last
+    // clicked. Main.qml's d.currentRoute is updated by BOTH navigation paths
+    // (navigateTo for a route and navigateToUrl for a stack push, which
+    // resolves the url back to its route key), so binding to it is what makes
+    // the highlight follow the page instead of the pointer.
+    property string currentRoute: "dashboard"
+
+    // NAVIGATION MODEL - ONE list, and that is the point.
+    //
+    // This was two parallel arrays: a navRoutes list of route keys and an
+    // inline Repeater model of label/icon pairs, joined only by a shared
+    // index. Nothing checked that they stayed the same length or the same
+    // order, so adding an entry to one and not the other would silently
+    // navigate to the wrong page - and adding to the model alone would index
+    // past the end of navRoutes and navigate nowhere at all. Merging them
+    // makes that class of mistake unrepresentable rather than merely unlikely.
+    //
+    // navRoutes had no reader outside this file (measured), so nothing
+    // depended on the split shape.
+    readonly property var navItems: [
+        { route: "dashboard", label: qsTr("Main"),     icon: "qrc:/icons/shield.svg"  },
+        { route: "security",  label: qsTr("Security"), icon: "qrc:/icons/lock.svg"    },
+        { route: "privacy",   label: qsTr("Privacy"),  icon: "qrc:/icons/eye.svg"     },
+        { route: "reports",   label: qsTr("Reports"),  icon: "qrc:/icons/reports.svg" }
     ]
+
+    // WHICH ENTRY IS LIT, derived rather than stored.
+    //
+    // -1 IS A REAL ANSWER AND IS DELIBERATE: Settings, Quarantine, Threat
+    // Intelligence, Zero Trust and the module detail pages have no entry in
+    // this bar, and on those pages NOTHING should be lit. Falling back to 0
+    // would light "Main" while the user is somewhere else, which is a nav bar
+    // reporting a location it does not have.
+    readonly property int selectedIndex: {
+        for (var i = 0; i < root.navItems.length; ++i) {
+            if (root.navItems[i].route === root.currentRoute) {
+                return i
+            }
+        }
+        return -1
+    }
 
     // Legacy numeric signal — retained so any existing listeners keep working.
     signal selectionChanged(int index)
@@ -128,25 +165,22 @@ Item {
             // Navigation items
             Repeater {
                 id: navRepeater
-                model: [
-                    { label: qsTr("Main"),     icon: "qrc:/icons/shield.svg" },
-                    { label: qsTr("Security"), icon: "qrc:/icons/lock.svg"   },
-                    { label: qsTr("Privacy"),  icon: "qrc:/icons/eye.svg"    }
-                ]
+                model: root.navItems
 
                 SidebarItem {
                     required property var modelData
                     required property int index
-                    label:     modelData.label
+                    label:      modelData.label
                     iconSource: modelData.icon
                     selected:   root.selectedIndex === index
                     collapsed:  root.collapsed
                     onActivated: {
-                        root.selectedIndex = index
+                        // The route travels WITH the entry, so there is no
+                        // index to keep aligned with a second list and no
+                        // bounds check to get wrong. selectedIndex updates
+                        // when Main.qml reflects the new route back.
                         root.selectionChanged(index)
-                        if (index >= 0 && index < root.navRoutes.length) {
-                            root.navigate(root.navRoutes[index])
-                        }
+                        root.navigate(modelData.route)
                     }
                 }
             }

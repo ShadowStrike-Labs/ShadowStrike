@@ -102,6 +102,13 @@ REPORTS_MODEL_CPP_PATH = (
 REPORTS_SUBROUTE_QML_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Client/qml/Pages/ReportsSubroute.qml"
 )
+UI_CLIENT_DIR = ROOT / "src/Products/Community/PhantomHome/UI/Client"
+UI_QML_DIR = UI_CLIENT_DIR / "qml"
+UI_ICONS_DIR = UI_QML_DIR / "icons"
+UI_MAIN_QML_PATH = UI_QML_DIR / "Main.qml"
+SIDEBAR_QML_PATH = UI_QML_DIR / "Components/Sidebar.qml"
+SIDEBAR_ITEM_QML_PATH = UI_QML_DIR / "Components/SidebarItem.qml"
+ASSETS_QRC_PATH = UI_CLIENT_DIR / "assets.qrc"
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
@@ -17667,6 +17674,199 @@ class ReportsFilterPipelineContractTests(unittest.TestCase):
             m,
             "the request no longer sends a computed lower bound with an open "
             "upper bound")
+
+
+class NavigationReachabilityContractTests(unittest.TestCase):
+    """Every page the router can show must have some way to get to it.
+
+    ReportsSubroute.qml is a 430-line paginated viewer with a category filter,
+    a search bar, a date-range control, CSV export and its own view model. It
+    was registered in Main.qml's routeMap and titleMap, and the sidebar listed
+    exactly Main / Security / Privacy - so the only way in was a card on the
+    dashboard. The owner reported it as missing, correctly.
+
+    MEASURED at the time: of the eight routes in routeMap, Reports was the ONLY
+    one with no navigation entry. Every other route is reached either from the
+    sidebar (dashboard, security, privacy, settings) or from a section page
+    (zerotrust, pgti and quarantine from SecurityPage). An earlier reading of
+    mine that called ZeroTrust unreachable too was WRONG - SecurityPage pushes
+    it - which is why this class derives the census instead of listing it.
+
+    The general rule is what is guarded, not the single instance: a route the
+    router knows about and nothing can reach is a page that does not exist as
+    far as a user is concerned.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.main = strip_c_comments(read_source(UI_MAIN_QML_PATH))
+        cls.side = strip_c_comments(read_source(SIDEBAR_QML_PATH))
+        cls.item = strip_c_comments(read_source(SIDEBAR_ITEM_QML_PATH))
+        cls.qrc = read_source(ASSETS_QRC_PATH)
+        # Every other .qml in the product, so a page push can be found
+        # wherever it lives rather than in a hardcoded list of pages.
+        cls.others = {}
+        for path in sorted(UI_QML_DIR.rglob("*.qml")):
+            if path.name == "Main.qml":
+                continue
+            cls.others[path.name] = strip_c_comments(read_source(path))
+
+    def _route_map(self):
+        """route key -> page url, read out of Main.qml rather than restated."""
+        m = re.search(r"readonly\s+property\s+var\s+routeMap\s*:\s*\(\{", self.main)
+        self.assertIsNotNone(m, "Main.qml no longer declares a routeMap")
+        brace = self.main.index("{", m.end() - 2)
+        body = self.main[brace:_matching_delimiter(self.main, brace, "{", "}") + 1]
+        pairs = re.findall(r'"(\w+)"\s*:\s*"([^"]+)"', body)
+        self.assertGreaterEqual(
+            len(pairs), 6,
+            "read only %d routes out of routeMap, so this census is not "
+            "seeing the real table" % len(pairs))
+        return dict(pairs)
+
+    def _nav_items(self):
+        """The sidebar's own list of route/label/icon records."""
+        m = re.search(r"readonly\s+property\s+var\s+navItems\s*:\s*\[", self.side)
+        self.assertIsNotNone(
+            m,
+            "the sidebar no longer declares a single navItems list; it was two "
+            "index-aligned arrays and merging them is what stops them drifting")
+        open_at = self.side.index("[", m.end() - 1)
+        body = self.side[open_at:_matching_delimiter(self.side, open_at, "[", "]") + 1]
+        entries = re.findall(r"\{([^}]*)\}", body)
+        out = []
+        for e in entries:
+            rec = {}
+            for key in ("route", "label", "icon"):
+                km = re.search(key + r'\s*:\s*(?:qsTr\()?"([^"]+)"', e)
+                rec[key] = km.group(1) if km else None
+            out.append(rec)
+        return out
+
+    def test_every_declared_route_can_be_reached(self):
+        routes = self._route_map()
+        nav = {r["route"] for r in self._nav_items()}
+        unreachable = []
+        for route, url in sorted(routes.items()):
+            page = url.rsplit("/", 1)[-1]
+            if route in nav:
+                continue
+            # A route may also be reached by a page push or by the sidebar's
+            # dedicated settings button, which is not part of navItems.
+            reached = any(page in body for name, body in self.others.items()
+                          if name != page)
+            if not reached and ('"%s"' % route) in self.side:
+                reached = True
+            if not reached:
+                unreachable.append("%s -> %s" % (route, page))
+        self.assertEqual(
+            unreachable, [],
+            "these routes are declared in routeMap and nothing can navigate to "
+            "them, so the pages are unreachable: %s" % unreachable)
+
+    def test_reports_is_in_the_navigation_bar(self):
+        # THE FILED DEFECT, pinned as its own arm so a regression names it.
+        nav = self._nav_items()
+        routes = [r["route"] for r in nav]
+        self.assertIn(
+            "reports", routes,
+            "Reports is not in the sidebar; it has a route, a title, a page "
+            "and a view model, and no way in from the nav")
+        self.assertIn(
+            "dashboard", routes, "the dashboard entry was dropped")
+        self.assertIn("security", routes, "the security entry was dropped")
+        self.assertIn("privacy", routes, "the privacy entry was dropped")
+
+    def test_each_nav_entry_carries_its_own_route_label_and_icon(self):
+        # ONE LIST, NOT TWO. The route used to live in a separate navRoutes
+        # array joined to the model by index, with nothing checking that the
+        # two stayed the same length or order - so adding to one and not the
+        # other navigated to the wrong page, or to nowhere at all.
+        self.assertEqual(
+            self.side.count("navRoutes"), 0,
+            "the parallel navRoutes array is back; the route must travel with "
+            "its own entry so there is no index to keep aligned")
+        for i, rec in enumerate(self._nav_items()):
+            for key in ("route", "label", "icon"):
+                self.assertIsNotNone(
+                    rec[key],
+                    "nav entry %d has no %s, so it cannot be rendered or "
+                    "navigated consistently" % (i, key))
+
+    def test_no_two_nav_entries_share_an_icon(self):
+        # A COLLAPSED SIDEBAR RENDERS THE ICON AND NOTHING ELSE: SidebarItem
+        # hides its label when collapsed, so two entries sharing a glyph are
+        # indistinguishable to the eye.
+        self.assertTrue(
+            re.search(r"visible:\s*!root\.collapsed", self.item),
+            "SidebarItem no longer hides its label when collapsed, which is "
+            "the premise of this arm - re-derive it before relaxing anything")
+        icons = [r["icon"] for r in self._nav_items()]
+        dupes = sorted({i for i in icons if icons.count(i) > 1})
+        self.assertEqual(
+            dupes, [],
+            "these icons are used by more than one nav entry, so the entries "
+            "cannot be told apart when the sidebar is collapsed: %s" % dupes)
+
+    def test_every_nav_icon_is_registered_and_present_on_disk(self):
+        # An icon that is not in the qrc renders as a blank square at runtime
+        # with no build or lint failure anywhere.
+        for rec in self._nav_items():
+            name = rec["icon"].rsplit("/", 1)[-1]
+            # assertTrue over a boolean, NOT assertIn against the qrc: the
+            # containment form dumps the whole 1.7 KB file into the failure and
+            # buries the one fact that matters.
+            self.assertTrue(
+                ('alias="%s"' % name) in self.qrc,
+                "%s is referenced by a nav entry and is not registered in "
+                "assets.qrc, so it would render as an empty square" % name)
+            self.assertTrue(
+                (UI_ICONS_DIR / name).is_file(),
+                "%s is registered in assets.qrc and does not exist on disk; "
+                "rcc fails the build on this, but say so precisely" % name)
+
+    def test_the_highlight_follows_the_page_not_the_last_click(self):
+        # The highlight was local mutable state written only by this bar's own
+        # click handler, so every other way of reaching a page - an in-page
+        # card, a recommendation, the tray verb, the -route command line - left
+        # it pointing somewhere the user was not.
+        self.assertTrue(
+            re.search(r"readonly\s+property\s+int\s+selectedIndex\s*:", self.side),
+            "selectedIndex is writable again, so it can be set independently "
+            "of the route actually being shown")
+        self.assertEqual(
+            len(re.findall(r"selectedIndex\s*=[^=]", self.side)), 0,
+            "something assigns selectedIndex; it must be derived from the "
+            "current route so the two cannot disagree")
+        self.assertTrue(
+            re.search(r"property\s+string\s+currentRoute\s*:", self.side),
+            "the sidebar no longer accepts the current route, so it has no "
+            "way to know which entry to light")
+        self.assertTrue(
+            re.search(r"currentRoute\s*:\s*d\.currentRoute", self.main),
+            "Main.qml no longer reflects d.currentRoute into the sidebar, so "
+            "the highlight cannot follow a navigation it did not originate")
+
+    def test_a_page_with_no_nav_entry_lights_nothing(self):
+        # Settings, Quarantine, Threat Intelligence, Zero Trust and the module
+        # detail pages have no entry here. Falling back to index 0 would light
+        # "Main" while the user is somewhere else, which is a nav bar reporting
+        # a location it does not have.
+        m = re.search(r"readonly\s+property\s+int\s+selectedIndex\s*:\s*\{",
+                      self.side)
+        self.assertIsNotNone(m, "selectedIndex is no longer a derived block")
+        brace = self.side.index("{", m.end() - 1)
+        body = self.side[brace:_matching_delimiter(self.side, brace, "{", "}") + 1]
+        self.assertIn(
+            "return -1", body,
+            "selectedIndex cannot report 'no entry'; a route outside this bar "
+            "would light an entry the user is not on")
+        self.assertEqual(
+            len(re.findall(r"return\s+0\b", body)), 0,
+            "selectedIndex falls back to the first entry, which lights Main "
+            "for every page that has no entry of its own")
+
+
 
 
 if __name__ == "__main__":

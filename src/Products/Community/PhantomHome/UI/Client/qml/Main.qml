@@ -97,6 +97,12 @@ ApplicationWindow {
             Layout.fillHeight: true
             Layout.preferredWidth: Theme.sidebarWidthExpanded
 
+            // Reflect the route back so the highlight follows the PAGE rather
+            // than the last click on this bar. d.currentRoute is set by both
+            // navigation paths, including a stack push from an in-page card,
+            // so reaching Reports from the dashboard lights the Reports entry.
+            currentRoute: d.currentRoute
+
             onNavigate: function(route) {
                 d.navigateTo(route);
             }
