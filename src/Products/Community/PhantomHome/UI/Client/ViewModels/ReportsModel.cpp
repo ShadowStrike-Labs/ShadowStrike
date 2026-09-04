@@ -58,6 +58,7 @@ struct ReportsModel::Impl {
     QString   filterCategory;
     QDateTime filterFrom;
     QDateTime filterTo;
+    int       filterMinSeverity{-1};   ///< Negative = no severity filter.
 
     [[nodiscard]] static QString SeverityToString(int severity) noexcept
     {
@@ -150,10 +151,22 @@ struct ReportsModel::Impl {
                 f[QLatin1String("category")] = kind;
             }
         }
+        // EPOCH MILLISECONDS, AND THE UNIT IS IN THE KEY NAME.
+        //
+        // These were previously serialised as ISO 8601 under the keys "from"
+        // and "to", and the service read neither - so the range was built on
+        // every request and discarded on arrival. Sending the same unit the
+        // store already keeps (ReportEntry::timestamp_unix_ms) removes both
+        // the conversion and the date parser that would otherwise sit on a
+        // path taking untrusted input.
         if (filterFrom.isValid())
-            f[QLatin1String("from")] = filterFrom.toString(Qt::ISODate);
+            f[QLatin1String("fromMs")] =
+                static_cast<qint64>(filterFrom.toMSecsSinceEpoch());
         if (filterTo.isValid())
-            f[QLatin1String("to")] = filterTo.toString(Qt::ISODate);
+            f[QLatin1String("toMs")] =
+                static_cast<qint64>(filterTo.toMSecsSinceEpoch());
+        if (filterMinSeverity >= 0)
+            f[QLatin1String("minSeverity")] = filterMinSeverity;
         return f;
     }
 };
@@ -221,11 +234,13 @@ void ReportsModel::loadMore()
 
 void ReportsModel::setFilter(const QString& category,
                               const QDateTime& from,
-                              const QDateTime& to)
+                              const QDateTime& to,
+                              int minSeverity)
 {
-    m_impl->filterCategory = category;
-    m_impl->filterFrom     = from;
-    m_impl->filterTo       = to;
+    m_impl->filterCategory    = category;
+    m_impl->filterFrom        = from;
+    m_impl->filterTo          = to;
+    m_impl->filterMinSeverity = minSeverity;
 
     // Reset the model, then fetch from offset 0.
     beginResetModel();

@@ -76,13 +76,23 @@ public:
     /**
      * @brief Apply a filter and reload from offset 0.
      *
-     * @param category  Empty string = all categories.
-     * @param from      Null datetime = no lower bound.
-     * @param to        Null datetime = no upper bound.
+     * @param category    Empty string = all categories.
+     * @param from        Null datetime = no lower bound.
+     * @param to          Null datetime = no upper bound.
+     * @param minSeverity Negative = no severity filter. Otherwise the
+     *                    lowest ReportSeverity ordinal to include, so 3
+     *                    means High and Critical.
+     *
+     * The range is sent to the service as epoch MILLISECONDS rather than
+     * ISO 8601: report entries are stored in that unit, so the bound needs
+     * no conversion and no date parser on the receiving side, and a local
+     * QDateTime rendered with Qt::ISODate carries no zone offset for the
+     * service to interpret.
      */
     Q_INVOKABLE void setFilter(const QString& category,
                                const QDateTime& from,
-                               const QDateTime& to);
+                               const QDateTime& to,
+                               int minSeverity = -1);
 
     /**
      * @brief Export currently loaded rows to a UTF-8 CSV file.

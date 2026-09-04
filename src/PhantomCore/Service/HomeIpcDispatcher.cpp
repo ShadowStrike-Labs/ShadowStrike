@@ -1556,10 +1556,65 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             static_cast<std::size_t>(std::max(0, Field<int>(j, "limit").value_or(50))),
             kMaxListItems);
 
-        std::optional<ReportKind> kindFilter;
+        std::optional<ReportKind>     kindFilter;
+        std::optional<ReportSeverity> severityFilter;
+        std::optional<std::int64_t>   sinceMs;
+        std::optional<std::int64_t>   untilMs;
+
+        // THE CONSUMER SIDE OF A FILTER THAT HAD ONLY A PRODUCER.
+        //
+        // ReportsModel::buildFilter has always serialised a time range, and
+        // this handler read neither key, so the range was silently discarded
+        // on every request. It went unnoticed because the QML passed a null
+        // datetime at both call sites, so the keys never reached the wire and
+        // the missing consumer could not be observed from either end.
+        //
+        // ReportQuery::min_severity was worse: the store's Query has always
+        // honoured it and nothing anywhere ever set it.
+        //
+        // THE RANGE IS EPOCH MILLISECONDS, NOT ISO 8601. ReportEntry stores
+        // timestamp_unix_ms, so a numeric bound compares directly with no
+        // conversion and no new date parser on a path that takes untrusted
+        // input from the UI pipe. It also removes a real ambiguity: a local
+        // QDateTime rendered with Qt::ISODate carries NO zone offset, so this
+        // side could not have known which zone it was reading.
         if (j.contains("filter") && j["filter"].is_object()) {
-            if (const auto cat = Field<int>(j["filter"], "category"))
+            const auto& filter = j["filter"];
+
+            if (const auto cat = Field<int>(filter, "category"))
                 kindFilter = static_cast<ReportKind>(*cat);
+
+            // A REJECTED FILTER MEANS "NO FILTER", AND THAT DIRECTION IS
+            // DELIBERATE. This is a read-only view, so the failure that matters
+            // is HIDING a report rather than showing an extra one. Clamping an
+            // out-of-range severity up to Critical would conceal everything
+            // below it and look exactly like a quiet machine. Refusing the
+            // field shows more than asked, which is the direction a security
+            // history can afford to err in.
+            if (const auto sev = Field<int>(filter, "minSeverity")) {
+                if (*sev >= static_cast<int>(ReportSeverity::Info) &&
+                    *sev <= static_cast<int>(ReportSeverity::Critical)) {
+                    severityFilter = static_cast<ReportSeverity>(*sev);
+                } else {
+                    SS_LOG_WARN(kLogCat, L"GetReports: minSeverity %d out of "
+                        L"range, applying no severity filter", *sev);
+                }
+            }
+
+            const auto rawFrom = Field<std::int64_t>(filter, "fromMs");
+            const auto rawTo   = Field<std::int64_t>(filter, "toMs");
+
+            // An INVERTED range matches nothing, and an empty page is
+            // indistinguishable from a machine that recorded nothing. Refuse
+            // the PAIR rather than honouring half of a request that cannot be
+            // what the caller meant.
+            if (rawFrom && rawTo && *rawFrom > *rawTo) {
+                SS_LOG_WARN(kLogCat, L"GetReports: inverted time range, "
+                    L"applying no time filter");
+            } else {
+                if (rawFrom && *rawFrom >= 0) sinceMs = *rawFrom;
+                if (rawTo   && *rawTo   >= 0) untilMs = *rawTo;
+            }
         }
 
         SS_LOG_INFO(kLogCat, L"GetReports offset=%zu limit=%zu clientId=%llu",
@@ -1567,7 +1622,10 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
 
         ReportQuery q;
         q.max_entries = HomeReportsStore::kMaxEntries;
-        if (kindFilter) q.kind = kindFilter;
+        if (kindFilter)     q.kind          = kindFilter;
+        if (severityFilter) q.min_severity  = severityFilter;
+        if (sinceMs)        q.since_unix_ms = sinceMs;
+        if (untilMs)        q.until_unix_ms = untilMs;
 
         const auto all    = HomeReportsStore::Instance().Query(q);
         const std::size_t total   = all.size();

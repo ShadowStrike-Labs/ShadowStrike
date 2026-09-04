@@ -98,6 +98,20 @@ struct ReportQuery {
     std::optional<ReportKind>     kind;
     std::optional<ReportSeverity> min_severity;
     std::optional<std::uint64_t>  since_id;      ///< Returns entries with id > since_id.
+
+    /// Inclusive time bounds, in the SAME unit as ReportEntry::timestamp_unix_ms.
+    ///
+    /// The unit is in the field NAME on purpose. A time or length field whose
+    /// unit lives only in a comment is how two producers come to disagree -
+    /// FILE_SCAN_REQUEST::PathLength was written in bytes by one builder and
+    /// characters by another, and every path from the rename route arrived at
+    /// half its length for as long as that went unnoticed.
+    ///
+    /// Both bounds are INCLUSIVE: a range a user picks as "today" must contain
+    /// the events at both of its edges.
+    std::optional<std::int64_t>   since_unix_ms;
+    std::optional<std::int64_t>   until_unix_ms;
+
     std::size_t                   max_entries = 256;
 };
 

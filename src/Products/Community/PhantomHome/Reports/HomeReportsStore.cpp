@@ -127,6 +127,13 @@ std::vector<ReportEntry> HomeReportsStore::Query(const ReportQuery& q) const {
                 static_cast<std::uint32_t>(it->severity) <
                 static_cast<std::uint32_t>(*q.min_severity))        continue;
             if (q.since_id     && it->id <= *q.since_id)            continue;
+
+            // Inclusive on both ends - see the field declaration for why.
+            if (q.since_unix_ms &&
+                it->timestamp_unix_ms < *q.since_unix_ms)            continue;
+            if (q.until_unix_ms &&
+                it->timestamp_unix_ms > *q.until_unix_ms)            continue;
+
             out.push_back(*it);
             if (out.size() >= cap) break;
         }

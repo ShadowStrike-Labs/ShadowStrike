@@ -96,6 +96,12 @@ HOME_REPORTS_STORE_CPP_PATH = (
 )
 ALERT_SYSTEM_CPP_PATH = ROOT / "src/PhantomCore/Communication/AlertSystem.cpp"
 ALERT_SYSTEM_HPP_PATH = ROOT / "src/PhantomCore/Communication/AlertSystem.hpp"
+REPORTS_MODEL_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/UI/Client/ViewModels/ReportsModel.cpp"
+)
+REPORTS_SUBROUTE_QML_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/UI/Client/qml/Pages/ReportsSubroute.qml"
+)
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
@@ -17462,6 +17468,143 @@ class AlertBridgeContractTests(unittest.TestCase):
                           body),
                 "AlertType::%s is mapped to a concrete ReportKind it does not "
                 "match" % t)
+
+
+
+class ReportsFilterPipelineContractTests(unittest.TestCase):
+    """A filter is only real when the producer and the consumer both exist.
+
+    ReportsModel::buildFilter had always serialised a time range and the service
+    read neither key, so the range was discarded on every request. It stayed
+    invisible because the QML passed a null datetime at both call sites, so the
+    keys never reached the wire at all. ReportQuery::min_severity was worse - the
+    store honoured it and nothing anywhere set it.
+
+    Same one-sided-graph shape as the reports store itself before it had a
+    writer, and as the whitelist stores that answer no query.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = strip_c_comments(read_source(REPORTS_MODEL_CPP_PATH))
+        cls.disp  = strip_c_comments(read_source(HOME_IPC_DISPATCHER_CPP_PATH))
+        cls.store = strip_c_comments(read_source(HOME_REPORTS_STORE_CPP_PATH))
+        cls.hpp   = strip_c_comments(read_source(HOME_REPORTS_STORE_HPP_PATH))
+        cls.qml   = read_source(REPORTS_SUBROUTE_QML_PATH)
+
+    def _build_filter(self):
+        k = self.model.index("QJsonObject buildFilter() const")
+        brace = self.model.index("{", k)
+        return self.model[k:_matching_delimiter(self.model, brace, "{", "}") + 1]
+
+    def _get_reports_parse(self):
+        """The GetReports filter-parse region, bounded by two asserted anchors."""
+        k = self.disp.index("std::optional<ReportKind>")
+        end = self.disp.index("HomeReportsStore::Instance().Query(q)", k)
+        return self.disp[k:end]
+
+    def test_every_filter_key_the_model_sends_is_read_by_the_service(self):
+        # DERIVED FROM THE PRODUCER, CHECKED AGAINST THE CONSUMER. The subject
+        # list is not written here - it is read out of buildFilter - so adding a
+        # key the service ignores fails this arm without anyone remembering to
+        # extend it. That is the defect this whole change removes.
+        body = self._build_filter()
+        keys = sorted(set(re.findall(r'f\[QLatin1String\("(\w+)"\)\]', body)))
+        self.assertGreaterEqual(
+            len(keys), 4,
+            "derived only %s from buildFilter - the extraction pattern no longer "
+            "matches how the payload is built" % keys)
+
+        parse = self._get_reports_parse()
+        unread = [k for k in keys if ('"%s"' % k) not in parse]
+        self.assertEqual(
+            unread, [],
+            "the model sends filter key(s) %s that the GetReports handler never "
+            "reads, so they are built on every request and discarded on arrival"
+            % unread)
+
+    def test_the_store_honours_the_time_bounds_it_is_given(self):
+        # A key parsed into a field the store ignores would look like a fix and
+        # change nothing, so the consumer chain is pinned all the way down.
+        for field in ("since_unix_ms", "until_unix_ms"):
+            self.assertGreater(
+                self.hpp.count(field), 0,
+                "ReportQuery has no %s, so a time range cannot be expressed" % field)
+
+        k = self.store.index("HomeReportsStore::Query(")
+        brace = self.store.index("{", k)
+        body = self.store[k:_matching_delimiter(self.store, brace, "{", "}") + 1]
+        for field in ("since_unix_ms", "until_unix_ms"):
+            self.assertIn(
+                "q.%s" % field, body,
+                "Query does not filter on %s, so the bound is accepted and "
+                "ignored" % field)
+        self.assertIn(
+            "timestamp_unix_ms", body,
+            "Query compares the bounds against something other than the entry "
+            "timestamp")
+
+    def test_the_time_bound_carries_its_unit_in_its_name(self):
+        # FILE_SCAN_REQUEST::PathLength was documented as a character count and
+        # written in bytes by one of its two producers, and every path from the
+        # rename route arrived at half length. A unit that lives only in a
+        # comment is how two sides come to disagree.
+        body = self._build_filter()
+        self.assertIn("fromMs", body)
+        self.assertIn("toMs", body)
+        self.assertNotIn(
+            "Qt::ISODate", body,
+            "the range is being sent as a formatted date again, which needs a "
+            "parser on the service side and carries no zone offset for it to read")
+
+    def test_a_rejected_filter_shows_more_rather_than_hiding_rows(self):
+        # THE DIRECTION IS THE POINT. This is a read-only view, so the failure
+        # that matters is concealing a report. Clamping an out-of-range severity
+        # up to Critical would hide everything below it and look exactly like a
+        # quiet machine.
+        parse = self._get_reports_parse()
+
+        sev_at = parse.index('"minSeverity"')
+        sev_region = parse[sev_at:]
+        self.assertIn(
+            "ReportSeverity::Critical", sev_region,
+            "the severity bound is no longer range-checked against the enum")
+        self.assertFalse(
+            re.search(r"std::(?:min|max|clamp)\s*\(", sev_region),
+            "an out-of-range severity is clamped rather than refused, so rows "
+            "below the clamped floor are silently hidden")
+
+        self.assertIn(
+            "rawFrom > *rawTo", parse,
+            "an inverted time range is no longer detected, and it matches "
+            "nothing - an empty page reads as a machine that recorded nothing")
+
+    def test_the_page_derives_its_request_instead_of_restating_defaults(self):
+        # Two call sites previously passed the range as a hardcoded null, which
+        # is what kept the missing consumer invisible from both ends.
+        self.assertEqual(
+            self.qml.count("setFilter(_categoryKeys[_categoryIndex], null, null)"), 0,
+            "the page still passes a hardcoded null range")
+        self.assertEqual(
+            self.qml.count('setFilter("", null, null)'), 0,
+            "the initial load restates the defaults as literals instead of "
+            "going through the one derivation the controls also use")
+        self.assertGreater(
+            self.qml.count("_applyFilter"), 0,
+            "the shared filter derivation is gone")
+        self.assertGreater(
+            self.qml.count("_severityKeys[_severityIndex]"), 0,
+            "the severity control is no longer wired into the request")
+
+        # ONLY A LOWER BOUND. A preset means "the last N hours" and its upper
+        # edge keeps moving, so pinning one would exclude everything that
+        # arrived after the filter was applied.
+        m = re.search(r"setFilter\(_categoryKeys\[_categoryIndex\],\s*"
+                      r"fromDate,\s*null,", self.qml)
+        self.assertIsNotNone(
+            m,
+            "the request no longer sends a computed lower bound with an open "
+            "upper bound")
 
 
 if __name__ == "__main__":
