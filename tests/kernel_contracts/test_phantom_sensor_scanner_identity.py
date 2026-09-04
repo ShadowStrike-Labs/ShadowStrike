@@ -134,6 +134,9 @@ MEMORY_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.hpp"
 MEMORY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/MemoryProtection.cpp"
 )
+MEMORY_PROTECTION_HPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/MemoryProtection.hpp"
+)
 MEMORY_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.cpp"
 SIGNATURE_FORMAT_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/SignatureFormat.cpp"
 METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
@@ -17866,6 +17869,178 @@ class NavigationReachabilityContractTests(unittest.TestCase):
             "selectedIndex falls back to the first entry, which lights Main "
             "for every page that has no entry of its own")
 
+
+
+
+class ProcessMitigationVerificationContractTests(unittest.TestCase):
+    """A mitigation this module cannot supply must not disable the rest of it.
+
+    MemoryProtection::Initialize verified DEP, ASLR and CFG and returned false
+    if any was absent. All three are decided by how the binary was LINKED and by
+    system policy: enableASLRInternal and enableCFGInternal only call
+    GetProcessMitigationPolicy, and there is no API that adds CFG to a process
+    that was not built with /guard:cf.
+
+    So refusing to initialize did not enable anything. What it did was leave the
+    secure allocator, the W^X policy, guard pages, anti-dump and code-integrity
+    monitoring uninitialised - STRICTLY LESS protection than continuing. That is
+    the same inversion 1d2e8b70 removed from the DEP path, one gate further
+    down, and the 1.0.108 field log shows it firing on CFG:
+        MemoryProtection.cpp  CFG is not enabled
+        MemoryProtection.cpp  Failed to verify CFG during initialization
+        AntivirusService.cpp  Failed to initialize MemoryProtection
+
+    THE GUARD'S HARDEST JOB IS ANTI-VACUITY. Deleting the three checks outright
+    would also delete the fatal returns and would look like a fix, so every arm
+    below requires the verification to still HAPPEN and still be REPORTED - only
+    its consequence changes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = read_source(MEMORY_PROTECTION_CPP_PATH)
+        cls.cpp = strip_c_comments(cls.raw)
+        cls.hpp = strip_c_comments(read_source(MEMORY_PROTECTION_HPP_PATH))
+        # Initialize() is bounded by two anchors verified to occur once each,
+        # rather than by a line window: the explanatory block added with this
+        # change is long, and a fixed window would slide off the end of it.
+        start = cls.cpp.index("bool Initialize(const MemoryProtectionConfiguration& config)")
+        end = cls.cpp.index("void Shutdown(std::string_view authorizationToken)")
+        cls.init = cls.cpp[start:end]
+
+    def _gate(self, mitigation):
+        """The body of one `if (config.enableX && !enableXInternal())` block."""
+        needle = "config.enable%s && !enable%sInternal()" % (mitigation, mitigation)
+        # Boolean form, not assertIn: the haystack is the whole Initialize body
+        # and dumping it buries the one fact that matters.
+        self.assertTrue(
+            needle in self.init,
+            "Initialize no longer verifies %s at all; the fix is to change what "
+            "an absent mitigation COSTS, not to stop looking for it" % mitigation)
+        at = self.init.index(needle)
+        brace = self.init.index("{", at)
+        return self.init[brace:_matching_delimiter(self.init, brace, "{", "}") + 1]
+
+    def test_all_three_mitigations_are_still_verified(self):
+        # ANTI-VACUITY, stated first because it is what stops the lazy fix.
+        # Boolean forms: the haystack is the whole Initialize body.
+        for mitigation, fn in (("DEP", "enableDEPInternal"),
+                               ("ASLR", "enableASLRInternal"),
+                               ("CFG", "enableCFGInternal")):
+            self.assertTrue(
+                ("config.enable" + mitigation) in self.init,
+                "%s is no longer consulted in Initialize" % mitigation)
+            self.assertTrue(
+                (fn + "()") in self.init,
+                "%s is no longer called, so the mitigation is not verified at "
+                "all - which is worse than verifying it and continuing" % fn)
+
+    def test_an_absent_mitigation_does_not_abort_initialization(self):
+        for mitigation in ("DEP", "ASLR", "CFG"):
+            body = self._gate(mitigation)
+            self.assertEqual(
+                len(re.findall(r"return\s+false", body)), 0,
+                "the %s gate still aborts Initialize. Refusing to start cannot "
+                "supply the mitigation; it only leaves the secure allocator, "
+                "W^X, guard pages, anti-dump and code-integrity monitoring "
+                "uninitialised" % mitigation)
+            self.assertEqual(
+                len(re.findall(r"ModuleStatus::Error", body)), 0,
+                "the %s gate still parks the module in Error over a property "
+                "it cannot influence" % mitigation)
+
+    def test_an_absent_mitigation_is_reported_and_counted(self):
+        # NOT SILENT. A missing compile-time mitigation is a real hardening gap
+        # and has to be loud even though it is not fatal.
+        for mitigation in ("DEP", "ASLR", "CFG"):
+            body = self._gate(mitigation)
+            self.assertTrue(
+                "SS_LOG_ERROR" in body,
+                "the %s gate no longer reports the absent mitigation at ERROR, "
+                "so a build shipping without it looks healthy" % mitigation)
+            self.assertTrue(
+                re.search(r"\+\+\s*mitigationsMissing", body),
+                "the %s gate does not count itself, so the status below cannot "
+                "tell how many mitigations are missing" % mitigation)
+
+    def test_the_module_reports_degraded_rather_than_running(self):
+        # Claiming Running with a mitigation absent would overstate the
+        # hardening posture, which is the over-claimed-outcome defect class.
+        self.assertTrue(
+            re.search(r"mitigationsMissing\s*==\s*0\s*\)\s*\?\s*ModuleStatus::Running",
+                      self.init),
+            "the status is no longer derived from the count, so it cannot "
+            "distinguish a fully hardened process from a degraded one")
+        self.assertIn(
+            "ModuleStatus::Degraded", self.init,
+            "Degraded is never reported; SecurityEnums.hpp defines it as "
+            "'running with reduced functionality', which is exactly this state")
+        self.assertEqual(
+            len(re.findall(r"m_status\s*=\s*ModuleStatus::Running\s*;", self.init)), 0,
+            "an unconditional Running assignment is back, so the degraded case "
+            "would report full hardening")
+
+    def test_a_failed_query_is_distinguished_from_a_disabled_mitigation(self):
+        # THE DEP LESSON, applied to its two siblings: folding "could not ask"
+        # into "measured absent" is what let the strongest possible DEP state be
+        # reported as a failure.
+        for fn in ("enableASLRInternal", "enableCFGInternal"):
+            at = self.cpp.index("bool " + fn + "() noexcept")
+            brace = self.cpp.index("{", at)
+            body = self.cpp[brace:_matching_delimiter(self.cpp, brace, "{", "}") + 1]
+            # Boolean forms throughout: the haystack is a whole function body.
+            self.assertTrue(
+                "GetProcessMitigationPolicy" in body,
+                "%s no longer queries the OS" % fn)
+            self.assertTrue(
+                "SS_LOG_ERROR" in body,
+                "%s returns false for an unanswerable query without saying so, "
+                "so a failed query is indistinguishable from the mitigation "
+                "being off" % fn)
+            self.assertTrue(
+                "GetLastError" in body,
+                "%s does not report WHY the query failed" % fn)
+            self.assertTrue(
+                "SS_LOG_WARN" in body,
+                "%s no longer distinguishes the mitigation being genuinely off "
+                "from the query failing" % fn)
+
+    def test_the_counter_survives_copy_reset_and_serialisation(self):
+        # MemoryProtectionStatistics HAND-WRITES its copy constructor and
+        # assignment operator, and GetStatistics() returns by value - so a
+        # member added to the declaration alone is dropped on every copy and
+        # reads as a permanent zero.
+        self.assertEqual(
+            len(re.findall(r"std::atomic<uint64_t>\s+mitigationsUnavailable",
+                           self.hpp)), 1,
+            "the counter is not declared exactly once in the statistics struct")
+        loads = re.findall(
+            r"mitigationsUnavailable\.store\(\s*other\.mitigationsUnavailable",
+            self.cpp)
+        self.assertEqual(
+            len(loads), 2,
+            "expected the counter to be carried by BOTH the copy constructor "
+            "and the assignment operator, found %d - GetStatistics returns by "
+            "value, so a dropped member is a structural zero" % len(loads))
+        self.assertTrue(
+            re.search(r"mitigationsUnavailable\s*=\s*0\s*;", self.cpp),
+            "Reset() does not clear the counter, so a stale value would keep "
+            "the module reporting Degraded after the mitigation was supplied")
+        # ToJson is SLICED rather than searched file-wide, for two reasons: the
+        # key is escaped in the source (\"mitigationsUnavailable\") so a naive
+        # containment test for the quoted name cannot match, and asserting
+        # against a 100 KB translation unit dumps the whole file into the
+        # failure output.
+        at = self.cpp.index("std::string MemoryProtectionStatistics::ToJson()")
+        brace = self.cpp.index("{", at)
+        tojson = self.cpp[brace:_matching_delimiter(self.cpp, brace, "{", "}") + 1]
+        self.assertTrue(
+            "mitigationsUnavailable" in tojson,
+            "the counter is absent from MemoryProtectionStatistics::ToJson, so "
+            "nothing outside the process can observe the degraded reason")
+        self.assertTrue(
+            re.search(r"m_stats\.mitigationsUnavailable\.fetch_add", self.init),
+            "Initialize never records the count, so the counter has no producer")
 
 
 

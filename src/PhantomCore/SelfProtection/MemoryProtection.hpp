@@ -782,6 +782,17 @@ struct MemoryProtectionStatistics {
     
     /// @brief Scan attempts detected
     std::atomic<uint64_t> scanAttemptsDetected{0};
+
+    /// @brief Requested process mitigations that could not be verified.
+    ///
+    /// DEP, ASLR and CFG are properties of how this binary was linked and of
+    /// system policy; this module can only ask the OS what they are. A non-zero
+    /// value means the configuration requested a mitigation the running image
+    /// does not carry, which is a BUILD defect rather than a runtime fault -
+    /// and it is why GetStatus() reports Degraded instead of Running. Kept as a
+    /// count rather than a bool so the number and the status cannot disagree
+    /// about how many are missing; the per-mitigation accessors say which.
+    std::atomic<uint64_t> mitigationsUnavailable{0};
     
     /// @brief Start time
     TimePoint startTime = Clock::now();

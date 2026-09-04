@@ -367,6 +367,7 @@ MemoryProtectionStatistics::MemoryProtectionStatistics(const MemoryProtectionSta
     hooksDetected.store(other.hooksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
     dumpAttemptsBlocked.store(other.dumpAttemptsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
     scanAttemptsDetected.store(other.scanAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    mitigationsUnavailable.store(other.mitigationsUnavailable.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
 MemoryProtectionStatistics& MemoryProtectionStatistics::operator=(
@@ -383,6 +384,7 @@ MemoryProtectionStatistics& MemoryProtectionStatistics::operator=(
         hooksDetected.store(other.hooksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
         dumpAttemptsBlocked.store(other.dumpAttemptsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
         scanAttemptsDetected.store(other.scanAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        mitigationsUnavailable.store(other.mitigationsUnavailable.load(std::memory_order_relaxed), std::memory_order_relaxed);
         startTime = other.startTime;
         lastEventTime = other.lastEventTime;
     }
@@ -401,6 +403,11 @@ void MemoryProtectionStatistics::Reset() noexcept {
     hooksDetected = 0;
     dumpAttemptsBlocked = 0;
     scanAttemptsDetected = 0;
+    // Deliberately reset with the rest: a stale count here would keep the
+    // module reporting Degraded after a reconfigure that supplied the
+    // mitigation, and a counter whose baseline is not reset with the counter
+    // it measures is a defect this codebase has already paid for twice.
+    mitigationsUnavailable = 0;
     startTime = Clock::now();
 }
 
@@ -417,7 +424,8 @@ std::string MemoryProtectionStatistics::ToJson() const {
     oss << "\"stackOverflowsDetected\":" << stackOverflowsDetected.load() << ",";
     oss << "\"hooksDetected\":" << hooksDetected.load() << ",";
     oss << "\"dumpAttemptsBlocked\":" << dumpAttemptsBlocked.load() << ",";
-    oss << "\"scanAttemptsDetected\":" << scanAttemptsDetected.load();
+    oss << "\"scanAttemptsDetected\":" << scanAttemptsDetected.load() << ",";
+    oss << "\"mitigationsUnavailable\":" << mitigationsUnavailable.load();
     oss << "}";
     return oss.str();
 }
@@ -533,23 +541,78 @@ public:
 
             m_config = config;
 
-            // Apply process hardening based on configuration
+            //
+            // PROCESS MITIGATIONS ARE VERIFIED, NOT ESTABLISHED - AND THAT IS
+            // WHY THEY MUST NOT BE FATAL HERE.
+            //
+            // DEP, ASLR and CFG are decided by how this binary was LINKED and
+            // by system policy, before a single line of this module runs.
+            // enableASLRInternal and enableCFGInternal only call
+            // GetProcessMitigationPolicy; they have no way to turn a mitigation
+            // on. enableDEPInternal can act, but only in the narrow case of a
+            // process whose system DEP policy is OptIn or OptOut.
+            //
+            // So consider what refusing to initialize actually accomplishes
+            // when one of them is absent. It does not enable the mitigation.
+            // What it does is return false from Initialize, which leaves the
+            // secure allocator, the W^X policy, guard pages, anti-dump and
+            // code-integrity monitoring uninitialised. FAILING CLOSED HERE
+            // PRODUCES STRICTLY LESS PROTECTION THAN CONTINUING, which makes it
+            // the same inversion 1d2e8b70 removed from the DEP path: the
+            // strongest available state was being reported as a failure, and
+            // the report cost five unrelated subsystems.
+            //
+            // FIELD-PROVEN, 1.0.108: DEP verified enabled and permanent, ASLR
+            // verified enabled, CFG reported off because no project in this
+            // repository passes /guard:cf - so
+            //     "Failed to verify CFG during initialization"
+            //     "Failed to initialize MemoryProtection"
+            // and every stage below this point never ran. The CFG gap is real
+            // and is tracked as build work; what is fixed here is a module
+            // disabling itself over a property it cannot influence.
+            //
+            // NOT SILENT, AND NOT FORGIVEN. Each absent mitigation is reported
+            // at ERROR naming the cause, counted in mitigationsUnavailable, and
+            // leaves the module in ModuleStatus::Degraded rather than Running -
+            // "running with reduced functionality", which is exactly the state.
+            // The per-mitigation accessors (IsDEPEnabled / IsASLREnabled /
+            // IsCFGEnabled) keep reporting the truth, so nothing downstream is
+            // told a mitigation is present when it is not.
+            //
+            uint32_t mitigationsMissing = 0;
+
             if (config.enableDEP && !enableDEPInternal()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to enable DEP during initialization");
-                m_status = ModuleStatus::Error;
-                return false;
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"DEP could not be verified or enabled for this process; "
+                    L"continuing with reduced hardening. Data Execution "
+                    L"Prevention is a system and image property - this module "
+                    L"cannot supply it, and refusing to start would only "
+                    L"remove the protections below.");
+                ++mitigationsMissing;
             }
 
             if (config.enableASLR && !enableASLRInternal()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to verify ASLR during initialization");
-                m_status = ModuleStatus::Error;
-                return false;
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"ASLR could not be verified for this process; continuing "
+                    L"with reduced hardening. ASLR comes from linking with "
+                    L"/DYNAMICBASE, so an absent one is a BUILD defect to fix "
+                    L"in the project, not a runtime condition to recover from.");
+                ++mitigationsMissing;
             }
 
             if (config.enableCFG && !enableCFGInternal()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to verify CFG during initialization");
-                m_status = ModuleStatus::Error;
-                return false;
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"Control Flow Guard could not be verified for this "
+                    L"process; continuing with reduced hardening. CFG comes "
+                    L"from compiling and linking with /guard:cf, so an absent "
+                    L"one is a BUILD defect to fix in the project, not a "
+                    L"runtime condition to recover from.");
+                ++mitigationsMissing;
+            }
+
+            if (mitigationsMissing != 0) {
+                m_stats.mitigationsUnavailable.fetch_add(
+                    mitigationsMissing, std::memory_order_relaxed);
             }
 
             // Initialize secure heap if enabled
@@ -576,10 +639,28 @@ public:
             }
 
             m_initialized = true;
-            m_status = ModuleStatus::Running;
+            // DEGRADED IS A MEASUREMENT, NOT A HEDGE. Every stage above ran,
+            // so the module is genuinely working - but a mitigation the
+            // configuration asked for is absent, and reporting Running would
+            // claim a hardening posture this process does not have. The
+            // dashboard's own sensor count is downstream of this, so an
+            // over-stated status here becomes an over-stated health figure
+            // there.
+            m_status = (mitigationsMissing == 0) ? ModuleStatus::Running
+                                                 : ModuleStatus::Degraded;
             m_stats.startTime = Clock::now();
 
-            SS_LOG_INFO(LOG_CATEGORY, L"MemoryProtection initialized successfully");
+            if (mitigationsMissing == 0) {
+                SS_LOG_INFO(LOG_CATEGORY, L"MemoryProtection initialized successfully");
+            } else {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"MemoryProtection initialized DEGRADED: %u requested "
+                    L"process mitigation(s) are absent from this build. Region "
+                    L"protection, the secure allocator, anti-dump and code "
+                    L"integrity monitoring are active; see the errors above for "
+                    L"which mitigation is missing.",
+                    mitigationsMissing);
+            }
             return true;
 
         } catch (const std::exception& ex) {
@@ -2186,8 +2267,12 @@ private:
     }
 
     [[nodiscard]] bool enableASLRInternal() noexcept {
-        // ASLR is typically enabled at compile time via /DYNAMICBASE
-        // Here we verify it's enabled
+        // NAMED "enable", BUT IT ONLY VERIFIES. ASLR comes from linking with
+        // /DYNAMICBASE and from system policy; there is no runtime call that
+        // turns it on for the current process. The name is kept because it is
+        // part of the private symmetry with enableDEPInternal and
+        // enableCFGInternal, and the caller now treats all three as
+        // verifications rather than as actions.
 
         PROCESS_MITIGATION_ASLR_POLICY aslrPolicy = {};
 
@@ -2198,20 +2283,54 @@ private:
                             aslrPolicy.EnableHighEntropy);
 
             if (m_aslrEnabled) {
-                SS_LOG_INFO(LOG_CATEGORY, L"ASLR is enabled");
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"ASLR is enabled (bottom-up: %hs, high entropy: %hs, "
+                    L"force relocate images: %hs)",
+                    aslrPolicy.EnableBottomUpRandomization ? "yes" : "no",
+                    aslrPolicy.EnableHighEntropy ? "yes" : "no",
+                    aslrPolicy.EnableForceRelocateImages ? "yes" : "no");
             } else {
-                SS_LOG_WARN(LOG_CATEGORY, L"ASLR is not enabled");
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"ASLR is not enabled for this process; the image was "
+                    L"probably linked without /DYNAMICBASE");
             }
 
             return m_aslrEnabled;
         }
 
+        // THE QUERY FAILING IS NOT THE SAME AS ASLR BEING OFF, and folding the
+        // two together is what made the DEP path report the strongest possible
+        // state as a failure. m_aslrEnabled stays false because nothing was
+        // established - not because anything was measured as absent.
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Could not query the process ASLR policy: %lu", GetLastError());
         return false;
     }
 
     [[nodiscard]] bool enableCFGInternal() noexcept {
-        // CFG is typically enabled at compile time via /guard:cf
-        // Here we verify it's enabled
+        // VERIFICATION ONLY, AND UNLIKE DEP THERE IS NO FALLBACK TO TRY.
+        //
+        // Control Flow Guard is instrumented by the COMPILER (/guard:cf emits a
+        // check before every indirect call) and tabulated by the LINKER (the
+        // guard CF function table of valid indirect-call targets). Both happen
+        // at build time. There is no SetProcessMitigationPolicy path that can
+        // add CFG to a running process that was not built for it - and there
+        // could not be, because the check instructions and the target table
+        // would both be missing.
+        //
+        // So when this reports disabled, the honest conclusion is that the
+        // project did not ask for /guard:cf. MEASURED across all 13 .vcxproj in
+        // this repository: zero declare ControlFlowGuard and zero pass
+        // /guard:cf, so this currently reports disabled on every shipped
+        // binary. That is a genuine hardening gap and it is tracked as build
+        // work; enabling it is not a one-line project edit, because this
+        // codebase has two measured CFG incompatibilities that must be handled
+        // in the same change - an indirect call through a table of MASM-defined
+        // functions in PackerDetector, and a JIT that calls into a
+        // VirtualAlloc'd buffer which can never appear in a guard table.
+        //
+        // What this function must NOT do is report the gap in a way that
+        // disables unrelated protections. See the caller.
 
         PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfgPolicy = {};
 
@@ -2221,14 +2340,23 @@ private:
             m_cfgEnabled = cfgPolicy.EnableControlFlowGuard != 0;
 
             if (m_cfgEnabled) {
-                SS_LOG_INFO(LOG_CATEGORY, L"CFG is enabled");
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"CFG is enabled (strict mode: %hs)",
+                    cfgPolicy.StrictMode ? "yes" : "no");
             } else {
-                SS_LOG_WARN(LOG_CATEGORY, L"CFG is not enabled");
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"CFG is not enabled for this process; the image was not "
+                    L"compiled and linked with /guard:cf");
             }
 
             return m_cfgEnabled;
         }
 
+        // Same distinction as ASLR above: an unanswerable query is reported as
+        // such rather than as a measured absence.
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Could not query the process Control Flow Guard policy: %lu",
+            GetLastError());
         return false;
     }
 
