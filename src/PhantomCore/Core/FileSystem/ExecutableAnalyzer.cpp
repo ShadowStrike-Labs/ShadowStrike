@@ -50,6 +50,11 @@
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
+// Named explicitly rather than inherited transitively. This translation unit
+// makes eleven Utils::FileUtils calls, so it owns that dependency; a file that
+// compiles only because some other header happens to pull in what it uses is
+// the same hidden coupling that made the tray build order-dependent.
+#include "../../Utils/FileUtils.hpp"
 
 // Windows includes for PE parsing
 #include <Windows.h>
@@ -638,8 +643,23 @@ public:
             std::vector<std::byte> fileBytes;
             Utils::FileUtils::Error fileErr;
             if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes, &fileErr)) {
-                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to read file: %hs",
-                    fileErr.message.c_str());
+                if (Utils::FileUtils::IsFileLockedError(fileErr.win32)) {
+                    // SAME PLATFORM CONDITION, 1,703 of the 1.0.109 log's 16,348
+                    // ERROR records. This analyzer runs on the on-access path, so it
+                    // is handed every write to the ESE transaction logs the BITS
+                    // downloader, the WebCache and Windows Update hold open
+                    // exclusively, and it can never read any of them.
+                    //
+                    // The file is still not analysed, invalidFiles is still
+                    // incremented and the empty info is still returned. Only the
+                    // severity of the per-file record changes.
+                    SS_LOG_DEBUG(L"ExecutableAnalyzer",
+                        L"Not examined - held open by another process (win32=%lu): %ls",
+                        static_cast<unsigned long>(fileErr.win32), filePath.c_str());
+                } else {
+                    SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to read file: %hs",
+                        fileErr.message.c_str());
+                }
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }

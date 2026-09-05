@@ -3966,9 +3966,32 @@ public:
             SS_DIAG_SCOPE("OnAccess", "PackerDetector::AnalyzeFile");
             auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr);
             if (pdErr.win32Code != 0) {
-                Utils::Logger::Warn(
-                    "RealTimeProtection: PackerDetector analysis failed for {}  -  error={} {}",
-                    Utils::StringUtils::ToNarrow(filePath.substr(0, 120)), pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
+                if (Utils::FileUtils::IsFileLockedError(pdErr.win32Code)) {
+                    // THE SAME PLATFORM CONDITION, REPORTED A THIRD WAY. In the
+                    // 1.0.109 log this line produced 598 WARN records for one file
+                    // alone, and 1,685 across the three ESE transaction logs that
+                    // the BITS downloader, the WebCache and Windows Update hold
+                    // open exclusively.
+                    //
+                    // WARN was the wrong level for the same reason ERROR was wrong
+                    // at the five sites below the analyzers: nothing is wrong with
+                    // this product when another process holds a file open, and a
+                    // per-file record on a path that repeats thousands of times
+                    // buries the records that do mean something.
+                    //
+                    // The deferral decision below is deliberately NOT changed - an
+                    // unexamined file is still requeued exactly as before, so this
+                    // is a reporting change only.
+                    SS_LOG_DEBUG(L"RealTimeProtection",
+                        L"Packer analysis skipped - held open by another process "
+                        L"(win32=%lu): %ls",
+                        static_cast<unsigned long>(pdErr.win32Code),
+                        filePath.c_str());
+                } else {
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: PackerDetector analysis failed for {}  -  error={} {}",
+                        Utils::StringUtils::ToNarrow(filePath.substr(0, 120)), pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
+                }
             }
             if (!packResult.analysisComplete || packResult.analysisTruncated) {
                 // Either the in-line budget stopped it or the file exceeded the

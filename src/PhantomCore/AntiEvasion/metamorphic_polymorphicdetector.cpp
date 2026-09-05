@@ -1784,7 +1784,22 @@ MetamorphicResult MetamorphicDetector::AnalyzeFile(
             err->message = L"Failed to map file";
             err->context = filePath;
         }
-        SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to map file: %ls (error %u)", filePath.c_str(), error);
+        if (Utils::FileUtils::IsFileLockedError(error)) {
+            // SAME PLATFORM CONDITION, 1,710 of the 1.0.109 log's 16,348 ERROR
+            // records. This detector runs on the on-access path, so it sees every
+            // write to the ESE transaction logs the BITS downloader, the WebCache
+            // and Windows Update hold open, and it can never map any of them.
+            //
+            // The result is unchanged: the error is still recorded in
+            // result.errors, analysisErrors is still incremented, and the file is
+            // still reported as un-analysed. Only the severity of the per-file
+            // record changes.
+            SS_LOG_DEBUG(L"MetamorphicDetector",
+                L"Not examined - held open by another process (win32=%u): %ls",
+                error, filePath.c_str());
+        } else {
+            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to map file: %ls (error %u)", filePath.c_str(), error);
+        }
         result.errors.push_back({ error, L"Failed to map file", filePath });
         ++m_impl->m_stats.analysisErrors;
         return result;

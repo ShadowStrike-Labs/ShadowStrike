@@ -995,7 +995,28 @@ namespace ShadowStrike {
                             : "ReadAllBytes: CreateFileW failed",
                         path);
                     // Don't log for expected errors (file not found)
-                    if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
+                    //
+                    // A FILE HELD OPEN BY ANOTHER PROCESS IS THE SAME KIND OF
+                    // EXPECTED CONDITION AS AN ABSENT ONE, and it dominates a real
+                    // run: 1,705 of the 1.0.109 log's 16,348 ERROR records came
+                    // from this line. The files are ESE transaction logs held
+                    // exclusively by the BITS downloader, the WebCache and Windows
+                    // Update; they are written constantly, so every write brings
+                    // them back through the on-access path, and the open can never
+                    // succeed while the holder runs.
+                    //
+                    // Kept as a DEBUG record rather than dropped like the
+                    // not-found case, because unlike an absent file this one exists
+                    // and was deliberately not examined, so it must remain
+                    // traceable when the level is raised. The Error object,
+                    // hasError() and the returned false are all unchanged.
+                    if (IsFileLockedError(lastError)) {
+                        SS_LOG_DEBUG(L"FileUtils",
+                            L"Not examined - held open by another process "
+                            L"(win32=%lu): %ls",
+                            static_cast<unsigned long>(lastError),
+                            longp.c_str());
+                    } else if (lastError != ERROR_FILE_NOT_FOUND && lastError != ERROR_PATH_NOT_FOUND) {
                         SS_LOG_LAST_ERROR(L"FileUtils", L"ReadAllBytes: CreateFileW failed: %s", longp.c_str());
                     }
                     return false;

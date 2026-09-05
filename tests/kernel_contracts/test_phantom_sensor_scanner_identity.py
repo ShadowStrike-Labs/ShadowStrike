@@ -146,6 +146,7 @@ MEMORY_PROTECTION_HPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/MemoryProtection.hpp"
 )
 MEMORY_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.cpp"
+HASH_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/HashUtils.cpp"
 SIGNATURE_FORMAT_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/SignatureFormat.cpp"
 METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
 PACKER_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/PackerDetector.cpp"
@@ -19040,6 +19041,196 @@ class PublisherTrustSuppressionContractTests(unittest.TestCase):
                 "SS_LOG_INFO", window,
                 "the suppression at line %d does not log at INFO, so a "
                 "withheld detection would be invisible in the field" % line)
+
+
+class LockedFileSeverityContractTests(unittest.TestCase):
+    """A file another process holds open must not be reported as a product fault.
+
+    MEASURED IN THE 1.0.109 FIELD LOG: 16,230 of 16,348 ERROR records - 99.3
+    percent - came from six sites, all reporting the same condition. Three files
+    account for almost all of it: ESE transaction logs held open exclusively by
+    the BITS downloader, the WebCache and Windows Update. They are written
+    constantly, so every write brings them back through the on-access path, and
+    the open can never succeed while the holder runs.
+
+    The consequence is not merely a large log. Our own log writes traverse our
+    own minifilter, so each record amplifies the condition it describes, and the
+    173 genuine faults in that run were unfindable among them.
+
+    WHY THIS IS A SOURCE CONTRACT RATHER THAN A BEHAVIOURAL TEST: reproducing it
+    needs a file held with dwShareMode 0 by a *different* process, on the
+    on-access path, with the driver loaded. tests/unit/locked_file_not_examined
+    covers the part that can be driven in-process (the verdict must not be
+    Clean, and the code must reach the caller). What cannot be driven is the
+    severity chosen at six separate sites in six modules, so the invariant is
+    pinned as structure instead.
+
+    THE INVARIANT AT EACH SITE: the severity of the per-file record is decided
+    by the SHARED classifier, and BOTH arms survive - the locked class is
+    demoted, and a genuine fault still reports at full severity. A site that
+    loses either arm fails here.
+    """
+
+    # (path constant, module label, the fault-path log call this site owns)
+    #
+    # The anchor is deliberately the FAULT-path message, not the demoted one:
+    # it predates this change, it is unique within its file, and anchoring on
+    # the thing that must SURVIVE means deleting the fault arm to silence a
+    # site cannot satisfy the guard.
+    SITES = (
+        (HASH_UTILS_CPP_PATH, "HashUtils",
+         'L"ComputeFile: CreateFileW failed: %ls"'),
+        (MEMORY_UTILS_CPP_PATH, "MemoryUtils",
+         'L"CreateFileW failed: %ls"'),
+        (FILE_UTILS_CPP_PATH, "FileUtils",
+         'L"ReadAllBytes: CreateFileW failed: %s"'),
+        (METAMORPHIC_DETECTOR_CPP_PATH, "MetamorphicDetector",
+         'L"Failed to map file: %ls (error %u)"'),
+        (EXECUTABLE_ANALYZER_CPP_PATH, "ExecutableAnalyzer",
+         'L"ExecutableAnalyzer::Analyze: Failed to read file: %hs"'),
+        (REAL_TIME_PROTECTION_CPP_PATH, "RealTimeProtection",
+         '"RealTimeProtection: PackerDetector analysis failed for {}  -  error={} {}"'),
+    )
+
+    # Sized against the comment-stripped source. Every block here is under 600
+    # characters once comments become whitespace; 1600 leaves headroom without
+    # being wide enough to reach an unrelated statement.
+    WINDOW = 1600
+
+    def _stripped(self, path):
+        return strip_c_comments(read_source(path))
+
+    def test_every_open_failure_site_anchors_uniquely(self):
+        """Anti-vacuity, and it must run first.
+
+        Every assertion below is scoped by these anchors. If one stopped
+        matching, or matched twice, the tests would silently examine the wrong
+        region or nothing at all - so the anchors are checked before anything
+        is concluded from them.
+        """
+        for path, label, anchor in self.SITES:
+            source = self._stripped(path)
+            count = source.count(anchor)
+            self.assertEqual(
+                1, count,
+                "%s: the fault-path anchor occurs %d times, expected exactly 1. "
+                "Every other assertion in this class is scoped by it, so a "
+                "changed or duplicated message must be reconciled here first."
+                % (label, count))
+
+    def test_every_open_failure_site_classifies_the_locked_condition(self):
+        """The demotion must be gated on the shared classifier."""
+        for path, label, anchor in self.SITES:
+            source = self._stripped(path)
+            at = source.find(anchor)
+            self.assertNotEqual(-1, at, "%s: anchor not found" % label)
+
+            window = source[max(0, at - self.WINDOW):at]
+            gate = window.rfind("IsFileLockedError(")
+            self.assertNotEqual(
+                -1, gate,
+                "%s: the open-failure site at line %d does not consult "
+                "IsFileLockedError, so a file held open by another process is "
+                "still reported at full severity there. In 1.0.109 the six "
+                "sites in this class produced 16,230 of 16,348 ERROR records."
+                % (label, source[:at].count("\n") + 1))
+
+    def test_the_demoted_record_sits_in_the_locked_arm(self):
+        """Pin WHERE the DEBUG record is, not merely that one exists.
+
+        A guard that only required SS_LOG_DEBUG somewhere in the window would be
+        satisfied by an unrelated debug line, and - worse - by an INVERTED
+        branch that demoted genuine faults and reported the routine case at
+        ERROR. Requiring the DEBUG call to fall BETWEEN the classifier and the
+        fault-path call is what distinguishes the two.
+        """
+        for path, label, anchor in self.SITES:
+            source = self._stripped(path)
+            at = source.find(anchor)
+            # A missing anchor makes `at` -1, which would turn the slice below
+            # into source[0:-1] - the whole file - and the assertion would then
+            # pass on some unrelated debug line. Refuse that explicitly.
+            self.assertNotEqual(
+                -1, at,
+                "%s: the fault-path record is gone, so there is no locked arm "
+                "to place a demoted record in relative to it" % label)
+            window = source[max(0, at - self.WINDOW):at]
+            gate = window.rfind("IsFileLockedError(")
+            self.assertNotEqual(-1, gate, "%s: no classifier in window" % label)
+
+            between = window[gate:]
+            self.assertIn(
+                "SS_LOG_DEBUG", between,
+                "%s: no demoted record appears between the classifier and the "
+                "fault-path log, so either the locked arm does not record "
+                "anything (untraceable when the level is raised) or the branch "
+                "is inverted and genuine faults are the ones being demoted."
+                % label)
+
+    def test_a_genuine_fault_still_reports_at_full_severity(self):
+        """The fault arm must survive, exactly once.
+
+        This is the anti-deletion half. Silencing a noisy site by removing its
+        ERROR path would satisfy a guard that only checked for the DEBUG record,
+        and would cost real diagnosability - a permissions defect, a failing
+        disk or an attacker denying us a file all arrive at these same lines.
+        """
+        for path, label, anchor in self.SITES:
+            source = self._stripped(path)
+            self.assertEqual(
+                1, source.count(anchor),
+                "%s: the fault-path record must survive exactly once" % label)
+
+    def test_the_classifier_is_shared_not_reimplemented(self):
+        """One definition, consulted from six places.
+
+        Six local copies of "is this code a lock?" is how the cloud-placeholder
+        classifier and this one would drift apart, and how ERROR_ACCESS_DENIED
+        would eventually be folded in at one site and not the others. The
+        numeric codes must appear only where the classifier is defined.
+        """
+        codes = ("ERROR_SHARING_VIOLATION", "ERROR_LOCK_VIOLATION",
+                 "ERROR_USER_MAPPED_FILE")
+        definition = strip_c_comments(read_source(FILE_UTILS_CPP_PATH))
+        for code in codes:
+            self.assertIn(
+                code, definition,
+                "the shared classifier no longer names %s" % code)
+
+        for path, label, _ in self.SITES:
+            if path == FILE_UTILS_CPP_PATH:
+                continue
+            source = self._stripped(path)
+            for code in codes:
+                self.assertEqual(
+                    0, source.count(code),
+                    "%s names %s directly instead of asking the shared "
+                    "classifier, so the two can disagree about what counts as "
+                    "locked" % (label, code))
+
+    def test_access_denied_is_still_excluded_from_the_locked_class(self):
+        """The most important boundary, restated where the callers are.
+
+        ERROR_ACCESS_DENIED can mean a real permissions defect, a DACL we should
+        have been able to traverse, or an attacker deliberately denying us a
+        file. Folding it into this class would demote all three to DEBUG at six
+        sites at once. The unit suite pins the classifier's own answer; this
+        pins that no caller has quietly re-added it alongside.
+        """
+        body = extract_c_function(
+            strip_c_comments(read_source(FILE_UTILS_CPP_PATH)),
+            "IsFileLockedError")
+        # Counted rather than asserted with assertNotIn: that dumps the whole
+        # function body on failure (measured at 1,292 characters), which buries
+        # the one fact the reader needs.
+        hits = body.count("ERROR_ACCESS_DENIED")
+        self.assertEqual(
+            0, hits,
+            "IsFileLockedError names ERROR_ACCESS_DENIED %d time(s). That code "
+            "can mean a real permissions defect, a DACL we should have been "
+            "able to traverse, or an attacker deliberately denying us a file - "
+            "accepting it would demote all three to a routine DEBUG record at "
+            "all six calling sites at once." % hits)
 
 
 if __name__ == "__main__":

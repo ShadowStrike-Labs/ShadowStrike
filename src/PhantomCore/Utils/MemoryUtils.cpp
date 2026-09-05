@@ -757,7 +757,27 @@ namespace ShadowStrike {
 					// Capture BEFORE logging. SS_LOG_LAST_ERROR reads and then resets the
 					// thread's last error, which is what left every caller reading zero.
 					outErr = ::GetLastError();
-					SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileW failed: %ls", path.c_str());
+
+					if (Utils::FileUtils::IsFileLockedError(outErr)) {
+						// SAME PLATFORM CONDITION, SECOND-LARGEST PRODUCER: 3,442 of
+						// the 1.0.109 log's 16,348 ERROR records came from this line.
+						// A file another process holds open cannot be mapped, and no
+						// number of retries changes that while the holder runs.
+						//
+						// The caller is unaffected: outErr still carries the code and
+						// false is still returned, so a mapping failure remains a
+						// mapping failure. Only the severity of the per-file record
+						// changes, because a per-file ERROR here hides real faults
+						// and, since our log writes traverse our own minifilter,
+						// amplifies the very condition it reports.
+						SS_LOG_DEBUG(L"MemoryUtils",
+							L"Not examined - held open by another process "
+							L"(win32=%lu): %ls",
+							static_cast<unsigned long>(outErr),
+							path.c_str());
+					} else {
+						SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileW failed: %ls", path.c_str());
+					}
 					return false;
 				}
 

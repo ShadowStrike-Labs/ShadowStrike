@@ -1127,8 +1127,41 @@ namespace ShadowStrike {
 				                       openFlags,
 				                       nullptr);
 				if (h == INVALID_HANDLE_VALUE) {
-					if (err) err->win32 = GetLastError();
-					SS_LOG_LAST_ERROR(L"HashUtils", L"ComputeFile: CreateFileW failed: %ls", pathStr.c_str());
+					// CAPTURE THE CODE UNCONDITIONALLY. The previous form read
+					// GetLastError() only when the caller supplied an Error
+					// object, so with err == nullptr the code was discarded and
+					// nothing could be decided from it. A local also removes any
+					// dependence on what the logging macro does to the thread's
+					// last error.
+					const DWORD lastError = ::GetLastError();
+					if (err) err->win32 = lastError;
+
+					if (Utils::FileUtils::IsFileLockedError(lastError)) {
+						// A FILE HELD OPEN BY ANOTHER PROCESS IS A PLATFORM
+						// CONDITION, NOT A FAULT IN THIS PRODUCT.
+						//
+						// This site was the largest single ERROR producer in the
+						// 1.0.109 field log - 3,835 of 16,348 records. The files
+						// responsible are ESE transaction logs held open
+						// exclusively by the BITS downloader, the WebCache and
+						// Windows Update for as long as those services run, and
+						// they are written constantly, so every write brings them
+						// back here.
+						//
+						// Reporting that at ERROR is worse than noisy: our own log
+						// writes traverse our own minifilter, so the record
+						// amplifies the condition it describes, and it buries the
+						// faults an operator needs to see. Nothing else changes -
+						// the file is still not hashed and false is still
+						// returned. Only the severity of the per-file record.
+						SS_LOG_DEBUG(L"HashUtils",
+							L"Not examined - held open by another process "
+							L"(win32=%lu): %ls",
+							static_cast<unsigned long>(lastError),
+							pathStr.c_str());
+					} else {
+						SS_LOG_LAST_ERROR(L"HashUtils", L"ComputeFile: CreateFileW failed: %ls", pathStr.c_str());
+					}
 					return false;
 				}
 
