@@ -104,6 +104,35 @@ public:
      */
     Q_INVOKABLE void exportCsv(const QUrl& destination);
 
+    /**
+     * @brief Default destination for exportCsv, chosen on the C++ side.
+     *
+     * WHY THIS IS NOT DONE IN QML. ReportsSubroute.qml built this path itself
+     * with QtCore's StandardPaths, which made the Reports page the only file in
+     * the UI needing `import QtCore`. That QML module is not deployed, so QML
+     * engine loading of the page failed outright with
+     *
+     *     ReportsSubroute.qml:25:1 - "QtCore" module is not installed
+     *
+     * and the page rendered BLANK on every navigation in the 1.0.109 field run -
+     * the title still drew, because it comes from the route table rather than
+     * from the page, which is why it looked like an empty report list rather
+     * than a load failure.
+     *
+     * Deploying the module would also have worked, but this is the better fix:
+     * the path is a platform question, QStandardPaths answers it natively in C++
+     * with no QML module involved, and this class has to open the file anyway.
+     * The layer that writes the file now chooses where it goes.
+     *
+     * Mirrors the QML behaviour exactly, including the fallback order:
+     * Documents, then AppData, then AppConfig. Returns an empty QUrl if the
+     * platform supplies none of them, which exportCsv already reports as an
+     * invalid destination.
+     *
+     * @return file:// URL carrying a timestamped CSV name, or an empty QUrl.
+     */
+    Q_INVOKABLE QUrl suggestedExportPath() const;
+
 signals:
     void loadingChanged();
     void hasMoreChanged();

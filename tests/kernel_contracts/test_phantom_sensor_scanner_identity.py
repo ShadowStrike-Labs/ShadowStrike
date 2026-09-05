@@ -110,6 +110,13 @@ UI_MAIN_QML_PATH = UI_QML_DIR / "Main.qml"
 SIDEBAR_QML_PATH = UI_QML_DIR / "Components/Sidebar.qml"
 SIDEBAR_ITEM_QML_PATH = UI_QML_DIR / "Components/SidebarItem.qml"
 ASSETS_QRC_PATH = UI_CLIENT_DIR / "assets.qrc"
+MODULE_CATALOG_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/UI/Shared/ModuleCatalog.cpp"
+)
+REPORTS_SUBROUTE_QML_PATH = UI_QML_DIR / "Pages/ReportsSubroute.qml"
+REPORTS_MODEL_HPP_PATH = (
+    UI_CLIENT_DIR / "ViewModels/ReportsModel.hpp"
+)
 ROLLBACK_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Update/RollbackManager.cpp"
 INSTALL_PROBE_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Tray/InstallProbe.cpp"
@@ -18583,6 +18590,235 @@ class ClientLogCollectionContractTests(unittest.TestCase):
             "the tail bound is %s lines, which is not a bound - a rotated log "
             "would be inlined whole" % tail.group(1))
 
+
+
+class ModuleIconResolvabilityContractTests(unittest.TestCase):
+    """Every module icon the catalog names must actually resolve at runtime.
+
+    THE 1.0.109 FIELD RUN produced 3,721 QML warnings, and 3,600 of them were a
+    module-card icon that could not be loaded:
+
+        840x Star.svg   280x Lock.svg   240x Globe.svg
+        240x Eye.svg    160x Shield.svg  80x Archive.svg
+
+    ModuleCatalog.cpp is the single source of those names, and the counts prove
+    it: it assigns Star 21 times, Lock 7, Eye 6, Globe 6, Shield 4, Archive 2,
+    and every warning count is exactly 40x the catalog count - one per delegate
+    rebuild. Three of the six were pure capitalisation mismatches against files
+    that existed in lower case, and three had no asset at all.
+
+    QRC LOOKUP IS CASE-SENSITIVE, so "Shield" and "shield" are different
+    resources and the first does not exist. Nothing failed loudly; the cards
+    simply drew with no icon, which is what made the UI look unfinished.
+
+    These guards derive the subject list FROM ModuleCatalog.cpp and check the
+    OTHER artifacts, so adding a module with a new icon id cannot silently ship
+    a card with no icon.
+    """
+
+    ICON_ID_RE = re.compile(r'\.iconId\s*=\s*"([^"]+)"')
+
+    def _catalog_icon_ids(self):
+        source = read_source(MODULE_CATALOG_CPP_PATH)
+        ids = self.ICON_ID_RE.findall(strip_c_comments(source))
+        self.assertGreaterEqual(
+            len(ids), 20,
+            "found only %d iconId assignments in ModuleCatalog.cpp, so the "
+            "regex no longer matches the catalog and these guards would pass "
+            "by having no subjects" % len(ids))
+        return ids
+
+    def test_every_catalog_icon_id_is_lower_case(self):
+        offenders = sorted({i for i in self._catalog_icon_ids() if i != i.lower()})
+        self.assertEqual(
+            [], offenders,
+            "these icon ids are not lower case, and qrc lookup is "
+            "case-sensitive, so each resolves to nothing and its module card "
+            "draws with no icon: %s" % offenders)
+
+    def test_every_catalog_icon_id_is_registered_in_the_qrc(self):
+        qrc = read_source(ASSETS_QRC_PATH)
+        aliases = set(re.findall(r'<file\s+alias="([^"]+)"', qrc))
+        self.assertGreaterEqual(
+            len(aliases), 10,
+            "only %d aliases parsed out of assets.qrc, so the alias regex no "
+            "longer matches and this guard has no haystack" % len(aliases))
+
+        missing = sorted({
+            i + ".svg" for i in self._catalog_icon_ids()
+            if (i + ".svg") not in aliases
+        })
+        self.assertEqual(
+            [], missing,
+            "ModuleCatalog names these icons but assets.qrc does not register "
+            "them, so they cannot be loaded from qrc: %s" % missing)
+
+    def test_every_catalog_icon_id_has_a_file_on_disk(self):
+        """Compared against the real directory listing, NOT with is_file().
+
+        The Windows filesystem is case-insensitive, so (UI_ICONS_DIR /
+        "Star.svg").is_file() is True while the file present is star.svg. QRC
+        lookup is case-SENSITIVE, so that mismatch is exactly what shipped and
+        an is_file() check cannot see it. Found by mutation: restoring the
+        capitalised id failed the lower-case and qrc guards and left this one
+        green.
+        """
+        on_disk = {p.name for p in UI_ICONS_DIR.iterdir() if p.is_file()}
+        self.assertGreaterEqual(
+            len(on_disk), 10,
+            "only %d files found in %s, so this guard has no haystack"
+            % (len(on_disk), UI_ICONS_DIR))
+
+        missing = sorted({
+            i + ".svg" for i in self._catalog_icon_ids()
+            if (i + ".svg") not in on_disk
+        })
+        self.assertEqual(
+            [], missing,
+            "ModuleCatalog names these icons but no file of that exact name "
+            "exists under %s: %s" % (UI_ICONS_DIR, missing))
+
+    def test_the_qrc_case_matches_the_file_on_disk_exactly(self):
+        """A file whose name differs only in case is a resource that does not
+        exist, and Windows will not tell you: the filesystem is
+        case-insensitive while qrc is not, so a mismatch builds cleanly and
+        fails only at runtime. Compared byte-for-byte here, not case-folded."""
+        qrc = read_source(ASSETS_QRC_PATH)
+        entries = re.findall(r'<file\s+alias="([^"]+)"\s*>([^<]+)</file>', qrc)
+        self.assertGreaterEqual(len(entries), 10, "no qrc entries parsed")
+
+        on_disk = {p.name for p in UI_ICONS_DIR.iterdir() if p.is_file()}
+        mismatched = []
+        for alias, target in entries:
+            name = target.strip().rsplit("/", 1)[-1]
+            if not name.endswith(".svg"):
+                continue
+            if name not in on_disk:
+                lowered = {n.lower(): n for n in on_disk}
+                actual = lowered.get(name.lower())
+                mismatched.append(
+                    "%s (on disk as %s)" % (name, actual) if actual
+                    else "%s (absent)" % name)
+            if alias != name:
+                mismatched.append(
+                    "alias %s does not match file %s" % (alias, name))
+        self.assertEqual([], sorted(mismatched), "qrc/disk mismatch: %s"
+                         % sorted(mismatched))
+
+
+class QmlModuleDeploymentContractTests(unittest.TestCase):
+    """No QML file may import a module the product does not deploy.
+
+    The Reports page rendered BLANK on every navigation in 1.0.109:
+
+        qrc:/qml/Pages/ReportsSubroute.qml:25:1 - "QtCore" module is not installed
+        [qml] PageLoader failed to load source: ReportsSubroute.qml
+
+    It was the only file in the UI importing QtCore, and it did so for one
+    thing - StandardPaths, to build a CSV export path. The page title still
+    drew, because it comes from the route table rather than from the page, so
+    the failure read as an empty report list rather than as a page that never
+    loaded.
+
+    The fix moved the path decision into ReportsModel, which already opens the
+    file and can call QStandardPaths natively in C++. This guard is what stops
+    it coming back, and it is deliberately a guard about DEPLOYMENT rather than
+    about QtCore: any import the deployment does not ship produces the same
+    silent blank page.
+    """
+
+    #: Modules the UI is built against and which windeployqt places beside the
+    #: binary. Derived from what the QML actually imports today, minus the
+    #: product's own C++-registered modules, and asserted below to be non-empty
+    #: so a typo cannot turn this into an allow-everything list.
+    DEPLOYED_QT_MODULES = frozenset({
+        "QtQuick",
+        "QtQuick.Controls",
+        "QtQuick.Controls.Basic",
+        "QtQuick.Layouts",
+        "QtQuick.Window",
+        "QtQuick.Effects",
+        "QtQml",
+        "QtQml.Models",
+    })
+
+    #: Qt QML modules known NOT to be deployed. QtCore is the measured one; it
+    #: is listed explicitly so the failure message can name the field evidence.
+    UNDEPLOYED_QT_MODULES = frozenset({"QtCore"})
+
+    def _qml_imports(self):
+        found = []
+        for path in sorted(UI_QML_DIR.rglob("*.qml")):
+            source = read_source(path)
+            for lineno, line in enumerate(source.splitlines(), 1):
+                match = re.match(r'\s*import\s+([A-Za-z][\w.]*)', line)
+                if match:
+                    found.append((path, lineno, match.group(1)))
+        self.assertGreater(
+            len(found), 20,
+            "only %d imports found across the QML tree, so the import regex no "
+            "longer matches and this guard has no subjects" % len(found))
+        return found
+
+    def test_the_undeployed_module_list_is_not_empty(self):
+        self.assertTrue(
+            self.UNDEPLOYED_QT_MODULES,
+            "the undeployed-module set is empty, which would make the guard "
+            "below vacuous")
+
+    def test_no_qml_imports_a_module_that_is_not_deployed(self):
+        offenders = [
+            "%s:%d imports %s" % (path.name, lineno, module)
+            for path, lineno, module in self._qml_imports()
+            if module in self.UNDEPLOYED_QT_MODULES
+        ]
+        self.assertEqual(
+            [], offenders,
+            "these QML files import a Qt module the product does not deploy. "
+            "The QML engine refuses to load the whole file, so the page renders "
+            "blank while its route-table title still draws - exactly how the "
+            "Reports page failed in 1.0.109: %s" % offenders)
+
+    def test_the_reports_page_gets_its_export_path_from_the_view_model(self):
+        """Anti-regression on the REPLACEMENT, not just on the symptom.
+
+        Deleting the import while leaving StandardPaths behind would break the
+        export instead of fixing the page, so the page must be shown to obtain
+        its destination from C++.
+        """
+        # Comments FIRST. The commit that removed the import left an
+        # explanation naming StandardPaths, and an absence assertion against
+        # raw source is satisfied by prose rather than by code - which is how
+        # this test failed the first time it ran.
+        source = read_source(REPORTS_SUBROUTE_QML_PATH)
+        stripped = strip_c_comments(source)
+
+        # Report line numbers, never the haystack. An assertNotIn against a
+        # whole source file prints the whole file: this assertion produced a
+        # 15,387-character failure message before it was bounded.
+        offending = [
+            lineno for lineno, line in enumerate(stripped.splitlines(), 1)
+            if "StandardPaths" in line
+        ]
+        self.assertEqual(
+            [], offending,
+            "ReportsSubroute.qml still references StandardPaths at line(s) %s. "
+            "That type only exists in the QtCore QML module, which is not "
+            "deployed, so importing it blanks the page." % offending)
+
+        self.assertIn(
+            "suggestedExportPath", stripped[:200000],
+            "ReportsSubroute.qml no longer asks the view model for the export "
+            "destination, so removing the QtCore import has cost the export "
+            "its path rather than relocating the decision")
+
+        model_header = read_source(REPORTS_MODEL_HPP_PATH)
+        self.assertRegex(
+            model_header,
+            r"Q_INVOKABLE\s+QUrl\s+suggestedExportPath\s*\(\s*\)\s*const\s*;",
+            "ReportsModel does not declare suggestedExportPath as a "
+            "Q_INVOKABLE returning QUrl, so the QML call above cannot resolve "
+            "at runtime and the export button would fail silently")
 
 
 if __name__ == "__main__":

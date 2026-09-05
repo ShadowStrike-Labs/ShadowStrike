@@ -20,6 +20,7 @@
             source: "qrc:/icons/<name>.svg"
     -->
     <qresource prefix="/icons">
+        <file alias="archive.svg">qml/icons/archive.svg</file>
         <file alias="back.svg">qml/icons/back.svg</file>
         <file alias="chevron_left.svg">qml/icons/chevron_left.svg</file>
         <file alias="chevron_right.svg">qml/icons/chevron_right.svg</file>
@@ -27,10 +28,12 @@
         <file alias="eye.svg">qml/icons/eye.svg</file>
         <file alias="gauge.svg">qml/icons/gauge.svg</file>
         <file alias="gear.svg">qml/icons/gear.svg</file>
+        <file alias="globe.svg">qml/icons/globe.svg</file>
         <file alias="lock.svg">qml/icons/lock.svg</file>
         <file alias="refresh.svg">qml/icons/refresh.svg</file>
         <file alias="reports.svg">qml/icons/reports.svg</file>
         <file alias="search.svg">qml/icons/search.svg</file>
         <file alias="shield.svg">qml/icons/shield.svg</file>
+        <file alias="star.svg">qml/icons/star.svg</file>
     </qresource>
 </RCC>

@@ -71,7 +71,11 @@ struct CatalogEntry {
     std::string descriptionKey;
 
     /// Icon identifier matching the QML Icons/ qmldir exports
-    /// (e.g. "Shield", "Lock", "Eye", "Globe", "Archive").
+    /// Lower-case, and it must match a file registered in assets.qrc under
+    /// the /icons prefix (e.g. "shield", "lock", "eye", "globe", "archive").
+    /// QRC LOOKUP IS CASE-SENSITIVE: capitalised ids here resolved to
+    /// nothing at runtime and produced 3,600 of the 3,721 UI warnings in
+    /// the 1.0.109 field run, one per delegate rebuild, with no icon drawn.
     std::string iconId;
 
     ModuleCategory category;

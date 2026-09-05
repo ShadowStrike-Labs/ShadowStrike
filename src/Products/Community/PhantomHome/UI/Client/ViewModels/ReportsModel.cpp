@@ -19,12 +19,14 @@
 #include "ReportsModel.hpp"
 
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QPointer>
+#include <QStandardPaths>
 #include <QTextStream>
 
 #include "../IPC/PipeClient.hpp"
@@ -251,6 +253,48 @@ void ReportsModel::setFilter(const QString& category,
     emit hasMoreChanged();
 
     doLoad(0);
+}
+
+QUrl ReportsModel::suggestedExportPath() const
+{
+    // Same fallback order the QML used before this moved to C++: a user-visible
+    // location first, then per-user application storage, then per-user config.
+    // QStandardPaths can legitimately return an empty string for any of these,
+    // so each is checked rather than assumed.
+    static constexpr QStandardPaths::StandardLocation kCandidates[] = {
+        QStandardPaths::DocumentsLocation,
+        QStandardPaths::AppDataLocation,
+        QStandardPaths::AppConfigLocation,
+    };
+
+    QString directory;
+    for (const auto location : kCandidates) {
+        directory = QStandardPaths::writableLocation(location);
+        if (!directory.isEmpty()) {
+            break;
+        }
+    }
+
+    if (directory.isEmpty()) {
+        return {};
+    }
+
+    // The directory may not exist yet - AppDataLocation in particular is only a
+    // promise about where data belongs, not a guarantee it has been created. A
+    // path inside a missing directory would fail at QFile::open with an error
+    // the user cannot act on, so create it here and report the failure honestly
+    // if that is not possible.
+    QDir dir(directory);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        return {};
+    }
+
+    const QString fileName =
+        QStringLiteral("shadowstrike-reports-") +
+        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")) +
+        QStringLiteral(".csv");
+
+    return QUrl::fromLocalFile(dir.filePath(fileName));
 }
 
 void ReportsModel::exportCsv(const QUrl& destination)

@@ -22,7 +22,6 @@
 
 import QtQuick
 import QtQuick.Controls.Basic
-import QtCore
 import ShadowStrike.Theming
 import ShadowStrike.Components
 import ShadowStrike.Accessibility
@@ -109,24 +108,17 @@ PageHost {
                                _severityKeys[_severityIndex])
     }
 
+    // The export destination is chosen by ReportsModel on the C++ side.
+    //
+    // This used to be a local _buildExportPath() built from QtCore's
+    // StandardPaths, which made this the ONLY file in the UI importing QtCore.
+    // That module is not deployed, so the QML engine refused to load this page
+    // and it rendered blank on every navigation - the page title still drew,
+    // because it comes from the route table, so it read as an empty report list
+    // rather than as a load failure. QStandardPaths answers the same question
+    // natively in C++, in the class that opens the file anyway.
     function _buildExportPath() {
-        var fileName = "shadowstrike-reports-" +
-                       Qt.formatDateTime(new Date(), "yyyyMMdd-HHmmss") + ".csv"
-        var directory = String(StandardPaths.writableLocation(StandardPaths.DocumentsLocation))
-        if (!directory || directory.length === 0)
-            directory = String(StandardPaths.writableLocation(StandardPaths.AppDataLocation))
-        if (!directory || directory.length === 0)
-            return ""
-
-        var normalized = directory.replace(/\\/g, "/")
-        if (normalized.indexOf("file:///") !== 0) {
-            if (normalized.charAt(0) === "/" && normalized.charAt(2) === ":")
-                normalized = normalized.substring(1)
-            normalized = "file:///" + normalized
-        }
-        if (normalized.charAt(normalized.length - 1) !== "/")
-            normalized += "/"
-        return Qt.resolvedUrl(normalized + fileName)
+        return reportsModel.suggestedExportPath()
     }
 
     // -------------------------------------------------------------------------

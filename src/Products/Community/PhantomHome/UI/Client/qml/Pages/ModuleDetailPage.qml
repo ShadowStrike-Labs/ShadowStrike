@@ -31,7 +31,7 @@ PageHost {
     readonly property string moduleId: (root.stack !== null && root.stack.detailModuleId !== undefined) ? root.stack.detailModuleId : ""
     readonly property int moduleIndex: root.findModuleIndex(moduleId)
     readonly property string displayName: root.moduleRole(2, moduleId.length > 0 ? moduleId : qsTr("Protection module"))
-    readonly property string iconId: root.moduleRole(3, "Shield")
+    readonly property string iconId: root.moduleRole(3, "shield")
     readonly property int category: root.moduleRole(4, -1)
     readonly property int currentMode: root.moduleRole(5, 0)
     readonly property int supportedModesMask: root.moduleRole(6, 0x0F)
