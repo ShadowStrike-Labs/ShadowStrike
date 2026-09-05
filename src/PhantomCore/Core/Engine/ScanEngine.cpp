@@ -1708,6 +1708,40 @@ EngineResult ScanEngine::ScanFile(
                         L"Not examined - content not resident (win32=%lu): %ls",
                         static_cast<unsigned long>(hashErr.win32),
                         std::wstring(filePath).c_str());
+                } else if (Utils::FileUtils::IsFileLockedError(hashErr.win32)) {
+                    result.errorMessage =
+                        L"another process holds the file open and denies read "
+                        L"access; the file was NOT examined";
+
+                    // DEBUG FOR THE SAME REASON AS THE CLOUD CASE ABOVE, AND THE
+                    // 1.0.109 RUN IS THE MEASUREMENT THAT FORCED IT.
+                    //
+                    // 16,175 of that run's 16,348 ERROR records were this one
+                    // condition, and 15,979 of those came from three files:
+                    // ProgramData\Microsoft\Network\Downloader\edb.log at 6,440,
+                    // WebCache\V01.log at 5,785 and SoftwareDistribution\DataStore
+                    // \Logs\edb.log at 3,754. Those are ESE transaction logs held
+                    // open exclusively by the BITS downloader, the WebCache and
+                    // Windows Update for as long as those services run - we can
+                    // never open them - and they are written constantly, so every
+                    // write brings them back through the on-access path. One was
+                    // re-attempted 1,725 times in a single run.
+                    //
+                    // The consequence was a 10.3 MB service log in which the
+                    // genuine faults were 173 records out of 16,348. A per-file
+                    // ERROR here does not inform an operator, it hides the faults
+                    // that would - and our own log writes traverse our own
+                    // minifilter, so it amplifies the condition it reports.
+                    //
+                    // THE VERDICT IS STILL Error. Nothing about the file's
+                    // treatment changes: it was not examined and it must not be
+                    // reported Clean. Only the severity of the per-file record
+                    // changes, and RealTimeProtection counts the aggregate.
+                    SS_LOG_DEBUG(L"ScanEngine",
+                        L"Not examined - held open by another process "
+                        L"(win32=%lu): %ls",
+                        static_cast<unsigned long>(hashErr.win32),
+                        std::wstring(filePath).c_str());
                 } else {
                     result.errorMessage = L"file hash could not be computed";
 

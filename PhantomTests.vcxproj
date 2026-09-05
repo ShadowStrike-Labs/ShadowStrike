@@ -291,6 +291,12 @@
          contract suite, because a behavioural assertion there would
          depend on a machine-specific heuristic risk score. -->
     <ClCompile Include="tests\unit\publisher_trust_suppression\PublisherTrustSuppression_Tests.cpp" />
+    <!-- 16,175 of the 16,348 error records in the 1.0.109 run were one
+         condition: a sharing violation on a file a Windows service holds
+         open, 15,979 of them from three ESE transaction logs, one
+         re-attempted 1,725 times. ALockedFileIsNotReportedClean is the
+         fail-open guard that makes reclassifying the severity safe. -->
+    <ClCompile Include="tests\unit\locked_file_not_examined\LockedFileNotExamined_Tests.cpp" />
     <ClCompile Include="tests\unit\sleep_evasion\SleepEvasion_Tests.cpp" />
     <ClCompile Include="tests\unit\host_calibration\HostCalibration_Tests.cpp" />
     <!-- Pins every structure that crosses the kernel boundary, by absolute offset.

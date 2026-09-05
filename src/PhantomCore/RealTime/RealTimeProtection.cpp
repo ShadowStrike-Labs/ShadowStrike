@@ -4223,6 +4223,15 @@ public:
                 // them. The engine now carries the reason in errorCode.
                 if (Utils::FileUtils::IsContentNotLocalError(engineResult.errorCode)) {
                     m_stats.contentNotLocalNotExamined++;
+                } else if (Utils::FileUtils::IsFileLockedError(engineResult.errorCode)) {
+                    // THE SAME DISTINCTION, FOR THE CONDITION THAT ACTUALLY
+                    // DOMINATES A FIELD RUN. In 1.0.109 this class was 16,175 of
+                    // 16,348 error records - 15,979 of them from three ESE
+                    // transaction logs held open by the BITS downloader, the
+                    // WebCache and Windows Update, one re-attempted 1,725 times.
+                    // Counting those as scan faults made scanErrors meaningless
+                    // and hid the 173 records that were genuine.
+                    m_stats.lockedNotExamined++;
                 } else {
                     m_stats.scanErrors++;
                 }
@@ -7177,6 +7186,7 @@ public:
         const uint64_t procWithheld = m_stats.processBlocksWithheldByMode.load(std::memory_order_relaxed);
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
         const uint64_t notLocal     = m_stats.contentNotLocalNotExamined.load(std::memory_order_relaxed);
+        const uint64_t lockedNE    = m_stats.lockedNotExamined.load(std::memory_order_relaxed);
         const uint64_t sandboxCap   = m_stats.sandboxEvasionCapabilityDetected.load(std::memory_order_relaxed);
         // Both are SELF-EXEMPTION counters. They are reported because an
         // exemption nobody can see is how a de-noising guard quietly becomes a
@@ -7294,6 +7304,7 @@ public:
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "contentNotLocalNotExamined={} "
+            "lockedNotExamined={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
@@ -7303,7 +7314,7 @@ public:
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, oversize, notLocal, notifyBudget, replyHorizon, procWithheld,
+            cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, notifyBudget, replyHorizon, procWithheld,
             exitBlockIgn, ownBinWithheld, ownHandleOps, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             kernelPart);
 
@@ -7817,6 +7828,7 @@ void RTPStatistics::Reset() noexcept {
     puaFiles = 0;
     scanErrors = 0;
     contentNotLocalNotExamined = 0;
+    lockedNotExamined = 0;
     filesBlocked = 0;
     processesBlocked = 0;
     connectionsBlocked = 0;

@@ -684,6 +684,51 @@ namespace ShadowStrike {
                 }
             }
 
+            bool IsFileLockedError(DWORD win32Error) noexcept {
+                // Every code here means the same actionable thing as the cloud
+                // family above: another process holds the file in a way that
+                // denies us read access, so the file was NOT examined. It is a
+                // PLATFORM CONDITION, not a fault in this product, and it recurs
+                // for the lifetime of whatever holds the handle.
+                //
+                // THE 1.0.109 FIELD RUN IS WHY THIS EXISTS. 16,175 of the run's
+                // 16,348 ERROR records were ERROR_SHARING_VIOLATION, and 15,979
+                // of those came from just three files:
+                //
+                //   ProgramData\Microsoft\Network\Downloader\edb.log    6,440
+                //   AppData\...\Microsoft\Windows\WebCache\V01.log      5,785
+                //   Windows\SoftwareDistribution\DataStore\Logs\edb.log 3,754
+                //
+                // All three are ESE transaction logs held open exclusively by a
+                // Windows service - the BITS downloader, the WebCache and Windows
+                // Update - for as long as that service runs. They can never be
+                // opened by us, they are written constantly, and each write brings
+                // them back through the on-access path. The result was a 10.3 MB
+                // service log, 8.6 times the size of 1.0.108's, in which the
+                // genuine faults were 173 records out of 16,348.
+                //
+                // This is the same reasoning IsContentNotLocalError records, and
+                // the same remedy: classify it, count it in the aggregate, and
+                // stop emitting a per-file ERROR for a condition the operator can
+                // do nothing about file-by-file.
+                //
+                // DELIBERATELY NARROW. Only the three codes that mean "someone
+                // else has it" are included. ERROR_ACCESS_DENIED (5) is NOT here:
+                // that can mean a real permissions defect, a DACL we should have
+                // been able to traverse, or an attacker denying us a file, and
+                // folding it in would relabel a genuine failure as routine - the
+                // same trap the cloud classifier avoided by excluding the
+                // metadata-corruption codes.
+                switch (win32Error) {
+                    case ERROR_SHARING_VIOLATION:   // 32 - the 1.0.109 field error
+                    case ERROR_LOCK_VIOLATION:      // 33 - a byte range is locked
+                    case ERROR_USER_MAPPED_FILE:    // 1224 - mapped by another process
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+
 
             bool Stat(std::wstring_view path, FileStat& out, Error* err) {
                 // Initialize output

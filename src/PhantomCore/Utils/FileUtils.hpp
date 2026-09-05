@@ -216,6 +216,23 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] bool IsContentNotLocalError(DWORD win32Error) noexcept;
 
+			/**
+			 * @brief True if a Win32 error means another process holds the file.
+			 *
+			 * ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION and
+			 * ERROR_USER_MAPPED_FILE. Like IsContentNotLocalError, a true answer
+			 * means the file was NOT examined and that the cause is a platform
+			 * condition rather than a fault in this product - so it belongs in an
+			 * aggregate counter, not in a per-file ERROR record. In the 1.0.109
+			 * field run this class accounted for 16,175 of 16,348 error records,
+			 * 15,979 of them from three service-held ESE transaction logs.
+			 *
+			 * ERROR_ACCESS_DENIED is deliberately excluded: it can be a real
+			 * permissions defect or an attacker denying us a file, and it must
+			 * keep surfacing as an error in its own right.
+			 */
+			[[nodiscard]] bool IsFileLockedError(DWORD win32Error) noexcept;
+
 
 			/**
 			 * @brief Alternate Data Stream (ADS) information.

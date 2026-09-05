@@ -892,6 +892,18 @@ struct alignas(64) RTPStatistics {
     /// COVERAGE number, not an error rate.
     std::atomic<uint64_t> contentNotLocalNotExamined{ 0 };
 
+    /// Files not examined because another process held them open.
+    ///
+    /// Counted apart from scanErrors for the same reason as the counter
+    /// above: a sharing violation is a platform condition, not a fault in
+    /// this product. In the 1.0.109 field run this class was 16,175 of the
+    /// 16,348 error records, 15,979 of them from three ESE transaction logs
+    /// held open by the BITS downloader, the WebCache and Windows Update -
+    /// one of which was re-attempted 1,725 times. Folding those into
+    /// scanErrors made that number meaningless and hid the 173 records that
+    /// were genuine faults.
+    std::atomic<uint64_t> lockedNotExamined{ 0 };
+
     // Blocking statistics
     std::atomic<uint64_t> filesBlocked{ 0 };
     std::atomic<uint64_t> processesBlocked{ 0 };
