@@ -2338,6 +2338,186 @@ EngineResult ScanEngine::ScanFile(
         }
 
         // ====================================================================
+        // STAGE 4.7: ARCHIVE CONTENT SCANNING
+        //
+        // WHY THIS STAGE EXISTS: FileTypeAnalyzer classified .zip / .rar / .7z
+        // as FileCategory::Archive and NOTHING consumed that classification.
+        // Stage 4.5 dispatches on Document/Spreadsheet/Presentation and stage
+        // 4.6 on Script; Archive had no equivalent, so an archive was hashed
+        // and pattern-scanned AS A CONTAINER and reported clean. Compressed
+        // bytes match no signature, so EICAR inside a .zip - the first thing
+        // any reviewer tries - was reported "No threats found".
+        //
+        // ScanEngine::ScanArchive was already complete and correct (zip-bomb
+        // refusal, path-traversal detection, nested extraction, and every
+        // entry pushed through SignatureStore::ScanBuffer). Its only caller in
+        // 1,272 translation units was Fuzzer/src/ScanEngineHarness.cpp, so the
+        // whole capability had run exclusively inside a fuzz harness.
+        // ====================================================================
+
+        {
+            const auto stage47Start = steady_clock::now();
+
+            try {
+                const auto& archiveTypeInfo = resolveFileType();
+
+                const bool isArchive =
+                    (archiveTypeInfo.category == FileSystem::FileCategory::Archive);
+
+                // Read the engine's archive policy under the config lock rather
+                // than touching m_config field by field further down: this stage
+                // must not hold that lock across extraction, which reads a file
+                // and can run for as long as maxExtractedSize allows.
+                ArchiveScanOptions archiveOptions{};
+                {
+                    std::shared_lock configLock(m_impl->m_configMutex);
+                    archiveOptions = m_impl->m_config.archiveOptions;
+                }
+
+                //
+                // THREE GATES, ALL OF THEM CONTROLS THAT ALREADY EXISTED AND
+                // REACHED NOTHING. No fourth switch is introduced.
+                //
+                //  1. context.scanArchives - the per-request control. Eleven
+                //     configuration sites set it (ProfileManager presets,
+                //     HomeConfigRegistration's standard profile, RTPConfig), and
+                //     QuickScanFile deliberately sets it FALSE for its 1-second
+                //     budget. FullSystemScan sets it true.
+                //  2. archiveOptions.action - the engine policy.
+                //     OptimizeForWorkload(Quick) sets Skip, (Full) sets Extract,
+                //     CreateParanoid sets Extract with depth 10.
+                //  3. context.type != RealTime - see below. This one is NEW and
+                //     it is the safety gate.
+                //
+                // WHY RealTime IS EXCLUDED, AND WHY THAT LOSES NO DETECTION.
+                // The on-access path (RealTimeProtection.cpp builds a
+                // ScanContext and sets only .type = RealTime, inheriting
+                // scanArchives = true) runs while the minifilter holds
+                // IRP_MJ_CREATE pending. Extraction there would read up to
+                // maxExtractedSize - 500 MB by default - across up to
+                // maxFilesInArchive entries and maxNestingDepth levels, on the
+                // thread the kernel is waiting on. That is precisely the
+                // mechanism that wedged a machine for 180 seconds in 1.0.86 and
+                // 1.0.91, and RealTimeProtection states the same intent for its
+                // own configuration (RTPConfig::scanArchives is set false).
+                //
+                // NOTHING IS GIVEN UP BY DEFERRING IT: content inside an
+                // archive cannot execute without first being extracted, and an
+                // extraction writes files whose creates this same on-access path
+                // intercepts and scans individually. So the coverage moves to
+                // the moment the bytes become reachable, rather than being lost
+                // - which is the distinction a latency bound must always honour.
+                // On-demand, contextual and scheduled scans - where a user or a
+                // schedule has asked us to examine an archive - do extract.
+                //
+                const bool mayExtract =
+                    context.scanArchives &&
+                    context.type != ScanType::RealTime &&
+                    archiveOptions.action != ArchiveAction::Skip;
+
+                if (isArchive && mayExtract) {
+                    SS_LOG_DEBUG(L"ScanEngine",
+                        L"Stage 4.7 archive dispatch: %ls", filePath.c_str());
+
+                    auto archiveResult = ScanArchive(filePath, archiveOptions, context);
+
+                    if (!archiveResult.results.empty()) {
+                        //
+                        // ScanVerdict IS NOT DECLARED IN SEVERITY ORDER
+                        // (ScanEngine.hpp:195 - Clean 0, Whitelisted 1,
+                        // Infected 2, Suspicious 3, PUA 4, Adware 5, Riskware 6,
+                        // Error 7, Timeout 8, Cancelled 9). A std::max_element
+                        // over the raw enum would rank a Timeout entry ABOVE an
+                        // Infected one and report a clean archive containing
+                        // malware. This is the same trap that made
+                        // IPCManager::CombineKernelVerdicts necessary for the
+                        // kernel verdict enum, so the rank is explicit here too.
+                        //
+                        const auto verdictRank = [](ScanVerdict v) -> int {
+                            switch (v) {
+                                case ScanVerdict::Infected:    return 9;
+                                case ScanVerdict::Suspicious:  return 8;
+                                case ScanVerdict::PUA:         return 7;
+                                case ScanVerdict::Adware:      return 6;
+                                case ScanVerdict::Riskware:    return 5;
+                                case ScanVerdict::Error:       return 4;
+                                case ScanVerdict::Timeout:     return 3;
+                                case ScanVerdict::Cancelled:   return 2;
+                                case ScanVerdict::Whitelisted: return 1;
+                                case ScanVerdict::Clean:       return 0;
+                            }
+                            return 0;
+                        };
+
+                        const auto& worstEntry = *std::max_element(
+                            archiveResult.results.begin(), archiveResult.results.end(),
+                            [&verdictRank](const EngineResult& a, const EngineResult& b) {
+                                return verdictRank(a.verdict) < verdictRank(b.verdict);
+                            });
+
+                        if (verdictRank(worstEntry.verdict) >
+                            verdictRank(result.verdict)) {
+
+                            result.verdict = worstEntry.verdict;
+                            result.threatName = worstEntry.threatName;
+                            result.threatCategory = worstEntry.threatCategory;
+                            result.severity = worstEntry.severity;
+                            result.threatId = worstEntry.threatId;
+                            result.confidence = worstEntry.confidence;
+                            result.detectionSource = worstEntry.detectionSource;
+                            result.sha256 = fileHash;
+
+                            // The archive's own hash, not the entry's - the
+                            // caller asked about this file, and quarantining or
+                            // reporting must name the file that exists on disk.
+                            for (const auto& ind : worstEntry.indicators) {
+                                result.indicators.push_back(ind);
+                            }
+                            result.detectionMethods.push_back("ArchiveContent");
+
+                            SS_LOG_WARN(L"ScanEngine",
+                                L"Stage 4.7 archive content detection: %ls in %ls "
+                                L"(%zu entr%ls flagged)",
+                                StringUtils::ToWide(result.threatName).c_str(),
+                                filePath.c_str(),
+                                archiveResult.results.size(),
+                                archiveResult.results.size() == 1 ? L"y" : L"ies");
+
+                            m_impl->InvokeDetectionCallbacks(result);
+
+                            if (result.verdict == ScanVerdict::Infected) {
+                                m_impl->m_stats.infections.fetch_add(
+                                    1, std::memory_order_relaxed);
+                                goto finalize_scan;
+                            }
+                        }
+                    }
+                } else if (isArchive) {
+                    // Stated rather than silent: an archive that was NOT opened
+                    // must not be mistaken for an archive that was opened and
+                    // found clean. Which of the three gates closed is named so a
+                    // field log can distinguish policy from the RealTime path.
+                    SS_LOG_DEBUG(L"ScanEngine",
+                        L"Stage 4.7 archive contents NOT examined: %ls "
+                        L"(scanArchives=%d realTime=%d action=%u)",
+                        filePath.c_str(),
+                        context.scanArchives ? 1 : 0,
+                        context.type == ScanType::RealTime ? 1 : 0,
+                        static_cast<unsigned>(archiveOptions.action));
+                }
+
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"ScanEngine",
+                    L"Stage 4.7 ArchiveAnalysis exception: %hs", e.what());
+            }
+
+            const auto stage47End = steady_clock::now();
+            SS_LOG_TRACE(L"ScanEngine", L"Stage 4.7 ArchiveAnalysis: %lldus",
+                static_cast<long long>(
+                    duration_cast<microseconds>(stage47End - stage47Start).count()));
+        }
+
+        // ====================================================================
         // STAGE 5: HEURISTIC ANALYSIS (PE/Entropy/Import/String Analysis)
         // ====================================================================
 
@@ -4153,12 +4333,51 @@ BatchScanResult ScanEngine::ScanArchive(
                     auto sigResult = m_impl->m_signatureStore->ScanBuffer(
                         std::span<const uint8_t>(data.data(), data.size()));
                     if (!sigResult.detections.empty()) {
-                        const auto& det = sigResult.detections.front();
-                        entryResult.verdict = ScanVerdict::Infected;
-                        entryResult.threatName = det.signatureName;
-                        entryResult.threatCategory = det.description;
-                        entryResult.confidence = det.similarity * 100.0f;
+                        //
+                        // MOST SEVERE, NOT FIRST - the same correction task 56 made
+                        // on the file and memory scan paths, which never reached this
+                        // one because this code had no production caller.
+                        //
+                        // detections is appended in SOURCE order (hash, then pattern,
+                        // then YARA), so front() is whichever store happened to run
+                        // first and find something. Taking it meant a Low pattern
+                        // match masked the name AND the severity of a Critical YARA
+                        // detection on the same archive entry.
+                        //
+                        const auto& topDetection = *std::max_element(
+                            sigResult.detections.begin(), sigResult.detections.end(),
+                            [](const auto& a, const auto& b) {
+                                return static_cast<uint8_t>(a.threatLevel) <
+                                       static_cast<uint8_t>(b.threatLevel);
+                            });
+
+                        // A detection at ThreatLevel::Info is an INDICATOR, not a
+                        // conviction. Mapped to Suspicious so it is still counted and
+                        // still reported, but is not treated as confirmed malware -
+                        // identical to the rule the file path applies, deliberately,
+                        // so an entry inside an archive is judged by the same standard
+                        // as the same bytes sitting loose on disk.
+                        const bool indicativeOnly =
+                            (topDetection.threatLevel ==
+                             SignatureStore::ThreatLevel::Info);
+
+                        entryResult.verdict = indicativeOnly ? ScanVerdict::Suspicious
+                                                             : ScanVerdict::Infected;
+                        entryResult.threatName = topDetection.signatureName;
+                        entryResult.severity = topDetection.threatLevel;
+                        entryResult.threatId = topDetection.signatureId;
+                        entryResult.threatCategory = topDetection.description;
+                        entryResult.confidence = topDetection.similarity * 100.0f;
                         entryResult.detectionSource = "SignatureStore";
+
+                        // WHICH member of the archive matched. EngineResult carries no
+                        // path field (task 198), and without this the caller learns
+                        // that "something in the zip is malicious" and cannot say what,
+                        // which is not actionable for a user or a responder.
+                        entryResult.indicators.push_back(
+                            "Archive entry: " +
+                            Utils::StringUtils::ToNarrow(entry.path));
+
                         result.results.push_back(std::move(entryResult));
                         return;
                     }
@@ -4764,6 +4983,10 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
     stats.heuristicHits = m_impl->m_stats.heuristicHits.load(std::memory_order_relaxed);
     stats.behaviorHits = m_impl->m_stats.behaviorHits.load(std::memory_order_relaxed);
     stats.mlHits = m_impl->m_stats.mlHits.load(std::memory_order_relaxed);
+    stats.archivesScanned =
+        m_impl->m_stats.archivesScanned.load(std::memory_order_relaxed);
+    stats.archiveFilesScanned =
+        m_impl->m_stats.archiveFilesScanned.load(std::memory_order_relaxed);
 
     uint64_t totalTimeUs = m_impl->m_stats.totalTimeUs.load(std::memory_order_relaxed);
     if (stats.totalScans > 0) {

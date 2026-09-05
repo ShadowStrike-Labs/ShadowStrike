@@ -264,6 +264,17 @@
          valid=true with a count of zero and any test checking only validity
          would have passed throughout. -->
     <ClCompile Include="tests\unit\scan_pool_health\ScanPoolHealth_Tests.cpp" />
+    <!-- Archive dispatch on the scan path. FileTypeAnalyzer classified .zip as
+         FileCategory::Archive and ScanFile consumed the classification nowhere -
+         it dispatches on Document (stage 4.5) and Script (stage 4.6) and had no
+         Archive branch - so an archive was signature-scanned as a CONTAINER and
+         a 1.0.109 field run reported "No threats found." for a real EICAR sample
+         inside eicar_com.zip. ScanEngine::ScanArchive was already complete; its
+         only caller across 1,272 translation units was the fuzz harness.
+         AnOnDemandScanExtractsAndExaminesArchiveContents is the discriminator,
+         and AnOnAccessScanDoesNotExtractArchiveContents is the safety gate that
+         keeps extraction off the thread the kernel blocks IRP_MJ_CREATE on. -->
+    <ClCompile Include="tests\unit\archive_dispatch\ArchiveDispatch_Tests.cpp" />
     <ClCompile Include="tests\unit\sleep_evasion\SleepEvasion_Tests.cpp" />
     <ClCompile Include="tests\unit\host_calibration\HostCalibration_Tests.cpp" />
     <!-- Pins every structure that crosses the kernel boundary, by absolute offset.

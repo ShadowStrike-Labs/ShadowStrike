@@ -524,7 +524,11 @@ struct EngineConfig {
 
     // Archive scanning
     ArchiveScanOptions archiveOptions;
-    bool enableCompressedScanning = false; // Scan inside zips (slow)
+    // Gates PackerUnpacker initialisation ONLY (ScanEngine.cpp Initialize), NOT
+    // archive scanning - the previous comment read "Scan inside zips (slow)",
+    // which is what made this look like the archive switch. Archive scanning is
+    // governed by archiveOptions.action above plus ScanContext::scanArchives.
+    bool enableCompressedScanning = false;
 
     // Performance
     size_t maxFileSizeRealTime = 50 * 1024 * 1024; // 50MB limit for RT
@@ -1044,6 +1048,18 @@ public:
         // Throughput
         uint64_t filesPerSecond;
         uint64_t bytesPerSecond;
+
+        // Archives. These two are incremented by ScanArchive but were absent
+        // from this snapshot, so no caller could read them - the archive
+        // subsystem's only observable counters were unreachable, which is the
+        // same shape as PerformanceMetrics::pendingScanQueue (task 50). They
+        // matter now that ScanFile dispatches archives: archivesScanned proves
+        // the dispatch happened, archiveFilesScanned proves entries were
+        // actually extracted and examined, and without both a field log cannot
+        // distinguish "no archives were seen" from "archives were seen and
+        // silently not opened".
+        uint64_t archivesScanned;
+        uint64_t archiveFilesScanned;
     };
 
     [[nodiscard]] Stats GetStatistics() const;
