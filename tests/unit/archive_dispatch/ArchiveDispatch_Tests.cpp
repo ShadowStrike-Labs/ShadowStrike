@@ -44,7 +44,7 @@
 //  which reports "1 of 1 pattern(s) matched by scan" against the shipped
 //  content and fails the build otherwise.
 //
-//  🔴 THE ARCHIVE CONTENT HERE IS DELIBERATELY BENIGN, AND THAT IS NOT
+// THE ARCHIVE CONTENT HERE IS DELIBERATELY BENIGN, AND THAT IS NOT
 //  LAZINESS. Putting the EICAR string in a test source would plant a live
 //  test-virus signature in the repository and in phantom-tests.exe, where our
 //  own scanner and the maintainer's resident AV would both act on it - the
@@ -188,7 +188,7 @@ namespace {
     // destruction, so a failing test cannot leave an artefact behind that a
     // later run would scan.
     //
-    // 🔴 EVERY TEST MUST PASS A DISTINCT tag. ScanContext::useCache defaults to
+    // EVERY TEST MUST PASS A DISTINCT tag. ScanContext::useCache defaults to
     // true, so a second scan of the same path and bytes is answered from the
     // result cache and never reaches stage 4.7 at all. When all four tests
     // shared one path and one payload, the two GATE tests passed by never
@@ -280,7 +280,7 @@ TEST(ArchiveDispatchTest, TheProbeArchiveIsRecognisedAsAnArchive) {
            "is the exact predicate stage 4.7 dispatches on, so every dispatch "
            "assertion in this suite would be meaningless";
 
-    // 🔴 DELIBERATELY NOT ASSERTED HERE: FileTypeAnalyzer::IsArchive().
+    // DELIBERATELY NOT ASSERTED HERE: FileTypeAnalyzer::IsArchive().
     //
     // MEASURED on this exact file: Analyze().category answers Archive while
     // IsArchive() answers FALSE. They are documented as the same question and
