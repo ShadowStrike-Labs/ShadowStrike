@@ -275,6 +275,14 @@
          and AnOnAccessScanDoesNotExtractArchiveContents is the safety gate that
          keeps extraction off the thread the kernel blocks IRP_MJ_CREATE on. -->
     <ClCompile Include="tests\unit\archive_dispatch\ArchiveDispatch_Tests.cpp" />
+    <!-- PolymorphicDetector is an x86 code detector, and AnalyzeFile used to
+         hand it whole files with no PE parse, so every non-executable file was
+         judged as code. 1.0.109 reported fourteen detections, all false and
+         none executable: five Prefetch files, two scheduled-task XML files, a
+         text log and a SQLite database. ADataFileIsNotJudgedAsCode is the
+         defect, and TheSameBytesAsCodeAreStillJudged is what stops the suite
+         being satisfiable by weakening the detector instead of scoping it. -->
+    <ClCompile Include="tests\unit\polymorphic_code_scope\PolymorphicCodeScope_Tests.cpp" />
     <ClCompile Include="tests\unit\sleep_evasion\SleepEvasion_Tests.cpp" />
     <ClCompile Include="tests\unit\host_calibration\HostCalibration_Tests.cpp" />
     <!-- Pins every structure that crosses the kernel boundary, by absolute offset.

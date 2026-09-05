@@ -345,6 +345,34 @@ struct FuzzyHashMatch {
 };
 
 /**
+ * @brief What a buffer handed to the analyser actually contains.
+ *
+ * EVERY DETECTOR IN THIS CLASS IS AN x86 CODE DETECTOR. The junk-instruction
+ * table is x86 opcodes (0x90 NOP, 0x8B 0xC0 MOV EAX/EAX, 0xEB 0x00 JMP $+0),
+ * DetectEngineInternal matches known packer/virus engine stubs, and
+ * FindDecryptionLoopsInternal looks for x86 decryptor loops. Applied to bytes
+ * that are not machine code, those searches are not weak - they are undefined.
+ * x86 is a dense encoding in which nearly every byte sequence decodes, so
+ * arbitrary compressed or textual data yields junk-pattern and loop "matches"
+ * at a rate governed by byte frequency rather than by intent.
+ *
+ * The 1.0.109 field run is the evidence: five Prefetch files, two scheduled-task
+ * XML files, one plain-text log and one SQLite database were all reported
+ * Polymorphic.Generic, and nothing executable was reported at all. This type
+ * exists so a caller must state which case it is in rather than defaulting into
+ * the wrong one silently.
+ */
+enum class PolyBufferKind : uint8_t {
+    /// @brief The buffer is machine code (a PE executable section, a memory
+    ///        region, or a code span a caller has already isolated).
+    MachineCode = 0,
+
+    /// @brief The buffer is a file or blob of unknown internal structure. The
+    ///        content-similarity half still applies; no code judgement does.
+    OpaqueData = 1
+};
+
+/**
  * @brief Polymorphic analysis result
  */
 struct PolyResult {
@@ -392,7 +420,34 @@ struct PolyResult {
     
     /// @brief Additional indicators
     std::vector<std::string> indicators;
-    
+
+    /// @brief Whether the code detectors actually ran on this buffer.
+    ///
+    /// False means the buffer was not machine code, so engine detection,
+    /// mutation detection and decryption-loop detection were not applicable
+    /// and were not attempted. The similarity hashes below are still produced.
+    ///
+    /// This is reported rather than inferred because "no polymorphic engine was
+    /// found" and "we did not look for one" are different statements, and a
+    /// caller that cannot tell them apart will eventually report the second as
+    /// the first. AnalyzeFile logs the same distinction.
+    bool codeAnalysisPerformed = false;
+
+    /// @brief File offset of the region that was analysed, when analysis came
+    ///        from a file.
+    ///
+    /// For a PE this is the file offset of the executable section, not 0, because
+    /// AnalyzeFile analyses the code rather than the image. Recording it makes a
+    /// detection auditable - "a decryptor loop was found at offset X" is a
+    /// checkable statement, "this file is polymorphic" is not - and it lets a
+    /// guard prove that the executable section was the region chosen. A guard
+    /// that only checks whether analysis ran is satisfied by analysing .rdata,
+    /// which a mutation proof of this module demonstrated.
+    uint64_t analyzedOffset = 0;
+
+    /// @brief Number of bytes analysed. Zero when no analysis ran.
+    uint32_t analyzedSize = 0;
+
     [[nodiscard]] std::string ToJson() const;
 };
 

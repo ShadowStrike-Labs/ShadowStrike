@@ -87,6 +87,7 @@
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../FuzzyHasher/FuzzyHasher.hpp"
+#include "../../PEParser/PEParser.hpp"
 
 // ============================================================================
 // EXTERNAL LIBRARY INCLUDES
@@ -268,7 +269,8 @@ namespace ShadowStrike::Core::Engine {
 
         [[nodiscard]] PolyResult AnalyzeInternal(
             std::span<const uint8_t> code,
-            const PolyAnalysisOptions& options) noexcept;
+            const PolyAnalysisOptions& options,
+            PolyBufferKind kind = PolyBufferKind::MachineCode) noexcept;
 
         // ====================================================================
         // NORMALIZATION
@@ -545,7 +547,8 @@ namespace ShadowStrike::Core::Engine {
 
     PolyResult PolymorphicDetectorImpl::AnalyzeInternal(
         std::span<const uint8_t> code,
-        const PolyAnalysisOptions& options) noexcept {
+        const PolyAnalysisOptions& options,
+        PolyBufferKind kind) noexcept {
 
         PolyResult result;
 
@@ -565,6 +568,65 @@ namespace ShadowStrike::Core::Engine {
             const auto startTime = Clock::now();
             const auto deadline  = startTime +
                 std::chrono::milliseconds(options.maxAnalysisTimeMs);
+
+            // ================================================================
+            // OPAQUE DATA: PRODUCE THE SIMILARITY HALF, MAKE NO CODE JUDGEMENT
+            // ================================================================
+            //
+            // Steps 1, 2 and 4 below all ask x86 questions - which engine stub
+            // is this, which junk instructions were inserted, where are the
+            // decryptor loops. On a buffer that is not machine code every one of
+            // them is a category error, and because x86 decodes almost any byte
+            // sequence they answer with noise rather than with silence. That is
+            // what produced Polymorphic.Generic on Prefetch, task XML, a text log
+            // and a SQLite database in 1.0.109 while no executable was flagged.
+            //
+            // The similarity hashes are NOT skipped. TLSH and the fuzzy digest
+            // are content hashes with no notion of instructions, so they remain
+            // meaningful for any file, and ScanEngine publishes result.fuzzyHash
+            // to downstream consumers for every scanned file. Dropping them here
+            // would trade one defect for a capability loss.
+            //
+            // Normalisation IS skipped, deliberately: NormalizeCodeInternal
+            // rewrites instruction sequences, so normalising a document before
+            // hashing it produces a digest of a transformation that means
+            // nothing. The hash is therefore taken over the raw bytes, which is
+            // the correct input for content similarity on a non-code file.
+            //
+            // The fuzzy SUSPICION screen is also skipped. FuzzyMatchInternal
+            // does not consult a family database - it asks
+            // FuzzyHasher::IsSuspiciousDigest about the digest and, on a hit,
+            // synthesises a match named Suspicious.FuzzyHash.Poly with family
+            // "Polymorphic". Step 5 then sets isPolymorphic from a non-empty
+            // match list and copies that family into threatFamily. That is the
+            // second FP mechanism and the field output distinguishes the two: the
+            // Prefetch, log and database detections were reported
+            // Polymorphic.Generic, with threatFamily empty, while the two
+            // scheduled-task XML files were reported as plain Polymorphic -
+            // exactly the name this path produces. Both arms are code judgements
+            // about a digest of code, so both are skipped here.
+            //
+            // The digest itself is still computed and returned above; only the
+            // suspicion verdict drawn from it is withheld.
+            if (kind == PolyBufferKind::OpaqueData) {
+                if (options.enableFuzzyMatching) {
+                    result.fuzzyHash = CalculateFuzzyHashInternal(code);
+                    result.tlshHash  = CalculateTLSHInternal(code);
+                }
+
+                result.codeAnalysisPerformed = false;
+
+                const auto opaqueEnd = Clock::now();
+                result.analysisTimeMs = static_cast<uint32_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        opaqueEnd - startTime).count());
+
+                m_stats.totalAnalyses.fetch_add(1, std::memory_order_relaxed);
+                m_status.store(PolyDetectorStatus::Running, std::memory_order_release);
+                return result;
+            }
+
+            result.codeAnalysisPerformed = true;
 
             // Step 1: Detect polymorphic engine
             result.engineType = DetectEngineInternal(code);
@@ -1970,15 +2032,107 @@ namespace ShadowStrike::Core::Engine {
                 return result;
             }
 
-            if (fileSize > PolyConstants::MAX_CODE_SIZE) {
-                SS_LOG_WARN(kLogCategory,
-                    L"File exceeds max analysis size (%llu > %zu), truncating: %ls",
-                    static_cast<unsigned long long>(fileSize),
-                    PolyConstants::MAX_CODE_SIZE, filePath.c_str());
+            // ================================================================
+            // LOCATE THE CODE. DO NOT ASSUME THE FILE IS CODE.
+            // ================================================================
+            //
+            // This function used to read up to MAX_CODE_SIZE bytes from offset 0
+            // and hand them to AnalyzeInternal, whose parameter is named `code`,
+            // with no PE parse and no type check. Everything this class detects
+            // is x86: the junk patterns are x86 opcodes, DetectEngineInternal
+            // matches x86 engine stubs, FindDecryptionLoopsInternal looks for
+            // x86 decryptor loops. So every non-executable file on the machine
+            // was judged as code, and because x86 decodes nearly any byte
+            // sequence the answers tracked byte frequency rather than intent.
+            //
+            // 1.0.109 measured the consequence exactly: fourteen detections, all
+            // false, none executable - five Prefetch files, two scheduled-task
+            // XML files, MpCmdRun.log and Microsoft.LocalContent.db reported
+            // Polymorphic.Generic or Polymorphic. Only blocked=0 kept it
+            // harmless.
+            //
+            // THE PE ARM IS STRICTLY STRONGER THAN WHAT IT REPLACES, so this is a
+            // precision fix and not a narrowing:
+            //   * the analysed bytes are the executable section rather than the
+            //     whole image, so a decryptor loop in .text is no longer searched
+            //     for across icons, string tables and overlay data, and the junk
+            //     ratio is measured over instructions instead of over resources.
+            //     Diluting the signal with non-code bytes lowered confidence on
+            //     real packers.
+            //   * the PE is parsed from the FILE, not from a 16 MB prefix of it.
+            //     The old code read at most MAX_CODE_SIZE and treated that as the
+            //     whole file, so no PE larger than 16 MB could be parsed at all -
+            //     found by this module's own guard suite against a 64 MB binary.
+            //   * only the code section is read, instead of up to 16 MB of every
+            //     file scanned. For a typical executable that is a large
+            //     reduction in I/O on the scan path.
+            //
+            // NOTHING COVERS RAW ON-DISK SHELLCODE FROM HERE, AND IT DOES NOT
+            // NEED TO - three modules own that independently, each with named
+            // families rather than generic scoring:
+            //   * ZeroDayDetector::DetectShellcode - eight signature families
+            //     (Meterpreter reverse_tcp, Cobalt Strike beacon, x86 bind and
+            //     reverse shells, egg hunter, x64 syscall stub, ws2_32
+            //     download-and-execute) plus IsPotentialShellcode, running on the
+            //     same file as ScanEngine stage 9.
+            //   * MemoryScanner::AnalyzeForShellcode - NOP sled, GetPC, API
+            //     hashing, syscall and lea-rip indicators.
+            //   * MemoryProtection::ScanForShellcode - NOP sled, encoder stub,
+            //     position-independent code, plus the kernel's own
+            //     SHELLCODE_DETECTION_EVENT.
+            // A file with no PE header also still passes through the hash, threat
+            // intel and YARA/pattern stages, which are content matches and do not
+            // care whether the bytes are code. So no detection is given up here;
+            // the wrong analyser stops guessing.
+            uint64_t readOffset = 0;
+            size_t   readSize   = 0;
+            PolyBufferKind kind = PolyBufferKind::OpaqueData;
+
+            PEParser::PEParser peParser;
+            PEParser::PEInfo peInfo;
+            if (peParser.ParseFile(filePath.wstring(), peInfo, nullptr)) {
+                // First executable section that is genuinely present in the file.
+                // rawAddress and rawSize are file offsets and a section header can
+                // describe more than the file holds - a truncated or deliberately
+                // malformed image - so both are bounded against the real size
+                // rather than trusted.
+                for (const auto& sec : peInfo.sections) {
+                    if (!sec.isExecutable || sec.rawSize == 0) {
+                        continue;
+                    }
+                    if (static_cast<uint64_t>(sec.rawAddress) >= fileSize) {
+                        continue;
+                    }
+                    const uint64_t avail = fileSize - sec.rawAddress;
+                    const uint64_t want  = std::min<uint64_t>(sec.rawSize, avail);
+                    if (want < PolyConstants::MIN_CODE_SIZE) {
+                        continue;
+                    }
+                    readOffset = sec.rawAddress;
+                    readSize   = static_cast<size_t>(
+                        std::min<uint64_t>(want, PolyConstants::MAX_CODE_SIZE));
+                    kind = PolyBufferKind::MachineCode;
+                    break;
+                }
+
+                if (kind != PolyBufferKind::MachineCode) {
+                    // A parsed PE with no usable executable section: malformed, or
+                    // pure resource data. Treated as opaque rather than falling
+                    // back to the whole file, which is the defect described above.
+                    SS_LOG_DEBUG(kLogCategory,
+                        L"PE has no usable executable section, code analysis not "
+                        L"applicable: %ls", filePath.c_str());
+                }
             }
 
-            const size_t readSize = static_cast<size_t>(
-                std::min<uintmax_t>(fileSize, PolyConstants::MAX_CODE_SIZE));
+            if (kind == PolyBufferKind::OpaqueData) {
+                readOffset = 0;
+                readSize   = static_cast<size_t>(
+                    std::min<uintmax_t>(fileSize, PolyConstants::MAX_CODE_SIZE));
+                SS_LOG_DEBUG(kLogCategory,
+                    L"Not machine code, similarity hashes only: %ls",
+                    filePath.c_str());
+            }
 
             std::vector<uint8_t> fileData(readSize);
             std::ifstream file(filePath, std::ios::binary);
@@ -1988,12 +2142,31 @@ namespace ShadowStrike::Core::Engine {
                 return result;
             }
 
+            if (readOffset != 0) {
+                file.seekg(static_cast<std::streamoff>(readOffset), std::ios::beg);
+                if (!file) {
+                    SS_LOG_ERROR(kLogCategory,
+                        L"Failed to seek to code section at offset %llu: %ls",
+                        static_cast<unsigned long long>(readOffset),
+                        filePath.c_str());
+                    return result;
+                }
+            }
+
             file.read(reinterpret_cast<char*>(fileData.data()),
                        static_cast<std::streamsize>(readSize));
             const auto bytesRead = static_cast<size_t>(file.gcount());
             fileData.resize(bytesRead);
 
-            return m_impl->AnalyzeInternal(fileData, options);
+            PolyResult analyzed = m_impl->AnalyzeInternal(fileData, options, kind);
+
+            // Record WHICH bytes were judged. Without this a caller cannot tell
+            // an executable section from a data section, and neither can a guard.
+            analyzed.analyzedOffset = readOffset;
+            analyzed.analyzedSize   = static_cast<uint32_t>(
+                std::min<size_t>(bytesRead, 0xFFFFFFFFu));
+
+            return analyzed;
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(kLogCategory,
