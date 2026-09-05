@@ -36,6 +36,7 @@
 #include "../../HashStore/HashStore.hpp"
 #include "../../SignatureStore/SignatureStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../SelfProtection/DigitalSignatureValidator.hpp"
 #include "../../ThreatIntel/ThreatIntelDatabase.hpp"
 #include "../../Database/LogDB.hpp"
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
@@ -257,6 +258,13 @@ public:
         // Archive stats
         std::atomic<uint64_t> archivesScanned{0};
         std::atomic<uint64_t> archiveFilesScanned{0};
+
+        // Heuristic convictions withheld because the file carried a verified
+        // trusted-publisher signature. THE observable for the 1.0.109 false
+        // positives: it must be non-zero on a machine holding Windows system
+        // binaries. Zero here while heuristic detections on OS files reappear
+        // means the trust path is not running at all.
+        std::atomic<uint64_t> heuristicVerdictsSuppressedByTrust{0};
 
         // Process stats
         std::atomic<uint64_t> processesScanned{0};
@@ -915,6 +923,7 @@ public:
             m_stats.cortexTimeUs.store(0, std::memory_order_relaxed);
             m_stats.archivesScanned.store(0, std::memory_order_relaxed);
             m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
+            m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
             m_stats.startTime = steady_clock::now();
@@ -1236,6 +1245,135 @@ public:
         }
 
         return false;
+    }
+
+    // ========================================================================
+    // PUBLISHER TRUST - WHETHER A HEURISTIC-ONLY CONVICTION MAY BE REPORTED
+    // ========================================================================
+    //
+    // THE DEFECT THIS ANSWERS. The 1.0.109 field run reported fourteen threats.
+    // Every one was false. Five were real executables convicted by heuristics
+    // alone, four of them Microsoft operating-system binaries:
+    //
+    //   System32\d3d11.dll                risk 73.0  Heuristic:Win/Generic
+    //   System32\usbmon.dll               risk 63.0  Heuristic:Win/Generic
+    //   SysWOW64\IME\IMEJP\IMJPDAPI.DLL   risk 63.0  Heuristic:Win/Packed
+    //   System32\drivers\ndis.sys         risk 83.0  Heuristic:Win/Packed
+    //   OneDriveStandaloneUpdater.exe     risk 78     Heur:PE.Suspicious
+    //
+    // Stage 5 convicts at sensitivityLevel * 30.0, which is 60.0 by default, and
+    // Windows system binaries land at 63 to 83. mssmbios.sys scored 53.0 and
+    // d2d1.dll 40.0, so this is not a mistuned threshold with a clean margin
+    // above it - entropy, packing and import heuristics simply do not separate
+    // Microsoft's optimised, resource-heavy, sometimes compressed system
+    // binaries from packed malware. Only blocked=0 kept the run harmless; with
+    // quarantine enabled 1.0.109 would have taken ndis.sys, and 1.0.93 had
+    // already made five attempts on System32\urlmon.dll.
+    //
+    // THE TRUST THIS CONSULTS WAS ALREADY BEING SEEDED AND NEVER READ.
+    // Initialize calls SeedTrustedPublishers, which registers 24 publishers
+    // with the reason "Seeded publisher (honoured only with a verified
+    // signature)" and logs that "signature-verified vendor binaries now take
+    // the fast path". No such path existed: stage 1's only whitelist
+    // consultation is a HASH lookup, so the publisher entries were written,
+    // persisted, and never queried by anything. WhitelistStore has had
+    // IsPublisherWhitelisted all along.
+    //
+    // WHY THIS IS NOT A WEAKENED DETECTOR, and the distinction is the whole
+    // design:
+    //
+    //   * It cannot fire for evidence-based verdicts. Stages 1 through 4 -
+    //     whitelist, hash, threat intel, YARA and pattern matching - every one
+    //     jumps to finalize_scan on a hit. Reaching stage 5 therefore MEANS no
+    //     signature, hash, IOC or rule matched. The only thing suppressible
+    //     here is a score.
+    //   * It does not end the scan. The conviction is withheld and the file
+    //     CONTINUES through stages 6 to 10 - polymorphic analysis, sandbox,
+    //     emulation, zero-day and the ML ensemble. A trusted signature buys a
+    //     file no exemption from any detector that reasons about behaviour or
+    //     content; it only stops a score from being reported as a threat.
+    //   * It requires a VERIFIED signature, not a path, a name or a location. A
+    //     file dropped in System32 gets nothing from this.
+    //
+    // WHAT THIS DELIBERATELY DOES NOT CLAIM. The stolen-certificate check
+    // below is wired because SignerInfo carries the thumbprint it needs, but
+    // LoadStolenCertDatabase and AddStolenCertificate have ZERO production call
+    // sites, so that database is EMPTY on an endpoint today and the check is
+    // inert. It is called so the protection engages automatically when the
+    // database is populated, and it must not be described as active until then.
+    // The property that actually makes this safe is the one above: the file
+    // keeps being analysed.
+    //
+    // COST. Verification runs only when a conviction is about to be reported,
+    // not per file. In 1.0.109 that would have been 14 calls against 14,276
+    // scans. OfflineOnly is set so no CRL or OCSP fetch can happen - task 48
+    // recorded a 180-second CryptSvc wedge from exactly that - and CacheResult
+    // is set so a repeated conviction on the same binary is answered from the
+    // cache.
+    //
+    struct TrustSuppression {
+        bool suppress = false;
+        std::wstring signerName;
+        const char* basis = "";
+    };
+
+    [[nodiscard]] TrustSuppression EvaluatePublisherTrust(
+        const std::wstring& filePath) const {
+        TrustSuppression decision{};
+
+        // Fail CLOSED. If the validator is not available we cannot establish
+        // trust, so the detection stands. A missing verifier must never become
+        // a reason to trust a file.
+        if (!Security::DigitalSignatureValidator::HasInstance()) {
+            return decision;
+        }
+        auto& validator = Security::DigitalSignatureValidator::Instance();
+        if (!validator.IsInitialized()) {
+            return decision;
+        }
+
+        using Flags = Security::SignatureValidationFlags;
+        Security::SignatureValidationOptions options{};
+        options.flags =
+            static_cast<Flags>(
+                static_cast<uint32_t>(Flags::OfflineOnly) |
+                static_cast<uint32_t>(Flags::VerifyChain) |
+                static_cast<uint32_t>(Flags::AllowCatalogSignatures) |
+                static_cast<uint32_t>(Flags::CacheResult));
+
+        const auto info = validator.VerifyFile(filePath, options);
+
+        if (!info.isValid) {
+            return decision;
+        }
+
+        // A signature we know to be stolen is not trust. Inert today - see the
+        // block comment above - and wired so it stops being inert the moment
+        // the database has content.
+        if (validator.CheckStolenCertificate(info.signer.thumbprint).has_value()) {
+            SS_LOG_WARN(L"ScanEngine",
+                L"Heuristic conviction NOT suppressed: signer '%ls' is in the "
+                L"stolen-certificate database: %ls",
+                info.signer.signerName.c_str(), filePath.c_str());
+            return decision;
+        }
+
+        if (info.isMicrosoftSigned) {
+            decision.suppress = true;
+            decision.basis = "Microsoft-signed";
+        } else if (m_whitelistStore && !info.signer.signerName.empty()) {
+            // The publishers seeded at Initialize, finally consulted. AddPublisher
+            // stored them for this and nothing had ever asked.
+            const auto lookup =
+                m_whitelistStore->IsPublisherWhitelisted(info.signer.signerName);
+            if (lookup.found) {
+                decision.suppress = true;
+                decision.basis = "whitelisted publisher";
+            }
+        }
+
+        decision.signerName = info.signer.signerName;
+        return decision;
     }
 
     // ========================================================================
@@ -2529,6 +2667,44 @@ EngineResult ScanEngine::ScanFile(
             if (heuristicResult.isMalicious ||
                 heuristicResult.riskScore >= m_impl->m_config.sensitivityLevel * 30.0) {
 
+                // A score is not evidence. Stages 1 to 4 all jump to
+                // finalize_scan on a hit, so arriving here means nothing
+                // matched: no whitelist hash, no signature, no IOC, no YARA
+                // rule. A verified trusted publisher therefore outweighs a
+                // heuristic score, and only a heuristic score. See
+                // EvaluatePublisherTrust for the field evidence and for why the
+                // scan continues rather than ending.
+                const auto trust = m_impl->EvaluatePublisherTrust(filePath);
+                if (trust.suppress) {
+                    m_impl->m_stats.heuristicVerdictsSuppressedByTrust
+                        .fetch_add(1, std::memory_order_relaxed);
+
+                    // INFO, not DEBUG. DigitalSignatureValidator carries a
+                    // trust-refusal diagnostic at DEBUG for this exact defect
+                    // and the 1.0.109 log contains ZERO of those lines, because
+                    // the shipped level is INFO. A diagnostic nobody can read
+                    // has not been added.
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"Heuristic score %.1f (%hs) NOT reported: %hs, signer "
+                        L"'%ls' - deeper stages still run: %ls",
+                        static_cast<double>(heuristicResult.riskScore),
+                        StringUtils::ToNarrow(heuristicResult.threatName).c_str(),
+                        trust.basis,
+                        trust.signerName.c_str(),
+                        filePath.c_str());
+
+                    result.indicators.push_back(
+                        "Heuristic score " +
+                        std::to_string(static_cast<int>(heuristicResult.riskScore)) +
+                        " withheld on a verified signature (" +
+                        std::string(trust.basis) + ")");
+
+                    // Deliberately NOT goto finalize_scan, and deliberately not
+                    // Clean or Whitelisted: the file is still owed stages 6
+                    // through 10, any of which may convict it on evidence
+                    // rather than on a score.
+                } else {
+
                 m_impl->m_stats.heuristicHits.fetch_add(1, std::memory_order_relaxed);
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
@@ -2546,6 +2722,7 @@ EngineResult ScanEngine::ScanFile(
                 m_impl->InvokeDetectionCallbacks(result);
 
                 goto finalize_scan;
+                }
             }
 
             const auto stage5End = steady_clock::now();
@@ -2607,6 +2784,27 @@ EngineResult ScanEngine::ScanFile(
                 auto execInfo = execAnalyzer.Analyze(filePath, opts);
 
                 if (execInfo.riskScore >= 75) {
+                    // Same rule as stage 5, same reasoning. OneDriveStandaloneUpdater.exe
+                    // scored 78 here in 1.0.109 and was reported Heur:PE.Suspicious.
+                    const auto trust = m_impl->EvaluatePublisherTrust(filePath);
+                    if (trust.suppress) {
+                        m_impl->m_stats.heuristicVerdictsSuppressedByTrust
+                            .fetch_add(1, std::memory_order_relaxed);
+
+                        SS_LOG_INFO(L"ScanEngine",
+                            L"ExecutableAnalyzer risk %u NOT reported: %hs, signer "
+                            L"'%ls' - deeper stages still run: %ls",
+                            static_cast<unsigned>(execInfo.riskScore),
+                            trust.basis,
+                            trust.signerName.c_str(),
+                            filePath.c_str());
+
+                        result.indicators.push_back(
+                            "PE structural risk " +
+                            std::to_string(static_cast<int>(execInfo.riskScore)) +
+                            " withheld on a verified signature (" +
+                            std::string(trust.basis) + ")");
+                    } else {
                     m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
                     result.verdict = ScanVerdict::Suspicious;
@@ -2623,6 +2821,7 @@ EngineResult ScanEngine::ScanFile(
 
                     m_impl->InvokeDetectionCallbacks(result);
                     goto finalize_scan;
+                    }
                 }
 
                 // Route packed executables to EmulationEngine for unpacking.
@@ -4987,6 +5186,8 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.archivesScanned.load(std::memory_order_relaxed);
     stats.archiveFilesScanned =
         m_impl->m_stats.archiveFilesScanned.load(std::memory_order_relaxed);
+    stats.heuristicVerdictsSuppressedByTrust =
+        m_impl->m_stats.heuristicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
 
     uint64_t totalTimeUs = m_impl->m_stats.totalTimeUs.load(std::memory_order_relaxed);
     if (stats.totalScans > 0) {
@@ -5028,6 +5229,7 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.cortexTimeUs.store(0, std::memory_order_relaxed);
     m_impl->m_stats.archivesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
     m_impl->m_stats.startTime = steady_clock::now();

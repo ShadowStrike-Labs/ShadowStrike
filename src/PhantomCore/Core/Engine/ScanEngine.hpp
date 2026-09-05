@@ -395,6 +395,7 @@ struct ScanStatistics {
     // Archives
     uint64_t archivesScanned = 0;
     uint64_t archiveFilesScanned = 0;
+
 };
 
 /**
@@ -1060,6 +1061,11 @@ public:
         // silently not opened".
         uint64_t archivesScanned;
         uint64_t archiveFilesScanned;
+
+        // Reported so a field run can distinguish "no false positives"
+        // from "the suppression never ran". Those are indistinguishable in
+        // a threat count and are opposite conditions.
+        uint64_t heuristicVerdictsSuppressedByTrust;
     };
 
     [[nodiscard]] Stats GetStatistics() const;

@@ -18821,5 +18821,226 @@ class QmlModuleDeploymentContractTests(unittest.TestCase):
             "at runtime and the export button would fail silently")
 
 
+class PublisherTrustSuppressionContractTests(unittest.TestCase):
+    """A heuristic score may be withheld on a verified signature. Nothing else may.
+
+    THE 1.0.109 FIELD RUN reported fourteen threats, all false. Five were real
+    executables convicted by heuristics alone, four of them Microsoft
+    operating-system binaries: System32\\d3d11.dll at risk 73.0,
+    System32\\usbmon.dll at 63.0, IMJPDAPI.DLL at 63.0,
+    System32\\drivers\\ndis.sys at 83.0 and OneDriveStandaloneUpdater.exe at 78.
+    Stage 5 convicts at sensitivityLevel * 30.0 = 60.0, and there is no clean
+    threshold below the OS binaries: mssmbios.sys scored 53.0 and d2d1.dll 40.0.
+
+    ScanEngine::Initialize had been calling SeedTrustedPublishers all along,
+    registering 24 publishers with the reason "honoured only with a verified
+    signature" and logging that vendor binaries "now take the fast path". No such
+    path existed - stage 1's only whitelist consultation is a HASH lookup - so
+    the publisher entries were written, persisted and never queried.
+
+    THESE GUARDS PIN THE PROPERTIES THAT MAKE THIS A PRECISION FIX RATHER THAN A
+    WEAKENED DETECTOR, and they are structural on purpose: a behavioural
+    assertion would depend on a machine-specific heuristic risk score, and a
+    test that silently stops discriminating when a score drifts is worse than
+    none. The trust PREDICATE is tested against the real OS in
+    tests/unit/publisher_trust_suppression.
+    """
+
+    def _engine_source(self):
+        return strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+
+    def _trust_helper(self):
+        source = self._engine_source()
+        body = extract_c_function(source, "EvaluatePublisherTrust")
+        self.assertGreater(
+            len(body), 300,
+            "EvaluatePublisherTrust body is %d chars, which is too small to be "
+            "the real helper" % len(body))
+        return body
+
+    def test_the_trust_helper_requires_a_valid_signature(self):
+        body = self._trust_helper()
+        self.assertTrue(
+            "isValid" in body,
+            "the trust helper does not consult isValid, so it could suppress a "
+            "detection on a file whose signature does not verify")
+
+    def test_the_trust_helper_requires_microsoft_or_a_whitelisted_publisher(self):
+        body = self._trust_helper()
+        self.assertTrue(
+            "isMicrosoftSigned" in body,
+            "the trust helper does not check isMicrosoftSigned")
+        self.assertTrue(
+            "IsPublisherWhitelisted" in body,
+            "the trust helper does not consult the seeded publisher whitelist, "
+            "which is the trust SeedTrustedPublishers has been writing and "
+            "nothing has been reading")
+
+    def test_the_trust_helper_refuses_a_stolen_certificate(self):
+        body = self._trust_helper()
+        self.assertTrue(
+            "CheckStolenCertificate" in body,
+            "the trust helper does not consult the stolen-certificate database. "
+            "That database is EMPTY in production today - LoadStolenCertDatabase "
+            "and AddStolenCertificate have no production caller - so the call is "
+            "inert, and it is required here so the protection engages the moment "
+            "the database has content rather than needing to be remembered")
+
+    def test_the_trust_helper_cannot_reach_the_network(self):
+        """A revocation fetch on the scan path wedged a machine for 180 seconds
+        (task 48). OfflineOnly is the flag that makes this affordable, and
+        OnlineCheck must not appear."""
+        body = self._trust_helper()
+        self.assertTrue(
+            "OfflineOnly" in body,
+            "the trust helper does not set OfflineOnly, so verification may "
+            "attempt a CRL or OCSP fetch on the scan path")
+        self.assertFalse(
+            "OnlineCheck" in body,
+            "the trust helper requests an online check")
+
+    def test_the_trust_helper_allows_catalog_signatures(self):
+        """Windows system binaries are catalog-signed, not embedded-signed. A
+        verifier that does not accept catalog signatures answers "unsigned" for
+        exactly the files this fix exists for."""
+        body = self._trust_helper()
+        self.assertTrue(
+            "AllowCatalogSignatures" in body,
+            "the trust helper does not allow catalog signatures, so Windows "
+            "system binaries - the population that produced the false "
+            "positives - would still verify as unsigned")
+
+    def test_the_trust_helper_fails_closed(self):
+        """If the validator is unavailable the detection must STAND. A missing
+        verifier must never become a reason to trust a file."""
+        body = self._trust_helper()
+        self.assertTrue(
+            "HasInstance" in body,
+            "the trust helper does not check that the validator exists")
+        head = body[:body.index("VerifyFile")] if "VerifyFile" in body else body
+        self.assertTrue(
+            "IsInitialized" in head,
+            "the trust helper does not confirm the validator is initialized "
+            "BEFORE verifying")
+
+    def test_suppression_does_not_end_the_scan(self):
+        """THE PROPERTY THAT MAKES THIS SAFE, AND THE ONE MOST WORTH GUARDING.
+
+        A withheld heuristic score must not finish the scan: the file is still
+        owed stages 6 to 10 - polymorphic analysis, sandbox, emulation, zero-day
+        and the ML ensemble - any of which may convict it on evidence rather than
+        on a score. If a suppression branch jumped to finalize_scan, a verified
+        signature would become a blanket exemption from every later detector,
+        which is exactly what the project's detection-integrity rule forbids.
+
+        BRACE-MATCHED, NOT WINDOWED. The first version of this test scanned a
+        fixed 900-character window after the counter increment. strip_c_comments
+        replaces comments with whitespace, so the real distance to the end of the
+        branch is mostly indentation, and a mutation that appended
+        goto finalize_scan landed just PAST the window and was not caught. The
+        branch is now delimited by its own braces, so its length cannot defeat
+        the check.
+        """
+        source = self._engine_source()
+
+        marker = "if (trust.suppress) {"
+        occurrences = []
+        pos = 0
+        while True:
+            i = source.find(marker, pos)
+            if i == -1:
+                break
+            occurrences.append(i)
+            pos = i + 1
+
+        self.assertGreaterEqual(
+            len(occurrences), 2,
+            "found %d trust-suppression branches, expected at least 2 (stage 5 "
+            "and stage 5.5); a lower count means a conviction site does not "
+            "suppress at all and this guard has no subject"
+            % len(occurrences))
+
+        offenders = []
+        for i in occurrences:
+            brace = source.index("{", i)
+            close = _matching_delimiter(source, brace, chr(123), chr(125))
+            self.assertGreater(
+                close, brace,
+                "could not brace-match the suppression branch at offset %d" % i)
+            branch = source[brace:close]
+            if "goto finalize_scan" in branch:
+                offenders.append(source[:i].count("\n") + 1)
+
+        self.assertEqual(
+            [], offenders,
+            "a trust-suppression branch reaches goto finalize_scan at line(s) "
+            "%s, so a verified signature would exempt the file from stages 6 "
+            "through 10 instead of only withholding a heuristic score"
+            % offenders)
+
+    def test_both_heuristic_conviction_sites_consult_trust(self):
+        """Stage 5 (HeuristicAnalyzer) and stage 5.5 (ExecutableAnalyzer) both
+        convicted OS binaries in the field, so both must ask. Deriving the
+        expected count from the number of conviction sites rather than hardcoding
+        it means adding a third heuristic verdict cannot silently skip trust."""
+        source = self._engine_source()
+
+        # Anchored on detectionSource, which is a real literal at each site.
+        # An earlier version keyed on the threat NAME "Heuristic:" and failed:
+        # stage 5 takes its name from heuristicResult.threatName, so that string
+        # never appears in this file. Derive the anchor from the artifact.
+        conviction_markers = (
+            'result.detectionSource = "Heuristic";',
+            'result.detectionSource = "ExecutableAnalyzer";',
+        )
+        missing = [m for m in conviction_markers if m not in source]
+        self.assertEqual(
+            [], missing,
+            "the heuristic conviction sites could not be located, so this guard "
+            "would pass without checking anything: %s" % missing)
+
+        calls = source.count("EvaluatePublisherTrust(")
+        # one definition plus one call per conviction site
+        self.assertGreaterEqual(
+            calls, 3,
+            "EvaluatePublisherTrust appears %d times. It needs its definition "
+            "plus a call at each of the two heuristic conviction sites, so at "
+            "least 3; a lower count means one conviction path convicts a signed "
+            "OS binary without asking" % calls)
+
+    def test_the_suppression_is_logged_at_info_not_debug(self):
+        """DigitalSignatureValidator already carries a trust-refusal diagnostic
+        at DEBUG for this exact defect, and the 1.0.109 service log contains ZERO
+        of those lines because the shipped level is INFO. A diagnostic nobody can
+        read has not been added, so the suppression must announce itself at a
+        level the field actually captures."""
+        source = self._engine_source()
+        idx = source.find("heuristicVerdictsSuppressedByTrust")
+        self.assertNotEqual(-1, idx)
+
+        # Look at each increment site and require an INFO log near it.
+        sites = []
+        start = 0
+        while True:
+            i = source.find("heuristicVerdictsSuppressedByTrust", start)
+            if i == -1:
+                break
+            if "fetch_add" in source[i:i + 200]:
+                sites.append(i)
+            start = i + 1
+        self.assertGreaterEqual(
+            len(sites), 2,
+            "found %d suppression increment sites, expected at least 2 (stage 5 "
+            "and stage 5.5)" % len(sites))
+
+        for site in sites:
+            window = source[site:site + 1200]
+            line = source[:site].count("\n") + 1
+            self.assertIn(
+                "SS_LOG_INFO", window,
+                "the suppression at line %d does not log at INFO, so a "
+                "withheld detection would be invisible in the field" % line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
