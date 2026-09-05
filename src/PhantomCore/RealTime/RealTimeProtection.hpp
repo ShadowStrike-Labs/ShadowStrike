@@ -904,6 +904,32 @@ struct alignas(64) RTPStatistics {
     /// were genuine faults.
     std::atomic<uint64_t> lockedNotExamined{ 0 };
 
+    /// Attempts skipped because the path was already known to be held open.
+    ///
+    /// This is a SUBSET of lockedNotExamined, not a separate class of file - the
+    /// two must be read together. lockedNotExamined counts files not examined;
+    /// this counts how many of those cost nothing to establish because the
+    /// condition had already been proven within HELD_OPEN_TTL.
+    ///
+    /// It exists to make the TTL tunable against evidence rather than taste. In
+    /// the 1.0.109 run one file was attempted 1,726 times at about 2.6 attempts
+    /// per second and each attempt cost roughly 21 ms across six subsystems, so
+    /// this number is what the five-second window is expected to remove - about
+    /// 92 percent of them. If it stays near zero while lockedNotExamined is
+    /// large, the suppression is not engaging and the TTL is too short; if the
+    /// ratio approaches one, the window could be shortened at no cost.
+    std::atomic<uint64_t> lockedAttemptsSuppressed{ 0 };
+
+    /// How often the bounded held-open path set was dropped wholesale.
+    ///
+    /// Expected to stay at zero: 32 distinct paths hit the condition in the
+    /// field run against a bound of 512. A non-zero value means either an
+    /// unexpectedly wide population or a process cycling paths it holds open,
+    /// and it matters because each clear costs one real re-attempt per path -
+    /// so a climbing number is the suppression paying for itself and then
+    /// throwing the result away.
+    std::atomic<uint64_t> lockedPathSetCleared{ 0 };
+
     // Blocking statistics
     std::atomic<uint64_t> filesBlocked{ 0 };
     std::atomic<uint64_t> processesBlocked{ 0 };

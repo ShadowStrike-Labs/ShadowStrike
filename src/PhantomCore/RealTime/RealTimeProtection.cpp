@@ -493,6 +493,47 @@ public:
     // always fully analyzed. Reuses ImageVerdictEntry (same shape).
     std::unordered_map<std::wstring, ImageVerdictEntry> m_fileVerdictCache;
 
+    // RECENTLY-UNOPENABLE PATHS, and the KEY IS THE PATH ALONE - deliberately
+    // NOT the identity key the cache above uses.
+    //
+    // The cache above is keyed on path|size|mtime, which is correct for a
+    // verdict: a file whose bytes changed must be re-examined. That is exactly
+    // why it cannot serve this purpose. The files that dominate a real run are
+    // ESE transaction logs being written continuously, so their size and mtime
+    // change on essentially every access; an identity-keyed entry would miss
+    // every single time, which is precisely how the storm survived alongside a
+    // working verdict cache.
+    //
+    // "Another process holds this file open" is a property of the HOLDER, not of
+    // the file's contents. It persists for as long as that service runs and is
+    // unaffected by the file changing. So the path is the whole key.
+    //
+    // WHAT IS STORED IS NOT A VERDICT. It records only that an open failed with
+    // a lock-class error and when. The caller still applies the configured
+    // failure policy itself, so FAIL_CLOSED still denies and FAIL_OPEN still
+    // allows exactly as they would after a full attempt.
+    mutable std::shared_mutex m_heldOpenMutex;
+    std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> m_heldOpenPaths;
+
+    // A SHORT LIFETIME IS THE WHOLE COVERAGE ARGUMENT, so it is stated where the
+    // number lives. Suppression defers an examination; it must never cancel one.
+    // If the holder releases the file, the entry has to expire quickly enough
+    // that the next access re-attempts it for real.
+    //
+    // MEASURED: the worst file in the 1.0.109 run was attempted 1,726 times in
+    // 675 seconds, about 2.6 attempts per second. At five seconds this removes
+    // roughly 92 percent of those attempts while bounding the window in which a
+    // just-released file goes unexamined to five seconds - and at that access
+    // rate the very next attempt after expiry arrives within half a second.
+    // CHOSEN, not measured: lockedAttemptsSuppressed is the number to tune it
+    // against, which is why that counter exists.
+    static constexpr auto HELD_OPEN_TTL = std::chrono::seconds(5);
+
+    // Bounded like every other cache here. 32 distinct paths hit this condition
+    // in the field run; 512 leaves room for a pathological case without letting
+    // a hostile process grow it without limit by cycling paths it holds open.
+    static constexpr size_t MAX_HELD_OPEN_PATHS = 512;
+
     // Recent Threats
     std::deque<ThreatEvent> m_recentThreats;
     static constexpr size_t MAX_RECENT_THREATS = 1000;
@@ -3707,6 +3748,52 @@ public:
                 // Directories have no file content to scan here.
                 return Communication::KernelVerdict::Allow;
             }
+
+            // THIRD CASE: THE FILE EXISTS AND WE HAVE ALREADY PROVEN WE CANNOT
+            // OPEN IT. The two checks above use metadata only, so they cannot
+            // see this one - GetFileAttributesW succeeds perfectly well on a
+            // file another process holds open exclusively. That is why the gate
+            // above, whose own comment describes this exact amplification,
+            // never caught the case that actually dominates a field run.
+            //
+            // MEASURED IN 1.0.109: one complete attempt on such a file costs
+            // about 21 ms and emits six failed opens from six subsystems. One
+            // file was attempted 1,726 times, so roughly 36 seconds went on
+            // re-failing against it; across the three ESE transaction logs
+            // involved that is about 90 seconds of a 675-second run - 13 percent
+            // of scan capacity - and every millisecond of it is charged to the
+            // thread the kernel is blocking a Windows service's write on.
+            //
+            // WHY THE VERDICT CACHE ABOVE DOES NOT ALREADY COVER THIS: it is
+            // consulted only for non-mutating access, and these files are being
+            // written, so the storm arrives on precisely the path that bypasses
+            // it. Even if it were consulted, its identity key changes on every
+            // write. See m_heldOpenPaths for why the key here is the path alone.
+            //
+            // THIS DEFERS AN EXAMINATION, IT DOES NOT CANCEL ONE. The entry
+            // expires in HELD_OPEN_TTL, so if the holder releases the file the
+            // next access re-attempts it for real. What is skipped is an attempt
+            // that had already been proven to fail, on a file whose bytes we
+            // were never able to read - so there is no examination being
+            // replaced by a weaker one.
+            //
+            // EXECUTE ACCESS IS NEVER SUPPRESSED. A pre-execution decision must
+            // always be taken on real evidence; this is the same exemption the
+            // latency budget below makes, for the same reason.
+            //
+            // THE FAILURE POLICY IS APPLIED HERE, NOT ASSUMED. A full attempt
+            // would have reached ScanEngine, returned ScanVerdict::Error and
+            // been mapped through m_config.failurePolicy - so FAIL_CLOSED denies
+            // and FAIL_OPEN allows. Returning Allow unconditionally would
+            // silently override an owner control on the one path where it is
+            // most likely to be set.
+            if (!isExecuteAccess && WasRecentlyHeldOpen(filePath)) {
+                m_stats.lockedNotExamined++;
+                m_stats.lockedAttemptsSuppressed++;
+                return m_config.failurePolicy == FailurePolicy::FAIL_CLOSED
+                    ? Communication::KernelVerdict::Block
+                    : Communication::KernelVerdict::Allow;
+            }
         }
 
         // =====================================================================
@@ -4255,6 +4342,18 @@ public:
                     // Counting those as scan faults made scanErrors meaningless
                     // and hid the 173 records that were genuine.
                     m_stats.lockedNotExamined++;
+
+                    // RECORD IT SO THE NEXT ACCESS DOES NOT REPEAT THE WHOLE
+                    // ATTEMPT. This is the only place the condition is learned
+                    // as fact rather than guessed: the engine has just told us
+                    // the open failed with a lock-class code. The gate near the
+                    // top of this handler reads what is written here.
+                    //
+                    // Deliberately NOT written for any other error class. A
+                    // cloud placeholder is handled by the branch above and has
+                    // its own remedy (fetch the content); a genuine fault must
+                    // keep being retried and keep being reported.
+                    NoteHeldOpen(filePath);
                 } else {
                     m_stats.scanErrors++;
                 }
@@ -6849,6 +6948,19 @@ public:
         m_imageVerdictCache.clear();
         m_fileVerdictCache.clear();
         m_performanceMetrics.cacheSize = 0;
+        {
+            // The held-open set is a cache and must be dropped with the others.
+            // Leaving it behind would make an operator's "clear the cache" only
+            // partly true, which is the class of defect this file has been
+            // repeatedly corrected for. Its own TTL is five seconds so the cost
+            // of dropping it is one real re-attempt per affected path.
+            //
+            // A separate mutex, so the ordering matters: this is the only site
+            // that holds both, and it takes them in this order. Nothing else
+            // acquires m_cacheMutex while holding m_heldOpenMutex.
+            std::unique_lock heldLock(m_heldOpenMutex);
+            m_heldOpenPaths.clear();
+        }
         Utils::Logger::Info("RealTimeProtection: Verdict cache cleared");
     }
 
@@ -6900,6 +7012,50 @@ public:
         }
         m_fileVerdictCache[key] = ImageVerdictEntry{
             verdict, Now() + std::chrono::milliseconds(m_config.cleanCacheTTLMs) };
+    }
+
+    // ---- Recently-unopenable paths (see m_heldOpenPaths) --------------------
+    //
+    // steady_clock, not the system clock every other cache here uses, and the
+    // reason is not stylistic: this TTL is five seconds, so a wall-clock
+    // adjustment - an NTP correction, a manual change, a resume from sleep -
+    // could make an entry appear arbitrarily old or arbitrarily fresh. Fresh is
+    // the dangerous direction, because it would extend suppression past the
+    // window this design justifies. A monotonic clock cannot do that.
+
+    void NoteHeldOpen(const std::wstring& filePath) {
+        std::unique_lock lock(m_heldOpenMutex);
+        if (m_heldOpenPaths.size() >= MAX_HELD_OPEN_PATHS) {
+            // Drop the whole set rather than evicting one entry. Re-warming
+            // costs a single real attempt per path, and the alternative -
+            // erase(begin()) on an unordered_map - evicts an arbitrary entry
+            // that may be the hot one, which is how a bounded cache degrades to
+            // no cache at all while still paying for itself.
+            m_heldOpenPaths.clear();
+            m_stats.lockedPathSetCleared++;
+        }
+        m_heldOpenPaths[ToLowerW(filePath)] = std::chrono::steady_clock::now();
+    }
+
+    bool WasRecentlyHeldOpen(const std::wstring& filePath) {
+        const std::wstring key = ToLowerW(filePath);
+        {
+            std::shared_lock lock(m_heldOpenMutex);
+            auto it = m_heldOpenPaths.find(key);
+            if (it == m_heldOpenPaths.end()) return false;
+            if (std::chrono::steady_clock::now() - it->second < HELD_OPEN_TTL) {
+                return true;
+            }
+        }
+        // Expired. Erase under a write lock so the set cannot grow without
+        // bound on paths whose holder has long since released them.
+        std::unique_lock lock(m_heldOpenMutex);
+        auto it = m_heldOpenPaths.find(key);
+        if (it != m_heldOpenPaths.end() &&
+            std::chrono::steady_clock::now() - it->second >= HELD_OPEN_TTL) {
+            m_heldOpenPaths.erase(it);
+        }
+        return false;
     }
 
     // =========================================================================
@@ -7210,6 +7366,8 @@ public:
         const uint64_t oversize     = m_stats.oversizeDeferred.load(std::memory_order_relaxed);
         const uint64_t notLocal     = m_stats.contentNotLocalNotExamined.load(std::memory_order_relaxed);
         const uint64_t lockedNE    = m_stats.lockedNotExamined.load(std::memory_order_relaxed);
+        const uint64_t lockedSupp  = m_stats.lockedAttemptsSuppressed.load(std::memory_order_relaxed);
+        const uint64_t lockedClear = m_stats.lockedPathSetCleared.load(std::memory_order_relaxed);
         const uint64_t sandboxCap   = m_stats.sandboxEvasionCapabilityDetected.load(std::memory_order_relaxed);
         // Both are SELF-EXEMPTION counters. They are reported because an
         // exemption nobody can see is how a de-noising guard quietly becomes a
@@ -7328,6 +7486,7 @@ public:
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "contentNotLocalNotExamined={} "
             "lockedNotExamined={} "
+            "lockedAttemptsSuppressed={} lockedPathSetCleared={} "
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
@@ -7337,7 +7496,7 @@ public:
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
-            cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, notifyBudget, replyHorizon, procWithheld,
+            cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
             exitBlockIgn, ownBinWithheld, ownHandleOps, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             kernelPart);
 
@@ -7852,6 +8011,8 @@ void RTPStatistics::Reset() noexcept {
     scanErrors = 0;
     contentNotLocalNotExamined = 0;
     lockedNotExamined = 0;
+    lockedAttemptsSuppressed = 0;
+    lockedPathSetCleared = 0;
     filesBlocked = 0;
     processesBlocked = 0;
     connectionsBlocked = 0;

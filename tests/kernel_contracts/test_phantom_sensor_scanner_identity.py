@@ -19233,5 +19233,243 @@ class LockedFileSeverityContractTests(unittest.TestCase):
             "all six calling sites at once." % hits)
 
 
+class HeldOpenSuppressionContractTests(unittest.TestCase):
+    """A path already proven unopenable must not be re-attempted in full.
+
+    MEASURED, 1.0.109: one complete attempt on a file another process holds open
+    costs about 21 ms and emits six failed opens from six subsystems. One file
+    was attempted 1,726 times, so roughly 36 seconds went on re-failing against
+    it; across the three ESE transaction logs involved that is about 90 seconds
+    of a 675-second run - 13 percent of scan capacity - and every millisecond is
+    charged to the thread the kernel blocks a Windows service's write on.
+
+    WHY THE EXISTING VERDICT CACHE DOES NOT COVER IT, measured rather than
+    assumed: it is consulted only for non-mutating access, and these files are
+    being written continuously, so the storm arrives on exactly the path that
+    bypasses it. Its identity key (path|size|mtime) would also change on every
+    write, so even if consulted it would miss every time.
+
+    WHY THESE ARE SOURCE CONTRACTS: the gate sits on OnKernelFileScan, which
+    needs a loaded driver, a live filter port and a file held with dwShareMode 0
+    by a DIFFERENT process. What can be driven in-process is already covered by
+    tests/unit/locked_file_not_examined. What cannot is the PLACEMENT of the gate
+    and the safety properties around it, and placement is the whole point - a
+    gate that drifts below the analyzers it exists to skip does nothing at all
+    while still looking correct.
+    """
+
+    GATE = "WasRecentlyHeldOpen(filePath)"
+
+    # Each must run AFTER the gate.
+    #
+    # ANCHOR CHOICE IS LOAD-BEARING, and getting it wrong here was caught by
+    # measurement rather than by reasoning: the obvious anchor for the scan stage
+    # -- "engineResult = ...ScanFile(filePath, context)" -- occurs TWICE in this
+    # file, once on the on-access path and once in Impl::ScanFile. find() would
+    # have silently taken whichever came first, so the ordering check would have
+    # been correct only by luck. Every anchor below is asserted unique.
+    CONTENT_STAGES = (
+        ("MetamorphicDetector", "m_metamorphicDetector->AnalyzeFile(filePath, metaCfg)"),
+        ("PackerDetector", "m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr)"),
+        ("ExecutableAnalyzer", 'SS_DIAG_SCOPE("OnAccess", "ExecutableAnalyzer::AnalyzeForKernel")'),
+        ("ScanEngine", "Core::Engine::EngineResult engineResult;"),
+    )
+
+    def _rtp(self):
+        return strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+    def test_the_gate_is_consulted_exactly_once_on_the_on_access_path(self):
+        """Anti-vacuity for everything below, which is scoped by this offset."""
+        source = self._rtp()
+        n = source.count(self.GATE)
+        self.assertEqual(
+            1, n,
+            "expected exactly one on-access consultation of the held-open set, "
+            "found %d. Every assertion in this class is positioned relative to "
+            "it." % n)
+
+    def test_the_gate_precedes_every_content_analyzer(self):
+        """The invariant that makes the fix worth anything.
+
+        Six subsystems each open the file independently. Skipping only the last
+        of them would leave five sixths of the cost in place - which is exactly
+        the shape of the defect this replaces, where a gate inside ScanFile could
+        not cover analyzers that run several hundred lines above it.
+        """
+        source = self._rtp()
+        gate = source.find(self.GATE)
+        self.assertNotEqual(-1, gate, "the held-open gate is gone")
+
+        for label, anchor in self.CONTENT_STAGES:
+            n = source.count(anchor)
+            self.assertEqual(
+                1, n,
+                "%s: stage anchor occurs %d times, expected exactly 1. An "
+                "ordering check against a non-unique anchor compares the gate "
+                "with whichever copy happens to come first, which is luck "
+                "rather than evidence." % (label, n))
+            at = source.find(anchor)
+            self.assertLess(
+                gate, at,
+                "the held-open gate is at offset %d but %s runs at offset %d, "
+                "so that analyzer still opens and re-fails on a file already "
+                "known to be held open" % (gate, label, at))
+
+    def test_execute_access_is_never_suppressed(self):
+        """A pre-execution decision must always rest on real evidence.
+
+        The same exemption the latency budget makes ("never cut short the
+        pre-execution decision"), for the same reason. Without it a binary could
+        be allowed to run on the strength of a cached open failure.
+        """
+        source = self._rtp()
+        gate = source.find(self.GATE)
+        window = source[max(0, gate - 200):gate]
+        self.assertIn(
+            "!isExecuteAccess", window,
+            "the held-open suppression is not gated on non-execute access, so a "
+            "file could be allowed to execute without ever having been examined")
+
+    def test_the_suppression_honours_the_configured_failure_policy(self):
+        """Returning Allow unconditionally would override an owner control.
+
+        A full attempt reaches ScanEngine, returns ScanVerdict::Error and is
+        mapped through m_config.failurePolicy - so FAIL_CLOSED denies. The
+        suppressed path must reach the same answer, or enabling FAIL_CLOSED would
+        silently stop working on the one class of file most likely to hit it.
+        """
+        source = self._rtp()
+        gate = source.find(self.GATE)
+        window = source[gate:gate + 700]
+        for token in ("failurePolicy", "FAIL_CLOSED", "KernelVerdict::Block"):
+            self.assertIn(
+                token, window,
+                "the suppressed path does not mention %s, so it cannot be "
+                "reproducing the verdict a full attempt would have produced"
+                % token)
+
+    def test_an_entry_is_recorded_only_where_the_lock_is_proven(self):
+        """Never guessed, and never for another error class.
+
+        A cloud placeholder has its own remedy and its own counter; a genuine
+        fault must keep being retried and keep being reported. Only the engine
+        reporting a lock-class code is evidence, so the write must sit in that
+        arm.
+        """
+        source = self._rtp()
+        occurrences = [m.start() for m in re.finditer(r"NoteHeldOpen\(", source)]
+        # The DEFINITION must be identified explicitly, not inferred from file
+        # order. It sits about 96,000 characters AFTER its only call site, so
+        # taking the last occurrence picks the definition and measures a
+        # meaningless distance - the same trap as slicing a function by its name
+        # when the callers precede the body.
+        defn = source.find("void NoteHeldOpen(const std::wstring&")
+        self.assertNotEqual(
+            -1, defn, "the NoteHeldOpen definition is gone")
+        call_sites = [o for o in occurrences if not defn <= o <= defn + 40]
+        self.assertEqual(
+            1, len(call_sites),
+            "expected exactly one NoteHeldOpen call site, found %d. More than "
+            "one means the entry is being recorded somewhere this guard has not "
+            "established the evidence for." % len(call_sites))
+
+        classifier = source.find("IsFileLockedError(engineResult.errorCode)")
+        self.assertNotEqual(
+            -1, classifier,
+            "the engine-result classifier is gone, so there is no proven-lock "
+            "arm for the entry to be recorded in")
+        call = call_sites[0]
+        self.assertLess(
+            classifier, call,
+            "the held-open entry is recorded at offset %d, before the "
+            "lock-class classifier at offset %d - so it is being written on "
+            "evidence that has not been established" % (call, classifier))
+        self.assertLess(
+            call - classifier, 1500,
+            "the held-open entry is recorded %d characters after the classifier, "
+            "which is too far to still be inside that arm" % (call - classifier))
+
+    def test_the_key_is_the_path_alone(self):
+        """The measurement that inverted the original design.
+
+        Keying this on the identity used by the verdict cache (path|size|mtime)
+        would miss every time, because the files that cause the storm are written
+        continuously. "Another process holds this open" is a property of the
+        holder, not of the contents.
+        """
+        source = self._rtp()
+        decl = re.search(
+            r"std::unordered_map<\s*std::wstring\s*,\s*"
+            r"std::chrono::steady_clock::time_point\s*>\s*m_heldOpenPaths",
+            source)
+        self.assertIsNotNone(
+            decl,
+            "m_heldOpenPaths is no longer a path-keyed map of monotonic "
+            "timestamps; if it has become identity-keyed it will miss on every "
+            "write, which is the defect it was built to fix")
+
+        for fn in ("NoteHeldOpen", "WasRecentlyHeldOpen"):
+            body = extract_c_function(source, fn)
+            hits = body.count("fileIdentityKey")
+            self.assertEqual(
+                0, hits,
+                "%s references the verdict cache's identity key %d time(s); "
+                "that key changes on every write to the files this exists for"
+                % (fn, hits))
+
+    def test_the_suppression_window_stays_short(self):
+        """A ceiling, because the window IS the coverage argument.
+
+        Suppression defers an examination; the TTL bounds how long. At the
+        measured access rate a released file is re-attempted within half a second
+        of expiry, but that only holds while the window is small.
+        """
+        source = self._rtp()
+        m = re.search(r"HELD_OPEN_TTL\s*=\s*std::chrono::seconds\((\d+)\)", source)
+        self.assertIsNotNone(
+            m, "HELD_OPEN_TTL is no longer declared in seconds, so the window "
+               "this design depends on cannot be read")
+        secs = int(m.group(1))
+        self.assertGreater(
+            secs, 0,
+            "a zero window disables the suppression while leaving its cost")
+        self.assertLessEqual(
+            secs, 30,
+            "the held-open window is %d seconds. Beyond about 30 the deferral "
+            "stops being negligible: a file whose holder released it would go "
+            "unexamined for that long on a path where the verdict is served "
+            "without any examination at all." % secs)
+
+    def test_the_new_counters_cannot_become_structural_zeros(self):
+        """Plumbed through declaration, increment, report and reset.
+
+        A counter that is declared and never published reads as healthy no
+        matter what happens - the defect that let an empty scan pool report
+        pool=0/0 for a whole field run.
+        """
+        cpp = self._rtp()
+        hpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+        for name in ("lockedAttemptsSuppressed", "lockedPathSetCleared"):
+            self.assertIn(
+                name, hpp,
+                "%s is not declared in the statistics struct" % name)
+            hits = cpp.count(name)
+            self.assertGreaterEqual(
+                hits, 4,
+                "%s occurs %d time(s) in the implementation, expected at least "
+                "4 - the increment, the report load, the report format string "
+                "and the reset. Fewer means it is either never moved or never "
+                "published." % (name, hits))
+
+    def test_clearing_the_cache_drops_the_held_open_set(self):
+        """Otherwise "clear the cache" is only partly true."""
+        cpp = self._rtp()
+        body = extract_c_function(cpp, "ClearVerdictCache")
+        self.assertIn(
+            "m_heldOpenPaths.clear()", body,
+            "ClearVerdictCache does not drop the held-open set, so an operator "
+            "clearing the cache would leave suppression entries in place")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
