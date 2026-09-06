@@ -19471,5 +19471,226 @@ class HeldOpenSuppressionContractTests(unittest.TestCase):
             "clearing the cache would leave suppression entries in place")
 
 
+class OnAccessFileIdentityKeyContractTests(unittest.TestCase):
+    """The on-access identity key and the verdict it publishes must name the same content.
+
+    FIELD DEFECT, 1.0.110: 397 trust determinations performed,
+    trustVerdictsCached=0. A structural zero, not a ratio.
+
+    RealTimeProtection builds a "path|size|mtime" identity key when it receives a
+    kernel scan request, and SignatureDeterminationLoop RE-DERIVES that key on its
+    own thread before publishing an Allow, so that a verdict is only published for
+    content that is still present. The two derivations read the size from different
+    places:
+
+        queue site   req.FileSize          - the kernel's reported size
+        publish site GetFileAttributesExW  - the Win32 on-disk size
+
+    and the kernel fills FileSize only when it can. ScanBridge.c initialises it to
+    zero and overwrites it only if FltQueryInformationFile succeeds, which on a
+    pre-create it commonly does not, and CommPort.c leaves it zero outright. Zero is
+    deliberate and correct there - it means "unknown", and no size guard rejects
+    zero, so the file still gets analysed. But "path|0|mtime" can never equal
+    "path|<real>|mtime", so the publish-side comparison failed every single time and
+    the trust fast path could never warm. The expensive work was done on the right
+    thread and every answer was discarded.
+
+    NOTE ON WHY THESE ARE SOURCE CONTRACTS RATHER THAN BEHAVIOURAL TESTS: the key
+    construction and both cache ends are private members of the RTP implementation,
+    and reaching them behaviourally means initialising RealTimeProtection, which
+    deploys honeypot files and hardens ACLs on the host running the suite. That is
+    not acceptable in a unit test, so the invariant is pinned at the source instead
+    and the reason is recorded here rather than left as an unexplained choice.
+
+    COMMENTS ARE STRIPPED BEFORE EVERY ASSERTION AND THAT IS LOAD-BEARING, not
+    hygiene: the explanatory comment at the fixed site names req.FileSize and
+    nFileSizeHigh in prose, so an assertion run against the raw text would be
+    satisfied - or broken - by the comment rather than by the code.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.scan_bridge_c = strip_c_comments(read_source(SCAN_BRIDGE_C_PATH))
+
+    def _mutating_block(self) -> str:
+        """The `if (!mutating) { ... }` block that builds the on-access identity key."""
+        anchor = "if (!mutating) {"
+        occurrences = self.rtp.count(anchor)
+        self.assertEqual(
+            1, occurrences,
+            "expected exactly one `if (!mutating) {{` block in RealTimeProtection.cpp "
+            "so this slice is unambiguous, found {}. Failing loudly rather than "
+            "guessing which one builds the identity key.".format(occurrences))
+        start = self.rtp.index(anchor)
+        brace = self.rtp.index("{", start)
+        end = _matching_delimiter(self.rtp, brace, "{", "}")
+        self.assertGreater(end, brace, "could not brace-match the !mutating block")
+        return self.rtp[brace:end + 1]
+
+    def _worker_body(self) -> str:
+        body = extract_c_function(self.rtp, "SignatureDeterminationLoop")
+        self.assertTrue(body, "SignatureDeterminationLoop not found")
+        return body
+
+    def test_the_on_access_identity_key_takes_its_size_from_the_attribute_query(self) -> None:
+        """The queue site must not name content using a size the kernel may not know."""
+        block = self._mutating_block()
+
+        # Anti-vacuity: the thing under test must still be here. A deletion of the
+        # key construction would otherwise satisfy every assertion below.
+        self.assertIn(
+            "fileIdentityKey =", block,
+            "the !mutating block no longer assigns fileIdentityKey, so this test is "
+            "guarding nothing")
+
+        self.assertEqual(
+            0, block.count("req.FileSize"),
+            "the on-access identity key is being built from req.FileSize again. "
+            "The kernel documents that field as zero-when-unknown (ScanBridge.c "
+            "initialises it to 0 and only overwrites it if FltQueryInformationFile "
+            "succeeds), while SignatureDeterminationLoop re-derives the key from "
+            "GetFileAttributesExW. A key containing |0| can never equal one "
+            "containing the real size, so the publish-side comparison fails every "
+            "time and the trust fast path silently never warms - which is exactly "
+            "the 1.0.110 field result of 397 determinations and trustVerdictsCached=0")
+
+        for field in ("nFileSizeHigh", "nFileSizeLow"):
+            self.assertIn(
+                field, block,
+                "the identity key must derive its size from the same "
+                "GetFileAttributesExW result the publish site uses, so {} is "
+                "expected in this block".format(field))
+
+    def test_the_publish_side_derives_the_key_from_the_same_two_fields(self) -> None:
+        """Cross-artifact: whatever the queue site names the size, the worker must match.
+
+        The expected field set is DERIVED from the queue site rather than written as
+        a literal here, so the two cannot drift apart while both tests still pass.
+        """
+        block = self._mutating_block()
+        worker = self._worker_body()
+
+        size_fields = sorted(
+            f for f in ("nFileSizeHigh", "nFileSizeLow", "req.FileSize")
+            if f in block)
+        self.assertTrue(
+            size_fields,
+            "could not determine how the queue site derives its size, so the "
+            "cross-check below would be vacuous")
+
+        for field in size_fields:
+            self.assertIn(
+                field, worker,
+                "the queue site derives the identity size from {} but "
+                "SignatureDeterminationLoop does not, so the key it re-derives "
+                "cannot match the key it was given and no verdict is ever "
+                "published".format(field))
+
+        # Anti-vacuity: the comparison this whole invariant exists to serve.
+        self.assertIn(
+            "currentKey != identityKey", worker,
+            "SignatureDeterminationLoop no longer compares the re-derived key "
+            "against the one it was given. That comparison is what binds a "
+            "published verdict to content that was still present when the verdict "
+            "was reached; removing it would reopen the swap window rather than fix "
+            "the mismatch")
+
+    def test_the_maximum_size_guard_still_uses_the_kernel_reported_size(self) -> None:
+        """Correcting the identity key must NOT be extended to the size guard.
+
+        This test exists to prevent an over-correction that would cost coverage.
+        req.FileSize is zero when the kernel could not determine a size, and the
+        maximum-size guard relies on that: zero is below every bound, so an
+        unmeasurable file is still analysed. Substituting a real on-disk size there
+        would start SKIPPING large files that are currently scanned, which is a
+        detection loss dressed up as consistency.
+        """
+        self.assertIn(
+            "req.FileSize > sizeBound", self.rtp,
+            "the maximum-size guard no longer compares req.FileSize against its "
+            "bound. If this was changed to use a real on-disk size, files above "
+            "the bound that are scanned today would start being skipped - the "
+            "unsafe direction. The kernel's zero-means-unknown contract is what "
+            "keeps an unmeasurable file in the pipeline")
+
+        # And it must be the size guard, not the identity key, that uses it.
+        self.assertEqual(
+            0, self._mutating_block().count("req.FileSize"),
+            "req.FileSize belongs at the size guard and not in the identity key")
+
+    def test_both_verdict_cache_ends_refuse_an_empty_key(self) -> None:
+        """An empty key is not a name, and neither end may treat it as one.
+
+        Callers leave the key empty when they could not determine a file's identity.
+        If either end accepted it, every such file would share the single entry
+        stored under "", which is a cross-file collision on the ALLOW path: one
+        file's benign verdict served for a different file.
+        """
+        for name in ("CheckFileVerdictCache", "UpdateFileVerdictCache"):
+            body = extract_c_function(self.rtp, name)
+            self.assertTrue(body, "{} not found".format(name))
+
+            # Anti-deletion: the map access must still exist, otherwise emptying the
+            # function would satisfy the ordering assertion trivially.
+            self.assertIn(
+                "m_fileVerdictCache", body,
+                "{} no longer touches the verdict cache at all".format(name))
+
+            guard = "key.empty()"
+            self.assertIn(
+                guard, body,
+                "{} does not refuse an empty identity key. A caller that could not "
+                "identify a file leaves the key empty, and without this guard every "
+                "such file shares one cache entry keyed on the empty string - so an "
+                "Allow cached for one file would be served for another".format(name))
+
+            guard_at = body.index(guard)
+            self.assertEqual(
+                1, body.count(guard),
+                "expected exactly one empty-key guard in {} so the ordering check "
+                "below is unambiguous".format(name))
+            map_at = body.index("m_fileVerdictCache")
+            self.assertLess(
+                guard_at, map_at,
+                "{}'s empty-key guard must run BEFORE it touches "
+                "m_fileVerdictCache, otherwise the collision it exists to prevent "
+                "has already happened".format(name))
+
+    def test_the_driver_still_reports_zero_when_it_cannot_size_a_file(self) -> None:
+        """The premise the user-mode fix rests on, pinned on the driver side.
+
+        If the driver ever starts guaranteeing a real size in every scan request,
+        the reasoning above changes and this test is where the next reader finds
+        out - rather than discovering it from another zeroed counter in the field.
+        """
+        default_assign = "scanRequest->FileSize = 0;"
+        real_assign = "scanRequest->FileSize = fileInfo.EndOfFile.QuadPart;"
+
+        self.assertIn(
+            default_assign, self.scan_bridge_c,
+            "ScanBridge.c no longer defaults the scan request size to zero")
+        self.assertIn(
+            real_assign, self.scan_bridge_c,
+            "ScanBridge.c no longer fills a real size when it can, so the size "
+            "would always be unknown")
+
+        default_at = self.scan_bridge_c.index(default_assign)
+        real_at = self.scan_bridge_c.index(real_assign)
+        self.assertLess(
+            default_at, real_at,
+            "the zero default must come first; a real size assigned before the "
+            "default would be overwritten by it")
+
+        # The real size must be gated on the query having SUCCEEDED. Scan backward
+        # from the assignment to its enclosing gate rather than forward, because a
+        # forward scan cannot see the condition that governs it.
+        preceding = self.scan_bridge_c[max(0, real_at - 700):real_at]
+        self.assertIn(
+            "NT_SUCCESS", preceding,
+            "the real size is no longer gated on the information query succeeding, "
+            "which would hand user mode an uninitialised size")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

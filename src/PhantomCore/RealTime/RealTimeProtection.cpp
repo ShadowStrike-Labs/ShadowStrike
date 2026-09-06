@@ -3529,16 +3529,66 @@ public:
                 at == static_cast<uint8_t>(ShadowStrikeAccessRename) ||
                 at == static_cast<uint8_t>(ShadowStrikeAccessDelete);
             if (!mutating) {
+                // BOTH TERMS MUST COME FROM THIS ONE QUERY.
+                //
+                // They did not, and that is what made the trust fast path dead
+                // code. This key is re-derived by SignatureDeterminationLoop
+                // before it publishes a verdict, and that re-derivation reads the
+                // size from GetFileAttributesExW - while this site used to read it
+                // from req.FileSize, which the kernel fills only when it can:
+                //
+                //   ScanBridge.c:885    scanRequest->FileSize = 0;
+                //   ScanBridge.c:903    ... = fileInfo.EndOfFile.QuadPart;  // only
+                //                       if FltObjects->FileObject != NULL and
+                //                       FltQueryInformationFile SUCCEEDS
+                //   CommPort.c:5486     scanRequest->FileSize = 0;
+                //                       // "Set in post-create if needed"
+                //
+                // On a pre-create the file is not open yet, so that query commonly
+                // fails and the field is legitimately 0 - the driver documents 0 as
+                // "unknown" on purpose, because no size guard rejects 0 and the file
+                // therefore still gets analysed. But an identity key of
+                // "path|0|mtime" can never equal the worker's "path|<real>|mtime",
+                // so the comparison at the publish site failed EVERY time and
+                // UpdateFileVerdictCache was never reached from that thread.
+                //
+                // MEASURED IN THE FIELD, 1.0.110: 397 trust determinations
+                // performed, trustVerdictsCached=0. Not a ratio - a structural zero.
+                // The worker did the expensive work, on the right thread, and threw
+                // every answer away.
+                //
+                // req.FileSize is deliberately left alone at the maximum-size guard
+                // further down: there 0 means "unknown, so do not skip", which is
+                // the safe direction and must stay that way.
                 uint64_t mtime = 0;
+                uint64_t size  = 0;
+                bool     identityKnown = false;
                 WIN32_FILE_ATTRIBUTE_DATA fad{};
                 SS_DIAG("OnAccess", "step.GetFileAttributesExW");
                 if (GetFileAttributesExW(filePath.c_str(), GetFileExInfoStandard, &fad)) {
                     mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
                           |  static_cast<uint64_t>(fad.ftLastWriteTime.dwLowDateTime);
+                    size  = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32)
+                          |  static_cast<uint64_t>(fad.nFileSizeLow);
+                    identityKnown = true;
                 }
-                fileIdentityKey = ToLowerW(filePath) + L"|" +
-                    std::to_wstring(static_cast<unsigned long long>(req.FileSize)) + L"|" +
-                    std::to_wstring(static_cast<unsigned long long>(mtime));
+                // If the query failed we do not know what this content is, so we
+                // must not name it. Leaving the key EMPTY is the honest state and a
+                // state the rest of the path already handles: the verdict cache
+                // refuses an empty key at both ends, and
+                // QueueSignatureDetermination documents an empty key as "just
+                // establish the verdict" - the validator's own cache still gets
+                // warmed, and this access takes the full pipeline.
+                //
+                // The previous behaviour fabricated "path|0|0" here, which is worse
+                // than useless: it is a name shared by every failed query for that
+                // path, so an Allow cached under it could be served for content that
+                // had changed in a way we could not see.
+                if (identityKnown) {
+                    fileIdentityKey = ToLowerW(filePath) + L"|" +
+                        std::to_wstring(static_cast<unsigned long long>(size)) + L"|" +
+                        std::to_wstring(static_cast<unsigned long long>(mtime));
+                }
                 SS_DIAG("OnAccess", "step.CheckFileVerdictCache");
                 if (auto cached = CheckFileVerdictCache(fileIdentityKey)) {
                     m_stats.cleanFiles++;
@@ -6990,9 +7040,21 @@ public:
     }
 
     // ---- On-access file verdict cache (see m_fileVerdictCache) --------------
+    // AN EMPTY KEY IS NOT A NAME, AND BOTH ENDS REFUSE IT.
+    //
+    // The callers derive this key from a file's path, size and last-write time, and
+    // any of those can be unavailable - a query on a locked or vanishing file fails.
+    // A caller that cannot name the content leaves the key empty, and if these two
+    // accepted it, every such file would share the single entry stored under "".
+    // That is a cross-file collision on the ALLOW path: one file's benign verdict
+    // would be served for a completely different file. Refusing here rather than
+    // trusting callers means a future caller cannot reintroduce it, and the cost of
+    // refusing is exactly one full analysis of a file we could not identify - the
+    // safe direction.
     std::optional<Communication::KernelVerdict>
     CheckFileVerdictCache(const std::wstring& key) {
         if (!m_config.useVerdictCache) return std::nullopt;
+        if (key.empty()) return std::nullopt;
         std::shared_lock lock(m_cacheMutex);
         auto it = m_fileVerdictCache.find(key);
         if (it == m_fileVerdictCache.end()) return std::nullopt;
@@ -7003,6 +7065,7 @@ public:
     void UpdateFileVerdictCache(const std::wstring& key,
                                 Communication::KernelVerdict verdict) {
         if (!m_config.useVerdictCache) return;
+        if (key.empty()) return;
         // Only benign Allow verdicts are memoized. Block/Suspicious/Monitor must
         // be re-evaluated on every access so a threat is never cached away.
         if (verdict != Communication::KernelVerdict::Allow) return;
