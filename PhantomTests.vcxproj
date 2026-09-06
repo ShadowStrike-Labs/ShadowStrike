@@ -88,7 +88,7 @@
            tests cannot test that code. -->
       <LanguageStandard>stdcpp23</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalOptions>/Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /Zc:__cplusplus /bigobj %(AdditionalOptions)</AdditionalOptions>
       <ExceptionHandling>Sync</ExceptionHandling>
       <WarningLevel>Level3</WarningLevel>
       <!-- Tests are not held to /WX: a warning in a test is not a product defect

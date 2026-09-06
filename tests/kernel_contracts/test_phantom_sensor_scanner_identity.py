@@ -19692,5 +19692,185 @@ class OnAccessFileIdentityKeyContractTests(unittest.TestCase):
             "which would hand user mode an uninitialised size")
 
 
+class SourceCharsetContractTests(unittest.TestCase):
+    """The compiler must be told the source tree is UTF-8, and told it the RIGHT way.
+
+    MEASURED DEFECT: 1021 non-ASCII characters live inside WIDE string literals
+    across 211 of our own sources. Not one product project passed a charset switch
+    and only 22 of those files carry a BOM, so MSVC fell back to the machine's ANSI
+    code page - 1254 on this host, confirmed by GetACP() and by the registry. Under
+    that fallback each UTF-8 byte becomes its OWN wchar_t.
+
+    PROVEN BY PROBE, not by reading the documentation. One source file, three
+    compilations, the same literal L"[<U+2014>|<U+043E>|<U+6587>]":
+
+        switch                    WIDE literal          NARROW literal
+        (none, today)             n=12  CORRUPT         12 bytes, same as source
+        /source-charset:utf-8     n=7   correct          7 bytes - DATA LOSS
+        /utf-8                    n=7   correct         12 bytes, same as source
+
+    THE MIDDLE ROW IS WHY THIS TEST EXISTS. /source-charset:utf-8 alone looks like
+    the surgical choice and is the one a reader will reach for. It fixes the wide
+    literals and then silently destroys the narrow ones: the execution charset stays
+    at the ANSI code page, so every character that code page cannot represent is
+    replaced by a literal '?' (0x3F). The probe showed Cyrillic and CJK becoming
+    '?' with warning C4566. There are 862 non-ASCII characters in narrow literals,
+    so that switch would trade one corruption for another.
+
+    /utf-8 sets BOTH charsets, which fixes the wide literals AND leaves every narrow
+    literal byte-for-byte identical to today - because today's narrow literals only
+    survive by accident, round-tripping through the ANSI code page unchanged.
+
+    It also makes the build reproducible. Today the wide-literal bytes depend on the
+    ANSI code page of whatever machine ran the compiler, so two developers produce
+    different binaries from identical sources.
+    """
+
+    # Projects that compile at least one source holding a non-ASCII wide literal.
+    # DERIVED from the artifact by the first test rather than written down here, so
+    # this list cannot drift away from what the tree actually contains.
+    _WIDE_RE = re.compile(r'L"((?:[^"\\\n]|\\.)*)"')
+    _INCLUDE_RE = re.compile(r'<ClCompile\s+Include="([^"]+)"')
+
+    @classmethod
+    def _decode(cls, path: Path) -> str:
+        raw = path.read_bytes()
+        body = raw[3:] if raw[:3] == b"\xef\xbb\xbf" else raw
+        return body.decode("utf-8", errors="replace")
+
+    @classmethod
+    def _wide_nonascii_count(cls, path: Path) -> int:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return 0
+        if not any(b > 127 for b in raw):
+            return 0
+        # Comments are stripped FIRST. A non-ASCII character in a comment is also
+        # mis-decoded but is then discarded by the compiler, so counting it would
+        # overstate the defect and could make a project look affected when the only
+        # thing wrong with it is prose.
+        text = strip_c_comments(cls._decode(path))
+        return sum(1 for m in cls._WIDE_RE.finditer(text)
+                   for ch in m.group(1) if ord(ch) > 127)
+
+    @classmethod
+    def _project_sources(cls, project: Path):
+        text = read_source(project)
+        for inc in cls._INCLUDE_RE.findall(text):
+            candidate = (project.parent / inc.replace("\\", "/")).resolve()
+            if candidate.exists():
+                yield candidate
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.projects = sorted(
+            [p for p in ROOT.glob("*.vcxproj")]
+            + [p for p in (ROOT / "Fuzzer").glob("*.vcxproj")]
+            + [p for p in (ROOT / "PhantomSensor").glob("*.vcxproj")]
+        )
+        cls.assertTrue(cls, cls.projects)
+
+    def test_every_project_compiling_a_wide_literal_declares_the_charset(self) -> None:
+        """A project that compiles an affected source must pass /utf-8."""
+        affected, missing = [], []
+        for project in self.projects:
+            total = sum(self._wide_nonascii_count(s) for s in self._project_sources(project))
+            if total == 0:
+                continue
+            affected.append(project.name)
+            if "/utf-8" not in read_source(project):
+                missing.append("{} ({} affected characters)".format(project.name, total))
+
+        self.assertTrue(
+            affected,
+            "no project was found compiling a non-ASCII wide literal, so this test "
+            "would pass vacuously - the derivation is broken, not the tree")
+
+        self.assertEqual(
+            [], missing,
+            "these projects compile sources holding non-ASCII WIDE string literals "
+            "and do not pass /utf-8, so MSVC decodes those files with the build "
+            "machine's ANSI code page and each UTF-8 byte becomes its own wchar_t: "
+            + "; ".join(missing))
+
+    def test_the_narrow_destroying_switch_is_never_used_alone(self) -> None:
+        """/source-charset:utf-8 without /execution-charset replaces narrow data with '?'.
+
+        Refused by name because it is the plausible-looking wrong answer, and its
+        damage is silent and irreversible - the bytes are gone at compile time.
+        """
+        offenders = []
+        for project in self.projects:
+            text = read_source(project)
+            if "/source-charset" in text and "/execution-charset" not in text:
+                offenders.append(project.name)
+        self.assertEqual(
+            [], offenders,
+            "/source-charset:utf-8 alone leaves the execution charset at the ANSI "
+            "code page, so every narrow-literal character that code page cannot "
+            "represent becomes a literal '?' (measured: Cyrillic and CJK, with "
+            "warning C4566). Use /utf-8, which sets both: " + ", ".join(offenders))
+
+    def test_every_non_ascii_source_is_valid_utf8(self) -> None:
+        """/utf-8 is only safe while every file really is UTF-8.
+
+        A file that is genuinely ANSI-encoded would stop compiling under /utf-8
+        (C4828), so this is the precondition the switch depends on. Measured 0
+        offenders when the switch was introduced.
+        """
+        skip = {"vendor", "include", "PhantomCortex", "build", "bin", "lib", "obj",
+                "node_modules", ".git", "x64"}
+        offenders = []
+        checked = 0
+        for path in ROOT.rglob("*"):
+            if path.suffix.lower() not in (".c", ".cpp", ".h", ".hpp", ".inl"):
+                continue
+            if any(part in skip or part.startswith(".venv") for part in path.parts):
+                continue
+            raw = path.read_bytes()
+            if not any(b > 127 for b in raw):
+                continue
+            checked += 1
+            body = raw[3:] if raw[:3] == b"\xef\xbb\xbf" else raw
+            try:
+                body.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                offenders.append("{} at offset {}".format(
+                    path.relative_to(ROOT).as_posix(), exc.start))
+
+        self.assertGreater(
+            checked, 0,
+            "no non-ASCII source was examined, so this test would pass vacuously")
+        self.assertEqual(
+            [], offenders,
+            "these sources hold non-ASCII bytes that are not valid UTF-8, so /utf-8 "
+            "cannot decode them and the build would fail: " + "; ".join(offenders[:20]))
+
+    def test_the_kernel_driver_exclusion_stays_justified(self) -> None:
+        """The driver was left out because it has NOTHING to fix - keep that true.
+
+        PhantomSensor was deliberately excluded from this change: it compiles zero
+        sources holding a non-ASCII wide literal, so the switch would buy nothing,
+        and a kernel compiler change that cannot be verified by a build must not be
+        made speculatively (the catalog step is externally blocked - task 101).
+        If the driver ever gains such a literal this test fires and says so.
+        """
+        driver = ROOT / "PhantomSensor" / "PhantomSensor.vcxproj"
+        self.assertTrue(driver.exists(), "driver project not found")
+
+        total = sum(self._wide_nonascii_count(s) for s in self._project_sources(driver))
+        if "/utf-8" in read_source(driver):
+            return  # someone has since added it deliberately; nothing to enforce
+
+        self.assertEqual(
+            0, total,
+            "the kernel driver now compiles {} non-ASCII characters inside wide "
+            "string literals while still not passing /utf-8, so they are being "
+            "decoded with the build machine's ANSI code page. The exclusion was "
+            "justified only by that count being zero - revisit it, and verify any "
+            "driver change with a real driver build".format(total))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

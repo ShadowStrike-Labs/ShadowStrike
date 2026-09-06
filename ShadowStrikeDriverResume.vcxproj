@@ -56,7 +56,7 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
       <!-- SEH (__try/__except) is used in wmain. /EHa enables C++ EH interop with SEH; -->
       <!-- set via ExceptionHandling element rather than AdditionalOptions to avoid clash -->
       <ExceptionHandling>Async</ExceptionHandling>
