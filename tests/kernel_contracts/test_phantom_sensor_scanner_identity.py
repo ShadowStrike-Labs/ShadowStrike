@@ -3285,7 +3285,12 @@ class SourceContractTests(unittest.TestCase):
         # Each guard, and the offset it must precede.
         for label, needle in (
             ("own-process refusal", "::GetCurrentProcessId()"),
-            ("own-install-directory refusal", "GetModuleFileNameW"),
+            # Named for the policy, not for the Win32 call that used to implement
+            # it inline: the check is now a shared helper so the manual
+            # BlockProcess path applies exactly the same test, and an anchor on
+            # GetModuleFileNameW would both miss it and be satisfiable by an
+            # unrelated use of that API elsewhere in this file.
+            ("own-install-directory refusal", "ImageIsInsideOurInstallDirectory("),
             ("protection-mode gate", "ProtectionMode::BLOCK_SUSPICIOUS"),
             ("Microsoft-signed check", "TryGetCachedMicrosoftSigned"),
             ("undetermined-signature withhold", "msTrust.has_value()"),
@@ -20655,6 +20660,217 @@ class TrustStatisticsVisibilityContractTests(unittest.TestCase):
                 "publishing the whole struct. A hand-maintained list goes stale "
                 "the next time a counter is added, silently, which is exactly how "
                 f"these counters became unreadable: {named}"
+            ),
+        )
+
+
+class ManualProcessBlockSafetyContractTests(unittest.TestCase):
+    """RealTimeProtection::BlockProcess is the one way to stop a process without
+    arriving through a guarded detection path.
+
+    Before the change that added these tests it terminated BY DEFAULT - the
+    declaration defaulted its `terminate` parameter to true - and checked nothing
+    at all: no image, no signature, no evidence class, no protection mode.  It
+    also did NOTHING when `terminate` was false, while its own documentation
+    described termination as an ADDITION to blocking.  It had no callers, which is
+    why it had never done any harm and also why nothing would have noticed.
+
+    The product enforces a written rule on both of its real detection paths: that
+    inference-class evidence may not destroy a Microsoft-signed target.  These
+    tests exist because this entry point was the way to perform that destruction
+    without meeting the rule, and because the next author to wire it up - task 75
+    (the UI cannot act on a detection) and task 142 (automatic termination) are
+    both plausible callers - would inherit whatever it does today.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.cpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.hpp = read_source(REAL_TIME_PROTECTION_HPP_PATH)
+        cls.impl = cls._impl_body(cls.cpp)
+
+    @staticmethod
+    def _impl_body(stripped: str) -> str:
+        """The Impl definition, NOT the public forwarder.
+
+        Anchored on the unqualified member form and asserted unique.  Choosing by
+        file order would be unsound: both a forwarder and an implementation of the
+        same name exist in this translation unit.
+        """
+        pattern = re.compile(
+            r"^    bool BlockProcess\(uint32_t pid, bool terminate,\s*$", re.M
+        )
+        matches = list(pattern.finditer(stripped))
+        if len(matches) != 1:
+            raise AssertionError(
+                "expected exactly one unqualified Impl::BlockProcess definition, "
+                f"found {len(matches)}"
+            )
+        brace = stripped.index("{", matches[0].end())
+        body = stripped[brace:_matching_delimiter(stripped, brace, "{", "}")]
+        if len(body) < 1200:
+            raise AssertionError(
+                f"Impl::BlockProcess body is only {len(body)} characters; this "
+                "suite is no longer reading the guarded implementation"
+            )
+        return body
+
+    def test_blockprocess_does_not_default_to_terminating(self) -> None:
+        """An irreversible action must be asked for, never inherited."""
+        match = re.search(
+            r"bool BlockProcess\((?P<params>[^;]*?)\);", self.hpp, re.S
+        )
+        self.assertIsNotNone(
+            match, msg="BlockProcess is no longer declared in the header"
+        )
+        params = match.group("params")
+
+        self.assertNotRegex(
+            params,
+            r"bool\s+terminate\s*=",
+            msg=(
+                "BlockProcess declares a DEFAULT for its terminate parameter. A "
+                "caller writing BlockProcess(pid, ...) would then destroy a "
+                "process without having asked to. Termination must be stated"
+            ),
+        )
+        self.assertIn(
+            "detectionSource",
+            params,
+            msg=(
+                "BlockProcess does not require the caller to state an evidence "
+                "class, so it cannot distinguish an identification from an "
+                "inference and cannot apply the rule the detection paths apply"
+            ),
+        )
+
+    def test_blockprocess_uses_the_cache_only_trust_accessor(self) -> None:
+        """The blocking accessor reaches CryptSvc and this thread is unknown."""
+        self.assertGreater(
+            len(re.findall(r"TryGetCachedMicrosoftSigned", self.impl)),
+            0,
+            msg=(
+                "BlockProcess performs no Microsoft-signed check, so it can "
+                "terminate an operating-system component on a heuristic score - "
+                "the one thing both detection paths are written to prevent"
+            ),
+        )
+
+        # The blocking accessor is a stall hazard here: a thread holding a kernel
+        # file operation open while calling into CryptSvc is the cross-process
+        # freeze this codebase has hit repeatedly, and this entry point is public,
+        # so its thread is not knowable from here.
+        blocking = re.findall(r"(?<!TryGetCached)\bIsMicrosoftSigned\s*\(", self.impl)
+        self.assertEqual(
+            [],
+            blocking,
+            msg=(
+                "BlockProcess calls the BLOCKING signature accessor. This entry "
+                "point is public and its thread is unknown; the blocking accessor "
+                "reaches CryptSvc and can stall a thread that owes the kernel an "
+                f"answer. Use the cache-only accessor: {blocking}"
+            ),
+        )
+
+    def test_blockprocess_withholds_when_trust_is_undetermined(self) -> None:
+        """Unknown must never authorise an irreversible action."""
+        # Anchored on the RECEIVER, not the bare method: this body also contains
+        # `if (p.has_value())` from the image-path lookup, which appears first.
+        marker = self.impl.find("msTrust.has_value()")
+        self.assertGreater(
+            marker,
+            -1,
+            msg=(
+                "BlockProcess never tests whether the trust verdict was actually "
+                "determined, so an UNDETERMINED result would be read as "
+                "'not signed' and the action would proceed"
+            ),
+        )
+        statement = enclosing_statement(self.impl, marker)
+        brace = self.impl.find("{", marker)
+        self.assertGreater(brace, -1, msg="no block follows the has_value() test")
+        block = self.impl[brace:_matching_delimiter(self.impl, brace, "{", "}")]
+        self.assertIn(
+            "return false",
+            block,
+            msg=(
+                "the undetermined-trust branch of BlockProcess does not withhold. "
+                "An unknown signature status must refuse the action, not fall "
+                f"through to it. Statement was: {statement.strip()[:120]!r}"
+            ),
+        )
+
+    def test_blockprocess_non_terminating_request_is_not_a_no_op(self) -> None:
+        """`terminate == false` used to do nothing and report failure.
+
+        A method named BlockProcess that can only act by killing is not a block
+        with an option; it is a kill with a dead parameter, and its own
+        documentation said the opposite.  A suspend is the reversible action, and
+        the product already has the primitive.
+        """
+        self.assertGreater(
+            len(re.findall(r"Utils::ProcessUtils::SuspendProcess\s*\(", self.impl)),
+            0,
+            msg=(
+                "BlockProcess does not suspend when termination was not "
+                "requested, so a non-terminating call does nothing at all and "
+                "returns false. Either it blocks reversibly or the parameter is a "
+                "lie"
+            ),
+        )
+        self.assertGreater(
+            len(re.findall(r"Utils::ProcessUtils::TerminateProcess\s*\(", self.impl)),
+            0,
+            msg="BlockProcess can no longer terminate at all",
+        )
+
+    def test_one_own_install_directory_test_serves_both_action_paths(self) -> None:
+        """Both paths must consult the same test, not two implementations of it.
+
+        The behavioural responder had this check inline.  Re-implementing it in
+        the manual path would let the two drift, and the failure mode of a drifted
+        copy is that the product terminates its own service.
+        """
+        # Anti-vacuity: the shared test must exist exactly once.  Whether the
+        # BEHAVIOURAL responder consults it is deliberately NOT asserted here -
+        # test_a_behavioural_response_is_gated_before_it_can_destroy_anything owns
+        # that, and two tests keying on one fact means neither can be mutated in
+        # isolation.
+        definitions = len(
+            re.findall(
+                r"static bool\s+ImageIsInsideOurInstallDirectory", self.cpp
+            )
+        )
+        self.assertEqual(
+            1,
+            definitions,
+            msg=(
+                "expected exactly one definition of the own-install-directory "
+                f"test, found {definitions}"
+            ),
+        )
+        self.assertGreater(
+            len(re.findall(r"ImageIsInsideOurInstallDirectory", self.impl)),
+            0,
+            msg=(
+                "the manual BlockProcess path does not consult the "
+                "own-install-directory test, so it can terminate our own service, "
+                "tray or UI"
+            ),
+        )
+        # The inline form must not come back AT A CALL SITE.  A file-wide ceiling
+        # was the wrong shape: this translation unit legitimately calls
+        # GetModuleFileNameW elsewhere for an unrelated purpose, so counting it
+        # across the file measures something this test does not care about.  What
+        # matters is that neither action path resolves the directory itself.
+        inlined_here = len(re.findall(r"GetModuleFileNameW", self.impl))
+        self.assertEqual(
+            0,
+            inlined_here,
+            msg=(
+                "BlockProcess resolves our own install directory itself instead of "
+                "using the shared test. Two copies can drift, and the failure mode "
+                "of a drifted copy is that the product terminates its own service"
             ),
         )
 

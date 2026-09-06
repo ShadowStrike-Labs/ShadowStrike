@@ -1554,12 +1554,35 @@ public:
     [[nodiscard]] ScanResult ScanProcess(uint32_t pid);
 
     /**
-     * @brief Manually blocks a process.
-     * @param pid Process ID.
-     * @param terminate Also terminate the process.
-     * @return True if blocked successfully.
+     * @brief Blocks a process on a stated class of evidence.
+     *
+     * SAFETY CONTRACT. This is the only entry point that can stop a process
+     * without arriving through one of the two guarded detection paths, so it
+     * applies equivalent controls itself rather than trusting its caller:
+     *
+     *   1. never the current process, the System process or the idle process;
+     *   2. the protection mode must permit acting at this evidence's class -
+     *      BLOCK_KNOWN for an identification, BLOCK_SUSPICIOUS for an
+     *      inference, which is what those two modes are documented to mean;
+     *   3. never an image inside our own installation directory;
+     *   4. for INFERENCE-class evidence only, the image must be resolvable and
+     *      must not be Microsoft-signed. An UNDETERMINED signature withholds
+     *      as well: unknown must never authorise an irreversible action.
+     *
+     * @param pid Process to act on.
+     * @param terminate True terminates the process. False SUSPENDS it, which is
+     *        reversible through Utils::ProcessUtils::ResumeProcess. There is
+     *        deliberately NO DEFAULT ARGUMENT - an irreversible action must be
+     *        asked for explicitly, never inherited from a signature.
+     * @param detectionSource The evidence justifying the action, in the same
+     *        vocabulary as Core::Engine::EngineResult::detectionSource (for
+     *        example "HashStore", "SignatureStore", "Heuristic"). Classified by
+     *        DetectionSourceIdentifiesThreat; anything unrecognised counts as
+     *        inference, which is the safe direction.
+     * @return True only if the process was actually terminated or suspended.
      */
-    bool BlockProcess(uint32_t pid, bool terminate = true);
+    bool BlockProcess(uint32_t pid, bool terminate,
+                      const std::string& detectionSource);
 
     /**
      * @brief Manually quarantines a file.

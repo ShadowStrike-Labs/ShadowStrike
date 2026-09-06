@@ -2319,26 +2319,14 @@ public:
 
                         // 2. Never act on anything shipped alongside us. Killing
                         //    our own service, tray or UI on a behavioural score
-                        //    would be self-sabotage.
-                        if (!imagePath.empty()) {
-                            static const std::wstring ownDir = []() -> std::wstring {
-                                wchar_t buf[MAX_PATH]{};
-                                if (::GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0)
-                                    return std::wstring();
-                                std::wstring full(buf);
-                                const auto slash = full.find_last_of(L'\\');
-                                return (slash == std::wstring::npos)
-                                           ? std::wstring()
-                                           : full.substr(0, slash + 1);
-                            }();
-                            if (!ownDir.empty() &&
-                                Utils::StringUtils::ToLowerCopy(imagePath).starts_with(
-                                    Utils::StringUtils::ToLowerCopy(ownDir))) {
-                                Utils::Logger::Warn(
-                                    "RealTimeProtection: behavioural response refused for "
-                                    "PID {} - image lives in our own install directory", pid);
-                                return false;
-                            }
+                        //    would be self-sabotage. The test lives in a shared
+                        //    helper so the manual BlockProcess entry point applies
+                        //    THE SAME check rather than a re-implementation of it.
+                        if (ImageIsInsideOurInstallDirectory(imagePath)) {
+                            Utils::Logger::Warn(
+                                "RealTimeProtection: behavioural response refused for "
+                                "PID {} - image lives in our own install directory", pid);
+                            return false;
                         }
 
                         // 3. A behavioural score is INFERENCE, not identification.
@@ -7305,14 +7293,183 @@ public:
         }
     }
 
-    bool BlockProcess(uint32_t pid, bool terminate) {
-        if (terminate) {
-            if (Utils::ProcessUtils::TerminateProcess(pid)) {
-                m_stats.processesTerminated++;
-                Utils::Logger::Info("RealTimeProtection: Terminated process PID {}", pid);
-                return true;
+    // Extracted from the behavioural responder so both callers apply exactly the
+    // same test. Resolved once: our own installation directory cannot change
+    // while the process runs. An unresolvable module path returns false, which is
+    // the pre-existing behaviour of the code this replaces, not a new risk.
+    [[nodiscard]] static bool ImageIsInsideOurInstallDirectory(
+        const std::wstring& imagePath) {
+        if (imagePath.empty()) {
+            return false;
+        }
+        static const std::wstring ownDir = []() -> std::wstring {
+            wchar_t buf[MAX_PATH]{};
+            if (::GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0)
+                return std::wstring();
+            std::wstring full(buf);
+            const auto slash = full.find_last_of(L'\\');
+            return (slash == std::wstring::npos)
+                       ? std::wstring()
+                       : full.substr(0, slash + 1);
+        }();
+        if (ownDir.empty()) {
+            return false;
+        }
+        return Utils::StringUtils::ToLowerCopy(imagePath).starts_with(
+            Utils::StringUtils::ToLowerCopy(ownDir));
+    }
+
+    // Manual, caller-driven process action. The contract is on the declaration.
+    //
+    // WHAT THIS REPLACED, in full:
+    //     if (terminate) { if (TerminateProcess(pid)) { ++stat; log; return true; } }
+    //     return false;
+    //
+    // It terminated by DEFAULT because the declaration defaulted `terminate` to
+    // true, it checked nothing whatsoever - no image, no signature, no evidence
+    // class, no protection mode - and when `terminate` was false it did NOTHING
+    // AT ALL while its own documentation described termination as an ADDITION to
+    // blocking. With no callers anywhere in the repository, that made this the
+    // one seam through which a future caller could destroy a Microsoft-signed
+    // process on a heuristic score without meeting the rule the product enforces
+    // on both of its real detection paths.
+    //
+    // The guards below deliberately MIRROR the behavioural responder rather than
+    // being shared with it: that responder's checks are interleaved with the
+    // action it performs, and the signature requirement here is stricter still
+    // because this entry point is public and its thread is unknown.
+    bool BlockProcess(uint32_t pid, bool terminate,
+                      const std::string& detectionSource) {
+        // 1. Never act on ourselves or on the two kernel pseudo-processes. A
+        //    false positive here disables the product.
+        if (pid == 0 || pid == 4 || pid == ::GetCurrentProcessId()) {
+            Utils::Logger::Warn(
+                "RealTimeProtection: BlockProcess refused for PID {} - own or "
+                "system-critical process (source='{}')", pid, detectionSource);
+            return false;
+        }
+
+        // An unrecognised source classifies as inference, which is the safe
+        // direction: it demands the stricter mode AND the signature check.
+        const bool identifies =
+            RealTimeProtection::DetectionSourceIdentifiesThreat(detectionSource);
+        const char* const evidenceClass =
+            identifies ? "identification-class" : "inference-class";
+
+        // 2. The protection mode must permit acting at this evidence's class.
+        //    BLOCK_KNOWN is documented as "block only known threats", which is
+        //    what an identification is; BLOCK_SUSPICIOUS is "known + suspicious",
+        //    which is the bar an inference has to clear.
+        const ProtectionMode required = identifies
+            ? ProtectionMode::BLOCK_KNOWN
+            : ProtectionMode::BLOCK_SUSPICIOUS;
+        if (m_mode.load(std::memory_order_relaxed) < required) {
+            m_stats.processBlocksWithheldByMode++;
+            Utils::Logger::Warn(
+                "RealTimeProtection: BlockProcess withheld for PID {} - protection "
+                "mode does not permit acting on {} evidence (source='{}')",
+                pid, evidenceClass, detectionSource);
+            return false;
+        }
+
+        std::wstring imagePath;
+        try {
+            auto p = Utils::ProcessUtils::GetProcessPath(pid);
+            if (p.has_value()) imagePath = *p;
+        } catch (...) {
+        }
+
+        // 3. Never act on anything shipped alongside us.
+        if (ImageIsInsideOurInstallDirectory(imagePath)) {
+            m_stats.ownBinaryBlockWithheld++;
+            Utils::Logger::Warn(
+                "RealTimeProtection: BlockProcess refused for PID {} - image lives "
+                "in our own install directory (source='{}')", pid, detectionSource);
+            return false;
+        }
+
+        // 4. INFERENCE-class evidence may not destroy an operating-system
+        //    component. The CACHE-ONLY accessor is used because this entry point
+        //    is public and its thread is unknown: the blocking accessor reaches
+        //    CryptSvc, and a thread that holds a kernel file operation open while
+        //    calling into CryptSvc is the cross-process stall this codebase has
+        //    hit repeatedly. An UNDETERMINED verdict withholds as well as a
+        //    signed one, and an unresolvable image withholds too - which is
+        //    STRICTER than the behavioural responder, deliberately, because that
+        //    path at least knows which thread it is on.
+        //
+        //    No counter is incremented for these two refusals on purpose. This
+        //    method has no callers, so a counter here would read zero forever and
+        //    be exactly the unreadable instrument this product has now had to fix
+        //    three times. The WARN lines are production-visible and are the right
+        //    instrument for a path that may never run.
+        if (!identifies) {
+            if (imagePath.empty()) {
+                Utils::Logger::Warn(
+                    "RealTimeProtection: BlockProcess withheld for PID {} - the "
+                    "image path could not be resolved, so the operating-system "
+                    "check cannot be performed and inference-class evidence may "
+                    "not act unchecked (source='{}')", pid, detectionSource);
+                return false;
+            }
+
+            std::optional<bool> msTrust;
+            try {
+                msTrust = Security::DigitalSignatureValidator::Instance()
+                              .TryGetCachedMicrosoftSigned(imagePath);
+            } catch (...) {
+                msTrust.reset();
+            }
+
+            if (!msTrust.has_value()) {
+                QueueSignatureDetermination(imagePath, std::wstring());
+                Utils::Logger::Warn(
+                    "RealTimeProtection: BlockProcess withheld for PID {} - "
+                    "Microsoft-signed status not yet determined and the evidence "
+                    "is inference-class (source='{}'). A determination has been "
+                    "queued", pid, detectionSource);
+                return false;
+            }
+            if (*msTrust) {
+                Utils::Logger::Warn(
+                    "RealTimeProtection: BlockProcess withheld for PID {} - "
+                    "Microsoft-signed image and the evidence is inference-class "
+                    "(source='{}'). An identification would still act", pid,
+                    detectionSource);
+                return false;
             }
         }
+
+        // 5. Act exactly as asked - never more. A suspend is reversible through
+        //    Utils::ProcessUtils::ResumeProcess, which is why that is what a
+        //    non-terminating request now does instead of nothing at all.
+        Utils::ProcessUtils::Error opErr{};
+        if (terminate) {
+            if (Utils::ProcessUtils::TerminateProcess(pid, 0, &opErr)) {
+                m_stats.processesTerminated++;
+                m_stats.processesBlocked++;
+                Utils::Logger::Warn(
+                    "RealTimeProtection: TERMINATED process PID {} on {} evidence "
+                    "(source='{}')", pid, evidenceClass, detectionSource);
+                return true;
+            }
+            Utils::Logger::Error(
+                "RealTimeProtection: BlockProcess could not terminate PID {} "
+                "(source='{}')", pid, detectionSource);
+            return false;
+        }
+
+        if (Utils::ProcessUtils::SuspendProcess(pid, &opErr)) {
+            m_stats.processesBlocked++;
+            Utils::Logger::Warn(
+                "RealTimeProtection: SUSPENDED process PID {} on {} evidence "
+                "(source='{}') - reversible with ResumeProcess", pid,
+                evidenceClass, detectionSource);
+            return true;
+        }
+        Utils::Logger::Error(
+            "RealTimeProtection: BlockProcess could not suspend PID {} "
+            "(source='{}')", pid, detectionSource);
         return false;
     }
 
@@ -8434,8 +8591,9 @@ ScanResult RealTimeProtection::ScanProcess(uint32_t pid) {
     return m_impl->ScanProcess(pid);
 }
 
-bool RealTimeProtection::BlockProcess(uint32_t pid, bool terminate) {
-    return m_impl->BlockProcess(pid, terminate);
+bool RealTimeProtection::BlockProcess(uint32_t pid, bool terminate,
+                                     const std::string& detectionSource) {
+    return m_impl->BlockProcess(pid, terminate, detectionSource);
 }
 
 bool RealTimeProtection::QuarantineFile(const std::wstring& filePath, std::wstring_view threatName) {
