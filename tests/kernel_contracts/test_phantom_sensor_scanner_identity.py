@@ -20875,5 +20875,92 @@ class ManualProcessBlockSafetyContractTests(unittest.TestCase):
         )
 
 
+class DeadSourceFileContractTests(unittest.TestCase):
+    """A file one keystroke from the most important source in the product.
+
+    src/PhantomCore/RealTime/RealtTimeProtection.cpp - note the transposed t - was
+    804 bytes containing a licence header and #include "pch.h", and FOUR projects
+    compiled it on every build.  It produced a harmless object file, so nothing
+    ever complained, and it sat directly beside the real RealTimeProtection.cpp.
+    The cost was not the wasted compile: it was that anybody grepping the project
+    files for the real translation unit found two hits and had to work out which
+    one mattered.
+
+    The guard below deliberately also asserts that the REAL file is still
+    compiled.  A test that only says "the typo is gone" is satisfied by deleting
+    both, which would be a far worse outcome than the defect it replaced.
+    """
+
+    _TRANSPOSED = "RealtTimeProtection"
+    _REAL_RELATIVE = "src\\PhantomCore\\RealTime\\RealTimeProtection.cpp"
+
+    def test_no_project_compiles_the_transposed_realtimeprotection_source(self) -> None:
+        transposed = ROOT / "src/PhantomCore/RealTime/RealtTimeProtection.cpp"
+        self.assertFalse(
+            transposed.is_file(),
+            msg=(
+                "the transposed-name source file is back. A filename one "
+                "character-swap from RealTimeProtection.cpp is a trap for anyone "
+                "searching the tree, and it carried no code"
+            ),
+        )
+
+        offenders: list[str] = []
+        projects = sorted(ROOT.glob("*.vcxproj"))
+        self.assertGreaterEqual(
+            len(projects),
+            8,
+            msg=f"only found {len(projects)} project files; this walk proves little",
+        )
+        for project in projects:
+            body = project.read_bytes().decode("utf-8", errors="replace")
+            if self._TRANSPOSED in body:
+                offenders.append(project.name)
+        self.assertEqual(
+            [],
+            offenders,
+            msg=(
+                "these projects list the transposed-name source, which does not "
+                "exist. MSVC reports a missing ClCompile entry as fatal C1083 at "
+                f"build time only: {offenders}"
+            ),
+        )
+
+    def test_the_real_realtimeprotection_source_is_still_compiled(self) -> None:
+        """Anti-deletion. The cleanup above must not have taken the real file.
+
+        Kept as its own test rather than as a third assertion on the one above,
+        so that removing the real translation unit and removing the dead one
+        cannot be confused for the same event in a failure report.
+        """
+        real = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
+        self.assertTrue(real.is_file(), msg="RealTimeProtection.cpp is missing")
+        self.assertGreater(
+            real.stat().st_size,
+            300_000,
+            msg=(
+                f"RealTimeProtection.cpp is only {real.stat().st_size} bytes; the "
+                "orchestrator should not have shrunk to that"
+            ),
+        )
+
+        # Counted, not assertIn: this project file is 121 KB and assertIn would
+        # print all of it. Whether the entry is there is the entire message.
+        text = self._project_text("PhantomCoreLib.vcxproj")
+        self.assertGreater(
+            text.count(self._REAL_RELATIVE),
+            0,
+            msg=(
+                "PhantomCoreLib no longer compiles RealTimeProtection.cpp. The "
+                "product's real-time orchestrator would be absent from the library "
+                "every other project links"
+            ),
+        )
+
+    @staticmethod
+    def _project_text(name: str) -> str:
+        return (ROOT / name).read_bytes().decode("utf-8", errors="replace")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

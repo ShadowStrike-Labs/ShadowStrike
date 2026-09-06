@@ -350,7 +350,6 @@
     <ClCompile Include="src\PhantomCore\RealTime\MemoryProtection.cpp" />
     <ClCompile Include="src\PhantomCore\RealTime\NetworkTrafficFilter.cpp" />
     <ClCompile Include="src\PhantomCore\RealTime\ProcessCreationMonitor.cpp" />
-    <ClCompile Include="src\PhantomCore\RealTime\RealtTimeProtection.cpp" />
     <ClCompile Include="src\PhantomCore\RealTime\ZeroHourProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\AMSIIntegration.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\JavaScriptScanner.cpp" />
