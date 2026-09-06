@@ -6197,8 +6197,8 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     _INSTALLED_USER_MODE_TOOLSETS = ("v143",)
 
     # ---------------------------------------------------------------------------
-    # Two project-file defects that are now ABSENT from the in-scope project and
-    # still PRESENT in three that are not.  Both are expressed as SHRINK-ONLY
+    # Two project-file defects that are now ABSENT from the two in-scope projects
+    # and still PRESENT in the two that are not.  Both are expressed as SHRINK-ONLY
     # ceilings rather than equalities, for a reason worth stating: an equality
     # guard over the whole tree would be red on arrival, and a guard that cannot
     # pass is a guard nobody keeps (the same reasoning that scopes the object-path
@@ -6221,7 +6221,7 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     # control - it can only ever start being wrong, never start being useful.
     _ABSOLUTE_TOOLCHAIN_PATH_CEILING = {
         "PhantomHomeModules.vcxproj": 0,
-        "ShadowStrike.vcxproj": 2,
+        "ShadowStrike.vcxproj": 0,
         "PhantomEDR.vcxproj": 2,
         "PhantomXDR.vcxproj": 2,
     }
@@ -6236,7 +6236,7 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     # pair is what makes this a measured typo rather than a style judgement.
     _BROKEN_PCH_OUTPUT_NAME_CEILING = {
         "PhantomHomeModules.vcxproj": 0,
-        "ShadowStrike.vcxproj": 2,
+        "ShadowStrike.vcxproj": 0,
         "PhantomEDR.vcxproj": 2,
         "PhantomXDR.vcxproj": 2,
     }
@@ -6494,25 +6494,39 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
         )
 
         # Removing the path must not be achieved by emptying the list: the entries the
-        # project genuinely needs have to survive.  Checked on the in-scope project
-        # only, because it is the one this guard requires to be at zero.
-        home = self._project_text("PhantomHomeModules.vcxproj")
-        for required in (
-            "$(ProjectDir)include",
-            "$(ProjectDir)include\\YARA",
-            "$(ProjectDir)src",
-            "%(AdditionalIncludeDirectories)",
-        ):
-            found = home.count(required)
-            self.assertGreaterEqual(
-                found,
-                2,
-                msg=(
-                    f"PhantomHomeModules names the include entry {required!r} only "
-                    f"{found} time(s); it needs one per configuration, so the list "
-                    "was pruned too far rather than having the dead path removed"
-                ),
-            )
+        # project genuinely needs have to survive.  Applied to EVERY project the
+        # ceiling requires to be at zero, derived from the dict rather than named, so
+        # a project picks this requirement up automatically when its number drops.
+        at_zero = sorted(
+            name for name, ceiling in self._ABSOLUTE_TOOLCHAIN_PATH_CEILING.items()
+            if ceiling == 0
+        )
+        self.assertGreaterEqual(
+            len(at_zero),
+            2,
+            msg=(
+                f"only {len(at_zero)} project(s) are required to be at zero; the "
+                "anti-deletion check below would cover almost nothing"
+            ),
+        )
+        for project in at_zero:
+            text = self._project_text(project)
+            for required in (
+                "$(ProjectDir)include",
+                "$(ProjectDir)include\\YARA",
+                "$(ProjectDir)src",
+                "%(AdditionalIncludeDirectories)",
+            ):
+                found = text.count(required)
+                self.assertGreaterEqual(
+                    found,
+                    2,
+                    msg=(
+                        f"{project} names the include entry {required!r} only "
+                        f"{found} time(s); it needs one per configuration, so the list "
+                        "was pruned too far rather than having the dead path removed"
+                    ),
+                )
 
     def test_no_project_gains_a_precompiled_header_name_with_a_literal_dollar(self) -> None:
         measured: dict[str, int] = {}
@@ -6556,18 +6570,35 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
 
         # And the correct form must be present, so the count cannot reach zero by the
         # element being deleted - which would silently disable the precompiled header
-        # and slow every build without failing anything.
-        home_correct = self._project_text("PhantomHomeModules.vcxproj").count(
-            "<PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>"
-        )
-        self.assertEqual(
-            2,
-            home_correct,
-            msg=(
-                "expected PhantomHomeModules to declare the corrected precompiled-header "
-                f"output path once per configuration, found {home_correct}"
-            ),
-        )
+        # and slow every build without failing anything.  Required of EVERY project the
+        # ceiling holds at zero, and expressed as "every declaration in that project is
+        # the correct form" rather than a fixed number, so it adapts to how many
+        # configurations a given project declares one for.
+        for project in sorted(
+            name for name, ceiling in self._BROKEN_PCH_OUTPUT_NAME_CEILING.items()
+            if ceiling == 0
+        ):
+            text = self._project_text(project)
+            total = len(re.findall(r"<PrecompiledHeaderOutputFile>", text))
+            correct = text.count(
+                "<PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>"
+            )
+            self.assertGreater(
+                total,
+                0,
+                msg=(
+                    f"{project} declares no PrecompiledHeaderOutputFile at all, so the "
+                    "corrected form cannot be asserted and a deletion would pass"
+                ),
+            )
+            self.assertEqual(
+                total,
+                correct,
+                msg=(
+                    f"{project} declares {total} precompiled-header output path(s) but "
+                    f"only {correct} use the corrected $(IntDir)pch.pch form"
+                ),
+            )
 
 
 class TestVectorEncodingContractTests(unittest.TestCase):
