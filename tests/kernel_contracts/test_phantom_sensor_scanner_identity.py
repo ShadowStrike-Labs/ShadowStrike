@@ -166,6 +166,22 @@ DIAG_TRACE_CPP_PATH = ROOT / "src/PhantomCore/Diagnostics/DiagTrace.cpp"
 # notification out to seven modules on the thread the driver blocks CreateProcess on.
 RANSOMWARE_WIRING_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/RansomwareWiring.cpp"
 
+# The two trust validators. Both maintain a full statistics block and neither had
+# any production consumer: GetStatistics() was called only from tests, so every
+# counter in both structs was incremented, snapshotted and discarded.
+DIGITAL_SIGNATURE_VALIDATOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/DigitalSignatureValidator.cpp"
+)
+DIGITAL_SIGNATURE_VALIDATOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
+)
+CERTIFICATE_VALIDATOR_CPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/CertificateValidator.cpp"
+)
+CERTIFICATE_VALIDATOR_HPP_PATH = (
+    ROOT / "src/PhantomCore/SelfProtection/CertificateValidator.hpp"
+)
+
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
 # tray both LINKS PhantomCoreLib.lib and COMPILES its shared headers.
@@ -20439,6 +20455,208 @@ class ProcessNotifyCostVisibilityContractTests(unittest.TestCase):
                 "loses detection instead of deferring it. Bound their cost inside "
                 "the modules or move them off this thread instead".format(
                     forbidden, offenders))
+
+
+class TrustStatisticsVisibilityContractTests(unittest.TestCase):
+    """A counter nobody can read cannot answer a question.
+
+    Both trust validators maintain a full statistics block, and until the change
+    that added these tests NEITHER had a production consumer - the only
+    GetStatistics() call sites in the entire repository were in tests.  Every
+    counter in both structs was therefore incremented, snapshotted and thrown
+    away, including unsignableTargetsRefused, which had been added specifically
+    so a field run could show how often WinVerifyTrust was being asked to verify
+    something unsignable.  The fix shipped with an unreadable instrument.
+
+    This is the same defect as an accumulator with no load, and it has now
+    appeared three times in this product (the ScanFile stage timers, the public
+    per-stage averages, and this).  These tests pin the general property rather
+    than the one line: every counter must be publishable, and the publication
+    must not be a hand-maintained list that goes stale the next time somebody
+    adds a field.
+    """
+
+    # (path to the struct, path to ToJson, struct name, minimum field count)
+    _TRUST_STATISTICS = (
+        (
+            DIGITAL_SIGNATURE_VALIDATOR_HPP_PATH,
+            DIGITAL_SIGNATURE_VALIDATOR_CPP_PATH,
+            "SignatureValidatorStatistics",
+            12,
+        ),
+        (
+            CERTIFICATE_VALIDATOR_HPP_PATH,
+            CERTIFICATE_VALIDATOR_CPP_PATH,
+            "CertificateValidatorStatistics",
+            10,
+        ),
+    )
+
+    @staticmethod
+    def _struct_fields(header_text: str, struct_name: str) -> list[str]:
+        """Every scalar counter declared in the named struct.
+
+        Derived from the artifact rather than listed here, so a counter added
+        later is covered without this file being touched.  Both brace-init
+        (``uint64_t x{0};``) and assignment (``uint64_t x = 0;``) forms appear
+        in these two structs, so both are accepted.
+        """
+        match = re.search(r"struct\s+" + re.escape(struct_name) + r"\s*\{", header_text)
+        if match is None:
+            raise AssertionError(f"struct {struct_name} not found in its header")
+        body_start = match.end() - 1
+        body_end = _matching_delimiter(header_text, body_start, "{", "}")
+        body = header_text[body_start:body_end]
+        return re.findall(
+            r"^\s*(?:uint64_t|uint32_t|size_t|double)\s+(\w+)\s*(?:\{|=|;)",
+            body,
+            re.M,
+        )
+
+    @staticmethod
+    def _tojson_body(source_text: str, struct_name: str) -> str:
+        match = re.search(
+            r"std::string\s+" + re.escape(struct_name) + r"::ToJson\(\)\s*const\s*\{",
+            source_text,
+        )
+        if match is None:
+            raise AssertionError(f"{struct_name}::ToJson not found")
+        start = match.end() - 1
+        return source_text[start:_matching_delimiter(source_text, start, "{", "}")]
+
+    @classmethod
+    def _report_capacity(cls) -> str:
+        """The body of the periodic report, which is what a field log shows."""
+        source = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        stripped = strip_c_comments(source)
+        match = re.search(r"void\s+ReportCapacity\(\)\s*\{", stripped)
+        if match is None:
+            raise AssertionError(
+                "ReportCapacity() not found in RealTimeProtection.cpp - this suite "
+                "can no longer tell whether the trust counters are published"
+            )
+        start = match.end() - 1
+        return stripped[start:_matching_delimiter(stripped, start, "{", "}")]
+
+    def test_both_trust_validators_are_read_by_the_periodic_report(self) -> None:
+        """The statistics must have a PRODUCTION consumer, not just a test one."""
+        body = self._report_capacity()
+
+        # Bounded on purpose: this region is several kilobytes and assertIn would
+        # print all of it.  Which validator is unread is the whole message.
+        for singleton in ("DigitalSignatureValidator", "CertificateValidator"):
+            reads = len(
+                re.findall(
+                    re.escape(singleton) + r"::Instance\(\)\s*\.?\s*\n?\s*\.?GetStatistics",
+                    body,
+                )
+            )
+            self.assertGreater(
+                reads,
+                0,
+                msg=(
+                    f"{singleton}'s statistics are not read by the periodic report, "
+                    "so every counter it maintains is invisible in the field. A "
+                    "counter that is incremented and never published cannot answer "
+                    "the question it was added for"
+                ),
+            )
+
+        self.assertGreater(
+            len(re.findall(r"Utils::Logger::Info", body)),
+            0,
+            msg=(
+                "the periodic report emits nothing at Info level, so nothing it "
+                "gathers reaches a field log"
+            ),
+        )
+
+    def test_every_trust_counter_is_publishable(self) -> None:
+        """The general form of the defect: a counter absent from ToJson is dark.
+
+        Deliberately not a check that the counter is *incremented* - an unused
+        counter is merely dead, whereas a counter that is maintained but cannot
+        be serialised is actively misleading, because the code looks as though it
+        is recording something readable.
+        """
+        unpublishable: list[str] = []
+        counted = 0
+        for header_path, source_path, struct_name, floor in self._TRUST_STATISTICS:
+            header = read_source(header_path)
+            source = read_source(source_path)
+            fields = self._struct_fields(header, struct_name)
+            self.assertGreaterEqual(
+                len(fields),
+                floor,
+                msg=(
+                    f"only {len(fields)} fields parsed out of {struct_name}; this "
+                    "test proves nothing if the struct stopped parsing"
+                ),
+            )
+            body = self._tojson_body(source, struct_name)
+            for field in fields:
+                # startTime is a time point, not a counter, and is deliberately
+                # excluded from the JSON by the existing implementations.
+                if field == "startTime":
+                    continue
+                counted += 1
+                # The key is a C++ string literal, so in the source it reads
+                # \"field\" with the quotes escaped.  Both forms are accepted so
+                # this keeps working if the serialiser is ever rewritten with
+                # raw literals or a JSON library.
+                if not re.search(r'\\?"' + re.escape(field) + r'\\?"', body):
+                    unpublishable.append(f"{struct_name}::{field}")
+
+        self.assertGreater(counted, 24, msg=f"only checked {counted} counters")
+        self.assertEqual(
+            [],
+            unpublishable,
+            msg=(
+                "these trust counters are maintained but cannot be serialised, so "
+                "they can never appear in a field report no matter who calls "
+                f"GetStatistics: {unpublishable}"
+            ),
+        )
+
+    def test_the_trust_report_cannot_drift_from_the_structs(self) -> None:
+        """The publication must be whole-struct, not a hand-maintained field list.
+
+        A format string naming individual counters is how these counters became
+        invisible in the first place: it silently stops reporting anything added
+        later, and nothing fails when that happens.  ToJson() is generated from
+        the struct, so it cannot fall behind it.
+        """
+        body = self._report_capacity()
+        self.assertGreaterEqual(
+            len(re.findall(r"GetStatistics\(\)\s*\.?\s*\n?\s*\.?ToJson\(\)", body)),
+            2,
+            msg=(
+                "the periodic report does not publish both trust statistics blocks "
+                "through ToJson(). Emitting the whole struct is what keeps this "
+                "report from falling behind the struct when a counter is added"
+            ),
+        )
+
+        # No individual counter may be named at the emission site.  Reported per
+        # offending name rather than with assertNotIn, which would dump the region.
+        named: list[str] = []
+        for header_path, _source_path, struct_name, _floor in self._TRUST_STATISTICS:
+            header = read_source(header_path)
+            for field in self._struct_fields(header, struct_name):
+                if field == "startTime":
+                    continue
+                if re.search(r"\b" + re.escape(field) + r"\b", body):
+                    named.append(f"{struct_name}::{field}")
+        self.assertEqual(
+            [],
+            named,
+            msg=(
+                "the periodic report names individual trust counters instead of "
+                "publishing the whole struct. A hand-maintained list goes stale "
+                "the next time a counter is added, silently, which is exactly how "
+                f"these counters became unreadable: {named}"
+            ),
+        )
 
 
 if __name__ == "__main__":

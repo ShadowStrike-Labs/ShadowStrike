@@ -7587,6 +7587,37 @@ public:
             Utils::Logger::Info("{}", line);
         }
 
+        // The trust stack's own counters, which NOTHING in production has ever
+        // read. Both validators maintain a full statistics block and both
+        // GetStatistics() accessors had ZERO production callers - the only call
+        // sites in the repository were tests - so every counter in them was
+        // incremented, snapshotted and discarded. That includes
+        // unsignableTargetsRefused, which was added when WinVerifyTrust was found
+        // being asked to verify a directory: the fix shipped with a counter that
+        // nobody could read, and a counter no one can read cannot answer a
+        // question. It is the same defect as an accumulator with no load.
+        //
+        // ToJson() is emitted rather than a hand-picked field list on purpose. A
+        // format string here would silently stop reporting any field added to
+        // either struct later, which is precisely how these counters became
+        // invisible in the first place; ToJson() cannot drift from the struct it
+        // belongs to. Both snapshots are lock-free reads of relaxed atomics (16
+        // and 12 loads, both noexcept), so this costs nothing at report cadence
+        // and takes no lock that the scan path holds.
+        try {
+            Utils::Logger::Info(
+                "RealTimeProtection: trust - signature={} certificate={}",
+                Security::DigitalSignatureValidator::Instance()
+                    .GetStatistics().ToJson(),
+                Security::CertificateValidator::Instance()
+                    .GetStatistics().ToJson());
+        } catch (...) {
+            // A diagnostic must never be able to stop the monitor thread that
+            // also honours a timed Pause() a few lines below.
+            Utils::Logger::Warn(
+                "RealTimeProtection: trust statistics unavailable this interval");
+        }
+
         m_reportBaselineDeepDropped  = deepDropped;
         m_reportBaselineTrustDropped = trustDropped;
         m_reportBaselineCapacityScans =
