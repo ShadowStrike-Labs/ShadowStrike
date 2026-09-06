@@ -6155,16 +6155,22 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
     Scoped deliberately:
       * the source-existence rule covers every user-mode project, because a listed
         file that is absent is unambiguously wrong wherever it appears;
-      * the object-path rule covers PhantomHome ONLY.  ShadowStrike.vcxproj has NINE
-        same-named pairs and no ObjectFileName (task 197), so asserting it tree-wide
-        would land a guard that cannot pass, and a guard that cannot pass is a guard
-        nobody keeps.  Widen it in the change that fixes 197, not before.
+      * the object-path rule now covers PhantomHomeModules AND ShadowStrike.  It was
+        PhantomHome-only until task 197, because ShadowStrike carried nine same-named
+        pairs with no ObjectFileName, and a guard that cannot pass is a guard nobody
+        keeps.  ShadowStrike measured MSB8027 x9 plus MSB8028 x1 before that fix and
+        0 Warning(s) after, so the rule holds for both and is asserted for both.
 
     PhantomEDR and PhantomXDR are deliberately absent from the project list.  Both
     still name an uninstalled toolset so they cannot be evaluated at all (task 202),
     and both carry the same stale source entries this guard rejects.  They join the
     list when they come into scope; excluding them is a scope statement, not an
-    oversight.
+    oversight.  Measured while widening the object-path rule in task 197, and worth
+    recording because it changes what widening would mean: each of those two projects
+    lists 22 sources that are ABSENT from the tree, and BOTH of its same-named pairs
+    pit an existing file against one of those absent ones.  So their MSB8027 is a
+    symptom of a stale file list, not two real modules colliding, and giving them an
+    ObjectFileName would tidy the warning while leaving the actual defect in place.
 
     NAMING, because two different things shared one word until task 211.  PhantomHome
     is the PRODUCT: its sources live under src/Products/Community/PhantomHome and its
@@ -6351,52 +6357,97 @@ class ProductProjectBuildabilityContractTests(unittest.TestCase):
             ),
         )
 
-    def test_phantomhome_gives_every_object_file_a_distinct_path(self) -> None:
-        text = self._project_text("PhantomHomeModules.vcxproj")
-        sources = self._compiled_sources("PhantomHomeModules.vcxproj")
-        # Anti-vacuity floor only.  It is deliberately far below the count: since
-        # task 205 PhantomHome borrows the whole shared tree from PhantomCoreLib and
-        # compiles only the sources it owns, so 300 - written when the project
-        # hand-listed 317 - described the defect rather than the requirement.
-        self.assertGreater(
-            len(sources),
-            50,
-            msg=f"expected PhantomHomeModules to compile >50 sources, found {len(sources)}",
-        )
+    # Projects the object-path rule is asserted for, mapped to an anti-vacuity floor
+    # on their compiled-source count.  Per project rather than in aggregate: an
+    # aggregate floor cannot tell a project that legitimately shrank from one whose
+    # parse broke.  PhantomEDR and PhantomXDR are excluded for the reason given in
+    # the class docstring - their collisions involve sources that do not exist, so
+    # asserting this rule there would measure a stale file list.
+    _OBJECT_PATH_RULE_PROJECTS = {
+        "PhantomHomeModules.vcxproj": 50,
+        "ShadowStrike.vcxproj": 400,
+    }
 
-        seen: dict[str, list[str]] = {}
-        for rel in sources:
-            seen.setdefault(rel.split("\\")[-1].lower(), []).append(rel)
-        collisions = {k: v for k, v in seen.items() if len(v) > 1}
-
-        if collisions:
-            # Same-named sources are permitted ONLY when the object path is derived
-            # per source; otherwise one silently overwrites the other's .obj and its
-            # symbols go missing at link (MSB8027).
-            self.assertIn(
-                "<ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>",
-                text,
+    def test_every_in_scope_project_gives_every_object_file_a_distinct_path(self) -> None:
+        for project, floor in sorted(self._OBJECT_PATH_RULE_PROJECTS.items()):
+            self.assertTrue(
+                (ROOT / project).is_file(),
+                msg=f"{project} is absent from the tree, so this walk proves nothing about it",
+            )
+            text = self._project_text(project)
+            sources = self._compiled_sources(project)
+            self.assertGreater(
+                len(sources),
+                floor,
                 msg=(
-                    "PhantomHomeModules compiles same-named sources without deriving the object "
-                    f"path per source, so one overwrites the other: {collisions}"
+                    f"expected {project} to compile >{floor} sources, found "
+                    f"{len(sources)}; the parse is broken so the rest of this "
+                    "walk would pass vacuously"
                 ),
             )
 
-        # The intermediate directory must be private to this project.  A shared one
-        # lets two projects' objects occupy the same path (MSB8028), which makes a
-        # link consume a stale object from an unrelated build.
-        shared = re.findall(
-            re.escape("<IntDir>$(ProjectDir)build\\$(Configuration)\\</IntDir>"), text
-        )
-        self.assertEqual(
-            [],
-            shared,
-            msg=(
-                "PhantomHomeModules writes intermediates into the shared build\\$(Configuration) "
-                "directory; give it a private subdirectory so objects cannot collide "
-                "with another project's."
-            ),
-        )
+            seen: dict[str, list[str]] = {}
+            for rel in sources:
+                seen.setdefault(rel.split("\\")[-1].lower(), []).append(rel)
+            collisions = {k: v for k, v in seen.items() if len(v) > 1}
+
+            # Same-named sources are permitted ONLY when the object path is derived
+            # per source; otherwise one silently overwrites the other's .obj and its
+            # symbols go missing at link (MSB8027).  Counted rather than asserted
+            # with assertIn, because a containment failure against a project file
+            # dumps the whole file into the report.
+            derived = text.count("<ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>")
+            if collisions:
+                self.assertGreater(
+                    derived,
+                    0,
+                    msg=(
+                        f"{project} compiles {len(collisions)} set(s) of same-named "
+                        "sources without deriving the object path per source, so one "
+                        f"overwrites the other: {sorted(collisions)}"
+                    ),
+                )
+
+            # A PARTIAL revert is the realistic regression: four configurations each
+            # carry their own ClCompile definition block, and losing the pattern from
+            # one of them reintroduces the defect for that configuration while the
+            # other three keep a presence-only assertion green.  Every solution
+            # configuration is real here - the solution maps Debug|x86 and
+            # Release|x86 to the Win32 blocks, not just x64.
+            blocks = len(re.findall(r"<ItemDefinitionGroup[^>]*>\s*<ClCompile>", text))
+            self.assertGreater(
+                blocks,
+                0,
+                msg=f"found no ClCompile definition block in {project}; the parse is broken",
+            )
+            if derived:
+                self.assertEqual(
+                    blocks,
+                    derived,
+                    msg=(
+                        f"{project} derives the object path in {derived} of its "
+                        f"{blocks} ClCompile definition block(s). Every configuration "
+                        "needs it, or the ones without it write same-named sources to "
+                        "one object path again"
+                    ),
+                )
+
+            # The intermediate directory must be private to this project.  A shared one
+            # lets two projects' objects occupy the same path (MSB8028), which makes a
+            # link consume a stale object from an unrelated build - and did, producing a
+            # false 'this file did not recompile' reading during task 110.
+            shared = re.findall(
+                re.escape("<IntDir>$(ProjectDir)build\\$(Configuration)\\</IntDir>"), text
+            )
+            self.assertEqual(
+                [],
+                shared,
+                msg=(
+                    f"{project} writes intermediates into the shared "
+                    "build\\$(Configuration) directory; give it a private "
+                    "subdirectory so objects cannot collide with another project's."
+                ),
+            )
 
     def test_no_project_gains_an_absolute_toolchain_include_path(self) -> None:
         measured: dict[str, int] = {}
