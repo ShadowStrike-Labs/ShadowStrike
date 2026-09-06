@@ -561,6 +561,29 @@ ScopeTrace::~ScopeTrace() noexcept {
 
 } // namespace ShadowStrike::Diag
 
+namespace {
+
+// Compile-time check. It is deliberately never called: it exists to be COMPILED.
+//
+// SS_DIAG_SCOPE must derive a distinct object name per line, and the only way to
+// state that requirement in C++ is to write code that stops compiling when it is
+// not met. Two scopes in one block is exactly that code - it is a redeclaration
+// (C2374 + C2086) whenever the macro pastes __LINE__ without expanding it first,
+// which is how the macro was written until this check was added.
+//
+// A unit test cannot stand in for this. PhantomTests.vcxproj builds with
+// SHADOWSTRIKE_DIAG_TRACE=0, where SS_DIAG_SCOPE expands to ((void)0) and two of
+// them in one block compile no matter what the macro does - so a test there would
+// have passed for the whole time the defect was present. This translation unit is
+// compiled with tracing ON by every product project, which is where the
+// requirement actually has to hold.
+[[maybe_unused]] void SsDiagScopeNamingIsUniquePerLine() {
+    SS_DIAG_SCOPE("SelfCheck", "first");
+    SS_DIAG_SCOPE("SelfCheck", "second");
+}
+
+} // namespace
+
 #else  // ---------------------- tracing compiled out ----------------------
 
 namespace ShadowStrike::Diag {

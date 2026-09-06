@@ -156,6 +156,12 @@ SCAN_CACHE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Cache/ScanCache.c"
 SCAN_CACHE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Cache/ScanCache.h"
 PRE_CREATE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreCreate.h"
 POST_CREATE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PostCreate.c"
+# The diagnostic ring's macros. SS_DIAG_SCOPE has to derive a distinct object name
+# per line; it pasted __LINE__ without expanding it, so every scope in the product
+# shared the identifier ss_diag_scope___LINE__ and two scopes in one block did not
+# compile at all.
+DIAG_TRACE_HPP_PATH = ROOT / "src/PhantomCore/Diagnostics/DiagTrace.hpp"
+DIAG_TRACE_CPP_PATH = ROOT / "src/PhantomCore/Diagnostics/DiagTrace.cpp"
 
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
@@ -19870,6 +19876,136 @@ class SourceCharsetContractTests(unittest.TestCase):
             "decoded with the build machine's ANSI code page. The exclusion was "
             "justified only by that count being zero - revisit it, and verify any "
             "driver change with a real driver build".format(total))
+
+
+class DiagScopeNamingContractTests(unittest.TestCase):
+    """SS_DIAG_SCOPE must name each scope object uniquely, per line.
+
+    WHY THIS IS A SOURCE CONTRACT RATHER THAN A UNIT TEST. The requirement is a
+    property of the PREPROCESSOR, and the one place it could be checked
+    behaviourally - the C++ suite - is compiled with SHADOWSTRIKE_DIAG_TRACE=0,
+    where SS_DIAG_SCOPE expands to ((void)0). Two scopes in one block compile
+    there no matter what the macro does, so a gtest case would have passed for
+    the whole time the defect was present. The real guard is the compile-time
+    check inside DiagTrace.cpp, which every product project compiles with tracing
+    ON; these tests pin the macro's shape and - the part that matters most - pin
+    that the check stays in the branch where it is able to fail.
+
+    COMMENTS ARE STRIPPED BEFORE EVERY ASSERTION AND THAT IS LOAD-BEARING. The
+    explanatory comments added with the fix necessarily NAME the broken form in
+    prose, so a comment-blind search for it is guaranteed to find the description
+    of the defect rather than the defect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hpp = strip_c_comments(read_source(DIAG_TRACE_HPP_PATH))
+        cls.cpp = strip_c_comments(read_source(DIAG_TRACE_CPP_PATH))
+
+    def test_the_scope_macro_expands_line_before_pasting_it(self):
+        # The operands of ## are not macro-expanded, so this form produces one
+        # shared identifier for every scope in the product.
+        # Counted rather than asserted with assertNotIn: a containment failure
+        # against a whole header dumps the header into the report, which buries
+        # the one fact the reader needs.
+        direct = self.hpp.count("ss_diag_scope_##__LINE__")
+        self.assertEqual(
+            0, direct,
+            "SS_DIAG_SCOPE pastes __LINE__ directly at {} site(s). The operands of "
+            "## are not macro-expanded, so this names every scope in the product "
+            "ss_diag_scope___LINE__: two scopes in one block become C2374/C2086 and "
+            "a nested scope shadows its parent (C4456). Route __LINE__ through "
+            "SS_DIAG_PASTE instead".format(direct))
+
+        through_helper = self.hpp.count("SS_DIAG_PASTE(ss_diag_scope_, __LINE__)")
+        self.assertEqual(
+            1, through_helper,
+            "expected exactly one SS_DIAG_SCOPE deriving its object name through "
+            "the two-level paste helper, found {}. Without it __LINE__ may not be "
+            "expanded before it is pasted".format(through_helper))
+
+    def test_the_paste_helper_keeps_its_second_level(self):
+        # THE PLAUSIBLE WRONG FIX: collapse the two helpers into one that pastes
+        # directly. That reads simpler and reintroduces the defect exactly,
+        # because the operand is still unexpanded at the point of the ##.
+        outer = [ln for ln in self.hpp.splitlines()
+                 if ln.lstrip().startswith("#define SS_DIAG_PASTE(")]
+        inner = [ln for ln in self.hpp.splitlines()
+                 if ln.lstrip().startswith("#define SS_DIAG_PASTE_INNER(")]
+        self.assertEqual(
+            1, len(outer),
+            "expected exactly one #define of SS_DIAG_PASTE, found {}".format(len(outer)))
+        self.assertEqual(
+            1, len(inner),
+            "expected exactly one #define of SS_DIAG_PASTE_INNER, found {}".format(len(inner)))
+
+        self.assertNotIn(
+            "##", outer[0],
+            "SS_DIAG_PASTE now pastes directly: {!r}. A single-level paste cannot "
+            "expand __LINE__ first, which is the whole defect. The outer macro must "
+            "only forward to SS_DIAG_PASTE_INNER".format(outer[0].strip()))
+        self.assertIn(
+            "SS_DIAG_PASTE_INNER(a, b)", outer[0],
+            "SS_DIAG_PASTE must forward to the inner macro so its arguments are "
+            "expanded before the ## is applied")
+        self.assertIn(
+            "##", inner[0],
+            "SS_DIAG_PASTE_INNER is the level that performs the ##; it no longer does")
+
+    def test_the_compile_time_check_has_two_scopes_in_one_block(self):
+        name = "SsDiagScopeNamingIsUniquePerLine"
+        self.assertEqual(
+            1, self.cpp.count(name),
+            "the compile-time naming check {} must exist exactly once in "
+            "DiagTrace.cpp; found {} occurrence(s). Without it a macro regression "
+            "is invisible until some caller happens to need two scopes in one "
+            "block".format(name, self.cpp.count(name)))
+
+        start = self.cpp.index(name)
+        brace = self.cpp.index("{", start)
+        end = _matching_delimiter(self.cpp, brace, "{", "}")
+        self.assertGreater(end, brace, "could not brace-match the check's body")
+        body = self.cpp[brace:end]
+
+        scopes = body.count("SS_DIAG_SCOPE(")
+        self.assertEqual(
+            2, scopes,
+            "the compile-time check must place exactly TWO SS_DIAG_SCOPE in ONE "
+            "block, because that is the construct the broken macro could not "
+            "compile; its body has {}. One scope compiles either way, so the check "
+            "would pass while the defect was present".format(scopes))
+
+    def test_the_compile_time_check_sits_where_tracing_is_enabled(self):
+        # A check placed in the tracing-compiled-out branch is vacuous: there
+        # SS_DIAG_SCOPE is ((void)0) and any number of them share a block.
+        gate = "#if SHADOWSTRIKE_DIAG_TRACE"
+        self.assertEqual(
+            1, self.cpp.count(gate),
+            "expected exactly one {!r} in DiagTrace.cpp so the offsets below are "
+            "unambiguous; found {}".format(gate, self.cpp.count(gate)))
+
+        else_markers = [i for i, ln in enumerate(self.cpp.splitlines())
+                        if ln.strip().startswith("#else")]
+        self.assertEqual(
+            1, len(else_markers),
+            "expected exactly one #else in DiagTrace.cpp; found {}".format(
+                len(else_markers)))
+
+        lines = self.cpp.splitlines()
+        gate_line = next(i for i, ln in enumerate(lines) if ln.strip() == gate)
+        check_line = next(i for i, ln in enumerate(lines)
+                          if "SsDiagScopeNamingIsUniquePerLine" in ln)
+        else_line = else_markers[0]
+
+        self.assertLess(
+            gate_line, check_line,
+            "the compile-time check must come after {!r}".format(gate))
+        self.assertLess(
+            check_line, else_line,
+            "the compile-time check has moved into the tracing-compiled-out "
+            "branch (check at line {}, #else at line {}). There SS_DIAG_SCOPE is "
+            "((void)0), so the check cannot fail and guards nothing".format(
+                check_line + 1, else_line + 1))
 
 
 if __name__ == "__main__":

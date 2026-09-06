@@ -55,6 +55,11 @@
  *   SS_DIAG_SCOPE("Scan", "ScanFile");   // logs enter now, leave + duration at
  *                                        // end of scope, even on an exception
  *
+ * A block may hold more than one SS_DIAG_SCOPE: each one declares a distinctly
+ * named object. That is worth stating because it was NOT true until the token
+ * pasting below was corrected, and a caller who tried it got a redeclaration
+ * error rather than a diagnostic that named the cause.
+ *
  * Categories should be short, stable and grep-able. Keep them to a handful per
  * subsystem so a trace can be filtered by area.
  */
@@ -113,8 +118,20 @@ private:
     #define SS_DIAG(category, ...) \
         ::ShadowStrike::Diag::Write((category), __VA_ARGS__)
 
-    #define SS_DIAG_SCOPE(category, label) \
-        ::ShadowStrike::Diag::ScopeTrace ss_diag_scope_##__LINE__((category), (label))
+    /* The operands of ## are NOT macro-expanded, so pasting __LINE__ directly
+     * yields the literal identifier ss_diag_scope___LINE__ - one name shared by
+     * every scope in the product. Measured consequences, all three reproduced
+     * with a probe before this was changed: two scopes in one block were a
+     * redeclaration (C2374 + C2086), a nested scope silently shadowed its parent
+     * (C4456 at /W4), and the variable name in a debugger named a line number it
+     * did not come from. Expanding __LINE__ before pasting it needs a second
+     * level of indirection, which is what these two macros provide. */
+    #define SS_DIAG_PASTE_INNER(a, b) a##b
+    #define SS_DIAG_PASTE(a, b)       SS_DIAG_PASTE_INNER(a, b)
+
+    #define SS_DIAG_SCOPE(category, label)                                     \
+        ::ShadowStrike::Diag::ScopeTrace                                       \
+            SS_DIAG_PASTE(ss_diag_scope_, __LINE__)((category), (label))
 
 #else
 
