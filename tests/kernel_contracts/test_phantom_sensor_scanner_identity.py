@@ -162,6 +162,9 @@ POST_CREATE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/Po
 # compile at all.
 DIAG_TRACE_HPP_PATH = ROOT / "src/PhantomCore/Diagnostics/DiagTrace.hpp"
 DIAG_TRACE_CPP_PATH = ROOT / "src/PhantomCore/Diagnostics/DiagTrace.cpp"
+# The ransomware subsystem's aggregator TU, which fans a kernel process-creation
+# notification out to seven modules on the thread the driver blocks CreateProcess on.
+RANSOMWARE_WIRING_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/RansomwareWiring.cpp"
 
 # The logging header whose missing <format> include forced an ordering requirement on
 # every consumer, and the two projects whose language standards must agree because the
@@ -20269,6 +20272,173 @@ class ScanStageInstrumentationContractTests(unittest.TestCase):
             literals[0], literals[1],
             "both arms of the outer scope label are {!r}, so the deep and shallow "
             "populations still share one name".format(literals[0]))
+
+
+class ProcessNotifyCostVisibilityContractTests(unittest.TestCase):
+    """The process-creation callback's unbounded stages must each be measurable.
+
+    WHY THESE EXIST. Tasks 185 and 186 both say their FIRST DELIVERABLE IS A
+    MEASUREMENT, not an edit, and both describe work that runs on the callback the
+    driver blocks CreateProcess on with no deadline: AntiDebug and
+    CertificateValidator (the latter opens the process image and builds a
+    certificate chain, per RealTimeProtection's own comment), and a seven-module
+    ransomware fan-out. None of it could be attributed, because none of it emitted a
+    span. These tests pin that it stays attributable, so the decision each task owes
+    can be made from field numbers instead of from reasoning.
+
+    WHY SOURCE TEXT. A span only exists when SHADOWSTRIKE_DIAG_TRACE is 1, and
+    PhantomTests.vcxproj builds with it set to 0, where SS_DIAG_SCOPE expands to
+    ((void)0) and emits nothing. Driving this path at all would need a loaded driver
+    delivering a real process notification. There is no configuration in which a
+    gtest case could observe one of these spans.
+
+    THE LABELS MUST SPLIT CREATION FROM EXIT, and that is asserted rather than left
+    to convention, because it IS the open question. Task 186 has to settle whether
+    the EXIT branch belongs off the reply-blocking thread; the two branches do very
+    different work per module - FileBackupManager is a no-op on creation and commits
+    pending backups on exit - so one shared label per module would average them
+    together and hide exactly the number needed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rtp = read_source(REAL_TIME_PROTECTION_CPP_PATH)
+        cls.wiring = read_source(RANSOMWARE_WIRING_CPP_PATH)
+
+    # ------------------------------------------------------------------ helpers
+    def _dispatch_body(self):
+        marker = "void DispatchProcessNotify("
+        self.assertEqual(
+            1, self.wiring.count(marker),
+            "expected exactly one definition of DispatchProcessNotify, found "
+            "{}".format(self.wiring.count(marker)))
+        head = self.wiring.index(marker)
+        brace = self.wiring.index("{", self.wiring.index(")", head))
+        end = _matching_delimiter(self.wiring, brace, "{", "}")
+        self.assertGreater(end, brace, "could not brace-match DispatchProcessNotify")
+        return self.wiring[brace:end]
+
+    @staticmethod
+    def _code_lines(block):
+        return [l for l in block.splitlines() if not l.strip().startswith("//")]
+
+    # ------------------------------------------------------------------- 186
+    def test_every_fanout_module_has_its_own_span(self):
+        lines = self._code_lines(self._dispatch_body())
+
+        # Subject list DERIVED from the dispatch body: every module entry point it
+        # calls. Refuses to pass by finding nothing.
+        calls = [i for i, l in enumerate(lines)
+                 if re.search(r"\b\w+_(?:OnProcessNotify|OnProcessCreated)\s*\(", l)]
+        self.assertGreaterEqual(
+            len(calls), 7,
+            "found only {} module call(s) in DispatchProcessNotify; the walk has lost "
+            "its subject list and would pass vacuously".format(len(calls)))
+
+        spans = [i for i, l in enumerate(lines) if "SS_DIAG_SCOPE(" in l]
+        self.assertEqual(
+            len(calls), len(spans),
+            "DispatchProcessNotify calls {} module(s) but declares {} span(s). Each "
+            "module needs its own, or the fan-out's cost cannot be attributed to the "
+            "handler that owns it - which is the measurement task 186 has to make "
+            "before choosing an execution model".format(len(calls), len(spans)))
+
+        # Every call must be immediately preceded by a span, so a span cannot drift
+        # away from the call it is supposed to be timing.
+        unmeasured = []
+        for i in calls:
+            preceding = [j for j in spans if j < i]
+            if not preceding or i - max(preceding) != 1:
+                unmeasured.append(lines[i].strip()[:60])
+        self.assertEqual(
+            [], unmeasured,
+            "module call(s) not immediately preceded by their own span: {}".format(
+                unmeasured))
+
+    def test_every_fanout_span_separates_creation_from_exit(self):
+        lines = self._code_lines(self._dispatch_body())
+        spans = [l for l in lines if "SS_DIAG_SCOPE(" in l]
+        self.assertGreaterEqual(
+            len(spans), 7,
+            "found only {} span(s); the walk has lost its subject list".format(len(spans)))
+
+        merged = []
+        for span in spans:
+            labels = re.findall(r'"([^"]*)"', span)
+            # the first literal is the category; the rest are labels
+            labels = [v for v in labels[1:]]
+            if not labels:
+                merged.append(span.strip()[:70])
+                continue
+            if not all(v.endswith("-create") or v.endswith("-exit") for v in labels):
+                merged.append(span.strip()[:70])
+        self.assertEqual(
+            [], merged,
+            "span(s) whose label does not state which branch it timed: {}. A module "
+            "does very different work on creation and on exit, so one shared label "
+            "averages the two together and hides the number task 186 needs".format(
+                merged))
+
+        # At least the modules called on BOTH branches must carry two labels. Only
+        # the one inside an isCreation gate may legitimately carry a single label.
+        two_way = [s for s in spans if len(re.findall(r'"([^"]*)"', s)) >= 3]
+        self.assertGreaterEqual(
+            len(two_way), 6,
+            "only {} span(s) distinguish both branches; the unconditional modules must "
+            "each report creation and exit separately".format(len(two_way)))
+
+    # ------------------------------------------------------------------- 185
+    def test_the_two_prebudget_stages_are_measured(self):
+        for call, label in (
+            ("Security::AntiDebug::Instance().OnKernelProcessNotify(", "antidebug"),
+            ("Security::CertificateValidator::Instance().OnKernelProcessCreate(",
+             "certvalidator"),
+        ):
+            self.assertEqual(
+                1, self.rtp.count(call),
+                "expected exactly one {!r} call site, found {}".format(
+                    call, self.rtp.count(call)))
+            position = self.rtp.index(call)
+            # the span must be within a few lines above the call, not merely present
+            # somewhere in a 467 KB file
+            # Bounded deliberately: assertIn against this window would print the
+            # window, and the reader only needs to know which stage is unmeasured.
+            window = self.rtp[max(position - 400, 0):position]
+            self.assertTrue(
+                "SS_DIAG_SCOPE(" in window,
+                "the {} stage runs on the process-creation callback with no span "
+                "above it. It is unbounded there and opens work whose cost cannot "
+                "otherwise be attributed".format(label))
+            self.assertTrue(
+                label in window,
+                "the span above the {} call does not name it, so its cost would be "
+                "attributed to the wrong stage".format(label))
+
+    def test_the_prebudget_stages_are_not_gated_on_the_reply_horizon(self):
+        # Task 185 is explicit: DO NOT GATE THESE TWO ON THE REPLY HORIZON. Both
+        # return void, so neither product flows through the kernel verdict, so the
+        # horizon's justification for skipping - the driver has failed open and the
+        # verdict is discarded, therefore the work is waste - does not extend to
+        # them. Skipping would DROP detection rather than defer it. This pins that
+        # decision so a later latency pass cannot quietly reverse it.
+        first = self.rtp.index("Security::AntiDebug::Instance().OnKernelProcessNotify(")
+        last = self.rtp.index(
+            "Security::CertificateValidator::Instance().OnKernelProcessCreate(")
+        self.assertLess(first, last, "the two stages are no longer in the expected order")
+        region = strip_c_comments(self.rtp[first - 600:last + 600])
+
+        for forbidden in ("kProcessNotifyReplyHorizonMs", "kProcessNotifyBudgetMs"):
+            # Reported per offending line rather than with assertNotIn, which would
+            # dump the whole region and bury the one line that matters.
+            offenders = [l.strip()[:90] for l in region.splitlines() if forbidden in l]
+            self.assertEqual(
+                [], offenders,
+                "the AntiDebug/CertificateValidator region now references {!r} at "
+                "{}. Neither stage may be skipped on a deadline: both return void, "
+                "so their product survives the driver timing out, and skipping them "
+                "loses detection instead of deferring it. Bound their cost inside "
+                "the modules or move them off this thread instead".format(
+                    forbidden, offenders))
 
 
 if __name__ == "__main__":

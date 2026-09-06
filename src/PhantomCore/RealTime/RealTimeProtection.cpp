@@ -4484,6 +4484,8 @@ public:
         if (Security::AntiDebug::HasInstance() &&
             Security::AntiDebug::Instance().IsInitialized()) {
             try {
+                SS_DIAG_SCOPE("ProcNotify", req.isCreation ? "antidebug-create"
+                                                           : "antidebug-exit");
                 Security::AntiDebug::Instance().OnKernelProcessNotify(
                     req.processId, req.parentProcessId,
                     imagePath, static_cast<bool>(req.isCreation));
@@ -4501,6 +4503,7 @@ public:
             Security::CertificateValidator::HasInstance() &&
             Security::CertificateValidator::Instance().IsInitialized()) {
             try {
+                SS_DIAG_SCOPE("ProcNotify", "certvalidator-create");
                 Security::CertificateValidator::Instance().OnKernelProcessCreate(
                     req.processId, req.parentProcessId, imagePath);
             } catch (const std::exception& e) {
@@ -5570,9 +5573,14 @@ public:
         // cost/benefit - not something to bolt onto a latency bound. It must be
         // settled before any further modules are added to this dispatch.
         // =====================================================================
-        Ransomware::Wiring::DispatchProcessNotify(
-            req.processId, req.parentProcessId,
-            imagePath, commandLine, static_cast<bool>(req.isCreation));
+        // Braced so the span covers the dispatch and nothing after it.
+        {
+            SS_DIAG_SCOPE("ProcNotify", req.isCreation ? "ransomware-fanout-create"
+                                                       : "ransomware-fanout-exit");
+            Ransomware::Wiring::DispatchProcessNotify(
+                req.processId, req.parentProcessId,
+                imagePath, commandLine, static_cast<bool>(req.isCreation));
+        }
 
         return Communication::KernelVerdict::Allow;
     }

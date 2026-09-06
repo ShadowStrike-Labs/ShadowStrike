@@ -22,6 +22,10 @@
 
 #include "RansomwareWiring.hpp"
 #include "../Utils/Logger.hpp"
+// Diagnostics only. This is NOT one of the per-module RansomwareProtection
+// headers the file comment above forbids: it declares only ShadowStrike::Diag
+// and redefines none of the pair-wise-conflicting subsystem types.
+#include "../Diagnostics/DiagTrace.hpp"
 
 namespace ShadowStrike::Ransomware::Wiring::Internal {
 
@@ -232,13 +236,25 @@ void DispatchProcessNotify(std::uint32_t pid,
                            bool isCreation) noexcept {
     using namespace Internal;
 
-    RansomwareDetector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
-    LockyDetector_OnProcessNotify(pid, parentPid, imagePath, isCreation);
-    HoneypotManager_OnProcessNotify(pid, parentPid, imagePath, isCreation);
+    {
+        SS_DIAG_SCOPE("RansomFanOut", isCreation ? "detector-create" : "detector-exit");
+        RansomwareDetector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
+    }
+    {
+        SS_DIAG_SCOPE("RansomFanOut", isCreation ? "locky-create" : "locky-exit");
+        LockyDetector_OnProcessNotify(pid, parentPid, imagePath, isCreation);
+    }
+    {
+        SS_DIAG_SCOPE("RansomFanOut", isCreation ? "honeypot-create" : "honeypot-exit");
+        HoneypotManager_OnProcessNotify(pid, parentPid, imagePath, isCreation);
+    }
 
     // BackupProtector intercepts destructive backup-removal commands
     // (vssadmin delete shadows, wbadmin delete, etc.) at process creation.
-    BackupProtector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
+    {
+        SS_DIAG_SCOPE("RansomFanOut", isCreation ? "backup-create" : "backup-exit");
+        BackupProtector_OnProcessNotify(pid, imagePath, commandLine, isCreation);
+    }
 
     // ShadowCopyProtector is the module that classifies a VSS destruction
     // attempt by type, records it, attributes it to MITRE T1490 and raises the
@@ -269,17 +285,24 @@ void DispatchProcessNotify(std::uint32_t pid,
     // Do NOT delete either entry on the assumption that the other covers it;
     // the ownership boundary between them is task 169's decision, not an
     // inference to be drawn from this comment.
-    ShadowCopyProtector_OnProcessNotify(pid, parentPid, imagePath, commandLine, isCreation);
+    {
+        SS_DIAG_SCOPE("RansomFanOut", isCreation ? "shadowcopy-create" : "shadowcopy-exit");
+        ShadowCopyProtector_OnProcessNotify(pid, parentPid, imagePath, commandLine, isCreation);
+    }
 
     // FileBackupManager commits any pending JIT backups when the source
     // process exits — must run on both creation and termination events so
     // dead-PID entries are not left behind to leak memory and starve the
     // eviction logic of room for still-running processes.
-    FileBackupManager_OnProcessNotify(pid, parentPid, imagePath, isCreation);
+    {
+        SS_DIAG_SCOPE("RansomFanOut", isCreation ? "filebackup-create" : "filebackup-exit");
+        FileBackupManager_OnProcessNotify(pid, parentPid, imagePath, isCreation);
+    }
 
     // WannaCry only cares about process creation events (service/mutex
     // indicators are checked in the creation hot path).
     if (isCreation) {
+        SS_DIAG_SCOPE("RansomFanOut", "wannacry-create");
         WannaCryDetector_OnProcessCreated(pid, imagePath, commandLine);
     }
 }
