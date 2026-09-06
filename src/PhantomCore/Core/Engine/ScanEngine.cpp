@@ -1570,7 +1570,15 @@ EngineResult ScanEngine::ScanFile(
     // Declared here rather than beside its first use because the stages below
     // reach the exit path via goto, which may not jump over an initialization.
     std::optional<FileSystem::FileTypeInfo> sharedTypeInfo;
-    SS_DIAG_SCOPE("ScanEngine", "ScanFile");
+    // The label separates the two populations that share this function,
+    // because a long tail means opposite things for each. A shallow scan
+    // runs on the thread the kernel is holding a file operation open for,
+    // so seconds there stall the machine; a deep scan runs on the deferred
+    // worker, where the same seconds cost nothing. One shared "ScanFile"
+    // label is why the measured 8.0 s outlier could be attributed to
+    // neither.
+    SS_DIAG_SCOPE("ScanEngine",
+                  context.deepScan ? "ScanFile-deep" : "ScanFile-shallow");
     const auto resolveFileType =
         [&sharedTypeInfo, &filePath]() -> const FileSystem::FileTypeInfo& {
             if (!sharedTypeInfo.has_value()) {
@@ -1796,6 +1804,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_whitelistStore) {
+            SS_DIAG_SCOPE("ScanEngine", "stage01-whitelist");
             const auto stage1Start = steady_clock::now();
 
             // Check by hash (bloom filter fast path)
@@ -1837,6 +1846,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_signatureStore) {
+            SS_DIAG_SCOPE("ScanEngine", "stage02-hash");
             const auto stage2Start = steady_clock::now();
 
             // Use SignatureStore's hash lookup (uses HashStore internally)
@@ -1885,6 +1895,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_threatIntelStore && result.verdict == ScanVerdict::Clean) {
+            SS_DIAG_SCOPE("ScanEngine", "stage02.5-threatintel-store");
             const auto stage25Start = steady_clock::now();
 
             try {
@@ -1951,6 +1962,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_config.enableCloudLookup && m_impl->m_threatIntelDB) {
+            SS_DIAG_SCOPE("ScanEngine", "stage03-threatintel-cloud");
             const auto stage3Start = steady_clock::now();
 
             bool tiFound = m_impl->m_threatIntelDB->HasEntry(fileHash, ThreatIntel::IOCType::FileHash);
@@ -1983,6 +1995,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_signatureStore && context.deepScan) {
+            SS_DIAG_SCOPE("ScanEngine", "stage04-signature-deep");
             const auto stage4Start = steady_clock::now();
 
             // Read file content
@@ -2110,6 +2123,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         {
+            SS_DIAG_SCOPE("ScanEngine", "stage04.5-document");
             const auto stage45Start = steady_clock::now();
 
             try {
@@ -2206,6 +2220,7 @@ EngineResult ScanEngine::ScanFile(
         if (m_impl->m_config.enableScriptAnalysis &&
             result.verdict == ScanVerdict::Clean) {
 
+            SS_DIAG_SCOPE("ScanEngine", "stage04.6-script");
             const auto stage46Start = steady_clock::now();
 
             try {
@@ -2528,6 +2543,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         {
+            SS_DIAG_SCOPE("ScanEngine", "stage04.7-archive");
             const auto stage47Start = steady_clock::now();
 
             try {
@@ -2694,6 +2710,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_config.enableHeuristics && m_impl->m_heuristicAnalyzer) {
+            SS_DIAG_SCOPE("ScanEngine", "stage05-heuristic");
             const auto stage5Start = steady_clock::now();
 
             auto heuristicResult = m_impl->m_heuristicAnalyzer->AnalyzeFile(filePath);
@@ -2775,6 +2792,7 @@ EngineResult ScanEngine::ScanFile(
         // Its risk score and anomaly detection complement HeuristicAnalyzer.
 
         {
+            SS_DIAG_SCOPE("ScanEngine", "stage05.5-executable");
             auto& execAnalyzer = FileSystem::ExecutableAnalyzer::Instance();
 
             // IsPE(filePath) opened and read the file a second time purely to
@@ -2938,6 +2956,7 @@ EngineResult ScanEngine::ScanFile(
         // similarity analysis still happen on every scanned file.
         if (context.deepScan &&
             m_impl->m_polymorphicDetector && m_impl->m_polymorphicDetector->IsInitialized()) {
+            SS_DIAG_SCOPE("ScanEngine", "stage06-polymorphic-fuzzy");
             const auto stage6Start = steady_clock::now();
 
             auto polyResult = m_impl->m_polymorphicDetector->AnalyzeFile(filePath);
@@ -3068,7 +3087,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_sandboxAnalyzer && m_impl->m_sandboxAnalyzer->IsInitialized() && context.deepScan) {
-            const auto stage7Start = steady_clock::now();
+            SS_DIAG_SCOPE("ScanEngine", "stage07-sandbox");
 
             SandboxAnalysisOptions sbOptions{};
             sbOptions.timeoutSeconds = 30;
@@ -3091,8 +3110,6 @@ EngineResult ScanEngine::ScanFile(
                 m_impl->InvokeDetectionCallbacks(result);
                 goto finalize_scan;
             }
-
-            const auto stage7End = steady_clock::now();
         }
 
         // ====================================================================
@@ -3100,7 +3117,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_emulationEngine && m_impl->m_emulationEngine->IsInitialized() && context.deepScan) {
-            const auto stage8Start = steady_clock::now();
+            SS_DIAG_SCOPE("ScanEngine", "stage08-emulation");
 
             // Read file into buffer for emulation
             try {
@@ -3263,8 +3280,6 @@ EngineResult ScanEngine::ScanFile(
             } catch (const std::exception& emuEx) {
                 SS_LOG_ERROR(L"ScanEngine", L"Emulation exception: %hs", emuEx.what());
             }
-
-            const auto stage8End = steady_clock::now();
         }
 
         // ====================================================================
@@ -3272,7 +3287,7 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
 
         if (m_impl->m_zeroDayDetector && m_impl->m_zeroDayDetector->IsInitialized() && context.deepScan) {
-            const auto stage9Start = steady_clock::now();
+            SS_DIAG_SCOPE("ScanEngine", "stage09-zeroday");
 
             ZeroDayAnalysisOptions zdOptions{};
             auto zdResult = m_impl->m_zeroDayDetector->AnalyzeFile(filePath, zdOptions);
@@ -3294,8 +3309,6 @@ EngineResult ScanEngine::ScanFile(
                 m_impl->InvokeDetectionCallbacks(result);
                 goto finalize_scan;
             }
-
-            const auto stage9End = steady_clock::now();
         }
 
         // ====================================================================
@@ -3307,6 +3320,7 @@ EngineResult ScanEngine::ScanFile(
         // detection layer for zero-day threats that evade all prior stages.
 
         if (m_impl->m_config.enableMachineLearning) {
+            SS_DIAG_SCOPE("ScanEngine", "stage10-cortex-ml");
             const auto stage10Start = steady_clock::now();
 
             try {

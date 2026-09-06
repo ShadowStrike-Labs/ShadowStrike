@@ -20008,5 +20008,186 @@ class DiagScopeNamingContractTests(unittest.TestCase):
                 check_line + 1, else_line + 1))
 
 
+class ScanStageInstrumentationContractTests(unittest.TestCase):
+    """Every stage of ScanEngine::ScanFile must publish its own span.
+
+    WHY A SOURCE CONTRACT AND NOT A BEHAVIOURAL ONE. There is no configuration in
+    which a gtest case could observe these spans. Reaching the stages needs an
+    initialised ScanEngine with a sandbox analyzer and an emulation engine, and
+    PhantomTests.vcxproj builds with SHADOWSTRIKE_DIAG_TRACE=0, where every
+    SS_DIAG_SCOPE expands to ((void)0) and emits nothing at all. The evidence this
+    instrumentation exists to produce appears only in a field ring, so the
+    enforceable invariant is the shape of the source.
+
+    WHAT WENT WRONG, so the next reader knows what these tests defend. ScanFile is
+    2025 lines with fifteen stage banners and it measured its own cost fifteen
+    times, yet a field run could attribute none of it: seven stages wrote into
+    atomics that nothing ever loads, five published only at SS_LOG_TRACE (disabled
+    in production, and a file write through our own minifilter is the wrong
+    instrument for a stall), and three - sandbox, emulation and zero-day, the three
+    most expensive - called steady_clock::now() twice and read neither value. The
+    measured 8.0 s worst case therefore had no attributable owner.
+
+    COMMENTS ARE HANDLED PER LINE RATHER THAN STRIPPED WHOLESALE, deliberately: the
+    stage banners this walk derives its subject list from ARE comments, so
+    strip_c_comments would delete the very thing being enumerated. A commented-out
+    scope must still not count, so a line whose first non-space characters are //
+    is treated as carrying no code.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = read_source(SCAN_ENGINE_CPP_PATH)
+        marker = "EngineResult ScanEngine::ScanFile("
+        assert src.count(marker) == 1, (
+            "expected exactly one definition of ScanEngine::ScanFile, found "
+            "{}".format(src.count(marker)))
+        head = src.index(marker)
+        open_paren = src.index("(", head)
+        close_paren = _matching_delimiter(src, open_paren, "(", ")")
+        open_brace = src.index("{", close_paren)
+        close_brace = _matching_delimiter(src, open_brace, "{", "}")
+        cls.body_lines = src[open_brace:close_brace].splitlines()
+
+    @staticmethod
+    def _is_code(line):
+        return not line.strip().startswith("//")
+
+    @staticmethod
+    def _expected_label_token(stage_number):
+        # "1" -> "stage01", "2.5" -> "stage02.5", "10" -> "stage10"
+        parts = stage_number.split(".")
+        token = "stage" + parts[0].zfill(2)
+        if len(parts) > 1:
+            token += "." + parts[1]
+        return token
+
+    def _banners(self):
+        found = []
+        for i, line in enumerate(self.body_lines):
+            m = re.match(r"\s*//\s*STAGE\s+([\d.]+)\s*:", line)
+            if m:
+                found.append((i, m.group(1)))
+        return found
+
+    def _scope_lines(self):
+        return [i for i, line in enumerate(self.body_lines)
+                if "SS_DIAG_SCOPE(" in line and self._is_code(line)]
+
+    def test_every_stage_banner_has_its_own_scope(self):
+        banners = self._banners()
+        # Anti-vacuity: the subject list is derived from the source, so this must
+        # refuse to pass by finding nothing to check.
+        self.assertGreaterEqual(
+            len(banners), 12,
+            "only {} stage banners found inside the ScanFile body; the walk has "
+            "lost its subject list and would pass vacuously".format(len(banners)))
+
+        scopes = self._scope_lines()
+        self.assertEqual(
+            len(banners) + 1, len(scopes),
+            "ScanFile has {} stage banners and {} scopes. It must carry exactly one "
+            "scope per stage plus one for the function itself; any other count "
+            "means a stage is unmeasured or an extra scope double-counts "
+            "one".format(len(banners), len(scopes)))
+
+        missing = []
+        mislabelled = []
+        for idx, (line_no, number) in enumerate(banners):
+            end = banners[idx + 1][0] if idx + 1 < len(banners) else len(self.body_lines)
+            inside = [i for i in scopes if line_no < i < end]
+            if len(inside) != 1:
+                missing.append((number, len(inside)))
+                continue
+            token = self._expected_label_token(number)
+            if token not in self.body_lines[inside[0]]:
+                mislabelled.append(
+                    (number, token, self.body_lines[inside[0]].strip()[:70]))
+
+        self.assertEqual(
+            [], missing,
+            "stage(s) without exactly one scope of their own, as (stage, scopes "
+            "found): {}. A stage with no span can be neither blamed nor cleared for "
+            "a slow scan".format(missing))
+        self.assertEqual(
+            [], mislabelled,
+            "stage(s) whose scope label does not name them, as (stage, expected "
+            "token, line): {}. A mislabelled span attributes cost to the wrong "
+            "stage, which is worse than no span at all".format(mislabelled))
+
+    def test_no_two_stages_share_a_label(self):
+        labels = []
+        for i in self._scope_lines():
+            for m in re.finditer(r'"([^"]*)"', self.body_lines[i]):
+                if m.group(1).startswith("stage"):
+                    labels.append(m.group(1))
+        self.assertGreaterEqual(
+            len(labels), 12,
+            "found only {} stage labels; the walk has lost its subject "
+            "list".format(len(labels)))
+        duplicates = sorted({v for v in labels if labels.count(v) > 1})
+        self.assertEqual(
+            [], duplicates,
+            "two or more stages share a scope label: {}. A trace groups by label, so "
+            "sharing one silently merges two populations and averages away the stage "
+            "that is actually slow".format(duplicates))
+
+    def test_no_stage_timer_is_measured_and_discarded(self):
+        # The general form of the defect rather than the three instances found: a
+        # stage that pays for a clock read must do something with the result.
+        declared = []
+        for i, line in enumerate(self.body_lines):
+            if not self._is_code(line):
+                continue
+            m = re.search(r"\bconst auto (stage\w*)\s*=\s*steady_clock::now", line)
+            if m:
+                declared.append((m.group(1), i))
+
+        self.assertGreaterEqual(
+            len(declared), 12,
+            "found only {} stage timers; the walk has lost its subject "
+            "list".format(len(declared)))
+
+        discarded = []
+        for (name, decl_line) in declared:
+            reads = 0
+            for i, line in enumerate(self.body_lines):
+                if i == decl_line or not self._is_code(line):
+                    continue
+                if re.search(r"\b" + re.escape(name) + r"\b", line):
+                    reads += 1
+            if reads == 0:
+                discarded.append(name)
+
+        self.assertEqual(
+            [], discarded,
+            "timer(s) assigned from steady_clock::now() and never read: {}. That is a "
+            "stage measuring its own cost and throwing it away - exactly what left "
+            "the sandbox, emulation and zero-day stages unattributable. Either "
+            "publish the value or do not pay for the clock read".format(discarded))
+
+    def test_the_outer_scan_scope_separates_deep_from_shallow(self):
+        scopes = self._scope_lines()
+        self.assertTrue(scopes, "ScanFile carries no scope at all")
+        window = "\n".join(self.body_lines[scopes[0]:scopes[0] + 3])
+
+        self.assertIn(
+            "context.deepScan", window,
+            "the outer ScanFile scope no longer distinguishes a deep scan. A shallow "
+            "scan runs on the thread the kernel holds a file operation open for and "
+            "a deep scan runs on the deferred worker, so one shared label leaves a "
+            "multi-second outlier attributable to neither")
+
+        literals = re.findall(r'"(ScanFile[^"]*)"', window)
+        self.assertEqual(
+            2, len(literals),
+            "expected exactly two ScanFile labels on the outer scope so the two "
+            "populations are separable, found {}: {}".format(len(literals), literals))
+        self.assertNotEqual(
+            literals[0], literals[1],
+            "both arms of the outer scope label are {!r}, so the deep and shallow "
+            "populations still share one name".format(literals[0]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
