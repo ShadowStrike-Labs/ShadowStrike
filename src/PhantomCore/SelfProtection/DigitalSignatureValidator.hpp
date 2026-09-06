@@ -715,6 +715,13 @@ struct SignatureValidatorStatistics {
     ///        an invalid signature. Non-zero means trust is being refused for a
     ///        reason nobody has triaged; the status is named in the log.
     uint64_t unrecognisedTrustStatus = 0;
+    /// @brief Verification requests declined because the target cannot carry a
+    ///        signature at all (today: a directory). Each one is a cross-process
+    ///        WinVerifyTrust round trip into CryptSvc that was NOT spent. Unsigned
+    ///        is the correct verdict for such a target, so this is saved work rather
+    ///        than skipped analysis. The 1.0.110 field run made 121 of these calls
+    ///        for a single directory path in 75 seconds.
+    uint64_t unsignableTargetsRefused = 0;
     uint64_t blockedSigners      = 0;
     uint64_t avgValidationTimeUs = 0;
     uint64_t stolenCertDetections = 0;

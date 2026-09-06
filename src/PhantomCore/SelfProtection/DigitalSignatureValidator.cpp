@@ -327,6 +327,7 @@ std::string SignatureValidatorStatistics::ToJson() const {
     oss << "\"expiredCertificates\":" << expiredCertificates << ",";
     oss << "\"revocationUndetermined\":" << revocationUndetermined << ",";
     oss << "\"unrecognisedTrustStatus\":" << unrecognisedTrustStatus << ",";
+    oss << "\"unsignableTargetsRefused\":" << unsignableTargetsRefused << ",";
     oss << "\"blockedSigners\":" << blockedSigners << ",";
     oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"stolenCertDetections\":" << stolenCertDetections << ",";
@@ -558,13 +559,95 @@ public:
                 fileType = DetectFileType(pathStr);
             }
 
-            // Perform WinTrust verification
-            result = verifyWithWinTrust(pathStr, options);
+            // A DIRECTORY CANNOT CARRY A SIGNATURE, SO IT MUST NOT REACH WinVerifyTrust.
+            //
+            // The existence rung above uses std::filesystem::exists, which is TRUE
+            // for a directory, so before this guard a directory passed every check
+            // and went all the way into WinVerifyTrust - which is an RPC into
+            // CryptSvc, whose own catalog-store file I/O our minifilter then
+            // intercepts. That is the most expensive call this module can make, and
+            // for a directory it can only ever fail.
+            //
+            // MEASURED IN THE 1.0.110 FIELD RUN, not inferred. In 75 seconds the
+            // service logged this line 121 times, with ONE distinct message and ONE
+            // distinct path:
+            //
+            //   Unrecognised WinVerifyTrust status 0x80092003 treated as invalid
+            //   signature: C:\Windows\System32 signer=''
+            //
+            // 0x80092003 is CRYPT_E_FILE_ERROR - WinVerifyTrust could not read the
+            // subject. The same directory was asked about 121 times because the
+            // answer was never cacheable: the trust worker took the !trusted branch
+            // and published nothing, so the on-access tier's cache-only query kept
+            // returning "not determined" and kept re-queueing it. The field run
+            // shows the end state of that loop directly: 397 determinations
+            // performed, trustVerdictsCached=0, and determine-microsoft-trust scopes
+            // reaching 6.23 SECONDS while CryptSvc was contended by work that could
+            // not succeed.
+            //
+            // NO DETECTION IS LOST, AND THAT IS STRUCTURAL RATHER THAN A JUDGEMENT.
+            // Unsigned is the CORRECT answer for a directory, not a weakened one: a
+            // directory has no PE structure and therefore no certificate directory to
+            // carry an embedded signature, and it cannot be a catalog member because
+            // catalogs key on file-content hashes. Declining to ask produces exactly
+            // the verdict the call would have produced, for free. The catalog
+            // fallback is skipped for the same reason - it would be a second doomed
+            // round trip for the same input.
+            //
+            // WHAT THIS DOES AND DOES NOT DO ABOUT THE REPETITION. Control falls
+            // through to the existing tail, so the normal
+            // `useCache && result != Error` write caches this definite Unsigned and
+            // TryGetCachedMicrosoftSigned can answer false - DETERMINED - instead of
+            // nullopt. For a QUIET directory that is the end of it.
+            //
+            // It does NOT stop the repetition for a BUSY one, and claiming otherwise
+            // would be wrong: getCachedResult revalidates last-write time, and a
+            // directory's last-write time changes whenever a file inside it is
+            // created, renamed or deleted. System32 is written to constantly, so its
+            // entry is invalidated by ordinary activity and the query returns nullopt
+            // again - which is exactly why the field asked 121 times about one path.
+            // The win is therefore that each repeat costs microseconds instead of a
+            // cross-process round trip, and that CryptSvc stops being contended by
+            // work that cannot succeed. That contention is the measurable harm: the
+            // same run recorded determine-microsoft-trust scopes at 6.23 seconds.
+            //
+            // The mtime revalidation is deliberately NOT bypassed for directories. A
+            // path that is a directory now can be removed and replaced by a file, and
+            // that revalidation is what catches it.
+            //
+            // ON UNCERTAINTY WE VERIFY. The error_code overload is used because this
+            // function is noexcept, and a failure to determine the type falls through
+            // to full verification rather than skipping it - unknown must never mean
+            // "skip", which is the same rule the content-size and trust tiers follow.
+            std::error_code dirEc;
+            const bool targetIsDirectory =
+                std::filesystem::is_directory(pathStr, dirEc) && !dirEc;
 
-            // If embedded signature not found, try catalog
-            if (result.result == SignatureValidationResult::Unsigned &&
-                (options.flags & SignatureValidationFlags::AllowCatalogSignatures) != SignatureValidationFlags::None) {
-                result = verifyCatalogSignature(pathStr);
+            if (targetIsDirectory) {
+                result.result = SignatureValidationResult::Unsigned;
+                result.isValid = false;
+                result.isMicrosoftSigned = false;
+                result.errorMessage =
+                    "Target is a directory; a directory carries no Authenticode "
+                    "signature and cannot be a catalog member";
+                m_stats.unsignableTargetsRefused++;
+
+                // DEBUG, not WARN, for the reason IsMicrosoftSigned's own refusal log
+                // records: this can run for many paths and our log writes traverse our
+                // own minifilter, so a per-path WARN would amplify the condition it
+                // reports. unsignableTargetsRefused is the always-on signal.
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"Signature verification declined: target is a directory: %ls",
+                    pathStr.c_str());
+            } else {
+                // Perform WinTrust verification
+                result = verifyWithWinTrust(pathStr, options);
+
+                // If embedded signature not found, try catalog
+                if (result.result == SignatureValidationResult::Unsigned &&
+                    (options.flags & SignatureValidationFlags::AllowCatalogSignatures) != SignatureValidationFlags::None) {
+                    result = verifyCatalogSignature(pathStr);
+                }
             }
 
             // Check blocked signers
@@ -2196,6 +2279,11 @@ private:
         // a direct measure of how much trust is being refused for a reason
         // nobody has triaged yet.
         std::atomic<uint64_t> unrecognisedTrustStatus{0};
+        // Verification declined because the target cannot carry a signature at all.
+        // Each increment is a CryptSvc round trip not spent on a call that could
+        // only have failed. See the directory guard in VerifyFile for the field
+        // measurement that produced this counter.
+        std::atomic<uint64_t> unsignableTargetsRefused{0};
         std::atomic<uint64_t> blockedSigners{0};
         std::atomic<uint64_t> avgValidationTimeUs{0};
         std::atomic<uint64_t> stolenCertDetections{0};
@@ -2207,6 +2295,7 @@ private:
             unsignedFiles = 0; cacheHits = 0; cacheMisses = 0;
             revocationChecks = 0; revokedCertificates = 0; expiredCertificates = 0;
             revocationUndetermined = 0; unrecognisedTrustStatus = 0;
+            unsignableTargetsRefused = 0;
             blockedSigners = 0; avgValidationTimeUs = 0;
             stolenCertDetections = 0; anomalyDetections = 0;
             startTime = Clock::now();
@@ -2225,6 +2314,7 @@ private:
             s.expiredCertificates = expiredCertificates.load(std::memory_order_relaxed);
             s.revocationUndetermined = revocationUndetermined.load(std::memory_order_relaxed);
             s.unrecognisedTrustStatus = unrecognisedTrustStatus.load(std::memory_order_relaxed);
+            s.unsignableTargetsRefused = unsignableTargetsRefused.load(std::memory_order_relaxed);
             s.blockedSigners      = blockedSigners.load(std::memory_order_relaxed);
             s.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
             s.stolenCertDetections = stolenCertDetections.load(std::memory_order_relaxed);

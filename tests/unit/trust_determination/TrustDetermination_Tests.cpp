@@ -67,6 +67,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -559,6 +560,172 @@ namespace {
                "until the verdict reply was wired no such block could take effect, "
                "so there is no field measurement of how often the five evasion "
                "detectors fire on legitimate software";
+    }
+
+    // ------------------------------------------------------------------------
+    // A DIRECTORY MUST NOT BE SENT TO WinVerifyTrust.
+    //
+    // Measured in the 1.0.110 field run: the service logged
+    //   "Unrecognised WinVerifyTrust status 0x80092003 ... C:\Windows\System32"
+    // 121 times in 75 seconds, one message form, one path. 0x80092003 is
+    // CRYPT_E_FILE_ERROR - the subject could not be read, because it is a folder.
+    //
+    // Each of those was a cross-process RPC into CryptSvc, whose catalog-store
+    // file I/O our own minifilter then intercepts. It repeated because the answer
+    // was never cacheable: the trust worker took its !trusted branch and published
+    // nothing, so the on-access tier's cache-only query kept returning "not
+    // determined" and kept re-queueing the same directory. The same run recorded
+    // 397 determinations with trustVerdictsCached=0 and determine-microsoft-trust
+    // scopes reaching 6.23 seconds.
+    //
+    // These cases use a FRESHLY CREATED directory rather than System32 so they
+    // cannot depend on whether another case warmed the validator's cache first -
+    // a counter assertion that silently reads a cache hit proves nothing.
+    // ------------------------------------------------------------------------
+    class TemporaryDirectory {
+    public:
+        TemporaryDirectory() {
+            wchar_t base[MAX_PATH]{};
+            const DWORD n = ::GetTempPathW(MAX_PATH, base);
+            if (n == 0 || n > MAX_PATH) {
+                return;
+            }
+            path_ = std::wstring(base) + L"phantom-sigdir-" +
+                    std::to_wstring(::GetCurrentProcessId()) + L"-" +
+                    std::to_wstring(::GetTickCount64()) + L"-" +
+                    std::to_wstring(s_counter++);
+            created_ = ::CreateDirectoryW(path_.c_str(), nullptr) != FALSE;
+        }
+
+        ~TemporaryDirectory() {
+            if (created_) {
+                ::RemoveDirectoryW(path_.c_str());
+            }
+        }
+
+        TemporaryDirectory(const TemporaryDirectory&) = delete;
+        TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+        [[nodiscard]] bool Ok() const { return created_; }
+        [[nodiscard]] const std::wstring& Path() const { return path_; }
+
+    private:
+        std::wstring path_;
+        bool created_ = false;
+        static unsigned s_counter;
+    };
+
+    unsigned TemporaryDirectory::s_counter = 0;
+
+    TEST_F(TrustDeterminationTest, ADirectoryIsRefusedWithoutAskingWinVerifyTrust) {
+        TemporaryDirectory dir;
+        ASSERT_TRUE(dir.Ok()) << "Could not create a temporary directory, so this "
+                                 "test cannot present an unsignable target.";
+
+        // Premise verified rather than assumed: the target really is a directory.
+        const DWORD attrs = ::GetFileAttributesW(dir.Path().c_str());
+        ASSERT_NE(INVALID_FILE_ATTRIBUTES, attrs);
+        ASSERT_NE(0u, attrs & FILE_ATTRIBUTE_DIRECTORY);
+
+        auto& validator = DigitalSignatureValidator::Instance();
+
+        // Baseline-relative: the validator is a singleton shared with every other
+        // suite, so an absolute value would depend on execution order.
+        const uint64_t before =
+            validator.GetStatistics().unsignableTargetsRefused;
+
+        const SignatureInfo info = validator.VerifyFile(dir.Path());
+
+        EXPECT_EQ(validator.GetStatistics().unsignableTargetsRefused, before + 1)
+            << "The directory was not refused by the signability guard, which means "
+               "it went into WinVerifyTrust - a CryptSvc round trip that can only "
+               "return CRYPT_E_FILE_ERROR for a folder."
+            << Describe(dir.Path(), info);
+
+        // Unsigned is the CORRECT verdict, not a weakened one: a directory has no
+        // PE certificate directory and cannot be a catalog member, so declining to
+        // ask produces exactly the answer the call would have produced.
+        EXPECT_EQ(static_cast<int>(ShadowStrike::Security::SignatureValidationResult::Unsigned),
+                  static_cast<int>(info.result))
+            << "A directory must be reported Unsigned." << Describe(dir.Path(), info);
+        EXPECT_FALSE(info.isValid) << Describe(dir.Path(), info);
+        EXPECT_FALSE(info.isMicrosoftSigned) << Describe(dir.Path(), info);
+    }
+
+    // The refusal is CACHEABLE, which is worth pinning - but read the limit below
+    // before drawing a stronger conclusion from it than it supports.
+    //
+    // RealTimeProtection's on-access trust tier queues a signature determination
+    // ONLY when the cache-only query returns nullopt, so an engaged-but-false
+    // answer is what takes a path out of that queue. This case proves the refusal
+    // produces such an answer.
+    //
+    // WHAT IT DOES *NOT* PROVE, stated here because the field data says otherwise
+    // and a test whose name over-claims is the defect this codebase keeps sweeping
+    // out of the product: getCachedResult revalidates last_write_time, and a
+    // DIRECTORY's last-write time changes every time a file inside it is created,
+    // renamed or deleted. C:\Windows\System32 is written to constantly, so its
+    // entry is invalidated by ordinary activity and the query returns nullopt
+    // again. That is precisely why the field run asked 121 times about one path.
+    // The guard's value is therefore that each of those repeats now costs
+    // microseconds instead of a cross-process round trip into CryptSvc - NOT that
+    // the repeats stop. This case uses a freshly created, quiet directory, so it
+    // measures the cacheability and nothing more.
+    //
+    // The mtime revalidation is deliberately NOT bypassed for directories: a path
+    // that is a directory now can be removed and replaced by a file, and that
+    // revalidation is what catches it.
+    TEST_F(TrustDeterminationTest, TheDirectoryRefusalIsCacheable) {
+        TemporaryDirectory dir;
+        ASSERT_TRUE(dir.Ok()) << "Could not create a temporary directory.";
+
+        auto& validator = DigitalSignatureValidator::Instance();
+
+        // Nothing has asked about this path before - it was created microseconds
+        // ago with a unique name - so the tier would queue it.
+        EXPECT_FALSE(validator.TryGetCachedMicrosoftSigned(dir.Path()).has_value())
+            << "A never-seen path must read as 'not determined' before any "
+               "verification, otherwise the rest of this test proves nothing.";
+
+        const SignatureInfo info = validator.VerifyFile(dir.Path());
+        ASSERT_EQ(static_cast<int>(ShadowStrike::Security::SignatureValidationResult::Unsigned),
+                  static_cast<int>(info.result))
+            << Describe(dir.Path(), info);
+
+        const std::optional<bool> determined =
+            validator.TryGetCachedMicrosoftSigned(dir.Path());
+
+        ASSERT_TRUE(determined.has_value())
+            << "The refusal was not cached, so the cache-only query still answers "
+               "'not determined' even for a directory nothing is writing to.";
+
+        EXPECT_FALSE(*determined)
+            << "A directory must never be reported as Microsoft-signed.";
+    }
+
+    // POSITIVE CONTROL - deliberately NOT a discriminator, and labelled so. Its job
+    // is to prove the guard did not make the validator inert: if the two cases above
+    // passed only because verification stopped working, this one would fail too.
+    TEST_F(TrustDeterminationTest, ARealSignedBinaryIsStillVerifiedAfterTheDirectoryGuard) {
+        const std::wstring path = SystemFile(L"kernel32.dll");
+        ASSERT_FALSE(path.empty()) << "GetSystemDirectoryW failed.";
+        if (::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            GTEST_SKIP() << "Not present on this Windows build: " << Narrow(path);
+        }
+
+        auto& validator = DigitalSignatureValidator::Instance();
+        const uint64_t before =
+            validator.GetStatistics().unsignableTargetsRefused;
+
+        const SignatureInfo info = validator.VerifyFile(path);
+
+        EXPECT_TRUE(info.isValid) << Describe(path, info);
+        EXPECT_TRUE(info.isMicrosoftSigned) << Describe(path, info);
+
+        EXPECT_EQ(validator.GetStatistics().unsignableTargetsRefused, before)
+            << "A real file was counted as an unsignable target, so the guard is "
+               "refusing more than directories."
+            << Describe(path, info);
     }
 
 }  // namespace
