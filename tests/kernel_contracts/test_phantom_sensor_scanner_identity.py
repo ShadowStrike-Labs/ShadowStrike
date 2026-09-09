@@ -372,6 +372,7 @@ HONEYPOT_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneyPo
 HONEYPOT_MANAGER_HPP_PATH = ROOT / "src/PhantomCore/RansomwareProtection/HoneypotManager.hpp"
 EXECUTABLE_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/FileSystem/ExecutableAnalyzer.cpp"
 PRE_CREATE_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreCreate.c"
+PRE_SET_INFO_C_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreSetInfo.c"
 PRE_CREATE_H_PATH = ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreCreate.h"
 
 # IPLeakProtection is the opposite case from Tor/VPN: its kill switch is REAL
@@ -24141,6 +24142,136 @@ class ParseUrlDiagnosticSubjectContractTests(unittest.TestCase):
             "Internal::WinHttpUrlErrorName(lastErr)" in source,
             "the crack failure no longer names its error, leaving the reader with a "
             "bare number")
+
+
+class KernelDenialTraceabilityContractTests(unittest.TestCase):
+    """A denial is the most consequential thing this driver does to a machine, and
+    it was the least traceable thing it did.
+
+    MEASURED IN 1.0.113: the service reported kernelPreCreate blocked=2 and NEITHER
+    FILE COULD BE NAMED from any surface. That is why the gray-screen investigation
+    could confirm the quarantine of svtminion.ps1 but could not establish what the
+    two denials were. PreCreate.c has five sites that complete a create with
+    STATUS_ACCESS_DENIED; two wrote the path with DbgPrintEx, which reaches a kernel
+    debugger and never the diagnostic bundle, and three wrote nothing at all.
+
+    Every denial now sends the path to user mode as a
+    SHADOWSTRIKE_FILE_OPERATION_EVENT, reusing the structure PreSetInformation
+    already used so the wire protocol did not grow.
+    """
+
+    def _pre_create(self):
+        return strip_c_comments(read_source(PRE_CREATE_C_PATH))
+
+    def test_every_denial_site_reports_the_file_it_refused(self):
+        """The count is derived from the artifact, not from a remembered number."""
+        source = self._pre_create()
+        denials = source.count("Data->IoStatus.Status = STATUS_ACCESS_DENIED;")
+        self.assertGreaterEqual(
+            denials, 5,
+            "the denial sites have been reduced; this contract counts them from the "
+            "source so it cannot silently cover fewer than exist")
+        emissions = source.count("ShadowStrikeSendFileOperationEvent(")
+        self.assertEqual(
+            denials, emissions,
+            "there are %d sites that complete a create with STATUS_ACCESS_DENIED but "
+            "%d that report which file was refused. A denial nobody can attribute is "
+            "what made two blocks in the 1.0.113 run unidentifiable."
+            % (denials, emissions))
+
+    def test_each_denial_reports_a_distinct_reason(self):
+        """The five sites mean different things and must stay distinguishable.
+
+        A CACHED_MALICIOUS refusal means no scan ran during that create, which is
+        the case an operator most needs to tell apart from a fresh conviction.
+        """
+        source = self._pre_create()
+        reasons = re.findall(r"SS_FILE_BLOCK_REASON_CREATE_\w+", source)
+        self.assertEqual(
+            len(reasons), len(set(reasons)),
+            "two denial sites report the same reason code, so the log cannot "
+            "distinguish them: %s" % sorted(reasons))
+        self.assertGreaterEqual(
+            len(set(reasons)), 5,
+            "fewer than five distinct denial reasons are in use, so at least two "
+            "sites are now indistinguishable in the log")
+
+    def test_every_emission_passes_the_resolved_path(self):
+        source = self._pre_create()
+        calls = [s for s in source.split(";")
+                 if "ShadowStrikeSendFileOperationEvent(" in s]
+        self.assertTrue(calls, "no denial reports a file at all")
+        for call in calls:
+            self.assertTrue(
+                "&NameInfo->Name" in call,
+                "a denial emission does not pass the resolved path. The name is "
+                "already resolved at these sites for the scan decision, so omitting "
+                "it reports that something was blocked without saying what.")
+
+    def test_the_notification_cannot_change_the_verdict(self):
+        """Telemetry must never decide whether a file is denied."""
+        source = self._pre_create()
+        calls = [s for s in source.split(";")
+                 if "ShadowStrikeSendFileOperationEvent(" in s]
+        for call in calls:
+            self.assertTrue(
+                "(VOID)ShadowStrikeSendFileOperationEvent(" in call,
+                "a denial emission's result is being consumed rather than "
+                "explicitly discarded. A failure to notify must not alter the "
+                "verdict, and the discard is how that intent is stated.")
+
+    def test_there_is_exactly_one_frame_builder(self):
+        """PreSetInformation had a private copy and PreCreate needed the same frame.
+
+        Two builders for one wire structure is how the two YARA metadata builders
+        and the two on-disk trie producers in this codebase drifted apart, with the
+        worse one being the one that ran.
+        """
+        producer = strip_c_comments(read_source(PRE_SET_INFO_C_PATH))
+        self.assertTrue(
+            "PSHADOWSTRIKE_FILE_OPERATION_EVENT payload" not in producer,
+            "PreSetInformation is framing the file-operation event itself again. "
+            "The builder lives in ScanBridge so that both producers emit an "
+            "identical frame.")
+        self.assertTrue(
+            "ShadowStrikeSendFileOperationEvent(" in producer,
+            "PreSetInformation no longer delegates to the shared builder, so its "
+            "telemetry has either been removed or re-implemented")
+
+    def test_the_service_narrates_only_refused_operations(self):
+        """PreSetInformation emits this event for every rename and delete.
+
+        A WARN per event is the log storm that once produced 51,169 lines in four
+        minutes, so the level must depend on WasBlocked.
+        """
+        consumer = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        marker = "case FilterMessageType_FileOperationEvent:"
+        position = consumer.find(marker)
+        self.assertNotEqual(
+            -1, position,
+            "the service does not handle the file-operation event, so the path "
+            "arrives and is discarded - which is the state this change fixed")
+        window = consumer[position:position + 4000]
+        self.assertTrue(
+            "if (op->WasBlocked == 0) {" in window,
+            "the handler no longer distinguishes a refused operation from an "
+            "evaluated one. Every rename and delete would be narrated at the same "
+            "level as a denial.")
+        self.assertTrue(
+            "KERNEL DENIED access" in window,
+            "the refusal is no longer logged with a distinguishable message")
+
+    def test_the_delivered_name_is_bounded_by_the_delivered_size(self):
+        """Trusting a declared length is how the malformed RegistryNotify frames
+        would have become a read past the end of a payload."""
+        consumer = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        position = consumer.find("case FilterMessageType_FileOperationEvent:")
+        window = consumer[position:position + 4000]
+        self.assertTrue(
+            "if (nameBytes > availableBytes) {" in window,
+            "the handler trusts FileNameBytes without bounding it against what was "
+            "actually delivered, so a frame declaring more name than it carries "
+            "would be read past its end")
 
 
 if __name__ == "__main__":

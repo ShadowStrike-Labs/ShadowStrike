@@ -6366,6 +6366,106 @@ public:
                 break;
             }
 
+            case FilterMessageType_FileOperationEvent: {
+                //
+                // WARN ONLY WHEN THE OPERATION WAS REFUSED, and the volume is the
+                // reason. PreSetInformation emits this event for every rename and
+                // delete it evaluates, which on a busy machine is continuous; a
+                // WARN per event would be exactly the log storm that once produced
+                // 51,169 lines in four minutes and a 27.7 MB log. A refusal is
+                // rare - the 1.0.113 run had two - and is the most consequential
+                // thing this driver does to a machine.
+                //
+                // THIS IS WHAT MADE THE TWO DENIALS IN THAT RUN UNTRACEABLE. The
+                // service reported kernelPreCreate blocked=2 and no surface named
+                // either file. Two of the driver's five denial sites wrote the path
+                // with DbgPrintEx, which reaches a kernel debugger and never the
+                // diagnostic bundle, and three wrote nothing at all.
+                //
+                if (!data || size < sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT)) {
+                    Utils::Logger::Error(
+                        "RealTimeProtection: FileOperationEvent too small ({} bytes, "
+                        "need at least {})",
+                        size,
+                        static_cast<uint32_t>(sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT)));
+                    break;
+                }
+
+                const auto* op =
+                    static_cast<const SHADOWSTRIKE_FILE_OPERATION_EVENT*>(data);
+
+                m_stats.kernelTelemetryEvents++;
+
+                if (op->WasBlocked == 0) {
+                    // Evaluated and allowed. Counted above, not narrated.
+                    break;
+                }
+
+                //
+                // The name is bounded by BOTH the declared length and what was
+                // actually delivered. Trusting FileNameBytes alone would read past
+                // the payload for any frame whose declared length exceeds its
+                // delivered size, which is the defect class that produced the
+                // malformed RegistryNotify frames.
+                //
+                const std::size_t fixed = sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT);
+                const std::size_t availableBytes = size - fixed;
+                std::size_t nameBytes = op->FileNameBytes;
+                if (nameBytes > availableBytes) {
+                    nameBytes = availableBytes;
+                }
+                nameBytes &= ~static_cast<std::size_t>(1);
+
+                std::wstring path;
+                if (nameBytes >= sizeof(wchar_t)) {
+                    const auto* chars = reinterpret_cast<const wchar_t*>(
+                        static_cast<const std::uint8_t*>(data) + fixed);
+                    path.assign(chars, nameBytes / sizeof(wchar_t));
+                    // The driver writes a terminator; do not carry it into the log.
+                    while (!path.empty() && path.back() == L'\0') {
+                        path.pop_back();
+                    }
+                }
+
+                //
+                // NAME THE REASON. The five denial sites mean different things and
+                // a bare "blocked" would flatten them. A CACHED_MALICIOUS refusal
+                // in particular means NO SCAN RAN DURING THIS CREATE - the verdict
+                // came from the kernel's own cache - which is the case an operator
+                // most needs to tell apart from a fresh conviction, because it is
+                // the one where a stale entry keeps denying a file that may no
+                // longer be a threat.
+                //
+                const wchar_t* reason = L"unspecified";
+                switch (op->BlockReason) {
+                case SS_FILE_BLOCK_REASON_CREATE_SELF_PROTECTION:
+                    reason = L"self-protection policy"; break;
+                case SS_FILE_BLOCK_REASON_CREATE_FILE_PROTECTION:
+                    reason = L"file-protection engine"; break;
+                case SS_FILE_BLOCK_REASON_CREATE_USB_AUTORUN:
+                    reason = L"removable-media autorun"; break;
+                case SS_FILE_BLOCK_REASON_CREATE_CACHED_MALICIOUS:
+                    reason = L"CACHED malicious verdict - no scan ran during this open";
+                    break;
+                case SS_FILE_BLOCK_REASON_CREATE_SCAN_VERDICT:
+                    reason = L"scan verdict or threat score over the block threshold";
+                    break;
+                default:
+                    break;
+                }
+
+                SS_LOG_WARN(L"RealTimeProtection",
+                    L"KERNEL DENIED access: '%ls' pid=%u reason=0x%X (%ls) score=%u",
+                    path.empty() ? L"<path not delivered>" : path.c_str(),
+                    op->ProcessId,
+                    op->BlockReason,
+                    reason,
+                    op->SuspicionScore);
+
+                m_stats.kernelThreatAlerts++;
+                break;
+            }
+
             case FilterMessageType_RegistryBehavioralAlert: {
                 //
                 // WARN, and unlike the behavioural alert below this line names

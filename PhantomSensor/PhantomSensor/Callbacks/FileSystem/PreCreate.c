@@ -982,6 +982,30 @@ Return Value:
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
         InterlockedIncrement64(&g_PcState.Stats.SelfProtectBlocks);
 
+        //
+        // RECORD WHICH FILE WAS REFUSED, AND WHY.
+        //
+        // Self-protection policy refused this requestor outright.
+        //
+        // A denial is the most consequential thing this driver does to a
+        // machine and it was the least traceable: the 1.0.113 run reported
+        // kernelPreCreate blocked=2 and neither file could be named. Two of the
+        // five denial sites logged the path with DbgPrintEx, which reaches a
+        // kernel debugger and never the diagnostic bundle, and three logged
+        // nothing at all.
+        //
+        // Fire-and-forget: the send cannot block this callback, and a failure
+        // to notify must never change the verdict, so the result is not tested.
+        //
+        (VOID)ShadowStrikeSendFileOperationEvent(
+            RequestorPid,
+            SS_FILE_OP_INFOCLASS_CREATE,
+            &NameInfo->Name,
+            SS_FILE_BLOCK_REASON_CREATE_SELF_PROTECTION,
+            0,
+            TRUE
+            );
+
         if (PcpShouldLogOperation()) {
             DbgPrintEx(
                 DPFLTR_IHVDRIVER_ID,
@@ -1041,6 +1065,30 @@ Return Value:
 
                     SHADOWSTRIKE_INC_STAT(FilesBlocked);
                     InterlockedIncrement64(&g_PcState.Stats.SelfProtectBlocks);
+
+                    //
+                    // RECORD WHICH FILE WAS REFUSED, AND WHY.
+                    //
+                    // The file-protection engine returned FpAccess_Block.
+                    //
+                    // A denial is the most consequential thing this driver does to a
+                    // machine and it was the least traceable: the 1.0.113 run reported
+                    // kernelPreCreate blocked=2 and neither file could be named. Two of the
+                    // five denial sites logged the path with DbgPrintEx, which reaches a
+                    // kernel debugger and never the diagnostic bundle, and three logged
+                    // nothing at all.
+                    //
+                    // Fire-and-forget: the send cannot block this callback, and a failure
+                    // to notify must never change the verdict, so the result is not tested.
+                    //
+                    (VOID)ShadowStrikeSendFileOperationEvent(
+                        RequestorPid,
+                        SS_FILE_OP_INFOCLASS_CREATE,
+                        &NameInfo->Name,
+                        SS_FILE_BLOCK_REASON_CREATE_FILE_PROTECTION,
+                        0,
+                        TRUE
+                        );
 
                     FltReleaseFileNameInformation(NameInfo);
                     ExReleaseRundownProtection(&g_PcState.RundownRef);
@@ -1441,6 +1489,30 @@ Return Value:
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
         InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
 
+        //
+        // RECORD WHICH FILE WAS REFUSED, AND WHY.
+        //
+        // Autorun on removable media.
+        //
+        // A denial is the most consequential thing this driver does to a
+        // machine and it was the least traceable: the 1.0.113 run reported
+        // kernelPreCreate blocked=2 and neither file could be named. Two of the
+        // five denial sites logged the path with DbgPrintEx, which reaches a
+        // kernel debugger and never the diagnostic bundle, and three logged
+        // nothing at all.
+        //
+        // Fire-and-forget: the send cannot block this callback, and a failure
+        // to notify must never change the verdict, so the result is not tested.
+        //
+        (VOID)ShadowStrikeSendFileOperationEvent(
+            RequestorPid,
+            SS_FILE_OP_INFOCLASS_CREATE,
+            &NameInfo->Name,
+            SS_FILE_BLOCK_REASON_CREATE_USB_AUTORUN,
+            ThreatScore,
+            TRUE
+            );
+
         BeEngineSubmitEvent(
             BehaviorEvent_HiddenFileCreation,
             BehaviorCategory_ProcessExecution,
@@ -1556,6 +1628,30 @@ Return Value:
 
                     SHADOWSTRIKE_INC_STAT(FilesBlocked);
                     InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
+
+                    //
+                    // RECORD WHICH FILE WAS REFUSED, AND WHY.
+                    //
+                    // CACHED verdict - NO SCAN RAN DURING THIS CREATE. This is the case an operator most needs to tell apart from a fresh conviction.
+                    //
+                    // A denial is the most consequential thing this driver does to a
+                    // machine and it was the least traceable: the 1.0.113 run reported
+                    // kernelPreCreate blocked=2 and neither file could be named. Two of the
+                    // five denial sites logged the path with DbgPrintEx, which reaches a
+                    // kernel debugger and never the diagnostic bundle, and three logged
+                    // nothing at all.
+                    //
+                    // Fire-and-forget: the send cannot block this callback, and a failure
+                    // to notify must never change the verdict, so the result is not tested.
+                    //
+                    (VOID)ShadowStrikeSendFileOperationEvent(
+                        RequestorPid,
+                        SS_FILE_OP_INFOCLASS_CREATE,
+                        &NameInfo->Name,
+                        SS_FILE_BLOCK_REASON_CREATE_CACHED_MALICIOUS,
+                        CacheResult.ThreatScore,
+                        TRUE
+                        );
 
                     BeEngineSubmitEvent(
                         BehaviorEvent_FileSignatureSpoofing,
@@ -2040,6 +2136,30 @@ Return Value:
 
         SHADOWSTRIKE_INC_STAT(FilesBlocked);
         InterlockedIncrement64(&g_PcState.Stats.OperationsBlocked);
+
+        //
+        // RECORD WHICH FILE WAS REFUSED, AND WHY.
+        //
+        // A verdict reached during this create, or a threat score over the configured block threshold.
+        //
+        // A denial is the most consequential thing this driver does to a
+        // machine and it was the least traceable: the 1.0.113 run reported
+        // kernelPreCreate blocked=2 and neither file could be named. Two of the
+        // five denial sites logged the path with DbgPrintEx, which reaches a
+        // kernel debugger and never the diagnostic bundle, and three logged
+        // nothing at all.
+        //
+        // Fire-and-forget: the send cannot block this callback, and a failure
+        // to notify must never change the verdict, so the result is not tested.
+        //
+        (VOID)ShadowStrikeSendFileOperationEvent(
+            RequestorPid,
+            SS_FILE_OP_INFOCLASS_CREATE,
+            &NameInfo->Name,
+            SS_FILE_BLOCK_REASON_CREATE_SCAN_VERDICT,
+            ThreatScore,
+            TRUE
+            );
 
         //
         // Track per-volume block count on instance context

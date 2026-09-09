@@ -157,6 +157,12 @@ extern "C" {
 /**
  * @brief Maximum registry data size to capture
  */
+//
+// The wire field is a UINT16 byte count, so 32 KB of path is already far more
+// than any real path and still leaves the field unable to overflow.
+//
+#define SB_MAX_FILE_OPERATION_NAME_BYTES   (32u * 1024u)
+
 #define SB_MAX_REGISTRY_DATA_SIZE           4096
 
 /**
@@ -392,6 +398,7 @@ typedef struct _SB_STATISTICS {
     volatile LONG64 ThreadNotifications;
     volatile LONG64 ImageNotifications;
     volatile LONG64 RegistryNotifications;
+    volatile LONG64 FileOperationNotifications;
 
     //
     // Performance metrics
@@ -679,6 +686,7 @@ ShadowStrikeSendRegistryNotification(
     _In_ ULONG DataSize,
     _In_ ULONG DataType
 );
+
 
 // ============================================================================
 // GENERIC MESSAGE OPERATIONS - REMOVED, DELIBERATELY

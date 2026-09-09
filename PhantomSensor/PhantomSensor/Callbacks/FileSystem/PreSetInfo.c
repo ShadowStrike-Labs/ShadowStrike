@@ -2451,105 +2451,32 @@ PsipSendTelemetryEvent(
     )
 {
     NTSTATUS status;
-    PSHADOWSTRIKE_MESSAGE_HEADER event = NULL;
-    PSHADOWSTRIKE_FILE_OPERATION_EVENT payload = NULL;
-    ULONG totalSize;
-    USHORT fileNameLength;
 
     if (!PsipIsInitialized()) {
         return;
     }
 
     //
-    // Calculate event size
+    // THE FRAME IS BUILT IN ONE PLACE, NOT TWO.
     //
-    if (FileName != NULL && FileName->Length > 0 && FileName->Buffer != NULL) {
-        fileNameLength = min(FileName->Length, 1024 * sizeof(WCHAR));  // Cap at 1024 chars
-    } else {
-        fileNameLength = 0;
-    }
-
+    // This function used to build the SHADOWSTRIKE_FILE_OPERATION_EVENT frame
+    // itself - header, payload, name, terminator and the send - and PreCreate
+    // needed exactly the same frame for a refused create. A second builder for one
+    // wire structure is how this codebase's two YARA metadata builders and its two
+    // on-disk trie producers drifted apart, with the worse one being the one that
+    // ran, so the framing moved to ScanBridge beside the other notification
+    // senders and this is now a thin wrapper.
     //
-    // A FRAMED message: [SHADOWSTRIKE_MESSAGE_HEADER][payload][name][NUL].
+    // What stays here is the accounting, because these counters belong to
+    // PreSetInformation's own statistics and mean nothing to ScanBridge.
     //
-    // The header is not optional and its absence is the whole reason this code
-    // is being read. Without it the service parses the payload's first field as
-    // the frame magic, and every frame is refused - see the commentary on
-    // SHADOWSTRIKE_FILE_OPERATION_EVENT.
-    //
-    totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
-                sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT) +
-                fileNameLength + sizeof(WCHAR);
-
-    //
-    // Allocate event structure (paged â€” runs at PASSIVE_LEVEL context)
-    //
-    event = (PSHADOWSTRIKE_MESSAGE_HEADER)ExAllocatePool2(
-        POOL_FLAG_PAGED,
-        totalSize,
-        PSI_POOL_TAG
-        );
-
-    if (event == NULL) {
-        InterlockedIncrement64(&g_PsiState.Stats.TelemetryEventsFailed);
-        return;
-    }
-
-    RtlZeroMemory(event, totalSize);
-
-    //
-    // Populate event
-    //
-    ShadowStrikeInitMessageHeader(
-        event,
-        FilterMessageType_FileOperationEvent,
-        totalSize - (ULONG)sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
-        );
-
-    payload = (PSHADOWSTRIKE_FILE_OPERATION_EVENT)(event + 1);
-
-    payload->ProcessId = HandleToULong(ProcessId);
-    payload->InfoClass = (UINT32)InfoClass;
-    payload->BlockReason = BlockReason;
-    payload->SuspicionScore = SuspicionScore;
-    payload->WasBlocked = WasBlocked ? 1u : 0u;
-    KeQuerySystemTime((PLARGE_INTEGER)&payload->Timestamp);
-    payload->FileNameBytes = fileNameLength;
-
-    //
-    // The name follows the payload structure. It is written through a byte
-    // cursor rather than a trailing array member, because the shared structure
-    // deliberately declares no array: a [1]-element member makes sizeof() carry
-    // one phantom character and every size calculation downstream inherits it.
-    //
-    {
-        PUCHAR nameStart = (PUCHAR)payload + sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT);
-
-        if (fileNameLength > 0) {
-            RtlCopyMemory(nameStart, FileName->Buffer, fileNameLength);
-        }
-
-        //
-        // Terminator written explicitly. RtlZeroMemory above already cleared it,
-        // but relying on that makes the NUL an accident of the allocator rather
-        // than part of the contract the reader is promised.
-        //
-        *(WCHAR UNALIGNED *)(nameStart + fileNameLength) = L'\0';
-    }
-
-    //
-    // Send through the CommPort notification funnel, which frames, encrypts
-    // and delivers it. This used to call ScanBridge's ShadowStrikeSendMessage,
-    // which transmits the caller's buffer verbatim - no header, no encryption,
-    // no authentication. Zero timeout, so it never blocks the callback.
-    //
-    // If no client is connected the funnel BUFFERS the message for delivery on
-    // reconnect rather than dropping it, which is why the old comment saying it
-    // is dropped no longer holds.
-    //
-    status = ShadowStrikeSendNotification(
-        event,
-        totalSize
+    status = ShadowStrikeSendFileOperationEvent(
+        ProcessId,
+        (ULONG)InfoClass,
+        FileName,
+        BlockReason,
+        SuspicionScore,
+        WasBlocked
         );
 
     if (NT_SUCCESS(status)) {
@@ -2564,8 +2491,6 @@ PsipSendTelemetryEvent(
                        status);
         }
     }
-
-    ExFreePoolWithTag(event, PSI_POOL_TAG);
 }
 
 // ============================================================================

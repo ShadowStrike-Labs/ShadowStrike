@@ -2019,6 +2019,148 @@ RegistryCleanup:
     return status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeSendFileOperationEvent(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG InfoClass,
+    _In_opt_ PCUNICODE_STRING FileName,
+    _In_ ULONG BlockReason,
+    _In_ ULONG SuspicionScore,
+    _In_ BOOLEAN WasBlocked
+)
+{
+    NTSTATUS status;
+    PSHADOWSTRIKE_MESSAGE_HEADER header = NULL;
+    PSHADOWSTRIKE_FILE_OPERATION_EVENT payload = NULL;
+    ULONG nameLen = (FileName != NULL && FileName->Buffer != NULL) ? FileName->Length : 0;
+    ULONG totalSize = 0;
+
+    PAGED_CODE();
+
+    if (!g_DriverData.Initialized || !g_DriverData.Config.NotificationsEnabled) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!ShadowStrikeIsUserModeConnected()) {
+        return SHADOWSTRIKE_ERROR_PORT_NOT_CONNECTED;
+    }
+
+    if (!SbpAcquireRundownProtection()) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    //
+    // FileNameBytes is a UINT16 on the wire, so the name has to be bounded before
+    // it is stored rather than after. An odd length would also be malformed - a
+    // UTF-16 path cannot occupy an odd number of bytes - so the clamp rounds down
+    // to an even boundary instead of truncating mid-character.
+    //
+    if (nameLen > SB_MAX_FILE_OPERATION_NAME_BYTES) {
+        nameLen = SB_MAX_FILE_OPERATION_NAME_BYTES;
+    }
+    nameLen &= ~1UL;
+
+    status = SbpSafeAddUlong(sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                             sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        goto FileOperationCleanup;
+    }
+
+    status = SbpSafeAddUlong(totalSize, nameLen, &totalSize);
+    if (!NT_SUCCESS(status)) {
+        goto FileOperationCleanup;
+    }
+
+    //
+    // Room for the terminator. The reader is promised a NUL-terminated name and
+    // that promise is part of the structure's contract, not an accident of the
+    // allocator.
+    //
+    status = SbpSafeAddUlong(totalSize, sizeof(WCHAR), &totalSize);
+    if (!NT_SUCCESS(status)) {
+        goto FileOperationCleanup;
+    }
+
+    if (totalSize > SHADOWSTRIKE_MAX_MESSAGE_SIZE) {
+        ULONG fixedOverhead = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) +
+                              sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT) +
+                              sizeof(WCHAR);
+        ULONG available = (SHADOWSTRIKE_MAX_MESSAGE_SIZE > fixedOverhead) ?
+                          SHADOWSTRIKE_MAX_MESSAGE_SIZE - fixedOverhead : 0;
+        if (nameLen > available) {
+            nameLen = available & ~1UL;
+        }
+        totalSize = fixedOverhead + nameLen;
+    }
+
+    header = (PSHADOWSTRIKE_MESSAGE_HEADER)SbAllocateMessageBuffer(totalSize);
+    if (header == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto FileOperationCleanup;
+    }
+
+    status = SbInitMessageHeader(
+        header,
+        FilterMessageType_FileOperationEvent,
+        totalSize - sizeof(SHADOWSTRIKE_MESSAGE_HEADER)
+    );
+    if (!NT_SUCCESS(status)) {
+        goto FileOperationCleanup;
+    }
+
+    payload = (PSHADOWSTRIKE_FILE_OPERATION_EVENT)
+              ((PUCHAR)header + sizeof(SHADOWSTRIKE_MESSAGE_HEADER));
+
+    payload->ProcessId = HandleToULong(ProcessId);
+    payload->InfoClass = InfoClass;
+    payload->BlockReason = BlockReason;
+    payload->SuspicionScore = SuspicionScore;
+    payload->WasBlocked = WasBlocked ? (UINT8)1 : (UINT8)0;
+    {
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+        payload->Timestamp = now.QuadPart;
+    }
+    payload->FileNameBytes = (UINT16)nameLen;
+
+    //
+    // The name is written through a byte cursor rather than a trailing array
+    // member, because the shared structure deliberately declares no array: a
+    // [1]-element member makes sizeof() carry one phantom character and every
+    // size calculation downstream inherits it.
+    //
+    {
+        PUCHAR nameStart = (PUCHAR)payload + sizeof(SHADOWSTRIKE_FILE_OPERATION_EVENT);
+
+        if (nameLen > 0) {
+            __try {
+                RtlCopyMemory(nameStart, FileName->Buffer, nameLen);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "[ShadowStrike/SB] Exception copying file name (len=%u)\n",
+                           nameLen);
+                payload->FileNameBytes = 0;
+                nameLen = 0;
+            }
+        }
+
+        *(WCHAR UNALIGNED *)(nameStart + nameLen) = L'\0';
+    }
+
+    status = ShadowStrikeSendNotification(header, totalSize);
+
+    SbpAccountNotificationResult(status, &g_ScanBridge.Stats.FileOperationNotifications);
+
+FileOperationCleanup:
+    if (header != NULL) {
+        SbFreeMessageBuffer(header);
+    }
+    SbpReleaseRundownProtection();
+
+    return status;
+}
+
 // ============================================================================
 // GENERIC MESSAGE OPERATIONS - REMOVED, DELIBERATELY
 // ============================================================================

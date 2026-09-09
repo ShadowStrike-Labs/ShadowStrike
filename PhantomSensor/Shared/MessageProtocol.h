@@ -423,6 +423,39 @@ C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, Timestamp)      == 20);
 C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, FileNameBytes)  == 28);
 
 //
+// WHAT THIS EVENT NOW COVERS. It began as "rename or delete evaluated by
+// PreSetInformation" and now also carries a CREATE that was refused, because the
+// two need exactly the same fields - who, which path, blocked or not, and why -
+// and inventing a second message class for them would have grown the wire
+// protocol for no gain.
+//
+// A CREATE HAS NO FILE_INFORMATION_CLASS, so InfoClass carries a sentinel that
+// cannot collide with one. FILE_INFORMATION_CLASS values start at 1
+// (FileDirectoryInformation) and are far below this.
+//
+#define SS_FILE_OP_INFOCLASS_CREATE            0x1000u
+
+//
+// BlockReason values for a refused CREATE.
+//
+// DELIBERATELY IN A HIGH RANGE, so they cannot be confused with the reason codes
+// PreSetInformation already passes for renames and deletes. The two producers
+// were written independently and a shared low-numbered space would have made
+// every future addition a collision audit.
+//
+// THESE ARE NOT INTERCHANGEABLE, which is the whole point of recording them.
+// A CACHED_MALICIOUS denial means NO SCAN RAN DURING THIS CREATE - the verdict
+// came from the kernel's own cache - and that is the case an operator most needs
+// to tell apart from a fresh conviction, because it is the one where a stale
+// entry can keep denying a file that is no longer a threat.
+//
+#define SS_FILE_BLOCK_REASON_CREATE_SELF_PROTECTION   0x101u
+#define SS_FILE_BLOCK_REASON_CREATE_FILE_PROTECTION   0x102u
+#define SS_FILE_BLOCK_REASON_CREATE_USB_AUTORUN       0x103u
+#define SS_FILE_BLOCK_REASON_CREATE_CACHED_MALICIOUS  0x104u
+#define SS_FILE_BLOCK_REASON_CREATE_SCAN_VERDICT      0x105u
+
+//
 // 1b. Behavioural Alert (FilterMessageType_BehavioralAlert)
 //
 // THE FIRST TWO FIELDS ARE NOT FREE CHOICES. BehaviorBlocker::

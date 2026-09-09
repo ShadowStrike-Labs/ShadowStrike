@@ -368,6 +368,48 @@ ShadowStrikeSendNotification(
     );
 
 /**
+ * @brief Send a file-operation notification, including a refused create.
+ *
+ * THE ONE FRAME BUILDER FOR SHADOWSTRIKE_FILE_OPERATION_EVENT. It is defined in
+ * ScanBridge.c beside the other four notification builders, but it is DECLARED
+ * HERE, and that split is deliberate rather than untidy.
+ *
+ * PreSetInfo.c and PreCreate.c both need it. PreCreate includes ScanBridge.h;
+ * PreSetInfo cannot, because ScanBridge.h conflicts with this header - a fact
+ * recorded at the top of PreSetInfo.c together with what it cost. A hand-copied
+ * forward declaration used to sit there instead, and that workaround is precisely
+ * what let a bare payload reach the send API with no SHADOWSTRIKE_MESSAGE_HEADER
+ * in front of it: with no shared header in play, nothing checked the buffer was a
+ * framed message. That file's own instruction is to fix the conflict rather than
+ * copy a declaration.
+ *
+ * Declaring it in the header both callers already include is the smaller half of
+ * that instruction: one declaration, checked by the compiler for both callers, and
+ * no second copy of the builder. The header conflict itself remains, and is filed.
+ *
+ * @param ProcessId      Process that issued the operation
+ * @param InfoClass      FILE_INFORMATION_CLASS value, or
+ *                       SS_FILE_OP_INFOCLASS_CREATE for a create
+ * @param FileName       Path the operation named (optional)
+ * @param BlockReason    Reason code; 0 when the operation was not refused
+ * @param SuspicionScore Driver's score for the operation
+ * @param WasBlocked     TRUE if the operation was refused
+ * @return STATUS_SUCCESS if queued successfully.
+ *
+ * @irql PASSIVE_LEVEL
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS
+ShadowStrikeSendFileOperationEvent(
+    _In_ HANDLE ProcessId,
+    _In_ ULONG InfoClass,
+    _In_opt_ PCUNICODE_STRING FileName,
+    _In_ ULONG BlockReason,
+    _In_ ULONG SuspicionScore,
+    _In_ BOOLEAN WasBlocked
+    );
+
+/**
  * @brief Hard ceiling on how long a process notification may wait for a verdict.
  *
  * The caller supplies the budget (see ReplyTimeoutMs below) because only the
