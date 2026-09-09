@@ -50,6 +50,9 @@
 
 #include "pch.h"
 #include "HomeIpcDispatcher.hpp"
+// For InvalidateCacheEntry on a quarantine restore - see the restore
+// branch of QuarantineAction below.
+#include "../RealTime/RealTimeProtection.hpp"
 #include "../Diagnostics/DiagTrace.hpp"
 #include "ServiceCommunicator.hpp"
 #include "IpcAuthToken.hpp"
@@ -1504,9 +1507,41 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                     MakeErrorResponse("missing_field", "id required for restore").dump());
                 return;
             }
+            // Read the entry BEFORE restoring. Restoring it is what makes the
+            // hash needed, and a successful restore may remove the record that
+            // carries it.
+            const auto entryBeforeRestore = qm.GetEntry(*id);
+
             RestoreRequest req;
             req.entryId = *id;
             ok = qm.RestoreFile(req).IsSuccess();
+
+            if (ok && entryBeforeRestore &&
+                !entryBeforeRestore->hashes.sha256.empty()) {
+                // A RESTORE IS AN OPERATOR SAYING THE DETECTION WAS WRONG, and it
+                // does not take effect while the verdict stays cached: the next
+                // access serves the same threat verdict from memory and the file
+                // is quarantined again without being re-examined.
+                //
+                // QuarantineManager cannot do this itself without inverting the
+                // layering - it lives under Core::Engine and RealTimeProtection is
+                // above it - so the service layer, whose job is exactly to
+                // coordinate the two, does it here. RealTimeProtection has carried
+                // InvalidateCacheEntry for this purpose with no production caller
+                // at all.
+                try {
+                    RealTime::RealTimeProtection::Instance()
+                        .InvalidateCacheEntry(entryBeforeRestore->hashes.sha256);
+                } catch (const std::exception& ex) {
+                    // The restore itself succeeded and must still be reported as
+                    // such. A failure to clear the cache degrades to the previous
+                    // behaviour rather than undoing the operator's action.
+                    SS_LOG_WARN(kLogCat,
+                        L"QuarantineAction restore: could not invalidate the cached "
+                        L"verdict for entry %llu: %hs",
+                        static_cast<unsigned long long>(*id), ex.what());
+                }
+            }
         } else if (*action == "delete") {
             const auto id = ParseEntryId();
             if (!id) {

@@ -23194,5 +23194,93 @@ class RemediationTrustBreadthContractTests(unittest.TestCase):
             "report, so no field run can show whether this control ever fired")
 
 
+class QuarantineRestoreInvalidationContractTests(unittest.TestCase):
+    """Restoring a file from quarantine must clear its cached verdict.
+
+    A restore is an operator saying the detection was wrong. While the verdict
+    stays in RealTimeProtection's cache, the next access serves that same threat
+    verdict from memory and the file is quarantined again without being
+    re-examined, so the restore silently does not take effect.
+
+    RealTimeProtection::InvalidateCacheEntry existed for this and had no
+    production caller - only a test. QuarantineManager::RestoreFile is over 15,000
+    characters and mentions Invalidate, RealTimeProtection, ScanEngine and verdict
+    exactly zero times, and it cannot call upward anyway: it lives under
+    Core::Engine and RealTimeProtection is above it. The service layer coordinates
+    the two.
+    """
+
+    def _restore_branch(self):
+        source = strip_c_comments(read_source(HOME_IPC_DISPATCHER_CPP_PATH))
+        marker = 'if (*action == "restore") {'
+        start = source.find(marker)
+        self.assertNotEqual(
+            -1, start,
+            "the quarantine restore branch was not found, so this contract is no "
+            "longer anchored to the artifact")
+        open_brace = source.index("{", start + len(marker) - 1)
+        depth = 0
+        end = -1
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        self.assertNotEqual(-1, end, "the restore branch is not brace-balanced")
+        branch = source[start:end]
+        self.assertTrue(
+            "RestoreFile" in branch,
+            "the restore branch no longer calls RestoreFile, so this contract is "
+            "anchored to the wrong code")
+        return branch
+
+    def test_a_successful_restore_invalidates_the_cached_verdict(self):
+        branch = self._restore_branch()
+        self.assertTrue(
+            "InvalidateCacheEntry" in branch,
+            "restoring a file from quarantine does not invalidate its cached "
+            "verdict. The next access will serve the previous threat verdict from "
+            "memory and undo the restore without re-examining the file.")
+
+    def test_the_hash_is_read_before_the_restore_consumes_the_entry(self):
+        """Ordering, not presence.
+
+        The entry carries the hash the invalidation needs, and a successful restore
+        may remove the record. Reading it afterwards would produce an empty hash
+        and an invalidation that silently does nothing - which looks exactly like
+        working code.
+        """
+        branch = self._restore_branch()
+        read_entry = branch.find("GetEntry")
+        restore = branch.find("RestoreFile")
+        self.assertNotEqual(
+            -1, read_entry,
+            "the restore branch never reads the quarantine entry, so it cannot "
+            "know which verdict to invalidate")
+        self.assertLess(
+            read_entry, restore,
+            "the restore branch reads the quarantine entry AFTER restoring it. The "
+            "hash must be captured first, or the invalidation has nothing to act "
+            "on.")
+
+    def test_the_invalidation_is_conditional_on_the_restore_succeeding(self):
+        """A failed restore must not clear the verdict.
+
+        If the file could not be put back, the detection still stands and its
+        verdict must remain cached.
+        """
+        branch = self._restore_branch()
+        invalidate = branch.find("InvalidateCacheEntry")
+        self.assertNotEqual(-1, invalidate, "the invalidation call is gone")
+        preceding = branch[:invalidate]
+        self.assertTrue(
+            re.search(r"if\s*\(\s*ok\b", preceding) is not None,
+            "the cache invalidation is not gated on the restore having succeeded, "
+            "so a failed restore would still clear a verdict that still applies")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

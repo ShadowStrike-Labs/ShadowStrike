@@ -8806,6 +8806,34 @@ void RealTimeProtection::InvalidateCacheEntry(const std::array<uint8_t, 32>& has
     m_impl->m_verdictCache.erase(oss.str());
 }
 
+void RealTimeProtection::InvalidateCacheEntry(const std::string& sha256Hex) {
+    if (sha256Hex.empty()) {
+        return;
+    }
+    // The cache key is built with std::hex, which emits lowercase, so normalise
+    // rather than trusting the caller's formatting.
+    std::string key;
+    key.reserve(sha256Hex.size());
+    for (const unsigned char ch : sha256Hex) {
+        key.push_back(static_cast<char>(std::tolower(ch)));
+    }
+
+    size_t removed = 0;
+    {
+        std::unique_lock lock(m_impl->m_cacheMutex);
+        removed = m_impl->m_verdictCache.erase(key);
+    }
+
+    // Logged at Info because it records an operator decision taking effect. A
+    // restore that silently failed to clear the verdict is precisely the state
+    // this is here to make visible.
+    Utils::Logger::Info(
+        "RealTimeProtection: verdict cache entry for {} {} - a subsequent access "
+        "will re-examine the file rather than reuse the previous verdict",
+        key,
+        removed ? "invalidated" : "was not cached");
+}
+
 void RealTimeProtection::ClearVerdictCache() {
     m_impl->ClearVerdictCache();
 }

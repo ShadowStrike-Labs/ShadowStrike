@@ -1669,6 +1669,25 @@ public:
     void InvalidateCacheEntry(const std::array<uint8_t, 32>& hash);
 
     /**
+     * @brief Drops a cached verdict identified by its SHA-256 hex digest.
+     *
+     * The verdict cache is keyed on the lowercase hex digest, so callers holding
+     * a hex string - QuarantineManager records hashes that way - can invalidate
+     * without a hex-to-bytes-to-hex round trip that could only introduce a
+     * formatting mismatch.
+     *
+     * WHY THIS EXISTS. Restoring a file from quarantine is an operator saying
+     * "that detection was wrong". While its verdict stays cached, the next access
+     * re-serves that verdict from memory and the restore is undone without any
+     * file being re-examined. The array overload above had existed with no
+     * production caller at all.
+     *
+     * Accepts any case and normalises, because a caller should not have to know
+     * which case the cache happens to use.
+     */
+    void InvalidateCacheEntry(const std::string& sha256Hex);
+
+    /**
      * @brief Clears the entire verdict cache.
      */
     void ClearVerdictCache();
