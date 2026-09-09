@@ -24274,5 +24274,114 @@ class KernelDenialTraceabilityContractTests(unittest.TestCase):
             "would be read past its end")
 
 
+class VanishedFileClassificationContractTests(unittest.TestCase):
+    """"The file was gone before we looked" and "we failed to read a file that
+    exists" are different facts and must not read the same.
+
+    MEASURED IN 1.0.113: one race produced 108 records across SIX modules and SEVEN
+    different messages - 46 from ScanEngine, 16 each from ExecutableAnalyzer,
+    MemoryUtils and the packer path, plus smaller counts from FileTypeAnalyzer and
+    HeuristicAnalyzer. The paths are dominated by
+    Windows\\assembly\\NativeImages_v4.0.30319_32\\Temp, where the .NET native image
+    compiler writes a temporary and deletes it immediately, and by Prefetch entries.
+
+    This is the third member of an established family. FileUtils already had
+    IsContentNotLocalError and IsFileLockedError; each names a platform condition
+    meaning the file was not examined, each is documented with the field run that
+    motivated it, and each moves a per-file record into an aggregate.
+    """
+
+    def _classifier(self):
+        source = strip_c_comments(read_source(FILE_UTILS_CPP_PATH))
+        start = source.find("bool IsFileGoneError(DWORD win32Error) noexcept {")
+        self.assertNotEqual(
+            -1, start,
+            "the vanished-file classifier is gone, so six modules are once again "
+            "each guessing what a failed open meant")
+        end = source.find("}", start)
+        return source[start:end + 1]
+
+    def test_the_classifier_covers_only_name_resolution_failures(self):
+        body = self._classifier()
+        self.assertTrue(
+            "ERROR_FILE_NOT_FOUND" in body and "ERROR_PATH_NOT_FOUND" in body,
+            "the classifier no longer recognises the two codes that mean the name "
+            "did not resolve")
+
+    def test_a_file_that_exists_is_never_called_gone(self):
+        """The distinction the whole change rests on.
+
+        ERROR_ACCESS_DENIED and the sharing-violation family mean the file EXISTS
+        and something refused us. Folding them in here would demote a real coverage
+        failure - or an attacker denying us a file - to a routine temporary.
+        """
+        body = self._classifier()
+        for banned in ("ERROR_ACCESS_DENIED", "ERROR_SHARING_VIOLATION",
+                       "ERROR_LOCK_VIOLATION"):
+            self.assertTrue(
+                banned not in body,
+                "%s has been folded into the vanished-file classifier. That code "
+                "means the file exists and we were refused, which is a coverage "
+                "failure and must keep surfacing as one." % banned)
+
+    def test_the_sibling_classifiers_are_untouched(self):
+        """Three predicates, three different facts."""
+        source = strip_c_comments(read_source(FILE_UTILS_CPP_PATH))
+        for sibling in ("IsFileLockedError", "IsContentNotLocalError"):
+            self.assertTrue(
+                "bool %s(DWORD win32Error) noexcept {" % sibling in source,
+                "%s has been removed or merged. The three predicates name three "
+                "different platform conditions and collapsing them would lose the "
+                "distinction each was added to preserve." % sibling)
+
+    def test_the_vanished_case_is_classified_before_the_generic_error(self):
+        source = strip_c_comments(read_source(MEMORY_UTILS_CPP_PATH))
+        gone = source.find("IsFileGoneError(outErr)")
+        generic = source.find('L"CreateFileW failed: %ls"')
+        self.assertNotEqual(
+            -1, gone,
+            "MemoryUtils no longer classifies a vanished file, so 16 ERROR records "
+            "per field run return for .NET native-image temporaries")
+        self.assertNotEqual(-1, generic, "the generic open failure is gone")
+        self.assertLess(
+            gone, generic,
+            "the generic error is reported before the vanished case is classified, "
+            "so the classification can never be reached")
+
+    def test_nothing_is_silenced_and_the_count_survives(self):
+        """A vanished file is still an UNSCANNED file.
+
+        Write, execute, delete is a real malware pattern, so this change moves a
+        record's severity and must never remove the record or the count.
+        """
+        mem = strip_c_comments(read_source(MEMORY_UTILS_CPP_PATH))
+        gone = mem.find("IsFileGoneError(outErr)")
+        window = mem[gone:gone + 900]
+        self.assertTrue(
+            "SS_LOG_DEBUG" in window,
+            "the vanished case now logs nothing at all. It is still a file that was "
+            "not examined and must remain observable.")
+        self.assertTrue(
+            "return false;" in mem[gone:gone + 1400],
+            "MemoryUtils no longer reports failure for a vanished file, which would "
+            "make a mapping that never happened look successful")
+
+        # SCOPED TO THE EXISTS BLOCK. invalidFiles is incremented at three sites in
+        # this function - empty path, path too long, and this one - so a check for
+        # the increment anywhere in the file passes even after the one that matters
+        # has been deleted.
+        exe = strip_c_comments(read_source(EXECUTABLE_ANALYZER_CPP_PATH))
+        marker = "if (!Utils::FileUtils::Exists(filePath)) {"
+        position = exe.find(marker)
+        self.assertNotEqual(
+            -1, position,
+            "ExecutableAnalyzer no longer tests whether the file exists")
+        block = exe[position:position + 900]
+        self.assertTrue(
+            "m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);" in block,
+            "ExecutableAnalyzer stopped counting files it could not examine, so "
+            "lowering the log level would make them disappear entirely")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1456,7 +1456,12 @@ public:
             // Efficient partial file read (only header bytes, not entire file)
             auto headerResult = ReadFileHeader(filePath, m_config.headerSize);
             if (!headerResult.success) {
-                SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: File not found or unreadable");
+                // The same upstream decision as in ExecutableAnalyzer: ScanEngine
+                // has already established whether the path resolves, and this
+                // message cannot even distinguish the two cases it names. It stays
+                // a failure - the function returns without detecting a type - but
+                // it is not a second ERROR record for one vanished file.
+                SS_LOG_DEBUG(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: File not found or unreadable");
                 return info;
             }
 

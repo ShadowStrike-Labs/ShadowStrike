@@ -233,6 +233,32 @@ namespace ShadowStrike {
 			 */
 			[[nodiscard]] bool IsFileLockedError(DWORD win32Error) noexcept;
 
+			/**
+			 * @brief True if a Win32 error means the name did not resolve to a file.
+			 *
+			 * ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND. The third member of the
+			 * same family as IsContentNotLocalError and IsFileLockedError: a true
+			 * answer means the file was NOT examined and that the cause is a platform
+			 * condition rather than a fault in this product, so it belongs in an
+			 * aggregate counter and not in a per-file record.
+			 *
+			 * THE 1.0.113 FIELD RUN IS WHY THIS EXISTS. One race produced 108 records
+			 * across six modules and seven different messages, dominated by
+			 * Windows\\assembly\\NativeImages_v4.0.30319_32\\Temp - the .NET native
+			 * image compiler writing a temporary and deleting it immediately - and by
+			 * Prefetch entries. Six modules each announced the same vanished file.
+			 *
+			 * A TRUE ANSWER IS NOT A CLEAN VERDICT. Write, execute, delete is a real
+			 * malware pattern, so a file that disappeared before we could look at it
+			 * is an unscanned file and must stay counted. This predicate decides how
+			 * LOUDLY to report it, never whether it was examined.
+			 *
+			 * ERROR_ACCESS_DENIED and the sharing-violation family are deliberately
+			 * absent: those mean the file EXISTS and we were refused, which is a
+			 * different fact with a different predicate.
+			 */
+			[[nodiscard]] bool IsFileGoneError(DWORD win32Error) noexcept;
+
 
 			/**
 			 * @brief Alternate Data Stream (ADS) information.

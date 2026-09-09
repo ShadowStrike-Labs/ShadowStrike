@@ -775,6 +775,22 @@ namespace ShadowStrike {
 							L"(win32=%lu): %ls",
 							static_cast<unsigned long>(outErr),
 							path.c_str());
+					} else if (Utils::FileUtils::IsFileGoneError(outErr)) {
+						// THE FILE WAS GONE BEFORE WE COULD LOOK, which is not the same
+						// fact as failing to read a file that exists and must not read
+						// like one. In the 1.0.113 run this site produced 16 ERROR
+						// records for .NET native-image temporaries that the compiler
+						// creates and deletes immediately, and five other modules
+						// announced the same files.
+						//
+						// The caller is unaffected: outErr still carries the code and
+						// false is still returned, so the mapping still failed and the
+						// file is still unexamined. Only the severity changes.
+						SS_LOG_DEBUG(L"MemoryUtils",
+							L"Not examined - gone before it could be opened "
+							L"(win32=%lu): %ls",
+							static_cast<unsigned long>(outErr),
+							path.c_str());
 					} else {
 						SS_LOG_LAST_ERROR(L"MemoryUtils", L"CreateFileW failed: %ls", path.c_str());
 					}

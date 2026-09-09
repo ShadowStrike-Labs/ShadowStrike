@@ -610,7 +610,23 @@ public:
             // Check file exists using real FileUtils API
             SS_DIAG("OnAccess", "Analyze.Exists ENTER");
             if (!Utils::FileUtils::Exists(filePath)) {
-                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File not found: %hs",
+                // DEBUG, BECAUSE THIS DECISION WAS ALREADY TAKEN UPSTREAM.
+                //
+                // ScanEngine::ScanFile tests the path before it reaches any
+                // analyzer, and it does so carefully - it reads the error_code so
+                // it can tell an absent file from one it is not allowed to look at.
+                // A per-file ERROR here is therefore a second record of a fact
+                // already established, and in the 1.0.113 run six modules each
+                // announced the same vanished .NET native-image temporaries: 108
+                // records across seven different messages for one race.
+                //
+                // NOTHING IS SUPPRESSED. invalidFiles still counts it and the
+                // function still refuses to analyse, so the file remains an
+                // unexamined file. Only the per-file record's severity changes,
+                // because Exists() returns a bare bool and cannot distinguish
+                // "gone" from "denied" - the caller that can, already did.
+                SS_LOG_DEBUG(L"ExecutableAnalyzer",
+                    L"Not examined - path did not resolve: %hs",
                     SanitizeNarrowForLog(Utils::StringUtils::ToNarrow(filePath)).c_str());
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;

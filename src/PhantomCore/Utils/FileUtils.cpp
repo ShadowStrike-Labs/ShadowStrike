@@ -684,6 +684,15 @@ namespace ShadowStrike {
                 }
             }
 
+            bool IsFileGoneError(DWORD win32Error) noexcept {
+                // Only the two codes that mean the NAME did not resolve. Everything
+                // else - access denied, sharing violation, cloud residency - means the
+                // file exists and something stopped us reading it, which is a
+                // different fact reported by a different predicate.
+                return win32Error == ERROR_FILE_NOT_FOUND ||
+                       win32Error == ERROR_PATH_NOT_FOUND;
+            }
+
             bool IsFileLockedError(DWORD win32Error) noexcept {
                 // Every code here means the same actionable thing as the cloud
                 // family above: another process holds the file in a way that
