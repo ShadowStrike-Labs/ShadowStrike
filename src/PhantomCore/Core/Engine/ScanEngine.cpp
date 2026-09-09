@@ -266,6 +266,12 @@ public:
         // means the trust path is not running at all.
         std::atomic<uint64_t> heuristicVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> heuristicSkippedOnKnownTrust{0};
+        // Stage 4.6 script convictions withheld because the file carried a
+        // verified signature from a whitelisted publisher. Same reporting
+        // contract as the heuristic counter above: non-zero means the control
+        // ran, zero while signed vendors are being quarantined again means it
+        // did not.
+        std::atomic<uint64_t> scriptVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> scansTruncatedByBudget{0};
 
         // Process stats
@@ -927,6 +933,7 @@ public:
             m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
             m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
+        m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
@@ -2558,25 +2565,83 @@ EngineResult ScanEngine::ScanFile(
 
                     // Confirmed malicious script — escalate to Infected verdict
                     if (scriptDetected) {
-                        result.verdict = ScanVerdict::Infected;
-                        result.threatName = std::move(scriptThreatName);
-                        result.detectionSource = std::move(scriptDetectionMethod);
-                        result.sha256 = fileHash;
-                        result.threatScore = static_cast<float>(scriptRiskScore);
-                        result.confidence = static_cast<float>(std::min(scriptRiskScore, 100u));
-                        result.severity = (scriptRiskScore >= 80)
-                            ? SignatureStore::ThreatLevel::Critical
-                            : SignatureStore::ThreatLevel::High;
-                        result.detectionMethods.push_back("ScriptAnalysis");
-                        m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
-                        m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+                        // TRUST PRE-CHECK. The same control stage 5 applies to a
+                        // heuristic score, for the same reason and with the same
+                        // limits.
+                        //
+                        // THE 1.0.113 FIELD RUN DELETED PART OF A WORKING DISPLAY
+                        // STACK FOR WANT OF THIS. PowerShellScanner scored VMware
+                        // Tools' svtminion.ps1 at 100 as PowerShell/Downloader.Gen,
+                        // the deferred deep scan remediated it, QuarantineManager
+                        // deleted the original, and the endpoint came up to a full
+                        // gray screen because VMware Tools owns the SVGA display
+                        // path on that machine. "VMware, Inc." was in the seeded
+                        // publisher whitelist the entire time - entry 14 of 24 -
+                        // and publisher suppression demonstrably worked in that
+                        // same run, four times. This stage simply never asked.
+                        //
+                        // WHY SUPPRESSION IS CORRECT HERE AND NOT A WEAKENING.
+                        // Reaching stage 4.6 means stages 1 through 4 all declined:
+                        // no whitelist hash, no malware hash, no shipped signature,
+                        // no YARA rule, no threat-intel IOC. Every verdict this
+                        // stage can reach - a script pattern score, a macro risk
+                        // score, an AMSI numeric result - is therefore an INFERENCE
+                        // with no named referent, which is precisely the class
+                        // stage 5's control governs. An IDENTIFICATION would have
+                        // ended the scan before it got here.
+                        //
+                        // EvaluatePublisherTrust still refuses to suppress when the
+                        // signer appears in the stolen-certificate database, so the
+                        // stolen-cert and supply-chain cases keep convicting, and
+                        // it fails CLOSED when no validator is available.
+                        const auto scriptTrust = m_impl->EvaluatePublisherTrust(filePath);
+                        if (scriptTrust.suppress) {
+                            m_impl->m_stats.scriptVerdictsSuppressedByTrust
+                                .fetch_add(1, std::memory_order_relaxed);
 
-                        SS_LOG_WARN(L"ScanEngine",
-                            L"Stage 4.6 script malware DETECTED: %ls [%hs] (risk=%u)",
-                            filePath.c_str(), result.threatName.c_str(), scriptRiskScore);
+                            // INFO, not DEBUG, for the reason recorded at stage 5:
+                            // the shipped log level is INFO, so a DEBUG diagnostic
+                            // is one nobody can read.
+                            SS_LOG_INFO(L"ScanEngine",
+                                L"Stage 4.6 script conviction '%hs' (risk=%u) NOT "
+                                L"reported: %hs, signer '%ls' - deeper stages still "
+                                L"run: %ls",
+                                scriptThreatName.c_str(),
+                                scriptRiskScore,
+                                scriptTrust.basis,
+                                scriptTrust.signerName.c_str(),
+                                filePath.c_str());
 
-                        m_impl->InvokeDetectionCallbacks(result);
-                        goto finalize_scan;
+                            result.indicators.push_back(
+                                "Script conviction " + scriptThreatName +
+                                " withheld on a verified signature (" +
+                                std::string(scriptTrust.basis) + ")");
+
+                            // Deliberately NOT goto finalize_scan, and deliberately
+                            // not Clean or Whitelisted: stages 4.7 through 10 are
+                            // still owed, and any of them may convict this file on
+                            // evidence rather than on a score.
+                        } else {
+                            result.verdict = ScanVerdict::Infected;
+                            result.threatName = std::move(scriptThreatName);
+                            result.detectionSource = std::move(scriptDetectionMethod);
+                            result.sha256 = fileHash;
+                            result.threatScore = static_cast<float>(scriptRiskScore);
+                            result.confidence = static_cast<float>(std::min(scriptRiskScore, 100u));
+                            result.severity = (scriptRiskScore >= 80)
+                                ? SignatureStore::ThreatLevel::Critical
+                                : SignatureStore::ThreatLevel::High;
+                            result.detectionMethods.push_back("ScriptAnalysis");
+                            m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+                            m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+
+                            SS_LOG_WARN(L"ScanEngine",
+                                L"Stage 4.6 script malware DETECTED: %ls [%hs] (risk=%u)",
+                                filePath.c_str(), result.threatName.c_str(), scriptRiskScore);
+
+                            m_impl->InvokeDetectionCallbacks(result);
+                            goto finalize_scan;
+                        }
                     }
                 }
             } catch (const std::exception& e) {
@@ -5431,6 +5496,8 @@ std::string ScanEngine::Stats::ToJson() const {
     oss << "\"heuristicVerdictsSuppressedByTrust\":"
         << heuristicVerdictsSuppressedByTrust << ",";
     oss << "\"heuristicSkippedOnKnownTrust\":" << heuristicSkippedOnKnownTrust << ",";
+    oss << "\"scriptVerdictsSuppressedByTrust\":"
+        << scriptVerdictsSuppressedByTrust << ",";
     oss << "\"scansTruncatedByBudget\":" << scansTruncatedByBudget;
     oss << "}";
     return oss.str();
@@ -5455,6 +5522,8 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.archiveFilesScanned.load(std::memory_order_relaxed);
     stats.heuristicVerdictsSuppressedByTrust =
         m_impl->m_stats.heuristicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
+    stats.scriptVerdictsSuppressedByTrust =
+        m_impl->m_stats.scriptVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.heuristicSkippedOnKnownTrust =
         m_impl->m_stats.heuristicSkippedOnKnownTrust.load(std::memory_order_relaxed);
     stats.scansTruncatedByBudget =
@@ -5501,6 +5570,7 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.archivesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);

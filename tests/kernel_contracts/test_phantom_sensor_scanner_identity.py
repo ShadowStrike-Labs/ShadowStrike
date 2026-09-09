@@ -22947,5 +22947,127 @@ class UnbaselinedRateContractTests(unittest.TestCase):
             + expression[:120])
 
 
+class ScriptConvictionTrustContractTests(unittest.TestCase):
+    """Stage 4.6 must consult publisher trust before convicting a script.
+
+    THE 1.0.113 FIELD RUN DELETED PART OF A WORKING DISPLAY STACK because it did
+    not. PowerShellScanner scored VMware Tools' svtminion.ps1 at 100 as
+    PowerShell/Downloader.Gen, the deferred deep scan remediated it, and the
+    endpoint came up to a full gray screen - VMware Tools owns the SVGA path on
+    that machine. "VMware, Inc." was entry 14 of 24 in the seeded publisher
+    whitelist the entire time, and publisher suppression worked four times in
+    that same run. Stage 4.6 was simply never given the check stage 5 has.
+
+    Reaching stage 4.6 means stages 1 through 4 all declined - no whitelist hash,
+    no malware hash, no shipped signature, no YARA rule, no IOC - so every verdict
+    this stage can produce is an inference, which is the class the control governs.
+    """
+
+    def _script_stage(self):
+        """The stage 4.6 conviction region, brace-matched from its guard."""
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        anchor = "if (scriptDetected) {"
+        start = source.find(anchor)
+        self.assertNotEqual(
+            -1, start,
+            "the stage 4.6 conviction block was not found, so this contract is no "
+            "longer anchored to the artifact")
+        open_brace = source.index("{", start + len(anchor) - 1)
+        depth = 0
+        end = -1
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        self.assertNotEqual(-1, end, "the conviction block is not brace-balanced")
+        return source[start:end + 1]
+
+    def test_the_script_conviction_is_gated_on_a_publisher_trust_check(self):
+        block = self._script_stage()
+
+        # Anti-vacuity: the block must still be the one that convicts.
+        self.assertTrue(
+            "ScanVerdict::Infected" in block,
+            "the stage 4.6 block no longer escalates to Infected, so this contract "
+            "is anchored to the wrong code")
+
+        trust = block.find("EvaluatePublisherTrust")
+        convict = block.find("result.verdict = ScanVerdict::Infected;")
+        self.assertNotEqual(
+            -1, trust,
+            "stage 4.6 convicts a script without consulting EvaluatePublisherTrust. "
+            "A verified signature from a whitelisted publisher must outweigh an "
+            "inferential script score, exactly as it does for a heuristic score in "
+            "stage 5.")
+        self.assertLess(
+            trust, convict,
+            "stage 4.6 calls EvaluatePublisherTrust only AFTER escalating to "
+            "Infected, so the conviction is not actually gated on it")
+        self.assertTrue(
+            "suppress" in block[trust:convict],
+            "the trust decision is fetched but its suppress result is not tested "
+            "before the conviction")
+
+    def test_a_suppressed_script_verdict_does_not_end_the_scan(self):
+        """Deeper stages are still owed.
+
+        Withholding an inferential verdict must not become an early exit that
+        reports the file clean - stages 4.7 through 10 may convict it on evidence.
+        Ending the scan here would turn a false positive into a false negative,
+        which is the worse of the two.
+        """
+        block = self._script_stage()
+
+        marker = "if (scriptTrust.suppress) {"
+        start = block.find(marker)
+        self.assertNotEqual(
+            -1, start,
+            "the suppression arm was not found, so this contract is no longer "
+            "anchored")
+        depth = 0
+        end = -1
+        for index in range(block.index("{", start + len(marker) - 1), len(block)):
+            if block[index] == "{":
+                depth += 1
+            elif block[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        self.assertNotEqual(-1, end, "the suppression arm is not brace-balanced")
+        arm = block[start:end]
+
+        # assertTrue, not assertNotIn: assertNotIn embeds the haystack in its
+        # standard message and the haystack here is the whole suppression arm,
+        # which produced a 1390-character failure line.
+        self.assertTrue(
+            "goto finalize_scan" not in arm,
+            "the suppression arm jumps to finalize_scan, which ends the scan and "
+            "reports the default verdict. The file is still owed stages 4.7 "
+            "through 10.")
+        self.assertTrue(
+            "ScanVerdict::Clean" not in arm,
+            "the suppression arm asserts the file is Clean. Withholding an "
+            "inferential verdict is not a finding of cleanliness.")
+
+    def test_a_suppressed_script_verdict_is_counted(self):
+        """A control nobody can observe cannot be shown to have run.
+
+        The 1.0.112 run could not distinguish "no heuristic false positives" from
+        "the heuristic suppression never ran" for exactly this reason, which is why
+        the heuristic counter exists. The script counter owes the same answer.
+        """
+        block = self._script_stage()
+        # assertTrue for the same reason as above: the block is ~3.5 KB.
+        self.assertTrue(
+            "scriptVerdictsSuppressedByTrust" in block,
+            "a suppressed script conviction is not counted, so a field run cannot "
+            "tell whether this control ran at all")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

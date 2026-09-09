@@ -1075,6 +1075,13 @@ public:
         // a threat count and are opposite conditions.
         uint64_t heuristicVerdictsSuppressedByTrust = 0;
 
+    /// Stage 4.6 script convictions withheld because the file carried a verified
+    /// signature from a whitelisted publisher. Reported so a field run can tell
+    /// "no script false positives" from "the trust pre-check never ran" - the
+    /// distinction that cost an endpoint in 1.0.113, when this control did not
+    /// exist and VMware Tools' signed script was deleted on a generic score.
+    uint64_t scriptVerdictsSuppressedByTrust = 0;
+
     /// @brief Heuristic analyses skipped because trust was ALREADY established.
     ///
     /// Distinct from heuristicVerdictsSuppressedByTrust, which counts analyses that
