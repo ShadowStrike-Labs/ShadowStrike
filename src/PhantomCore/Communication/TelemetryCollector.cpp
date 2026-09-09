@@ -395,8 +395,17 @@ bool TelemetryCollectorImpl::Initialize(const TelemetryConfiguration& config) {
         GetEnvironmentVariableW(L"ProgramData", appData, MAX_PATH) > 0) {
         m_offlineQueuePath = fs::path(appData) / L"ShadowStrike" / L"telemetry_queue.json";
         Utils::FileUtils::Error fsErr;
-        Utils::FileUtils::CreateDirectories(
-            m_offlineQueuePath.parent_path().wstring(), &fsErr);
+        if (!Utils::FileUtils::CreateDirectories(
+                m_offlineQueuePath.parent_path().wstring(), &fsErr)) {
+            // Not fatal - telemetry is best-effort - but a queue directory that
+            // does not exist means every later offline enqueue fails silently, so
+            // the reason is worth having once at startup rather than never.
+            SS_LOG_WARN(L"Telemetry",
+                L"Offline telemetry queue directory could not be created: %ls "
+                L"(WinError %lu) - telemetry will not be queued while offline",
+                m_offlineQueuePath.parent_path().wstring().c_str(),
+                static_cast<unsigned long>(fsErr.win32));
+        }
     }
 
     // Load any persisted offline events
@@ -1164,8 +1173,19 @@ void TelemetryCollectorImpl::LoadOfflineQueue() {
         return;
     }
 
-    // Delete the file after reading to prevent duplicate processing
-    Utils::FileUtils::RemoveFile(m_offlineQueuePath.wstring(), &fsErr);
+    // Delete the file after reading to prevent duplicate processing.
+    //
+    // THE RESULT DECIDES WHETHER TELEMETRY IS SENT TWICE. If the removal fails the
+    // queue is read again on the next flush and every event in it is resubmitted,
+    // so a discarded failure here is a silent duplication rather than a cosmetic
+    // omission.
+    if (!Utils::FileUtils::RemoveFile(m_offlineQueuePath.wstring(), &fsErr)) {
+        SS_LOG_WARN(L"Telemetry",
+            L"Offline telemetry queue could not be removed after reading: %ls "
+            L"(WinError %lu) - its events may be submitted again on the next flush",
+            m_offlineQueuePath.wstring().c_str(),
+            static_cast<unsigned long>(fsErr.win32));
+    }
 
     if (content.empty() || content[0] != '[') return;
 
@@ -1263,7 +1283,12 @@ void TelemetryCollectorImpl::ClearQueue() {
     // Remove offline queue file
     if (!m_offlineQueuePath.empty() && fs::exists(m_offlineQueuePath)) {
         Utils::FileUtils::Error fsErr;
-        Utils::FileUtils::RemoveFile(m_offlineQueuePath.wstring(), &fsErr);
+        if (!Utils::FileUtils::RemoveFile(m_offlineQueuePath.wstring(), &fsErr)) {
+            SS_LOG_WARN(L"Telemetry",
+                L"Offline telemetry queue could not be removed: %ls (WinError %lu)",
+                m_offlineQueuePath.wstring().c_str(),
+                static_cast<unsigned long>(fsErr.win32));
+        }
     }
 
     SS_LOG_DEBUG(L"Telemetry", L"Queue cleared");

@@ -58,6 +58,8 @@ EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
 HOME_IPC_DISPATCHER_CPP_PATH = (
     ROOT / "src/PhantomCore/Service/HomeIpcDispatcher.cpp"
 )
+TELEMETRY_COLLECTOR_CPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "Communication" / "TelemetryCollector.cpp")
 TRAY_UI_ARGS_HPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/UI/Shared/TrayUiArgs.hpp"
 )
@@ -23393,6 +23395,77 @@ class DefenseEvasionValueQualificationContractTests(unittest.TestCase):
             "defenderOperationalWritesIgnored={}" in source,
             "the ignored-write counter is not emitted in the capacity report, so "
             "the volume this rule is suppressing is invisible")
+
+
+class TelemetryQueueFailureReportingContractTests(unittest.TestCase):
+    """The offline telemetry queue's file operations must report their failures.
+
+    FileUtils::CreateDirectories and RemoveFile are both [[nodiscard]] and both
+    populate an Error out-parameter. Three sites passed that parameter and then
+    discarded the result. The compiler warns about the discard (C4834), so what
+    this test adds is what the compiler cannot see: that a failure is reported
+    rather than swallowed.
+
+    The removal after reading is the one that matters. Its own comment says
+    "Delete the file after reading to prevent duplicate processing" - so if the
+    removal fails and nobody notices, the queue is read again on the next flush
+    and every event in it is submitted twice.
+    """
+
+    def test_no_queue_file_operation_discards_its_result(self):
+        source = strip_c_comments(read_source(TELEMETRY_COLLECTOR_CPP_PATH))
+        bare = []
+        for match in re.finditer(
+                r"^[ \t]*Utils::FileUtils::(?:CreateDirectories|RemoveFile)\s*\(",
+                source, re.M):
+            bare.append(source[:match.start()].count("\n") + 1)
+        self.assertEqual(
+            [], bare,
+            "these FileUtils calls in TelemetryCollector discard a [[nodiscard]] "
+            "result: " + repr(bare) + ". Each one is passed an Error "
+            "out-parameter that is then ignored.")
+
+    def test_the_removal_that_prevents_duplicates_reports_its_failure(self):
+        """Anchored on the consequence, not on the call.
+
+        A test that only required the result to be tested would be satisfied by
+        `if (!RemoveFile(...)) {}`, which discards the failure just as effectively
+        while silencing the compiler.
+        """
+        source = strip_c_comments(read_source(TELEMETRY_COLLECTOR_CPP_PATH))
+        marker = "if (!Utils::FileUtils::RemoveFile("
+        first = source.find(marker)
+        self.assertNotEqual(
+            -1, first,
+            "the offline queue removal is no longer result-checked, so this "
+            "contract is no longer anchored to the artifact")
+
+        # Every result-checked removal must log inside its failure branch.
+        offenders = []
+        position = first
+        while position != -1:
+            open_brace = source.index("{", source.index(")", position))
+            depth = 0
+            end = -1
+            for index in range(open_brace, len(source)):
+                if source[index] == "{":
+                    depth += 1
+                elif source[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = index
+                        break
+            branch = source[open_brace:end] if end != -1 else ""
+            if "SS_LOG_" not in branch and "Logger::" not in branch:
+                offenders.append(source[:position].count("\n") + 1)
+            position = source.find(marker, position + 1)
+
+        self.assertEqual(
+            [], offenders,
+            "a failed offline-queue removal is detected and then silently ignored "
+            "at lines " + repr(offenders) + ". Its own comment explains the "
+            "consequence: the queue is read again and every event in it is "
+            "submitted twice.")
 
 
 if __name__ == "__main__":
