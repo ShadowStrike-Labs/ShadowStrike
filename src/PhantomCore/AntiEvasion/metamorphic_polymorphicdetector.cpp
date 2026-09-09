@@ -3509,46 +3509,196 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
     // ========================================================================
     // Register Reassignment Detection
     // ========================================================================
-    // Track register usage patterns - metamorphic code often uses different
-    // registers for the same logical operations across variants
+    //
+    // WHAT THIS LOOKS FOR, and why the previous implementation could not find it.
+    //
+    // Register reassignment is the metamorphic technique of emitting the same
+    // logical routine with different registers in each generation, so a byte
+    // signature over one generation does not match the next.
+    //
+    // THE PREVIOUS RULE COMPUTED SHANNON ENTROPY OVER THE FILE'S REGISTER-USE
+    // HISTOGRAM AND FIRED ABOVE 3.0. That is provably not a detector for this
+    // technique, and the proof is one line: reassigning registers PERMUTES the
+    // histogram, and Shannon entropy is invariant under permutation of the
+    // distribution it is given - it depends only on the multiset of
+    // probabilities, never on which register carries which. The rule therefore
+    // produced the SAME number for a reassigned variant and for its original. It
+    // could not distinguish the transformation it was named after.
+    //
+    // What it actually measured is how evenly a binary spreads work across the
+    // sixteen general-purpose registers, which is a measure of register
+    // allocation quality. The maximum is log2(16) = 4.0 and the threshold was
+    // 3.0 - roughly eight registers used evenly, which is what every optimising
+    // compiler produces. The 1.0.113 field run is unambiguous: 51 alerts, every
+    // one on a Microsoft-signed System32 binary, four of them NGEN native images
+    // (windowsbase.ni.dll, mmcex.ni.dll, system.xml.linq.ni.dll,
+    // microsoft.managementconsole.ni.dll) which are .NET ahead-of-time output and
+    // about the most machine-optimised code present on a Windows install. Zero
+    // alerts on anything malicious. The rule's own TechnicalDetails string
+    // asserted "normal < 2.5"; the measured normal for optimised x86-64 is 3.2
+    // to 3.6, so the justification printed next to every alert was false too.
+    //
+    // WHAT REPLACES IT DETECTS THE ARTIFACT THE TECHNIQUE ACTUALLY LEAVES BEHIND:
+    // one code SHAPE realised with several different register assignments inside
+    // a single image. A window of instructions is reduced to a shape key in which
+    // every register operand is replaced by the ORDER in which that register
+    // first appears in the window, so
+    //
+    //     mov rax, rbx ; add rax, rcx ; xor rax, rdx
+    //     mov rdx, rsi ; add rdx, rdi ; xor rdx, r8
+    //
+    // collapse to ONE shape carrying TWO distinct register assignments. A
+    // generator that emits permuted copies of its own routines leaves shapes with
+    // several assignments each. A compiler does not: it has no reason to emit the
+    // same eight-instruction computation three times with three different
+    // register allocations.
+    //
+    // THIS IS STRICTLY STRONGER, NOT NARROWER, and that follows from the
+    // invariance proof rather than from judgement. The previous rule could not
+    // detect register reassignment at all, so no detection capability is given
+    // up here - a rule that fires on optimised compiler output while being
+    // mathematically blind to its own technique was providing none. This one
+    // fires on the technique and not on the compiler.
+    {
+        // A window long enough that ordinary repeated shapes - prologues, thunks,
+        // two-instruction stubs - cannot fill it, and three distinct assignments
+        // required rather than two, because a compiler inlining one routine twice
+        // with different registers is plausible while three copies of the same
+        // eight-instruction computation is a generator.
+        constexpr size_t kWindow                 = 8;
+        constexpr size_t kMinComputeOps          = 2;
+        constexpr size_t kMinDistinctAssignments = 3;
+        // Bounds the memory this can take on a hostile input. Beyond the cap new
+        // shapes are ignored while existing ones keep accumulating evidence, so
+        // the effect is a ceiling on breadth, never a false negative on a shape
+        // already being tracked.
+        constexpr size_t kMaxShapesTracked       = 4096;
 
-    std::array<size_t, 16> registerUseCounts = {};
-    size_t totalRegisterUses = 0;
+        // Canonical GPR index, folding the 64-bit and 32-bit names of one
+        // register together so a generator that also varies operand width is not
+        // read as using a different register. Anything that is not a
+        // general-purpose register gets a marker distinct from register 0.
+        const auto gprIndex = [](Phantom::Disasm::Register reg) noexcept -> int {
+            using R = Phantom::Disasm::Register;
+            if (reg >= R::RAX && reg <= R::R15) {
+                return static_cast<int>(reg) - static_cast<int>(R::RAX);
+            }
+            if (reg >= R::EAX && reg <= R::R15D) {
+                return static_cast<int>(reg) - static_cast<int>(R::EAX);
+            }
+            return -1;
+        };
 
-    for (const auto& instr : instructions) {
-        for (size_t i = 0; i < instr.instruction.operand_count; ++i) {
-            if (instr.operands[i].type == Phantom::Disasm::OperandType::REGISTER) {
-                Phantom::Disasm::Register reg = instr.operands[i].reg.value;
-                // Map to general purpose register index (0-15 for x64)
-                if (reg >= Phantom::Disasm::Register::RAX && reg <= Phantom::Disasm::Register::R15) {
-                    ++registerUseCounts[static_cast<int>(reg) - static_cast<int>(Phantom::Disasm::Register::RAX)];
-                    ++totalRegisterUses;
-                } else if (reg >= Phantom::Disasm::Register::EAX && reg <= Phantom::Disasm::Register::R15D) {
-                    ++registerUseCounts[static_cast<int>(reg) - static_cast<int>(Phantom::Disasm::Register::EAX)];
-                    ++totalRegisterUses;
+        const auto mix = [](uint64_t h, uint64_t v) noexcept -> uint64_t {
+            h ^= v + 0x9E3779B97F4A7C15ull;
+            h *= 0x00000100000001B3ull;
+            return h;
+        };
+
+        std::unordered_map<uint64_t, std::unordered_set<uint64_t>> shapeAssignments;
+
+        for (size_t start = 0; start + kWindow <= instructions.size(); ++start) {
+            uint64_t shapeKey  = 0xCBF29CE484222325ull;
+            uint64_t assignKey = 0xCBF29CE484222325ull;
+            std::array<int, 16> firstUseOrder{};
+            firstUseOrder.fill(-1);
+            int    nextSlot    = 0;
+            size_t computeOps  = 0;
+            size_t regOperands = 0;
+            bool   usable      = true;
+
+            for (size_t k = 0; k < kWindow; ++k) {
+                const auto& instr = instructions[start + k];
+
+                // Straight-line code only. A window spanning a call or a branch
+                // is not one routine, so two such windows agreeing says nothing
+                // about a routine having been duplicated.
+                if (instr.instruction.IsControlFlow()) {
+                    usable = false;
+                    break;
+                }
+
+                switch (instr.instruction.category) {
+                    case Phantom::Disasm::InstructionCategory::ARITHMETIC:
+                    case Phantom::Disasm::InstructionCategory::LOGIC:
+                    case Phantom::Disasm::InstructionCategory::SHIFT_ROTATE:
+                        ++computeOps;
+                        break;
+                    default:
+                        break;
+                }
+
+                shapeKey = mix(shapeKey,
+                               static_cast<uint64_t>(instr.instruction.mnemonic));
+                shapeKey = mix(shapeKey,
+                               static_cast<uint64_t>(instr.instruction.operand_count));
+
+                const size_t operandCount =
+                    (std::min)(static_cast<size_t>(instr.instruction.operand_count),
+                               static_cast<size_t>(Phantom::Disasm::MAX_OPERANDS));
+                for (size_t i = 0; i < operandCount; ++i) {
+                    const auto& op = instr.operands[i];
+                    shapeKey = mix(shapeKey, static_cast<uint64_t>(op.type));
+                    if (op.type != Phantom::Disasm::OperandType::REGISTER) {
+                        continue;
+                    }
+                    const int idx = gprIndex(op.reg.value);
+                    if (idx < 0) {
+                        shapeKey = mix(shapeKey, 0xFFull);
+                        continue;
+                    }
+                    ++regOperands;
+                    if (firstUseOrder[static_cast<size_t>(idx)] < 0) {
+                        firstUseOrder[static_cast<size_t>(idx)] = nextSlot++;
+                    }
+                    // The shape carries the ORDER in which a register first
+                    // appears, never its identity. That is precisely what makes
+                    // two register-permuted copies of one routine collide, and it
+                    // is the property the entropy rule lacked.
+                    shapeKey = mix(shapeKey,
+                                   static_cast<uint64_t>(
+                                       firstUseOrder[static_cast<size_t>(idx)]));
+                    assignKey = mix(assignKey, static_cast<uint64_t>(idx));
                 }
             }
-        }
-    }
 
-    // Calculate register usage entropy - high entropy suggests reassignment
-    if (totalRegisterUses > 0) {
-        double registerEntropy = 0.0;
-        for (size_t count : registerUseCounts) {
-            if (count > 0) {
-                double p = static_cast<double>(count) / static_cast<double>(totalRegisterUses);
-                registerEntropy -= p * std::log2(p);
+            if (!usable || computeOps < kMinComputeOps || regOperands == 0) {
+                continue;
+            }
+            if (shapeAssignments.size() >= kMaxShapesTracked &&
+                shapeAssignments.find(shapeKey) == shapeAssignments.end()) {
+                continue;
+            }
+            shapeAssignments[shapeKey].insert(assignKey);
+        }
+
+        size_t permutedShapes = 0;
+        size_t strongestShape = 0;
+        for (const auto& entry : shapeAssignments) {
+            if (entry.second.size() >= kMinDistinctAssignments) {
+                ++permutedShapes;
+                strongestShape = (std::max)(strongestShape, entry.second.size());
             }
         }
 
-        // Normalized entropy > 3.0 suggests intentional register variation
-        if (registerEntropy > 3.0) {
+        if (permutedShapes > 0) {
+            // Evidence-proportional. The old rule emitted 0.62 to 0.65 for every
+            // input it saw, which told a reader nothing about how much evidence
+            // there was.
+            const double confidence = (std::min)(
+                0.55 +
+                    0.05 * static_cast<double>(strongestShape - kMinDistinctAssignments) +
+                    0.05 * static_cast<double>(permutedShapes - 1),
+                0.95);
             auto detection = MetamorphicDetectionBuilder()
                 .Technique(MetamorphicTechnique::META_RegisterReassignment)
-                .Confidence(std::min(0.6 + (registerEntropy - 3.0) * 0.1, 0.95))
+                .Confidence(confidence)
                 .Description(L"Register reassignment pattern detected")
-                .TechnicalDetails(L"Register entropy: " + std::to_wstring(registerEntropy) +
-                                  L" (normal < 2.5)")
+                .TechnicalDetails(
+                    L"Identical code shapes emitted with different register "
+                    L"assignments: " + std::to_wstring(permutedShapes) +
+                    L" shape(s), strongest carrying " +
+                    std::to_wstring(strongestShape) + L" distinct assignments")
                 .Build();
             AddDetection(result, std::move(detection));
         }

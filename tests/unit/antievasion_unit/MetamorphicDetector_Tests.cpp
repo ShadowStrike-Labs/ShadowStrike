@@ -314,4 +314,110 @@ TEST(MetamorphicDetector_Histogram, AlignmentPaddingIsNotMistakenForJunkCode) {
            "binaries, so it is genuinely unusual";
 }
 
+// ============================================================================
+// REGISTER REASSIGNMENT - the technique, not the compiler
+// ============================================================================
+//
+// These two tests exist because this rule was REPLACED rather than tuned, and a
+// replaced detection algorithm has to be shown to work.
+//
+// The previous implementation computed Shannon entropy over the file's
+// register-use histogram and fired above 3.0. That cannot detect register
+// reassignment: reassigning registers PERMUTES the histogram, and Shannon
+// entropy is invariant under permutation of the distribution it is given, so the
+// number it produced was identical for a reassigned variant and for its
+// original. What it actually measured was how evenly a binary uses the general
+// purpose registers, which is a property of good register allocation. In the
+// 1.0.113 field run it fired 51 times, every one on a Microsoft-signed System32
+// binary and four of them on NGEN native images, and zero times on anything
+// malicious.
+//
+// Both buffers below are decoded in 32-bit mode, because AnalyzeFileInternal
+// uses the raw buffer with is64Bit = false when the input is not a PE. Worth
+// recording while we are here: 32-bit code has eight general-purpose registers,
+// so its register-use entropy cannot exceed log2(8) = 3.0, which means the old
+// rule's "> 3.0" test could never fire on 32-bit code at all. It was silently
+// 64-bit-only, and that is exactly the shape of the field evidence.
+
+namespace {
+
+// Three register-permuted realisations of ONE eight-instruction computation:
+//     mov A,B / add A,C / xor A,B / sub A,C / and A,B / or A,C / adc A,B / mov B,A
+// with (A,B,C) = (eax,ebx,ecx), then (edx,esi,edi), then (ebx,ecx,eax).
+// That is one code shape carrying three distinct register assignments, which is
+// the defining artifact of the technique.
+constexpr uint8_t kRegisterPermutedRoutines[] = {
+        0x89, 0xD8, 0x01, 0xC8, 0x31, 0xD8, 0x29, 0xC8, 0x21, 0xD8, 0x09, 0xC8,
+        0x11, 0xD8, 0x89, 0xC3, 0x89, 0xF2, 0x01, 0xFA, 0x31, 0xF2, 0x29, 0xFA,
+        0x21, 0xF2, 0x09, 0xFA, 0x11, 0xF2, 0x89, 0xD6, 0x89, 0xCB, 0x01, 0xC3,
+        0x31, 0xCB, 0x29, 0xC3, 0x21, 0xCB, 0x09, 0xC3, 0x11, 0xCB, 0x89, 0xD9
+};
+
+// Forty-eight varied instructions spread over all eight 32-bit general-purpose
+// registers. Register-use entropy is 2.97 against a ceiling of 3.0, so usage is
+// about as even as 32-bit code can be - precisely the property the old rule
+// mistook for mutation - while 41 distinct code shapes appear and NOT ONE of
+// them is realised by three different register assignments.
+constexpr uint8_t kEvenRegisterUseNoPermutation[] = {
+        0x31, 0xE1, 0x01, 0xFF, 0x19, 0xDE, 0x01, 0xC7, 0x11, 0xC6, 0x19, 0xDC,
+        0x85, 0xE9, 0x89, 0xC0, 0x39, 0xF0, 0x29, 0xC6, 0x39, 0xFB, 0x19, 0xEB,
+        0x29, 0xFB, 0x21, 0xF0, 0x39, 0xD1, 0x21, 0xE9, 0x39, 0xDE, 0x21, 0xFC,
+        0x39, 0xC6, 0x19, 0xF3, 0x11, 0xEA, 0x39, 0xCD, 0x19, 0xD1, 0x39, 0xEE,
+        0x19, 0xF8, 0x89, 0xF4, 0x31, 0xDA, 0x89, 0xDB, 0x11, 0xED, 0x19, 0xC4,
+        0x11, 0xDA, 0x11, 0xF8, 0x09, 0xF3, 0x19, 0xF5, 0x09, 0xE8, 0x19, 0xD8,
+        0x31, 0xCA, 0x39, 0xC4, 0x01, 0xC1, 0x19, 0xE0, 0x29, 0xCC, 0x85, 0xEA,
+        0x21, 0xD1, 0x31, 0xD4, 0x21, 0xFC, 0x09, 0xFF, 0x01, 0xE0, 0x11, 0xF5
+};
+
+} // namespace
+
+TEST(MetamorphicDetector_RegisterReassignment,
+     PermutedCopiesOfOneRoutineAreDetected) {
+    MetamorphicDetector detector;
+    ASSERT_TRUE(detector.Initialize())
+        << "the detector must initialise for either of these tests to mean "
+           "anything - an uninitialised detector returns an empty result, which "
+           "would make the negative test below pass for entirely the wrong reason";
+
+    const auto result = detector.AnalyzeBuffer(
+        kRegisterPermutedRoutines, sizeof(kRegisterPermutedRoutines));
+
+    ASSERT_GT(result.instructionsAnalyzed, 0u)
+        << "no instructions were decoded, so the rule never ran and this test "
+           "proves nothing about it";
+
+    EXPECT_TRUE(result.HasTechnique(
+        MetamorphicTechnique::META_RegisterReassignment))
+        << "three register-permuted copies of one eight-instruction routine is "
+           "the artifact register reassignment leaves behind. A metamorphic "
+           "generator emits exactly this; a compiler has no reason to emit the "
+           "same computation three times with three different register "
+           "allocations.";
+
+    detector.Shutdown();
+}
+
+TEST(MetamorphicDetector_RegisterReassignment,
+     EvenRegisterUseAloneIsNotReportedAsReassignment) {
+    MetamorphicDetector detector;
+    ASSERT_TRUE(detector.Initialize());
+
+    const auto result = detector.AnalyzeBuffer(
+        kEvenRegisterUseNoPermutation, sizeof(kEvenRegisterUseNoPermutation));
+
+    ASSERT_GT(result.instructionsAnalyzed, 0u)
+        << "no instructions were decoded, so this buffer never reached the rule "
+           "and its silence means nothing";
+
+    EXPECT_FALSE(result.HasTechnique(
+        MetamorphicTechnique::META_RegisterReassignment))
+        << "this buffer spreads work evenly across every general-purpose "
+           "register, which is what an optimising compiler produces and what the "
+           "old entropy rule convicted 51 Microsoft-signed System32 binaries for, "
+           "while containing no code shape realised by more than one register "
+           "assignment. Even register use is not evidence of mutation.";
+
+    detector.Shutdown();
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

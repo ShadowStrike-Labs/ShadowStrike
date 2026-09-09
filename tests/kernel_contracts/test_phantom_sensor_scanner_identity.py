@@ -158,6 +158,9 @@ MEMORY_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/MemoryUtils.cpp"
 HASH_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/HashUtils.cpp"
 SIGNATURE_FORMAT_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/SignatureFormat.cpp"
 METAMORPHIC_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"
+METAMORPHIC_DETECTOR_TESTS_PATH = (
+    ROOT / "tests" / "unit" / "antievasion_unit" /
+    "MetamorphicDetector_Tests.cpp")
 PACKER_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/PackerDetector.cpp"
 PE_PARSER_CPP_PATH = ROOT / "src/PhantomCore/PEParser/PEParser.cpp"
 BOOT_TIME_ANALYZER_CPP_PATH = ROOT / "src/PhantomCore/Core/System/BootTimeAnalyzer.cpp"
@@ -23610,6 +23613,198 @@ class FileEnumerationActorContractTests(unittest.TestCase):
             "trk.trust =" not in early_out,
             "the not-yet-available path caches a trust verdict; a transient "
             "condition would become permanent for this process")
+
+
+class RegisterReassignmentDetectionContractTests(unittest.TestCase):
+    """The register-reassignment rule was REPLACED, not tuned, and these hold the
+    properties that make the replacement correct.
+
+    WHY THE OLD RULE WAS NOT A DETECTOR FOR ITS OWN TECHNIQUE. It computed
+    Shannon entropy over the file's register-use histogram and fired above 3.0.
+    Reassigning registers PERMUTES that histogram, and Shannon entropy is
+    invariant under permutation of the distribution it is given - it depends only
+    on the multiset of probabilities, never on which register carries which. The
+    rule therefore produced an identical number for a reassigned variant and for
+    its original. What it measured was register-allocation evenness. In the
+    1.0.113 field run it fired 51 times, every one on a Microsoft-signed System32
+    binary, four of them NGEN native images, and zero times on anything malicious.
+
+    Two behaviour tests in MetamorphicDetector_Tests.cpp prove the replacement
+    fires on the artifact and stays silent on even register use. These contract
+    tests cover what those cannot see, and each one below was chosen because a
+    MEASUREMENT showed the behaviour tests do not catch it.
+    """
+
+    def _region(self):
+        """The brace-matched block implementing the rule.
+
+        Anchored on code, never on the section comment, because strip_c_comments
+        blanks comments before any of this runs.
+        """
+        source = strip_c_comments(read_source(METAMORPHIC_DETECTOR_CPP_PATH))
+        needle = "kMinDistinctAssignments"
+        position = source.find(needle)
+        self.assertNotEqual(
+            -1, position,
+            "the register-reassignment rule's anchor is gone, so this contract is "
+            "no longer attached to the artifact")
+
+        depth = 0
+        start = -1
+        for index in range(position, -1, -1):
+            if source[index] == "}":
+                depth += 1
+            elif source[index] == "{":
+                if depth == 0:
+                    start = index
+                    break
+                depth -= 1
+        self.assertNotEqual(-1, start, "could not find the enclosing block")
+
+        depth = 0
+        for index in range(start, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    region = source[start:index + 1]
+                    self.assertIn(
+                        "META_RegisterReassignment", region,
+                        "the extracted block does not emit the technique, so it "
+                        "is the wrong region")
+                    return region
+        self.fail("the rule's block is not brace-balanced")
+
+    def test_the_rule_is_not_a_register_histogram_entropy_test(self):
+        """The exact defect that shipped, and it reads plausible."""
+        region = self._region()
+        for banned in ("registerEntropy", "registerUseCounts"):
+            self.assertTrue(
+                banned not in region,
+                "the register-reassignment rule has been re-expressed as an "
+                "entropy measure over a register histogram. That is provably not "
+                "a detector for this technique: register reassignment permutes "
+                "the histogram and Shannon entropy is invariant under "
+                "permutation, so the value is identical before and after the "
+                "transformation being looked for.")
+        self.assertTrue(
+            "std::log2" not in region,
+            "a logarithm in this block means a distribution is being scored "
+            "rather than code shapes being compared")
+
+    def test_the_shape_key_uses_first_use_order_not_register_identity(self):
+        """The single property that makes permuted copies collide.
+
+        If the shape key carried register identity, two permuted realisations of
+        one routine would produce two different shapes with one assignment each,
+        and the rule would detect nothing. If the assignment key carried order
+        rather than identity, every realisation would look identical and the rule
+        would fire on any repeated shape. The two keys must not be swapped.
+        """
+        region = self._region()
+        self.assertTrue(
+            "firstUseOrder" in region,
+            "the shape key is not built from the order in which registers first "
+            "appear, so register-permuted copies of one routine cannot collide")
+
+        # STATEMENTS, not lines. Every mix() call in the real code spans three
+        # lines, so a per-line conjunction cannot see its argument and reports a
+        # correct implementation as broken.
+        statements = region.split(";")
+        shape_stmts = [s for s in statements if "shapeKey = mix(" in s]
+        assign_stmts = [s for s in statements if "assignKey = mix(" in s]
+        self.assertTrue(shape_stmts, "no shape key is being accumulated")
+        self.assertTrue(assign_stmts, "no assignment key is being accumulated")
+        self.assertTrue(
+            any(re.search(r"assignKey = mix\(assignKey,[^;]*\bidx\b", s)
+                for s in assign_stmts),
+            "the assignment key does not carry the register index, so two "
+            "different register choices cannot be told apart")
+
+        self.assertTrue(
+            any("firstUseOrder" in s for s in shape_stmts),
+            "the shape key never mixes in the first-use order, which is the only "
+            "thing that makes it invariant to which registers were chosen")
+        self.assertFalse(
+            any("firstUseOrder" in s for s in assign_stmts),
+            "the assignment key mixes in first-use ORDER rather than register "
+            "IDENTITY. Order is shared by every permuted realisation, so all "
+            "realisations would collapse to one assignment and the rule would "
+            "report nothing.")
+
+    def test_a_permuted_shape_requires_three_distinct_assignments(self):
+        """MEASURED: the behaviour tests cannot catch this being lowered.
+
+        Every one of the 41 code shapes in the negative behaviour-test buffer is
+        realised by exactly ONE register assignment, so lowering the requirement
+        from three to two leaves both behaviour tests passing. Two is not a safe
+        value: a compiler inlining one routine twice with different registers is
+        ordinary, while three copies of the same eight-instruction computation
+        with three different register allocations is a generator.
+        """
+        region = self._region()
+        match = re.search(r"kMinDistinctAssignments\s*=\s*(\d+)", region)
+        self.assertIsNotNone(
+            match, "the minimum distinct-assignment requirement is gone")
+        self.assertGreaterEqual(
+            int(match.group(1)), 3,
+            "a code shape now needs fewer than three distinct register "
+            "assignments to be reported as reassignment. Two copies of one "
+            "routine with different registers is something a compiler produces "
+            "by inlining.")
+
+    def test_the_window_requires_straight_line_code(self):
+        """The behaviour-test buffers contain no control flow at all, so they
+        cannot notice this being removed."""
+        region = self._region()
+        self.assertTrue(
+            "IsControlFlow()" in region,
+            "the instruction window no longer rejects control flow. A window "
+            "spanning a call or a branch is not one routine, so two such windows "
+            "agreeing says nothing about a routine having been duplicated.")
+
+    def test_the_shape_tracking_work_stays_bounded(self):
+        """This rule runs on the on-access path with a kernel thread waiting.
+
+        The behaviour tests use buffers of a few dozen instructions and can never
+        reach a capacity limit, so only a source-level check can hold this.
+        """
+        region = self._region()
+        self.assertTrue(
+            "kMaxShapesTracked" in region,
+            "the shape map is no longer capped. This runs while a kernel thread "
+            "is parked in FltSendMessage holding an IRP_MJ_CREATE, so unbounded "
+            "growth on a hostile input is a denial of service against every file "
+            "operation on the machine.")
+        self.assertTrue(
+            re.search(r"shapeAssignments\.size\(\)\s*>=\s*kMaxShapesTracked",
+                      region) is not None,
+            "the cap is declared but never tested against the map's size")
+
+    def test_the_replacement_is_backed_by_non_vacuous_behaviour_tests(self):
+        """A replaced detection algorithm must be shown to fire.
+
+        Both directions are required: without the positive test a rule that never
+        fires would pass, and without the negative test one that always fires
+        would. The instructionsAnalyzed assertion is what stops either passing
+        because nothing was decoded at all.
+        """
+        source = read_source(METAMORPHIC_DETECTOR_TESTS_PATH)
+        self.assertIn(
+            "PermutedCopiesOfOneRoutineAreDetected", source,
+            "the test proving the replacement fires on register-permuted copies "
+            "of one routine is gone")
+        self.assertIn(
+            "EvenRegisterUseAloneIsNotReportedAsReassignment", source,
+            "the test proving even register use is NOT reported - the false "
+            "positive that convicted 51 signed System32 binaries - is gone")
+        self.assertEqual(
+            2, source.count("ASSERT_GT(result.instructionsAnalyzed, 0u)"),
+            "both behaviour tests must assert that instructions were actually "
+            "decoded. Without it a buffer that never reached the rule would make "
+            "the negative test pass for the wrong reason and the positive test "
+            "fail for an unrelated one.")
 
 
 if __name__ == "__main__":
