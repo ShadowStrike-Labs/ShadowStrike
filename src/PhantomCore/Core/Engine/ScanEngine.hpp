@@ -652,6 +652,20 @@ public:
     [[nodiscard]] static ScanEngine& Instance();
 
     /**
+     * @brief Whether the engine singleton already exists.
+     *
+     * Instance() CONSTRUCTS on first call, which is wrong for a caller that only
+     * wants to consult the engine if it happens to be running - a monitor thread
+     * asking EvaluatePublisherTrust, for example, must not bring the whole scan
+     * engine into being as a side effect of a performance sample.
+     *
+     * DigitalSignatureValidator, RealTimeProtection and CryptoManager all expose
+     * this; ScanEngine did not, which is the inconsistency that made such a caller
+     * unable to be safe.
+     */
+    [[nodiscard]] static bool HasInstance() noexcept;
+
+    /**
      * @brief Whether a file carries a verified signature from a publisher this
      *        product trusts, and on what basis.
      *

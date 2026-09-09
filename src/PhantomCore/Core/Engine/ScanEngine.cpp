@@ -1489,9 +1489,20 @@ public:
 // SINGLETON INSTANCE
 // ============================================================================
 
+namespace {
+// Set by the constructor, read by HasInstance(). Same shape as
+// DigitalSignatureValidator's, so the two singletons answer this question the
+// same way.
+std::atomic<bool> g_scanEngineInstanceCreated{false};
+}  // namespace
+
 ScanEngine& ScanEngine::Instance() {
     static ScanEngine instance;
     return instance;
+}
+
+bool ScanEngine::HasInstance() noexcept {
+    return g_scanEngineInstanceCreated.load(std::memory_order_acquire);
 }
 
 // ============================================================================
@@ -1501,6 +1512,7 @@ ScanEngine& ScanEngine::Instance() {
 ScanEngine::ScanEngine()
     : m_impl(std::make_unique<Impl>())
 {
+    g_scanEngineInstanceCreated.store(true, std::memory_order_release);
     SS_LOG_INFO(L"ScanEngine", L"Constructor called");
 }
 

@@ -41,6 +41,9 @@
 #include "pch.h"
 #include "DiskMonitor.hpp"
 #include "../Utils/Logger.hpp"
+// For the publisher-trust policy consulted before raising a
+// file-enumeration alert. See IsTrustedPublisherProcess below.
+#include "../Core/Engine/ScanEngine.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY
@@ -251,7 +254,8 @@ std::string DiskMonitorModuleStats::ToJson() const {
       << "\"processesTracked\":" << processesTracked << ","
       << "\"ransomwareAlertsTriggered\":" << ransomwareAlertsTriggered << ","
       << "\"fileEnumAlertsTriggered\":" << fileEnumAlertsTriggered << ","
-      << "\"uptimeSeconds\":" << uptimeSeconds
+      << "\"uptimeSeconds\":" << uptimeSeconds << ","
+      << "\"fileEnumAlertsSuppressedByTrust\":" << fileEnumAlertsSuppressedByTrust
       << "}";
     return o.str();
 }
@@ -497,9 +501,16 @@ public:
 
             WCHAR nameBuf[MAX_PATH] = L"<unknown>";
             DWORD nameLen = static_cast<DWORD>(std::size(nameBuf));
+            // The FULL path, kept before nameBuf is reduced to the base name below.
+            // Publisher verification needs the path; the base name is what the
+            // rest of this function reports. A trust decision taken on a NAME
+            // would be defeated by any binary calling itself svchost.exe, which is
+            // why the path is what gets verified.
+            std::wstring imagePath;
             if (::QueryFullProcessImageNameW(hProc.get(), 0, nameBuf, &nameLen)
                 && nameLen > 0) {
                 std::wstring_view full(nameBuf, nameLen);
+                imagePath.assign(full);
                 const auto slash = full.find_last_of(L"\\/");
                 if (slash != std::wstring_view::npos) {
                     const auto base = full.substr(slash + 1);
@@ -619,17 +630,47 @@ public:
 
                     if (!trk.fileEnumAlerted) {
                         trk.fileEnumAlerted = true;
-                        FileEnumAlert alert{};
-                        alert.processId                = pid;
-                        alert.processName              = usage.processName;
-                        alert.sustainedOtherOpsPerSec  = avgOps;
-                        alert.sustainedDurationSamples = static_cast<uint32_t>(enumWin);
-                        alert.detectedAt               = now;
-                        NotifyFileEnum(alert);
-                        SS_LOG_WARN(LOG_CAT,
-                            L"FILE ENUM ALERT: PID %u (%ls) sustained %.0f other-ops/s for %u samples",
-                            pid, usage.processName.c_str(), avgOps,
-                            static_cast<unsigned>(enumWin));
+
+                        // ACTOR QUALIFICATION. Sustained file enumeration is a real
+                        // reconnaissance signal and this rule stays, but it means
+                        // nothing without knowing who is enumerating. The 1.0.113
+                        // field run produced 84 of these alerts across twelve
+                        // processes and every single one was a Windows component
+                        // whose documented job is walking the file system:
+                        // SearchIndexer and SearchProtocolHost index the disk,
+                        // CompatTelRunner inventories installed software, mscorsvw
+                        // precompiles assemblies, and MsMpEng is Microsoft
+                        // Defender's engine - this product was alerting on another
+                        // antivirus scanning files.
+                        //
+                        // Only a VERIFIED SIGNATURE suppresses, and only for this
+                        // rule. The sustained-write ransomware detector above is
+                        // deliberately untouched: it raised zero alerts in that same
+                        // run, so it is not crying wolf, and a signed process can
+                        // still be hijacked into encrypting files.
+                        if (IsTrustedPublisherProcess(trk, imagePath)) {
+                            m_stats.fileEnumAlertsSuppressedByTrust.fetch_add(
+                                1, std::memory_order_relaxed);
+                            SS_LOG_INFO(LOG_CAT,
+                                L"File enumeration by PID %u (%ls) NOT reported: "
+                                L"verified signature, signer '%ls' - %.0f other-ops/s "
+                                L"over %u samples",
+                                pid, usage.processName.c_str(),
+                                trk.trustSigner.c_str(), avgOps,
+                                static_cast<unsigned>(enumWin));
+                        } else {
+                            FileEnumAlert alert{};
+                            alert.processId                = pid;
+                            alert.processName              = usage.processName;
+                            alert.sustainedOtherOpsPerSec  = avgOps;
+                            alert.sustainedDurationSamples = static_cast<uint32_t>(enumWin);
+                            alert.detectedAt               = now;
+                            NotifyFileEnum(alert);
+                            SS_LOG_WARN(LOG_CAT,
+                                L"FILE ENUM ALERT: PID %u (%ls) sustained %.0f other-ops/s for %u samples",
+                                pid, usage.processName.c_str(), avgOps,
+                                static_cast<unsigned>(enumWin));
+                        }
                     }
                 } else {
                     trk.fileEnumAlerted = false;
@@ -905,6 +946,11 @@ private:
     // INTERNAL TYPES
     // ========================================================================
 
+    // Tri-state, so publisher verification happens once per process rather than
+    // once per sample. This loop runs over every process on the machine on every
+    // cycle; a WinVerifyTrust call per process per cycle would be indefensible.
+    enum class PublisherTrustState : uint8_t { Unknown = 0, Trusted, Untrusted };
+
     struct ProcessTrackingData {
         DiskIoCounters     prevCounters{};
         std::deque<double> writeRateSamples;
@@ -914,7 +960,43 @@ private:
         bool               firstSample       = true;   // suppress lifetime-counter spike on first observation
         TimePoint          lastSeen;
         std::wstring       processName;
+        PublisherTrustState trust = PublisherTrustState::Unknown;
+        std::wstring       trustSigner;
     };
+
+    // Does this process carry a verified signature from a publisher we trust?
+    //
+    // ONE IMPLEMENTATION OF THE POLICY. ScanEngine::EvaluatePublisherTrust is the
+    // single place that answers this - the same function the scan engine's own
+    // heuristic suppression and RealTimeProtection's remediation guard use. A
+    // second copy here is exactly what this codebase's own comments warn against.
+    //
+    // NEVER DECIDED ON THE PROCESS NAME. The signature of the image at its real
+    // path is what is checked, so a binary that calls itself svchost.exe from a
+    // temp directory is not trusted and still alerts. Masquerading is a technique
+    // this product detects elsewhere; it must not be handed a bypass here.
+    [[nodiscard]] bool IsTrustedPublisherProcess(ProcessTrackingData& trk,
+                                                const std::wstring& imagePath) {
+        if (trk.trust != PublisherTrustState::Unknown) {
+            return trk.trust == PublisherTrustState::Trusted;
+        }
+        // Deliberately NOT cached when the answer could not be established. The
+        // engine may exist on a later cycle, and caching Untrusted here would make
+        // a temporary condition permanent for the life of the process.
+        if (imagePath.empty() || !Core::Engine::ScanEngine::HasInstance()) {
+            return false;
+        }
+        try {
+            const auto decision =
+                Core::Engine::ScanEngine::Instance().EvaluatePublisherTrust(imagePath);
+            trk.trust = decision.trusted ? PublisherTrustState::Trusted
+                                         : PublisherTrustState::Untrusted;
+            trk.trustSigner = decision.signerName;
+            return decision.trusted;
+        } catch (...) {
+            return false;
+        }
+    }
 
     struct DriveSpaceSnapshot {
         uint64_t  freeBytes = 0;
@@ -928,6 +1010,7 @@ private:
         std::atomic<uint64_t> processesTracked{0};
         std::atomic<uint64_t> ransomwareAlerts{0};
         std::atomic<uint64_t> fileEnumAlerts{0};
+        std::atomic<uint64_t> fileEnumAlertsSuppressedByTrust{0};
         TimePoint startTime = Clock::now();
 
         void Reset() noexcept {
@@ -936,6 +1019,7 @@ private:
             errorsEncountered = 0;
             processesTracked = 0;
             ransomwareAlerts = 0;
+            fileEnumAlertsSuppressedByTrust = 0;
             fileEnumAlerts   = 0;
             startTime        = Clock::now();
         }
@@ -949,6 +1033,8 @@ private:
             s.ransomwareAlertsTriggered = ransomwareAlerts.load(std::memory_order_relaxed);
             s.fileEnumAlertsTriggered   = fileEnumAlerts.load(std::memory_order_relaxed);
             s.uptimeSeconds = std::chrono::duration<double>(Clock::now() - startTime).count();
+            s.fileEnumAlertsSuppressedByTrust =
+                fileEnumAlertsSuppressedByTrust.load(std::memory_order_relaxed);
             return s;
         }
     };

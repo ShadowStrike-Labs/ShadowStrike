@@ -55,6 +55,8 @@ DEPLOY_HARNESS_PS1_PATH = ROOT / "tools/vm-harness/Invoke-PhantomDeploy.ps1"
 INSTALLER_PRODUCT_WXS_PATH = ROOT / "packaging/installer/Product.wxs"
 EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
+DISK_MONITOR_CPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "Performance" / "DiskMonitor.cpp")
 HOME_IPC_DISPATCHER_CPP_PATH = (
     ROOT / "src/PhantomCore/Service/HomeIpcDispatcher.cpp"
 )
@@ -23466,6 +23468,148 @@ class TelemetryQueueFailureReportingContractTests(unittest.TestCase):
             "at lines " + repr(offenders) + ". Its own comment explains the "
             "consequence: the queue is read again and every event in it is "
             "submitted twice.")
+
+
+class FileEnumerationActorContractTests(unittest.TestCase):
+    """Sustained file enumeration is a real reconnaissance signal, and it means
+    nothing without knowing who is enumerating.
+
+    MEASURED IN 1.0.113: 84 FILE ENUM ALERTs across twelve processes, every one a
+    Windows component whose documented job is walking the file system -
+    SearchIndexer, SearchProtocolHost, CompatTelRunner, mscorsvw, svchost, lsass,
+    taskhostw, wermgr, WerFault, WmiPrvSE, TabTip, and MsMpEng, which is Microsoft
+    Defender's engine. The product was alerting on another antivirus scanning files.
+
+    Every assertion here is scoped to a brace-matched region. A first version
+    searched the whole file for each token, and three of four mutation rounds passed
+    because the tokens survived elsewhere - in the helper definition, in a
+    declaration, or in a reset.
+    """
+
+    def _source(self):
+        return strip_c_comments(read_source(DISK_MONITOR_CPP_PATH))
+
+    def _block_from(self, source, marker, what):
+        """The brace-matched block whose opening line contains marker."""
+        start = source.find(marker)
+        self.assertNotEqual(
+            -1, start,
+            "%s was not found, so this contract is no longer anchored to the "
+            "artifact" % what)
+        open_brace = source.index("{", start)
+        depth = 0
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:index + 1]
+        self.fail("%s is not brace-balanced" % what)
+
+    def _enumeration_alert_block(self):
+        source = self._source()
+        block = self._block_from(source, "if (!trk.fileEnumAlerted) {",
+                                 "the file-enumeration alert block")
+        self.assertIn(
+            "FILE ENUM ALERT", block,
+            "the extracted block does not contain the enumeration alert, so it is "
+            "the wrong region")
+        return block
+
+    def test_the_enumeration_alert_consults_publisher_trust(self):
+        block = self._enumeration_alert_block()
+        self.assertTrue(
+            "IsTrustedPublisherProcess" in block,
+            "the file-enumeration alert fires with no notion of which actor may "
+            "legitimately enumerate files. That produced 84 alerts in 1.0.113 and "
+            "every one was a legitimate Windows component.")
+
+    def test_trust_is_decided_on_the_image_path_never_the_process_name(self):
+        """The property that stops this being an evasion bypass.
+
+        A suppression keyed on the process NAME would be defeated by any binary
+        calling itself svchost.exe.
+        """
+        source = self._source()
+        helper = self._block_from(source, "bool IsTrustedPublisherProcess(",
+                                  "the publisher-trust helper")
+        self.assertTrue(
+            "EvaluatePublisherTrust(imagePath)" in helper,
+            "the trust helper does not evaluate the image PATH. A decision taken on "
+            "the process name would let any binary named svchost.exe suppress its "
+            "own enumeration alert.")
+        self.assertTrue(
+            "processName" not in helper,
+            "the trust helper references the process name, which must play no part "
+            "in the decision")
+
+        capture = source.find("imagePath.assign(")
+        truncate = source.find("find_last_of")
+        self.assertNotEqual(
+            -1, capture, "the full image path is never captured")
+        self.assertLess(
+            capture, truncate,
+            "the image path is captured AFTER the buffer is reduced to the base "
+            "name, so what gets verified is not a path")
+
+    def test_the_ransomware_write_rule_is_not_suppressed_by_trust(self):
+        """Detection integrity: a signed process can still be hijacked.
+
+        The write-rate detector raised ZERO alerts in the 1.0.113 run, so it has no
+        false-positive problem to solve. Extending publisher suppression to it would
+        create a real blind spot - ransomware delivered through a signed, hijacked
+        binary is an established technique.
+
+        The region starts at the CONDITION, not after it: a first version began the
+        slice at the assignment inside the branch, so a mutation that added the
+        trust call to the condition was invisible to it.
+        """
+        source = self._source()
+        block = self._block_from(source, "if (!trk.ransomwareAlerted",
+                                 "the ransomware write-rate branch")
+        self.assertIn(
+            "RANSOMWARE ALERT", block,
+            "the extracted block does not contain the ransomware alert, so it is "
+            "the wrong region")
+        self.assertTrue(
+            "IsTrustedPublisherProcess" not in block,
+            "the ransomware write-rate alert has been gated on publisher trust. It "
+            "raised zero alerts in the field, so there is no false positive to fix, "
+            "and a signed process hijacked into encrypting files must still be "
+            "caught.")
+
+    def test_a_suppressed_enumeration_alert_is_counted(self):
+        block = self._enumeration_alert_block()
+        self.assertTrue(
+            "fileEnumAlertsSuppressedByTrust.fetch_add" in block,
+            "a suppressed enumeration alert is not counted in the alert block, so a "
+            "field run cannot distinguish 'no reconnaissance was observed' from "
+            "'this rule stopped firing'")
+
+    def test_an_undeterminable_trust_verdict_is_not_cached(self):
+        """Otherwise a transient condition becomes permanent.
+
+        The engine may not exist yet on an early monitor cycle. Caching Untrusted at
+        that moment would fix the answer for the life of the process - the alert
+        would keep firing for a trusted process purely because of when it was first
+        sampled.
+        """
+        source = self._source()
+        helper = self._block_from(source, "bool IsTrustedPublisherProcess(",
+                                  "the publisher-trust helper")
+        marker = "!Core::Engine::ScanEngine::HasInstance()"
+        position = helper.find(marker)
+        self.assertNotEqual(
+            -1, position,
+            "the helper does not check whether the scan engine exists before "
+            "calling Instance(), which would CONSTRUCT the engine from a "
+            "performance-monitor thread")
+        early_out = helper[position:position + 120]
+        self.assertTrue(
+            "trk.trust =" not in early_out,
+            "the not-yet-available path caches a trust verdict; a transient "
+            "condition would become permanent for this process")
 
 
 if __name__ == "__main__":

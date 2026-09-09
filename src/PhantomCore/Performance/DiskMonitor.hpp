@@ -265,6 +265,20 @@ struct DiskMonitorModuleStats {
     uint64_t fileEnumAlertsTriggered   = 0;
     double   uptimeSeconds             = 0.0;
 
+    /// @brief File-enumeration alerts withheld because the process carried a
+    ///        verified signature from a publisher this product trusts.
+    ///
+    /// In the 1.0.113 run this population was 84 alerts across twelve processes -
+    /// svchost, SearchIndexer, SearchProtocolHost, lsass, MsMpEng, taskhostw,
+    /// CompatTelRunner, wermgr, WerFault, WmiPrvSE, mscorsvw and TabTip - and every
+    /// one was a legitimate Windows component doing the thing it exists to do.
+    ///
+    /// DECLARED LAST DELIBERATELY. This is a public aggregate and callers
+    /// brace-initialise it positionally; DiskMonitor_Tests.cpp does. Inserting a
+    /// member ahead of uptimeSeconds shifted every following value, so uptimeSeconds
+    /// read 0.0 while this counter absorbed 7.5. Append here, never insert above.
+    uint64_t fileEnumAlertsSuppressedByTrust = 0;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
