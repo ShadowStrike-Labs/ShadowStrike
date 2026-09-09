@@ -3159,6 +3159,50 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
             break;
         }
 
+        // =====================================================================
+        // REGISTRY BEHAVIOURAL ALERT (persistence spray, defense-evasion combos)
+        // =====================================================================
+        //
+        // Bounded on an EXACT size rather than a minimum. This structure has no
+        // variable-length tail, so any other size means the sender and this
+        // reader do not agree about the layout - which is the precise defect
+        // that produced this message class: the alert arrived under
+        // FilterMessageType_RegistryNotify and was parsed as a registry
+        // operation, reporting a value name length of 512 that was really the
+        // low half of a category count. An exact check turns that class of
+        // disagreement into one loud line instead of a plausible-looking
+        // structure full of misaligned fields.
+        //
+        case FilterMessageType_RegistryBehavioralAlert: {
+            if (pAppHeader->DataSize !=
+                sizeof(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT)) {
+                Utils::Logger::Error(
+                    "[IPCManager] RegistryBehavioralAlert size mismatch ({} bytes, "
+                    "expected exactly {}); discarding rather than parsing a "
+                    "structure the sender does not agree with",
+                    pAppHeader->DataSize,
+                    static_cast<uint32_t>(
+                        sizeof(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT)));
+                m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_RegistryBehavioralAlert,
+                                   pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error(
+                        "[IPCManager] RegistryBehavioralAlert handler exception: {}",
+                        e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_RegistryBehavioralAlert);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
         case FilterMessageType_MemoryAlert: {
             // Route to MemoryProtection engine for kernel event processing
             try {
@@ -3682,6 +3726,7 @@ std::string_view GetMessageTypeName(SHADOWSTRIKE_MESSAGE_TYPE type) noexcept {
         case FilterMessageType_HandleAlert:   return "HandleAlert";
         case FilterMessageType_RansomwareAlert: return "RansomwareAlert";
         case FilterMessageType_FileOperationEvent: return "FileOperationEvent";
+        case FilterMessageType_RegistryBehavioralAlert: return "RegistryBehavioralAlert";
         default: return "Unknown";
     }
 }

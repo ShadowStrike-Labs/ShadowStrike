@@ -200,20 +200,19 @@ typedef struct _SHADOWSTRIKE_REGISTRY_MONITOR {
  * Sent via BatchProcessing to user-mode for SOC visibility.
  * Covers multi-persistence spray, defense-evasion combo, and ransomware prep.
  */
-#pragma pack(push, 1)
-typedef struct _REG_BEHAVIORAL_ALERT {
-    ULONG ProcessId;
-    ULONG Score;
-    ULONG PatternFlags;          // Bitmask: 0x1=MultiPersistence, 0x2=DefEvasion+Persist, 0x4=RansomwarePrep
-    ULONG DistinctCategories;
-    ULONG RunKeyMods;
-    ULONG ServiceMods;
-    ULONG IFEOMods;
-    ULONG SecurityPolicyMods;
-    ULONG ThreatIndicators;
-    LARGE_INTEGER Timestamp;
-} REG_BEHAVIORAL_ALERT, *PREG_BEHAVIORAL_ALERT;
-#pragma pack(pop)
+//
+// THE DEFINITION LIVES IN THE SHARED PROTOCOL HEADER, NOT HERE.
+//
+// It used to be declared privately in this file, which made agreement with the
+// service impossible: a structure that crosses the kernel boundary has to be
+// visible to both sides. It was also sent under
+// FilterMessageType_RegistryNotify, so the service parsed these 44 bytes as a
+// SHADOWSTRIKE_REGISTRY_NOTIFICATION and read DistinctCategories where a value
+// name length belongs. See MessageProtocol.h section 1c for the byte arithmetic
+// and the field evidence.
+//
+typedef SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT  REG_BEHAVIORAL_ALERT;
+typedef PSHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT PREG_BEHAVIORAL_ALERT;
 
 #define REG_PATTERN_MULTI_PERSISTENCE     0x1
 #define REG_PATTERN_DEFEVASION_PERSIST    0x2
@@ -268,10 +267,27 @@ RegpSendBehavioralAlert(
     alert.IFEOMods = ProcCtx->IFEOModifications;
     alert.SecurityPolicyMods = ProcCtx->SecurityPolicyModifications;
     alert.ThreatIndicators = ProcCtx->ThreatIndicators;
-    KeQuerySystemTime(&alert.Timestamp);
 
+    //
+    // Written through a local LARGE_INTEGER rather than by casting the packed
+    // INT64 field to PLARGE_INTEGER: the structure is pack(1) and Timestamp sits
+    // at offset 36, so the field is not 8-byte aligned and handing its address
+    // to an API that writes a LARGE_INTEGER would rely on that being tolerated.
+    //
+    {
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+        alert.Timestamp = now.QuadPart;
+    }
+
+    //
+    // ITS OWN MESSAGE TYPE. This used to be sent as
+    // FilterMessageType_RegistryNotify, which describes a single registry
+    // operation and has an entirely different layout, so every frame was
+    // correctly refused by the service. See MessageProtocol.h section 1c.
+    //
     ShadowStrikeBatchSendNotification(
-        (UINT16)FilterMessageType_RegistryNotify,
+        (UINT16)FilterMessageType_RegistryBehavioralAlert,
         &alert,
         sizeof(alert)
     );

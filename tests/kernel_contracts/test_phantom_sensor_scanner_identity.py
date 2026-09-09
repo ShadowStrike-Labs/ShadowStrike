@@ -57,6 +57,9 @@ EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
 DISK_MONITOR_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "Performance" / "DiskMonitor.cpp")
+REGISTRY_CALLBACK_C_PATH = (
+    ROOT / "PhantomSensor" / "PhantomSensor" / "Callbacks" / "Registry" /
+    "RegistryCallback.c")
 HOME_IPC_DISPATCHER_CPP_PATH = (
     ROOT / "src/PhantomCore/Service/HomeIpcDispatcher.cpp"
 )
@@ -23806,6 +23809,90 @@ class RegisterReassignmentDetectionContractTests(unittest.TestCase):
             "the negative test pass for the wrong reason and the positive test "
             "fail for an unrelated one.")
 
+
+class RegistryBehavioralAlertWireContractTests(unittest.TestCase):
+    """A structure that crosses the kernel boundary must be declared where both
+    sides can see it, and must travel under a message type that means what it is.
+
+    MEASURED IN 1.0.113, and the arithmetic is exact. RegpSendBehavioralAlert sent
+    a 44-byte REG_BEHAVIORAL_ALERT - declared PRIVATELY inside RegistryCallback.c -
+    under FilterMessageType_RegistryNotify. The service parses that type as
+    SHADOWSTRIKE_REGISTRY_NOTIFICATION, whose pack(1) header is 4+4+1+2+2+4+4 = 21
+    bytes, so 44 - 21 = 23 bytes remained, matching the logged remaining=23; and
+    ValueNameLength falls on payload bytes 11..12, which is the low half of
+    DistinctCategories, so a value of 2 read as 0x0200 = 512 and 3 read as 768.
+    Both numbers appear verbatim in the log. Twenty-three behavioural alerts were
+    discarded in one six-minute run.
+
+    The compiler already holds the layout through C_ASSERTs on the size and all ten
+    offsets, and two wire-ordinal tests hold the enumerator's position. These cover
+    what neither can see.
+
+    DELIBERATELY ABSENT: a test that the reader keeps refusing malformed
+    RegistryNotify frames. RejectedRegistryFrameIsDiagnosableContractTests
+    already holds exactly that, and mutation round D confirms it - relaxing the
+    valueName bound makes test_every_rejection_still_refuses_the_frame fail. A
+    second copy of one invariant is how two copies of a policy drift apart, so
+    the existing one is cited rather than duplicated.
+    """
+
+    def test_the_alert_structure_is_declared_in_the_shared_protocol_header(self):
+        """The root cause was a wire structure private to its producer."""
+        producer = strip_c_comments(read_source(REGISTRY_CALLBACK_C_PATH))
+        self.assertTrue(
+            "struct _REG_BEHAVIORAL_ALERT" not in producer,
+            "the registry behavioural alert structure has been declared privately "
+            "inside its producer again. A structure that crosses the kernel "
+            "boundary cannot be agreed with unless both sides can see it, and this "
+            "exact arrangement caused 23 discarded alerts in the 1.0.113 run.")
+
+        shared = read_source(MESSAGE_PROTOCOL_H_PATH)
+        self.assertTrue(
+            "SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT" in shared,
+            "the shared definition is missing from the protocol header, so there "
+            "is no agreed layout for this message class")
+
+    def test_the_alert_is_not_sent_as_a_registry_operation(self):
+        """The defect itself, and it would read plausible if reintroduced."""
+        producer = strip_c_comments(read_source(REGISTRY_CALLBACK_C_PATH))
+        sends = [s for s in producer.split(";")
+                 if "ShadowStrikeBatchSendNotification" in s]
+        self.assertTrue(sends, "the alert is no longer sent at all")
+        for send in sends:
+            self.assertTrue(
+                "FilterMessageType_RegistryNotify" not in send,
+                "a registry BEHAVIOURAL alert is being sent as "
+                "FilterMessageType_RegistryNotify, which describes a single "
+                "registry operation and has an entirely different layout. The "
+                "service will parse a category count where a value name length "
+                "belongs and refuse every frame.")
+        self.assertTrue(
+            any("FilterMessageType_RegistryBehavioralAlert" in s for s in sends),
+            "no send uses the behavioural alert's own message type")
+
+    def test_the_reader_bounds_the_alert_on_an_exact_size(self):
+        """This structure has no variable-length tail.
+
+        A minimum-size check would accept a longer frame, and a frame of the wrong
+        length is precisely the signal that the two sides disagree about the
+        layout - which is the defect that created this message class.
+        """
+        source = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        marker = "case FilterMessageType_RegistryBehavioralAlert:"
+        position = source.find(marker)
+        self.assertNotEqual(
+            -1, position,
+            "the service does not handle the registry behavioural alert, so every "
+            "frame reaches the generic path or is dropped")
+        window = source[position:position + 700]
+        self.assertTrue(
+            re.search(r"DataSize\s*!=\s*\r?\n?\s*sizeof\(\s*"
+                      r"SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT\s*\)", window)
+            is not None,
+            "the handler does not reject on an EXACT size. This structure has no "
+            "variable-length tail, so any other length means the sender and the "
+            "reader disagree, and that must be one loud line rather than a "
+            "plausible-looking structure of misaligned fields.")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

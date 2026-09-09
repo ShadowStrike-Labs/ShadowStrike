@@ -197,6 +197,15 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     //
     FilterMessageType_FileOperationEvent,     // Rename/delete evaluated by PreSetInformation
 
+    //
+    // Registry BEHAVIOURAL alert - a score and pattern flags for a process,
+    // not a single registry operation. It exists as its own type because it
+    // was previously sent as FilterMessageType_RegistryNotify while carrying a
+    // completely different structure, so the service parsed a score where a
+    // key path length belongs and correctly refused every frame.
+    //
+    FilterMessageType_RegistryBehavioralAlert, // Registry behaviour score (persistence spray, defense evasion)
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 
@@ -343,7 +352,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
  * @brief Kernel -> user, unsolicited.
  *
  * Says NOTHING about replies - see the note above. Complete as of
- * FilterMessageType_Max == 45.
+ * FilterMessageType_Max == 46.
  */
 #define SHADOWSTRIKE_IS_NOTIFICATION_MESSAGE(type) \
     ((type) == FilterMessageType_ProcessNotify || \
@@ -368,7 +377,8 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
      (type) == FilterMessageType_SyscallAlert || \
      (type) == FilterMessageType_SelfProtectAlert || \
      (type) == FilterMessageType_ThreatScoreNotify || \
-     (type) == FilterMessageType_FileOperationEvent)
+     (type) == FilterMessageType_FileOperationEvent || \
+     (type) == FilterMessageType_RegistryBehavioralAlert)
 
 /**
  * @brief User -> kernel data push.

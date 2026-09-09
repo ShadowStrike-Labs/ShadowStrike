@@ -104,7 +104,7 @@ TEST(IpcStatisticsContractTest, NewMessageTypesAreAppendedNotInserted) {
     // immediately before _Max renumbers every type after it, which silently
     // re-labels whole message classes between a driver and a service built at
     // different times.
-    EXPECT_EQ(static_cast<int>(FilterMessageType_FileOperationEvent) + 1,
+    EXPECT_EQ(static_cast<int>(FilterMessageType_RegistryBehavioralAlert) + 1,
               static_cast<int>(FilterMessageType_Max))
         << "the most recently added type must be the last real enumerator";
 }

@@ -6366,6 +6366,46 @@ public:
                 break;
             }
 
+            case FilterMessageType_RegistryBehavioralAlert: {
+                //
+                // WARN, and unlike the behavioural alert below this line names
+                // what it found, so it can support a diagnosis on its own. The
+                // fields are why this message class exists: a score, which
+                // categories contributed, and the counts behind them.
+                //
+                // Volume is not a concern the way it was for the payload-size
+                // line below: the driver emits this only when a COMBINATION of
+                // registry behaviours crosses a threshold, and the 1.0.113 run
+                // produced 23 of them in six minutes.
+                //
+                if (data && size == sizeof(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT)) {
+                    const auto* alert =
+                        static_cast<const SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT*>(data);
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: registry behaviour alert pid={} score={} "
+                        "patterns=0x{:X} categories={} [run={} service={} ifeo={} "
+                        "policy={}] indicators=0x{:X}",
+                        alert->ProcessId, alert->Score, alert->PatternFlags,
+                        alert->DistinctCategories, alert->RunKeyMods,
+                        alert->ServiceMods, alert->IFEOMods,
+                        alert->SecurityPolicyMods, alert->ThreatIndicators);
+                    // A kernel-side behavioural conviction, made below us, in the
+                    // same class as the behavioural alert handled next.
+                    m_stats.kernelThreatAlerts++;
+                } else {
+                    // Reaching here means the dispatcher's exact-size check and
+                    // this one disagree, which would itself be a defect worth
+                    // seeing rather than silently ignoring.
+                    Utils::Logger::Error(
+                        "RealTimeProtection: registry behaviour alert has "
+                        "unexpected size {} (expected {})",
+                        size,
+                        static_cast<uint32_t>(
+                            sizeof(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT)));
+                }
+                break;
+            }
+
             case FilterMessageType_BehavioralAlert: {
                 //
                 // DEBUG, NOT WARN, AND THE REASON IS THE LINE'S OWN CONTENT.

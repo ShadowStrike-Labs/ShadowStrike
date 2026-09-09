@@ -302,6 +302,69 @@ C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, PathLength)        == FIELD_OFFSET(SHAD
 C_ASSERT(FIELD_OFFSET(FILE_SCAN_REQUEST, ProcessNameLength) == FIELD_OFFSET(SHADOWSTRIKE_FILE_SCAN_REQUEST, ProcessNameLength));
 
 //
+// 1c. Registry Behavioural Alert (FilterMessageType_RegistryBehavioralAlert)
+//
+// A SCORE FOR A PROCESS, not a single registry operation, which is why it is a
+// separate message class from SHADOWSTRIKE_REGISTRY_NOTIFICATION rather than a
+// variant of it. The registry callback accumulates per-process evidence - Run key
+// writes, service creations, Image File Execution Options entries, security
+// policy edits - and emits this once a combination crosses a threshold.
+//
+// THIS STRUCTURE IS HERE BECAUSE ITS ABSENCE CAUSED A WIRE DEFECT, in exactly the
+// way described for FilterMessageType_FileOperationEvent above. It was declared
+// privately inside RegistryCallback.c as REG_BEHAVIORAL_ALERT and sent under
+// FilterMessageType_RegistryNotify, so the service parsed 44 bytes of scoring
+// data as a SHADOWSTRIKE_REGISTRY_NOTIFICATION. That structure's pack(1) header
+// is 4+4+1+2+2+4+4 = 21 bytes, leaving 23, and ValueNameLength falls on payload
+// bytes 11..12 - the low half of DistinctCategories. A DistinctCategories of 2
+// therefore read as a ValueNameLength of 0x0200 = 512, and 3 read as 768. The
+// 1.0.113 field log contains precisely those numbers:
+//
+//   RegistryNotify valueName exceeds buffer: valueNameLength=512 remaining=23
+//   DataSize=44 keyPathLength=0 declaredTotal=512 pid=... op=2
+//
+// The service was right to refuse the frame. The cost was that 23 behavioural
+// alerts in one six-minute run were discarded instead of raised, which is a lost
+// detection signal - persistence spray and defense-evasion combinations are
+// exactly what this alert reports.
+//
+// A structure that crosses the kernel boundary must be declared where BOTH sides
+// can see it. A private definition in the producer cannot be agreed with.
+//
+#pragma pack(push, 1)
+typedef struct _SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT {
+    UINT32 ProcessId;
+    UINT32 Score;               // Accumulated behavioural score for the process
+    UINT32 PatternFlags;        // 0x1 MultiPersistence, 0x2 DefEvasion+Persist,
+                                // 0x4 RansomwarePrep
+    UINT32 DistinctCategories;  // How many distinct categories contributed
+    UINT32 RunKeyMods;          // Run / RunOnce writes
+    UINT32 ServiceMods;         // Service key creations and edits
+    UINT32 IFEOMods;            // Image File Execution Options entries
+    UINT32 SecurityPolicyMods;  // Security policy / Defender policy edits
+    UINT32 ThreatIndicators;    // Accumulated indicator bitmask
+    INT64  Timestamp;           // KeQuerySystemTime, 100ns units since 1601
+} SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, *PSHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT;
+#pragma pack(pop)
+
+//
+// The size and every offset are asserted because this structure's whole purpose
+// is to be the ONE agreed layout. 44 bytes is also the DataSize observed in the
+// field, which ties the definition to the evidence that produced it.
+//
+C_ASSERT(sizeof(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT) == 44);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, ProcessId)          ==  0);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, Score)              ==  4);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, PatternFlags)       ==  8);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, DistinctCategories) == 12);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, RunKeyMods)         == 16);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, ServiceMods)        == 20);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, IFEOMods)           == 24);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, SecurityPolicyMods) == 28);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, ThreatIndicators)   == 32);
+C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_REGISTRY_BEHAVIORAL_ALERT, Timestamp)          == 36);
+
+//
 // 1b. File Operation Event (FilterMessageType_FileOperationEvent)
 //
 // Emitted by the PreSetInformation callback when a rename or delete has been
