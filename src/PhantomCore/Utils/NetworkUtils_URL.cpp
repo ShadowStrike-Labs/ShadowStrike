@@ -82,6 +82,87 @@ namespace ShadowStrike {
 					return htonl(host);
 				}
 
+				// Render a URL for a log line: bounded, control characters escaped,
+				// and any embedded userinfo removed.
+				//
+				// A DIAGNOSTIC THAT NAMES NO SUBJECT CANNOT BE ACTED ON. The 1.0.113
+				// field run recorded 52 identical "WinHttpCrackUrl failed err=12006"
+				// lines in one burst, and because none of them said WHICH string had
+				// failed, the caller responsible could not be identified from the log.
+				//
+				// THREE THINGS MAKE PRINTING THE URL SAFE, and all three are required:
+				//   * userinfo is stripped. A URL may carry user:password@host, and
+				//     credentials must never reach a log sink. NetworkUtils_proxy.cpp
+				//     has a sibling helper for the same reason; it is not reused here
+				//     because it parses a proxy server specification, which is a
+				//     different grammar (semicolon-separated scheme=host pairs).
+				//   * the result is length-bounded. ParseUrl accepts up to 65536
+				//     characters and a log line is not the place for that.
+				//   * control characters are escaped rather than passed through. This
+				//     function is called from the branch that REJECTS control
+				//     characters, so by construction its input may contain CR or LF,
+				//     and writing those raw would let a crafted URL forge log lines.
+				inline std::wstring RedactUrlForLog(std::wstring_view url) noexcept {
+					constexpr size_t kMaxLoggedUrl = 256;
+					std::wstring out;
+					try {
+						// Locate the authority: after "//" if present, up to the next '/'.
+						size_t authorityStart = 0;
+						const size_t slashes = url.find(L"//");
+						if (slashes != std::wstring_view::npos) {
+							authorityStart = slashes + 2;
+						}
+						size_t authorityEnd = url.find(L'/', authorityStart);
+						if (authorityEnd == std::wstring_view::npos) {
+							authorityEnd = url.size();
+						}
+						const std::wstring_view authority =
+							url.substr(authorityStart, authorityEnd - authorityStart);
+						const size_t at = authority.rfind(L'@');
+						
+						out.reserve((std::min)(url.size(), kMaxLoggedUrl) + 16u);
+						if (at == std::wstring_view::npos) {
+							out.assign(url.begin(), url.end());
+						} else {
+							out.assign(url.begin(), url.begin() + authorityStart);
+							out.append(L"<redacted>@");
+							out.append(authority.substr(at + 1));
+							out.append(url.substr(authorityEnd));
+						}
+						
+						// Escape anything that could forge or break a log line.
+						for (wchar_t& ch : out) {
+							if (ch == L'\r' || ch == L'\n' || ch == L'\t' ||
+								(ch > 0 && ch < 0x20)) {
+								ch = L'.';
+							}
+						}
+						
+						if (out.size() > kMaxLoggedUrl) {
+							out.resize(kMaxLoggedUrl);
+							out.append(L"...(truncated)");
+						}
+					} catch (...) {
+						// A diagnostic must never be the thing that throws.
+						return L"<unavailable>";
+					}
+					return out;
+				}
+
+				// Name the WinHTTP URL errors that actually occur, because the number
+				// alone sends the reader to a search engine. 12006 was every one of the
+				// 52 failures in the field run, and its meaning - the scheme is not one
+				// WinHTTP handles - is the whole diagnosis: something is putting
+				// non-http strings through a URL parser.
+				inline const wchar_t* WinHttpUrlErrorName(DWORD code) noexcept {
+					switch (code) {
+					case ERROR_WINHTTP_INVALID_URL:          return L"INVALID_URL";
+					case ERROR_WINHTTP_UNRECOGNIZED_SCHEME:  return L"UNRECOGNIZED_SCHEME";
+					case ERROR_INSUFFICIENT_BUFFER:          return L"INSUFFICIENT_BUFFER";
+					default:                                 return L"see winhttp.h";
+					}
+				}
+
 			} // namespace Internal
 
 
@@ -96,7 +177,9 @@ namespace ShadowStrike {
 					// Input length validation — reject excessively long URLs
 					constexpr size_t MAX_URL_LENGTH = 65536;
 					if (url.empty() || url.size() > MAX_URL_LENGTH) {
-						SS_LOG_ERROR(L"NetworkUtils", L"ParseUrl invalid URL length=%zu", url.size());
+						SS_LOG_ERROR(L"NetworkUtils",
+							L"ParseUrl invalid URL length=%zu: '%ls'",
+							url.size(), Internal::RedactUrlForLog(url).c_str());
 						Internal::SetError(err, ERROR_INVALID_PARAMETER, L"URL empty or exceeds maximum length");
 						return false;
 					}
@@ -109,7 +192,9 @@ namespace ShadowStrike {
 					// likewise enable smuggling into any downstream textual HTTP path.
 					for (wchar_t ch : url) {
 						if (ch == L'\0' || ch == L'\r' || ch == L'\n' || (ch > 0 && ch < 0x20)) {
-							SS_LOG_WARN(L"NetworkUtils", L"ParseUrl rejected URL with control character");
+							SS_LOG_WARN(L"NetworkUtils",
+							L"ParseUrl rejected URL with control character: '%ls'",
+							Internal::RedactUrlForLog(url).c_str());
 							Internal::SetError(err, ERROR_INVALID_PARAMETER,
 								L"URL contains NUL or control characters");
 							return false;
@@ -142,7 +227,10 @@ namespace ShadowStrike {
 					std::wstring urlCopy(url);
 					if (!::WinHttpCrackUrl(urlCopy.c_str(), 0, 0, &urlComp)) {
 						DWORD lastErr = ::GetLastError();
-						SS_LOG_WARN(L"NetworkUtils", L"WinHttpCrackUrl failed err=%lu", lastErr);
+						SS_LOG_WARN(L"NetworkUtils",
+							L"WinHttpCrackUrl failed err=%lu (%ls) for '%ls'",
+							lastErr, Internal::WinHttpUrlErrorName(lastErr),
+							Internal::RedactUrlForLog(url).c_str());
 						Internal::SetError(err, lastErr, L"WinHttpCrackUrl failed");
 						return false;
 					}

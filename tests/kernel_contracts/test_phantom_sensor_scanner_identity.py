@@ -57,6 +57,8 @@ EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
 DISK_MONITOR_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "Performance" / "DiskMonitor.cpp")
+NETWORK_UTILS_URL_CPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "Utils" / "NetworkUtils_URL.cpp")
 SANDBOX_ANALYZER_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "Core" / "Engine" / "SandboxAnalyzer.cpp")
 SANDBOX_ANALYZER_HPP_PATH = (
@@ -24029,6 +24031,116 @@ class SandboxCapabilityGateContractTests(unittest.TestCase):
             "Self-test: task creation failed" in source,
             "the genuine task-creation failure message is gone, so a real fault in "
             "the factory would now be reported as a missing capability")
+
+
+class ParseUrlDiagnosticSubjectContractTests(unittest.TestCase):
+    """A diagnostic that names no subject cannot be acted on, and one that names it
+    carelessly leaks credentials.
+
+    MEASURED IN 1.0.113: 52 lines, byte-for-byte identical, all err=12006, all at
+    08:56:25.107 on thread 5492:
+
+        [WARN] [NetworkUtils] ParseUrl - WinHttpCrackUrl failed err=12006
+
+    12006 is ERROR_WINHTTP_UNRECOGNIZED_SCHEME - the string was not an http or https
+    URL. The failing input was in hand at that line and was not printed, so 52 log
+    lines could not identify the caller putting non-URL strings through a URL parser.
+    That caller is still unidentified, and remains filed, precisely because the log
+    could not say.
+
+    The redaction helper is file-local, so no behaviour test can reach it. These
+    hold its required properties at the source instead.
+    """
+
+    def _source(self):
+        return strip_c_comments(read_source(NETWORK_UTILS_URL_CPP_PATH))
+
+    def _redactor(self):
+        source = self._source()
+        signature = "inline std::wstring RedactUrlForLog("
+        start = source.find(signature)
+        self.assertNotEqual(
+            -1, start,
+            "the URL log redactor is gone, so either the diagnostics no longer name "
+            "their subject or they name it without redacting credentials")
+        opening = source.index("{", start)
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:index + 1]
+        self.fail("RedactUrlForLog is not brace-balanced")
+
+    def test_every_parse_failure_names_the_failing_url(self):
+        source = self._source()
+        self.assertEqual(
+            3, source.count("Internal::RedactUrlForLog(url).c_str())"),
+            "one of ParseUrl's three rejection paths - length, control character, "
+            "or WinHttpCrackUrl - no longer names the URL it rejected. That is what "
+            "made 52 field log lines unactionable.")
+
+    def test_the_logged_url_has_its_credentials_removed(self):
+        """A URL may carry user:password@host and a log sink is permanent."""
+        body = self._redactor()
+        self.assertTrue(
+            '<redacted>@' in body,
+            "the redactor no longer replaces embedded userinfo. A URL may carry "
+            "user:password@host, and writing that to the structured log sink puts "
+            "credentials in a file that outlives the process and is collected for "
+            "diagnostics.")
+        self.assertTrue(
+            "rfind(L'@')" in body,
+            "the redactor does not locate the userinfo separator, so credentials "
+            "would be printed verbatim")
+
+    def test_the_logged_url_is_length_bounded(self):
+        """ParseUrl accepts 65536 characters; a log line must not carry them."""
+        body = self._redactor()
+        self.assertTrue(
+            "kMaxLoggedUrl" in body,
+            "the redactor no longer bounds its output. ParseUrl accepts URLs up to "
+            "65536 characters, and this project has already had two log lines of "
+            "over 300,000 characters from unbounded interpolation.")
+        self.assertTrue(
+            re.search(r"resize\(\s*kMaxLoggedUrl\s*\)", body) is not None,
+            "the bound is declared but never applied to the output")
+
+    def test_control_characters_cannot_forge_a_log_line(self):
+        """This helper is called FROM the control-character rejection path.
+
+        By construction its input may contain CR or LF, so passing them through
+        would let a crafted URL inject fabricated lines into the log.
+        """
+        body = self._redactor()
+        self.assertTrue(
+            re.search(r"ch\s*==\s*L'\\r'", body) is not None and
+            re.search(r"ch\s*==\s*L'\\n'", body) is not None,
+            "the redactor no longer neutralises CR and LF. One of its three callers "
+            "is the branch that rejects control characters, so its input is known to "
+            "contain them, and a crafted URL could forge log lines.")
+
+    def test_the_diagnostic_cannot_become_the_failure(self):
+        body = self._redactor()
+        self.assertTrue(
+            "catch (...)" in body,
+            "the redactor can now propagate an exception. It is called only from "
+            "failure paths inside a noexcept function, so a throwing diagnostic "
+            "would turn a rejected URL into a terminate.")
+
+    def test_the_error_code_is_named_not_just_numbered(self):
+        source = self._source()
+        self.assertTrue(
+            "ERROR_WINHTTP_UNRECOGNIZED_SCHEME" in source,
+            "the WinHTTP URL error codes are no longer translated. Every one of the "
+            "52 field failures was 12006, and its name - the scheme is not one "
+            "WinHTTP handles - is the entire diagnosis.")
+        self.assertTrue(
+            "Internal::WinHttpUrlErrorName(lastErr)" in source,
+            "the crack failure no longer names its error, leaving the reader with a "
+            "bare number")
 
 
 if __name__ == "__main__":
