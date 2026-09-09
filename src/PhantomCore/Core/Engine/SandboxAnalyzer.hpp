@@ -613,6 +613,16 @@ public:
         std::atomic<uint64_t> totalAnalysisTimeSeconds{0};
         std::atomic<uint64_t> timeouts{0};
         std::atomic<uint64_t> failures{0};
+
+        /// @brief Submissions refused because no sandbox VM exists on this host.
+        ///
+        /// Counted separately from `failures` on purpose. A failure means analysis
+        /// was attempted and did not complete; this means it was never attempted,
+        /// because the host has no Hyper-V VM to detonate anything in. Folding the
+        /// two together made a machine with no sandbox at all look like a machine
+        /// whose sandbox kept breaking - the 1.0.113 run recorded 35 "failures"
+        /// that were really 35 refusals.
+        std::atomic<uint64_t> submissionsDeclinedNoSandbox{0};
         TimePoint startTime = Clock::now();
 
         void Reset() noexcept;

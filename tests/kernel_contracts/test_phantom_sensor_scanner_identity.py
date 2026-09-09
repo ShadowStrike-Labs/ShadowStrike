@@ -57,6 +57,10 @@ EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
 DISK_MONITOR_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "Performance" / "DiskMonitor.cpp")
+SANDBOX_ANALYZER_CPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "Core" / "Engine" / "SandboxAnalyzer.cpp")
+SANDBOX_ANALYZER_HPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "Core" / "Engine" / "SandboxAnalyzer.hpp")
 REGISTRY_CALLBACK_C_PATH = (
     ROOT / "PhantomSensor" / "PhantomSensor" / "Callbacks" / "Registry" /
     "RegistryCallback.c")
@@ -23893,6 +23897,139 @@ class RegistryBehavioralAlertWireContractTests(unittest.TestCase):
             "variable-length tail, so any other length means the sender and the "
             "reader disagree, and that must be one loud line rather than a "
             "plausible-looking structure of misaligned fields.")
+
+class SandboxCapabilityGateContractTests(unittest.TestCase):
+    """A capability the host does not have must be declined once, not failed per
+    request.
+
+    MEASURED IN 1.0.113. Initialize logged "No VMs detected - sandbox analysis
+    requires Hyper-V VMs" and then "Detected 0 available VM(s)", completed, and
+    started its worker thread. CreateTask went on to accept 35 submissions and
+    ExecuteTask failed every one at ERROR with "No available VMs for task": 35 INFO
+    creations, 35 INFO executions and 35 ERROR failures, 105 log lines, zero
+    analysis. Worse, those ERRORs read as a sandbox that keeps breaking rather than
+    a host that has none.
+
+    The files submitted were things like ngen.log, prefetch (.pf) files,
+    store.db-journal and the scheduled-task name SvcRestartTask - none of them a
+    detonation candidate - which is a separate defect in the submission criteria and
+    is filed rather than fixed here.
+    """
+
+    def _cpp(self):
+        return strip_c_comments(read_source(SANDBOX_ANALYZER_CPP_PATH))
+
+    def _body(self, source, signature):
+        """The brace-matched body of one function.
+
+        A fixed character window is unsound here: comment stripping shrinks the
+        text unpredictably, and CreateTask is immediately followed by
+        HasSandboxCapability, whose one line contains !m_availableVMs.empty(). A
+        window that overran by a few hundred characters therefore reported a gate
+        that had been removed as still present.
+        """
+        start = source.find(signature)
+        self.assertNotEqual(
+            -1, start, "%s is gone, so this contract is unanchored" % signature)
+        opening = source.index("{", start)
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:index + 1]
+        self.fail("%s is not brace-balanced" % signature)
+
+    def test_submissions_are_declined_when_the_host_has_no_sandbox(self):
+        source = self._cpp()
+        body = self._body(source, "std::string SandboxAnalyzer::Impl::CreateTask(")
+        self.assertTrue(
+            "m_availableVMs.empty()" in body,
+            "task creation no longer checks whether the host has any sandbox VM. "
+            "Without that check every submission is queued and then failed at "
+            "ERROR, which is what produced 105 log lines and no analysis in the "
+            "1.0.113 run.")
+        # The INCREMENT, not the name. The refusal's own log message contains
+        # the counter's name inside a wide string literal, which survives comment
+        # stripping, so a check for the name alone passes even after the increment
+        # has been replaced by something else.
+        self.assertTrue(
+            "m_stats.submissionsDeclinedNoSandbox++" in body,
+            "a declined submission is not counted, so a field run cannot tell "
+            "'nothing was submitted' from 'everything was refused'")
+
+    def test_the_gate_tests_an_absent_capability_not_a_busy_one(self):
+        """These are different states and must stay different.
+
+        An EMPTY VM list means this host cannot do sandbox analysis at all. A null
+        return from FindAvailableVM means every VM is currently busy, which is
+        transient and must still reach ExecuteTask's error path. Gating on the
+        second would silently refuse work a working sandbox could have done.
+        """
+        source = self._cpp()
+        body = self._body(source, "std::string SandboxAnalyzer::Impl::CreateTask(")
+        self.assertTrue(
+            "FindAvailableVM" not in body,
+            "task creation now consults FindAvailableVM, which reports momentary "
+            "VM availability rather than whether the host has a sandbox at all. "
+            "Refusing submissions because every VM is briefly busy discards work a "
+            "working sandbox would have completed.")
+        self.assertTrue(
+            'L"No available VMs for task' in source,
+            "ExecuteTask's error for the transient all-VMs-busy case has been "
+            "removed. The gate covers an absent capability, not a busy one, so "
+            "that path is still reachable and still needs to say so.")
+
+    def test_a_declined_submission_is_not_counted_as_a_failure(self):
+        """Otherwise no sandbox looks identical to a broken sandbox."""
+        hpp = strip_c_comments(read_source(SANDBOX_ANALYZER_HPP_PATH))
+        self.assertTrue(
+            "submissionsDeclinedNoSandbox" in hpp,
+            "the decline counter is not declared in the statistics surface, so it "
+            "cannot be reported")
+
+        source = self._cpp()
+        body = self._body(source, "std::string SandboxAnalyzer::Impl::CreateTask(")
+        self.assertTrue(
+            "m_stats.failures++" not in body,
+            "a refused submission is being counted as a failure. A failure means "
+            "analysis was attempted and did not finish; this was never attempted, "
+            "and folding them together made 35 refusals look like 35 breakages.")
+
+    def test_the_explanation_is_given_once_not_per_submission(self):
+        source = self._cpp()
+        body = self._body(source, "std::string SandboxAnalyzer::Impl::CreateTask(")
+        # The CONDITION inside the factory, not the member declaration, which
+        # survives anywhere in the translation unit.
+        self.assertTrue(
+            "if (!m_noSandboxDeclineExplained) {" in body,
+            "the reason for declining is not rate-limited, so a host with no "
+            "sandbox will emit one line per submission - which is the log volume "
+            "this change exists to remove")
+
+    def test_the_self_test_says_which_reason_it_failed_for(self):
+        """A missing capability and a broken task factory are not the same thing.
+
+        The self-test still returns false either way, because a component that can
+        analyse nothing has not passed anything - reporting success there would be
+        the same dishonesty as a module claiming healthy while protecting nothing.
+        """
+        source = self._cpp()
+        body = self._body(source, "bool SandboxAnalyzer::SelfTest() noexcept")
+        # The CALL inside SelfTest, not the accessor's declaration or definition,
+        # both of which survive elsewhere in the file.
+        self.assertTrue(
+            "!m_impl->HasSandboxCapability()" in body,
+            "the self-test cannot distinguish an absent sandbox from a fault in "
+            "task creation, so its failure sends the reader looking in the wrong "
+            "place")
+        self.assertTrue(
+            "Self-test: task creation failed" in source,
+            "the genuine task-creation failure message is gone, so a real fault in "
+            "the factory would now be reported as a missing capability")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -469,6 +469,12 @@ namespace ShadowStrike::Core::Engine {
 
         std::vector<VMInstance> m_availableVMs;
 
+        /// @brief Whether the "no sandbox on this host" refusal has been explained.
+        ///
+        /// The explanation is worth one line, not one per submission. Guarded by
+        /// m_mutex, which every writer already holds.
+        bool m_noSandboxDeclineExplained = false;
+
         /// @brief MITRE ATT&CK technique mapping
         const std::unordered_map<std::string, std::string> m_mitreTechniques = {
             {"T1055", "Process Injection"},
@@ -541,6 +547,7 @@ namespace ShadowStrike::Core::Engine {
         [[nodiscard]] std::string CreateTask(const fs::path& filePath,
                                              const SandboxAnalysisOptions& options,
                                              bool enqueue = true) noexcept;
+        [[nodiscard]] bool HasSandboxCapability() const noexcept;
         [[nodiscard]] AnalysisTask* GetTask(const std::string& taskId) noexcept;
         void ProcessTaskQueue() noexcept;
         [[nodiscard]] bool ExecuteTask(AnalysisTask* task) noexcept;
@@ -1713,6 +1720,44 @@ namespace ShadowStrike::Core::Engine {
         try {
             std::unique_lock lock(m_mutex);
 
+            // DECLINE AT THE GATE WHEN THERE IS NO SANDBOX TO RUN IN.
+            //
+            // Initialize already discovers this and says so: it logs "No VMs
+            // detected - sandbox analysis requires Hyper-V VMs" and then
+            // "Detected 0 available VM(s)". Accepting work afterwards cannot
+            // produce analysis - it produces one INFO creation, one INFO
+            // execution and one ERROR failure per submission. The 1.0.113 field
+            // run did exactly that 35 times, 105 log lines for nothing, and the
+            // ERRORs read as a sandbox that keeps breaking rather than a host
+            // that has no sandbox.
+            //
+            // NO ANALYSIS IS LOST, because none was happening. On a host that
+            // does have VMs this branch is never taken and behaviour is
+            // unchanged. The refusal is counted so the absence stays visible,
+            // and it is counted SEPARATELY from failures so the two states are
+            // distinguishable.
+            //
+            // This is deliberately a check on m_availableVMs being EMPTY, not on
+            // FindAvailableVM returning null. Those mean different things: empty
+            // is "this host cannot do sandbox analysis", null is "every VM is
+            // busy right now", and the second is transient and must still reach
+            // ExecuteTask's error path rather than being refused here.
+            if (m_availableVMs.empty()) {
+                m_stats.submissionsDeclinedNoSandbox++;
+                if (!m_noSandboxDeclineExplained) {
+                    m_noSandboxDeclineExplained = true;
+                    SS_LOG_WARN(kLogCat,
+                        L"No sandbox VM is present on this host, so analysis "
+                        L"submissions are being declined rather than queued and "
+                        L"failed. Sandbox analysis requires a configured Hyper-V "
+                        L"VM; every other detection stage is unaffected. This is "
+                        L"reported once - see submissionsDeclinedNoSandbox for the "
+                        L"running count. First declined file: '%ls'",
+                        filePath.filename().wstring().c_str());
+                }
+                return "";
+            }
+
             const std::string taskId = std::format("task-{:08d}",
                 m_nextTaskId.fetch_add(1, std::memory_order_relaxed));
 
@@ -1742,6 +1787,11 @@ namespace ShadowStrike::Core::Engine {
             SS_LOG_ERROR(kLogCat, L"Exception during task creation");
             return "";
         }
+    }
+
+    bool SandboxAnalyzer::Impl::HasSandboxCapability() const noexcept {
+        std::shared_lock lock(m_mutex);
+        return !m_availableVMs.empty();
     }
 
     SandboxAnalyzer::Impl::AnalysisTask* SandboxAnalyzer::Impl::GetTask(const std::string& taskId) noexcept {
@@ -2422,6 +2472,7 @@ namespace ShadowStrike::Core::Engine {
         totalAnalysisTimeSeconds = 0;
         timeouts = 0;
         failures = 0;
+        submissionsDeclinedNoSandbox = 0;
         startTime = Clock::now();
     }
 
@@ -2436,7 +2487,23 @@ namespace ShadowStrike::Core::Engine {
             opts.timeoutSeconds = 5;
             const std::string testTaskId = m_impl->CreateTask(L"__selftest__.exe", opts);
             if (testTaskId.empty()) {
-                SS_LOG_ERROR(kLogCat, L"Self-test: task creation failed");
+                // SAY WHICH OF THE TWO REASONS IT WAS.
+                //
+                // A host with no Hyper-V VM now declines task creation, and
+                // reporting that as "task creation failed" would send whoever
+                // reads it looking for a defect in the task factory. The result
+                // is still false either way: a component that cannot analyse
+                // anything has not passed a self-test, and returning true here
+                // would be the same dishonesty as a module reporting healthy
+                // while protecting nothing.
+                if (!m_impl->HasSandboxCapability()) {
+                    SS_LOG_ERROR(kLogCat,
+                        L"Self-test: no sandbox VM on this host, so no analysis "
+                        L"task can be created. This is a missing capability, not "
+                        L"a fault in task creation.");
+                } else {
+                    SS_LOG_ERROR(kLogCat, L"Self-test: task creation failed");
+                }
                 return false;
             }
 
