@@ -23282,5 +23282,118 @@ class QuarantineRestoreInvalidationContractTests(unittest.TestCase):
             "so a failed restore would still clear a verdict that still applies")
 
 
+class DefenseEvasionValueQualificationContractTests(unittest.TestCase):
+    """The defense-evasion registry rule must decide on the VALUE, not the key alone.
+
+    MEASURED IN 1.0.113: this one rule produced 257 warning lines - 26 percent of
+    every warning in the run - across 95 distinct key/value pairs, and not one of
+    them could disable a protection. They were Windows Defender writing its own
+    operational state: InitializingComponentProgress 33 times, SignatureUpdatePending,
+    EngineVersion, AVSignatureVersion, and Features\\Controls with numeric value
+    names.
+
+    These tests exist as much to stop the WRONG fix as the defect. Silencing this
+    noise by deleting a key from the watch set would remove real coverage of MITRE
+    T1562.001, so the watch set and the impairing-value set are both pinned.
+    """
+
+    def _rule_region(self):
+        source = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        start = source.find("kDefenseEvasionKeys[]")
+        self.assertNotEqual(
+            -1, start,
+            "the defense-evasion rule was not found, so this contract is no longer "
+            "anchored to the artifact")
+        # to the end of the loop that consumes the key list
+        end = source.find("PrivilegeEscalationDetector", start)
+        self.assertNotEqual(
+            -1, end, "the end of the defense-evasion region could not be located")
+        return source[start:end]
+
+    def test_the_rule_qualifies_on_the_value_written(self):
+        region = self._rule_region()
+        self.assertTrue(
+            "kProtectionImpairingValues" in region,
+            "the defense-evasion rule does not consult the value being written. "
+            "Matching the key prefix alone reports Windows Defender maintaining its "
+            "own configuration as MITRE T1562.001 - 257 lines of it in the 1.0.113 "
+            "run.")
+        # The list existing is not enough. A first version of this test asserted
+        # only that, and a mutation which emptied the lowered value name - leaving
+        # the list untouched - passed. Assert the value is DERIVED from the event
+        # and COMPARED against the list.
+        self.assertTrue(
+            "ToLowerW(valueName)" in region,
+            "the rule does not derive the value name from the registry event, so "
+            "whatever it compares against the impairing list is not the value that "
+            "was written")
+        self.assertTrue(
+            re.search(r"lowerValueName\s*==\s*\w+", region) is not None,
+            "the rule never compares the written value against the "
+            "protection-impairing list, so the qualification has no effect")
+
+    def test_the_watched_key_set_has_not_been_narrowed(self):
+        """The anti-weakening assertion, and the reason these tests exist.
+
+        Deleting a key from the watch set would silence the noise and remove real
+        coverage. Every family that was watched must still be watched.
+        """
+        region = self._rule_region()
+        required_keys = [
+            "policies\\\\microsoft\\\\windows defender",   # administrative disabling
+            # NOT "microsoft\\windows defender" - that is a substring of the
+            # policies key above, so a mutation deleting this entry would still
+            # satisfy it. The "software\\" prefix distinguishes them.
+            "software\\\\microsoft\\\\windows defender",     # operational key
+            "sharedaccess\\\\parameters\\\\firewallpolicy",  # firewall
+            "currentversion\\\\policies\\\\system",         # UAC
+        ]
+        for key in required_keys:
+            self.assertTrue(
+                key in region,
+                "the watched key '%s' has been removed from the defense-evasion "
+                "rule. Narrowing the watch set is not an acceptable way to reduce "
+                "false positives - qualify on the value instead." % key)
+
+    def test_the_impairing_value_set_covers_the_real_techniques(self):
+        """A value-qualified rule with an empty or token value set detects nothing.
+
+        Each required value below turns a protection off or carves a hole in one, so
+        each must remain. Role-based rather than an exact count, so the list can grow.
+        """
+        region = self._rule_region()
+        required_values = {
+            "disableantispyware": "Defender master switch",
+            "disablerealtimemonitoring": "real-time protection switch",
+            "disablebehaviormonitoring": "behaviour monitoring switch",
+            "tamperprotection": "tamper protection, the precondition for the rest",
+            "spynetreporting": "cloud reporting",
+            "enablefirewall": "firewall switch",
+            "enablelua": "UAC switch",
+            "exclusions": "exclusion paths - evasion without disabling anything",
+        }
+        for value, why in required_values.items():
+            self.assertTrue(
+                value in region,
+                "the defense-evasion rule no longer covers '%s' (%s). A rule that "
+                "qualifies on the value but omits the values that matter detects "
+                "nothing." % (value, why))
+
+    def test_a_non_impairing_write_is_counted_rather_than_silently_dropped(self):
+        region = self._rule_region()
+        self.assertTrue(
+            "defenderOperationalWritesIgnored" in region,
+            "writes that are not protection-impairing are dropped without being "
+            "counted, so a field run cannot distinguish 'no tampering occurred' "
+            "from 'this rule never ran'")
+
+    def test_the_ignored_write_counter_is_reported(self):
+        source = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        self.assertTrue(
+            "defenderOperationalWritesIgnored={}" in source,
+            "the ignored-write counter is not emitted in the capacity report, so "
+            "the volume this rule is suppressing is invisible")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

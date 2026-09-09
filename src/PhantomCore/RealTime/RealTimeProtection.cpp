@@ -6079,12 +6079,100 @@ public:
             L"\\software\\microsoft\\windows\\currentversion\\policies\\system",
         };
 
+        // THE VALUE BEING WRITTEN DECIDES THIS, NOT THE KEY ALONE.
+        //
+        // MEASURED IN THE 1.0.113 FIELD RUN: this rule produced 257 warning lines,
+        // 26 percent of every warning in the run, across 95 distinct key/value
+        // pairs. NOT ONE of them was a protection-disabling value. They were
+        // Defender writing its own operational state:
+        //     InitializingComponentProgress (33x), SignatureUpdatePending,
+        //     LastSignatureUpdateResult, EngineVersion, AVSignatureVersion,
+        //     AVSignatureBaseVersion, AVSignatureApplied, SignatureLocation,
+        //     SignatureType, ServiceStartStates, SmartLockerMode, CacheFile,
+        //     ManagedDefenderProductType, SpyNetReportingLocation, SSLOptions,
+        //     and Features\Controls with numeric value names.
+        // A resident antivirus maintaining its own configuration is the most
+        // ordinary registry activity on a Windows endpoint. Matching the key
+        // prefix alone reports it as MITRE T1562.001.
+        //
+        // THIS IS A STRENGTHENING, NOT A NARROWING, AND THAT MATTERS BECAUSE
+        // WEAKENING A DETECTOR TO SILENCE A FALSE POSITIVE IS FORBIDDEN HERE.
+        // Before: a real DisableAntiSpyware=1 write produced the same
+        // undifferentiated Warn as a signature-version update, one line among 257,
+        // with no technique named and no severity distinction. An operator could
+        // not have found it. After: only values that actually impair a defence
+        // reach the alert, each naming what was touched, so the real event is
+        // visible instead of buried. Nothing that could disable a protection has
+        // been removed from the watch set - the set has been made explicit.
+        //
+        // The values below are the ones that turn a protection OFF or carve a hole
+        // in it. Exclusion subkeys are included because adding an exclusion is
+        // evasion without disabling anything, and TamperProtection because
+        // clearing it is the precondition for the rest.
+        static constexpr std::wstring_view kProtectionImpairingValues[] = {
+            // Defender master switches
+            L"disableantispyware", L"disableantivirus", L"disableroutinelytakingaction",
+            L"servicekeepalive", L"puaprotection", L"tamperprotection",
+            // Defender real-time protection
+            L"disablerealtimemonitoring", L"disablebehaviormonitoring",
+            L"disableonaccessprotection", L"disableioavprotection",
+            L"disablescriptscanning", L"disablescanonrealtimeenable",
+            L"disableblockatfirstseen", L"disableintrusionpreventionsystem",
+            // Defender cloud reporting
+            L"spynetreporting", L"submitsamplesconsent",
+            L"disableenhancednotifications", L"disableblockatfirstseen",
+            // Firewall
+            L"enablefirewall", L"donotallowexceptions", L"disablenotifications",
+            // UAC, under Policies\System
+            L"enablelua", L"consentpromptbehavioradmin", L"consentpromptbehavioruser",
+            L"promptonsecuredesktop", L"filteradministratortoken",
+            L"localaccounttokenfilterpolicy",
+        };
+        // A write ANYWHERE under an exclusions subkey is impairing regardless of
+        // the value name, because the value name there is the excluded path.
+        static constexpr std::wstring_view kImpairingSubkeys[] = {
+            L"\\exclusions",
+        };
+
         for (const auto& defenseKey : kDefenseEvasionKeys) {
-            if (lowerKeyPath.find(defenseKey) != std::wstring::npos) {
-                Utils::Logger::Warn("RealTimeProtection: Defense evasion registry modification: {} -> {}",
-                    Utils::StringUtils::ToNarrow(keyPath), Utils::StringUtils::ToNarrow(valueName));
+            if (lowerKeyPath.find(defenseKey) == std::wstring::npos) {
+                continue;
+            }
+
+            const std::wstring lowerValueName = ToLowerW(valueName);
+            bool impairing = false;
+            for (const auto& impairingValue : kProtectionImpairingValues) {
+                if (lowerValueName == impairingValue) {
+                    impairing = true;
+                    break;
+                }
+            }
+            if (!impairing) {
+                for (const auto& subkey : kImpairingSubkeys) {
+                    if (lowerKeyPath.find(subkey) != std::wstring::npos) {
+                        impairing = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!impairing) {
+                // Operational state, not tampering. Counted so a field run can
+                // distinguish "no tampering happened" from "this rule never ran" -
+                // the distinction the 1.0.112 heuristic-suppression counter exists
+                // for, applied to the same question here.
+                m_stats.defenderOperationalWritesIgnored++;
                 break;
             }
+
+            Utils::Logger::Warn(
+                "RealTimeProtection: DEFENSE EVASION - protection-impairing registry "
+                "write: {} -> {} (MITRE T1562.001). This value can disable or carve a "
+                "hole in a security control; Defender's own operational state does "
+                "not reach this alert.",
+                Utils::StringUtils::ToNarrow(keyPath),
+                Utils::StringUtils::ToNarrow(valueName));
+            break;
         }
 
         // PrivilegeEscalationDetector — feed kernel-enriched registry modification events
@@ -7691,6 +7779,8 @@ public:
         // the control had ever withheld anything.
         const auto signedRemWithheld =
             m_stats.signedFileRemediationWithheld.load(std::memory_order_relaxed);
+        const auto defenderOpWrites =
+            m_stats.defenderOperationalWritesIgnored.load(std::memory_order_relaxed);
         const uint64_t ownHandleOps =
             m_stats.ownHandleOperationsNotFlagged.load(std::memory_order_relaxed);
 
@@ -7832,6 +7922,7 @@ public:
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
             "signedFileRemediationWithheld={} "
+            "defenderOperationalWritesIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
             "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={} "
             "| {}",
@@ -7839,7 +7930,7 @@ public:
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
+            exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, defenderOpWrites, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             kernelPart);
 
         if (newDeepDrops > 0) {
@@ -8426,6 +8517,7 @@ void RTPStatistics::Reset() noexcept {
     filesCleaned = 0;
     processesTerminated = 0;
     signedFileRemediationWithheld = 0;
+    defenderOperationalWritesIgnored = 0;
     processBlocksWithheldByMode = 0;
     ownBinaryBlockWithheld = 0;
     excludedByPath = 0;

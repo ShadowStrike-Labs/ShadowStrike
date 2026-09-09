@@ -976,6 +976,15 @@ struct alignas(64) RTPStatistics {
     /// System32\urlmon.dll.
     std::atomic<uint64_t> signedFileRemediationWithheld{ 0 };
 
+    /// @brief Registry writes under a watched security key whose VALUE does not
+    ///        impair any protection, so they were not reported as defense evasion.
+    ///
+    /// Reported so a field run can tell "no tampering occurred" from "the rule
+    /// never ran". In the 1.0.113 run, before value qualification existed, this
+    /// population was 257 log lines - 26 percent of every warning - and every one
+    /// of them was Windows Defender maintaining its own configuration.
+    std::atomic<uint64_t> defenderOperationalWritesIgnored{ 0 };
+
     /// Times a process-creation BLOCK was withheld because the configured
     /// protection mode is below BLOCK_SUSPICIOUS and the evidence was inferential
     /// (the OR of the five evasion detectors, which is a score with no named
