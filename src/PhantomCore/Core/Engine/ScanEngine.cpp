@@ -5503,6 +5503,23 @@ std::string ScanEngine::Stats::ToJson() const {
     return oss.str();
 }
 
+ScanEngine::PublisherTrustDecision ScanEngine::EvaluatePublisherTrust(
+    const std::wstring& filePath) const {
+    // Delegation, deliberately trivial. The policy lives in exactly one place -
+    // Impl::EvaluatePublisherTrust - and both the heuristic suppression inside
+    // this engine and RealTimeProtection's remediation guard reach it through
+    // here. See the header for what "trusted" means and why this is public.
+    PublisherTrustDecision decision{};
+    if (!m_impl) {
+        return decision;
+    }
+    const auto internal = m_impl->EvaluatePublisherTrust(filePath);
+    decision.trusted = internal.suppress;
+    decision.signerName = internal.signerName;
+    decision.basis = internal.basis;
+    return decision;
+}
+
 ScanEngine::Stats ScanEngine::GetStatistics() const {
     if (!m_impl) return Stats{};
 

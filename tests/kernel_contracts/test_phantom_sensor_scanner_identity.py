@@ -23069,5 +23069,130 @@ class ScriptConvictionTrustContractTests(unittest.TestCase):
             "tell whether this control ran at all")
 
 
+class RemediationTrustBreadthContractTests(unittest.TestCase):
+    """The guard that decides whether a detected file may be DELETED.
+
+    It was added after the 1.0.93 run, where fourteen detections were all
+    Microsoft or OneDrive binaries and remediation of urlmon.dll was attempted
+    five times; its own comment records that the endpoint survived only because
+    the file was in use and the quarantine failed.
+
+    It then failed in 1.0.113 for a different reason. It classified the detection
+    as inference correctly and asked only whether the file was MICROSOFT-signed.
+    VMware Tools' svtminion.ps1 is VMware-signed, so the guard let the deletion
+    proceed and the endpoint came up to a gray screen. VMware, NVIDIA, Intel,
+    Adobe, Google, Dell and Lenovo were all already in this product's own
+    whitelist; the guard could not see any of them.
+    """
+
+    def _guard_body(self):
+        source = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        marker = "bool MayRemediateDetectedFile("
+        start = source.find(marker)
+        self.assertNotEqual(
+            -1, start,
+            "MayRemediateDetectedFile was not found, so this contract is no "
+            "longer anchored to the artifact")
+        open_brace = source.index("{", start)
+        depth = 0
+        end = -1
+        for index in range(open_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        self.assertNotEqual(-1, end, "the guard body is not brace-balanced")
+        body = source[start:end]
+        self.assertTrue(
+            "signedFileRemediationWithheld" in body,
+            "the guard no longer counts a withheld remediation, so this contract "
+            "is anchored to the wrong function")
+        return body
+
+    def test_trust_is_not_decided_by_a_microsoft_signature_alone(self):
+        body = self._guard_body()
+
+        self.assertTrue(
+            "IsMicrosoftSigned" not in body,
+            "MayRemediateDetectedFile decides publisher trust with "
+            "IsMicrosoftSigned, which recognises exactly one vendor. Every other "
+            "publisher in this product's own whitelist - VMware, NVIDIA, Intel, "
+            "Adobe, Google, Dell, Lenovo and more - would have its validly signed "
+            "files deleted on an inferential verdict.")
+        self.assertTrue(
+            "EvaluatePublisherTrust" in body,
+            "MayRemediateDetectedFile does not consult the shared publisher-trust "
+            "policy, so it is deciding trust some other way")
+
+    def test_an_identification_is_still_checked_before_any_trust_lookup(self):
+        """Ordering, not mere presence.
+
+        An identification - a hash, shipped signature or threat-intel match - must
+        never be withheld by this control and must never pay for a signature
+        verification. A Microsoft-signed binary matching a malware hash IS the
+        stolen-certificate case, which is exactly when remediation must proceed.
+        """
+        body = self._guard_body()
+        identifies = body.find("DetectionIdentifiesRatherThanInfers")
+        trust = body.find("EvaluatePublisherTrust")
+        self.assertNotEqual(
+            -1, identifies,
+            "the identification test is gone from the remediation guard, so an "
+            "identification could now be withheld by a publisher signature")
+        self.assertNotEqual(-1, trust, "the trust lookup is gone")
+        self.assertLess(
+            identifies, trust,
+            "the remediation guard performs a publisher-trust lookup before "
+            "testing whether the detection was an identification. An "
+            "identification must short-circuit first.")
+
+    def test_the_publisher_trust_policy_has_exactly_one_implementation(self):
+        """The codebase's own instruction, honoured.
+
+        DetectionIdentifiesRatherThanInfers delegates to a public policy function
+        with the comment: "Two copies of a security policy is how the two YARA
+        metadata builders and the two on-disk trie producers in this codebase
+        drifted apart, with the worse one being the one that ran." The publisher
+        trust decision must not acquire a second copy either.
+        """
+        engine = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        rtp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+
+        # The Impl policy is the single implementation.
+        impl = engine.count("TrustSuppression EvaluatePublisherTrust(")
+        self.assertEqual(
+            1, impl,
+            "expected exactly one Impl-level publisher-trust implementation in "
+            "ScanEngine.cpp; found %d" % impl)
+
+        # RealTimeProtection must CALL it, never reimplement it. A reimplementation
+        # would have to consult the whitelist store or the stolen-cert database
+        # itself, so those are what to look for.
+        for forbidden in ("IsPublisherWhitelisted", "CheckStolenCertificate"):
+            self.assertTrue(
+                forbidden not in rtp,
+                "RealTimeProtection.cpp calls %s directly, which means the "
+                "publisher-trust policy has been reimplemented there instead of "
+                "delegating to ScanEngine::EvaluatePublisherTrust" % forbidden)
+
+    def test_a_withheld_remediation_is_reported(self):
+        """signedFileRemediationWithheld was incremented, reset, and never read.
+
+        A control whose effect is invisible cannot be shown to have run, which is
+        the same defect class as the eleven other counters in this codebase that
+        were computed and discarded.
+        """
+        source = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        # assertTrue, not assertIn: assertIn embeds its haystack in the standard
+        # message and the haystack here is the whole 322 KB translation unit.
+        self.assertTrue(
+            "signedFileRemediationWithheld={}" in source,
+            "the withheld-remediation counter is not emitted in the capacity "
+            "report, so no field run can show whether this control ever fired")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

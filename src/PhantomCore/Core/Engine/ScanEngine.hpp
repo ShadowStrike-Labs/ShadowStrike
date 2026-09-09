@@ -652,6 +652,41 @@ public:
     [[nodiscard]] static ScanEngine& Instance();
 
     /**
+     * @brief Whether a file carries a verified signature from a publisher this
+     *        product trusts, and on what basis.
+     *
+     * PUBLIC ON PURPOSE, for the same reason DetectionSourceIdentifiesThreat is
+     * public and static: this is a safety-critical policy, and a policy that
+     * cannot be read or tested from outside the class is a policy nobody can
+     * verify. It is also the ONLY implementation - RealTimeProtection's
+     * remediation guard calls this rather than carrying its own copy, because two
+     * copies of a security policy is how the two YARA metadata builders and the
+     * two on-disk trie producers in this codebase drifted apart, with the worse
+     * one being the one that ran.
+     *
+     * WHAT "TRUSTED" MEANS HERE, precisely, because the answer governs whether a
+     * file gets deleted:
+     *   - a Microsoft signature, or a verified signature whose signer appears in
+     *     the whitelist store's publisher list, and
+     *   - the signer is NOT in the stolen-certificate database.
+     * A signer in that database is never trusted, which is what keeps the
+     * stolen-certificate and supply-chain cases convicting.
+     *
+     * FAILS CLOSED: if no signature validator is available, or the file carries no
+     * verified signature, trusted is false. Callers must decide what a false means
+     * for them - for heuristic suppression it means the detection stands, and for
+     * remediation it means the destructive action proceeds.
+     */
+    struct PublisherTrustDecision {
+        bool trusted = false;          ///< A verified signature from a trusted publisher.
+        std::wstring signerName;       ///< The signer, for the audit trail. May be empty.
+        const char* basis = "";        ///< Why it was trusted, for the log. Never null.
+    };
+
+    [[nodiscard]] PublisherTrustDecision EvaluatePublisherTrust(
+        const std::wstring& filePath) const;
+
+    /**
      * @brief Initialize the engine and connect to all subsystems.
      * @param config Configuration parameters.
      * @return True if all critical databases loaded successfully.

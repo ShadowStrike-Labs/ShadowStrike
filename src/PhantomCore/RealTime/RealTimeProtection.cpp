@@ -3138,44 +3138,71 @@ public:
             return true;
         }
 
+        // THIS CHECK USED TO BE IsMicrosoftSigned AND NOTHING ELSE, AND THAT COST
+        // AN ENDPOINT. In the 1.0.113 field run a generic script heuristic scored
+        // VMware Tools' svtminion.ps1 at 100, this guard classified the detection
+        // as inference correctly, then asked only whether the file was
+        // MICROSOFT-signed. It was not - it was VMware-signed - so the guard
+        // returned true, the file was quarantined and deleted, and the machine
+        // came up to a gray screen because VMware Tools owns its display path.
+        //
+        // "VMware, Inc." was already in our own whitelist. So were NVIDIA, Intel,
+        // Adobe, Google, Dell, Lenovo and sixteen others. The guard simply could
+        // not see any of them.
+        //
+        // ONE IMPLEMENTATION, NOT A SECOND COPY. The policy is
+        // ScanEngine::EvaluatePublisherTrust, which is also what the engine's own
+        // heuristic suppression uses. Duplicating it here is exactly the mistake
+        // DetectionIdentifiesRatherThanInfers' comment warns about. That policy
+        // refuses to trust a signer in the stolen-certificate database, so the
+        // stolen-cert and supply-chain cases keep remediating.
+        //
         // SAFE TO BLOCK HERE. This runs on the deferred deep-scan thread, which
         // owes the kernel nothing -- nothing is waiting on it, which is the whole
         // reason the deep scan was deferred to it. The 180-second cross-process
         // stall this codebase has hit repeatedly only occurs when a thread
         // holding a kernel file operation open calls into CryptSvc. That is not
-        // this thread. Calling the cache-only accessor instead would be wrong
-        // here: an undetermined verdict would silently become "not signed" and
-        // this control would fail open exactly when it matters.
-        bool osSigned = false;
+        // this thread. The policy performs a full verification rather than a
+        // cache-only lookup for the same reason as before: an undetermined verdict
+        // silently becoming "not signed" would make this control fail open exactly
+        // when it matters.
+        Core::Engine::ScanEngine::PublisherTrustDecision trust{};
         try {
-            osSigned = Security::DigitalSignatureValidator::Instance()
-                           .IsMicrosoftSigned(filePath);
+            trust = Core::Engine::ScanEngine::Instance()
+                        .EvaluatePublisherTrust(filePath);
         } catch (...) {
-            // A verification we could not complete must not be read as "this is
-            // not an operating-system file". Leaving osSigned false would do
+            // A verification we could not complete must not be read as "this file
+            // has no trusted publisher". Leaving trust.trusted false would do
             // exactly that, so the failure is reported and remediation proceeds
             // as it did before this control existed -- which is the pre-existing
-            // behaviour, not a new risk.
+            // behaviour, not a new risk. Deliberately UNCHANGED from the
+            // Microsoft-only version: widening which publishers are recognised is
+            // this commit's business; changing what an undeterminable signature
+            // means is a separate policy decision.
             Utils::Logger::Warn(
-                "RealTimeProtection: signature check threw while deciding whether to "
-                "remediate {} - proceeding with remediation as before",
+                "RealTimeProtection: publisher trust check threw while deciding "
+                "whether to remediate {} - proceeding with remediation as before",
                 Utils::StringUtils::ToNarrow(filePath));
             return true;
         }
 
-        if (!osSigned) {
+        if (!trust.trusted) {
             return true;
         }
 
         m_stats.signedFileRemediationWithheld++;
         Utils::Logger::Warn(
-            "RealTimeProtection: WITHHELD remediation of Microsoft-signed file {} - "
-            "detection was inferential (source='{}', threat='{}', confidence={:.1f}, "
-            "score={:.1f}, severity={}). The detection stands and is reported; the "
-            "file is NOT quarantined. Quarantining an operating-system binary on a "
-            "heuristic score alone risks breaking the endpoint. An identification "
-            "(hash, signature or threat-intel match) would still remediate.",
+            "RealTimeProtection: WITHHELD remediation of {} - signed by '{}' ({}), "
+            "and the detection was inferential (source='{}', threat='{}', "
+            "confidence={:.1f}, score={:.1f}, severity={}). The detection stands and "
+            "is reported; the file is NOT quarantined. Deleting a validly signed "
+            "vendor's file on a heuristic score risks breaking the endpoint, which "
+            "is what happened to VMware Tools in 1.0.113. An identification (hash, "
+            "signature or threat-intel match) would still remediate, and a signer in "
+            "the stolen-certificate database is never trusted here.",
             Utils::StringUtils::ToNarrow(filePath),
+            Utils::StringUtils::ToNarrow(trust.signerName),
+            trust.basis,
             result.detectionSource,
             result.threatName,
             result.confidence,
@@ -7658,6 +7685,12 @@ public:
         // published anywhere, so it could only ever be read with a debugger.
         const uint64_t ownBinWithheld =
             m_stats.ownBinaryBlockWithheld.load(std::memory_order_relaxed);
+        // Reported because this is the observable for the remediation guard. It
+        // was incremented and reset and NEVER READ - the twelfth counter in this
+        // codebase computed and discarded - so no field run could show whether
+        // the control had ever withheld anything.
+        const auto signedRemWithheld =
+            m_stats.signedFileRemediationWithheld.load(std::memory_order_relaxed);
         const uint64_t ownHandleOps =
             m_stats.ownHandleOperationsNotFlagged.load(std::memory_order_relaxed);
 
@@ -7798,6 +7831,7 @@ public:
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
+            "signedFileRemediationWithheld={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
             "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={} "
             "| {}",
@@ -7805,7 +7839,7 @@ public:
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, ownBinWithheld, ownHandleOps, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
+            exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             kernelPart);
 
         if (newDeepDrops > 0) {
