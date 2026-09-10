@@ -57,6 +57,9 @@ EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
 DISK_MONITOR_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "Performance" / "DiskMonitor.cpp")
+USB_SCANNER_CPP_PATH = (
+    ROOT / "src" / "Products" / "Community" / "PhantomHome" /
+    "USB_Protection" / "USBScanner.cpp")
 NETWORK_UTILS_URL_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "Utils" / "NetworkUtils_URL.cpp")
 SANDBOX_ANALYZER_CPP_PATH = (
@@ -24381,6 +24384,144 @@ class VanishedFileClassificationContractTests(unittest.TestCase):
             "m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);" in block,
             "ExecutableAnalyzer stopped counting files it could not examine, so "
             "lowering the log level would make them disappear entirely")
+
+
+class UsbDetectionStoreContractTests(unittest.TestCase):
+    """Removable media is the one path where a user physically introduces unknown
+    content, so its detection layers must actually be open.
+
+    MEASURED (task 223): USBScanner declared HashStore, PatternStore and
+    SignatureStore as members and never initialised any of them. IsInitialized() was
+    false forever, the three scan phases were skipped on every file of every stick,
+    and the startup warnings were not premature - they were permanently true and
+    could not say why.
+    """
+
+    def _init_region(self):
+        """The detection-store block only.
+
+        Impl::Initialize legitimately returns false when the thread pool fails, so a
+        test about store failures must not see the whole function.
+        """
+        source = strip_c_comments(read_source(USB_SCANNER_CPP_PATH))
+        opening = "const std::wstring signatureDbPath ="
+        closing = "m_status = ScannerModuleStatus::Running;"
+        self.assertEqual(
+            1, source.count(opening),
+            "the detection-store initialisation block is gone or duplicated")
+        self.assertEqual(
+            1, source.count(closing),
+            "the end marker of the initialisation block is no longer unique, so this "
+            "region cannot be sliced safely")
+        return source[source.index(opening):source.index(closing)]
+
+    def _declared_stores(self):
+        """DERIVED from the member declarations, never hard-coded here.
+
+        If a fourth store is added and left uninitialised, this list grows and the
+        first test fails - which is the whole point.
+        """
+        source = strip_c_comments(read_source(USB_SCANNER_CPP_PATH))
+        stores = re.findall(
+            r"(?m)^\s*(?:HashStore|PatternStore|SignatureStore)::\w+\s+(m_\w+);",
+            source)
+        self.assertTrue(
+            stores, "no detection-store members found; the declarations moved")
+        return stores
+
+    def test_every_declared_store_is_initialised(self):
+        region = self._init_region()
+        for member in self._declared_stores():
+            self.assertTrue(
+                "%s.Initialize(" % member in region,
+                "%s is declared but never initialised, so its detection layer is "
+                "dead on every removable device, permanently" % member)
+
+    def test_the_database_is_the_shared_one_not_a_local_filename(self):
+        """A store opened against an invented filename is a store that is never open.
+
+        MaliciousDownloadBlocker.cpp:786 does exactly that - it initialises a
+        HashStore against <quarantineDir>\\malware_hashes.db, a name DataStorePaths
+        does not own and nothing creates - so its hash layer is dead for this same
+        reason. This test exists so USBScanner cannot acquire that defect.
+        """
+        region = self._init_region()
+        self.assertTrue(
+            "Utils::DataStorePaths::SignatureDatabase()" in region,
+            "the USB stores no longer open the shared signature database")
+        invented = re.findall(r'L"[^"]*\.(?:db|sdb|hdb|dat)"', region)
+        self.assertEqual(
+            [], invented,
+            "a database filename is hard-coded here (%s). Paths belong to "
+            "DataStorePaths, which owns creation and hardening; a local literal is "
+            "how MaliciousDownloadBlocker's hash layer ended up permanently "
+            "empty." % invented)
+
+    def test_the_stores_are_opened_read_only(self):
+        region = self._init_region()
+        calls = re.findall(r"m_\w+\.Initialize\(\s*signatureDbPath\s*,\s*(\w+)\s*\)",
+                           region)
+        self.assertTrue(calls, "no store Initialize call matches the expected shape")
+        for value in calls:
+            self.assertEqual(
+                "true", value,
+                "a USB detection store is opened for WRITING. These stores are "
+                "shared with ScanEngine and the scanner has no reason to modify "
+                "detection content.")
+
+    def test_a_store_failure_never_fails_the_module(self):
+        """One dead layer must not remove the other two, or the heuristics.
+
+        ScanEngine.cpp:665 states the same rule for the engine: a missing or
+        unreadable signature database must not take the whole thing down.
+        """
+        region = self._init_region()
+        self.assertTrue(
+            "return false;" not in region,
+            "a detection-store failure now aborts USBScanner::Initialize. A missing "
+            "database would disable USB scanning entirely instead of disabling one "
+            "layer.")
+
+    def test_no_initialize_result_is_discarded(self):
+        """Initialize is [[nodiscard]] on all three stores.
+
+        Relational, not an absolute count: every Initialize call must have a
+        corresponding IsSuccess() check, whatever the number of stores.
+        """
+        region = self._init_region()
+        initialises = len(re.findall(r"m_\w+\.Initialize\(", region))
+        checked = len(re.findall(r"\.IsSuccess\(\)", region))
+        self.assertEqual(
+            initialises, checked,
+            "%d store Initialize calls but %d IsSuccess checks. A discarded "
+            "[[nodiscard]] result here means a store that failed to open is treated "
+            "as though it opened." % (initialises, checked))
+
+    def test_the_scan_time_guards_survive(self):
+        """What makes a failed layer degrade instead of crash."""
+        source = strip_c_comments(read_source(USB_SCANNER_CPP_PATH))
+        for member in self._declared_stores():
+            self.assertTrue(
+                "if (%s.IsInitialized()) {" % member in source,
+                "the scan path no longer checks whether %s opened before querying "
+                "it" % member)
+
+    def test_a_signature_id_is_converted_not_assigned_raw(self):
+        """DetectedThreat::signatureId is std::string; the source is uint64_t.
+
+        A bare assignment picks std::string::operator=(char) and stores ONE byte of
+        the id, which ToJson then writes into the threat report. These three sites
+        sit inside the store guards, so they were unreachable until the stores were
+        opened - the defect became observable and this change made it so.
+        """
+        source = strip_c_comments(read_source(USB_SCANNER_CPP_PATH))
+        self.assertTrue(
+            "threat.signatureId = det.signatureId;" not in source,
+            "a uint64_t signature id is assigned straight into a std::string field "
+            "again. That stores one byte of the id and puts it in the threat report.")
+        self.assertEqual(
+            3, source.count("threat.signatureId = std::to_string(det.signatureId);"),
+            "the three threat mappings no longer all convert the signature id")
 
 
 if __name__ == "__main__":

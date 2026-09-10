@@ -49,6 +49,7 @@
 #include "PhantomCore/Utils/FileUtils.hpp"
 #include "PhantomCore/Utils/HashUtils.hpp"
 #include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/DataStorePaths.hpp"
 #include "PhantomCore/HashStore/HashStore.hpp"
 #include "PhantomCore/PatternStore/PatternStore.hpp"
 #include "PhantomCore/SignatureStore/SignatureStore.hpp"
@@ -313,19 +314,80 @@ public:
             return false;
         }
 
-        // Log detection layer readiness
-        if (!m_hashStore.IsInitialized()) {
+        // ---- Detection stores: open the shared signature database read-only --
+        //
+        // MEASURED (task 223): these three stores were declared as members and
+        // never initialised. IsInitialized() was therefore false forever, all
+        // three scan phases below were skipped on every file, and removable
+        // media - the one path where a user physically introduces unknown
+        // content - had no hash, no YARA and no pattern detection at all.
+        //
+        // Read-only, against the same database ScanEngine opens. Each store is
+        // independent: a failure disables THAT LAYER ONLY and never the module,
+        // following ScanEngine.cpp:665, where a missing signature database
+        // deliberately does not take the whole engine down. Initialize is
+        // [[nodiscard]] on all three and every result is checked.
+        const std::wstring signatureDbPath =
+            Utils::DataStorePaths::SignatureDatabase();
+
+        // StoreError::message is documented as deliberately empty when the error
+        // came from the FromWin32 factory, so the numeric code and the Win32
+        // error are reported too. A warning that prints an empty parenthesis is
+        // the same failure as the three warnings this block replaced.
+        const auto hashStoreError = m_hashStore.Initialize(signatureDbPath, true);
+        if (!hashStoreError.IsSuccess()) {
             SS_LOG_WARN(LOG_CATEGORY,
-                L"HashStore not initialized — hash-based detection layer disabled");
+                L"HashStore init failed (code=%d win32=%lu %hs) for %ls - "
+                L"USB hash detection is DISABLED",
+                static_cast<int>(hashStoreError.code), hashStoreError.win32Error,
+                hashStoreError.message.empty() ? "no detail"
+                                              : hashStoreError.message.c_str(),
+                signatureDbPath.c_str());
         }
-        if (!m_signatureStore.IsInitialized()) {
+
+        const auto patternStoreError =
+            m_patternStore.Initialize(signatureDbPath, true);
+        if (!patternStoreError.IsSuccess()) {
             SS_LOG_WARN(LOG_CATEGORY,
-                L"SignatureStore not initialized — YARA detection layer disabled");
+                L"PatternStore init failed (code=%d win32=%lu %hs) for %ls - "
+                L"USB pattern detection is DISABLED",
+                static_cast<int>(patternStoreError.code), patternStoreError.win32Error,
+                patternStoreError.message.empty() ? "no detail"
+                                                 : patternStoreError.message.c_str(),
+                signatureDbPath.c_str());
         }
-        if (!m_patternStore.IsInitialized()) {
+
+        // YARA ONLY. SignatureStore is a composite that opens its own internal
+        // HashStore and PatternStore against the same path, but the scan path
+        // sets enableHashLookup=false and enablePatternScan=false because the
+        // two standalone stores above own those layers. Without these toggles
+        // initialisation would map signatures.sdb twice more for components
+        // that are never queried.
+        m_signatureStore.SetHashStoreEnabled(false);
+        m_signatureStore.SetPatternStoreEnabled(false);
+        m_signatureStore.SetYaraStoreEnabled(true);
+        const auto signatureStoreError =
+            m_signatureStore.Initialize(signatureDbPath, true);
+        if (!signatureStoreError.IsSuccess()) {
             SS_LOG_WARN(LOG_CATEGORY,
-                L"PatternStore not initialized — pattern detection layer disabled");
+                L"SignatureStore init failed (code=%d win32=%lu %hs) for %ls - "
+                L"USB YARA detection is DISABLED",
+                static_cast<int>(signatureStoreError.code),
+                signatureStoreError.win32Error,
+                signatureStoreError.message.empty() ? "no detail"
+                                                   : signatureStoreError.message.c_str(),
+                signatureDbPath.c_str());
         }
+
+        // One line an operator can read: which layers are actually live, and
+        // which database answered. The three warnings this replaced could not
+        // distinguish a store that was never wired up from a missing database.
+        SS_LOG_INFO(LOG_CATEGORY,
+            L"USB detection layers: hash=%ls yara=%ls pattern=%ls (database: %ls)",
+            m_hashStore.IsInitialized() ? L"on" : L"off",
+            m_signatureStore.IsInitialized() ? L"on" : L"off",
+            m_patternStore.IsInitialized() ? L"on" : L"off",
+            signatureDbPath.c_str());
 
         m_status = ScannerModuleStatus::Running;
 
@@ -610,7 +672,10 @@ public:
                 DetectedThreat threat;
                 threat.type        = DetectionType::HashMatch;
                 threat.threatName  = det.signatureName;
-                threat.signatureId = det.signatureId;
+                // std::string field, uint64_t source. A bare assignment picks
+                // operator=(char) and stores one byte of the id (C4244), which
+                // ToJson then writes into the threat report verbatim.
+                threat.signatureId = std::to_string(det.signatureId);
                 threat.riskScore   = ThreatLevelToRiskScore(det.threatLevel);
                 threat.confidence  = 100;
                 threat.details     = det.description;
@@ -639,7 +704,10 @@ public:
                 DetectedThreat threat;
                 threat.type        = DetectionType::YARAMatch;
                 threat.threatName  = det.signatureName;
-                threat.signatureId = det.signatureId;
+                // std::string field, uint64_t source. A bare assignment picks
+                // operator=(char) and stores one byte of the id (C4244), which
+                // ToJson then writes into the threat report verbatim.
+                threat.signatureId = std::to_string(det.signatureId);
                 threat.riskScore   = ThreatLevelToRiskScore(det.threatLevel);
                 threat.confidence  = 95;
                 threat.details     = det.description;
@@ -671,7 +739,10 @@ public:
                 DetectedThreat threat;
                 threat.type        = DetectionType::SignatureMatch;
                 threat.threatName  = det.signatureName;
-                threat.signatureId = det.signatureId;
+                // std::string field, uint64_t source. A bare assignment picks
+                // operator=(char) and stores one byte of the id (C4244), which
+                // ToJson then writes into the threat report verbatim.
+                threat.signatureId = std::to_string(det.signatureId);
                 threat.riskScore   = ThreatLevelToRiskScore(det.threatLevel);
                 threat.confidence  = 90;
                 threat.details     = det.description;
