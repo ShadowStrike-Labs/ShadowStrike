@@ -740,4 +740,50 @@
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true" />
   </Target>
+  <!--
+    Put the VENDORED googletest DLLs beside the test executable, matching the CRT.
+
+    WHY THIS EXISTS. gtest.lib and gmock.lib above are IMPORT libraries, so the DLLs
+    must be present at run time. MSBuild reaps them from $(OutDir) as stale outputs
+    that no project produces, and restoring them by hand is how a DEBUG-CRT pair
+    reached a RELEASE test binary: phantom-tests.exe imports MSVCP140.dll while the
+    copies tracked in build\ import ucrtbased.dll and MSVCP140D.dll. That gives two
+    heaps and two incompatible sets of std:: layouts, and because gtest registers
+    every test through a dynamic initialiser that passes std::string across the DLL
+    boundary, the process died with 0xC0000005 before main and printed NOTHING at all,
+    even when asked only to list its tests. A green suite became a silent crash with
+    no source change.
+
+    THE FOLDERS ARE NAMED BY CRT FLAVOUR, NOT BY CONFIGURATION, for two reasons. The
+    flavour is the property that actually has to match, and .gitignore excludes any
+    directory called Release or Debug, so a per-configuration folder could never be
+    committed and a clean checkout would silently have nothing to copy.
+
+    THERE IS DELIBERATELY NO FALLBACK. A configuration this mapping does not cover
+    leaves GoogleTestCrtFlavour empty, the condition fails, nothing is copied, and the
+    run fails loudly with a missing DLL. A default would quietly deploy the wrong CRT,
+    which is the defect above.
+
+    IT RUNS AFTER Build, NOT AFTER Link. MSBuild skips Link when nothing needs
+    relinking, which is exactly the state in which the DLLs have been reaped and need
+    replacing. Measured: with AfterTargets="Link", a rebuild after deleting both DLLs
+    restored neither and still reported success.
+
+    NOTE. build\gtest.dll and build\gmock.dll are DEBUG builds. They are the wrong
+    source for a Release output and must not be copied there by hand; this target
+    exists so nobody has to.
+  -->
+  <PropertyGroup>
+    <GoogleTestCrtFlavour Condition="'$(Configuration)' == 'Release'">release-crt</GoogleTestCrtFlavour>
+    <GoogleTestCrtFlavour Condition="'$(Configuration)' == 'Debug'">debug-crt</GoogleTestCrtFlavour>
+  </PropertyGroup>
+  <Target Name="DeployGoogleTest" AfterTargets="Build"
+          Condition="'$(GoogleTestCrtFlavour)' != '' And Exists('$(SolutionDir)vendor\gtest_framework\lib\$(GoogleTestCrtFlavour)\gtest.dll')">
+    <ItemGroup>
+      <GoogleTestBinaries Include="$(SolutionDir)vendor\gtest_framework\lib\$(GoogleTestCrtFlavour)\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GoogleTestBinaries)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

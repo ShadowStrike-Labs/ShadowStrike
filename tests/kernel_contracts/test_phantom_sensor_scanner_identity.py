@@ -53,6 +53,9 @@ FILE_PROTECTION_HPP_PATH = ROOT / "src" / "PhantomCore" / "SelfProtection" / "Fi
 INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
 DEPLOY_HARNESS_PS1_PATH = ROOT / "tools/vm-harness/Invoke-PhantomDeploy.ps1"
 INSTALLER_PRODUCT_WXS_PATH = ROOT / "packaging/installer/Product.wxs"
+PHANTOM_TESTS_VCXPROJ_PATH = ROOT / "PhantomTests.vcxproj"
+GTEST_VENDOR_DLL_DIR = (
+    ROOT / "vendor" / "gtest_framework" / "lib")
 EVENT_PUSH_CPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.cpp"
 EVENT_PUSH_HPP_PATH = ROOT / "src/PhantomCore/Service/EventPush.hpp"
 DISK_MONITOR_CPP_PATH = (
@@ -24522,6 +24525,129 @@ class UsbDetectionStoreContractTests(unittest.TestCase):
         self.assertEqual(
             3, source.count("threat.signatureId = std::to_string(det.signatureId);"),
             "the three threat mappings no longer all convert the signature id")
+
+
+class TestRuntimeDependencyContractTests(unittest.TestCase):
+    """The test binary's runtime DLLs must match its CRT, and the build must supply
+    them rather than a human.
+
+    MEASURED 2026-09-10. phantom-tests.exe is a RELEASE binary. Every gtest.dll and
+    gmock.dll in this repository, including the git-tracked build\\gtest.dll, was a
+    DEBUG build importing ucrtbased.dll and MSVCP140D.dll. MSBuild reaps these DLLs
+    from the output directory as stale outputs no project produces, and restoring them
+    by hand from build\\ put the debug pair beside a release binary. That gives two
+    heaps and two incompatible sets of std:: layouts, and since gtest registers every
+    test through a dynamic initialiser that passes std::string across the DLL boundary,
+    the process died with 0xC0000005 during initialisation, before main, printing
+    nothing at all. A suite that had been green became a silent crash with no source
+    change.
+
+    The CRT flavour is read from the PE import names directly. Only full, distinctive
+    names are used: "VCRUNTIME140D.dll" does not contain "VCRUNTIME140.dll", so the two
+    cannot be confused as byte sequences. This method was cross-checked against
+    dumpbin /DEPENDENTS on all four vendored files and agreed on every one.
+    """
+
+    DEBUG_CRT_IMPORTS = (b"ucrtbased.dll", b"MSVCP140D.dll", b"VCRUNTIME140D.dll")
+    RELEASE_CRT_IMPORTS = (b"VCRUNTIME140.dll",)
+
+    def _dlls(self, flavour):
+        folder = GTEST_VENDOR_DLL_DIR / flavour
+        self.assertTrue(
+            folder.is_dir(),
+            "vendor/gtest_framework/lib/%s is gone, so the build has nothing to copy "
+            "and the reaped DLLs come back from wherever a human last put them"
+            % flavour)
+        found = sorted(p for p in folder.glob("*.dll"))
+        self.assertTrue(found, "no vendored DLLs in %s" % folder)
+        return found
+
+    def _debug_imports(self, path):
+        blob = path.read_bytes()
+        return [n.decode() for n in self.DEBUG_CRT_IMPORTS if n in blob]
+
+    def test_the_project_file_is_well_formed_xml(self):
+        """Catches the whole MSB4025 class, not just one instance of it.
+
+        An XML comment may not contain a double hyphen. Writing one into this file
+        made MSBuild refuse to LOAD the project, which fails every target in it rather
+        than just the new one - a build that reports failure with no compiler error.
+        """
+        import xml.etree.ElementTree as ET
+        try:
+            ET.parse(str(PHANTOM_TESTS_VCXPROJ_PATH))
+        except ET.ParseError as exc:
+            self.fail("PhantomTests.vcxproj is not well-formed XML (%s). MSBuild "
+                      "cannot load it, so every build of the test project fails "
+                      "before compiling anything." % exc)
+
+    def test_the_vendored_release_dlls_are_release_crt(self):
+        for path in self._dlls("release-crt"):
+            debug = self._debug_imports(path)
+            self.assertEqual(
+                [], debug,
+                "%s imports the DEBUG CRT (%s) but sits in the Release folder. "
+                "Deploying it beside the release test binary reproduces the "
+                "0xC0000005-before-main crash exactly." % (path.name, debug))
+            self.assertTrue(
+                any(n in path.read_bytes() for n in self.RELEASE_CRT_IMPORTS),
+                "%s imports neither CRT flavour recognisably; the check can no "
+                "longer tell them apart" % path.name)
+
+    def test_the_vendored_debug_dlls_are_debug_crt(self):
+        """Anti-vacuity, and a swap detector.
+
+        If both folders held release DLLs the test above would pass while a Debug test
+        run was broken, and the two folders would be pointless.
+        """
+        for path in self._dlls("debug-crt"):
+            self.assertTrue(
+                self._debug_imports(path),
+                "%s sits in the Debug folder but does not import the debug CRT, so "
+                "either the folders are swapped or both hold the same pair"
+                % path.name)
+
+    def test_the_deploy_target_runs_after_build_not_after_link(self):
+        """MSBuild skips Link when nothing needs relinking.
+
+        A target hanging off Link does not run on an up-to-date project - which is
+        exactly the state in which the DLLs have been reaped and need replacing.
+        Measured: with AfterTargets="Link", a rebuild after deleting both DLLs
+        restored neither and still reported success.
+        """
+        text = read_source(PHANTOM_TESTS_VCXPROJ_PATH)
+        start = text.find('<Target Name="DeployGoogleTest"')
+        self.assertNotEqual(
+            -1, start,
+            "the target that supplies the test DLLs is gone; they revert to being a "
+            "manual artefact a clean checkout cannot reproduce")
+        end = text.index("</Target>", start)
+        region = text[start:end]
+        self.assertTrue(
+            'AfterTargets="Build"' in region,
+            "DeployGoogleTest no longer runs after Build. If it hangs off Link it "
+            "will not run when the project is up to date, which is when the DLLs are "
+            "missing.")
+
+    def test_the_deploy_target_selects_dlls_by_configuration(self):
+        """The flavour must follow the configuration.
+
+        One shared source folder cannot serve both: a release binary needs the release
+        pair and a debug binary needs the debug pair. Copying the wrong one is the
+        original defect.
+        """
+        text = read_source(PHANTOM_TESTS_VCXPROJ_PATH)
+        start = text.find('<Target Name="DeployGoogleTest"')
+        self.assertNotEqual(-1, start, "DeployGoogleTest is gone")
+        end = text.index("</Target>", start)
+        region = text[start:end]
+        self.assertTrue(
+            r"lib\$(GoogleTestCrtFlavour)\gtest.dll" in region,
+            "the Exists condition no longer selects the DLLs by CRT flavour")
+        self.assertTrue(
+            r"lib\$(GoogleTestCrtFlavour)\*.dll" in region,
+            "the copy no longer selects the DLLs by CRT flavour, so one flavour "
+            "would be deployed into both")
 
 
 if __name__ == "__main__":
