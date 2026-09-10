@@ -566,35 +566,64 @@ struct ModelCache::Impl {
         try {
             Utils::JSON::Json doc;
 
-            Utils::JSON::Set(doc, "model_type",
-                Utils::StringUtils::ToNarrow(kSlotNames[idx]));
+            // EVERY Set RESULT IS CHECKED. Utils::JSON::Set is [[nodiscard]] bool and
+            // documented to return false on a type mismatch or other error. All six
+            // results here were discarded, so a manifest missing a field - including
+            // sha256, and including the previous_sha256 that the comment below says
+            // Rollback needs after a restart - was written and reported as success.
+            //
+            // The first failing field is remembered rather than the last, because it is
+            // the one that explains the rest.
+            const char* failedField = nullptr;
+            const auto setField = [&doc, &failedField](const char* field, auto&& value) {
+                if (failedField != nullptr) {
+                    return;
+                }
+                if (!Utils::JSON::Set(doc, field,
+                        std::forward<decltype(value)>(value))) {
+                    failedField = field;
+                }
+            };
+
+            setField("model_type", Utils::StringUtils::ToNarrow(kSlotNames[idx]));
 
             Utils::JSON::Json ver;
             ver["major"] = s.version.major;
             ver["minor"] = s.version.minor;
             ver["patch"] = s.version.patch;
-            Utils::JSON::Set(doc, "version", ver);
+            setField("version", ver);
 
-            Utils::JSON::Set(doc, "sha256",
-                Utils::StringUtils::ToNarrow(s.currentHash));
+            setField("sha256", Utils::StringUtils::ToNarrow(s.currentHash));
 
             // Persist the previous-model hash so Rollback can verify
             // integrity of previous.onnx after a process restart. Absent
             // entries are intentional (no rollback target available).
             if (s.hasPrevious && !s.previousHash.empty()) {
-                Utils::JSON::Set(doc, "previous_sha256",
+                setField("previous_sha256",
                     Utils::StringUtils::ToNarrow(s.previousHash));
             }
 
-            Utils::JSON::Set(doc, "trained_at",
+            setField("trained_at",
                 Utils::StringUtils::ToNarrow(
                     FormatIso8601(s.version.trainedAt)));
 
             // File size
             std::error_code ec;
             const auto sz = std::filesystem::file_size(s.currentModel, ec);
-            Utils::JSON::Set(doc, "file_size",
-                ec ? static_cast<uint64_t>(0) : sz);
+            setField("file_size", ec ? static_cast<uint64_t>(0) : sz);
+
+            // FAIL CLOSED, and this is the safe direction rather than the cautious one.
+            // SaveToFile below uses atomicReplace, so declining to write leaves the
+            // previous COMPLETE manifest in place. Writing one without sha256 would
+            // replace a verifiable record with an unverifiable one, in the component
+            // whose purpose is verifying model integrity.
+            if (failedField != nullptr) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Manifest for slot '%ls' could not be populated (field '%hs'); "
+                    L"refusing to replace a complete manifest with a partial one",
+                    kSlotNames[idx], failedField);
+                return false;
+            }
 
             Utils::JSON::SaveOptions saveOpt;
             saveOpt.pretty = true;
@@ -723,7 +752,16 @@ bool ModelCache::Initialize(const std::filesystem::path& cacheDir) noexcept {
                         }
                         else {
                             s.version.modelHash = s.currentHash;
-                            m_impl->SaveManifest(i);
+                            if (!m_impl->SaveManifest(i)) {
+                                // Same policy as SwapModel and DownloadModel: the rollback itself
+                                // succeeded, so it is not undone for a manifest write failure. But
+                                // the record is now stale, and on the next start the manifest still
+                                // describes the model that was just replaced.
+                                SS_LOG_WARN(kLogCategory,
+                                    L"Rolled back slot '%ls' but the manifest did not persist; "
+                                    L"the recorded hash still describes the replaced model",
+                                    kSlotNames[i]);
+                            }
                             SS_LOG_INFO(kLogCategory,
                                 L"Rolled back slot '%ls' to previous model",
                                 kSlotNames[i]);
@@ -749,7 +787,13 @@ bool ModelCache::Initialize(const std::filesystem::path& cacheDir) noexcept {
                             s.hasPrevious = false;
                             if (ComputeFileSha256Hex(s.currentModel, s.currentHash)) {
                                 s.version.modelHash = s.currentHash;
-                                m_impl->SaveManifest(i);
+                                if (!m_impl->SaveManifest(i)) {
+                                    SS_LOG_WARN(kLogCategory,
+                                        L"Integrity rollback for slot '%ls' did not persist to the "
+                                        L"manifest; the recorded hash still describes the model that "
+                                        L"failed verification",
+                                        kSlotNames[i]);
+                                }
                                 SS_LOG_INFO(kLogCategory,
                                     L"Integrity rollback succeeded for slot '%ls'",
                                     kSlotNames[i]);
@@ -1105,7 +1149,20 @@ bool ModelCache::Rollback(CortexModelType type) noexcept {
             return false;
         }
 
-        m_impl->SaveManifest(idx);
+        if (!m_impl->SaveManifest(idx)) {
+            // The rollback is durable on disk - the files were renamed and the
+            // hash reverified - so it is not reported as a failure, matching
+            // SwapModel and DownloadModel. The consequence is specific and worth
+            // naming: on the next start the manifest still describes the model
+            // this call replaced, VerifySlotIntegrity will compare the current
+            // file against that stale hash and fail, and hasPrevious is already
+            // false, so there is no second rollback available and the slot will
+            // be disabled.
+            SS_LOG_WARN(kLogCategory,
+                L"Rollback for slot '%ls' did not persist to the manifest; the "
+                L"slot is likely to be disabled on the next start",
+                kSlotNames[idx]);
+        }
 
         SS_LOG_INFO(kLogCategory,
             L"Rollback succeeded for slot '%ls': sha256=%ls",

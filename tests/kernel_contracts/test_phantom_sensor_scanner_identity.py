@@ -53,6 +53,7 @@ FILE_PROTECTION_HPP_PATH = ROOT / "src" / "PhantomCore" / "SelfProtection" / "Fi
 INSTALLER_COMPONENTS_WXS_PATH = ROOT / "packaging/installer/Components.wxs"
 DEPLOY_HARNESS_PS1_PATH = ROOT / "tools/vm-harness/Invoke-PhantomDeploy.ps1"
 INSTALLER_PRODUCT_WXS_PATH = ROOT / "packaging/installer/Product.wxs"
+MODEL_CACHE_CPP_PATH = ROOT / "src" / "PhantomCore" / "AI" / "ModelCache.cpp"
 PHANTOM_TESTS_VCXPROJ_PATH = ROOT / "PhantomTests.vcxproj"
 GTEST_VENDOR_DLL_DIR = (
     ROOT / "vendor" / "gtest_framework" / "lib")
@@ -24754,6 +24755,121 @@ class EmulationInputMemoryContractTests(unittest.TestCase):
             "stage08's emulation cap has changed. That alters what the emulator sees "
             "and must be argued as a detection change, not slipped in with a memory "
             "fix.")
+
+
+class ModelManifestIntegrityContractTests(unittest.TestCase):
+    """The record of which model is installed decides whether it can be verified.
+
+    MEASURED: ModelCache.cpp produced 18 C4834 warnings, which are nine sites listed
+    twice. Six were Utils::JSON::Set results discarded inside SaveManifest, which is
+    [[nodiscard]] bool and documented to return false on error - so a manifest written
+    WITHOUT its sha256 field returned true. Three were SaveManifest results discarded
+    at call sites that then logged success; the worst is in the public Rollback, which
+    returned true and logged "Rollback succeeded" even when nothing persisted.
+
+    This is the same defect class as the TelemetryCollector discards fixed in b777b08a,
+    where the ignored result decided whether the offline queue was deleted and every
+    event in it was resubmitted.
+    """
+
+    def _save_manifest(self):
+        source = strip_c_comments(read_source(MODEL_CACHE_CPP_PATH))
+        signature = "bool SaveManifest(size_t idx) noexcept {"
+        start = source.find(signature)
+        self.assertNotEqual(-1, start, "SaveManifest is gone")
+        opening = source.index("{", start)
+        depth = 0
+        for i in range(opening, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        self.fail("SaveManifest is not brace-balanced")
+
+    def test_every_manifest_field_write_is_checked(self):
+        region = self._save_manifest()
+        bare = re.findall(r"(?m)^\s*Utils::JSON::Set\(", region)
+        self.assertEqual(
+            [], bare,
+            "%d manifest field writes ignore their result again. Utils::JSON::Set "
+            "returns false on error, so a manifest missing a field - sha256 included - "
+            "would be written and reported as saved." % len(bare))
+
+    def test_a_partial_manifest_is_never_written(self):
+        """Fail closed, and this is the safe direction rather than the cautious one.
+
+        SaveToFile uses atomicReplace, so declining leaves the previous COMPLETE
+        manifest in place. Writing one without sha256 replaces a verifiable record
+        with an unverifiable one, in the component whose purpose is verifying model
+        integrity.
+        """
+        region = self._save_manifest()
+        self.assertTrue(
+            "return false;" in region,
+            "SaveManifest can no longer fail, so a manifest it could not populate "
+            "would be written anyway")
+        self.assertTrue(
+            "refusing to replace a complete manifest with a partial one" in region,
+            "the refusal to write a partial manifest is gone")
+
+    def test_the_failing_field_is_named(self):
+        """"Manifest failed" that does not say which field is not actionable."""
+        region = self._save_manifest()
+        self.assertTrue(
+            "failedField" in region,
+            "the failing field is no longer tracked")
+        self.assertTrue(
+            "(field '%hs')" in region,
+            "the log no longer names which field could not be written")
+
+    def test_no_caller_ignores_whether_the_manifest_persisted(self):
+        """DERIVED from the call sites, not a fixed number.
+
+        Three of five sites used to discard the result and then log success. If a
+        sixth call site is added and left unchecked, this grows and fails.
+        """
+        source = strip_c_comments(read_source(MODEL_CACHE_CPP_PATH))
+        discarded = re.findall(r"(?m)^\s*m_impl->SaveManifest\(\w+\);", source)
+        self.assertEqual(
+            [], discarded,
+            "%d SaveManifest call site(s) discard the result again. Each is followed "
+            "by a line claiming the operation succeeded, so a failure to persist is "
+            "reported as success." % len(discarded))
+        checked = re.findall(r"if \(!m_impl->SaveManifest\(\w+\)\)", source)
+        self.assertTrue(
+            len(checked) >= 5,
+            "only %d checked SaveManifest call sites; there were five" % len(checked))
+
+    def test_a_manifest_failure_does_not_undo_the_operation(self):
+        """The established policy, followed rather than replaced.
+
+        SwapModel and DownloadModel already handled this condition, both by warning
+        that the operation succeeded while the record is stale and deliberately NOT
+        undoing it, with a comment saying so. The three sites that were silent are now
+        consistent with those two. Turning any of them into a failure would be a new
+        policy invented for one caller.
+        """
+        source = strip_c_comments(read_source(MODEL_CACHE_CPP_PATH))
+        for match in re.finditer(r"if \(!m_impl->SaveManifest\(\w+\)\) \{", source):
+            start = match.start()
+            opening = source.index("{", start)
+            depth = 0
+            for i in range(opening, len(source)):
+                if source[i] == "{":
+                    depth += 1
+                elif source[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        body = source[opening:i + 1]
+                        break
+            self.assertTrue(
+                "return false" not in body,
+                "a manifest write failure now aborts its caller. The model swap or "
+                "rollback already happened on disk, so failing the call reports "
+                "something untrue and diverges from SwapModel and DownloadModel, "
+                "which warn and continue.")
 
 
 if __name__ == "__main__":
