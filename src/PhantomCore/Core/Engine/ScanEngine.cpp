@@ -44,6 +44,7 @@
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/MemoryUtils.hpp"
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
@@ -3125,13 +3126,26 @@ EngineResult ScanEngine::ScanFile(
                         L"Packed PE detected (%hs), routing to EmulationEngine",
                         execInfo.packer.name.c_str());
 
-                    // Read file data for emulation
-                    std::vector<std::byte> emulFileBytes;
-                    if (Utils::FileUtils::ReadAllBytes(filePath, emulFileBytes) && !emulFileBytes.empty()) {
-                        std::vector<uint8_t> peData(
-                            reinterpret_cast<const uint8_t*>(emulFileBytes.data()),
-                            reinterpret_cast<const uint8_t*>(emulFileBytes.data()) + emulFileBytes.size()
-                        );
+                    // MAP, DO NOT READ. This previously read the whole file into a
+                    // std::vector<std::byte> bounded only by FileUtils::MAX_READ_FILE_SIZE,
+                    // which is 1 GB, and then COPIED it into a std::vector<uint8_t> purely to
+                    // change the element type - so one packed file could hold up to 2 GB at
+                    // once, times maxConcurrentScans. Measured consequence: the service peaked
+                    // at 3129 MB working set against its own 1024 MB limit in the 1.0.113 run.
+                    //
+                    // The emulator sees byte-for-byte the same content: EmulatePE's
+                    // std::span<const uint8_t> overload forwards straight to RunPE without
+                    // copying, so nothing about what is examined changes here.
+                    //
+                    // A mapped scan target cannot shrink under the view - a section object
+                    // blocks it and SetEndOfFile fails with ERROR_USER_MAPPED_FILE - so the
+                    // in-page fault that would otherwise need SEH protection cannot occur.
+                    // ScanTargetMapping_Tests.AMappedScanTargetStillCannotBeTruncatedUnderUs
+                    // pins that invariant and fails first if it ever stops holding.
+                    Utils::MemoryUtils::MappedView emulView;
+                    if (emulView.mapReadOnly(filePath) && emulView.hasData()) {
+                        const std::span<const uint8_t> peData(
+                            static_cast<const uint8_t*>(emulView.data()), emulView.size());
 
                         EmulationConfig emulCfg = EmulationConfig::CreateDefault();
                         auto emulResult = m_impl->m_emulationEngine->EmulatePE(peData, emulCfg);
@@ -3150,6 +3164,13 @@ EngineResult ScanEngine::ScanFile(
                             m_impl->InvokeDetectionCallbacks(result);
                             goto finalize_scan;
                         }
+                    } else {
+                        // Previously a silent skip. A packed file that never reached the
+                        // emulator is a coverage gap, so say so and name the reason.
+                        SS_LOG_DEBUG(L"ScanEngine",
+                            L"Packed PE not emulated, could not map %ls (win32=%lu)",
+                            filePath.c_str(),
+                            static_cast<unsigned long>(emulView.lastError()));
                     }
                 }
 
