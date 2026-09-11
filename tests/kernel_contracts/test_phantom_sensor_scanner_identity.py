@@ -25072,5 +25072,100 @@ class RegistryDefensiveKeyBaselineContractTests(unittest.TestCase):
             "commit with its own evidence, not folded into a diagnostic fix.")
 
 
+class TrustPathUnexaminablePathContractTests(unittest.TestCase):
+    """A path the validator cannot examine must yield no verdict, not an exception.
+
+    MEASURED, 1.0.113: 2x ERROR "Exception during verification: exists: <access denied>:
+    <path>". filesystem_error::what() is prefixed with the failing function, so the field
+    log named the thrower itself - std::filesystem::exists through its THROWING overload.
+    The exception unwound the whole of VerifyFile into the generic handler, which reports
+    at ERROR, turning a routine condition on a live endpoint into an alarm.
+
+    The not-exists rung beside it had already been given this treatment, with eight lines
+    explaining why it logs at DEBUG: "logging every probe miss at WARN produced
+    high-volume, alarming noise for a benign condition". Only one of the two branches
+    received it.
+
+    Distinct from UnreadableSubjectContractTests, which pins the WinVerifyTrust status
+    arm. This is the filesystem rung reached before WinVerifyTrust is called at all, and
+    the cache invariant those tests own is deliberately not repeated here.
+    """
+
+    def _existence_region(self):
+        """The two existence rungs, bounded by the cache flag rather than the handler.
+
+        The end marker is deliberately NOT the exception handler: a slice ending at the
+        thing under test couples every assertion in this class to it.
+        """
+        source = strip_c_comments(read_source(DIGITAL_SIGNATURE_VALIDATOR_CPP_PATH))
+        start = source.find("std::wstring pathStr(filePath);")
+        self.assertNotEqual(
+            -1, start, "VerifyFile's body no longer begins as measured")
+        end = source.find("bool useCache", start)
+        self.assertGreater(
+            end, start,
+            "the cache flag no longer follows the existence rungs; this region bound "
+            "needs re-measuring before the assertions below mean anything")
+        return source[start:end]
+
+    def test_the_existence_check_cannot_throw(self):
+        """THE DEFECT. The throwing overload must not be used on the trust path."""
+        region = self._existence_region()
+        self.assertTrue(
+            "std::filesystem::exists(pathStr))" not in region,
+            "the existence check uses the THROWING overload of std::filesystem::exists "
+            "again. An unreadable path then unwinds VerifyFile into the generic handler "
+            "and is reported at ERROR rather than being classified.")
+        self.assertTrue(
+            "std::filesystem::exists(pathStr, existsEc)" in region,
+            "the existence check no longer uses the error_code overload")
+
+    def test_the_failure_code_is_examined_not_discarded(self):
+        """An error_code overload whose code is ignored is worse than throwing.
+
+        Throwing at least announced itself. Collecting the code and dropping it would
+        silently treat a path that could not be read as a path that is not there.
+        """
+        region = self._existence_region()
+        self.assertTrue(
+            "if (existsEc) {" in region,
+            "the error_code from the existence check is collected and then ignored, so "
+            "an unreadable path is silently indistinguishable from an absent one")
+
+    def test_an_unexaminable_path_yields_no_verdict(self):
+        """UNREADABLE IS NOT UNSIGNED - the trust conclusion that must not be drawn."""
+        region = self._existence_region()
+        at = region.index("if (existsEc) {")
+        branch = region[at:region.index("if (!pathExists)", at)]
+        self.assertTrue(
+            "result.result = SignatureValidationResult::Error;" in branch,
+            "a path that cannot be examined no longer produces the no-verdict result")
+        for forbidden in ("SignatureValidationResult::Unsigned",
+                          "SignatureValidationResult::Valid",
+                          "isValid = true"):
+            self.assertTrue(
+                forbidden not in branch,
+                "an unexaminable path now yields %s. Concluding anything about a file "
+                "nobody could read is the trust error this exists to prevent, and "
+                "Unsigned in particular is a determined answer that downstream trust "
+                "guards act on." % forbidden)
+
+    def test_an_unexaminable_path_is_not_an_alarm(self):
+        """Routine on a live endpoint: protected directories, cloud placeholders."""
+        region = self._existence_region()
+        at = region.index("if (existsEc) {")
+        branch = region[at:region.index("if (!pathExists)", at)]
+        self.assertTrue(
+            "SS_LOG_DEBUG" in branch,
+            "an unexaminable path is no longer logged at DEBUG, reinstating the field "
+            "noise the sibling not-exists rung documents at length")
+        for loud in ("SS_LOG_ERROR", "SS_LOG_WARN"):
+            self.assertTrue(
+                loud not in branch,
+                "an unexaminable path is reported at %s. Our own log writes traverse our "
+                "own minifilter, so a per-path alarm amplifies the condition it reports."
+                % loud)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

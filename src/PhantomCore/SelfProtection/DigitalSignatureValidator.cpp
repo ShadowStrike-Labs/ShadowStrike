@@ -527,7 +527,39 @@ public:
             }
 
             // Check file existence
-            if (!std::filesystem::exists(pathStr)) {
+            // NON-THROWING, and the error_code is examined rather than discarded.
+            // std::filesystem::exists THROWS filesystem_error when the path cannot be
+            // stat'd at all - most often access denied on a protected directory, or a
+            // cloud placeholder - and that exception unwound this entire function into
+            // the generic handler at the bottom, which reports at ERROR as though
+            // something unexpected had happened. It has not: an unreadable path is the
+            // same benign, non-actionable condition the not-exists rung below documents,
+            // and it is now reported the same way. The field run named the thrower
+            // directly, because filesystem_error::what() is prefixed with the failing
+            // function: "exists: <access denied>: <path>".
+            //
+            // The error_code overload is already the house style in this function - the
+            // directory guard below uses it for the same reason, that VerifyFile owes its
+            // caller a verdict rather than an exception.
+            //
+            // UNREADABLE IS NOT UNSIGNED. Error is the correct verdict here: it means no
+            // determination was made. It is deliberately never cached (see the cache
+            // write below), so an unreadable file leaves no stale verdict behind to be
+            // mistaken for a real one later.
+            std::error_code existsEc;
+            const bool pathExists = std::filesystem::exists(pathStr, existsEc);
+
+            if (existsEc) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                             L"VerifyFile: path cannot be examined (skipping): %ls"
+                             L" (code=%d)", pathStr.c_str(), existsEc.value());
+                result.result = SignatureValidationResult::Error;
+                result.errorMessage =
+                    "File cannot be examined: " + existsEc.message();
+                return finalizeResult(result, startTime);
+            }
+
+            if (!pathExists) {
                 // DEBUG, not WARN: callers legitimately query paths that may not
                 // exist as files — OS-loader SxS/MUI/manifest probe misses and
                 // synthetic resource identifiers surfaced by kernel image-load
