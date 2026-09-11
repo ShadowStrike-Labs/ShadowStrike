@@ -405,6 +405,10 @@ IP_LEAK_PROTECTION_HPP_PATH = (
 # because its one remaining claim is a gate DECISION, which is honest only while
 # the caller enforces the decision it returns.
 SELF_DEFENSE_CPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.cpp"
+YARA_RULE_STORE_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/YaraRuleStore.cpp"
+SIG_BUILDER_SERIALIZATION_CPP_PATH = (
+    ROOT / "src" / "PhantomCore" / "SignatureStore" /
+    "sig_builder_serialization.cpp")
 REGISTRY_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.hpp"
 REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
@@ -25165,6 +25169,157 @@ class TrustPathUnexaminablePathContractTests(unittest.TestCase):
                 "an unexaminable path is reported at %s. Our own log writes traverse our "
                 "own minifilter, so a per-path alarm amplifies the condition it reports."
                 % loud)
+
+
+class YaraMetadataSchemaContractTests(unittest.TestCase):
+    """The metadata reader and the metadata writer must agree on a schema.
+
+    MEASURED, 1.0.113: 2x WARN "LoadRulesInternal: Metadata root is not an array".
+
+    SignatureBuilder::SerializeMetadata writes a database SUMMARY OBJECT with database,
+    hashes, patterns and yaraRules keys. The reader demanded an ARRAY of per-rule records.
+    They were written for different schemas, so a correctly produced section was rejected
+    on every load.
+
+    No attribution depended on it, and that was verified rather than assumed: author,
+    description and reference are read from each rule's own meta: block through
+    yr_rule_metas_foreach BEFORE this section is consulted, and the section only ever
+    augmented rules already present. YaraRuleInput carries no such fields, so the builder
+    could not have produced the array even in principle.
+
+    These tests pin the schemas TOGETHER, on both sides. A reader that agrees with itself
+    is what produced the defect.
+    """
+
+    def _metadata_block(self):
+        """The metadata section handling, bounded by its own log markers."""
+        source = strip_c_comments(read_source(YARA_RULE_STORE_CPP_PATH))
+        start = source.find("No metadata section in database")
+        self.assertNotEqual(
+            -1, start, "the metadata section handling is gone from LoadRulesInternal")
+        end = source.find("Metadata entry is not an object", start)
+        self.assertGreater(
+            end, start,
+            "the per-entry loop marker is gone; this region bound needs re-measuring")
+        return source[start:end]
+
+    def test_the_writers_schema_is_still_an_object_with_a_rule_count(self):
+        """DERIVED FROM THE WRITER. If the producer changes shape, this fails first."""
+        builder = read_source(SIG_BUILDER_SERIALIZATION_CPP_PATH)
+        start = builder.find("std::string jsonContent = R\"({")
+        self.assertNotEqual(
+            -1, start,
+            "SerializeMetadata no longer builds its JSON as a raw string literal; the "
+            "reader's expectations below were derived from that shape")
+        end = builder.find('})"', start)
+        self.assertGreater(end, start, "the metadata JSON literal is not terminated")
+        document = builder[start:end]
+        self.assertTrue(
+            document.lstrip().startswith('std::string jsonContent = R"({'),
+            "the metadata document no longer starts as a JSON OBJECT. If it became an "
+            "array, the reader's object branch is now dead and the two sides have "
+            "swapped places rather than agreed.")
+        # '"count"' also appears in the hashes and patterns sections, so an
+        # unbounded check passed with the yaraRules count renamed.
+        at = document.find('"yaraRules"')
+        self.assertNotEqual(-1, at, "the summary has no yaraRules section")
+        self.assertTrue(
+            '"count"' in document[at:],
+            "the summary no longer carries a yaraRules count, which is the only thing "
+            "in it that can be checked against reality")
+
+    def test_the_reader_accepts_the_object_the_writer_produces(self):
+        block = self._metadata_block()
+        self.assertTrue(
+            "Metadata root is not an array" not in block,
+            "the reader rejects an object root again, so the section the builder "
+            "actually writes is discarded on every load")
+        self.assertTrue(
+            "if (metadataRoot.is_object()) {" in block,
+            "the reader no longer handles the object schema at all")
+
+    def test_a_rule_count_shortfall_is_reported_as_missing_coverage(self):
+        """THE POINT OF THE CHANGE. Silent rule loss had no signal at all before.
+
+        A database claiming more YARA rules than actually compiled is detection coverage
+        gone with nothing to show it. The summary states the claim and the loader knows
+        the truth, so the comparison costs nothing.
+        """
+        block = self._metadata_block()
+        self.assertTrue(
+            'metadataRoot["yaraRules"]["count"]' in block,
+            "the claimed rule count is no longer read, so the database's own statement "
+            "about its contents is unused")
+        self.assertTrue(
+            "m_ruleMetadata.size()" in block,
+            "the compiled rule count is no longer read, so there is nothing to compare "
+            "the claim against")
+        self.assertTrue(
+            "!= compiled" in block,
+            "the claimed and compiled rule counts are no longer compared")
+        # SS_LOG_WARN also appears for the malformed-root case, so an unbounded
+        # check passed with the shortfall downgraded to debug.
+        at = block.find("detection coverage is missing")
+        self.assertNotEqual(
+            -1, at, "the missing-coverage message is gone from the block")
+        self.assertTrue(
+            "SS_LOG_WARN" in block[max(0, at - 240):at],
+            "a rule-count shortfall is no longer reported as missing coverage. This is "
+            "the one condition in this block that deserves a warning; everything else "
+            "here is a normal state.")
+
+    def test_agreement_and_absent_overrides_are_both_quiet(self):
+        """What made the original warning worthless was that it fired on health."""
+        block = self._metadata_block()
+        for quiet, why in (
+                ("rule count agrees with the database",
+                 "a matching rule count is reported loudly again"),
+                ("no per-rule metadata overrides in the database",
+                 "the absence of optional per-rule overrides is reported loudly again, "
+                 "which is the normal state for every database the builder produces")):
+            self.assertTrue(quiet in block, why)
+            at = block.index(quiet)
+            preceding = block[max(0, at - 220):at]
+            self.assertTrue(
+                "SS_LOG_DEBUG" in preceding,
+                "%r is no longer logged at DEBUG. A message that fires on a healthy "
+                "load teaches operators to ignore this module." % quiet)
+
+    def test_the_per_rule_override_channel_still_works(self):
+        """Kept deliberately: it must work if the builder is ever taught to emit it."""
+        block = self._metadata_block()
+        self.assertTrue(
+            'metadataRoot["ruleMetadata"].is_array()' in block,
+            "the optional per-rule override array is gone, so a builder that starts "
+            "emitting per-rule metadata would have nothing reading it")
+        self.assertTrue(
+            "metadataRoot.is_array() ? metadataRoot" in block,
+            "an array root is no longer accepted, so a database written to the reader's "
+            "old expectation would silently lose its per-rule metadata")
+        source = strip_c_comments(read_source(YARA_RULE_STORE_CPP_PATH))
+        self.assertTrue(
+            "for (const auto& entry : ruleOverrideEntries) {" in source,
+            "the per-entry loop no longer iterates the resolved override entries")
+
+    def test_rule_attribution_still_comes_from_the_rules_themselves(self):
+        """The reason no attribution was lost. This must not become dependent on JSON."""
+        source = strip_c_comments(read_source(YARA_RULE_STORE_CPP_PATH))
+        self.assertEqual(
+            2, source.count("yr_rule_metas_foreach("),
+            "the rules' own meta: blocks are no longer iterated in both places they "
+            "were. That parsing is where author, description and reference actually "
+            "come from; the JSON section only augments it.")
+        # The ASSIGNMENT FORM is the proof: "= meta->string" can only come from a
+        # YARA meta: entry. Anchoring on the first yr_rule_metas_foreach was wrong -
+        # that occurrence is a different function which only builds a key.
+        for field in ("metadata.author = meta->string;",
+                      "metadata.description = meta->string;",
+                      "metadata.reference = meta->string;"):
+            self.assertTrue(
+                field in source,
+                "%s is no longer populated from the rule's own meta block, which would "
+                "make attribution depend on a JSON section the builder does not write"
+                % field)
 
 
 if __name__ == "__main__":

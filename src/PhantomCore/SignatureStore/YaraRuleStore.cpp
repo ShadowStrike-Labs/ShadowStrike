@@ -3884,18 +3884,73 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
                     return StoreError{ SignatureStoreError::Success };
                 }
 
-                // Validate metadata structure - must be array
-                if (!metadataRoot.is_array()) {
+                // THE ROOT IS AN OBJECT, and that is the format's actual schema.
+                //
+                // SignatureBuilder::SerializeMetadata writes a database summary -
+                // {"database":{...},"hashes":{...},"patterns":{...},"yaraRules":{...}} -
+                // while this reader used to demand an array of per-rule records. The two were
+                // designed for different schemas, so a correctly written section was rejected
+                // and warned about twice per load.
+                //
+                // NO ATTRIBUTION DEPENDED ON IT. Author, description and reference are read
+                // from each rule's own meta: block via yr_rule_metas_foreach before this point,
+                // and this section only ever AUGMENTED rules that were already present. The
+                // per-rule channel is kept, as an optional "ruleMetadata" array, so it still
+                // works if the builder is ever taught to emit it; an array root is still
+                // accepted so a database written to the old expectation keeps loading.
+                //
+                // AND THE SUMMARY EARNS ITS PLACE. It states how many YARA rules the database
+                // claims to carry, and the count that actually compiled is known here, so the
+                // two are compared. A database claiming more rules than compiled is silent
+                // detection loss - coverage gone with no signal - which nothing detected
+                // before. That mismatch is the one thing in this block worth a warning.
+                if (metadataRoot.is_object()) {
+                    if (metadataRoot.contains("yaraRules")
+                        && metadataRoot["yaraRules"].is_object()
+                        && metadataRoot["yaraRules"].contains("count")
+                        && metadataRoot["yaraRules"]["count"].is_number_integer()) {
+                        const int64_t claimed =
+                            metadataRoot["yaraRules"]["count"].get<int64_t>();
+                        const size_t compiled = m_ruleMetadata.size();
+                        if (claimed >= 0 && static_cast<uint64_t>(claimed) != compiled) {
+                            SS_LOG_WARN(L"YaraRuleStore",
+                                L"LoadRulesInternal: database claims %lld YARA rule(s) but %zu"
+                                L" compiled - detection coverage is missing",
+                                static_cast<long long>(claimed), compiled);
+                        } else {
+                            SS_LOG_DEBUG(L"YaraRuleStore",
+                                L"LoadRulesInternal: rule count agrees with the database (%zu)",
+                                compiled);
+                        }
+                    }
+                } else if (!metadataRoot.is_array()) {
                     SS_LOG_WARN(L"YaraRuleStore",
-                        L"LoadRulesInternal: Metadata root is not an array");
+                        L"LoadRulesInternal: metadata root is neither an object nor an array");
                     return StoreError{ SignatureStoreError::Success };
                 }
+
+                // Per-rule overrides are OPTIONAL. Their absence is the normal state today and
+                // is not a fault: the rules carry their own metadata.
+                const bool haveRuleOverrides =
+                    metadataRoot.is_array()
+                    || (metadataRoot.contains("ruleMetadata")
+                        && metadataRoot["ruleMetadata"].is_array());
+
+                if (!haveRuleOverrides) {
+                    SS_LOG_DEBUG(L"YaraRuleStore",
+                        L"LoadRulesInternal: no per-rule metadata overrides in the database;"
+                        L" attribution comes from each rule's own meta block");
+                    return StoreError{ SignatureStoreError::Success };
+                }
+
+                const auto& ruleOverrideEntries =
+                    metadataRoot.is_array() ? metadataRoot : metadataRoot["ruleMetadata"];
 
                 size_t metadataCount = 0;
                 size_t parseErrors = 0;
 
                 // Iterate through metadata entries
-                for (const auto& entry : metadataRoot) {
+                for (const auto& entry : ruleOverrideEntries) {
                     if (!entry.is_object()) {
                         SS_LOG_WARN(L"YaraRuleStore",
                             L"LoadRulesInternal: Metadata entry is not an object, skipping");
