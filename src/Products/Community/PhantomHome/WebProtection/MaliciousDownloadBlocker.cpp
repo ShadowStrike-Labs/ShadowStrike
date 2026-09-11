@@ -54,6 +54,7 @@
 #include <mscat.h>
 #include <ShlObj.h>
 #include "../../../../PhantomCore/Utils/SystemUtils.hpp"  // GetKnownFolderForAllUsersOrSelf
+#include "../../../../PhantomCore/Utils/DataStorePaths.hpp"
 
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -779,19 +780,44 @@ bool MaliciousDownloadBlockerImpl::Initialize(const DownloadBlockerConfiguration
         m_monitoredDirs.resize(MAX_MONITORED_DIRS);
     }
 
-    // Attempt to initialize hash store
-    if (!config.quarantinePath.empty()) {
-        fs::path dbDir = config.quarantinePath.parent_path();
-        if (!dbDir.empty()) {
-            fs::path hashDbPath = dbDir / L"malware_hashes.db";
-            auto err = m_hashStore.Initialize(hashDbPath.wstring(), true);
-            m_hashStoreReady = err.IsSuccess();
-            if (!m_hashStoreReady) {
-                Logger::Warn("DownloadBlocker: HashStore init from {} returned error, hash lookups disabled",
-                             Utils::StringUtils::ToNarrow(hashDbPath.wstring()));
-            }
-        }
+    // THE HASH REPUTATION LAYER OPENS THE CANONICAL SIGNATURE DATABASE.
+    //
+    // It used to build its own path: the QUARANTINE directory's parent joined with
+    // a hardcoded "malware_hashes.db". That filename appeared exactly once in the
+    // whole tree - at that line. DataStorePaths does not own it, GetOwnedDataFiles
+    // does not list it, and nothing creates it, so Initialize failed on every
+    // endpoint and m_hashStoreReady stayed false.
+    //
+    // THAT MATTERED BECAUSE THIS IS A CONVICTION PATH, NOT A HINT. A hit at
+    // ThreatLevel::High or above sets DownloadVerdict::Malware,
+    // DownloadAction::Quarantine and the KnownMalware indicator, so a dead store
+    // here left every known-malicious download to the heuristic layers alone.
+    // Same defect as the three USB detection layers, and the same fix.
+    //
+    // Availability is no longer gated on config.quarantinePath. Where confiscated
+    // files are put is unrelated to where signatures live, and coupling them meant
+    // an unset quarantine directory silently disabled hash reputation too.
+    const std::wstring hashDbPath = Utils::DataStorePaths::SignatureDatabase();
+    const auto hashStoreError = m_hashStore.Initialize(hashDbPath, true);
+    m_hashStoreReady = hashStoreError.IsSuccess();
+    if (!m_hashStoreReady) {
+        // StoreError::message is documented as deliberately empty when the error came
+        // from the FromWin32 factory, so the numeric code and the Win32 error are
+        // reported as well - a warning naming no cause is the failure this replaced.
+        Logger::Warn("DownloadBlocker: HashStore init failed (code={} win32={} {}) "
+                     "for {} - known-bad download hash detection is DISABLED",
+                     static_cast<int>(hashStoreError.code),
+                     hashStoreError.win32Error,
+                     hashStoreError.message.empty() ? std::string("no detail")
+                                                    : hashStoreError.message,
+                     Utils::StringUtils::ToNarrow(hashDbPath));
     }
+
+    // Always reported, either way. Whether a detection layer is live is not
+    // something an operator should have to infer from the absence of a warning.
+    Logger::Info("DownloadBlocker: hash reputation layer {} (database: {})",
+                 m_hashStoreReady ? "ACTIVE" : "DISABLED",
+                 Utils::StringUtils::ToNarrow(hashDbPath));
 
     m_status.store(ModuleStatus::Running, std::memory_order_release);
     Logger::Info("DownloadBlocker: initialized, monitoring {} directories", m_monitoredDirs.size());

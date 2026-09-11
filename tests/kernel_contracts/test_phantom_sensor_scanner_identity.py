@@ -409,6 +409,9 @@ YARA_RULE_STORE_CPP_PATH = ROOT / "src/PhantomCore/SignatureStore/YaraRuleStore.
 SIG_BUILDER_SERIALIZATION_CPP_PATH = (
     ROOT / "src" / "PhantomCore" / "SignatureStore" /
     "sig_builder_serialization.cpp")
+MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH = (
+    ROOT / "src" / "Products" / "Community" / "PhantomHome" /
+    "WebProtection" / "MaliciousDownloadBlocker.cpp")
 REGISTRY_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.hpp"
 REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
@@ -25454,6 +25457,153 @@ class HoneypotLocationCoverageContractTests(unittest.TestCase):
                 "endpoint does not own. That needs its own decision and its own review, "
                 "not a resolver arm added alongside a logging fix." % api)
         del source
+
+
+class DownloadHashReputationContractTests(unittest.TestCase):
+    """The download blocker's known-bad hash layer must open a database that exists.
+
+    MEASURED. MaliciousDownloadBlocker built its own path - the QUARANTINE directory's
+    parent joined with a hardcoded "malware_hashes.db". That filename occurred exactly once
+    in the whole tree, at that line. DataStorePaths does not own it, GetOwnedDataFiles does
+    not list it, nothing creates it. Initialize failed on every endpoint, m_hashStoreReady
+    stayed false, and both lookup sites were unreachable.
+
+    THIS IS A CONVICTION PATH, WHICH IS WHY IT MATTERS. A hit at ThreatLevel::High or above
+    sets DownloadVerdict::Malware, DownloadAction::Quarantine, shouldBlock = true and the
+    ThreatIndicator::KnownMalware bit. A dead store left every known-malicious download to
+    the heuristic layers alone. Identical class to the three dead USB detection layers whose
+    guards note this very module as the next instance.
+    """
+
+    def _init_region(self):
+        """The hash-store initialisation, comments stripped.
+
+        Stripping is load-bearing: the code comment deliberately names the old filename so
+        the next reader knows what was there, which would satisfy a raw substring check.
+        """
+        source = strip_c_comments(read_source(MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH))
+        start = source.find("m_hashStore.Initialize(")
+        self.assertNotEqual(
+            -1, start,
+            "the download blocker no longer initialises its hash store at all, so the "
+            "known-bad hash layer cannot convict anything")
+        return source[max(0, start - 700):start + 900]
+
+    def test_the_hash_layer_opens_a_database_the_product_owns(self):
+        region = self._init_region()
+        self.assertTrue(
+            "DataStorePaths::SignatureDatabase()" in region,
+            "the hash store no longer opens the canonical signature database. Any other "
+            "path must be owned by DataStorePaths and created by the product, or this "
+            "layer is dead again exactly as it was.")
+
+    def test_no_database_filename_is_constructed_in_this_module(self):
+        """DERIVED, not a blocklist. Any wide-string .db literal fails, whatever its name.
+
+        The original defect was a filename that existed nowhere else in the tree. Naming
+        only that filename here would let the next invented one through.
+        """
+        source = strip_c_comments(read_source(MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH))
+        literals = re.findall(r'L"[^"]*\.(?:db|sdb|hdb)"', source)
+        self.assertEqual(
+            [], literals,
+            "a database filename is hardcoded in MaliciousDownloadBlocker: %s. Database "
+            "paths belong to Utils::DataStorePaths, which is what guarantees something "
+            "creates the file. A filename invented here opens a store that will never "
+            "exist." % literals)
+
+    def test_the_hash_layer_does_not_depend_on_the_quarantine_path(self):
+        """Two unrelated settings were coupled: an unset quarantine path killed detection."""
+        source = strip_c_comments(read_source(MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH))
+        self.assertTrue(
+            "config.quarantinePath.parent_path()" not in source,
+            "the hash database path is derived from the quarantine directory again. Where "
+            "confiscated files are put has nothing to do with where signatures live.")
+        region = self._init_region()
+        self.assertTrue(
+            "quarantinePath" not in region,
+            "hash-store initialisation references the quarantine path again, so an unset "
+            "quarantine directory can silently disable known-bad hash detection")
+
+    def test_a_failed_hash_store_says_why_and_says_what_is_lost(self):
+        region = self._init_region()
+        self.assertTrue(
+            "hashStoreError.win32Error" in region,
+            "the hash-store failure no longer reports the Win32 error, so a field log "
+            "cannot say whether the database is missing, unreadable or malformed")
+        self.assertTrue(
+            "no detail" in region,
+            "StoreError::message is documented as deliberately empty when the error came "
+            "from the FromWin32 factory, so a message printed alone can be blank. The "
+            "fallback text is what keeps the warning meaningful.")
+        self.assertTrue(
+            "DISABLED" in region,
+            "the warning no longer states that known-bad hash detection is disabled. A "
+            "failure that does not name the protection lost gets triaged as noise.")
+
+    def test_the_layers_state_is_reported_whether_or_not_it_failed(self):
+        """Whether a detection layer is live must not be inferred from silence."""
+        region = self._init_region()
+        self.assertTrue(
+            "hash reputation layer" in region,
+            "the always-on report of the hash layer's state is gone, so an operator can "
+            "only infer that the layer is live from the absence of a warning")
+        self.assertTrue(
+            '"ACTIVE"' in region and '"DISABLED"' in region,
+            "the state report no longer distinguishes an active layer from a disabled one")
+
+    def test_the_conviction_the_hash_layer_produces_is_intact(self):
+        """THE DETECTION-INTEGRITY GUARD. Opening the store is worthless if the verdict went.
+
+        Both lookup sites are pinned. If one is removed, half the paths that can recognise
+        a known-malicious download stop doing so, and this change would have opened a
+        database for nothing.
+        """
+        source = strip_c_comments(read_source(MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH))
+        self.assertEqual(
+            2, source.count("m_hashStore.LookupHashString("),
+            "the download blocker performs %d hash lookups, expected 2. Losing one loses "
+            "a path that can recognise a known-malicious download."
+            % source.count("m_hashStore.LookupHashString("))
+        for token in ("DownloadVerdict::Malware", "DownloadAction::Quarantine",
+                      "ThreatIndicator::KnownMalware"):
+            self.assertTrue(
+                token in source,
+                "%s is gone, so a known-bad hash match no longer produces the verdict, "
+                "the action or the indicator it was written to produce" % token)
+
+    def test_download_directories_are_still_resolved_per_session(self):
+        """The other half of this task, already fixed, pinned so it cannot regress.
+
+        A LocalSystem service resolving FOLDERID_Downloads against a null token gets
+        %WINDIR%\\System32\\config\\systemprofile\\Downloads - a directory nobody downloads
+        into. That made StartMonitoring return false and download protection never ran.
+        """
+        source = strip_c_comments(read_source(MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH))
+        self.assertTrue(
+            "GetKnownFolderForAllUsersOrSelf(FOLDERID_Downloads)" in source,
+            "download directories are no longer resolved per interactive session. A "
+            "null-token resolution under LocalSystem yields the system profile, which is "
+            "how this module came to monitor nothing at all.")
+        self.assertTrue(
+            "SHGetKnownFolderPath" not in source,
+            "this module calls SHGetKnownFolderPath directly again. The session-aware "
+            "resolution lives in SystemUtils precisely so each module does not reintroduce "
+            "the null-token bug.")
+
+    def test_an_empty_monitor_list_is_still_refused(self):
+        """A module reporting healthy while protecting nothing is worse than one failing."""
+        source = strip_c_comments(read_source(MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH))
+        at = source.find("no directories to monitor")
+        self.assertNotEqual(
+            -1, at,
+            "the empty-monitor-list refusal is gone. Starting with nothing to monitor "
+            "makes the module report healthy while watching no directory at all.")
+        following = source[at:at + 200]
+        self.assertTrue(
+            "return false" in following,
+            "an empty monitor list no longer fails the start. That converts a visible "
+            "failure into a module that reports success and protects nothing.")
 
 
 if __name__ == "__main__":
