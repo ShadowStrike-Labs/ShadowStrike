@@ -37,7 +37,6 @@
 #  include <bcrypt.h>  
 #  include <ncrypt.h>    
 #  include <mscat.h>    
-#  include <ntstatus.h>   
 
 #  pragma comment(lib, "crypt32.lib")
 #  pragma comment(lib, "wintrust.lib")

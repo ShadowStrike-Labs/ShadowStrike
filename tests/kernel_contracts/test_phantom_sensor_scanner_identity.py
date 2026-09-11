@@ -416,6 +416,7 @@ OPENSSL_VENDOR_DLL_DIR = ROOT / "vendor" / "openssl" / "lib"
 BROWSER_PROTECTION_CPP_PATH = (
     ROOT / "src" / "Products" / "Community" / "PhantomHome" /
     "WebProtection" / "BrowserProtection.cpp")
+PCH_HEADER_PATH = ROOT / "src" / "pch.h"
 REGISTRY_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.hpp"
 REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
@@ -25874,6 +25875,108 @@ class BrowserProtectionCapabilityHonestyContractTests(unittest.TestCase):
             1, body.count("return true;"),
             "the only success return must be the already-running early exit. An extra one "
             "means the module now claims to have started a host.")
+
+
+class NtStatusRedefinitionContractTests(unittest.TestCase):
+    """One definer of the NTSTATUS constants per translation unit.
+
+    MEASURED. pch.h supplies <windows.h> to all 565 translation units, and four of them then
+    included <ntstatus.h>, which redefines constants windows.h already provided: 128 C4005
+    macro redefinition warnings on a full rebuild. That volume is what makes a genuine new
+    warning easy to miss.
+
+    TWO pch.h-LEVEL FIXES WERE TRIED AND BOTH BROKE THE BUILD. They are recorded here so
+    nobody spends the time again:
+      * WIN32_NO_STATUS plus <ntstatus.h> in pch.h gave 202 errors. CryptoManager.cpp
+        declares "constexpr NTSTATUS STATUS_SUCCESS = 0;" and a macro cannot be shadowed by
+        a declaration. PhantomEmulator declares roughly forty more guest STATUS_ constants,
+        so it would also have been a landmine for the next include of an emulator header.
+      * WIN32_NO_STATUS alone gave 402 errors, because units such as
+        ServiceCommunication.cpp rely on the STATUS_WAIT_0 family that winnt.h supplies.
+
+    Three of the four files used no STATUS_ identifier at all, so the include was dead
+    weight. The fourth needed one constant and defines it under a guard.
+    """
+
+    SOURCE_SUFFIXES = (".cpp", ".hpp", ".h")
+    SKIP_PARTS = {"node_modules", ".venv_local", ".git", "build", "vendor", "include",
+                  "PhantomSensor", "PhantomEmulator"}
+
+    def _sources(self):
+        for path in sorted(ROOT.rglob("*")):
+            if path.suffix not in self.SOURCE_SUFFIXES:
+                continue
+            if set(path.parts) & self.SKIP_PARTS:
+                continue
+            yield path
+
+    def test_no_unit_pulls_in_both_definers_of_the_ntstatus_constants(self):
+        """DERIVED from the tree, so a new include fails here rather than in a build log."""
+        include_re = re.compile(r"#\s*include\s*<\s*ntstatus\.h\s*>")
+        offenders = []
+        checked = 0
+        for path in self._sources():
+            checked += 1
+            try:
+                text = path.read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            if include_re.search(text):
+                offenders.append(path.relative_to(ROOT).as_posix())
+        self.assertGreater(
+            checked, 500,
+            "only %d sources were examined, so this guard has lost its subject and would "
+            "pass vacuously" % checked)
+        self.assertEqual(
+            [], offenders,
+            "these files include <ntstatus.h> while pch.h has already supplied "
+            "<windows.h>: %s. Both define the NTSTATUS constants, which is 128 C4005 "
+            "warnings. If a file genuinely needs a constant windows.h does not provide, "
+            "define that one under an #ifndef guard as CryptoUtils_Secure_Random.cpp and "
+            "HashUtils.cpp do." % offenders)
+
+    def test_pch_does_not_try_to_own_the_ntstatus_constants(self):
+        """The two attempts that broke the build. Do not repeat them."""
+        text = read_source(PCH_HEADER_PATH)
+        self.assertTrue(
+            "WIN32_NO_STATUS" not in text,
+            "pch.h defines WIN32_NO_STATUS. Measured twice: with <ntstatus.h> alongside it "
+            "the build fails with 202 errors because CryptoManager declares a constexpr "
+            "STATUS_SUCCESS and PhantomEmulator declares about forty guest STATUS_ "
+            "constants; without it the build fails with 402 errors because other units "
+            "rely on the STATUS_WAIT_0 family from winnt.h.")
+        self.assertTrue(
+            "ntstatus.h" not in text,
+            "pch.h includes <ntstatus.h>, which forces every STATUS_ constant on all 565 "
+            "translation units and turns any local declaration of one of those names into "
+            "a syntax error")
+
+    def test_the_measured_lean_and_nominmax_redefinitions_stay_guarded(self):
+        """Scoped to the file that actually warned, deliberately.
+
+        A tree-wide rule would be wrong here. 470 of these definitions appear BEFORE the
+        pch include, where the definition simply wins and nothing is redefined, and of the
+        35 that follow it only this file produced C4005 - two of them - in any configuration
+        that is built. Asserting the general property would fail on clean code.
+        """
+        path = (ROOT / "tests" / "unit" / "Database_systems_unit" / "threat_intel" /
+                "ThreatIntelDatabase_tests.cpp")
+        self.assertTrue(path.is_file(), "%s is gone" % path.name)
+        text = path.read_bytes().decode("utf-8")
+        for name in ("WIN32_LEAN_AND_MEAN", "NOMINMAX"):
+            self.assertTrue(
+                ("#ifndef %s" % name) in text,
+                "%s is redefined in %s without a guard. pch.h has already defined it by "
+                "that point, which is where the last two C4005 warnings came from."
+                % (name, path.name))
+
+    def test_the_rule_file_size_comparison_stays_unsigned(self):
+        source = strip_c_comments(read_source(YARA_RULE_STORE_CPP_PATH))
+        self.assertTrue(
+            "static_cast<uint64_t>(fileSize) > YaraTitaniumLimits::MAX_FILE_SIZE" in source,
+            "the rule-file size check compares a signed std::streampos against an unsigned "
+            "limit again, which is C4018. The negative case is rejected above it, so the "
+            "cast is correct rather than only quiet.")
 
 
 if __name__ == "__main__":

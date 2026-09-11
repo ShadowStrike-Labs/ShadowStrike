@@ -83,7 +83,6 @@
 #include <bcrypt.h>
 #include <objbase.h>
 #include <ole2.h>
-#include <ntstatus.h>
 #include <sddl.h>
 
 #pragma comment(lib, "bcrypt.lib")

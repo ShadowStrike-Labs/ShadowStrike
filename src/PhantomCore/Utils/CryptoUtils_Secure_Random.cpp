@@ -18,7 +18,14 @@
 #include"pch.h"
 #include"CryptoUtils.hpp"
 #include "CryptoUtilsCommon.hpp"
-#include<ntstatus.h>
+// STATUS_UNSUCCESSFUL is the only NTSTATUS constant this file needs, as a failure
+// sentinel before BCryptGenRandom overwrites it. Including <ntstatus.h> for it alone
+// redefines every constant windows.h already supplied through pch.h, which was 128
+// C4005 warnings across the four files that did so. Guarded here, matching the two
+// codes HashUtils.cpp defines the same way.
+#ifndef STATUS_UNSUCCESSFUL
+#define STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+#endif
 namespace ShadowStrike {
 	namespace Utils {
 		namespace CryptoUtils {

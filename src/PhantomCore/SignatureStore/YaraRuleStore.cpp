@@ -204,7 +204,10 @@ StoreError YaraCompiler::AddFile(
         }
         
         // VALIDATION 6: File size limit (DoS protection - 10MB max per rule file)
-        if (fileSize > YaraTitaniumLimits::MAX_FILE_SIZE) {
+        // fileSize is std::streampos, MAX_FILE_SIZE is size_t. The negative case is
+        // rejected above, so the value is known non-negative here and the cast is
+        // correct rather than only quiet.
+        if (static_cast<uint64_t>(fileSize) > YaraTitaniumLimits::MAX_FILE_SIZE) {
             SS_LOG_ERROR(L"YaraCompiler", L"File too large: %s (%lld bytes)",
                 filePath.c_str(), static_cast<long long>(fileSize));
             return StoreError{SignatureStoreError::TooLarge, 0, "Rule file exceeds the maximum rule file size"};

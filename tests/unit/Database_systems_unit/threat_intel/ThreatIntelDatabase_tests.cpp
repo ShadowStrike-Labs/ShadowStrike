@@ -53,8 +53,13 @@
 #include <random>
 #include <chrono>
 
+// Guarded: pch.h already defines both, so redefining them here was 2 C4005 warnings.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 
 using namespace ShadowStrike::ThreatIntel;
