@@ -405,6 +405,7 @@ IP_LEAK_PROTECTION_HPP_PATH = (
 # because its one remaining claim is a gate DECISION, which is honest only while
 # the caller enforces the decision it returns.
 SELF_DEFENSE_CPP_PATH = ROOT / "src/PhantomCore/SelfProtection/SelfDefense.cpp"
+REGISTRY_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.hpp"
 REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
 )
@@ -24920,6 +24921,155 @@ class ModelManifestIntegrityContractTests(unittest.TestCase):
                 "rollback already happened on disk, so failing the call reports "
                 "something untrue and diverges from SwapModel and DownloadModel, "
                 "which warn and continue.")
+
+
+class RegistryDefensiveKeyBaselineContractTests(unittest.TestCase):
+    """A protected key that is absent is a baseline fact, not a failed snapshot.
+
+    MEASURED, 1.0.113: six protected keys are DEFENSIVE - three IFEO subkeys for our own
+    executables (a Debugger value there redirects the executable, MITRE T1546.012), two
+    SafeBoot service entries, and HKCU\\SOFTWARE\\ShadowStrike under the service account.
+    Their absence is the healthy state. VerifyKeyIntegrity documents this and handles it,
+    after "a perpetual false-positive loop (RegOpenKeyExW code=2 on every poll)".
+    CreateSnapshotInternal did not: it warned uniformly and named no error code, so twelve
+    warning lines appeared per startup on a healthy machine and a key that EXISTS but
+    denies us read was indistinguishable from one that is simply not there.
+    """
+
+    def _snapshot_body(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        signature = "bool CreateSnapshotInternal(const std::wstring& keyPath)"
+        start = source.find(signature)
+        self.assertNotEqual(-1, start, "CreateSnapshotInternal is gone")
+        opening = source.index("{", start)
+        depth = 0
+        for i in range(opening, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        self.fail("CreateSnapshotInternal is not brace-balanced")
+
+    def _restore_body(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        signature = "bool RestoreFromSnapshot(std::wstring_view keyPath, uint32_t version)"
+        start = source.find(signature)
+        self.assertNotEqual(-1, start, "RestoreFromSnapshot is gone")
+        opening = source.index("{", start)
+        depth = 0
+        for i in range(opening, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        self.fail("RestoreFromSnapshot is not brace-balanced")
+
+    def test_the_snapshot_path_asks_why_the_open_failed(self):
+        """Open has always taken an Error out-parameter. It was never passed."""
+        body = self._snapshot_body()
+        self.assertTrue(
+            "Open(rootKey, subKey, opts, &openErr)" in body,
+            "the snapshot path no longer collects the open error, so absence and access "
+            "denial cannot be told apart at all")
+
+    def test_an_absent_key_is_not_reported_as_a_problem(self):
+        body = self._snapshot_body()
+        self.assertTrue(
+            "!IsKeyAbsentError(openErr.win32)" in body,
+            "the snapshot warning is no longer conditioned on the key actually existing, "
+            "which reinstates twelve warning lines per startup on a healthy machine")
+        self.assertTrue(
+            "Cannot create snapshot - key not accessible" not in body,
+            "the codeless warning is back; it cannot distinguish a missing key from one "
+            "that denies access")
+
+    def test_a_key_that_exists_but_cannot_be_read_is_still_reported_with_its_code(self):
+        """THE CASE THAT MATTERS. A key present but unreadable is a real problem."""
+        body = self._snapshot_body()
+        self.assertTrue(
+            "SS_LOG_WARN" in body,
+            "nothing warns any more, so a protected key that exists and denies us read "
+            "is now silent - the fix would have removed a signal instead of sharpening it")
+        # BOUND TO THE WARNING ITSELF. "win32=%lu" also appears in the debug line for an
+        # absent key, so checking the whole function body would be satisfied by the wrong
+        # call site and would pass even with the warning stripped of its code.
+        at = body.index("SS_LOG_WARN")
+        end = body.index(";", at)
+        warning = body[at:end]
+        self.assertTrue(
+            "win32=%lu" in warning and "DescribeKeyOpenError" in warning,
+            "the surviving warning no longer names the numeric error code and its name, "
+            "so the field log cannot say why the key could not be read")
+
+    def test_an_absent_key_still_records_a_baseline(self):
+        """The absence is the fact that makes a later appearance recognisable."""
+        body = self._snapshot_body()
+        self.assertTrue(
+            "snapshot.keyExisted = keyOpened;" in body,
+            "the baseline no longer records whether the key existed, so an absence "
+            "leaves no evidence behind")
+        self.assertTrue(
+            '"Protection baseline (key absent)"' in body,
+            "an absent baseline is no longer distinguishable from a normal one by reason")
+        header = read_source(REGISTRY_PROTECTION_HPP_PATH)
+        self.assertTrue(
+            "bool keyExisted = true;" in header,
+            "KeySnapshot::keyExisted must default to TRUE so every snapshot taken of a "
+            "key that exists keeps its meaning without being set explicitly")
+
+    def test_restore_refuses_a_baseline_that_recorded_an_absence(self):
+        """PINS ORDERING. The refusal must precede the Create call, not follow it.
+
+        RestoreFromSnapshot calls Create(), so restoring an absent baseline would
+        MANUFACTURE the IFEO key this module exists to keep from appearing. Restoring
+        absence would instead mean deleting the key, which is a destructive registry
+        operation needing its own design and authorization.
+        """
+        body = self._restore_body()
+        self.assertTrue(
+            "if (!snapshotToRestore->keyExisted) {" in body,
+            "restore no longer refuses an absent baseline, so restoring one would create "
+            "an IFEO key for our own executable")
+        refusal = body.index("!snapshotToRestore->keyExisted")
+        create = body.find("regKey.Create(")
+        self.assertNotEqual(-1, create, "the Create call is gone; re-check this guard")
+        self.assertLess(
+            refusal, create,
+            "the absent-baseline refusal must come BEFORE the key is created, otherwise "
+            "the key exists by the time the code declines to restore it")
+
+    def test_absence_covers_both_ways_the_registry_says_not_there(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        start = source.find("constexpr bool IsKeyAbsentError")
+        self.assertNotEqual(-1, start, "the absent-error classifier is gone")
+        body = source[start:source.index("}", start)]
+        for code in ("ERROR_FILE_NOT_FOUND", "ERROR_PATH_NOT_FOUND"):
+            self.assertTrue(
+                code in body,
+                "%s is no longer treated as absence, so that case reverts to being "
+                "reported as a failure" % code)
+        self.assertTrue(
+            "ERROR_ACCESS_DENIED" not in body,
+            "access denial must NOT be classified as absence - that is the case worth "
+            "reporting, and folding it in would silence the only real signal here")
+
+    def test_the_verification_paths_own_defensive_handling_is_untouched(self):
+        """This change must not disturb the loop that was already fixed."""
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        self.assertTrue(
+            "wasBaselined = (it->second.integrity == RegistryIntegrityStatus::Valid)"
+            in source,
+            "VerifyKeyIntegrity no longer decides tampering by whether the key was ever "
+            "observed present, which reinstates the false-positive loop")
+        self.assertTrue(
+            "= RegistryIntegrityStatus::New" not in source,
+            "something now assigns RegistryIntegrityStatus::New. Reporting a defensive "
+            "key's APPEARANCE is a detector behaviour change and belongs in its own "
+            "commit with its own evidence, not folded into a diagnostic fix.")
 
 
 if __name__ == "__main__":

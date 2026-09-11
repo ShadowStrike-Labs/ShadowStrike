@@ -597,6 +597,15 @@ struct KeySnapshot {
     
     /// @brief Snapshot reason
     std::string reason;
+
+    /// @brief Whether the key existed when this baseline was taken.
+    ///
+    /// False records a DELIBERATE, MEANINGFUL absence rather than a failed
+    /// snapshot. Keys protected defensively - IFEO entries for our own
+    /// executables, SafeBoot service entries - are expected not to exist, and a
+    /// baseline saying so is what allows a later appearance to be recognised as a
+    /// change. Appended rather than inserted: this is a public aggregate.
+    bool keyExisted = true;
 };
 
 /**

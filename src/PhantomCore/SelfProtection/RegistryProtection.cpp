@@ -1240,6 +1240,18 @@ public:
                 return false;
             }
 
+            // A baseline that recorded the key as ABSENT cannot be restored by writing.
+            // Restoring absence would mean DELETING the key, a destructive registry
+            // operation needing its own design and authorization; and Create() below
+            // would instead manufacture the very artefact this module exists to keep
+            // from appearing. Refuse, and say so.
+            if (!snapshotToRestore->keyExisted) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Refusing to restore a baseline that recorded the key as absent:"
+                    L" %ls (version=%u)", normalized.c_str(), snapshotToRestore->version);
+                return false;
+            }
+
             restoredVersion = snapshotToRestore->version;
             entriesToRestore.reserve(snapshotToRestore->values.size());
             for (size_t i = 0; i < snapshotToRestore->values.size(); ++i) {
@@ -1795,6 +1807,28 @@ private:
         return false;
     }
 
+    // Absence versus inaccessibility - two different facts about a protected key.
+    // A key that is not there is the healthy state for every defensively protected
+    // key; a key that exists and refuses to open means something has taken it away
+    // from us. FileUtils draws the same distinction with IsFileGoneError, and this
+    // follows that precedent rather than inventing a second vocabulary.
+    [[nodiscard]] static constexpr bool IsKeyAbsentError(DWORD code) noexcept {
+        return code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
+    }
+
+    // The numeric code stays in the message because that is what a bug report can
+    // be searched for; the name is added so the log is readable without a lookup.
+    [[nodiscard]] static const wchar_t* DescribeKeyOpenError(DWORD code) noexcept {
+        switch (code) {
+            case ERROR_ACCESS_DENIED:  return L"ERROR_ACCESS_DENIED";
+            case ERROR_FILE_NOT_FOUND: return L"ERROR_FILE_NOT_FOUND";
+            case ERROR_PATH_NOT_FOUND: return L"ERROR_PATH_NOT_FOUND";
+            case ERROR_INVALID_HANDLE: return L"ERROR_INVALID_HANDLE";
+            case ERROR_KEY_DELETED:    return L"ERROR_KEY_DELETED";
+            case ERROR_BADKEY:         return L"ERROR_BADKEY";
+            default:                   return L"unmapped";
+        }
+    }
     [[nodiscard]] bool CreateSnapshotInternal(const std::wstring& keyPath) {
         const auto normalized = NormalizeKeyPath(keyPath);
 
@@ -1809,9 +1843,21 @@ private:
         Utils::RegistryUtils::OpenOptions opts;
         opts.access = KEY_READ;
 
-        if (!regKey.Open(rootKey, subKey, opts)) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Cannot create snapshot - key not accessible: %ls",
-                normalized.c_str());
+        // ABSENT IS NOT A FAILURE. Six protected keys are defensive - three IFEO
+        // subkeys for our own executables, two SafeBoot service entries and
+        // HKCU\\SOFTWARE\\ShadowStrike under the service account - and their absence is
+        // the expected state, exactly as the verification path above documents. Warning
+        // about it produced twelve lines per startup on a healthy machine, counting the
+        // paired "Initial snapshot creation failed", and named no code, so a key that
+        // EXISTS and denies us read was indistinguishable from one that is not there.
+        Utils::RegistryUtils::Error openErr;
+        const bool keyOpened = regKey.Open(rootKey, subKey, opts, &openErr);
+
+        if (!keyOpened && !IsKeyAbsentError(openErr.win32)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Cannot snapshot a key that exists: %ls (win32=%lu %ls)",
+                normalized.c_str(), openErr.win32,
+                DescribeKeyOpenError(openErr.win32));
             return false;
         }
 
@@ -1819,11 +1865,24 @@ private:
         snapshot.id = GenerateUniqueId();
         snapshot.keyPath = normalized;
         snapshot.timestamp = Clock::now();
-        snapshot.reason = "Protection baseline";
+        snapshot.keyExisted = keyOpened;
+        snapshot.reason = keyOpened
+            ? "Protection baseline"
+            : "Protection baseline (key absent)";
+
+        if (!keyOpened) {
+            // A recorded absence is a BASELINE, not a gap. It is the fact that lets a
+            // later appearance be recognised as a change instead of accepted as normal.
+            // Debug level: this is the expected state, not an event.
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Baseline records this key as absent, which is expected for a"
+                L" defensively protected key: %ls (win32=%lu)",
+                normalized.c_str(), openErr.win32);
+        }
 
         // Read all values
         std::vector<Utils::RegistryUtils::ValueInfo> valueInfos;
-        if (regKey.EnumValues(valueInfos)) {
+        if (keyOpened && regKey.EnumValues(valueInfos)) {
             for (const auto& vi : valueInfos) {
                 std::vector<uint8_t> data;
                 Utils::RegistryUtils::ValueType actualType;
@@ -1839,7 +1898,7 @@ private:
 
         // Read subkeys
         std::vector<std::wstring> subKeys;
-        if (regKey.EnumKeys(subKeys)) {
+        if (keyOpened && regKey.EnumKeys(subKeys)) {
             snapshot.subkeys = std::move(subKeys);
         }
 
