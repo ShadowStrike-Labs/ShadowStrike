@@ -25322,5 +25322,139 @@ class YaraMetadataSchemaContractTests(unittest.TestCase):
                 % field)
 
 
+class HoneypotLocationCoverageContractTests(unittest.TestCase):
+    """A decoy location that gets no decoys must say which location, and why.
+
+    MEASURED, 1.0.113: 4x WARN "No location path resolved for type N". LocationType has
+    EIGHT values; GetLocationPaths had arms for FIVE and a bare default falling through to
+    an empty vector. Those locations get no ransomware decoys, so they have no early
+    warning at all, and the message named neither the location nor the reason.
+
+    Two situations were collapsed into one. Custom REQUIRES an explicit path - the deploy
+    path uses location.path verbatim when set and only consults the resolver when it is
+    empty, so Custom reaching the resolver is a configuration error. NetworkShare and
+    CloudSync are unimplemented, which is a coverage gap. They need opposite responses.
+
+    A third defect, found while measuring: GetLocationTypeName's default returned "Custom",
+    so NetworkShare and CloudSync were reported as Custom in every report, JSON payload and
+    statistic.
+    """
+
+    def _location_types(self):
+        """DERIVED FROM THE HEADER. The enum is the authority for what must be covered."""
+        header = strip_c_comments(read_source(HONEYPOT_MANAGER_HPP_PATH))
+        start = header.find("enum class LocationType")
+        self.assertNotEqual(-1, start, "the LocationType enum is gone")
+        body = header[header.index("{", start):header.index("}", start)]
+        names = re.findall(r"(\w+)\s*=\s*\d+", body)
+        self.assertGreaterEqual(
+            len(names), 8,
+            "LocationType now declares %d members, fewer than the 8 measured. If a type "
+            "was removed, confirm its decoys were not the only coverage for somewhere."
+            % len(names))
+        return names
+
+    def _resolver(self):
+        source = strip_c_comments(read_source(HONEYPOT_MANAGER_CPP_PATH))
+        sig = "std::vector<std::wstring> GetLocationPaths(LocationType type)"
+        start = source.find(sig)
+        self.assertNotEqual(-1, start, "GetLocationPaths is gone")
+        opening = source.index("{", start)
+        depth = 0
+        for i in range(opening, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        self.fail("GetLocationPaths is not brace-balanced")
+
+    def test_every_location_type_is_accounted_for_in_the_resolver(self):
+        """The subject list comes from the enum, not from a list written here."""
+        resolver = self._resolver()
+        for name in self._location_types():
+            self.assertTrue(
+                ("LocationType::%s" % name) in resolver,
+                "LocationType::%s has no arm in GetLocationPaths, so it falls through to "
+                "an empty path list and that location silently receives no ransomware "
+                "decoys. Add an arm, even one that declines, so the decision is visible."
+                % name)
+
+    def test_the_resolver_has_no_catch_all_arm(self):
+        """A default arm is how the gap hid. Enumerate, so a new type is visible."""
+        resolver = self._resolver()
+        self.assertTrue(
+            "default:" not in resolver,
+            "GetLocationPaths has a default arm again. That is exactly what allowed three "
+            "location types to resolve to nothing without anyone noticing.")
+
+    def test_a_missing_configured_path_is_told_apart_from_an_unimplemented_type(self):
+        source = strip_c_comments(read_source(HONEYPOT_MANAGER_CPP_PATH))
+        self.assertTrue(
+            "LocationNeedsExplicitPath" in source,
+            "the distinction between a location whose path the configuration must supply "
+            "and one this build cannot place decoys in is gone; both would report the "
+            "same thing again and need opposite fixes")
+        self.assertTrue(
+            "return type == LocationType::Custom;" in source,
+            "the set of types that carry their own path has changed. Custom exists to be "
+            "given a path; if another type joined it, confirm the deploy path really does "
+            "take that path verbatim.")
+
+    def test_both_reports_name_the_location_and_the_consequence(self):
+        source = strip_c_comments(read_source(HONEYPOT_MANAGER_CPP_PATH))
+        self.assertTrue(
+            "No location path resolved for type %d" not in source,
+            "the deployment warning prints a raw enum integer again, which is not "
+            "actionable from a field log")
+        self.assertEqual(
+            2, source.count("GetLocationTypeName(location.type)"),
+            "both branches must name the location type. Found %d of 2."
+            % source.count("GetLocationTypeName(location.type)"))
+        self.assertEqual(
+            2, source.count("no ransomware early"),
+            "both branches must state the consequence - that the location has no "
+            "ransomware early warning. A message that reports a failure without saying "
+            "what protection was lost gets triaged as noise. Found %d of 2."
+            % source.count("no ransomware early"))
+
+    def test_no_location_type_misreports_itself_as_another(self):
+        """NetworkShare and CloudSync used to be reported as Custom."""
+        source = strip_c_comments(read_source(HONEYPOT_MANAGER_CPP_PATH))
+        start = source.find("GetLocationTypeName(LocationType type)")
+        self.assertNotEqual(-1, start, "GetLocationTypeName is gone")
+        body = source[start:source.index("}", source.index("switch", start))]
+        self.assertTrue(
+            'default: return "Custom";' not in body,
+            "GetLocationTypeName maps unlisted types to \"Custom\" again, so NetworkShare "
+            "and CloudSync report as a different location type in every report and JSON "
+            "payload that uses this name")
+        for name in self._location_types():
+            self.assertTrue(
+                ('return "%s"' % name) in body,
+                "GetLocationTypeName does not name LocationType::%s, so it will be "
+                "reported as something it is not" % name)
+
+    def test_no_placement_was_invented_for_storage_the_endpoint_does_not_own(self):
+        """DELIBERATELY NOT IMPLEMENTED, and this pins that decision.
+
+        A network share is storage this endpoint does not own - a file server, another
+        machine's shared folder. Writing decoy files there has a far larger blast radius
+        than a local user folder, so it is a decision to take explicitly rather than to
+        add while fixing a diagnostic.
+        """
+        source = strip_c_comments(read_source(HONEYPOT_MANAGER_CPP_PATH))
+        resolver = self._resolver()
+        for api in ("WNetOpenEnum", "WNetEnumResource", "NetShareEnum",
+                    "GetLogicalDrives", "WNetGetConnection"):
+            self.assertTrue(
+                api not in resolver,
+                "GetLocationPaths now uses %s, so decoys may be written to storage this "
+                "endpoint does not own. That needs its own decision and its own review, "
+                "not a resolver arm added alongside a logging fix." % api)
+        del source
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -144,11 +144,37 @@ namespace {
                 }
                 return { L"C:\\" };
             }
-            default:
+            // THE THREE TYPES THIS RESOLVER CANNOT ANSWER, STATED EXPLICITLY.
+            //
+            // Custom is not a resolver failure at all: DeployToLocation uses
+            // location.path verbatim when it is set and only consults this
+            // function when it is empty, so a Custom location arriving here is a
+            // configuration error. NetworkShare and CloudSync are unimplemented,
+            // which is missing early-warning coverage rather than a mistake.
+            // The caller distinguishes them; see LocationNeedsExplicitPath.
+            //
+            // Listed one by one rather than left to a bare default so that adding
+            // a LocationType without deciding how to resolve it is visible here
+            // instead of turning into silence at deployment time.
+            case LocationType::NetworkShare:
+            case LocationType::CloudSync:
+            case LocationType::Custom:
                 break;
         }
 #endif
         return {};
+    }
+
+    /**
+     * @brief Whether a location type carries its path in the configuration.
+     *
+     * Custom exists to be given an explicit path. Reaching the resolver means
+     * the configuration omitted it, which is a different failure from a type
+     * the resolver has no implementation for, and warrants a different
+     * message and a different fix.
+     */
+    [[nodiscard]] constexpr bool LocationNeedsExplicitPath(LocationType type) noexcept {
+        return type == LocationType::Custom;
     }
 
     /**
@@ -461,8 +487,21 @@ bool HoneypotManagerImpl::DeployToLocation(const DeploymentLocation& location) {
     }
 
     if (basePaths.empty()) {
-        SS_LOG_WARN(kLogCategory, L"No location path resolved for type %d",
-                    static_cast<int>(location.type));
+        // The two cases need opposite responses, so they are reported
+        // differently and the type is named rather than printed as an integer.
+        if (LocationNeedsExplicitPath(location.type)) {
+            SS_LOG_WARN(kLogCategory,
+                L"Decoy location of type %hs has no path configured. This type"
+                L" carries its own path; without one no decoys are placed and"
+                L" that location has no ransomware early warning.",
+                std::string(GetLocationTypeName(location.type)).c_str());
+        } else {
+            SS_LOG_WARN(kLogCategory,
+                L"Decoy location of type %hs cannot be resolved: no placement is"
+                L" implemented for it, so that location has no ransomware early"
+                L" warning. Configure an explicit path to cover it meanwhile.",
+                std::string(GetLocationTypeName(location.type)).c_str());
+        }
         return false;
     }
 
@@ -1653,8 +1692,15 @@ std::string_view GetLocationTypeName(LocationType type) noexcept {
         case LocationType::UserPictures: return "UserPictures";
         case LocationType::UserDownloads: return "UserDownloads";
         case LocationType::RootDrive: return "RootDrive";
-        default: return "Custom";
-    }
+        // NetworkShare and CloudSync used to fall to a default that returned
+        // "Custom", so both were reported as Custom in every report, JSON
+        // payload and statistic that uses this name. A type that misreports
+        // itself makes every message about it misleading.
+        case LocationType::NetworkShare: return "NetworkShare";
+        case LocationType::CloudSync: return "CloudSync";
+        case LocationType::Custom: return "Custom";
+        }
+    return "Unknown";
 }
 
 std::string_view GetAccessTypeName(HoneypotAccessType type) noexcept {
