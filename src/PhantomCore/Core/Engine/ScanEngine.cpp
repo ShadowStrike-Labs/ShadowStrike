@@ -423,6 +423,55 @@ public:
             seeded);
     }
 
+    // One place that hands a file to the emulator.
+    //
+    // MAPPED, NOT READ. A read-only view gives the emulator byte-for-byte the
+    // same content through EmulatePE's std::span overload, which forwards to
+    // RunPE without copying, so what is examined is unchanged while the cost
+    // becomes the pages actually touched rather than a heap copy of the file.
+    // stage08 previously allocated up to 50 MB for EVERY deep scan, packed or
+    // not, multiplied by maxConcurrentScans.
+    //
+    // maxBytes == 0 means the whole file. The callers deliberately differ: the
+    // packer branch examines everything because it is the path that escalates
+    // to Infected, and stage08 caps at MAX_EMU_SIZE. Equalising them would
+    // change how many bytes the emulator sees for large files, which is a
+    // detection decision rather than a memory one.
+    //
+    // A file that cannot be mapped yields a DEFAULT EmulationResult, whose
+    // isMalicious and emulationComplete are both false and whose apiCalls is
+    // empty, so every caller's downstream guard is already false and no caller
+    // needs a failure branch. The reason is logged here, once.
+    //
+    // A mapped scan target cannot shrink under the view - a section object
+    // blocks it and SetEndOfFile fails with ERROR_USER_MAPPED_FILE - so the
+    // in-page fault that would otherwise need SEH protection cannot occur.
+    // ScanTargetMapping_Tests.AMappedScanTargetStillCannotBeTruncatedUnderUs
+    // pins that and fails first if it ever stops holding.
+    [[nodiscard]] EmulationResult EmulateFileForScan(
+        const std::wstring& filePath, size_t maxBytes) const {
+        if (!m_emulationEngine || !m_emulationEngine->IsInitialized()) {
+            return {};
+        }
+
+        Utils::MemoryUtils::MappedView view;
+        if (!view.mapReadOnly(filePath) || !view.hasData()) {
+            SS_LOG_DEBUG(L"ScanEngine",
+                L"Emulation skipped, could not map %ls (win32=%lu)",
+                filePath.c_str(),
+                static_cast<unsigned long>(view.lastError()));
+            return {};
+        }
+
+        const size_t length = (maxBytes == 0)
+            ? view.size()
+            : std::min<size_t>(view.size(), maxBytes);
+        const std::span<const uint8_t> bytes(
+            static_cast<const uint8_t*>(view.data()), length);
+
+        return m_emulationEngine->EmulatePE(
+            bytes, EmulationConfig::CreateDefault());
+    }
     [[nodiscard]] bool Initialize(const EngineConfig& config) {
         std::unique_lock lock(m_configMutex);
 
@@ -3142,13 +3191,10 @@ EngineResult ScanEngine::ScanFile(
                     // in-page fault that would otherwise need SEH protection cannot occur.
                     // ScanTargetMapping_Tests.AMappedScanTargetStillCannotBeTruncatedUnderUs
                     // pins that invariant and fails first if it ever stops holding.
-                    Utils::MemoryUtils::MappedView emulView;
-                    if (emulView.mapReadOnly(filePath) && emulView.hasData()) {
-                        const std::span<const uint8_t> peData(
-                            static_cast<const uint8_t*>(emulView.data()), emulView.size());
-
-                        EmulationConfig emulCfg = EmulationConfig::CreateDefault();
-                        auto emulResult = m_impl->m_emulationEngine->EmulatePE(peData, emulCfg);
+                    // maxBytes 0: the whole file. This is the path that escalates a packed
+                    // sample to Infected, so it examines everything; stage08 caps at
+                    // MAX_EMU_SIZE and that difference is deliberate.
+                    const auto emulResult = m_impl->EmulateFileForScan(filePath, 0);
 
                         if (emulResult.isMalicious) {
                             m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
@@ -3164,14 +3210,6 @@ EngineResult ScanEngine::ScanFile(
                             m_impl->InvokeDetectionCallbacks(result);
                             goto finalize_scan;
                         }
-                    } else {
-                        // Previously a silent skip. A packed file that never reached the
-                        // emulator is a coverage gap, so say so and name the reason.
-                        SS_LOG_DEBUG(L"ScanEngine",
-                            L"Packed PE not emulated, could not map %ls (win32=%lu)",
-                            filePath.c_str(),
-                            static_cast<unsigned long>(emulView.lastError()));
-                    }
                 }
 
                 // Extract ML features for PhantomCortex if available
@@ -3376,23 +3414,13 @@ EngineResult ScanEngine::ScanFile(
         if (m_impl->m_emulationEngine && m_impl->m_emulationEngine->IsInitialized() && context.deepScan) {
             SS_DIAG_SCOPE("ScanEngine", "stage08-emulation");
 
-            // Read file into buffer for emulation
             try {
-                std::ifstream emuFile(filePath, std::ios::binary | std::ios::ate);
-                if (emuFile) {
-                    auto emuFileSize = emuFile.tellg();
-                    if (emuFileSize >= 0) {
-                    emuFile.seekg(0, std::ios::beg);
-
-                    constexpr size_t MAX_EMU_SIZE = 50 * 1024 * 1024; // 50MB limit
-                    size_t emuReadSize = std::min<size_t>(
-                        static_cast<size_t>(emuFileSize), MAX_EMU_SIZE);
-
-                    std::vector<uint8_t> emuBuffer(emuReadSize);
-                    emuFile.read(reinterpret_cast<char*>(emuBuffer.data()), emuReadSize);
-
-                    EmulationConfig emuConfig = EmulationConfig::CreateDefault();
-                    auto emuResult = m_impl->m_emulationEngine->EmulatePE(emuBuffer, emuConfig);
+                // Capped at 50 MB, the same bound the heap buffer this replaced
+                // used. The cap decides what the emulator sees, so it is a
+                // detection setting and is asserted by a contract test.
+                constexpr size_t MAX_EMU_SIZE = 50 * 1024 * 1024; // 50MB limit
+                const auto emuResult =
+                    m_impl->EmulateFileForScan(filePath, MAX_EMU_SIZE);
 
                     // Preserve trace for PhantomCortex ML ensemble (Stage 10)
                     if (emuResult.emulationComplete && !emuResult.apiCalls.empty()) {
@@ -3532,8 +3560,6 @@ EngineResult ScanEngine::ScanFile(
                             }
                         }
                     }
-                    } // end if (emuFileSize >= 0)
-                }
             } catch (const std::exception& emuEx) {
                 SS_LOG_ERROR(L"ScanEngine", L"Emulation exception: %hs", emuEx.what());
             }

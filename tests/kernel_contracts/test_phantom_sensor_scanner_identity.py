@@ -24652,19 +24652,38 @@ class TestRuntimeDependencyContractTests(unittest.TestCase):
 
 
 class EmulationInputMemoryContractTests(unittest.TestCase):
-    """The emulator's input must not be a heap copy of the whole file.
+    """The emulator gets one read path, and it is a mapping rather than a heap copy.
 
     MEASURED, 1.0.113: working set 1334 -> 3129 MB against the product's own 1024 MB
-    limit, rising AND falling across the run, which is transient allocation rather
-    than a leak. The packer branch read the file into a std::vector<std::byte> bounded
-    only by FileUtils::MAX_READ_FILE_SIZE - 1 GB - and then COPIED it into a
-    std::vector<uint8_t> purely to change the element type, so a single packed file
-    could hold up to 2 GB at once, multiplied by maxConcurrentScans.
+    limit, rising and falling across the run, which is transient allocation rather than
+    a leak. Two sites fed the emulator by reading whole files onto the heap. The packer
+    branch read up to FileUtils::MAX_READ_FILE_SIZE - 1 GB - into a std::vector<std::byte>
+    and then copied it into a std::vector<uint8_t> to change the element type, so one
+    packed file could hold 2 GB at once. stage08 allocated up to 50 MB for EVERY deep
+    scan, packed or not. Both are multiplied by maxConcurrentScans, which is 4.
 
-    A read-only mapped view gives the emulator byte-for-byte the same content through
-    EmulatePE's std::span overload, which forwards to RunPE without copying. Nothing
-    about WHAT is examined changes; only where it lives.
+    EmulateFileForScan now maps read-only and hands EmulatePE a std::span, which forwards
+    to RunPE without copying, so the bytes examined are unchanged.
     """
+
+    def _helper(self):
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        signature = "EmulationResult EmulateFileForScan("
+        start = source.find(signature)
+        self.assertNotEqual(
+            -1, start,
+            "the shared emulator read path is gone; the two call sites are reading "
+            "files onto the heap again")
+        opening = source.index("{", start)
+        depth = 0
+        for i in range(opening, len(source)):
+            if source[i] == "{":
+                depth += 1
+            elif source[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:i + 1]
+        self.fail("EmulateFileForScan is not brace-balanced")
 
     def _packer_branch(self):
         source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
@@ -24686,76 +24705,107 @@ class EmulationInputMemoryContractTests(unittest.TestCase):
         self.fail("the packed-PE branch is not brace-balanced")
 
     def test_the_emulator_input_is_mapped_not_read_onto_the_heap(self):
-        region = self._packer_branch()
+        region = self._helper()
         self.assertTrue(
             "mapReadOnly(filePath)" in region,
-            "the packed-PE branch no longer maps the file. Reading it instead puts a "
-            "whole-file copy on the heap, bounded only by MAX_READ_FILE_SIZE at 1 GB.")
-        self.assertTrue(
-            "ReadAllBytes" not in region,
-            "the packed-PE branch reads the whole file onto the heap again")
+            "the shared read path no longer maps. Reading instead puts a whole-file "
+            "copy on the heap for every emulation.")
+        for banned in ("ReadAllBytes", "std::ifstream", "std::vector<uint8_t>",
+                       "std::vector<std::byte>"):
+            self.assertTrue(
+                banned not in region,
+                "the shared read path uses %s again, which allocates the file rather "
+                "than mapping it" % banned)
 
-    def test_there_is_no_second_full_copy_of_the_file(self):
-        """The copy existed only to turn std::byte into uint8_t."""
-        region = self._packer_branch()
+    def test_the_emulator_is_handed_a_span_over_the_mapping(self):
+        region = self._helper()
         self.assertTrue(
-            "std::vector<uint8_t> peData" not in region,
-            "a second full-file buffer is back. Both copies are alive at the "
-            "EmulatePE call, which is what made one packed file cost up to 2 GB.")
+            "std::span<const uint8_t> bytes(" in region,
+            "the emulator is no longer handed a span over the mapping, so something "
+            "is copying the bytes first")
         self.assertTrue(
-            "std::span<const uint8_t> peData" in region,
-            "the emulator is no longer handed a span over the mapping")
+            "EmulatePE(" in region,
+            "the shared read path no longer calls the emulator")
 
-    def test_a_file_that_cannot_be_mapped_is_reported(self):
-        """It used to be a silent skip: a packed file simply was not emulated."""
-        region = self._packer_branch()
-        self.assertTrue(
-            "could not map" in region,
-            "a packed PE that cannot be mapped is silently not emulated again, which "
-            "is a coverage gap nobody can see")
+    def test_there_is_exactly_one_read_path_for_the_emulator(self):
+        """The duplication this replaced: two sites, two mechanisms, two caps.
 
-    def test_the_packed_verdict_is_still_stronger_than_emulation_alone(self):
-        """THE DETECTION-INTEGRITY GUARD FOR THIS CHANGE.
-
-        Both emulation sites run for a packed file in a deep scan, and the second
-        one's gate is strictly weaker, so the packer branch looks redundant. It is
-        not: it yields Infected where the general stage yields only Suspicious,
-        because packed AND emulation-malicious is stronger evidence than emulation
-        alone. Deleting it as a duplicate would demote every packed-malware verdict.
+        Derived from the call count rather than a fixed list, so a third site that
+        reads its own buffer fails here.
         """
-        region = self._packer_branch()
-        self.assertTrue(
-            "result.verdict = ScanVerdict::Infected;" in region,
-            "the packed-PE branch no longer convicts. If it was removed as a "
-            "duplicate of stage08, packed malware is now merely Suspicious.")
-        self.assertTrue(
-            '"EmulationEngine+ExecutableAnalyzer"' in region,
-            "the combined detection source is gone, so a verdict that rests on two "
-            "independent signals no longer says so")
-
-    def test_both_emulation_sites_survive(self):
         source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
-        calls = len(re.findall(r"->EmulatePE\(", source))
+        emulate_calls = re.findall(r"->EmulatePE\(", source)
         self.assertEqual(
-            2, calls,
-            "ScanEngine makes %d EmulatePE calls, not 2. The packer branch and "
-            "stage08 are both required: one convicts a packed sample, the other "
-            "preserves the emulation trace for the ML ensemble." % calls)
+            1, len(emulate_calls),
+            "ScanEngine calls EmulatePE %d times. There must be exactly one, inside "
+            "EmulateFileForScan; another call site means another read path and "
+            "another whole-file allocation." % len(emulate_calls))
+        callers = re.findall(r"m_impl->EmulateFileForScan\(", source)
+        self.assertEqual(
+            2, len(callers),
+            "%d call sites use the shared read path, expected 2 - the packer branch "
+            "and stage08. If one stopped using it, it is reading the file itself."
+            % len(callers))
 
-    def test_the_general_emulation_stage_keeps_its_cap(self):
-        """Deliberately NOT equalised with the packer branch.
+    def test_the_two_callers_keep_their_different_caps(self):
+        """Deliberately NOT equalised.
 
-        The packer branch is uncapped and stage08 caps at 50 MB. Making them agree
-        changes how many bytes the emulator sees for files over 50 MB, which is a
-        detection decision and not a memory one.
+        The packer branch examines the whole file because it is the path that
+        escalates to Infected. stage08 caps at 50 MB. Making them agree changes how
+        many bytes the emulator sees for large files, which is a detection decision
+        and must not ride along with a memory change.
         """
         source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        self.assertTrue(
+            "EmulateFileForScan(filePath, 0)" in source,
+            "the packer branch no longer examines the whole file; a cap there changes "
+            "what the convicting path sees")
+        self.assertTrue(
+            "EmulateFileForScan(filePath, MAX_EMU_SIZE)" in source,
+            "stage08 no longer passes its cap")
         self.assertTrue(
             "constexpr size_t MAX_EMU_SIZE = 50 * 1024 * 1024;" in source,
             "stage08's emulation cap has changed. That alters what the emulator sees "
             "and must be argued as a detection change, not slipped in with a memory "
             "fix.")
 
+    def test_a_file_that_cannot_be_mapped_is_reported(self):
+        """It used to be a silent skip at one site and absent at the other."""
+        region = self._helper()
+        self.assertTrue(
+            "could not map" in region,
+            "a file the emulator cannot read is silently not emulated, which is a "
+            "coverage gap nobody can see")
+        self.assertTrue(
+            "return {};" in region,
+            "a failed map no longer yields a default EmulationResult, so callers can "
+            "no longer rely on their existing guards being false")
+
+    def test_the_packed_verdict_is_still_stronger_than_emulation_alone(self):
+        """THE DETECTION-INTEGRITY GUARD FOR THIS AREA.
+
+        Both emulation sites run for a packed file in a deep scan, and stage08's gate
+        is strictly weaker, so the packer branch looks redundant. It is not: it yields
+        Infected where stage08 yields only Suspicious, because packed AND
+        emulation-malicious is stronger evidence than emulation alone. Deleting it as a
+        duplicate would demote every packed-malware verdict.
+        """
+        region = self._packer_branch()
+        self.assertTrue(
+            "result.verdict = ScanVerdict::Infected;" in region,
+            "the packed-PE branch no longer convicts. If it was removed as a duplicate "
+            "of stage08, packed malware is now merely Suspicious.")
+        self.assertTrue(
+            '"EmulationEngine+ExecutableAnalyzer"' in region,
+            "the combined detection source is gone, so a verdict resting on two "
+            "independent signals no longer says so")
+
+    def test_stage08_still_feeds_the_ml_ensemble(self):
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        self.assertTrue(
+            "emulTraceForML = emuResult;" in source,
+            "stage08 no longer preserves the emulation trace, so the ML ensemble at "
+            "stage 10 loses its input")
 
 class ModelManifestIntegrityContractTests(unittest.TestCase):
     """The record of which model is installed decides whether it can be verified.
