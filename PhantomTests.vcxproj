@@ -786,4 +786,49 @@
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true" />
   </Target>
+  <!--
+    Put the VENDORED OpenSSL DLLs beside the test executable, matching the CRT.
+
+    WHY THIS EXISTS. phantom-tests.exe imports libcrypto-3-x64.dll, and no project
+    produces it or claims it as an output, so it is a manual artefact. When it goes
+    missing the process cannot start at all: it exits 0xC0000135, STATUS_DLL_NOT_FOUND,
+    and prints NOTHING, which reads as a hung or silently broken test run rather than
+    as a missing file.
+
+    MEASURED. This recurred for months and was repaired by hand from a stash of DLLs
+    kept outside the repository. Every file in that stash is a DEBUG build, so each
+    repair installed a Debug-CRT runtime into a Release binary, which is the crash
+    described above DeployGoogleTest: 0xC0000005 before main, printing nothing. The two
+    failure modes therefore alternated and neither looked related to the other.
+
+    The files that stopped disappearing are exactly the ones a deploy target owns, so
+    what remains unknown here is the agent doing the deleting, not the remedy.
+
+    THE FOLDERS ARE NAMED BY CRT FLAVOUR, NOT BY CONFIGURATION, and there is
+    deliberately no fallback, for the reasons recorded above DeployGoogleTest: the
+    flavour is the property that has to match, .gitignore excludes any directory called
+    Release or Debug, and an unmapped configuration must copy nothing and fail loudly
+    rather than quietly deploy the wrong runtime.
+
+    IT RUNS AFTER Build, NOT AFTER Link, for the same measured reason: Link is skipped
+    when nothing needs relinking, which is precisely the state in which the DLL is
+    absent and needs replacing.
+
+    libssl-3-x64.dll travels with libcrypto. The test binary does not import it
+    directly, but the pair ships together and other product binaries need it, so
+    keeping them together prevents a half restored OpenSSL.
+  -->
+  <PropertyGroup>
+    <OpenSslCrtFlavour Condition="'$(Configuration)' == 'Release'">release-crt</OpenSslCrtFlavour>
+    <OpenSslCrtFlavour Condition="'$(Configuration)' == 'Debug'">debug-crt</OpenSslCrtFlavour>
+  </PropertyGroup>
+  <Target Name="DeployOpenSsl" AfterTargets="Build"
+          Condition="'$(OpenSslCrtFlavour)' != '' And Exists('$(SolutionDir)vendor\openssl\lib\$(OpenSslCrtFlavour)\libcrypto-3-x64.dll')">
+    <ItemGroup>
+      <OpenSslBinaries Include="$(SolutionDir)vendor\openssl\lib\$(OpenSslCrtFlavour)\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(OpenSslBinaries)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

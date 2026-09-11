@@ -412,6 +412,7 @@ SIG_BUILDER_SERIALIZATION_CPP_PATH = (
 MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH = (
     ROOT / "src" / "Products" / "Community" / "PhantomHome" /
     "WebProtection" / "MaliciousDownloadBlocker.cpp")
+OPENSSL_VENDOR_DLL_DIR = ROOT / "vendor" / "openssl" / "lib"
 REGISTRY_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.hpp"
 REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
@@ -25604,6 +25605,157 @@ class DownloadHashReputationContractTests(unittest.TestCase):
             "return false" in following,
             "an empty monitor list no longer fails the start. That converts a visible "
             "failure into a module that reports success and protects nothing.")
+
+
+class OpenSslRuntimeDependencyContractTests(unittest.TestCase):
+    """The OpenSSL runtime the test binary needs must come from the build, not a human.
+
+    MEASURED. phantom-tests.exe imports libcrypto-3-x64.dll. No project produced it and no
+    target claimed it, so it was a manual artefact, and it went missing repeatedly over
+    months. A missing runtime DLL does not report itself usefully: the process exits
+    0xC0000135, STATUS_DLL_NOT_FOUND, having printed nothing, which reads as a hung or
+    silently broken test run.
+
+    The repair was a stash of DLLs kept outside the repository, and EVERY FILE IN IT WAS A
+    DEBUG BUILD - libcrypto, libssl, gtest and gmock alike. So each repair replaced a
+    missing-DLL failure with a mismatched-CRT failure, which is the 0xC0000005-before-main
+    crash that TestRuntimeDependencyContractTests documents. The two alternated and neither
+    looked related to the other.
+
+    The DLLs that stopped disappearing are exactly the ones a deploy target owns, so these
+    tests pin the ownership rather than the cause of the deletion, which remains unknown.
+
+    Sibling of TestRuntimeDependencyContractTests: that class owns the XML well-formedness
+    check and gtest's flavours, and neither is repeated here.
+    """
+
+    DEBUG_CRT_IMPORTS = (b"ucrtbased.dll", b"VCRUNTIME140D.dll", b"MSVCP140D.dll")
+    RELEASE_CRT_IMPORTS = (b"VCRUNTIME140.dll", b"api-ms-win-crt-runtime-l1-1-0.dll")
+
+    def _dlls(self, flavour):
+        folder = OPENSSL_VENDOR_DLL_DIR / flavour
+        self.assertTrue(
+            folder.is_dir(),
+            "vendor/openssl/lib/%s is gone, so the build has nothing to copy and the "
+            "OpenSSL runtime reverts to being restored by hand from wherever someone last "
+            "kept a copy" % flavour)
+        found = sorted(folder.glob("*.dll"))
+        self.assertTrue(found, "no vendored OpenSSL DLLs in %s" % folder)
+        return found
+
+    def _debug_imports(self, path):
+        blob = path.read_bytes()
+        return [n.decode() for n in self.DEBUG_CRT_IMPORTS if n in blob]
+
+    def test_the_vendored_release_openssl_is_release_crt(self):
+        """Read from the PE import names, so the folder cannot simply be trusted.
+
+        Only full distinctive names are used: "VCRUNTIME140D.dll" does not contain
+        "VCRUNTIME140.dll", so the two cannot be confused as byte sequences.
+        """
+        for path in self._dlls("release-crt"):
+            debug = self._debug_imports(path)
+            self.assertEqual(
+                [], debug,
+                "%s imports the DEBUG CRT (%s) but sits in the release folder. Deploying "
+                "it beside the release test binary is the mismatched-runtime failure that "
+                "the manual restores kept reintroducing." % (path.name, debug))
+            self.assertTrue(
+                any(n in path.read_bytes() for n in self.RELEASE_CRT_IMPORTS),
+                "%s imports neither CRT flavour recognisably, so this check can no longer "
+                "tell them apart" % path.name)
+
+    def test_the_vendored_debug_openssl_is_debug_crt(self):
+        """Anti-vacuity and a swap detector.
+
+        If both folders held the release pair, the test above would pass while a Debug run
+        was broken, and the two folders would be pointless.
+        """
+        for path in self._dlls("debug-crt"):
+            self.assertTrue(
+                self._debug_imports(path),
+                "%s sits in the debug folder but does not import the debug CRT, so either "
+                "the folders are swapped or both hold the same pair" % path.name)
+
+    def test_the_openssl_deploy_target_runs_after_build_not_after_link(self):
+        """MSBuild skips Link when nothing needs relinking.
+
+        That is exactly the state in which the DLL has been deleted and needs replacing, so
+        a target hanging off Link does not run when it is most needed.
+        """
+        text = read_source(PHANTOM_TESTS_VCXPROJ_PATH)
+        start = text.find('<Target Name="DeployOpenSsl"')
+        self.assertNotEqual(
+            -1, start,
+            "the target that supplies the OpenSSL runtime is gone, so libcrypto reverts to "
+            "a manual artefact and the test binary will one day fail to start with no "
+            "output at all")
+        region = text[start:text.index("</Target>", start)]
+        self.assertTrue(
+            'AfterTargets="Build"' in region,
+            "DeployOpenSsl no longer runs after Build. Hanging off Link means it will not "
+            "run on an up-to-date project, which is when the DLL is missing.")
+        self.assertTrue(
+            'DestinationFolder="$(OutDir)"' in region,
+            "DeployOpenSsl no longer copies into the output directory, so the DLL never "
+            "reaches the test binary")
+
+    def test_the_openssl_flavour_mapping_is_complete_and_has_no_fallback(self):
+        """A default would quietly deploy the wrong runtime, which is the original defect."""
+        text = read_source(PHANTOM_TESTS_VCXPROJ_PATH)
+        for configuration, flavour in (("Release", "release-crt"), ("Debug", "debug-crt")):
+            expected = ("<OpenSslCrtFlavour Condition=\"'$(Configuration)' == '%s'\">%s"
+                        % (configuration, flavour))
+            self.assertTrue(
+                expected in text,
+                "the %s configuration no longer maps to %s, so an OpenSSL runtime of the "
+                "wrong flavour, or none at all, reaches that build"
+                % (configuration, flavour))
+        self.assertTrue(
+            "<OpenSslCrtFlavour>" not in text,
+            "an unconditional OpenSslCrtFlavour default has been added. A configuration "
+            "the mapping does not cover must copy NOTHING and fail loudly with a missing "
+            "DLL, rather than silently receive a runtime built against the other CRT.")
+
+    def test_every_vendored_dll_directory_has_a_deploy_target(self):
+        """THE GENERAL GUARD, derived rather than listed.
+
+        The defect was not specific to OpenSSL: it was a DLL the build did not own. Any
+        future vendored runtime with no target is the same defect again, so the subject list
+        comes from the vendor tree itself.
+        """
+        vendor = ROOT / "vendor"
+        self.assertTrue(vendor.is_dir(), "the vendor directory is gone")
+        holders = sorted({p.parent for p in vendor.rglob("*.dll")})
+        self.assertTrue(
+            holders,
+            "no vendored DLLs found at all; this guard has lost its subject and would "
+            "pass vacuously")
+        project = read_source(PHANTOM_TESTS_VCXPROJ_PATH)
+        for folder in holders:
+            # Targets reference either the flavour parent or the folder itself.
+            parent_token = folder.parent.relative_to(ROOT).as_posix().replace("/", "\\")
+            own_token = folder.relative_to(ROOT).as_posix().replace("/", "\\")
+            self.assertTrue(
+                parent_token in project or own_token in project,
+                "%s holds vendored DLLs that no deploy target in PhantomTests.vcxproj "
+                "references. An unowned runtime DLL is a manual artefact: when it goes "
+                "missing the test binary exits 0xC0000135 printing nothing, and when it is "
+                "restored by hand the CRT flavour is whatever the restorer happened to "
+                "have." % own_token)
+
+    def test_the_flavour_folders_are_not_named_after_configurations(self):
+        """.gitignore excludes any directory called Release or Debug.
+
+        A per-configuration folder therefore could not be committed, and a clean checkout
+        would silently have nothing to copy - which is the same outcome as having no target.
+        """
+        for folder in sorted(p for p in OPENSSL_VENDOR_DLL_DIR.iterdir() if p.is_dir()):
+            self.assertNotIn(
+                folder.name, ("Release", "Debug", "release", "debug"),
+                "vendor/openssl/lib/%s is named after a configuration. .gitignore excludes "
+                "directories called Release or Debug, so this cannot be committed and a "
+                "fresh clone would have nothing to deploy." % folder.name)
 
 
 if __name__ == "__main__":
