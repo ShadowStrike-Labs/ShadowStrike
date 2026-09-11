@@ -8,7 +8,7 @@
 <strong>Open-Source Next-Generation Endpoint Protection Platform for Windows</strong>
 
 <br/>
-<em>Custom kernel sensor · On-device analysis · Full-system emulation engine</em>
+<em>Custom kernel sensor · Full-system emulation engine</em>
 
 <br/><br/>
 
@@ -66,7 +66,7 @@ This is not a wrapper around existing tools, and not a proof of concept. It is a
 | **[PhantomSensor](#phantomsensor--kernel-driver)** | WDM minifilter kernel driver — 20 detection subsystems, from file I/O interception to syscall integrity |
 | **[PhantomCore](#phantomcore--shared-detection-engine)** | User-mode detection, protection and intelligence stack — 23 module families, shared by all three product tiers |
 | **[PhantomEmulator](#phantomemulator--malware-emulation-engine)** | Custom x86/x64 CPU emulation engine for safe malware detonation — no hypervisor, no third-party emulation library |
-| **[PhantomCortex](#phantomcortex--on-device-analysis)** | On-device threat classification — 5 model architectures with the inference path wired into the scan pipeline |
+| **PhantomCortex** | Threat classification — 5 model architectures with the inference path wired into the scan pipeline |
 | **[PhantomDisassembler](#phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 instruction decoder, replacing the vendored Zydis dependency |
 
 > **Current state — alpha, under active development, tested against live Windows endpoints.** The kernel driver is complete: Coverity-verified at 0.25 defects/KLoC, passing Driver Verifier with zero violations, loading and filtering on a live endpoint. The user-mode engine is feature-complete and in a security-hardening phase — the product installs, loads its signed driver, establishes an encrypted kernel channel and performs on-access scanning, with a recent field run scanning 56,866 files on a live endpoint. The emulation engine is implemented. The AI models are trained on 3.5M+ real PE samples (EMBER 2018 + EMBER 2024) and the inference path is wired into the scan pipeline, but the models are not yet packaged for endpoint deployment. Public beta is targeted for the start of 2027. See [Known Limitations](#known-limitations) for a full account of what is not finished.
@@ -131,7 +131,7 @@ ShadowStrike Phantom is the alternative:
 │  │  ┌──────────────────┐  ┌──────────────────────────┐ │                                  │
 │  │  │ PhantomEmulator  │  │     PhantomCortex AI     │ │                                  │
 │  │  │ x86/x64 CPU Emu  │  │  5 Neural Network Models │ │                                  │
-│  │  │ 10 DLL Emulation │  │  ONNX · On-Device        │ │                                  │
+│  │  │ 10 DLL Emulation │  │  ONNX Runtime            │ │                                  │
 │  │  └──────────────────┘  └──────────────────────────┘ │                                  │
 │  └─────────────────────────┬──────────────────────────┘                                  │
 │                            │                                                              │
@@ -202,37 +202,6 @@ A from-scratch WDM minifilter kernel driver that intercepts, analyzes, and block
 - `/INTEGRITYCHECK` linked for `PsSetCreateProcessNotifyRoutineEx` compliance
 - CNG (BCrypt) — kernel-mode SHA-256/MD5 hashing for file reputation
 - Memory-mapped shared definitions for kernel↔user-mode type safety
-
----
-
-## PhantomCortex — On-Device Analysis
-
-Five purpose-built neural network models designed to run inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on 3.5–3.6M real PE samples from the EMBER 2018–2024 datasets plus synthetic behavioral, memory, network, and emulation data.
-
-> **Status.** The C++ inference bridge and ONNX Runtime integration are built and wired into the scan pipeline, and four of the five models are trained (the fifth is being retrained). Endpoint delivery is not done: the models are not packaged into the installer and there is no signed model distribution, so on an installed endpoint the ML path finds no models and stays inactive. Sub-millisecond scoring is a development measurement, not a figure from a shipped deployment.
-
-| Model | Architecture | Input | Purpose |
-|-------|-------------|-------|---------|
-| **Cortex-Static** | LightGBM (gradient boosting) | PE headers, imports, sections, entropy | Static file classification before execution |
-| **Cortex-Behavioral** | 1D CNN | API call sequences (512-length) | Runtime behavior pattern recognition |
-| **Cortex-Emulation** | GRU (recurrent) | Emulation trace sequences | Malware family classification from sandbox runs |
-| **Cortex-Memory** | MLP (feedforward) | Memory region features | Injected code / shellcode detection in process memory |
-| **Cortex-Network** | Autoencoder (anomaly) | Network flow features | C2 communication and exfiltration anomaly detection |
-
-### Training Pipeline
-- **Automated retraining pipeline** with fresh threat intelligence feeds
-- **INT8 quantization** for minimal CPU footprint on endpoints
-- **ONNX Runtime** inference — sub-millisecond scoring per sample as measured in development
-- **6 threat intel feeds**: EMBER, Feodo Tracker, MalwareBazaar, OTX AlienVault, ThreatFox, URLhaus
-- **Feature extraction pipeline** with PE, behavioral, emulation, memory, and network feature modules
-- **Model evaluation** with precision/recall/F1 tracking, A/B deployment support
-
-### C++ Inference Bridge (`src/PhantomCore/AI/`)
-- `PhantomCortex.cpp` — Singleton orchestrator coordinating all 5 models
-- `ModelInference.cpp` — ONNX Runtime integration with thread-safe batch inference
-- `ModelCache.cpp` — LRU model cache with secure hash verification
-- `FeatureExtractor.cpp` — Real-time feature extraction from scan pipeline
-- `CortexConfig.cpp` — Dynamic model configuration with hot-reload
 
 ---
 
@@ -501,7 +470,7 @@ ShadowStrike/
 
 A deliberate design goal is a small, permissively licensed dependency set: the supply chain of a security product is part of its attack surface, and every third-party component in a Ring-0-adjacent product is something a user would otherwise have to audit separately.
 
-**There are no GPL dependencies, and no cloud service is required to reach a detection verdict.**
+**There are no GPL dependencies.**
 
 | Dependency | Licence | Role | Notes |
 |-----------|---------|------|-------|
