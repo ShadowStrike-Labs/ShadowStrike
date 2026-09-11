@@ -413,6 +413,9 @@ MALICIOUS_DOWNLOAD_BLOCKER_CPP_PATH = (
     ROOT / "src" / "Products" / "Community" / "PhantomHome" /
     "WebProtection" / "MaliciousDownloadBlocker.cpp")
 OPENSSL_VENDOR_DLL_DIR = ROOT / "vendor" / "openssl" / "lib"
+BROWSER_PROTECTION_CPP_PATH = (
+    ROOT / "src" / "Products" / "Community" / "PhantomHome" /
+    "WebProtection" / "BrowserProtection.cpp")
 REGISTRY_PROTECTION_HPP_PATH = ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.hpp"
 REGISTRY_PROTECTION_CPP_PATH = (
     ROOT / "src/PhantomCore/SelfProtection/RegistryProtection.cpp"
@@ -25756,6 +25759,121 @@ class OpenSslRuntimeDependencyContractTests(unittest.TestCase):
                 "vendor/openssl/lib/%s is named after a configuration. .gitignore excludes "
                 "directories called Release or Debug, so this cannot be committed and a "
                 "fresh clone would have nothing to deploy." % folder.name)
+
+
+class BrowserProtectionCapabilityHonestyContractTests(unittest.TestCase):
+    """A module must not report a capability it does not have.
+
+    MEASURED. StartNativeMessagingInternal checked that ShadowStrikeNativeHost.exe existed
+    and, if so, set m_nativeMessagingRunning and logged "Native messaging host started".
+    Nothing in the file starts a host: no thread, no pipe server, no process launch. The
+    presence of a file was reported as a running host, and StopNativeMessagingInternal
+    closes a pipe handle nothing ever opens.
+
+    IsNativeMessagingRunningInternal probed the named pipe and, when the probe FAILED,
+    returned the flag anyway, commented "the flag indicates intent to run". It verified,
+    discarded the verification, and returned the wish. That answer feeds
+    nativeMessagingConnected in the statistics JSON, so the claim travelled.
+
+    WHY THE MODULE STILL REFUSES TO START, and why that must not be "fixed" into a start.
+    Nothing outside WebProtectionWiring's four lifecycle hooks calls into BrowserProtection
+    at all: OnNavigate, IsURLBlocked, OnDownload and the rest of roughly forty-five public
+    capability methods have no caller, so the blocklist is populated at Initialize and never
+    consulted. EnforceSafeSearchInternal sets a bool, logs "enforcement enabled" and writes
+    no policy. The module therefore inspects nothing without the host, and a start would
+    report a healthy module with no function.
+    """
+
+    MEMBER_CLOSE = "\n    }\n"
+
+    def _member(self, signature):
+        source = strip_c_comments(read_source(BROWSER_PROTECTION_CPP_PATH))
+        at = source.find(signature)
+        self.assertNotEqual(-1, at, "%s is gone" % signature)
+        end = source.find(self.MEMBER_CLOSE, at)
+        self.assertNotEqual(-1, end, "%s has no member close" % signature)
+        return source[at:end]
+
+    def test_nothing_claims_a_host_was_started(self):
+        source = read_source(BROWSER_PROTECTION_CPP_PATH)
+        self.assertTrue(
+            'L"Native messaging host started"' not in source,
+            "something logs that the native messaging host started. No code in this module "
+            "starts one, so the message can only ever be false.")
+
+    def test_the_running_flag_is_never_set_from_a_file_existing(self):
+        """The core defect: presence of a binary is not a running host."""
+        source = strip_c_comments(read_source(BROWSER_PROTECTION_CPP_PATH))
+        self.assertTrue(
+            "m_nativeMessagingRunning.store(true)" not in source,
+            "the native messaging running flag is set to true somewhere. Nothing launches "
+            "or connects to a host, so setting it means IsNativeMessagingRunning and the "
+            "nativeMessagingConnected statistic both report a channel that does not exist.")
+
+    def test_an_absent_host_reports_which_protection_is_lost(self):
+        body = self._member("bool StartNativeMessagingInternal() {")
+        self.assertTrue(
+            "in-browser navigation" in body,
+            "the missing-host message no longer names the protection that is unavailable. "
+            "A failure that does not say what was lost gets triaged as noise.")
+        self.assertTrue(
+            body.count("inspects nothing") >= 1,
+            "the message no longer states that the module inspects nothing without the "
+            "host, which is the fact that makes this an outage rather than a warning")
+
+    def test_a_present_binary_is_not_reported_as_a_running_host(self):
+        """The case that was silently wrong and would have bitten on the first drop-in."""
+        body = self._member("bool StartNativeMessagingInternal() {")
+        self.assertTrue(
+            "no host launch is" in body,
+            "finding the host binary no longer reports that no launch is implemented. If "
+            "this path reports success again, dropping any file of that name beside the "
+            "service makes the module claim a working browser channel.")
+
+    def test_the_pipe_probe_is_the_answer_and_intent_is_not(self):
+        body = self._member(
+            "bool IsNativeMessagingRunningInternal() const noexcept {")
+        self.assertTrue(
+            "Pipe may not be created yet" not in read_source(BROWSER_PROTECTION_CPP_PATH),
+            "the intent fallback comment is back, which means the function is reporting a "
+            "wish again")
+        tail = body[body.index("CreateFileW"):]
+        self.assertTrue(
+            "return m_nativeMessagingRunning.load();" not in tail,
+            "after probing the pipe the function returns the running flag again. A failed "
+            "probe is a definite no; falling back to intent turns a verification into a "
+            "claim.")
+        self.assertTrue(
+            "CloseHandle(hPipe);" in body,
+            "the probe no longer closes the handle it opened, which leaks one per query")
+
+    def test_initialize_does_not_duplicate_the_attempt(self):
+        source = strip_c_comments(read_source(BROWSER_PROTECTION_CPP_PATH))
+        self.assertEqual(
+            1, source.count("StartNativeMessagingInternal();"),
+            "StartNativeMessagingInternal is called %d times, expected only the public "
+            "wrapper. Initialize used to call it and discard the result, which logged the "
+            "same failure twice per startup and gated nothing."
+            % source.count("StartNativeMessagingInternal();"))
+
+    def test_the_module_still_refuses_to_start_without_a_host(self):
+        """THE ANTI-REGRESSION GUARD, and the tempting wrong fix.
+
+        Making this return true would silence the startup error and produce a module that
+        reports healthy. It would inspect nothing: no caller feeds it a navigation, and its
+        safe-search path writes no policy. The loud failure is the honest signal.
+        """
+        body = self._member("bool StartNativeMessagingInternal() {")
+        self.assertEqual(
+            2, body.count("return false;"),
+            "StartNativeMessagingInternal has %d failure returns, expected 2 - one for an "
+            "absent host and one for a present binary with no launch path. If either became "
+            "a success the module would start while inspecting nothing."
+            % body.count("return false;"))
+        self.assertEqual(
+            1, body.count("return true;"),
+            "the only success return must be the already-running early exit. An extra one "
+            "means the module now claims to have started a host.")
 
 
 if __name__ == "__main__":

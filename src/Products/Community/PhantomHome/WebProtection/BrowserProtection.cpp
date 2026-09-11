@@ -484,9 +484,11 @@ public:
         m_parentalSettings = m_config.parentalControls;
         m_safeSearchEnforced = m_config.enableSafeSearch;
 
-        if (m_config.enableExtensionScanning) {
-            StartNativeMessagingInternal();
-        }
+        // Native messaging is started by the orchestrator's start step, not here. This
+        // used to call StartNativeMessagingInternal and DISCARD the result, which
+        // achieved nothing except logging the same failure a second time on every
+        // startup - the 1.0.113 run shows the pair one millisecond apart. Initialize
+        // carried on to Running regardless, so the call never gated anything.
 
         m_stats.Reset();
         m_status = ModuleStatus::Running;
@@ -1290,21 +1292,46 @@ public:
     // NATIVE MESSAGING
     // ========================================================================
 
+    // NATIVE MESSAGING IS NOT IMPLEMENTED, AND THIS FUNCTION MUST NOT PRETEND IT IS.
+    //
+    // It used to check that ShadowStrikeNativeHost.exe existed and, if so, set
+    // m_nativeMessagingRunning and log "Native messaging host started". Nothing in
+    // this file starts a host: there is no thread, no pipe server and no process
+    // launch. The presence of a file was being reported as a running host.
+    //
+    // That mattered less than it looks only because the executable does not exist -
+    // no project in the tree builds it. The moment anyone dropped a binary of that
+    // name beside the service, the module would have claimed a working browser
+    // channel and IsNativeMessagingRunning would have agreed.
+    //
+    // The refusal below is deliberate and must stay. Without the host the module has
+    // no navigation input at all, so starting anyway would report a healthy module
+    // that inspects nothing. See the task board for the host and extension work.
     bool StartNativeMessagingInternal() {
         if (m_nativeMessagingRunning.load()) return true;
 
-        // Verify the native host executable exists
         wchar_t modulePath[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-        fs::path hostExePath = fs::path(modulePath).parent_path() / L"ShadowStrikeNativeHost.exe";
+        const fs::path hostExePath =
+            fs::path(modulePath).parent_path() / L"ShadowStrikeNativeHost.exe";
+
         if (!fs::exists(hostExePath) || !fs::is_regular_file(hostExePath)) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Native messaging host executable missing: %ls", hostExePath.c_str());
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"Native messaging host executable missing: %ls - in-browser navigation"
+                L" and download control are UNAVAILABLE, so this module inspects nothing.",
+                hostExePath.c_str());
             return false;
         }
 
-        m_nativeMessagingRunning.store(true);
-        SS_LOG_INFO(LOG_CATEGORY, L"Native messaging host started");
-        return true;
+        // PRESENT IS NOT RUNNING. There is no launch or connect path to run, so the
+        // only honest answer is still no. Reporting success here on the strength of a
+        // file existing is the defect this replaces.
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"Native messaging host binary found at %ls but no host launch is"
+            L" implemented, so the browser channel is not established and this module"
+            L" inspects nothing.",
+            hostExePath.c_str());
+        return false;
     }
 
     void StopNativeMessagingInternal() {
@@ -1320,20 +1347,25 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Native messaging host stopped");
     }
 
+    // THE PIPE PROBE IS THE ANSWER. INTENT IS NOT EVIDENCE.
+    //
+    // This used to fall back to m_nativeMessagingRunning when the probe failed,
+    // commented "the flag indicates intent to run". It verified, discarded the
+    // verification and returned the wish, so a caller asking whether the browser
+    // channel was up could be told yes while no pipe existed. That answer feeds
+    // nativeMessagingConnected in the statistics JSON, so the claim travels.
     bool IsNativeMessagingRunningInternal() const noexcept {
         if (!m_nativeMessagingRunning.load()) return false;
 
-        // Verify the named pipe exists
-        std::wstring pipeName = L"\\\\.\\pipe\\ShadowStrikeBrowserProtection";
-        HANDLE hPipe = CreateFileW(pipeName.c_str(), GENERIC_READ, 0, nullptr,
-                                    OPEN_EXISTING, 0, nullptr);
-        if (hPipe != INVALID_HANDLE_VALUE) {
-            CloseHandle(hPipe);
-            return true;
+        const std::wstring pipeName = L"\\\\.\\pipe\\ShadowStrikeBrowserProtection";
+        const HANDLE hPipe = CreateFileW(pipeName.c_str(), GENERIC_READ, 0, nullptr,
+                                         OPEN_EXISTING, 0, nullptr);
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            return false;
         }
 
-        // Pipe may not be created yet but the flag indicates intent to run
-        return m_nativeMessagingRunning.load();
+        CloseHandle(hPipe);
+        return true;
     }
 
     // ========================================================================
