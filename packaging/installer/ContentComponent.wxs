@@ -60,7 +60,16 @@
       same way DriverComponent.wxs contributes Drivers\ and Certs\.
     -->
     <DirectoryRef Id="INSTALLFOLDER">
-      <Directory Id="ContentDir" Name="content"/>
+      <Directory Id="ContentDir" Name="content">
+        <!--
+          content\psl\ - reference data read at runtime by
+          Utils::Domain::PublicSuffixList, which resolves it through
+          DataStorePaths::GetShippedContentDirectory(), that being
+          ModuleDirectory() + "\content". So this path is what the code already
+          looks for; nothing in the product had to change to find it.
+        -->
+        <Directory Id="ContentPslDir" Name="psl"/>
+      </Directory>
     </DirectoryRef>
 
     <!--
@@ -117,6 +126,37 @@
       <File Id="ThirdPartyRulesManifest"
             Name="THIRD-PARTY-RULES.md"
             Source="$(var.StagingDir)\Content\THIRD-PARTY-RULES.md"/>
+    </Component>
+
+    <!--
+      Public Suffix List.
+
+      WHY IT MUST SHIP RATHER THAN BE OPTIONAL. Without it the registrable domain of a
+      host cannot be determined, and the code that needs one falls back to assuming the
+      last two labels. That is wrong for every multi-label suffix - it reads co.uk as the
+      owner of bbc.co.uk - and in the DNS-tunnel checks it is the difference between
+      measuring the labels an attacker added and measuring the registrant's own name.
+      The fallback is deliberately imprecise rather than empty, because an empty
+      subdomain scores zero on every tunnel check and would switch the detector off
+      instead of degrading it. Shipping the list is what makes the precise path the
+      normal one.
+
+      THE MPL-2.0 NOTICE TRAVELS INSIDE THE FILE. The list carries its own licence
+      header in the first three lines, so shipping the file unmodified satisfies the
+      attribution condition without a separate manifest - unlike the YARA rules, whose
+      attribution had to be generated into THIRD-PARTY-RULES.md.
+
+      Pure payload, no side effects, so a repair restores it without disturbing anything.
+    -->
+    <Component Id="CmpPublicSuffixList"
+               Directory="ContentPslDir"
+               Guid="{9B41E7D2-6C58-4A93-B70E-1D5F2A84C3E7}"
+               Bitness="always64">
+
+      <File Id="PublicSuffixListData"
+            Name="public_suffix_list.dat"
+            Source="$(var.StagingDir)\Content\psl\public_suffix_list.dat"
+            KeyPath="yes"/>
     </Component>
 
     <!--

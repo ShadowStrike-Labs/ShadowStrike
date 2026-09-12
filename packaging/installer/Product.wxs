@@ -233,6 +233,7 @@
       <ComponentRef Id="CmpProgramDataData"/>
       <ComponentRef Id="CmpCortexModelStore"/>
       <ComponentRef Id="CmpDetectionContent"/>
+      <ComponentRef Id="CmpPublicSuffixList"/>
 
       <!-- Qt 6 runtime DLLs and plugins (auto-harvested from windeployqt staging). -->
       <ComponentGroupRef Id="QtRuntimeComponents"/>

@@ -628,6 +628,31 @@ Rebuild with phantom-sigbuild, which generates the manifest alongside the output
     }
     Copy-Item $prebuiltDoc (Join-Path $stagingContentDir 'THIRD-PARTY-RULES.md') -Force
 
+    # The Public Suffix List is reference data the product reads at runtime from
+    # content\psl\, so it has to reach the staging tree the MSI is built from. It is
+    # tracked in the repository rather than fetched, so an absent file means a broken
+    # checkout and not a missing optional download - hence Die rather than a warning.
+    # Shipping without it does not disable anything, but it does silently drop every
+    # domain decision back to a last-two-labels approximation, which is precisely the
+    # imprecision the list was added to remove.
+    $pslSource = Join-Path $RepoRoot 'content\psl\public_suffix_list.dat'
+    if (-not (Test-Path $pslSource)) {
+        Die @"
+content\psl\public_suffix_list.dat is missing from the repository.
+
+It is tracked, not downloaded, so this is a broken checkout. Without it every
+registrable-domain decision falls back to assuming the last two labels, which is
+wrong for co.uk and every other multi-label suffix.
+"@
+    }
+    $stagingPslDir = Join-Path $stagingContentDir 'psl'
+    New-Item -ItemType Directory -Force -Path $stagingPslDir | Out-Null
+    Copy-Item $pslSource (Join-Path $stagingPslDir 'public_suffix_list.dat') -Force
+    $pslVersion = (Select-String -Path $pslSource -Pattern '^// VERSION:' |
+                   Select-Object -First 1).Line
+    Say ("  staged Public Suffix List: {0} bytes, {1}" -f `
+        (Get-Item (Join-Path $stagingPslDir 'public_suffix_list.dat')).Length, $pslVersion)
+
     # Report what is actually going into the MSI, decoded from the database header
     # rather than taken on trust: magic 'SSSD' at 0, rule/hash counts at 144/128.
     $bytes = New-Object byte[] 160

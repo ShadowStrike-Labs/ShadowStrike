@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+CONTENT_COMPONENT_WXS_PATH = ROOT / "packaging/installer/ContentComponent.wxs"
 NETWORK_EVASION_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
 DOMAIN_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.hpp"
 DOMAIN_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.cpp"
@@ -26406,6 +26407,109 @@ class DnsTunnelSubdomainContractTests(unittest.TestCase):
             "again. Any host whose text repeats its suffix earlier resolves to the wrong "
             "offset, and the function returns 0.0 - disabling the entropy check for exactly "
             "the crafted names it exists to catch.")
+
+
+class ShippedContentDeliveryContractTests(unittest.TestCase):
+    """A file the product reads from its install tree but the MSI never places is absent.
+
+    MEASURED. DataStorePaths::GetShippedContentDirectory() resolves to ModuleDirectory() plus
+    "\\content", so anything read through it must be installed under [INSTALLFOLDER]\\content.
+    Getting that wrong is silent in a specific and unhelpful way: the read fails at runtime on
+    an endpoint, every developer machine works because the repository tree is right there, and
+    no build step complains.
+
+    The Public Suffix List hit exactly that. It was vendored, loaded through this accessor, and
+    packaged nowhere - so on an installed endpoint every registrable-domain decision would
+    have fallen back to assuming the last two labels.
+
+    The subject list is DERIVED from the source, so a future file read from shipped content
+    without a matching installer entry fails here.
+    """
+
+    def _shipped_content_reads(self):
+        """Leaf filenames the code builds from GetShippedContentDirectory()."""
+        found = set()
+        scanned = 0
+        skip = {"node_modules", ".venv_local", ".git", "build", "bin", "obj", "vendor", "x64"}
+        for path in sorted(ROOT.rglob("*")):
+            if path.suffix not in (".cpp", ".hpp") or set(path.parts) & skip:
+                continue
+            scanned += 1
+            text = path.read_bytes().decode("utf-8", "replace")
+            if "GetShippedContentDirectory" not in text:
+                continue
+            # Only same-expression concatenations, which is where a literal relative path is
+            # visible. A path assembled across statements is out of reach here and is not
+            # claimed to be covered.
+            for match in re.finditer(
+                    r'GetShippedContentDirectory\(\)\s*\+\s*L"([^"]+)"', text):
+                leaf = match.group(1).replace("\\\\", "\\").strip("\\").split("\\")[-1]
+                if leaf:
+                    found.add(leaf)
+        self.assertGreater(
+            scanned, 200,
+            "only %d sources were scanned, so this guard has lost its subject" % scanned)
+        return found
+
+    def test_every_file_read_from_shipped_content_is_installed(self):
+        reads = self._shipped_content_reads()
+        self.assertTrue(
+            reads,
+            "no shipped-content reads were found at all. Either the accessor was renamed or "
+            "the concatenation form changed; this guard must be updated rather than left "
+            "passing on an empty set.")
+        wxs = read_source(CONTENT_COMPONENT_WXS_PATH)
+        missing = [leaf for leaf in sorted(reads)
+                   if ('Name="%s"' % leaf) not in wxs]
+        self.assertEqual(
+            [], missing,
+            "the product reads these from its shipped content directory, but the installer "
+            "packages no File element for them, so they are absent on any installed "
+            "endpoint: %s" % missing)
+
+    def test_the_public_suffix_component_is_referenced_by_a_feature(self):
+        """An unreferenced component is compiled and never installed."""
+        wxs = read_source(CONTENT_COMPONENT_WXS_PATH)
+        self.assertIn(
+            'Id="CmpPublicSuffixList"', wxs,
+            "the public suffix list component is gone from ContentComponent.wxs")
+        product = read_source(INSTALLER_PRODUCT_WXS_PATH)
+        self.assertIn(
+            '<ComponentRef Id="CmpPublicSuffixList"/>', product,
+            "CmpPublicSuffixList is declared but no Feature references it. WiX will build the "
+            "component and the installer will never place the file, which is the same "
+            "end state as not authoring it at all.")
+
+    def test_the_installer_directory_matches_the_path_the_code_reads(self):
+        """content\\psl in the code and in the installer must not drift apart."""
+        code = strip_c_comments(read_source(DOMAIN_UTILS_CPP_PATH))
+        self.assertIn(
+            'L"\\\\psl\\\\public_suffix_list.dat"', code,
+            "the loader no longer reads content\\psl\\public_suffix_list.dat")
+        wxs = read_source(CONTENT_COMPONENT_WXS_PATH)
+        self.assertIn('Name="psl"', wxs, "the psl directory is gone from the installer")
+        self.assertIn(
+            'Name="public_suffix_list.dat"', wxs,
+            "the list file is gone from the installer")
+        self.assertIn(
+            r'Source="$(var.StagingDir)\Content\psl\public_suffix_list.dat"', wxs,
+            "the installer sources the list from somewhere other than the staging Content "
+            "tree, which is the only directory the deploy harness populates")
+
+    def test_the_deploy_harness_stages_the_list(self):
+        """The MSI is built from the staging tree, so an unstaged file cannot be packaged."""
+        harness = read_source(DEPLOY_HARNESS_PS1_PATH)
+        self.assertIn(
+            "Join-Path $stagingContentDir 'psl'", harness,
+            "the deploy harness no longer creates content\\psl under the staging tree, so "
+            "the installer's Source path will not exist")
+        # The copy itself, not just a mention of the directory: creating the folder and
+        # never filling it produces an MSI build failure at best and a stale packaged copy
+        # at worst.
+        self.assertRegex(
+            harness, r"Copy-Item\s+\$pslSource",
+            "the harness creates the staging psl directory but no longer copies the list "
+            "into it, so nothing reaches the MSI")
 
 
 if __name__ == "__main__":
