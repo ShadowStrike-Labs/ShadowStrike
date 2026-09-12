@@ -61,3 +61,6 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+# Vendored data: keep byte-exact. The loader tolerates CR, but a checkout that
+# differs from what was committed makes the file's hash meaningless as evidence.
+content/psl/public_suffix_list.dat -text
