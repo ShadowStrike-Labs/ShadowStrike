@@ -50,6 +50,7 @@ extern "C" {
     void PhantomHome_KeepAlive_ZeroTrust()            noexcept;
     void PhantomHome_KeepAlive_AmsiProvider()         noexcept;
     void PhantomHome_KeepAlive_NetworkAttackBlocker() noexcept;
+    void PhantomHome_KeepAlive_Pgti()                 noexcept;
 }
 
 namespace ShadowStrike {
@@ -96,6 +97,7 @@ void EnsureAllModulesWired() noexcept {
         &PhantomHome_KeepAlive_ZeroTrust,
         &PhantomHome_KeepAlive_AmsiProvider,
         &PhantomHome_KeepAlive_NetworkAttackBlocker,
+        &PhantomHome_KeepAlive_Pgti,
     };
 
     // Force the optimiser to assume the table is observed by reading every

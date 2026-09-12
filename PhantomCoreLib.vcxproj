@@ -437,6 +437,9 @@
     <ClCompile Include="src\Products\Community\PhantomHome\NetworkAttackBlocker\wiring\NabWiring.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomHome\ThreatIntel\wiring\PgtiWiring.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\AI\CortexConfig.cpp" />
     <ClCompile Include="src\PhantomCore\AI\FeatureExtractor.cpp" />
     <ClCompile Include="src\PhantomCore\AI\ModelCache.cpp" />

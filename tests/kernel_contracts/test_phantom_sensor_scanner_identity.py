@@ -160,6 +160,11 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+WIRING_ANCHOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WiringAnchor.cpp"
+PGTI_WIRING_CPP_PATH = (
+    ROOT / "src/Products/Community/PhantomHome/ThreatIntel/wiring/PgtiWiring.cpp"
+)
+PHANTOM_HOME_DIR = ROOT / "src/Products/Community/PhantomHome"
 REPORT_GENERATOR_CPP_PATH = ROOT / "src" / "PhantomCore" / "Communication" / "ReportGenerator.cpp"
 CONFIG_MANAGER_CPP_PATH = ROOT / "src" / "PhantomCore" / "Config" / "ConfigManager.cpp"
 SCAN_ENGINE_HPP_PATH = SCAN_ENGINE_CPP_PATH.with_suffix(".hpp")
@@ -26072,6 +26077,126 @@ class ScanCounterRoundTripContractTests(unittest.TestCase):
                 "%s is cleared by %d reset path(s) but mlHits by %d. A counter cleared by "
                 "only some reset paths keeps counting across a reset that claims to have "
                 "zeroed the statistics." % (counter, resets, reference))
+
+
+class HomeWiringRetentionContractTests(unittest.TestCase):
+    """A registrar that the linker elides is indistinguishable from one never written.
+
+    MEASURED. Every PhantomHome module registers itself with HomeProductOrchestrator from a
+    static registrar in a *Wiring.cpp, and WiringAnchor.cpp documents why that is fragile:
+    MSVC /OPT:REF with /LTCG can elide a translation unit whose only contribution is a
+    dynamically-initialised internal-linkage global. The defence is a per-unit extern "C"
+    keep-alive function whose address is read through a volatile table in
+    EnsureAllModulesWired().
+
+    That makes the chain four links long - the symbol is defined, declared, referenced in the
+    table, and the unit is listed in a project file - and breaking any one of them produces
+    the SAME silent outcome: the module never registers, nothing logs, and no build fails.
+    PGTI shipped with zero of the four for as long as it existed.
+
+    Every subject list here is DERIVED from the tree. The anchor implementations are exempt
+    by ROLE rather than by name: a wiring unit that defines EnsureAllModulesWired is an
+    anchor or a stub for one, not a registrar.
+    """
+
+    def _wiring_units(self):
+        """(path, source) for every registrar wiring unit under PhantomHome."""
+        units = []
+        for path in sorted(PHANTOM_HOME_DIR.rglob("*Wiring*.cpp")):
+            source = path.read_bytes().decode("utf-8", "replace")
+            if re.search(r"void\s+EnsureAllModulesWired\s*\(\s*\)", source):
+                continue  # the anchor itself, or a stub standing in for it
+            units.append((path, source))
+        self.assertGreater(
+            len(units), 20,
+            "only %d registrar wiring units were found, so these guards have lost their "
+            "subject and would pass vacuously" % len(units))
+        return units
+
+    def _anchor_sets(self):
+        text = read_source(WIRING_ANCHOR_CPP_PATH)
+        declared = set(re.findall(
+            r"void\s+(PhantomHome_KeepAlive_\w+)\(\)\s+noexcept;", text))
+        tabled = set(re.findall(r"&(PhantomHome_KeepAlive_\w+),", text))
+        return declared, tabled
+
+    def test_every_registrar_wiring_unit_defines_a_keep_alive_symbol(self):
+        missing = [p.name for p, s in self._wiring_units()
+                   if not re.search(
+                       r'extern "C" void\s+PhantomHome_KeepAlive_\w+\(\)\s*noexcept\s*\{\}', s)]
+        self.assertEqual(
+            [], missing,
+            "these wiring units register a module but define no keep-alive symbol, so the "
+            "linker may drop the whole translation unit and the module will silently never "
+            "register: %s" % missing)
+
+    def test_every_keep_alive_symbol_is_referenced_by_the_volatile_table(self):
+        """The table read is what creates the reference edge; a declaration alone does not."""
+        _declared, tabled = self._anchor_sets()
+        orphans = []
+        for path, source in self._wiring_units():
+            found = re.search(
+                r'extern "C" void\s+(PhantomHome_KeepAlive_\w+)\(\)\s*noexcept\s*\{\}', source)
+            if found and found.group(1) not in tabled:
+                orphans.append("%s -> %s" % (path.name, found.group(1)))
+        self.assertEqual(
+            [], orphans,
+            "these keep-alive symbols are defined but never referenced from the volatile "
+            "table in EnsureAllModulesWired, so nothing stops /OPT:REF pruning their "
+            "translation unit: %s" % orphans)
+
+    def test_the_anchor_declares_exactly_what_its_table_references(self):
+        declared, tabled = self._anchor_sets()
+        self.assertGreater(len(tabled), 20, "the keep-alive table has shrunk to %d entries"
+                           % len(tabled))
+        self.assertEqual(
+            sorted(declared), sorted(tabled),
+            "WiringAnchor.cpp declares and references different sets of keep-alive symbols. "
+            "declared-not-referenced=%s referenced-not-declared=%s. A declaration without a "
+            "table entry protects nothing, and a table entry without a declaration will not "
+            "compile."
+            % (sorted(declared - tabled), sorted(tabled - declared)))
+
+    def test_every_wiring_unit_is_listed_in_a_project_file(self):
+        projects = {p: p.read_bytes().decode("utf-8", "replace")
+                    for p in sorted(ROOT.rglob("*.vcxproj"))}
+        self.assertGreater(len(projects), 5, "only %d project files found" % len(projects))
+        unbuilt = []
+        for path, _source in self._wiring_units():
+            rel = path.relative_to(ROOT).as_posix().replace("/", "\\")
+            if not any(rel in text for text in projects.values()):
+                unbuilt.append(path.name)
+        self.assertEqual(
+            [], unbuilt,
+            "these wiring units are not listed in any project file, so they are never "
+            "compiled and their modules never register: %s" % unbuilt)
+
+    def test_the_pgti_feed_manager_has_a_start_and_a_stop(self):
+        """PgtiFeedManager was complete and never started for as long as it existed."""
+        source = strip_c_comments(read_source(PGTI_WIRING_CPP_PATH))
+        self.assertIn(
+            "PgtiFeedManager::Instance().Start()", source,
+            "the PGTI registrar no longer starts the feed manager. Its worker is what marks "
+            "a feed Degraded when it stops reporting, so without Start() the feed-health "
+            "view in the UI can never report a stalled feed.")
+        self.assertIn(
+            "PgtiFeedManager::Instance().Stop()", source,
+            "the PGTI registrar no longer stops the feed manager, so its jthread outlives "
+            "orchestrator shutdown")
+
+    def test_the_pgti_watchdog_starts_after_the_subsystem_it_observes(self):
+        """ORDERING. It reports on feeds owned by a CoreProtections-phase subsystem."""
+        source = strip_c_comments(read_source(PGTI_WIRING_CPP_PATH))
+        self.assertIn(
+            "ModulePhase::Background", source,
+            "the PGTI watchdog has been moved out of the Background phase. It observes feeds "
+            "owned by ThreatIntelStore, which comes up during CoreProtections, so starting "
+            "at or before that phase observes a subsystem that does not exist yet - the "
+            "start-ordering inversion recorded as task 235.")
+        self.assertNotIn(
+            "ModulePhase::Foundation", source,
+            "the PGTI watchdog now claims the Foundation phase, which runs before every "
+            "protection module")
 
 
 if __name__ == "__main__":
