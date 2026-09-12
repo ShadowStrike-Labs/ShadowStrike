@@ -25979,5 +25979,100 @@ class NtStatusRedefinitionContractTests(unittest.TestCase):
             "cast is correct rather than only quiet.")
 
 
+class ScanCounterRoundTripContractTests(unittest.TestCase):
+    """A scan-layer counter that is incremented but not exposed is unreadable.
+
+    MEASURED. This has already happened here twice. The Stats struct carries a comment about
+    archivesScanned and archiveFilesScanned, which ScanArchive incremented while they were
+    absent from the snapshot, so no caller could read them. And the 1.0.113 field run reported
+    six layer counters with nothing at all for threat intel, because stage 2.5 - which can
+    raise a verdict to Infected and invoke the detection callbacks - had no counter.
+
+    The subject list is DERIVED from the Stats struct, so a counter added in future without
+    its plumbing fails here rather than in a field log a year later.
+
+    JSON emission is deliberately NOT re-asserted here: 
+    ScanEngineStatisticsReadabilityContractTests already owns that invariant, and a
+    mutation confirmed it fires. This class covers the half that was uncovered - the
+    snapshot copy, the increments, their ordering, and reset parity.
+    """
+
+    # Counters that describe a pipeline measurement rather than a layer outcome are exempt
+    # from the JSON and snapshot requirements only if they are exempt from BOTH; a counter
+    # may not be half-plumbed.
+    TIMING_SUFFIXES = ("TimeMs", "TimeUs", "PerSecond")
+
+    def _stats_fields(self):
+        """Every uint64_t field declared in ScanEngine::Stats."""
+        text = strip_c_comments(read_source(SCAN_ENGINE_HPP_PATH))
+        at = text.find("struct Stats {")
+        self.assertNotEqual(-1, at, "ScanEngine::Stats is gone")
+        body = text[at:_matching_delimiter(text, text.index("{", at), "{", "}")]
+        fields = re.findall(r"\buint64_t\s+(\w+)\s*=", body)
+        self.assertGreater(
+            len(fields), 8,
+            "only %d uint64_t fields found in Stats, so this guard has lost its subject "
+            "and would pass vacuously" % len(fields))
+        return [f for f in fields if not f.endswith(self.TIMING_SUFFIXES)]
+
+    def test_every_declared_counter_is_copied_into_the_snapshot(self):
+        """A counter absent from the snapshot cannot be read by any caller."""
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        missing = [f for f in self._stats_fields()
+                   if not re.search(r"stats\.%s\s*=" % re.escape(f), source)]
+        self.assertEqual(
+            [], missing,
+            "these Stats counters are never assigned in the GetStatistics snapshot, so they "
+            "read as zero to every caller regardless of what was counted: %s. This is the "
+            "archivesScanned defect the Stats struct already documents." % missing)
+
+    def test_the_threat_intel_stage_counts_both_lookups_and_hits(self):
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        for counter in ("threatIntelLookups", "threatIntelHits"):
+            self.assertIn(
+                "m_impl->m_stats.%s.fetch_add(" % counter, source,
+                "%s is declared but never incremented, which makes it a counter that "
+                "reports zero forever" % counter)
+
+    def test_the_lookup_counter_counts_attempts_not_matches(self):
+        """ORDERING. The pair is only meaningful if one counts attempts.
+
+        Zero lookups means the stage never ran - no store, or the verdict was no longer
+        Clean. Lookups with zero hits means the stage ran against an empty or unhelpful
+        store. Those are opposite conditions, and if the lookup counter sat inside the
+        found-branch both would report zero and be indistinguishable.
+        """
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        lookup_at = source.find("m_impl->m_stats.threatIntelLookups.fetch_add(")
+        found_at = source.find("if (tiLookup.found)")
+        hit_at = source.find("m_impl->m_stats.threatIntelHits.fetch_add(")
+        for label, value in (("the lookup increment", lookup_at),
+                             ("the found check", found_at),
+                             ("the hit increment", hit_at)):
+            self.assertNotEqual(-1, value, "%s is gone" % label)
+        self.assertLess(
+            lookup_at, found_at,
+            "the threatIntelLookups increment has moved after the tiLookup.found check, so "
+            "it now counts matches rather than attempts and can no longer distinguish "
+            "'the stage never ran' from 'the store had nothing'")
+        self.assertLess(
+            found_at, hit_at,
+            "the threatIntelHits increment is no longer inside the found branch, so it "
+            "counts every lookup and the hit rate becomes meaningless")
+
+    def test_the_threat_intel_counters_are_cleared_by_every_reset_path(self):
+        """Two reset paths exist; a counter cleared by only one drifts across resets."""
+        source = strip_c_comments(read_source(SCAN_ENGINE_CPP_PATH))
+        for counter in ("threatIntelLookups", "threatIntelHits"):
+            resets = len(re.findall(
+                r"m_stats\.%s\.store\(0" % re.escape(counter), source))
+            reference = len(re.findall(r"m_stats\.mlHits\.store\(0", source))
+            self.assertEqual(
+                reference, resets,
+                "%s is cleared by %d reset path(s) but mlHits by %d. A counter cleared by "
+                "only some reset paths keeps counting across a reset that claims to have "
+                "zeroed the statistics." % (counter, resets, reference))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

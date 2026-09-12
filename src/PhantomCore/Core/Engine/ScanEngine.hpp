@@ -1097,6 +1097,20 @@ public:
         uint64_t behaviorHits = 0;
         uint64_t mlHits = 0;
 
+        /// @brief Stage 2.5 lookups performed against ThreatIntelStore, and how
+        ///        many of those found an entry.
+        ///
+        /// Reported as a pair because one number cannot separate two opposite
+        /// conditions. Zero lookups means the stage never ran - either no store
+        /// was present, or the verdict was no longer Clean when control reached
+        /// stage 2.5. Lookups with zero hits means the stage ran and the store
+        /// had nothing to say about the file, which is what an empty IOC
+        /// database looks like from the scan path. The 1.0.113 field run could
+        /// report neither: it listed six layer counters and had no number for
+        /// this one, so the layer's contribution was unmeasurable.
+        uint64_t threatIntelLookups = 0;
+        uint64_t threatIntelHits = 0;
+
         // Pipeline timing
         double avgWhitelistTimeUs = 0;
         double avgHashTimeUs = 0;

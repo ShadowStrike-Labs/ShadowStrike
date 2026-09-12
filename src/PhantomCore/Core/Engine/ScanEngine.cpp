@@ -244,6 +244,8 @@ public:
         std::atomic<uint64_t> heuristicHits{0};
         std::atomic<uint64_t> behaviorHits{0};
         std::atomic<uint64_t> mlHits{0};
+        std::atomic<uint64_t> threatIntelLookups{0};
+        std::atomic<uint64_t> threatIntelHits{0};
         std::atomic<uint64_t> totalTimeUs{0};
 
         // Pipeline stage times
@@ -970,6 +972,8 @@ public:
             m_stats.heuristicHits.store(0, std::memory_order_relaxed);
             m_stats.behaviorHits.store(0, std::memory_order_relaxed);
             m_stats.mlHits.store(0, std::memory_order_relaxed);
+            m_stats.threatIntelLookups.store(0, std::memory_order_relaxed);
+            m_stats.threatIntelHits.store(0, std::memory_order_relaxed);
             m_stats.totalTimeUs.store(0, std::memory_order_relaxed);
             m_stats.whitelistTimeUs.store(0, std::memory_order_relaxed);
             m_stats.hashTimeUs.store(0, std::memory_order_relaxed);
@@ -2023,10 +2027,24 @@ EngineResult ScanEngine::ScanFile(
             const auto stage25Start = steady_clock::now();
 
             try {
+                // Counted before the call, so a lookup that throws is still
+                // recorded as having been attempted; the catch below reports
+                // the exception separately.
+                m_impl->m_stats.threatIntelLookups.fetch_add(
+                    1, std::memory_order_relaxed);
+
                 auto tiLookup = m_impl->m_threatIntelStore->LookupHash(
                     "SHA256", fileHash, ThreatIntel::StoreLookupOptions{});
 
                 if (tiLookup.found) {
+                    // Counted for every arm below, including KnownGood.
+                    // A hit means the store held an entry for this file,
+                    // which is the question this counter answers; what the
+                    // entry then decided is already carried by the
+                    // infections and suspicious counters.
+                    m_impl->m_stats.threatIntelHits.fetch_add(
+                        1, std::memory_order_relaxed);
+
                     if (tiLookup.IsMalicious()) {
                         // Known-malicious IOC — immediate escalation
                         result.verdict = ScanVerdict::Infected;
@@ -5544,6 +5562,8 @@ std::string ScanEngine::Stats::ToJson() const {
     oss << "\"heuristicHits\":" << heuristicHits << ",";
     oss << "\"behaviorHits\":" << behaviorHits << ",";
     oss << "\"mlHits\":" << mlHits << ",";
+    oss << "\"threatIntelLookups\":" << threatIntelLookups << ",";
+    oss << "\"threatIntelHits\":" << threatIntelHits << ",";
     oss << "\"avgWhitelistTimeUs\":" << avgWhitelistTimeUs << ",";
     oss << "\"avgHashTimeUs\":" << avgHashTimeUs << ",";
     oss << "\"avgSignatureTimeMs\":" << avgSignatureTimeMs << ",";
@@ -5592,6 +5612,10 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
     stats.heuristicHits = m_impl->m_stats.heuristicHits.load(std::memory_order_relaxed);
     stats.behaviorHits = m_impl->m_stats.behaviorHits.load(std::memory_order_relaxed);
     stats.mlHits = m_impl->m_stats.mlHits.load(std::memory_order_relaxed);
+    stats.threatIntelLookups =
+        m_impl->m_stats.threatIntelLookups.load(std::memory_order_relaxed);
+    stats.threatIntelHits =
+        m_impl->m_stats.threatIntelHits.load(std::memory_order_relaxed);
     stats.archivesScanned =
         m_impl->m_stats.archivesScanned.load(std::memory_order_relaxed);
     stats.archiveFilesScanned =
@@ -5634,6 +5658,8 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.heuristicHits.store(0, std::memory_order_relaxed);
     m_impl->m_stats.behaviorHits.store(0, std::memory_order_relaxed);
     m_impl->m_stats.mlHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.threatIntelLookups.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.threatIntelHits.store(0, std::memory_order_relaxed);
     m_impl->m_stats.totalTimeUs.store(0, std::memory_order_relaxed);
     m_impl->m_stats.whitelistTimeUs.store(0, std::memory_order_relaxed);
     m_impl->m_stats.hashTimeUs.store(0, std::memory_order_relaxed);
