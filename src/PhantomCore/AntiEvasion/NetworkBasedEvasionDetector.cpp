@@ -89,6 +89,7 @@
 // ============================================================================
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <execution>
 #include <numeric>
@@ -123,6 +124,7 @@
 // ============================================================================
 
 #include "../Utils/StringUtils.hpp"
+#include "../Utils/DomainUtils.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
@@ -247,7 +249,11 @@ namespace ShadowStrike::AntiEvasion {
         constexpr size_t MAX_NORMAL_SUBDOMAIN_LENGTH = 32;
 
         /// @brief Maximum total subdomain labels
-        constexpr size_t MAX_NORMAL_LABEL_COUNT = 5;
+        // Subdomain labels, not total labels. Derived from the previous total-label limit of 5:
+    // a registrable domain contributes two labels of its own, so the same sensitivity for the
+    // part an attacker controls is 3. Re-derived rather than reused, because applying a
+    // total-label threshold to a subdomain count would silently widen the check.
+    constexpr size_t MAX_NORMAL_SUBDOMAIN_LABEL_COUNT = 3;
 
         /// @brief Entropy threshold for DNS tunneling
         constexpr double DNS_TUNNEL_ENTROPY_THRESHOLD = 4.0;
@@ -545,7 +551,7 @@ namespace ShadowStrike::AntiEvasion {
         [[nodiscard]] bool IsEncodedSubdomain(std::wstring_view subdomain) const noexcept;
 
         /// @brief Calculate subdomain entropy
-        [[nodiscard]] double CalculateSubdomainEntropy(std::wstring_view domain) const noexcept;
+        [[nodiscard]] double CalculateSubdomainEntropy(std::wstring_view subdomain) const noexcept;
 
         // ================================================================
         // BEACONING DETECTION
@@ -650,10 +656,17 @@ namespace ShadowStrike::AntiEvasion {
         [[nodiscard]] std::wstring GetSecondLevelDomain(std::wstring_view domain) const noexcept;
 
         /// @brief Count subdomain labels
-        [[nodiscard]] size_t CountSubdomainLabels(std::wstring_view domain) const noexcept;
+        /// @brief The labels beneath the registrable domain - what a tunnel heuristic
+        ///        must measure. Empty when the host has no subdomain.
+        [[nodiscard]] std::wstring ExtractSubdomain(std::wstring_view host) const noexcept;
+        /// @brief Last-two-labels approximation, used only when the public suffix list is
+        ///        unavailable. Imprecise by design; never blind.
+        [[nodiscard]] std::wstring SubdomainWithoutPublicSuffixList(
+            std::wstring_view host) const noexcept;
+        [[nodiscard]] size_t CountSubdomainLabels(std::wstring_view subdomain) const noexcept;
 
         /// @brief Get longest subdomain label
-        [[nodiscard]] std::wstring GetLongestSubdomainLabel(std::wstring_view domain) const noexcept;
+        [[nodiscard]] std::wstring GetLongestSubdomainLabel(std::wstring_view subdomain) const noexcept;
     };
 
     // ========================================================================
@@ -1290,22 +1303,26 @@ namespace ShadowStrike::AntiEvasion {
         outDetails.clear();
 
         try {
-            // Count subdomain labels
-            size_t labelCount = CountSubdomainLabels(domain);
+            // Everything below is measured over the SUBDOMAIN, not the whole host.
+            // Measuring the host charged every check for labels the registrant owns:
+            // a long company name read as a long subdomain label, and its characters
+            // as subdomain entropy. A bare registrable domain could reach the tunnel
+            // threshold on its own name with no subdomain present at all.
+            const std::wstring subdomain = ExtractSubdomain(domain);
 
-            // Get longest subdomain label
-            std::wstring longestLabel = GetLongestSubdomainLabel(domain);
+            size_t labelCount = CountSubdomainLabels(subdomain);
 
-            // Calculate subdomain entropy
-            double subdomainEntropy = CalculateSubdomainEntropy(domain);
+            std::wstring longestLabel = GetLongestSubdomainLabel(subdomain);
+
+            double subdomainEntropy = CalculateSubdomainEntropy(subdomain);
 
             double score = 0.0;
 
             // Check 1: Excessive subdomain labels
-            if (labelCount > MAX_NORMAL_LABEL_COUNT) {
+            if (labelCount > MAX_NORMAL_SUBDOMAIN_LABEL_COUNT) {
                 score += 25.0;
-                outDetails += std::format(L"Excessive labels: {} (max normal: {}). ",
-                    labelCount, MAX_NORMAL_LABEL_COUNT);
+                outDetails += std::format(L"Excessive subdomain labels: {} (max normal: {}). ",
+                    labelCount, MAX_NORMAL_SUBDOMAIN_LABEL_COUNT);
             }
 
             // Check 2: Long subdomain labels
@@ -1404,22 +1421,14 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
-    double NetworkBasedEvasionDetector::Impl::CalculateSubdomainEntropy(std::wstring_view domain) const noexcept {
+    double NetworkBasedEvasionDetector::Impl::CalculateSubdomainEntropy(std::wstring_view subdomain) const noexcept {
         try {
-            // Get the subdomain portion (everything before the second-level domain)
-            std::wstring sld = GetSecondLevelDomain(domain);
-            if (sld.empty() || sld.length() >= domain.length()) {
-                return 0.0;
-            }
-
-            // Subdomain is everything before the SLD
-            size_t sldPos = domain.find(sld);
-            if (sldPos == 0 || sldPos == std::wstring::npos) {
-                return 0.0;
-            }
-
-            std::wstring subdomain(domain.substr(0, sldPos - 1)); // -1 to remove the dot
-
+            // The caller supplies the subdomain, so no second-level domain has to be
+            // guessed here. The previous form took the last two labels as the
+            // second-level domain and then located it with find(), a SUBSTRING search:
+            // any host whose text repeated the suffix earlier resolved to the wrong
+            // offset and this function returned 0.0, silently disabling the entropy
+            // check for exactly the crafted names it exists to catch.
             if (subdomain.length() < 3) {
                 return 0.0;
             }
@@ -2769,13 +2778,68 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
-    size_t NetworkBasedEvasionDetector::Impl::CountSubdomainLabels(std::wstring_view domain) const noexcept {
-        if (domain.empty()) {
+    std::wstring NetworkBasedEvasionDetector::Impl::SubdomainWithoutPublicSuffixList(
+        std::wstring_view host) const noexcept {
+        // FALLBACK ONLY, used when the public suffix list is unavailable. It assumes the
+        // registrable domain is the last two labels, which is wrong for every multi-label
+        // suffix and is the imprecision the list exists to remove.
+        //
+        // It is still the right behaviour in that situation. An empty subdomain scores zero
+        // on every tunnel check, so returning nothing here would silently switch DNS
+        // tunnel detection off whenever the data file is missing - a blind spot is worse
+        // than an imprecise measurement, and the missing file is reported separately.
+        const size_t lastDot = host.find_last_of(L'.');
+        if (lastDot == std::wstring_view::npos) {
+            return std::wstring();
+        }
+        const size_t secondLastDot = host.find_last_of(L'.', lastDot - 1);
+        if (secondLastDot == std::wstring_view::npos) {
+            return std::wstring();
+        }
+        return std::wstring(host.substr(0, secondLastDot));
+    }
+
+    std::wstring NetworkBasedEvasionDetector::Impl::ExtractSubdomain(
+        std::wstring_view host) const noexcept {
+        try {
+            // IcannOnly yields the longer of the two subdomains, so it is the more
+            // sensitive scope, and a registry delegation is the boundary an operator of
+            // a tunnel actually controls. A hosting convention such as github.io is not.
+            auto& psl = Utils::Domain::PublicSuffixList::Instance();
+            if (psl.EnsureLoaded()) {
+                const std::string narrow = Utils::StringUtils::ToNarrow(host);
+                // A host the list cannot decompose - a single label, or an address
+                // literal - genuinely has no subdomain, so an empty result here is an
+                // answer and must NOT fall through to the approximation below.
+                return Utils::StringUtils::ToWide(
+                    psl.Decompose(narrow, Utils::Domain::SuffixScope::IcannOnly).subdomain);
+            }
+
+            static std::atomic<bool> s_warned{false};
+            if (!s_warned.exchange(true, std::memory_order_acq_rel)) {
+                SS_LOG_WARN(L"NetworkEvasion",
+                    L"Public suffix list unavailable - DNS tunnel checks fall back to a "
+                    L"last-two-labels approximation of the subdomain, which over-reports on "
+                    L"multi-label suffixes such as co.uk. Detection stays active.");
+            }
+            return SubdomainWithoutPublicSuffixList(host);
+        }
+        catch (...) {
+            // Never return an empty subdomain on an exception: that scores zero on every
+            // check and would read as "no tunnel" rather than "not examined".
+            return SubdomainWithoutPublicSuffixList(host);
+        }
+    }
+
+    size_t NetworkBasedEvasionDetector::Impl::CountSubdomainLabels(std::wstring_view subdomain) const noexcept {
+        // A host with no subdomain has no subdomain labels. Returning 1 here would
+        // credit every bare registrable domain with a label it does not have.
+        if (subdomain.empty()) {
             return 0;
         }
 
         size_t count = 1;
-        for (wchar_t c : domain) {
+        for (wchar_t c : subdomain) {
             if (c == L'.') {
                 count++;
             }
@@ -2784,16 +2848,16 @@ namespace ShadowStrike::AntiEvasion {
         return count;
     }
 
-    std::wstring NetworkBasedEvasionDetector::Impl::GetLongestSubdomainLabel(std::wstring_view domain) const noexcept {
+    std::wstring NetworkBasedEvasionDetector::Impl::GetLongestSubdomainLabel(std::wstring_view subdomain) const noexcept {
         try {
             std::wstring longest;
             size_t start = 0;
 
-            for (size_t i = 0; i <= domain.length(); ++i) {
-                if (i == domain.length() || domain[i] == L'.') {
+            for (size_t i = 0; i <= subdomain.length(); ++i) {
+                if (i == subdomain.length() || subdomain[i] == L'.') {
                     size_t len = i - start;
                     if (len > longest.length()) {
-                        longest = std::wstring(domain.substr(start, len));
+                        longest = std::wstring(subdomain.substr(start, len));
                     }
                     start = i + 1;
                 }

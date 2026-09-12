@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+NETWORK_EVASION_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
 DOMAIN_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.hpp"
 DOMAIN_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.cpp"
 PUBLIC_SUFFIX_LIST_PATH = ROOT / "content/psl/public_suffix_list.dat"
@@ -26297,6 +26298,114 @@ class PublicSuffixDataContractTests(unittest.TestCase):
             "if (i > 0) {", window,
             "the wildcard lookup is bounded on the left again, which prevents a wildcard "
             "rule from matching at position 0")
+
+
+class DnsTunnelSubdomainContractTests(unittest.TestCase):
+    """The tunnel checks must measure the subdomain, and must never measure nothing.
+
+    MEASURED. DetectDNSTunneling scores five checks. Three were fed the WHOLE hostname while
+    being named for the subdomain, so each was charged for labels the registrant owns:
+    CountSubdomainLabels counted every dot in the host, GetLongestSubdomainLabel walked the
+    registrable domain and the TLD, and CalculateSubdomainEntropy located the second-level
+    domain with a SUBSTRING search that resolved to the wrong offset whenever a host repeated
+    its own suffix earlier in the name.
+
+    A host with a long alphanumeric registrable label and NO SUBDOMAIN AT ALL therefore scored
+    +30 for a long subdomain label and +30 for an encoded subdomain, reaching the 50-point
+    verdict with nothing to tunnel through.
+
+    The second invariant here is the more dangerous one to lose. An empty subdomain scores
+    zero on every check, so a subdomain extractor that returns nothing when the public suffix
+    list is unavailable does not degrade the detector - it switches it off, silently, and a
+    field log would show no tunnel detections rather than an error.
+    """
+
+    def _tunnel_body(self):
+        source = strip_c_comments(read_source(NETWORK_EVASION_CPP_PATH))
+        marker = "::DetectDNSTunneling("
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "DetectDNSTunneling is gone")
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_the_three_checks_measure_the_subdomain_not_the_host(self):
+        body = self._tunnel_body()
+        for helper in ("CountSubdomainLabels", "GetLongestSubdomainLabel",
+                       "CalculateSubdomainEntropy"):
+            self.assertIn(
+                "%s(subdomain)" % helper, body,
+                "%s is being handed something other than the extracted subdomain. Passing the "
+                "whole host charges the check for labels the registrant owns, which is how a "
+                "domain with no subdomain reached the tunnel threshold on its own name."
+                % helper)
+        self.assertIn(
+            "ExtractSubdomain(domain)", body,
+            "the subdomain is no longer extracted in DetectDNSTunneling")
+
+    def test_the_subdomain_scope_is_icann_only(self):
+        """IcannOnly yields the longer subdomain, so it is the more sensitive scope."""
+        source = strip_c_comments(read_source(NETWORK_EVASION_CPP_PATH))
+        at = source.find("::ExtractSubdomain(")
+        self.assertNotEqual(-1, at, "ExtractSubdomain is gone")
+        body = source[at:_matching_delimiter(source, source.index("{", at), "{", "}")]
+        self.assertIn(
+            "SuffixScope::IcannOnly", body,
+            "the tunnel subdomain is no longer resolved with IcannOnly. IncludePrivate treats "
+            "a hosting convention such as github.io as a suffix, which yields a SHORTER "
+            "subdomain and therefore a less sensitive tunnel check.")
+        self.assertNotIn(
+            "SuffixScope::IncludePrivate", body,
+            "the tunnel subdomain now uses IncludePrivate, reducing sensitivity")
+
+    def test_the_label_threshold_is_expressed_in_subdomain_labels(self):
+        """A total-label threshold applied to a subdomain count silently widens the check."""
+        source = strip_c_comments(read_source(NETWORK_EVASION_CPP_PATH))
+        self.assertIn(
+            "MAX_NORMAL_SUBDOMAIN_LABEL_COUNT", source,
+            "the subdomain-label threshold is gone")
+        self.assertNotIn(
+            "MAX_NORMAL_LABEL_COUNT ", source,
+            "the old total-label threshold is back. Comparing a subdomain label count against "
+            "a limit calibrated for total labels widens the check by the two labels a "
+            "registrable domain contributes.")
+        match = re.search(
+            r"MAX_NORMAL_SUBDOMAIN_LABEL_COUNT\s*=\s*(\d+)", source)
+        self.assertIsNotNone(match, "the threshold has no literal value")
+        self.assertLessEqual(
+            int(match.group(1)), 3,
+            "the subdomain-label limit has been raised to %s. It was derived as 3 from the "
+            "previous total-label limit of 5 minus the two labels a registrable domain "
+            "contributes; raising it weakens the check." % match.group(1))
+
+    def test_an_unavailable_suffix_list_does_not_silence_the_checks(self):
+        """ANTI-FAIL-OPEN. Zero-length subdomain scores zero on all four checks."""
+        source = strip_c_comments(read_source(NETWORK_EVASION_CPP_PATH))
+        at = source.find("::ExtractSubdomain(")
+        body = source[at:_matching_delimiter(source, source.index("{", at), "{", "}")]
+        self.assertIn(
+            "SubdomainWithoutPublicSuffixList(host)", body,
+            "ExtractSubdomain no longer falls back to an approximation when the public suffix "
+            "list is unavailable. Returning an empty subdomain instead scores zero on every "
+            "tunnel check, which switches the detector off rather than degrading it - and the "
+            "list is not currently packaged with the product, so that is the live case.")
+        self.assertEqual(
+            2, body.count("SubdomainWithoutPublicSuffixList(host)"),
+            "the fallback is reached on only one of the two failure paths. Both the "
+            "list-unavailable branch and the exception handler must use it, or an exception "
+            "silently disables the checks.")
+        self.assertNotRegex(
+            body, r"catch\s*\([^)]*\)\s*\{\s*return\s+std::wstring\(\)\s*;",
+            "the exception handler returns an empty subdomain again, which reads as "
+            "'no tunnel' rather than 'not examined'")
+
+    def test_the_entropy_helper_does_not_locate_a_suffix_by_substring(self):
+        source = strip_c_comments(read_source(NETWORK_EVASION_CPP_PATH))
+        self.assertNotIn(
+            "domain.find(sld)", source,
+            "the entropy helper locates the second-level domain with a substring search "
+            "again. Any host whose text repeats its suffix earlier resolves to the wrong "
+            "offset, and the function returns 0.0 - disabling the entropy check for exactly "
+            "the crafted names it exists to catch.")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,9 @@
 
 #include "AntiEvasion_TestUtils.hpp"
 #include "../../../src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.hpp"
+#include "../../../src/PhantomCore/Utils/DomainUtils.hpp"
+
+#include <filesystem>
 
 namespace ShadowStrike::AntiEvasion {
 const wchar_t* NetworkEvasionTechniqueToString(NetworkEvasionTechnique technique) noexcept;
@@ -158,4 +161,148 @@ TEST(NetworkBasedEvasionDetector_Beaconing, RejectsInsufficientAndNonIncreasingS
     EXPECT_DOUBLE_EQ(0.0, duplicateSeriesInfo.intervalVariance);
 }
 
+
+// ===========================================================================================
+// DNS tunnelling: the checks must measure the SUBDOMAIN, not the whole hostname.
+//
+// Three of the five checks were fed the entire host while being named for the subdomain, so
+// each was charged for labels the registrant owns - a long company name read as a long
+// subdomain label, and its characters as subdomain entropy.
+// ===========================================================================================
+
+namespace {
+
+/// Loads the vendored public suffix list. EnsureLoaded() resolves beside the executable,
+/// which the test binary is not, so the path is found by walking up from the working
+/// directory. Without this the detector exercises its fallback approximation instead of the
+/// list, and these tests would be measuring the wrong code path.
+void EnsurePublicSuffixListLoaded() {
+    using ShadowStrike::Utils::Domain::PublicSuffixList;
+    auto& psl = PublicSuffixList::Instance();
+    if (psl.IsLoaded()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::path here = std::filesystem::current_path(ec);
+    for (int depth = 0; depth < 8 && !here.empty(); ++depth) {
+        const std::filesystem::path candidate =
+            here / L"content" / L"psl" / L"public_suffix_list.dat";
+        if (std::filesystem::exists(candidate, ec)) {
+            (void)psl.LoadFromFile(candidate.wstring());
+            return;
+        }
+        if (!here.has_parent_path() || here.parent_path() == here) {
+            break;
+        }
+        here = here.parent_path();
+    }
+}
+
+[[nodiscard]] bool HasTunnelDetection(
+    const std::vector<NetworkDetectedTechnique>& detections) noexcept {
+    for (const auto& detection : detections) {
+        if (detection.technique == NetworkEvasionTechnique::DNS_Tunneling) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(NetworkBasedEvasionDetector_DNSTunnel, ABareRegistrableDomainIsNeverATunnel) {
+    EnsurePublicSuffixListLoaded();
+    ASSERT_TRUE(ShadowStrike::Utils::Domain::PublicSuffixList::Instance().IsLoaded())
+        << "the vendored public suffix list did not load, so this test would exercise the "
+           "fallback approximation rather than the path under test";
+
+    NetworkBasedEvasionDetector detector;
+    // AnalyzeDomain returns early with ERROR_NOT_READY unless the detector is initialised,
+    // leaving outDetections empty - which reads as "no tunnel" and would make every
+    // negative assertion below pass without running a single check.
+    ASSERT_TRUE(detector.Initialize());
+
+    std::vector<NetworkDetectedTechnique> detections;
+
+    // A 34-character alphanumeric registrable label and NO SUBDOMAIN AT ALL. Measuring the
+    // whole host scored this +30 for a long subdomain label and +30 for an encoded
+    // subdomain, reaching the 50-point verdict - a DNS tunnel with nothing to tunnel
+    // through. Other checks such as DGA or high entropy may legitimately fire on a name
+    // like this, so only the tunnelling verdict is asserted.
+    (void)detector.AnalyzeDomain(L"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7.com", detections);
+
+    EXPECT_FALSE(HasTunnelDetection(detections))
+        << "a host with no subdomain was reported as a DNS tunnel, which means the tunnel"
+           " checks are measuring the registrable domain again";
+}
+
+TEST(NetworkBasedEvasionDetector_DNSTunnel, ALegitimateMultiLabelCcTldHostIsNotATunnel) {
+    EnsurePublicSuffixListLoaded();
+    ASSERT_TRUE(ShadowStrike::Utils::Domain::PublicSuffixList::Instance().IsLoaded())
+        << "the vendored public suffix list did not load, so this test would exercise the "
+           "fallback approximation rather than the path under test";
+
+    NetworkBasedEvasionDetector detector;
+    // AnalyzeDomain returns early with ERROR_NOT_READY unless the detector is initialised,
+    // leaving outDetections empty - which reads as "no tunnel" and would make every
+    // negative assertion below pass without running a single check.
+    ASSERT_TRUE(detector.Initialize());
+
+    std::vector<NetworkDetectedTechnique> detections;
+
+    // Six total labels but only three below the registrable domain. Counting total labels
+    // put this over the old limit of 5; counting the subdomain puts it at the limit of 3.
+    (void)detector.AnalyzeDomain(L"eu-west-1.api.prod.company.co.uk", detections);
+
+    EXPECT_FALSE(HasTunnelDetection(detections))
+        << "a routine multi-label ccTLD host was reported as a DNS tunnel";
+}
+
+TEST(NetworkBasedEvasionDetector_DNSTunnel, ALongEncodedLabelBeneathARegisteredDomainIsDetected) {
+    EnsurePublicSuffixListLoaded();
+    ASSERT_TRUE(ShadowStrike::Utils::Domain::PublicSuffixList::Instance().IsLoaded())
+        << "the vendored public suffix list did not load, so this test would exercise the "
+           "fallback approximation rather than the path under test";
+
+    NetworkBasedEvasionDetector detector;
+    // AnalyzeDomain returns early with ERROR_NOT_READY unless the detector is initialised,
+    // leaving outDetections empty - which reads as "no tunnel" and would make every
+    // negative assertion below pass without running a single check.
+    ASSERT_TRUE(detector.Initialize());
+
+    std::vector<NetworkDetectedTechnique> detections;
+
+    // One 40-character base64-shaped label - the classic exfiltration payload. Sensitivity
+    // for this shape must survive the change, because it is what the checks exist to catch.
+    (void)detector.AnalyzeDomain(
+        L"aGVsbG93b3JsZHRoaXNpc2FiYXNlNjRwYXlsb2Fk.evil.com", detections);
+
+    EXPECT_TRUE(HasTunnelDetection(detections))
+        << "a long encoded label beneath a registered domain was not detected as a tunnel";
+}
+
+TEST(NetworkBasedEvasionDetector_DNSTunnel, ADeepEncodedTunnelUnderACcTldIsDetected) {
+    EnsurePublicSuffixListLoaded();
+    ASSERT_TRUE(ShadowStrike::Utils::Domain::PublicSuffixList::Instance().IsLoaded())
+        << "the vendored public suffix list did not load, so this test would exercise the "
+           "fallback approximation rather than the path under test";
+
+    NetworkBasedEvasionDetector detector;
+    // AnalyzeDomain returns early with ERROR_NOT_READY unless the detector is initialised,
+    // leaving outDetections empty - which reads as "no tunnel" and would make every
+    // negative assertion below pass without running a single check.
+    ASSERT_TRUE(detector.Initialize());
+
+    std::vector<NetworkDetectedTechnique> detections;
+
+    // Four encoded labels beneath a multi-label ccTLD. This is the case the change must not
+    // lose: the registrable domain contributes three labels of its own, so the threshold has
+    // to be reached on the subdomain alone.
+    (void)detector.AnalyzeDomain(
+        L"aGVsbG93b3JsZHRoaXNpc2E.YmFzZTY0cGF5bG9hZHR3bw.dGhpcmRjaHVuaw."
+        L"Zm91cnRoY2h1bms.example.co.uk", detections);
+
+    EXPECT_TRUE(HasTunnelDetection(detections))
+        << "a deep encoded tunnel under a ccTLD was not detected";
+}
 } // namespace ShadowStrike::AntiEvasion::Tests
