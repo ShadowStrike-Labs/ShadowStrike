@@ -372,6 +372,7 @@
     <ClCompile Include="tests\unit\utils_unit\CertUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\CompressionUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\CryptoUtils_Tests.cpp" />
+    <ClCompile Include="tests\unit\utils_unit\DomainUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\FileUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\HashUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\JSONUtils_Tests.cpp" />

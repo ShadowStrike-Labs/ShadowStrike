@@ -160,6 +160,9 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+DOMAIN_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.hpp"
+DOMAIN_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.cpp"
+PUBLIC_SUFFIX_LIST_PATH = ROOT / "content/psl/public_suffix_list.dat"
 WIRING_ANCHOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WiringAnchor.cpp"
 PGTI_WIRING_CPP_PATH = (
     ROOT / "src/Products/Community/PhantomHome/ThreatIntel/wiring/PgtiWiring.cpp"
@@ -26197,6 +26200,103 @@ class HomeWiringRetentionContractTests(unittest.TestCase):
             "ModulePhase::Foundation", source,
             "the PGTI watchdog now claims the Foundation phase, which runs before every "
             "protection module")
+
+
+class PublicSuffixDataContractTests(unittest.TestCase):
+    """The registrable domain of a hostname is a trust decision, not a string operation.
+
+    MEASURED. Before this list existed, sixteen files split hostnames on the last dot and
+    nineteen carried a "base" or "second-level" domain derived that way. That yields co.uk as
+    the owner of bbc.co.uk, and treats every tenant of a shared host such as blogspot.com as
+    the same party. One direction produces false positives on legitimate multi-label ccTLDs;
+    the other lets one tenant of a shared host confer trust on another.
+
+    The list's two sections answer DIFFERENT questions and are not interchangeable, which is
+    why SuffixScope has no default value - see the scope test below.
+    """
+
+    def test_the_list_ships_with_both_sections_and_a_version(self):
+        """DERIVED from the file: the markers are what classify a rule's trust section."""
+        self.assertTrue(
+            PUBLIC_SUFFIX_LIST_PATH.is_file(),
+            "the vendored Public Suffix List is missing, so no caller can determine a "
+            "registrable domain and every domain-keyed decision silently loses precision")
+        raw = PUBLIC_SUFFIX_LIST_PATH.read_bytes()
+        self.assertGreater(
+            len(raw), 100000,
+            "the list is only %d bytes, which is far below the real list and suggests a "
+            "truncated or placeholder file" % len(raw))
+        text = raw.decode("utf-8")
+        for marker in ("===BEGIN ICANN DOMAINS===", "===END ICANN DOMAINS===",
+                       "===BEGIN PRIVATE DOMAINS===", "===END PRIVATE DOMAINS==="):
+            self.assertIn(
+                marker, text,
+                "the list is missing the %s marker. Without both sections delimited, an "
+                "ICANN rule cannot be told from a PRIVATE one, and every trust decision "
+                "keyed on that distinction would be wrong." % marker)
+        self.assertRegex(
+            text[:2000], r"//\s*VERSION:\s*\S+",
+            "the list has no VERSION header, so a field log cannot state which revision "
+            "produced a verdict")
+        icann = text.index("===BEGIN ICANN DOMAINS===")
+        private = text.index("===BEGIN PRIVATE DOMAINS===")
+        self.assertLess(icann, private, "the sections appear in an unexpected order")
+
+    def test_the_loader_refuses_a_list_without_section_markers(self):
+        """A list it cannot classify must be rejected, not loaded with a guess."""
+        source = strip_c_comments(read_source(DOMAIN_UTILS_CPP_PATH))
+        self.assertIn(
+            "BEGIN ICANN DOMAINS", source,
+            "the loader no longer looks for the ICANN section marker")
+        self.assertIn(
+            "BEGIN PRIVATE DOMAINS", source,
+            "the loader no longer looks for the PRIVATE section marker")
+        # The refusal must be reachable: both flags are checked together before the list is
+        # accepted. A loader that parses the markers but does not require them is the same
+        # as one that ignores them.
+        self.assertRegex(
+            source, r"if\s*\(\s*!\s*sawIcannBegin\s*\|\|\s*!\s*inPrivate\s*\)",
+            "the loader no longer REFUSES a list that is missing a section marker; it must "
+            "not fall back to treating unclassified rules as either section")
+
+    def test_the_suffix_scope_argument_has_no_default(self):
+        """SECURITY. A default would let a caller pick trust semantics by accident.
+
+        IncludePrivate and IcannOnly answer opposite questions. If either becomes the default,
+        every future call site inherits a trust decision it never made - and the wrong one is
+        silent, because both return a plausible domain.
+        """
+        header = strip_c_comments(read_source(DOMAIN_UTILS_HPP_PATH))
+        offenders = re.findall(r"SuffixScope\s+\w+\s*=\s*[^,)]+", header)
+        self.assertEqual(
+            [], offenders,
+            "SuffixScope now has a default value: %s. Remove it. Choosing between ICANN-only "
+            "and include-private is a trust decision each call site must make explicitly - "
+            "for allowlisting one tenant of a shared host must not speak for another, while "
+            "for attribution they are the same party." % offenders)
+        for name in ("RegistrableDomain", "PublicSuffix", "Subdomain"):
+            self.assertRegex(
+                header, r"%s\(std::string_view host, SuffixScope scope\)" % name,
+                "%s no longer takes an explicit scope" % name)
+
+    def test_the_wildcard_rule_is_bounded_on_the_right(self):
+        """A wildcard consumes one label, so the bound is on what follows it.
+
+        Bounding on the left instead - i > 0 - stops a rule such as *.ck from ever matching
+        at position 0, which hands a public suffix a registrable domain of its own. That was
+        a real defect here, caught by the list's own canonical cases.
+        """
+        source = strip_c_comments(read_source(DOMAIN_UTILS_CPP_PATH))
+        at = source.find('"*." + JoinFrom(labels, i + 1)')
+        self.assertNotEqual(-1, at, "the wildcard candidate construction is gone")
+        window = source[max(0, at - 400):at]
+        self.assertIn(
+            "i + 1 < labels.size()", window,
+            "the wildcard lookup is no longer bounded by the labels that follow it")
+        self.assertNotIn(
+            "if (i > 0) {", window,
+            "the wildcard lookup is bounded on the left again, which prevents a wildcard "
+            "rule from matching at position 0")
 
 
 if __name__ == "__main__":

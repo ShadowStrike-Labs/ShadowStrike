@@ -481,6 +481,7 @@ A deliberate design goal is a small, permissively licensed dependency set: the s
 | [nlohmann/json](https://github.com/nlohmann/json) | MIT | JSON parsing | |
 | [pugixml](https://pugixml.org) | MIT | XML parsing | |
 | [TLSH](https://github.com/trendmicro/tlsh) | Apache-2.0 | Fuzzy / similarity hashing | Chosen over GPL-licensed ssdeep specifically to keep the dependency set permissive |
+| [Public Suffix List](https://publicsuffix.org/list/) | MPL-2.0 | Registrable-domain determination for DNS, URL and DGA analysis | Data only, no code. Vendored under `content/psl/`; a last-dot split cannot tell `co.uk` from `example.com` |
 | OpenSSL | Apache-2.0 | Vendored | The product's own cryptography uses Windows CNG/BCrypt; OpenSSL's remaining surface is being reduced |
 | [Qt 6](https://www.qt.io) | LGPL-3.0 | Desktop UI only | Not present in the kernel sensor or the detection path |
 | [googletest / googlemock](https://github.com/google/googletest) | BSD-3-Clause | Test framework | Test-only, not shipped |

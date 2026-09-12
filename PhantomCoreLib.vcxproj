@@ -366,6 +366,7 @@
     <ClCompile Include="src\PhantomCore\Utils\CacheManager.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\ProcessSnapshotCache.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\DataStorePaths.cpp" />
+    <ClCompile Include="src\PhantomCore\Utils\DomainUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CertUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CompressionUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\CryptoUtils_AsymmetricCipher.cpp" />
