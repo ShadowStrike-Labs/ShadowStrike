@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+ATTACHMENT_SCANNER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Email/AttachmentScanner.cpp"
 PHISHING_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/PhishingDetector.cpp"
 BANKING_TROJAN_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Banking/BankingTrojanDetector.cpp"
 NETWORK_CAPTURE_CPP_PATH = ROOT / "src/Products/Community/PhantomEDR/Forensics/NetworkCapture.cpp"
@@ -27205,6 +27206,83 @@ class DecoyExtensionCaseContractTests(unittest.TestCase):
         self.assertIn(
             '"Heuristic.DoubleExtension"', source,
             "the double-extension detection no longer reports a threat")
+
+
+class BlockedAttachmentIsReportableContractTests(unittest.TestCase):
+    """A blocked attachment the product cannot report is indistinguishable from lost mail.
+
+    MEASURED. ShouldBlock() blocks on Malicious, on HighRisk, and on Suspicious above risk 70. The
+    threat callback in ScanAttachmentImpl fired only on Malicious and Suspicious, so a verdict of
+    HighRisk reached from the 50-79 heuristic band was blocked with no subscriber notified and no
+    detection counter incremented - totalScans counted it while neither suspiciousDetected nor
+    cleanDetected did.
+
+    The other site that assigns HighRisk, the high-risk extension check, always called the callback
+    directly and incremented its own counter, which is why only one of the two was silent.
+
+    THIS GUARD EXISTS BECAUSE THE FIX IS NOT UNIT-TESTABLE. ScanAttachmentImpl takes a filesystem
+    path and hashes real bytes, so the callback and the counter cannot be reached from a unit test;
+    AttachmentVerdict_Tests can only pin ShouldBlock itself. The relationship between the two is
+    therefore held here.
+    """
+
+    def _impl_source(self):
+        return strip_c_comments(read_source(ATTACHMENT_SCANNER_CPP_PATH))
+
+    def test_the_threat_callback_covers_every_blocking_verdict(self):
+        """RELATIONAL. Derived from ShouldBlock rather than from a hardcoded list, so adding a
+        blocking verdict without notifying on it fails here.
+        """
+        source = self._impl_source()
+
+        marker = "bool AttachmentScanResult::ShouldBlock() const noexcept"
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "ShouldBlock is gone")
+        opening = source.index("{", at)
+        should_block = source[at:_matching_delimiter(source, opening, "{", "}")]
+        blocking = set(re.findall(r"AttachmentVerdict::(\w+)", should_block))
+        self.assertIn("HighRisk", blocking, "anchor check: HighRisk should be a blocking verdict")
+        self.assertGreaterEqual(
+            len(blocking), 3, "ShouldBlock names fewer verdicts than expected; re-derive this guard")
+
+        # The notification condition guarding InvokeThreatCallback at the end of the scan.
+        call_at = source.rfind("InvokeThreatCallback(result);")
+        self.assertNotEqual(-1, call_at, "the threat callback is gone")
+        window = source[max(0, call_at - 400):call_at]
+        gate = window[window.rfind("if ("):]
+        notified = set(re.findall(r"AttachmentVerdict::(\w+)", gate))
+        if "IsMalicious()" in gate:
+            notified.add("Malicious")
+
+        missing = sorted(blocking - notified)
+        self.assertEqual(
+            [], missing,
+            "these verdicts cause ShouldBlock() to block but are not covered by the threat "
+            "callback, so an attachment is withheld from the user with nothing reporting why: %s"
+            % ", ".join(missing))
+
+    def test_the_blocking_heuristic_band_increments_a_counter(self):
+        """A blocked attachment that increments nothing makes totalScans irreconcilable."""
+        source = self._impl_source()
+        marker = "} else if (result.riskScore >= 50) {"
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "the 50-79 heuristic band is gone")
+        band = source[at:source.find("} else {", at)]
+        self.assertIn(
+            "m_stats.", band,
+            "the heuristic band that assigns a BLOCKING verdict increments no statistic, so the "
+            "attachment is blocked while appearing in neither suspiciousDetected nor "
+            "cleanDetected and totalScans stops reconciling with them")
+
+    def test_the_band_thresholds_are_unchanged(self):
+        """A visibility fix must not become a threshold change."""
+        source = self._impl_source()
+        self.assertIn("result.riskScore >= 80", source,
+                      "the suspicious risk band boundary moved")
+        self.assertIn("result.riskScore >= 50", source,
+                      "the high-risk band boundary moved")
+        self.assertIn("riskScore >= 70", source,
+                      "the ShouldBlock risk boundary for a suspicious verdict moved")
 
 
 if __name__ == "__main__":

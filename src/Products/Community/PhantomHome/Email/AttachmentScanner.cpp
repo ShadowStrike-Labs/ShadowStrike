@@ -902,6 +902,13 @@ public:
                     m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
                 } else if (result.riskScore >= 50) {
                     result.verdict = AttachmentVerdict::HighRisk;
+                    // This band BLOCKS, because ShouldBlock() includes HighRisk, so it must
+                    // also be counted. Without this the attachment is blocked while
+                    // appearing in neither suspiciousDetected nor cleanDetected, and
+                    // totalScans stops reconciling with the detection counters. The verdict
+                    // itself is deliberately left as HighRisk: reassigning it to Suspicious
+                    // would stop the 50-69 range blocking at all, which is a weakening.
+                    m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     m_stats.cleanDetected.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -913,7 +920,13 @@ public:
 
             InvokeScanResultCallback(result);
 
-            if (result.IsMalicious() || result.verdict == AttachmentVerdict::Suspicious) {
+            // HighRisk is included because ShouldBlock() blocks on it. Previously a verdict
+            // reached from the 50-79 heuristic band was blocked without any subscriber being
+            // told, so the attachment vanished and nothing reported why. The other site that
+            // assigns HighRisk, the high-risk extension check, already calls this directly.
+            if (result.IsMalicious()
+                || result.verdict == AttachmentVerdict::Suspicious
+                || result.verdict == AttachmentVerdict::HighRisk) {
                 InvokeThreatCallback(result);
             }
 
