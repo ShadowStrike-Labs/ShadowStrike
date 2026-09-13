@@ -385,6 +385,9 @@
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\AdBlocker.cpp" />
     <ClCompile Include="tests\unit\webprotection_unit\PhishingDetector_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\PhishingDetector.cpp" />
+    <!-- tests\unit\usb_protection_unit -->
+    <ClCompile Include="tests\unit\usb_protection_unit\USBAutorunBlocker_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBAutorunBlocker.cpp" />
     <ClCompile Include="tests\unit\utils_unit\FileUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\HashUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\JSONUtils_Tests.cpp" />
