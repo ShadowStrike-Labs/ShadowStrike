@@ -383,6 +383,8 @@
     <!-- tests\unit\webprotection_unit -->
     <ClCompile Include="tests\unit\webprotection_unit\AdBlocker_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\AdBlocker.cpp" />
+    <ClCompile Include="tests\unit\webprotection_unit\PhishingDetector_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\PhishingDetector.cpp" />
     <ClCompile Include="tests\unit\utils_unit\FileUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\HashUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\JSONUtils_Tests.cpp" />

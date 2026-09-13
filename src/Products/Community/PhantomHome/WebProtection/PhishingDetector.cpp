@@ -33,6 +33,8 @@
 
 #include "PhishingDetector.hpp"
 
+#include "PhantomCore/Utils/DomainUtils.hpp"
+
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -185,8 +187,30 @@ namespace {
         return authority.substr(at + 1);
     }
 
-    // Extract the registrable domain (last two labels) from a full domain
+    // The registrable domain: the public suffix plus the one label in front of it.
+    //
+    // This previously took the last two labels, which for a multi-label public suffix IS
+    // the suffix - hsbc.co.uk yielded co.uk. Typosquatting comparison against any brand
+    // whose domain sits under such a suffix therefore had nothing useful to compare, and
+    // that covers most national banking and media brands: co.uk, com.au, com.br, co.jp.
+    //
+    // IncludePrivate, because the question is which registrable domain a host belongs to,
+    // and a phishing page on a shared host should be compared as the tenant it is.
     std::string ExtractRegistrableDomain(const std::string& domain) {
+        auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+        if (psl.EnsureLoaded()) {
+            std::string registrable = psl.Decompose(
+                domain, ShadowStrike::Utils::Domain::SuffixScope::IncludePrivate)
+                .registrableDomain;
+            if (!registrable.empty()) {
+                return registrable;
+            }
+            return domain;
+        }
+
+        // List unavailable: the previous approximation. Correct for a two-label suffix and
+        // never empty, because an empty candidate would silently drop one of the two
+        // comparisons the typosquatting check relies on.
         auto pos = domain.rfind('.');
         if (pos == std::string::npos || pos == 0) return domain;
         auto pos2 = domain.rfind('.', pos - 1);
@@ -675,6 +699,16 @@ public:
                 // Compare against registrable domain and full domain
                 for (const auto& candidate : {domainLower, registrable}) {
                     if (candidate.empty()) continue;
+
+                    // A candidate identical to the brand's own domain is the brand, not a
+                    // typo. The guard above only compares the FULL domain, so without this
+                    // every subdomain of a protected brand matched its own registrable
+                    // domain at distance 0 and similarity 1.0, and was reported as
+                    // typosquatting: www.paypal.com, mail.google.com, login.microsoft.com.
+                    // This cannot hide an attack - reaching distance 0 on the registrable
+                    // domain requires control of that domain, and a homograph uses
+                    // different bytes and so scores above zero.
+                    if (candidate == legit) continue;
 
                     int dist = DamerauLevenshteinDistance(candidate, legit);
                     if (dist > TYPOSQUAT_MAX_EDIT_DIST) continue;
