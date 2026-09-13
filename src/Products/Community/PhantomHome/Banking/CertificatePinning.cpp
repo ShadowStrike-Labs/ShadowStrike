@@ -1827,17 +1827,40 @@ bool CertificatePin::IsExpired() const noexcept {
     return std::chrono::system_clock::now() > expiration;
 }
 
+// A parsed certificate always carries notBefore and notAfter - they are mandatory X.509
+// fields - so an unset date on THIS struct can only mean the certificate was never parsed.
+// The safe reading of an unparsed certificate is that it must not be trusted, so both
+// predicates below report the untrusting answer and GetDaysUntilExpiry reports 0 rather than
+// a fabricated negative computed against the epoch. Previously the three disagreed: the two
+// predicates treated an unset date as "no constraint" while GetDaysUntilExpiry treated the
+// epoch as a real date and returned roughly -20000 days for the same object.
+//
+// The identical idiom in CertificatePin::IsExpired is CORRECT and deliberately unchanged:
+// for a pin, an unset expiration genuinely means the pin never expires.
+[[nodiscard]] static bool CertificateDatesWereParsed(
+    const std::chrono::system_clock::time_point& stamp) noexcept
+{
+    return stamp.time_since_epoch().count() != 0;
+}
+
 bool CertificateInfo::IsExpired() const noexcept {
-    if (notAfter.time_since_epoch().count() == 0) return false; // Uninitialized
+    if (!CertificateDatesWereParsed(notAfter)) {
+        return true;   // never parsed - treat as unusable rather than valid forever
+    }
     return std::chrono::system_clock::now() > notAfter;
 }
 
 bool CertificateInfo::IsNotYetValid() const noexcept {
-    if (notBefore.time_since_epoch().count() == 0) return false;
+    if (!CertificateDatesWereParsed(notBefore)) {
+        return true;   // never parsed - see CertificateDatesWereParsed above
+    }
     return std::chrono::system_clock::now() < notBefore;
 }
 
 int32_t CertificateInfo::GetDaysUntilExpiry() const noexcept {
+    if (!CertificateDatesWereParsed(notAfter)) {
+        return 0;   // no parsed expiry to count towards; do not fabricate a date
+    }
     auto diff = notAfter - std::chrono::system_clock::now();
     auto hours = std::chrono::duration_cast<std::chrono::hours>(diff).count();
     const auto days = hours / 24;
