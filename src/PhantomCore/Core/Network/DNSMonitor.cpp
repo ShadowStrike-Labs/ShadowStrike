@@ -58,6 +58,7 @@
 #include "DNSMonitor.hpp"
 #include "../../Utils/NetworkUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
+#include "../../Utils/DomainUtils.hpp"
 #include "../../Utils/Logger.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../ThreatIntel/ThreatIntelFormat.hpp"
@@ -501,18 +502,38 @@ public:
                 return analysis;
             }
 
-            // Extract just the domain name (remove TLD)
-            size_t lastDot = domain.find_last_of('.');
-            if (lastDot == std::string::npos || lastDot == 0) {
-                return analysis;  // Invalid domain
-            }
-
-            size_t secondLastDot = domain.find_last_of('.', lastDot - 1);
+            // The label the registrant chose, which is the only string a generation
+            // algorithm produces. Taking the label between the last two dots gave the
+            // MIDDLE LABEL OF THE SUFFIX for a multi-label suffix: evil.co.uk yielded
+            // "co". At two characters that is below DGA_MIN_LENGTH, so every domain
+            // under .co.uk, .com.au, .co.jp and the rest returned here before a single
+            // feature was computed - a blind spot indistinguishable from a clean result.
+            //
+            // IncludePrivate: a label generated beneath a private-section suffix is
+            // still generated, and IcannOnly would measure the hosting provider's name.
             std::string sld;
-            if (secondLastDot != std::string::npos) {
-                sld = domain.substr(secondLastDot + 1, lastDot - secondLastDot - 1);
-            } else {
-                sld = domain.substr(0, lastDot);
+            {
+                auto& psl = Utils::Domain::PublicSuffixList::Instance();
+                if (psl.EnsureLoaded()) {
+                    sld = psl.Decompose(
+                        domain,
+                        Utils::Domain::SuffixScope::IncludePrivate).registrableLabel;
+                }
+                if (sld.empty()) {
+                    // The list is unavailable or the host does not decompose. Falling
+                    // back to the previous rule keeps DGA analysis running rather than
+                    // silently skipping every domain.
+                    const size_t lastDot = domain.find_last_of('.');
+                    if (lastDot == std::string::npos || lastDot == 0) {
+                        return analysis;  // Invalid domain
+                    }
+                    const size_t secondLastDot =
+                        domain.find_last_of('.', lastDot - 1);
+                    sld = (secondLastDot != std::string::npos)
+                        ? domain.substr(secondLastDot + 1,
+                                        lastDot - secondLastDot - 1)
+                        : domain.substr(0, lastDot);
+                }
             }
 
             analysis.totalLength = sld.length();
@@ -888,18 +909,39 @@ public:
                 std::string baseDomain;
                 std::string subdomain;
 
-                // Extract base domain and subdomain for correlation
-                size_t lastDot = normDomain.find_last_of('.');
-                if (lastDot != std::string::npos && lastDot > 0) {
-                    size_t secondLastDot = normDomain.find_last_of('.', lastDot - 1);
-                    if (secondLastDot != std::string::npos) {
-                        baseDomain = normDomain.substr(secondLastDot + 1);
-                        subdomain = normDomain.substr(0, secondLastDot);
-                    } else {
-                        baseDomain = normDomain;
+                // The tracking key must be the registrable domain. Keying on the last
+                // two labels made the SUFFIX the key for a multi-label suffix, so every
+                // .co.uk domain shared one bucket: tunnel correlation aggregated
+                // unrelated sites into a single series, and the 50,000-entry cap
+                // counted an entire public suffix as one entry.
+                //
+                // IcannOnly yields the longer subdomain and is therefore the more
+                // sensitive scope for tunnel measurement.
+                {
+                    auto& psl = Utils::Domain::PublicSuffixList::Instance();
+                    if (psl.EnsureLoaded()) {
+                        const auto parts = psl.Decompose(
+                            normDomain, Utils::Domain::SuffixScope::IcannOnly);
+                        baseDomain = parts.registrableDomain;
+                        subdomain  = parts.subdomain;
                     }
-                } else {
-                    baseDomain = normDomain;
+                    if (baseDomain.empty()) {
+                        // Without a key nothing is tracked at all, so fall back to the
+                        // previous rule rather than dropping the observation.
+                        const size_t lastDot = normDomain.find_last_of('.');
+                        if (lastDot != std::string::npos && lastDot > 0) {
+                            const size_t secondLastDot =
+                                normDomain.find_last_of('.', lastDot - 1);
+                            if (secondLastDot != std::string::npos) {
+                                baseDomain = normDomain.substr(secondLastDot + 1);
+                                subdomain = normDomain.substr(0, secondLastDot);
+                            } else {
+                                baseDomain = normDomain;
+                            }
+                        } else {
+                            baseDomain = normDomain;
+                        }
+                    }
                 }
 
                 std::lock_guard<std::mutex> lock(m_trackingMutex);
@@ -2045,16 +2087,36 @@ double DNSMonitor::CalculateEntropy(std::string_view str) {
 }
 
 std::string DNSMonitor::GetBaseDomain(const std::string& fqdn) {
-    size_t lastDot = fqdn.find_last_of('.');
-    if (lastDot == std::string::npos) {
+    // The registrable domain, not the last two labels. The previous rule returned the
+    // SUFFIX for any multi-label suffix - co.uk for evil.co.uk - so a reputation or
+    // grouping decision keyed on it treated every UK domain as the same party.
+    //
+    // IncludePrivate, because the integration test for this helper states its purpose is
+    // reputation keying, and one tenant of a shared host must not speak for another.
+    //
+    // A host with no registrable domain - a single label such as localhost, an address
+    // literal, or a bare public suffix - returns unchanged. That is the existing
+    // contract and the tests pin it.
+    auto& psl = Utils::Domain::PublicSuffixList::Instance();
+    if (psl.EnsureLoaded()) {
+        const std::string registrable = psl.Decompose(
+            fqdn, Utils::Domain::SuffixScope::IncludePrivate).registrableDomain;
+        if (!registrable.empty()) {
+            return registrable;
+        }
         return fqdn;
     }
 
-    size_t secondLastDot = fqdn.find_last_of('.', lastDot - 1);
+    // List unavailable: the previous rule, which is right for a two-label suffix and
+    // wrong for the rest, rather than refusing to answer.
+    const size_t lastDot = fqdn.find_last_of('.');
+    if (lastDot == std::string::npos) {
+        return fqdn;
+    }
+    const size_t secondLastDot = fqdn.find_last_of('.', lastDot - 1);
     if (secondLastDot != std::string::npos) {
         return fqdn.substr(secondLastDot + 1);
     }
-
     return fqdn;
 }
 

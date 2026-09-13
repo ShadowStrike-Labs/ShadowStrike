@@ -20,6 +20,9 @@
 #include <string>
 
 #include "../../../src/PhantomCore/Core/Network/DNSMonitor.hpp"
+#include "../../../src/PhantomCore/Utils/DomainUtils.hpp"
+
+#include <filesystem>
 #include "CoreNetwork_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Network::Test {
@@ -240,4 +243,85 @@ TEST_F(DNSMonitorTest, DiagnosticsExportAndSelfTestSucceedWithoutLiveCapture) {
     EXPECT_TRUE(monitor.SelfTest());
 }
 
+
+// ===========================================================================================
+// Multi-label public suffixes. The previous last-two-labels rule returned the SUFFIX as the
+// base domain for these - co.uk for evil.co.uk - which made every UK domain the same party
+// for any decision keyed on it. These cases need the public suffix list loaded, because
+// EnsureLoaded() resolves beside the executable and the test binary is not there.
+// ===========================================================================================
+
+namespace {
+
+[[nodiscard]] bool LoadPublicSuffixListForTests() {
+    using ShadowStrike::Utils::Domain::PublicSuffixList;
+    auto& psl = PublicSuffixList::Instance();
+    if (psl.IsLoaded()) {
+        return true;
+    }
+    std::error_code ec;
+    std::filesystem::path here = std::filesystem::current_path(ec);
+    for (int depth = 0; depth < 8 && !here.empty(); ++depth) {
+        const std::filesystem::path candidate =
+            here / L"content" / L"psl" / L"public_suffix_list.dat";
+        if (std::filesystem::exists(candidate, ec)) {
+            return psl.LoadFromFile(candidate.wstring());
+        }
+        if (!here.has_parent_path() || here.parent_path() == here) {
+            break;
+        }
+        here = here.parent_path();
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_F(DNSMonitorTest, GetBaseDomainHandlesMultiLabelSuffixes) {
+    ASSERT_TRUE(LoadPublicSuffixListForTests())
+        << "the vendored public suffix list did not load, so this test would exercise the "
+           "fallback rule it exists to replace";
+
+    // The defect: the suffix itself was returned as the base domain, so bbc.co.uk and
+    // gov.co.uk resolved to the same string and any reputation or grouping decision keyed
+    // on it treated them as one party.
+    EXPECT_EQ("evil.co.uk", DNSMonitor::GetBaseDomain("evil.co.uk"));
+    EXPECT_EQ("evil.co.uk", DNSMonitor::GetBaseDomain("a.b.evil.co.uk"));
+    EXPECT_EQ("example.com.au", DNSMonitor::GetBaseDomain("www.example.com.au"));
+
+    EXPECT_NE(DNSMonitor::GetBaseDomain("one.co.uk"),
+              DNSMonitor::GetBaseDomain("two.co.uk"))
+        << "two unrelated UK domains still resolve to the same base domain";
+
+    // A tenant of a shared host is its own party under IncludePrivate, which is the scope
+    // this helper uses because its purpose is reputation keying.
+    EXPECT_NE(DNSMonitor::GetBaseDomain("a.github.io"),
+              DNSMonitor::GetBaseDomain("b.github.io"));
+
+    // The behaviour the existing expectations pin must be unchanged.
+    EXPECT_EQ("example.com", DNSMonitor::GetBaseDomain("a.b.example.com"));
+    EXPECT_EQ("example.com", DNSMonitor::GetBaseDomain("example.com"));
+    EXPECT_EQ("localhost", DNSMonitor::GetBaseDomain("localhost"));
+}
+
+TEST_F(DNSMonitorTest, DgaAnalysisNoLongerSkipsMultiLabelSuffixDomains) {
+    ASSERT_TRUE(LoadPublicSuffixListForTests());
+
+    // Taking the label between the last two dots yielded "co" for a .co.uk host. At two
+    // characters that is below DGA_MIN_LENGTH of 8, so analysis returned before computing a
+    // single feature: every domain under a multi-label suffix was invisible to DGA scoring.
+    // The generated label below is 15 characters and highly random, so a non-zero entropy
+    // proves the features were actually computed.
+    const auto ccTld = monitor.AnalyzeDGA("xj93kq2p9zv8q1w.co.uk");
+    EXPECT_GT(ccTld.totalLength, 8u)
+        << "the analysed string is still the suffix label rather than the registrant's";
+    EXPECT_GT(ccTld.entropy, 0.0)
+        << "DGA analysis returned before extracting features for a .co.uk host";
+
+    // The same label under a single-label suffix was already analysed, and must still be.
+    const auto com = monitor.AnalyzeDGA("xj93kq2p9zv8q1w.com");
+    EXPECT_GT(com.entropy, 0.0);
+    EXPECT_EQ(com.totalLength, ccTld.totalLength)
+        << "the same registrable label measured different lengths under different suffixes";
+}
 }  // namespace ShadowStrike::Core::Network::Test

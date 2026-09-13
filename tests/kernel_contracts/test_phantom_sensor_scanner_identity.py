@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+DNS_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/DNSMonitor.cpp"
 BOTNET_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/BotnetDetector.cpp"
 CONTENT_COMPONENT_WXS_PATH = ROOT / "packaging/installer/ContentComponent.wxs"
 NETWORK_EVASION_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
@@ -26609,6 +26610,105 @@ class DgaFeatureInputContractTests(unittest.TestCase):
             "domain. A path that leaves it empty makes DGA scoring fall back to the coarse "
             "string for hosts that decompose perfectly well."
             % source.count("parts.registrableLabel"))
+
+
+class DnsMonitorDomainScopeContractTests(unittest.TestCase):
+    """Three domain decisions in one file, three different scopes, none of them blind.
+
+    MEASURED. DNSMonitor split hostnames on dots in three places and each was wrong in its own
+    way for a multi-label suffix, with .co.uk as the worked example:
+
+      AnalyzeDGAInternal   took the label BETWEEN the last two dots, so evil.co.uk yielded
+                           "co". At two characters that is below DGA_MIN_LENGTH of 8, so the
+                           function returned before computing a single feature - every domain
+                           under a multi-label suffix was invisible to DGA scoring, and a
+                           skipped domain is indistinguishable from a clean one.
+
+      tunnel tracking      keyed the map on the last two labels, so every .co.uk domain shared
+                           one bucket. Correlation then aggregated unrelated sites into a
+                           single series and the 50,000-entry cap counted a public suffix as
+                           one entry.
+
+      GetBaseDomain        the same rule, exposed publicly. Its tests - a.b.example.com to
+                           example.com, example.com and localhost unchanged - all hold under a
+                           public-suffix implementation, which is why they never caught it.
+
+    The scopes deliberately differ per site, and getting one wrong is silent because both
+    scopes return a plausible domain. Each is pinned separately below.
+    """
+
+    def _body(self, marker):
+        source = strip_c_comments(read_source(DNS_MONITOR_CPP_PATH))
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "%s is gone" % marker)
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_dga_analysis_measures_the_registrable_label(self):
+        # Defined inline inside the Impl class, so there is no ::-qualified form.
+        body = self._body("AnalyzeDGAInternal(const std::string& domain)")
+        self.assertIn(
+            "registrableLabel", body,
+            "DGA analysis no longer measures the registrant's label. Taking the label between "
+            "the last two dots yields the middle label of a multi-label SUFFIX, which is short "
+            "enough to fail the minimum-length check and skip the domain entirely.")
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "DGA analysis no longer uses IncludePrivate. A label generated beneath a "
+            "private-section suffix is still generated; IcannOnly would measure the hosting "
+            "provider's name instead.")
+
+    def test_tunnel_tracking_keys_on_the_registrable_domain_at_icann_scope(self):
+        source = strip_c_comments(read_source(DNS_MONITOR_CPP_PATH))
+        # m_domainTracking.find(baseDomain) appears twice - the other is in
+        # AnalyzeTunnelingInternal, which RECEIVES a base domain rather than deriving one.
+        # Only the deriving site declares trackingIt, so that is the unique anchor.
+        anchor = "trackingIt = m_domainTracking.find(baseDomain)"
+        self.assertEqual(
+            1, source.count(anchor),
+            "expected exactly one deriving tracking site, found %d" % source.count(anchor))
+        at = source.index(anchor)
+        window = source[max(0, at - 2600):at]
+        self.assertIn(
+            "parts.registrableDomain", window,
+            "the tunnel tracking key is no longer the registrable domain. Keying on the last "
+            "two labels makes the suffix itself the key, so every domain under a multi-label "
+            "suffix shares one bucket and correlation mixes unrelated sites.")
+        self.assertIn(
+            "SuffixScope::IcannOnly", window,
+            "tunnel tracking no longer uses IcannOnly, which yields the longer subdomain and "
+            "is therefore the more sensitive scope for tunnel measurement")
+
+    def test_the_public_base_domain_helper_uses_the_reputation_scope(self):
+        body = self._body("DNSMonitor::GetBaseDomain(")
+        self.assertIn(
+            "registrableDomain", body,
+            "GetBaseDomain no longer returns the registrable domain, so it returns the suffix "
+            "for any multi-label suffix and every domain under it groups as one party")
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "GetBaseDomain no longer uses IncludePrivate. Its integration test states the "
+            "purpose is reputation keying, and under IcannOnly one tenant of a shared host "
+            "would speak for every other tenant.")
+        self.assertIn(
+            "return fqdn;", body,
+            "GetBaseDomain no longer returns its input for a host with no registrable domain, "
+            "which is the contract its existing tests pin for localhost")
+
+    def test_no_domain_decision_goes_blind_without_the_suffix_list(self):
+        """ANTI-FAIL-OPEN, derived: every consult must have a fallback beside it."""
+        source = strip_c_comments(read_source(DNS_MONITOR_CPP_PATH))
+        consults = source.count("psl.EnsureLoaded()")
+        self.assertEqual(
+            3, consults,
+            "expected three public-suffix consults in DNSMonitor and found %d. The three sites "
+            "are DGA analysis, tunnel tracking and GetBaseDomain." % consults)
+        fallbacks = source.count("find_last_of('.')")
+        self.assertGreaterEqual(
+            fallbacks, 3,
+            "only %d last-dot fallbacks remain for three consults. The suffix list is shipped "
+            "content and can be absent; a site without a fallback then skips DGA analysis "
+            "entirely, drops tunnel tracking, or answers with nothing at all." % fallbacks)
 
 
 if __name__ == "__main__":
