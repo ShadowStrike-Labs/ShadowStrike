@@ -391,6 +391,7 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\PgtiFeedManager_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\NetworkAttackBlocker_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\ZeroTrustPromptQueue_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\ZeroTrustGuard_Tests.cpp" />
