@@ -391,6 +391,11 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\GameModeSchedule_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameModeManager.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\PerformanceOptimizer.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\OverlayProtection.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameProcessDetector.cpp" />
     <ClCompile Include="tests\unit\home_unit\PhishingVerdict_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\PhishingEmailDetector.cpp" />
     <ClCompile Include="tests\unit\home_unit\WiFiSecurityScore_Tests.cpp" />
