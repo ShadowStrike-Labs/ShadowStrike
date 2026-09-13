@@ -33,6 +33,7 @@
 #include "pch.h"
 #include "AdBlocker.hpp"
 #include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/DomainUtils.hpp"
 #include "PhantomCore/Utils/StringUtils.hpp"
 
 // ============================================================================
@@ -137,16 +138,42 @@ namespace {
                value.find('\0') != std::string_view::npos;
     }
 
+    // The registrable domain: the identity of the party that owns a host.
+    //
+    // The previous implementation returned everything after the FIRST dot, which is the
+    // host minus one label rather than a base domain, so its answer depended on how deep
+    // the host happened to be. cdn.a.example.com yielded a.example.com - still a
+    // subdomain - and a.co.uk yielded co.uk, which is the public suffix. Three consumers
+    // were affected: the cross-origin comparison that drives $third-party matching, the
+    // lookup key for a party's filter rules, and the whitelist's subdomain fallback.
+    //
+    // IncludePrivate, because each of those asks WHICH PARTY owns a host. Under IcannOnly
+    // two tenants of a shared host would be one party, so one tenant's filter rule or
+    // whitelist entry would apply to the other.
     std::string GetBaseDomain(const std::string& domain) {
-        auto parts = std::string_view(domain);
-        size_t dotCount = 0;
-        for (auto c : parts) {
-            if (c == '.') ++dotCount;
+        auto& psl = Utils::Domain::PublicSuffixList::Instance();
+        if (psl.EnsureLoaded()) {
+            std::string registrable = psl.Decompose(
+                domain, Utils::Domain::SuffixScope::IncludePrivate).registrableDomain;
+            if (!registrable.empty()) {
+                return registrable;
+            }
+            // A single label, an address literal, or a bare public suffix. There is no
+            // registrable domain to return, and the callers compare for equality, so the
+            // host itself is the only honest answer.
+            return domain;
         }
-        if (dotCount <= 1) return domain;
-        size_t pos = parts.find('.');
-        if (pos != std::string_view::npos) {
-            return std::string(parts.substr(pos + 1));
+
+        // List unavailable: the last two labels. Note this is NOT the previous rule, which
+        // was wrong at every depth except exactly three labels and is not worth
+        // preserving. The last two labels are correct for the common two-label suffix and
+        // no worse than the previous rule anywhere else.
+        const size_t lastDot = domain.find_last_of('.');
+        if (lastDot != std::string::npos && lastDot > 0) {
+            const size_t secondLastDot = domain.find_last_of('.', lastDot - 1);
+            if (secondLastDot != std::string::npos) {
+                return domain.substr(secondLastDot + 1);
+            }
         }
         return domain;
     }

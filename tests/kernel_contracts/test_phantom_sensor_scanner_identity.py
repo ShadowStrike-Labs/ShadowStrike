@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+AD_BLOCKER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/AdBlocker.cpp"
 COOKIE_MANAGER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/CookieManager.cpp"
 DNS_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/DNSMonitor.cpp"
 BOTNET_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/BotnetDetector.cpp"
@@ -26800,6 +26801,103 @@ class CookieIdentityKeyContractTests(unittest.TestCase):
             "the comment claiming the public suffix list is not used has returned. The list is "
             "vendored and packaged; a comment saying otherwise will send the next reader "
             "looking for work that is already done.")
+
+
+class AdBlockerPartyIdentityContractTests(unittest.TestCase):
+    """The ad blocker decides which party owns a host three times, and all three must agree.
+
+    MEASURED. GetBaseDomain returned everything after the FIRST dot, which is the host minus one
+    label rather than a base domain, so the answer depended on the host's depth:
+    cdn.a.example.com yielded a.example.com and a.co.uk yielded co.uk.
+
+    The consumers, each traced to what uses the value:
+      * IsCrossOrigin, consumed as isThirdPartyReq, which drives $third-party rule matching.
+        Wrong in BOTH directions - a first-party asset at cdn.a.example.com on a page at
+        example.com was declared cross-origin so $third-party rules fired on it, while a.co.uk
+        and b.co.uk both reduced to co.uk and were declared same-origin so a real tracker
+        escaped every $third-party rule.
+      * the m_domainToNetworkRuleIndices lookup, so a rule filed under example.com was never
+        found for a request to cdn.a.example.com and silently did not apply.
+      * IsWhitelistedInternal's subdomain fallback, which missed the entry the user created.
+
+    NOT A BYPASS, and recorded so nobody claims otherwise: AddToWhitelist stores the domain
+    verbatim, so a wrong base can only fail to match. It cannot place a public suffix in the
+    whitelist.
+
+    As with the other PhantomHome modules there is no behavioural coverage, because PhantomTests
+    links PhantomCoreLib only and no PhantomHome source is in the test binary. See task 264.
+    """
+
+    def _base_domain_body(self):
+        source = strip_c_comments(read_source(AD_BLOCKER_CPP_PATH))
+        marker = "std::string GetBaseDomain(const std::string& domain)"
+        self.assertEqual(
+            1, source.count(marker),
+            "GetBaseDomain is not defined exactly once in AdBlocker.cpp")
+        at = source.find(marker)
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_party_identity_uses_the_registrable_domain(self):
+        body = self._base_domain_body()
+        self.assertIn(
+            "registrableDomain", body,
+            "AdBlocker no longer resolves the registrable domain. Any rule that removes a fixed "
+            "number of labels is depth-dependent, which makes two hosts of the same site "
+            "disagree about their own identity.")
+
+    def test_party_identity_uses_the_trust_scope(self):
+        body = self._base_domain_body()
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "AdBlocker no longer uses IncludePrivate. Filter rules and whitelist entries name a "
+            "party, and under IcannOnly two tenants of a shared host become one party - so one "
+            "tenant's whitelist entry would silently cover the other.")
+        self.assertNotIn(
+            "SuffixScope::IcannOnly", body,
+            "AdBlocker now uses IcannOnly, which is the measurement scope rather than the "
+            "identity scope")
+
+    def test_the_depth_dependent_rule_does_not_return(self):
+        """The specific defect: returning everything after the FIRST dot."""
+        body = self._base_domain_body()
+        self.assertNotIn(
+            "parts.substr(pos + 1)", body,
+            "the host-minus-one-label rule has returned. It answers correctly only for hosts of "
+            "exactly three labels, and is wrong for cdn.a.example.com as well as for every "
+            "multi-label public suffix.")
+        self.assertNotIn(
+            "dotCount", body,
+            "the dot-counting rule has returned; counting labels cannot locate a public suffix")
+
+    def test_an_unavailable_suffix_list_still_yields_an_identity(self):
+        body = self._base_domain_body()
+        self.assertIn(
+            "domain.find_last_of('.')", body,
+            "the fallback is gone. All three consumers compare this value for equality, so "
+            "returning nothing would make every host its own party: no filter rule would match "
+            "and no whitelist entry would apply.")
+
+    def test_the_cross_origin_comparison_still_compares_both_sides(self):
+        """ANTI-VACUITY. A correct base domain is worthless if the comparison is short-circuited.
+
+        This is the assertion that ties the fix to its purpose: the $third-party decision must
+        remain a comparison of the request's party against the page's party.
+        """
+        source = strip_c_comments(read_source(AD_BLOCKER_CPP_PATH))
+        marker = "bool IsCrossOrigin("
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "IsCrossOrigin is gone")
+        opening = source.index("{", at)
+        body = source[at:_matching_delimiter(source, opening, "{", "}")]
+        self.assertEqual(
+            2, body.count("GetBaseDomain("),
+            "IsCrossOrigin no longer resolves BOTH sides through the same identity function. "
+            "Comparing a registrable domain against a raw host makes every subdomain "
+            "cross-origin.")
+        self.assertIn(
+            "reqDomain != pageDomain", body,
+            "the cross-origin comparison is gone; $third-party rule matching depends on it")
 
 
 if __name__ == "__main__":
