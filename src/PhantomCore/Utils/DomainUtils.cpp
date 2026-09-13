@@ -336,6 +336,7 @@ DomainParts PublicSuffixList::Decompose(std::string_view host, SuffixScope scope
         if (found != m_impl->exceptions.end() && acceptable(found->second)) {
             parts.publicSuffix        = JoinFrom(labels, i + 1);
             parts.registrableDomain   = candidate;
+            parts.registrableLabel    = std::string(labels[i]);
             if (i > 0) {
                 parts.subdomain = std::string(
                     lowered.substr(0, lowered.size() - candidate.size() - 1));
@@ -398,6 +399,7 @@ DomainParts PublicSuffixList::Decompose(std::string_view host, SuffixScope scope
     }
 
     parts.registrableDomain     = JoinFrom(labels, suffixStart - 1);
+    parts.registrableLabel      = std::string(labels[suffixStart - 1]);
     parts.subdomainLabelCount   = suffixStart - 1;
     if (parts.subdomainLabelCount > 0) {
         parts.subdomain = std::string(

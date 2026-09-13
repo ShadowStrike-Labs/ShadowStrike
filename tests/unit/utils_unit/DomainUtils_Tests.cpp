@@ -233,4 +233,49 @@ TEST_F(DomainUtilsTest, AnOverlongHostIsRejectedRatherThanTruncated) {
         << "a host beyond the DNS length limit was decomposed instead of rejected";
 }
 
+
+TEST_F(DomainUtilsTest, RegistrableLabelIsTheOneLabelTheRegistrantChose) {
+    // The string a DGA scorer must measure. A generation algorithm produces this label and
+    // nothing else, so a subdomain or a suffix remainder left in it dilutes every
+    // character-distribution feature computed over it - and both www and co are short,
+    // pronounceable, high-frequency tokens, which pushes a DGA score DOWN.
+    EXPECT_EQ("evil", Parse("evil.com").registrableLabel);
+    EXPECT_EQ("evil", Parse("www.evil.com").registrableLabel);
+    EXPECT_EQ("evil", Parse("evil.co.uk").registrableLabel);
+    EXPECT_EQ("evil", Parse("a.b.evil.co.uk").registrableLabel);
+    EXPECT_EQ("good", Parse("a.b.good.co.uk").registrableLabel);
+
+    // A host that IS a public suffix has no registrant, so no label.
+    EXPECT_TRUE(Parse("co.uk").registrableLabel.empty());
+    EXPECT_TRUE(Parse("com").registrableLabel.empty());
+
+    // Never the whole host.
+    EXPECT_NE("www.evil.com", Parse("www.evil.com").registrableLabel);
+}
+
+TEST_F(DomainUtilsTest, RegistrableLabelFollowsTheScopeForSharedHosts) {
+    // The scopes disagree here and both answers are correct for their own question. For DGA
+    // scoring IncludePrivate is the sensitive one: the generated label sits BENEATH the
+    // private-section suffix, so IcannOnly would measure the hosting provider's name
+    // instead of the generated string. This is the reverse of the tunnelling case.
+    EXPECT_EQ("x7f2q9zk3m",
+              Parse("x7f2q9zk3m.blogspot.com", SuffixScope::IncludePrivate).registrableLabel);
+    EXPECT_EQ("blogspot",
+              Parse("x7f2q9zk3m.blogspot.com", SuffixScope::IcannOnly).registrableLabel);
+}
+
+TEST_F(DomainUtilsTest, RegistrableLabelIsConsistentWithItsNeighbours) {
+    // RELATIONAL rather than a fixed string: the label plus a dot plus the public suffix
+    // must reconstruct the registrable domain exactly, for every case that has one.
+    for (const char* host : {"evil.com", "www.evil.com", "a.b.good.co.uk",
+                             "sub.pvt.k12.ma.us", "c.b.ck", "a.www.ck"}) {
+        const DomainParts parts = Parse(host);
+        ASSERT_TRUE(parts.valid) << host;
+        ASSERT_FALSE(parts.registrableDomain.empty()) << host;
+        EXPECT_EQ(parts.registrableLabel + "." + parts.publicSuffix,
+                  parts.registrableDomain)
+            << "for " << host << " the label and suffix do not reconstruct the registrable"
+               " domain, so one of the three is wrong";
+    }
+}
 }  // namespace

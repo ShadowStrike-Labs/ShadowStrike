@@ -92,6 +92,14 @@ struct DomainParts {
     /// Number of labels in `subdomain`. Zero when there is no subdomain.
     std::size_t subdomainLabelCount = 0;
 
+    /// The single label the registrant chose, e.g. "good" for "a.b.good.co.uk". This is
+    /// the string a DGA scorer must measure: a generation algorithm produces this label
+    /// and nothing else, so including a subdomain or a suffix remainder dilutes every
+    /// character-distribution feature computed over it.
+    ///
+    /// EMPTY when there is no registrable domain. It is never the whole host.
+    std::string registrableLabel;
+
     SuffixSection section = SuffixSection::None;
 
     /// True when an explicit rule matched. False means the implicit "*" default was used,

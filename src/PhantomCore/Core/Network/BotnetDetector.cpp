@@ -59,6 +59,7 @@
 // ============================================================================
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/StringUtils.hpp"
+#include "../../Utils/DomainUtils.hpp"
 #include "../../Utils/NetworkUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
@@ -989,10 +990,35 @@ BotnetDGAAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeDGAInternal(const s
     analysis.domain = domain;
 
     try {
-        // Extract domain name without TLD
-        size_t lastDot = domain.find_last_of('.');
-        std::string baseDomain = (lastDot != std::string::npos) ?
-                                domain.substr(0, lastDot) : domain;
+        // The label the registrant chose, which is the only string a generation
+        // algorithm produces. Removing just the final label left the subdomain and any
+        // suffix remainder in place - www.evil.com became "www.evil" and evil.co.uk
+        // became "evil.co" - and both www and co are short, pronounceable,
+        // high-frequency tokens, so every feature below was diluted toward normal and
+        // the score was pushed DOWN. That is the miss direction, not a false positive.
+        //
+        // IncludePrivate, deliberately, and note this is the opposite scope to the one
+        // DNS tunnelling uses. A DGA generates the label its operator registers, and on
+        // shared hosting that label sits beneath a private-section suffix:
+        // x7f2q9zk3m.blogspot.com yields the generated label under IncludePrivate and
+        // yields "blogspot" under IcannOnly. Here IncludePrivate is the sensitive one.
+        std::string baseDomain;
+        {
+            auto& psl = Utils::Domain::PublicSuffixList::Instance();
+            if (psl.EnsureLoaded()) {
+                baseDomain = psl.Decompose(
+                    domain, Utils::Domain::SuffixScope::IncludePrivate).registrableLabel;
+            }
+            if (baseDomain.empty()) {
+                // Either the list is unavailable or it could not decompose the host.
+                // An empty label returns below before a single feature is extracted, so
+                // failing to a coarser string keeps DGA scoring alive rather than
+                // silently switching it off. Imprecise, never blind.
+                const size_t lastDot = domain.find_last_of('.');
+                baseDomain = (lastDot != std::string::npos)
+                           ? domain.substr(0, lastDot) : domain;
+            }
+        }
 
         if (baseDomain.empty() || baseDomain.length() < BotnetDetectorConstants::DGA_MIN_LENGTH) {
             return analysis;

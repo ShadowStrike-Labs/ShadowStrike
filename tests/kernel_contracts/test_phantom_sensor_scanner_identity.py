@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+BOTNET_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/BotnetDetector.cpp"
 CONTENT_COMPONENT_WXS_PATH = ROOT / "packaging/installer/ContentComponent.wxs"
 NETWORK_EVASION_CPP_PATH = ROOT / "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.cpp"
 DOMAIN_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/DomainUtils.hpp"
@@ -26510,6 +26511,104 @@ class ShippedContentDeliveryContractTests(unittest.TestCase):
             harness, r"Copy-Item\s+\$pslSource",
             "the harness creates the staging psl directory but no longer copies the list "
             "into it, so nothing reaches the MSI")
+
+
+class DgaFeatureInputContractTests(unittest.TestCase):
+    """Every DGA feature must be computed over the one label the registrant chose.
+
+    MEASURED. AnalyzeDGAInternal removed only the final label of the host, so the string nine
+    features were computed over still contained the subdomain and any suffix remainder:
+    www.evil.com became "www.evil" and evil.co.uk became "evil.co".
+
+    The direction of that error is what makes it serious. Both www and co are short,
+    pronounceable, high-frequency tokens, so they dilute entropy, pull the consonant ratio
+    toward normal, and raise bigram and trigram frequency - every one of which REDUCES the DGA
+    score. A generated label reached over www, or registered under a multi-label ccTLD, scored
+    lower than the same label reached directly. That is a miss, not a false positive.
+
+    The scope choice here is the opposite of the one DNS tunnelling makes, and both are
+    correct for their own question. A DGA generates the label its operator registers, and on
+    shared hosting that label sits beneath a private-section suffix, so IncludePrivate is the
+    sensitive scope for DGA while IcannOnly is the sensitive one for tunnelling. Neither may
+    become a default; the tests below pin each site's choice separately.
+    """
+
+    def _dga_body(self):
+        source = strip_c_comments(read_source(BOTNET_DETECTOR_CPP_PATH))
+        marker = "::AnalyzeDGAInternal("
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "AnalyzeDGAInternal is gone")
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_the_features_are_computed_over_the_registrable_label(self):
+        body = self._dga_body()
+        self.assertIn(
+            "registrableLabel", body,
+            "DGA features are no longer computed over the registrant's label. Removing only "
+            "the final label of the host leaves the subdomain and any suffix remainder in the "
+            "string, and both dilute the features toward normal - which lowers the score and "
+            "produces misses.")
+
+    def test_the_dga_scope_is_include_private(self):
+        body = self._dga_body()
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "DGA scoring no longer resolves the label with IncludePrivate. Under IcannOnly a "
+            "generated label on shared hosting is invisible: x7f2q9zk3m.blogspot.com yields "
+            "the hosting provider's name rather than the generated string.")
+        self.assertNotIn(
+            "SuffixScope::IcannOnly", body,
+            "DGA scoring now uses IcannOnly, which measures the wrong label for any generated "
+            "name registered beneath a private-section suffix")
+
+    def test_an_unavailable_suffix_list_does_not_disable_dga_scoring(self):
+        """ANTI-FAIL-OPEN. An empty label returns before a single feature is extracted."""
+        body = self._dga_body()
+        self.assertIn(
+            "if (baseDomain.empty())", body,
+            "the empty-label fallback is gone. AnalyzeDGAInternal returns early on an empty "
+            "or too-short label, so without a fallback a missing public suffix list would not "
+            "degrade DGA scoring - it would switch it off, and the list is shipped content "
+            "that can be absent.")
+        self.assertIn(
+            "domain.find_last_of('.')", body,
+            "the coarse fallback string is gone, so there is nothing to fall back TO")
+        empty_at = body.find("if (baseDomain.empty())")
+        min_at = body.find("DGA_MIN_LENGTH")
+        self.assertNotEqual(-1, min_at, "the minimum-length guard is gone")
+        self.assertLess(
+            empty_at, min_at,
+            "the fallback now runs AFTER the minimum-length guard, so an empty label returns "
+            "before the fallback can supply one")
+
+    def test_every_feature_reads_the_same_string(self):
+        """DERIVED: whatever the extraction produces, all features must share it."""
+        body = self._dga_body()
+        calls = re.findall(r"analysis\.\w+\s*=\s*(Calculate\w+|Contains\w+)\(([^)]*)\)", body)
+        self.assertGreaterEqual(
+            len(calls), 8,
+            "only %d feature computations were found in AnalyzeDGAInternal; this guard has "
+            "lost its subject" % len(calls))
+        wrong = ["%s(%s)" % (fn, arg) for fn, arg in calls if arg.strip() != "baseDomain"]
+        self.assertEqual(
+            [], wrong,
+            "these feature computations read something other than the extracted label, so the "
+            "features no longer describe one consistent string: %s" % wrong)
+
+    def test_the_registrable_label_is_never_the_whole_host(self):
+        """The field's contract, stated where a future reader will look for it."""
+        header = strip_c_comments(read_source(DOMAIN_UTILS_HPP_PATH))
+        self.assertIn(
+            "std::string registrableLabel;", header,
+            "DomainParts::registrableLabel is gone")
+        source = strip_c_comments(read_source(DOMAIN_UTILS_CPP_PATH))
+        self.assertEqual(
+            2, source.count("parts.registrableLabel"),
+            "registrableLabel is assigned on %d of the two paths that produce a registrable "
+            "domain. A path that leaves it empty makes DGA scoring fall back to the coarse "
+            "string for hosts that decompose perfectly well."
+            % source.count("parts.registrableLabel"))
 
 
 if __name__ == "__main__":
