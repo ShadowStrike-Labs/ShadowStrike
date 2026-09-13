@@ -27127,5 +27127,85 @@ class PhishingTyposquatScopeContractTests(unittest.TestCase):
             "the original full-domain exact-match guard is gone")
 
 
+class DecoyExtensionCaseContractTests(unittest.TestCase):
+    """A filename on removable media is chosen by the attacker, so case cannot decide detection.
+
+    MEASURED. PerformHeuristicAnalysis tested the two halves of one heuristic differently. The
+    trailing executable extension went through IsPriorityScanExtension, which compares character
+    by character through std::tolower. The inner document extension was compared with raw string
+    equality against lowercase literals. So document.pdf.exe was detected and document.PDF.exe was
+    not, and Windows filenames are case-insensitive, so capitalising one letter removed the
+    detection at no cost.
+
+    NO BEHAVIOURAL TEST EXISTS FOR THIS. PerformHeuristicAnalysis is a private Impl method taking
+    a filesystem path, and the heuristics around it call GetFileAttributesW, so exercising it needs
+    real files; the public entry points walk a drive. These guards are the protection.
+    """
+
+    def _usb_source(self):
+        return strip_c_comments(read_source(USB_SCANNER_CPP_PATH))
+
+    def _fn_body(self, source, signature):
+        self.assertEqual(
+            1, source.count(signature), "%s is not defined exactly once" % signature)
+        at = source.find(signature)
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_the_inner_extension_is_not_compared_case_sensitively(self):
+        source = self._usb_source()
+        for literal in ('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.jpg', '.png', '.mp3'):
+            self.assertNotIn(
+                'innerExt == "%s"' % literal, source,
+                'the inner extension is compared directly against "%s" again. Windows filenames '
+                'are case-insensitive and the filename comes from removable media, so '
+                'document.PDF.exe would evade the double-extension heuristic while '
+                'document.pdf.exe is caught.' % literal)
+
+    def test_both_halves_of_the_heuristic_compare_case_insensitively(self):
+        """RELATIONAL. The point is not that a helper exists, but that the two halves agree.
+
+        The outer half already lowercased both sides. A guard that only checked the inner half
+        would pass if someone made the OUTER half case-sensitive instead, which is the same defect
+        with the arms swapped.
+        """
+        source = self._usb_source()
+        for helper in ("IsPriorityScanExtension", "IsDecoyExtension"):
+            body = self._fn_body(source, "bool %s(std::string_view ext) noexcept" % helper)
+            self.assertIn(
+                "std::tolower", body,
+                "%s no longer lowercases before comparing, so one half of the double-extension "
+                "heuristic is case-sensitive and the other is not" % helper)
+            self.assertEqual(
+                2, body.count("std::tolower"),
+                "%s must lowercase BOTH sides of the comparison; lowering only one makes an "
+                "uppercase input fail against an uppercase constant" % helper)
+
+    def test_the_decoy_list_still_covers_the_document_types(self):
+        """ANTI-DELETION. Emptying the list would satisfy every assertion above."""
+        body = self._fn_body(self._usb_source(),
+                             "bool IsDecoyExtension(std::string_view ext) noexcept")
+        for literal in ('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.jpg', '.png', '.mp3'):
+            self.assertIn(
+                '"%s"' % literal, body,
+                'the decoy extension "%s" was dropped from the list, so a filename using it as '
+                'the visible extension is no longer treated as a decoy' % literal)
+
+    def test_the_heuristic_still_consumes_the_decoy_check(self):
+        """ANTI-VACUITY. A correct helper that nothing calls detects nothing."""
+        source = self._usb_source()
+        self.assertIn(
+            "IsDecoyExtension(innerExt)", source,
+            "the decoy check is no longer applied to the inner extension, so the "
+            "double-extension heuristic no longer tests what the user was shown")
+        self.assertIn(
+            "IsPriorityScanExtension(realExt)", source,
+            "the trailing extension is no longer required to be executable, which would make the "
+            "heuristic fire on any file with two dots")
+        self.assertIn(
+            '"Heuristic.DoubleExtension"', source,
+            "the double-extension detection no longer reports a threat")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

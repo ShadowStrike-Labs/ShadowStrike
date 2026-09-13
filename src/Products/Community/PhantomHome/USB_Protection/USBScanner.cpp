@@ -217,6 +217,35 @@ struct ScopedHandle {
     return false;
 }
 
+// The document extension a decoy filename shows the user, as in "invoice.pdf.exe".
+//
+// This mirrors IsPriorityScanExtension deliberately, including its case-insensitive
+// comparison. The double-extension heuristic previously compared the inner extension with
+// raw string equality against lowercase literals while the outer half used the helper
+// above, so the two halves of one test disagreed: "document.pdf.exe" was detected and
+// "document.PDF.exe" was not. A filename on removable media is chosen entirely by
+// whoever wrote the media, and Windows filenames are case-insensitive, so capitalising one
+// letter removed the detection at no cost to the attacker.
+[[nodiscard]] bool IsDecoyExtension(std::string_view ext) noexcept {
+    static constexpr const char* kDecoyExtensions[] = {
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".jpg", ".png", ".mp3"
+    };
+    for (const char* de : kDecoyExtensions) {
+        if (ext.size() == std::string_view(de).size()) {
+            bool match = true;
+            for (size_t i = 0; i < ext.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(ext[i])) !=
+                    std::tolower(static_cast<unsigned char>(de[i]))) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
 /// Check whether a file is a reparse point (symlink, junction, etc.).
 [[nodiscard]] bool IsReparsePoint(const std::wstring& path) noexcept {
     DWORD attrs = ::GetFileAttributesW(path.c_str());
@@ -1318,9 +1347,7 @@ private:
             std::string realExt = filename.substr(lastDot);
             if (IsPriorityScanExtension(realExt)) {
                 std::string innerExt = filename.substr(firstDot, lastDot - firstDot);
-                if (innerExt == ".pdf" || innerExt == ".doc" || innerExt == ".docx" ||
-                    innerExt == ".xls" || innerExt == ".xlsx" || innerExt == ".txt" ||
-                    innerExt == ".jpg" || innerExt == ".png" || innerExt == ".mp3") {
+                if (IsDecoyExtension(innerExt)) {
                     DetectedThreat threat;
                     threat.type       = DetectionType::Heuristic;
                     threat.threatName = "Heuristic.DoubleExtension";
