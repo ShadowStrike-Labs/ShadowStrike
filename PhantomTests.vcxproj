@@ -388,6 +388,9 @@
     <!-- tests\unit\usb_protection_unit -->
     <ClCompile Include="tests\unit\usb_protection_unit\USBAutorunBlocker_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBAutorunBlocker.cpp" />
+    <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
+         so only the test file needs listing here. -->
+    <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\FileUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\HashUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\JSONUtils_Tests.cpp" />
