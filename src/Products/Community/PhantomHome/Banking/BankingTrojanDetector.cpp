@@ -33,6 +33,8 @@
 #include "pch.h"
 #include "BankingTrojanDetector.hpp"
 
+#include "PhantomCore/Utils/DomainUtils.hpp"
+
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
@@ -1447,13 +1449,38 @@ public:
         for (const auto& conn : connections) {
             if (conn.domainName.empty()) continue;
 
-            // Extract the second-level domain label
-            const auto lastDot = conn.domainName.rfind('.');
-            if (lastDot == std::string::npos) continue;
-            const auto prevDot = conn.domainName.rfind('.', lastDot - 1);
-            const std::string label = (prevDot == std::string::npos)
-                ? conn.domainName.substr(0, lastDot)
-                : conn.domainName.substr(prevDot + 1, lastDot - prevDot - 1);
+            // The label the registrant chose - the string a generator actually produces.
+            //
+            // This previously took the text between the last two dots, which for a
+            // multi-label public suffix is part of the SUFFIX: x7f2q9zk3m.co.uk yielded
+            // "co". Two characters fall below DGA_MIN_LABEL_LENGTH, so the domain was
+            // discarded before entropy or the consonant ratio was computed, and the result
+            // was indistinguishable from a clean verdict. Every DGA domain under such a
+            // suffix was invisible - and DGA is how the families named in this file, Zeus
+            // and Dridex, reach their command and control.
+            //
+            // IncludePrivate: a generated label is the one its operator registers, and on
+            // shared hosting that sits beneath a private-section suffix.
+            std::string label;
+            auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+            if (psl.EnsureLoaded()) {
+                label = psl.Decompose(
+                    conn.domainName,
+                    ShadowStrike::Utils::Domain::SuffixScope::IncludePrivate)
+                    .registrableLabel;
+            }
+            if (label.empty()) {
+                // List unavailable, or a host with no registrable label at all. The
+                // previous approximation, which is correct for a two-label suffix. Never
+                // leave the label empty and fall through: an empty label scores zero
+                // entropy, which reads as clean rather than as not examined.
+                const auto lastDot = conn.domainName.rfind('.');
+                if (lastDot == std::string::npos) continue;
+                const auto prevDot = conn.domainName.rfind('.', lastDot - 1);
+                label = (prevDot == std::string::npos)
+                    ? conn.domainName.substr(0, lastDot)
+                    : conn.domainName.substr(prevDot + 1, lastDot - prevDot - 1);
+            }
 
             if (label.size() < DGA_MIN_LABEL_LENGTH) continue;
 

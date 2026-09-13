@@ -160,6 +160,8 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+PHISHING_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/PhishingDetector.cpp"
+BANKING_TROJAN_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Banking/BankingTrojanDetector.cpp"
 NETWORK_CAPTURE_CPP_PATH = ROOT / "src/Products/Community/PhantomEDR/Forensics/NetworkCapture.cpp"
 AD_BLOCKER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/AdBlocker.cpp"
 COOKIE_MANAGER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/CookieManager.cpp"
@@ -26995,6 +26997,134 @@ class DnsTunnelCorrelationScopeContractTests(unittest.TestCase):
             "CalculateShannonEntropy(subdomain)", body,
             "the entropy is no longer measured over the subdomain, so the split this fix "
             "corrects is not consumed by the verdict")
+
+
+class BankingDgaLabelContractTests(unittest.TestCase):
+    """A DGA scorer must measure the label a generator produced, not part of the public suffix.
+
+    MEASURED. DetectDGADomains took the text between the last two dots, which for a multi-label
+    public suffix is part of the SUFFIX: x7f2q9zk3m.co.uk yielded "co". DGA_MIN_LABEL_LENGTH is 8,
+    and every multi-label suffix label is at most three characters - co, com, ac, gov, net - so
+    the domain was DISCARDED BEFORE entropy or the consonant ratio was computed. The blind spot
+    was total for such suffixes, and the outcome is indistinguishable from a clean verdict. DGA is
+    how the families this file names, Zeus and Dridex, reach command and control.
+
+    NO BEHAVIOURAL TEST IS POSSIBLE HERE. DetectDGADomains takes a process id and enumerates live
+    TCP connections; the header exposes no entry point accepting a domain string. These guards are
+    the only protection, which is why the anti-blind case below matters.
+    """
+
+    def _dga_body(self):
+        source = strip_c_comments(read_source(BANKING_TROJAN_DETECTOR_CPP_PATH))
+        marker = "std::vector<std::string> DetectDGADomains(uint32_t processId)"
+        self.assertEqual(
+            1, source.count(marker), "DetectDGADomains is not defined exactly once")
+        at = source.find(marker)
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_the_dga_scorer_measures_the_registrable_label(self):
+        body = self._dga_body()
+        self.assertIn(
+            "registrableLabel", body,
+            "the banking DGA check no longer measures the registrable label. Taking the text "
+            "between the last two dots yields a suffix label such as co, which is shorter than "
+            "DGA_MIN_LABEL_LENGTH and so discards the domain before any measurement.")
+
+    def test_the_dga_scorer_uses_the_generated_label_scope(self):
+        body = self._dga_body()
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "the banking DGA check no longer uses IncludePrivate. A generated label is the one "
+            "its operator registers, and under IcannOnly a domain on shared hosting yields the "
+            "hosting provider's label - blogspot rather than the generated string.")
+        self.assertNotIn(
+            "SuffixScope::IcannOnly", body,
+            "the banking DGA check now uses IcannOnly, which measures the wrong label beneath a "
+            "private-section suffix")
+
+    def test_an_unavailable_suffix_list_does_not_blind_the_dga_check(self):
+        """ANTI-BLIND. An empty label scores zero entropy, which reads as clean."""
+        body = self._dga_body()
+        self.assertIn(
+            "conn.domainName.rfind('.', lastDot - 1)", body,
+            "the fallback is gone. With no label the entropy is zero and the consonant ratio is "
+            "meaningless, so a missing suffix list would switch the check off rather than degrade "
+            "it - and the suffix list is shipped content that can be absent.")
+        self.assertIn(
+            "if (label.empty())", body,
+            "the fallback is no longer guarded on an empty label, so it either never runs or "
+            "always overwrites the decomposed answer")
+
+    def test_the_dga_thresholds_are_unchanged(self):
+        """A boundary fix must not become a threshold change."""
+        body = self._dga_body()
+        self.assertIn(
+            "if (label.size() < DGA_MIN_LABEL_LENGTH) continue;", body,
+            "the minimum label length gate was altered while correcting the boundary; the gate "
+            "now measures a different quantity and must not also be relaxed")
+        self.assertIn(
+            "entropy > DGA_ENTROPY_THRESHOLD", body,
+            "the entropy threshold comparison is gone")
+        self.assertIn(
+            "ratio > 3.0", body,
+            "the consonant-to-vowel ratio comparison is gone")
+
+
+class PhishingTyposquatScopeContractTests(unittest.TestCase):
+    """Typosquatting comparison: identity scope, and a zero distance is not a typo.
+
+    The behavioural cases in PhishingDetector_Tests.cpp cannot pin the scope choice, because
+    co.uk is an ICANN suffix and both scopes agree on it. This holds the choice at source level.
+
+    The identity skip is guarded here as well as behaviourally, because it is the difference
+    between reporting www.paypal.com as an attack on PayPal and not doing so.
+    """
+
+    def _typosquat_body(self):
+        source = strip_c_comments(read_source(PHISHING_DETECTOR_CPP_PATH))
+        marker = "TyposquattingResult CheckTyposquattingInternal(const std::string& domain)"
+        self.assertEqual(
+            1, source.count(marker), "CheckTyposquattingInternal is not defined exactly once")
+        at = source.find(marker)
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_a_candidate_equal_to_the_brand_domain_is_not_a_typo(self):
+        body = self._typosquat_body()
+        self.assertIn(
+            "if (candidate == legit) continue;", body,
+            "the identity skip is gone. The guard above the loop compares only the FULL domain, "
+            "so without this every subdomain of a protected brand matches its own registrable "
+            "domain at distance 0 and similarity 1.0 and is reported as typosquatting the brand "
+            "it belongs to: www.paypal.com, mail.google.com, login.microsoft.com.")
+
+    def test_the_registrable_domain_uses_the_identity_scope(self):
+        source = strip_c_comments(read_source(PHISHING_DETECTOR_CPP_PATH))
+        marker = "std::string ExtractRegistrableDomain(const std::string& domain)"
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "ExtractRegistrableDomain is gone")
+        opening = source.index("{", at)
+        body = source[at:_matching_delimiter(source, opening, "{", "}")]
+        self.assertIn(
+            "registrableDomain", body,
+            "ExtractRegistrableDomain no longer resolves a registrable domain, so it does not do "
+            "what its name says and a brand under a multi-label suffix has nothing to compare")
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "the typosquatting comparison no longer uses IncludePrivate; a phishing page on a "
+            "shared host must be compared as the tenant it is")
+
+    def test_both_typosquat_candidates_are_still_compared(self):
+        """ANTI-VACUITY. The fix is worthless if only one candidate survives."""
+        body = self._typosquat_body()
+        self.assertIn(
+            "for (const auto& candidate : {domainLower, registrable})", body,
+            "the typosquatting check no longer compares both the full domain and the registrable "
+            "domain; dropping either loses a detection the other cannot make")
+        self.assertIn(
+            "if (domainLower == legit) continue;", body,
+            "the original full-domain exact-match guard is gone")
 
 
 if __name__ == "__main__":
