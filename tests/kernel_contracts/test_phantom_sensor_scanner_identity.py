@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+NETWORK_CAPTURE_CPP_PATH = ROOT / "src/Products/Community/PhantomEDR/Forensics/NetworkCapture.cpp"
 AD_BLOCKER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/AdBlocker.cpp"
 COOKIE_MANAGER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/CookieManager.cpp"
 DNS_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/DNSMonitor.cpp"
@@ -26898,6 +26899,102 @@ class AdBlockerPartyIdentityContractTests(unittest.TestCase):
         self.assertIn(
             "reqDomain != pageDomain", body,
             "the cross-origin comparison is gone; $third-party rule matching depends on it")
+
+
+class DnsTunnelCorrelationScopeContractTests(unittest.TestCase):
+    """DetectDNSTunneling measures attacker-added labels, so it takes the measurement scope.
+
+    MEASURED. GetBaseDomain returned the last two labels, so evil.co.uk yielded co.uk. Two uses,
+    both measurement rather than identity:
+      * metricsByBaseDomain[baseDomain] is the correlation bucket. Every domain under a
+        multi-label suffix shared ONE bucket, so unrelated sites summed their query counts into a
+        single threshold comparison and the domain reported to the analyst was co.uk.
+      * GetSubdomainComponent feeds CalculateShannonEntropy. For x.evil.co.uk the base was co.uk,
+        so the measured subdomain was x.evil - it included the registrable label the owner chose,
+        diluting the entropy of the part a tunnel encodes data into.
+
+    THIS IS THE ONE SITE IN TASK 262 THAT TAKES IcannOnly. Under a private-section suffix the
+    tenant label is itself attacker-chosen, so a tunnel at data1.attacker.blogspot.com must keep
+    attacker inside the measured portion. IncludePrivate would discard a label the operator
+    controls. The CookieManager and AdBlocker sites take IncludePrivate because they ask which
+    party owns a host; this one asks how much an attacker added.
+
+    THESE GUARDS ARE THE ONLY PROTECTION THIS FILE HAS. PhantomEDR and PhantomXDR declare
+    PlatformToolset v145, which is not installed, and the project carries 630 pre-existing
+    compile errors including missing sources - so the translation unit cannot be built or tested
+    on the development host. Filed separately.
+    """
+
+    def _fn_body(self, signature):
+        source = strip_c_comments(read_source(NETWORK_CAPTURE_CPP_PATH))
+        self.assertEqual(
+            1, source.count(signature), "%s is not defined exactly once" % signature)
+        at = source.find(signature)
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_the_correlation_bucket_uses_the_registrable_domain(self):
+        body = self._fn_body("std::string GetBaseDomain(std::string_view domain)")
+        self.assertIn(
+            "registrableDomain", body,
+            "the DNS tunnel correlation bucket is no longer keyed on the registrable domain. "
+            "The last two labels are the SUFFIX for a multi-label suffix, which merges unrelated "
+            "sites into one set of metrics and reports a public suffix as the suspicious domain.")
+
+    def test_the_entropy_input_is_the_decomposed_subdomain(self):
+        body = self._fn_body("std::string GetSubdomainComponent(std::string_view domain)")
+        self.assertIn(
+            "parts.subdomain", body,
+            "the entropy input no longer comes from the decomposition. Slicing the base domain "
+            "off the front by length assumes it is a suffix of the host, and with a wrong base "
+            "it leaves the registrable label inside the measured portion.")
+
+    def test_both_sites_use_the_measurement_scope(self):
+        """RELATIONAL. The bucket and the entropy input must agree, or they describe different
+        splits of the same host: a subdomain measured against one boundary, filed under another.
+        """
+        base = self._fn_body("std::string GetBaseDomain(std::string_view domain)")
+        subdomain = self._fn_body("std::string GetSubdomainComponent(std::string_view domain)")
+        for label, body in (("GetBaseDomain", base), ("GetSubdomainComponent", subdomain)):
+            self.assertIn(
+                "SuffixScope::IcannOnly", body,
+                "%s no longer uses IcannOnly. This is measurement of attacker-added labels, and "
+                "beneath a private-section suffix the tenant label was chosen by whoever "
+                "registered it, so it belongs in the measured portion." % label)
+            self.assertNotIn(
+                "SuffixScope::IncludePrivate", body,
+                "%s now uses IncludePrivate, the identity scope. It would discard a label the "
+                "tunnel operator controls." % label)
+
+    def test_neither_site_can_return_an_empty_measurement(self):
+        """ANTI-BLIND. An empty subdomain scores zero entropy, which reads as clean rather than
+        as not examined; an empty bucket key merges every observed domain into one metric set.
+        """
+        base = self._fn_body("std::string GetBaseDomain(std::string_view domain)")
+        subdomain = self._fn_body("std::string GetSubdomainComponent(std::string_view domain)")
+        self.assertIn(
+            "labels[labels.size() - 2]", base,
+            "GetBaseDomain lost its fallback; an absent suffix list would leave every observed "
+            "domain sharing one bucket")
+        self.assertIn(
+            "const size_t suffixStart = domain.size() - baseDomain.size();", subdomain,
+            "GetSubdomainComponent lost its fallback; an absent suffix list would score zero "
+            "entropy for every domain, which the detector cannot distinguish from clean")
+
+    def test_the_tunnel_verdict_still_consumes_both_measurements(self):
+        """ANTI-VACUITY. A correct split is worthless if the scoring stops reading it."""
+        source = strip_c_comments(read_source(NETWORK_CAPTURE_CPP_PATH))
+        at = source.find("std::vector<std::string> NetworkCaptureImpl::DetectDNSTunneling(")
+        self.assertNotEqual(-1, at, "DetectDNSTunneling is gone")
+        opening = source.index("{", at)
+        body = source[at:_matching_delimiter(source, opening, "{", "}")]
+        self.assertIn(
+            "metricsByBaseDomain[baseDomain]", body,
+            "the metrics are no longer filed under the base domain")
+        self.assertIn(
+            "CalculateShannonEntropy(subdomain)", body,
+            "the entropy is no longer measured over the subdomain, so the split this fix "
+            "corrects is not consumed by the verdict")
 
 
 if __name__ == "__main__":

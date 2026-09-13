@@ -37,6 +37,7 @@
 #include "PhantomCore/Utils/Logger.hpp"
 #include "PhantomCore/Utils/FileUtils.hpp"
 #include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/DomainUtils.hpp"
 #include "PhantomCore/Utils/StringUtils.hpp"
 #include "PhantomCore/Utils/SystemUtils.hpp"
 #include "PhantomCore/Utils/ProcessUtils.hpp"
@@ -380,8 +381,33 @@ constexpr size_t DNS_TUNNELING_TXT_NULL_THRESHOLD = 10;
     return false;
 }
 
+// The registrable domain, used as the correlation bucket for DNS tunnel metrics.
+//
+// The previous rule took the last two labels, which for a multi-label suffix IS the
+// suffix: every domain under .co.uk shared one bucket, summed its query counts into a
+// single threshold comparison, and was reported to the analyst as co.uk.
+//
+// IcannOnly, not IncludePrivate. This is measurement of labels an attacker added, and
+// under a private-section suffix the tenant label is itself attacker-chosen - a tunnel at
+// data1.attacker.blogspot.com should keep attacker in the measured portion, because the
+// operator picked it. The same choice is made in NetworkBasedEvasionDetector and in
+// DNSMonitor's tunnel tracking.
 [[nodiscard]] std::string GetBaseDomain(std::string_view domain) {
     const auto normalized = ToLowerAscii(std::string(domain));
+
+    auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+    if (psl.EnsureLoaded()) {
+        const auto parts = psl.Decompose(
+            normalized, ShadowStrike::Utils::Domain::SuffixScope::IcannOnly);
+        if (!parts.registrableDomain.empty()) {
+            return parts.registrableDomain;
+        }
+        return normalized;
+    }
+
+    // List unavailable: the previous last-two-labels approximation. Imprecise for a
+    // multi-label suffix, but never empty - an empty bucket key would merge every
+    // observed domain into one set of metrics.
     std::vector<std::string> labels;
     std::stringstream ss(normalized);
     std::string label;
@@ -398,7 +424,29 @@ constexpr size_t DNS_TUNNELING_TXT_NULL_THRESHOLD = 10;
     return labels[labels.size() - 2] + "." + labels[labels.size() - 1];
 }
 
+// The labels in front of the registrable domain - the portion a DNS tunnel encodes data
+// into, and the only part whose entropy is meaningful. Previously this sliced the front
+// off the host using domain.size() - baseDomain.size(), which silently assumed the base
+// domain is a suffix of the input; the decomposition reports the subdomain directly, so
+// that assumption is no longer needed.
+//
+// IcannOnly for the same reason as GetBaseDomain above: a label beneath a private-section
+// suffix was chosen by whoever registered it, so it belongs in the measured portion.
 [[nodiscard]] std::string GetSubdomainComponent(std::string_view domain) {
+    const auto normalized = ToLowerAscii(std::string(domain));
+
+    auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+    if (psl.EnsureLoaded()) {
+        const auto parts = psl.Decompose(
+            normalized, ShadowStrike::Utils::Domain::SuffixScope::IcannOnly);
+        if (parts.valid) {
+            return parts.subdomain;
+        }
+    }
+
+    // List unavailable, or a host the algorithm rejects. The previous computation, which
+    // is imprecise for a multi-label suffix but still returns the labels most likely to
+    // carry tunnelled data. Returning nothing would score zero entropy and read as clean.
     const auto baseDomain = GetBaseDomain(domain);
     if (baseDomain.empty() || domain.size() <= baseDomain.size()) {
         return {};
