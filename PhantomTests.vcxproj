@@ -391,6 +391,8 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\SafeBrowsingVerdict_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\SafeBrowsingAPI.cpp" />
     <ClCompile Include="tests\unit\home_unit\DeviceControlManager_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\DeviceControlManager.cpp" />
     <ClCompile Include="tests\unit\home_unit\CertificatePinning_Tests.cpp" />
