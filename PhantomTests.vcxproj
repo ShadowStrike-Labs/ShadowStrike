@@ -380,6 +380,9 @@
          no unit coverage at all - which is how the base-domain defect shipped past its own
          self-test. There is no duplicate-symbol risk: the library does not export it. -->
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\CookieManager.cpp" />
+    <!-- tests\unit\webprotection_unit -->
+    <ClCompile Include="tests\unit\webprotection_unit\AdBlocker_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\AdBlocker.cpp" />
     <ClCompile Include="tests\unit\utils_unit\FileUtilsTests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\HashUtils_Tests.cpp" />
     <ClCompile Include="tests\unit\utils_unit\JSONUtils_Tests.cpp" />
