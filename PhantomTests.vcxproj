@@ -391,6 +391,8 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\WiFiSecurityScore_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\IoT\WiFiSecurityAnalyzer.cpp" />
     <ClCompile Include="tests\unit\home_unit\AttachmentVerdict_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\AttachmentScanner.cpp" />
     <ClCompile Include="tests\unit\home_unit\SafeBrowsingVerdict_Tests.cpp" />
