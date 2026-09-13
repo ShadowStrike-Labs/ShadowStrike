@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+COOKIE_MANAGER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/CookieManager.cpp"
 DNS_MONITOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/DNSMonitor.cpp"
 BOTNET_DETECTOR_CPP_PATH = ROOT / "src/PhantomCore/Core/Network/BotnetDetector.cpp"
 CONTENT_COMPONENT_WXS_PATH = ROOT / "packaging/installer/ContentComponent.wxs"
@@ -26709,6 +26710,96 @@ class DnsMonitorDomainScopeContractTests(unittest.TestCase):
             "only %d last-dot fallbacks remain for three consults. The suffix list is shipped "
             "content and can be absent; a site without a fallback then skips DGA analysis "
             "entirely, drops tunnel tracking, or answers with nothing at all." % fallbacks)
+
+
+class CookieIdentityKeyContractTests(unittest.TestCase):
+    """Which party a cookie belongs to is a trust question, not a string operation.
+
+    MEASURED. CookieManager::GetBaseDomain returned the last two labels and carried its own
+    admission of the gap: "Simple TLD extraction (production would use Public Suffix List)".
+    For a multi-label suffix the last two labels ARE the suffix, so evil.co.uk yielded co.uk and
+    so did every other UK domain.
+
+    Two live consequences, traced to their callers rather than assumed:
+      * tracker matching compares this value against KNOWN_TRACKERS and against user-added
+        trackers, so a tracker under such a suffix reduced to the suffix and matched nothing;
+      * GetDomainSummaries groups cookies by this value and feeds GetTopTrackingDomains, so
+        every .co.uk cookie collapsed into one row labelled co.uk - a name nobody owns, offered
+        to the user as a top tracking domain.
+
+    IsThirdPartyCookie has NO production caller, so no live third-party decision ran through
+    this; that is recorded here so the fix is not mistaken for closing one.
+
+    THERE IS NO BEHAVIOURAL COVERAGE FOR THIS FUNCTION AND THERE CANNOT BE YET: PhantomTests
+    references PhantomCoreLib only, so no PhantomHome module is linked into the unit test
+    binary. These source-level guards are the whole of the protection until that changes.
+    """
+
+    def _base_domain_body(self):
+        source = strip_c_comments(read_source(COOKIE_MANAGER_CPP_PATH))
+        marker = "std::string GetBaseDomain(const std::string& domain)"
+        at = source.find(marker)
+        self.assertNotEqual(-1, at, "GetBaseDomain is gone")
+        self.assertEqual(
+            1, source.count(marker),
+            "GetBaseDomain is defined more than once in this file")
+        opening = source.index("{", at)
+        return source[at:_matching_delimiter(source, opening, "{", "}")]
+
+    def test_cookie_identity_uses_the_registrable_domain(self):
+        body = self._base_domain_body()
+        self.assertIn(
+            "registrableDomain", body,
+            "cookie identity is no longer keyed on the registrable domain. The last two labels "
+            "are the SUFFIX for a multi-label suffix, which merges every domain under it into "
+            "one party for tracker matching and one row for grouping.")
+
+    def test_cookie_identity_uses_the_trust_scope(self):
+        body = self._base_domain_body()
+        self.assertIn(
+            "SuffixScope::IncludePrivate", body,
+            "cookie identity no longer uses IncludePrivate. Every caller here asks WHICH PARTY "
+            "a cookie belongs to, and under IcannOnly two tenants of a shared host such as "
+            "github.io become the same party - so one tenant's cookies group with another's.")
+        self.assertNotIn(
+            "SuffixScope::IcannOnly", body,
+            "cookie identity now uses IcannOnly, which is the measurement scope rather than "
+            "the identity scope")
+
+    def test_the_leading_dot_is_stripped_before_decomposition(self):
+        """ORDERING. A cookie domain is commonly sent as .example.com.
+
+        A leading dot makes the first label empty, which the decomposition rejects as
+        malformed - so it would return no registrable domain and every cookie domain in the
+        common wire form would silently fall through to the approximation.
+        """
+        body = self._base_domain_body()
+        strip_at = body.find("base[0] == '.'")
+        decompose_at = body.find("psl.Decompose(")
+        self.assertNotEqual(-1, strip_at, "the leading-dot strip is gone")
+        self.assertNotEqual(-1, decompose_at, "the decomposition is gone")
+        self.assertLess(
+            strip_at, decompose_at,
+            "the leading dot is now stripped AFTER decomposition, so a cookie domain in its "
+            "usual .example.com form presents an empty first label, is rejected as malformed, "
+            "and falls back to the approximation for every cookie")
+
+    def test_an_unavailable_suffix_list_still_yields_a_key(self):
+        """ANTI-BLIND. Returning nothing here would break grouping entirely."""
+        body = self._base_domain_body()
+        self.assertIn(
+            "base.find_last_of('.')", body,
+            "the fallback is gone. Without a key, cookie grouping and tracker matching have "
+            "nothing to compare, and the suffix list is shipped content that can be absent.")
+        # The RAW source, deliberately. strip_c_comments runs before the body above, so a
+        # comment-based assertion made against it can never fail - which is exactly what a
+        # mutation round showed when restoring the comment changed nothing.
+        raw = read_source(COOKIE_MANAGER_CPP_PATH)
+        self.assertNotIn(
+            "production would use Public Suffix List", raw,
+            "the comment claiming the public suffix list is not used has returned. The list is "
+            "vendored and packaged; a comment saying otherwise will send the next reader "
+            "looking for work that is already done.")
 
 
 if __name__ == "__main__":

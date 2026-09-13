@@ -68,6 +68,8 @@
 
 #include "pch.h"
 #include "CookieManager.hpp"
+
+#include "../../../../PhantomCore/Utils/DomainUtils.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -2655,15 +2657,43 @@ std::string GetBaseDomain(const std::string& domain) {
     try {
         std::string base = domain;
 
-        // Remove leading dot
+        // A cookie domain is commonly sent with a leading dot, and it is not a label.
         if (!base.empty() && base[0] == '.') {
             base = base.substr(1);
         }
 
-        // Simple TLD extraction (production would use Public Suffix List)
-        size_t lastDot = base.find_last_of('.');
+        // The registrable domain. The previous rule took the last two labels, which for
+        // a multi-label suffix IS the suffix: evil.co.uk yielded co.uk, and so did every
+        // other UK domain. Two live consequences followed. Tracker matching compares this
+        // value against KNOWN_TRACKERS and against user-added trackers, so a tracker under
+        // such a suffix reduced to the suffix and matched nothing. And GetDomainSummaries
+        // groups cookies by this value, so every .co.uk cookie collapsed into one row
+        // labelled co.uk - which GetTopTrackingDomains could then report as a top
+        // tracking domain, a name nobody owns.
+        //
+        // IncludePrivate, because every caller here is asking WHICH PARTY a cookie
+        // belongs to rather than measuring a string an attacker chose. A tenant of a
+        // shared host must be its own party or one tenant's cookies group with another's.
+        auto& psl = Utils::Domain::PublicSuffixList::Instance();
+        if (psl.EnsureLoaded()) {
+            const std::string registrable = psl.Decompose(
+                base, Utils::Domain::SuffixScope::IncludePrivate).registrableDomain;
+            if (!registrable.empty()) {
+                return registrable;
+            }
+            // No registrable domain - a single label, an address literal, or a bare
+            // public suffix. Returning the input unchanged is the existing contract and
+            // the self-test depends on it.
+            return base;
+        }
+
+        // List unavailable. The previous rule, whose bias is to UNDER-separate multi-label
+        // suffixes and therefore to over-merge when grouping. That is the same direction
+        // as the behaviour being replaced, so an absent list is no worse than the current
+        // state rather than a new failure mode.
+        const size_t lastDot = base.find_last_of('.');
         if (lastDot != std::string::npos && lastDot > 0) {
-            size_t secondLastDot = base.find_last_of('.', lastDot - 1);
+            const size_t secondLastDot = base.find_last_of('.', lastDot - 1);
             if (secondLastDot != std::string::npos) {
                 return base.substr(secondLastDot + 1);
             }
