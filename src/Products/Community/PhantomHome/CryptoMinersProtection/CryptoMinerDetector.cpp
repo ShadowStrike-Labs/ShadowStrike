@@ -3764,12 +3764,37 @@ bool ValidateWalletAddress(std::string_view address, Cryptocurrency crypto) {
         }
 
         case Cryptocurrency::EthClassic:
+            // Ethereum Classic addresses ARE EVM addresses, identical in form to Ethereum's,
+            // so the rule is shared rather than approximated.
+            return address.size() == 42 &&
+                   address[0] == '0' && address[1] == 'x' &&
+                   allMatch(address.substr(2), isHexChar);
+
         case Cryptocurrency::Ergo:
+            // Ergo has several address forms of differing lengths, so this is a charset and
+            // length bound rather than a precise format check - stated plainly because it is
+            // not a claim of precision. It still rejects everything the previous catch-all
+            // wrongly accepted: a Windows path fails on the backslash, a command-line flag on
+            // the dashes and equals sign, a URL on the colon and slashes.
+            return address.size() >= 40 && address.size() <= 120 &&
+                   allMatch(address, isBase58);
+
         case Cryptocurrency::Other:
         case Cryptocurrency::Unknown:
         default:
-            return std::none_of(address.begin(), address.end(),
-                [](unsigned char ch) { return std::isspace(ch) != 0; });
+            // FAIL CLOSED. A currency that could not be determined validates nothing.
+            //
+            // This branch previously returned true for any string containing no whitespace, so
+            // "C:\\Windows\\System32" and "--config=miner.conf" were both accepted as wallet
+            // addresses. A wallet address is evidence - it is reported as a miner's payout
+            // address - so accepting arbitrary tokens manufactured evidence instead of finding
+            // it. Unknown is reachable: DetectCryptocurrency yields it, and the result field is
+            // left as Unknown when detection fails.
+            //
+            // The sibling validator in PoolConnectionDetector already fails closed for the
+            // same input, so this direction also removes a disagreement between two functions
+            // that look interchangeable.
+            return false;
     }
 }
 

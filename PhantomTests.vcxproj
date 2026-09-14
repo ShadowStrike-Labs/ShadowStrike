@@ -391,6 +391,12 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\MiningPortAndWallet_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\CryptoMinerDetector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\BrowserMinerDetector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\CPUUsageAnalyzer.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\GPUMiningDetector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\PoolConnectionDetector.cpp" />
     <ClCompile Include="tests\unit\home_unit\BadUSBDeviceIdentity_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\BadUSBDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBDeviceMonitor.cpp" />
