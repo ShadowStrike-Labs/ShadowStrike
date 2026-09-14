@@ -1272,7 +1272,24 @@ std::vector<DLPPolicy> DataLeakProtectionImpl::GetPolicies() const {
 // ============================================================================
 
 bool DataLeakProtectionImpl::ValidateCreditCard(const std::string& number) {
-    return LuhnCheck(NormalizeNumber(number));
+    // A correct Luhn checksum is not enough to call something a card number. Luhn is satisfied
+    // by many very short strings - "0", "18", "26", "00" all pass - so without a length
+    // policy a two-character token was reported as a credit card. In a data-leak module a false
+    // positive blocks a user's upload, so the bound matters.
+    //
+    // The bound lives here rather than in LuhnCheck because Luhn is a checksum primitive with
+    // nothing to say about payload length, and it is shared with other number kinds. Length is
+    // card policy, so the card validator owns it.
+    //
+    // 12 rather than 13: ISO/IEC 7812 permits 12 to 19 digits and Maestro issues 12-digit
+    // numbers, so a floor of 13 would reject a real card. MaskCreditCard keeps its own floor of
+    // 13 on purpose - it masks a 12-digit number entirely rather than revealing eight of its
+    // digits, and masking more is never a leak.
+    const std::string normalized = NormalizeNumber(number);
+    if (normalized.length() < 12 || normalized.length() > 19) {
+        return false;
+    }
+    return LuhnCheck(normalized);
 }
 
 bool DataLeakProtectionImpl::ValidateSSN(const std::string& ssn) {
