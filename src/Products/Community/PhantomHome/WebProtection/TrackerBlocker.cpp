@@ -1685,9 +1685,26 @@ private:
         return std::nullopt;
     }
 
+    // Removes the named tracking parameters and changes NOTHING else. Anything else this
+    // alters is a defect, because the user did not ask for it and cannot see it happen.
+    //
+    // Two previous losses: the rebuild took url.substr(0, url.find('?')) and never re-appended
+    // anything after the query, so a fragment was destroyed - a single-page application routes
+    // on the fragment, so a deep link collapsed to the application root. And "=" was emitted
+    // only for a non-empty value, so "?a=&b=1" became "?a&b=1", changing a parameter the
+    // product was not asked to touch.
     [[nodiscard]] std::string StripTrackingParamsInternal(std::string_view url) const {
+        // Separate the fragment before anything else. Doing it here rather than relying on the
+        // internal parser keeps this correct whichever side of the '#' the parser assigns.
+        const std::size_t fragmentPos = url.find('#');
+        const std::string_view fragment =
+            (fragmentPos != std::string_view::npos) ? url.substr(fragmentPos)
+                                                   : std::string_view{};
+        const std::string_view addressable =
+            (fragmentPos != std::string_view::npos) ? url.substr(0, fragmentPos) : url;
+
         std::string domain, path, query;
-        if (!ParseUrlInternal(url, domain, path, query)) {
+        if (!ParseUrlInternal(addressable, domain, path, query)) {
             return std::string(url);
         }
 
@@ -1695,35 +1712,60 @@ private:
             return std::string(url);
         }
 
-        // Parse and filter query parameters
-        std::vector<std::pair<std::string, std::string>> filteredParams;
+        // NetworkUtils::ParseUrl reports the query INCLUDING its leading '?', so splitting it
+        // straight away made the first parameter's key "?utm_source" rather than "utm_source".
+        // That key can never match the strip set, so the FIRST query parameter was never removed -
+        // which is the most common shape of all, a single tracker appended to a URL - and the
+        // rebuild then emitted a doubled "??". Normalised here rather than in ParseUrlInternal
+        // because that helper has three other callers, one of which stores the value as
+        // request.queryString where the leading '?' is the expected form, and its own source is the
+        // shared NetworkUtils::ParseUrl whose contract other subsystems rely on.
+        if (!query.empty() && query.front() == '?') {
+            query.erase(query.begin());
+        }
+        if (query.empty()) {
+            return std::string(url);
+        }
+
+        // Parse and filter query parameters. hadEquals is carried per parameter rather than
+        // inferred from the value, so an explicitly empty value keeps its separator.
+        struct QueryParam {
+            std::string key;
+            std::string value;
+            bool hadEquals = false;
+        };
+        std::vector<QueryParam> filteredParams;
         std::istringstream queryStream(query);
         std::string param;
 
         while (std::getline(queryStream, param, '&')) {
-            size_t eqPos = param.find('=');
-            std::string key = (eqPos != std::string::npos) ?
-                              param.substr(0, eqPos) : param;
+            const size_t eqPos = param.find('=');
+            const bool hadEquals = (eqPos != std::string::npos);
+            std::string key = hadEquals ? param.substr(0, eqPos) : param;
 
             // Check if this is a tracking parameter
             if (m_trackingParams.find(key) == m_trackingParams.end()) {
-                filteredParams.emplace_back(key,
-                    (eqPos != std::string::npos) ? param.substr(eqPos + 1) : "");
+                filteredParams.push_back(QueryParam{
+                    std::move(key),
+                    hadEquals ? param.substr(eqPos + 1) : std::string{},
+                    hadEquals});
             }
         }
 
-        // Rebuild URL
-        std::string result = std::string(url.substr(0, url.find('?')));
+        // Rebuild from the addressable part, then restore the fragment verbatim.
+        std::string result =
+            std::string(addressable.substr(0, addressable.find('?')));
         if (!filteredParams.empty()) {
             result += "?";
             for (size_t i = 0; i < filteredParams.size(); ++i) {
                 if (i > 0) result += "&";
-                result += filteredParams[i].first;
-                if (!filteredParams[i].second.empty()) {
-                    result += "=" + filteredParams[i].second;
+                result += filteredParams[i].key;
+                if (filteredParams[i].hadEquals) {
+                    result += "=" + filteredParams[i].value;
                 }
             }
         }
+        result.append(fragment);
 
         return result;
     }
