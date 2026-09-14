@@ -566,8 +566,8 @@ struct MicrophoneConfiguration {
 
 using AudioAccessCallback = std::function<void(const AudioAccessEvent&)>;
 using StreamCallback = std::function<void(const AudioStreamInfo&)>;
-using DeviceChangeCallback = std::function<void(const AudioDevice&, bool added)>;
-using DecisionCallback = std::function<AudioAccessDecision(const AudioAccessEvent&)>;
+using AudioDeviceChangeCallback = std::function<void(const AudioDevice&, bool added)>;
+using AudioAccessDecisionCallback = std::function<AudioAccessDecision(const AudioAccessEvent&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
@@ -736,8 +736,8 @@ public:
     
     void RegisterAccessCallback(AudioAccessCallback callback);
     void RegisterStreamCallback(StreamCallback callback);
-    void RegisterDeviceCallback(DeviceChangeCallback callback);
-    void RegisterDecisionCallback(DecisionCallback callback);
+    void RegisterDeviceCallback(AudioDeviceChangeCallback callback);
+    void RegisterDecisionCallback(AudioAccessDecisionCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 

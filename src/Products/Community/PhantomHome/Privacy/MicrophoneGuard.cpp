@@ -607,8 +607,8 @@ public:
     /// @brief Callbacks
     std::vector<AudioAccessCallback> m_accessCallbacks;
     std::vector<StreamCallback> m_streamCallbacks;
-    std::vector<DeviceChangeCallback> m_deviceCallbacks;
-    std::vector<DecisionCallback> m_decisionCallbacks;
+    std::vector<AudioDeviceChangeCallback> m_deviceCallbacks;
+    std::vector<AudioAccessDecisionCallback> m_decisionCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
     std::mutex m_callbacksMutex;
 
@@ -2213,13 +2213,13 @@ void MicrophoneGuard::RegisterStreamCallback(StreamCallback callback) {
     m_impl->m_streamCallbacks.push_back(std::move(callback));
 }
 
-void MicrophoneGuard::RegisterDeviceCallback(DeviceChangeCallback callback) {
+void MicrophoneGuard::RegisterDeviceCallback(AudioDeviceChangeCallback callback) {
     if (!m_impl) return;
     std::lock_guard lock(m_impl->m_callbacksMutex);
     m_impl->m_deviceCallbacks.push_back(std::move(callback));
 }
 
-void MicrophoneGuard::RegisterDecisionCallback(DecisionCallback callback) {
+void MicrophoneGuard::RegisterDecisionCallback(AudioAccessDecisionCallback callback) {
     if (!m_impl) return;
     std::lock_guard lock(m_impl->m_callbacksMutex);
     m_impl->m_decisionCallbacks.push_back(std::move(callback));

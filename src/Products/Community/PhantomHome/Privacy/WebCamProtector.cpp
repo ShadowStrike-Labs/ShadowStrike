@@ -523,8 +523,8 @@ public:
 
     /// @brief Callbacks
     std::vector<AccessEventCallback> m_accessCallbacks;
-    std::vector<DeviceChangeCallback> m_deviceCallbacks;
-    std::vector<DecisionCallback> m_decisionCallbacks;
+    std::vector<CameraDeviceChangeCallback> m_deviceCallbacks;
+    std::vector<CameraAccessDecisionCallback> m_decisionCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
     std::mutex m_callbacksMutex;
 
@@ -1815,13 +1815,13 @@ void WebcamProtector::RegisterAccessCallback(AccessEventCallback callback) {
     m_impl->m_accessCallbacks.push_back(std::move(callback));
 }
 
-void WebcamProtector::RegisterDeviceCallback(DeviceChangeCallback callback) {
+void WebcamProtector::RegisterDeviceCallback(CameraDeviceChangeCallback callback) {
     if (!m_impl) return;
     std::lock_guard lock(m_impl->m_callbacksMutex);
     m_impl->m_deviceCallbacks.push_back(std::move(callback));
 }
 
-void WebcamProtector::RegisterDecisionCallback(DecisionCallback callback) {
+void WebcamProtector::RegisterDecisionCallback(CameraAccessDecisionCallback callback) {
     if (!m_impl) return;
     std::lock_guard lock(m_impl->m_callbacksMutex);
     m_impl->m_decisionCallbacks.push_back(std::move(callback));

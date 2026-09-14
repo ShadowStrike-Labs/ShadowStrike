@@ -517,8 +517,8 @@ struct WebcamConfiguration {
 // ============================================================================
 
 using AccessEventCallback = std::function<void(const CameraAccessEvent&)>;
-using DeviceChangeCallback = std::function<void(const CameraDevice&, bool added)>;
-using DecisionCallback = std::function<CameraAccessDecision(const CameraAccessEvent&)>;
+using CameraDeviceChangeCallback = std::function<void(const CameraDevice&, bool added)>;
+using CameraAccessDecisionCallback = std::function<CameraAccessDecision(const CameraAccessEvent&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
@@ -677,8 +677,8 @@ public:
     // ========================================================================
     
     void RegisterAccessCallback(AccessEventCallback callback);
-    void RegisterDeviceCallback(DeviceChangeCallback callback);
-    void RegisterDecisionCallback(DecisionCallback callback);
+    void RegisterDeviceCallback(CameraDeviceChangeCallback callback);
+    void RegisterDecisionCallback(CameraAccessDecisionCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 
