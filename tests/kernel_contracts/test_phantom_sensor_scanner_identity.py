@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+RECOMMENDATIONS_ENGINE_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Recommendations/RecommendationsEngine.cpp"
 ATTACHMENT_SCANNER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Email/AttachmentScanner.cpp"
 PHISHING_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/PhishingDetector.cpp"
 BANKING_TROJAN_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Banking/BankingTrojanDetector.cpp"
@@ -27283,6 +27284,76 @@ class BlockedAttachmentIsReportableContractTests(unittest.TestCase):
                       "the high-risk band boundary moved")
         self.assertIn("riskScore >= 70", source,
                       "the ShouldBlock risk boundary for a suspicious verdict moved")
+
+
+class RecommendationIdentityContractTests(unittest.TestCase):
+    """Every recommendation the engine can raise must be identifiable and renderable.
+
+    MakeRec's first argument is the id used to deduplicate tiles AND to dismiss them, followed by the two
+    i18n keys the UI renders. An empty id cannot be dismissed, a duplicate id means dismissing one tile
+    hides another, and an empty key renders a blank tile the user cannot act on.
+
+    These hold at the source, so they do not depend on the engine's worker thread having run - which is
+    why they live here rather than in the unit suite, where the equivalent case needed a skip.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = strip_c_comments(read_source(RECOMMENDATIONS_ENGINE_CPP_PATH))
+        # Derived from the artifact rather than hard-coded: id, title key, detail key per call site.
+        cls.calls = re.findall(
+            r'MakeRec\s*\(\s*"([^"]*)"\s*,\s*[^,]+,\s*"([^"]*)"\s*,\s*"([^"]*)"',
+            cls.source,
+            re.S,
+        )
+
+    def test_the_engine_raises_at_least_one_recommendation(self):
+        # Anti-vacuity for every case below: a regex matching nothing would make them all pass.
+        self.assertGreater(
+            len(self.calls),
+            0,
+            "no MakeRec call sites were parsed, so the cases below assert nothing - the call shape "
+            "changed and this guard needs updating",
+        )
+
+    def test_every_recommendation_id_is_non_empty(self):
+        for rec_id, _title, _detail in self.calls:
+            self.assertNotEqual(
+                "",
+                rec_id.strip(),
+                "a recommendation is built with an empty id, so it cannot be dismissed",
+            )
+
+    def test_recommendation_ids_are_unique(self):
+        ids = [rec_id for rec_id, _t, _d in self.calls]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        self.assertEqual(
+            [],
+            duplicates,
+            "these recommendation ids are used more than once, so dismissing one tile hides "
+            "another: %s" % duplicates,
+        )
+
+    def test_every_recommendation_carries_both_text_keys(self):
+        for rec_id, title, detail in self.calls:
+            self.assertNotEqual(
+                "", title.strip(), "recommendation %s has no title key, so its tile renders blank" % rec_id
+            )
+            self.assertNotEqual(
+                "", detail.strip(), "recommendation %s has no detail key" % rec_id
+            )
+
+    def test_the_dismissal_key_is_namespaced_per_recommendation(self):
+        # Dismissals persist under a per-id configuration key. If the key were fixed rather than derived
+        # from the id, dismissing one recommendation would dismiss all of them.
+        #
+        # assertTrue rather than assertIn: a failing assertIn prints the whole haystack, and the haystack
+        # here is an entire source file.
+        self.assertTrue(
+            '"Home/Recommendations/dismissed/" + std::string(id)' in self.source,
+            "the dismissal key is no longer derived from the recommendation id, so one dismissal may "
+            "hide every recommendation",
+        )
 
 
 if __name__ == "__main__":
