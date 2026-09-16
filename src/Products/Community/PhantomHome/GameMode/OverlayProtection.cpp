@@ -136,7 +136,7 @@ namespace {
 
     /// @brief Known overlay DLL patterns (all lowercase for case-insensitive match)
     /// FIX #21: Removed duplicate RTSSHooks.dll, adjusted array size
-    constexpr std::array<std::wstring_view, 33> KNOWN_OVERLAY_MODULES = {
+    constexpr auto KNOWN_OVERLAY_MODULES = std::to_array<std::wstring_view>({
         // Discord
         L"discord_hook.dll",
         L"discordhook64.dll",
@@ -190,7 +190,7 @@ namespace {
         // Accessibility
         L"magnification.dll",
         L"narrator.dll"
-    };
+    });
 
     /// @brief Exported DirectX functions resolvable via GetProcAddress for hook detection
     constexpr std::array<const char*, 3> DX_EXPORTED_FUNCTIONS = {
@@ -2693,6 +2693,14 @@ bool OverlayProtection::RemoveFromWhitelist(const std::wstring& moduleName) {
  */
 bool OverlayProtection::IsWhitelisted(const std::wstring& moduleName) const {
     try {
+        // A module with no resolvable name is the case that most deserves inspection - a manually
+        // mapped image, or one whose name query failed - so it must never be treated as exempt.
+        // IsKnownOverlayModule already rejects an empty name before consulting the same array;
+        // this mirrors that guard.
+        if (moduleName.empty()) {
+            return false;
+        }
+
         const std::wstring lower = ToLowerW(moduleName);
         std::shared_lock lock(m_impl->m_whitelistMutex);
         return m_impl->m_moduleWhitelist.count(lower) > 0;
