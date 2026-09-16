@@ -512,7 +512,10 @@ bool GameProcessDetectorImpl::Initialize(const DetectorConfiguration& config) {
 
         // Add user-defined games
         for (const auto& gameName : m_config.userDefinedGames) {
-            m_userDefinedGames.insert(gameName);
+            // Lowercased to match m_gameDatabase, which normalises at all eight of its sites.
+            // Windows process names are case-insensitive, so the two containers holding the same
+            // names must agree on the key or a removal can clear one and not the other.
+            m_userDefinedGames.insert(Utils::StringUtils::ToLowerCopy(gameName));
             GameEntry userEntry;
             userEntry.title = Utils::StringUtils::WStringToString(gameName);
             userEntry.executableNames.push_back(gameName);
@@ -668,7 +671,7 @@ bool GameProcessDetectorImpl::IsKnownGame(const std::wstring& processName) {
     m_stats.databaseLookups++;
 
     return m_gameDatabase.count(Utils::StringUtils::ToLowerCopy(processName)) > 0 ||
-           m_userDefinedGames.count(processName) > 0;
+           m_userDefinedGames.count(Utils::StringUtils::ToLowerCopy(processName)) > 0;
 }
 
 std::optional<DetectedGame> GameProcessDetectorImpl::DetectGame(uint32_t pid) {
@@ -1143,7 +1146,10 @@ std::vector<GameEntry> GameProcessDetectorImpl::SearchDatabase(const std::string
 bool GameProcessDetectorImpl::AddUserGame(const std::wstring& processName, const std::string& title) {
     std::unique_lock lock(m_mutex);
 
-    m_userDefinedGames.insert(processName);
+    // Lowercased for the same reason as the seed path: this name is also written into
+    // m_gameDatabase under a lowercase key four lines below, and RemoveUserGame must be able to
+    // erase both with one argument whatever case the caller used.
+    m_userDefinedGames.insert(Utils::StringUtils::ToLowerCopy(processName));
 
     GameEntry entry;
     entry.title = title.empty() ? Utils::StringUtils::WStringToString(processName) : title;
@@ -1160,7 +1166,7 @@ bool GameProcessDetectorImpl::AddUserGame(const std::wstring& processName, const
 bool GameProcessDetectorImpl::RemoveUserGame(const std::wstring& processName) {
     std::unique_lock lock(m_mutex);
 
-    const size_t userErased = m_userDefinedGames.erase(processName);
+    const size_t userErased = m_userDefinedGames.erase(Utils::StringUtils::ToLowerCopy(processName));
     const size_t dbErased = m_gameDatabase.erase(Utils::StringUtils::ToLowerCopy(processName));
 
     if (userErased == 0 && dbErased == 0) {
