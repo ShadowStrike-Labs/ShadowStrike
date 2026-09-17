@@ -66,6 +66,23 @@ namespace ShadowStrike::Banking {
         L"narrator.exe", L"magnify.exe", L"osk.exe", L"nvda.exe", L"jaws.exe"
     };
 
+    // Reduce a process name or full path to a lower-case bare filename.
+    //
+    // The predicates below previously tested with find(), which made "kiosk.exe" match the
+    // accessibility entry "osk.exe" and "notobs64.exe" match the recorder entry "obs64.exe".
+    // OverlayProtection::IsKnownOverlayModule already carries the fix for this exact class - extract
+    // the filename, then compare with == - and this is the same shape.
+    [[nodiscard]] inline std::wstring ProcessFilenameLower(std::wstring_view processName) {
+        std::wstring name(processName);
+        const size_t slash = name.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            name = name.substr(slash + 1);
+        }
+        std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+        return name;
+    }
+
+
     // ========================================================================
     // IMPLEMENTATION CLASS
     // ========================================================================
@@ -565,11 +582,13 @@ namespace ShadowStrike::Banking {
         }
 
         [[nodiscard]] bool IsKnownScreenRecorder(std::wstring_view processName) const {
-            std::wstring lowerName(processName);
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+            const std::wstring name = ProcessFilenameLower(processName);
+            if (name.empty()) {
+                return false;
+            }
 
             for (const auto& recorder : KNOWN_SCREEN_RECORDERS) {
-                if (lowerName.find(recorder) != std::wstring::npos) {
+                if (name == recorder) {
                     return true;
                 }
             }
@@ -1370,11 +1389,13 @@ namespace ShadowStrike::Banking {
     }
 
     bool IsKnownScreenRecorder(std::wstring_view processName) {
-        std::wstring lowerName(processName);
-        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+        const std::wstring name = ProcessFilenameLower(processName);
+        if (name.empty()) {
+            return false;
+        }
 
         for (const auto& recorder : KNOWN_SCREEN_RECORDERS) {
-            if (lowerName.find(recorder) != std::wstring::npos) {
+            if (name == recorder) {
                 return true;
             }
         }
@@ -1382,11 +1403,13 @@ namespace ShadowStrike::Banking {
     }
 
     bool IsAccessibilityTool(std::wstring_view processName) {
-        std::wstring lowerName(processName);
-        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+        const std::wstring name = ProcessFilenameLower(processName);
+        if (name.empty()) {
+            return false;
+        }
 
         for (const auto& tool : ACCESSIBILITY_TOOLS) {
-            if (lowerName.find(tool) != std::wstring::npos) {
+            if (name == tool) {
                 return true;
             }
         }
