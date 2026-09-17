@@ -1553,8 +1553,18 @@ private:
             return true;
         }
 
-        // Check URL patterns
+        // Check URL patterns.
+        //
+        // m_whitelist holds BOTH domains added through WhitelistDomain and patterns added through
+        // WhitelistUrl, because GetWhitelist() returns it for display. Only the patterns may be
+        // matched as substrings. A domain is not a pattern: it was already matched exactly above,
+        // so substring-matching it as well exempted every URL that merely MENTIONED it - a tracker
+        // appending ?referrer=example.com to its own URL was allowed through, and this is the first
+        // check in the request path, so the exemption skipped blocking entirely.
         for (const auto& pattern : m_whitelist) {
+            if (m_whitelistedDomains.count(pattern) > 0) {
+                continue;
+            }
             if (url.find(pattern) != std::string_view::npos) {
                 return true;
             }
