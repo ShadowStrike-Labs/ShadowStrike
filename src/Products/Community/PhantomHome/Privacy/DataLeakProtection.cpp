@@ -2428,6 +2428,20 @@ bool IBANCheck(const std::string& iban) {
         return false;
     }
 
+    // An IBAN begins with two letters of country code and two check digits, per ISO 13616. Without
+    // this the MOD-97 arithmetic alone accepts roughly one in ninety-seven strings of a valid length -
+    // so an ordinary sixteen-digit reference number was reported as an IBAN about one percent of the
+    // time, and in a data-leak module a false positive blocks a user's upload.
+    //
+    // TransactionMonitor::ValidateIBAN already performs exactly this check before its own MOD-97 pass;
+    // this is the same test, so the two validators now agree on what shape an IBAN has.
+    if (!std::isalpha(static_cast<unsigned char>(iban[0])) ||
+        !std::isalpha(static_cast<unsigned char>(iban[1])) ||
+        !std::isdigit(static_cast<unsigned char>(iban[2])) ||
+        !std::isdigit(static_cast<unsigned char>(iban[3]))) {
+        return false;
+    }
+
     // Move first 4 characters to end
     std::string rearranged = iban.substr(4) + iban.substr(0, 4);
 
