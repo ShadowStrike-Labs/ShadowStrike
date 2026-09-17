@@ -391,6 +391,9 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\ExtensionPermissionRisk_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\ChromeExtensionScanner.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\FirefoxAddonScanner.cpp" />
     <ClCompile Include="tests\unit\home_unit\HomeAdvisoryState_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\GameModeIdentity_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\DownloadExtensionPolicy_Tests.cpp" />
