@@ -1021,18 +1021,22 @@ public:
             FirefoxPermissionInfo info;
             info.name = perm;
 
-            if (IsFirefoxDangerousPermission(perm)) {
+            // The all-websites case is tested FIRST, because both "<all_urls>" and "*://*/*" are
+            // also entries in DANGEROUS_PERMISSIONS. Testing the dangerous list first made this
+            // arm unreachable and reported the broadest permission Firefox offers as merely High,
+            // while SelfTest asserts it is Critical and while Chrome's classifier - which checks
+            // its critical list before its dangerous list - reports Critical for the same string.
+            if (perm == "<all_urls>" || perm == "*://*/*") {
+                info.isHostPermission = true;
+                info.riskLevel = AddonRiskLevel::Critical;
+                info.description = "Grants access to all websites";
+            } else if (IsFirefoxDangerousPermission(perm)) {
                 info.riskLevel = AddonRiskLevel::High;
                 info.description = "Grants access to sensitive browser data or functions";
-            } else if (perm.find("://") != std::string::npos || perm == "<all_urls>") {
+            } else if (perm.find("://") != std::string::npos) {
                 info.isHostPermission = true;
-                if (perm == "<all_urls>" || perm == "*://*/*") {
-                    info.riskLevel = AddonRiskLevel::Critical;
-                    info.description = "Grants access to all websites";
-                } else {
-                    info.riskLevel = AddonRiskLevel::Medium;
-                    info.description = "Grants access to specific websites";
-                }
+                info.riskLevel = AddonRiskLevel::Medium;
+                info.description = "Grants access to specific websites";
             } else {
                 info.riskLevel = AddonRiskLevel::Low;
                 info.description = "Standard permission";
