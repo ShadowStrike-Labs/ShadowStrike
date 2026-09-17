@@ -2734,13 +2734,23 @@ void IPLeakStatistics::Reset() noexcept {
     }
 
     // Link-local: fe80::/10
-    if (ip.size() >= 4) {
-        std::string prefix4;
-        prefix4.reserve(4);
-        for (size_t i = 0; i < 4 && i < ip.size(); ++i) {
-            prefix4 += static_cast<char>(std::tolower(static_cast<unsigned char>(ip[i])));
+    //
+    // The prefix fixes only TEN bits, so the range is fe80:: through febf:: - the third hex digit
+    // may be 8, 9, a or b. Comparing the literal text "fe80" covered a sixteenth of the range and
+    // reported fe90::, fea0:: and febf:: as public. The sibling implementation in
+    // IoT/IPLeakProtection masks the two significant bits of the second byte for the same reason.
+    if (ip.size() >= 3) {
+        std::string prefix3;
+        prefix3.reserve(3);
+        for (size_t i = 0; i < 3 && i < ip.size(); ++i) {
+            prefix3 += static_cast<char>(std::tolower(static_cast<unsigned char>(ip[i])));
         }
-        if (prefix4 == "fe80") return true;
+        if (prefix3.size() == 3 && prefix3[0] == 'f' && prefix3[1] == 'e') {
+            const char third = prefix3[2];
+            if (third == '8' || third == '9' || third == 'a' || third == 'b') {
+                return true;
+            }
+        }
     }
 
     return false;
