@@ -391,6 +391,7 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\TrackerWhitelistScope_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\ScreenshotProcessMatch_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\IbanValidatorParity_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\ScreenshotBlocker.cpp" />
