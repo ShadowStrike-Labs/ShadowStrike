@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+DNS_LEAK_PROTECTION_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/DNSLeakProtection.cpp"
 RECOMMENDATIONS_ENGINE_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Recommendations/RecommendationsEngine.cpp"
 ATTACHMENT_SCANNER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Email/AttachmentScanner.cpp"
 PHISHING_DETECTOR_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/WebProtection/PhishingDetector.cpp"
@@ -27354,6 +27355,80 @@ class RecommendationIdentityContractTests(unittest.TestCase):
             "the dismissal key is no longer derived from the recommendation id, so one dismissal may "
             "hide every recommendation",
         )
+
+
+class VpnDetectionCriteriaContractTests(unittest.TestCase):
+    """Both VPN-adapter decisions in DNSLeakProtection must accept the same evidence.
+
+    IsVPNActive gates the entire leak check - CheckForLeaksInternal runs only when it says yes - so a VPN it
+    fails to recognise receives no DNS leak protection at all, rather than weaker protection. It previously
+    accepted only a ten-entry vendor-name list while the CheckForLeaks site also accepted the interface
+    type, so a protocol-level IPSec, L2TP or PPTP connection was invisible to the gate and recognised
+    twenty lines below it.
+
+    IP_ADAPTER_INFO names the interface type Type and IP_ADAPTER_ADDRESSES names it IfType, so the two sites
+    spell the field differently while using the same constants.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = strip_c_comments(read_source(DNS_LEAK_PROTECTION_CPP_PATH))
+
+    def _gate_body(self):
+        marker = "bool IsVPNActive() {"
+        start = self.source.find(marker)
+        self.assertNotEqual(-1, start, "IsVPNActive is gone - this guard needs updating")
+        opening = self.source.index("{", start)
+        return self.source[start:_matching_delimiter(self.source, opening, "{", "}")]
+
+    def test_the_gate_still_exists_and_is_what_runs_the_leak_check(self):
+        # Anti-vacuity: if the gate were renamed or the call sites removed, every case below would pass
+        # while guarding nothing.
+        self.assertIn("bool IsVPNActive() {", self.source)
+        self.assertTrue(
+            "if (IsVPNActive()) {" in self.source
+            or "if (m_impl->IsVPNActive()) {" in self.source,
+            "IsVPNActive no longer gates the leak check, so this guard is measuring the wrong thing",
+        )
+
+    def test_the_gate_accepts_the_tunnel_interface_type(self):
+        self.assertIn(
+            "IF_TYPE_TUNNEL",
+            self._gate_body(),
+            "IsVPNActive no longer accepts a tunnel interface as evidence, so a protocol-level VPN with "
+            "no vendor name in the adapter description gets no DNS leak protection at all",
+        )
+
+    def test_the_gate_accepts_the_ppp_interface_type(self):
+        self.assertIn(
+            "IF_TYPE_PPP",
+            self._gate_body(),
+            "IsVPNActive no longer accepts a PPP interface as evidence, so L2TP and PPTP connections get "
+            "no DNS leak protection at all",
+        )
+
+    def test_the_gate_still_consults_the_adapter_name(self):
+        # The interface-type tests were ADDED alongside the name test, not in place of it. A vendor whose
+        # adapter reports as ordinary Ethernet is recognised only by name.
+        self.assertIn(
+            "IsVPNAdapter(",
+            self._gate_body(),
+            "IsVPNActive no longer consults the adapter name, so a VPN whose adapter reports as Ethernet "
+            "is no longer recognised",
+        )
+
+    def test_both_vpn_decisions_accept_the_same_evidence(self):
+        # The asymmetry this guard exists for. Whichever way the criteria change, they must change at both
+        # sites - the field name differs by struct, so the constants are what is compared.
+        gate = self._gate_body()
+        for constant in ("IF_TYPE_TUNNEL", "IF_TYPE_PPP"):
+            in_gate = constant in gate
+            elsewhere = self.source.count(constant) > (1 if in_gate else 0)
+            self.assertTrue(
+                in_gate and elsewhere,
+                "%s is accepted at one VPN decision and not the other - the gate and the leak check have "
+                "diverged again" % constant,
+            )
 
 
 if __name__ == "__main__":

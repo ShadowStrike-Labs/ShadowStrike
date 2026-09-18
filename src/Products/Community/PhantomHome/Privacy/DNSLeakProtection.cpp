@@ -479,8 +479,17 @@ public:
                 auto* adapter = reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data());
 
                 while (adapter) {
+                    // The interface type is checked alongside the name, because this function
+                    // GATES the whole leak check - CheckForLeaksInternal only runs when it says
+                    // yes - and the name list holds ten vendor strings. A protocol-level IPSec,
+                    // L2TP or PPTP connection carries no vendor name, and CheckForLeaks already
+                    // accepts IF_TYPE_TUNNEL and IF_TYPE_PPP as evidence for exactly that reason.
+                    // IP_ADAPTER_INFO names the field Type where IP_ADAPTER_ADDRESSES names it
+                    // IfType; the constants are the same.
                     std::string adapterName = adapter->Description;
-                    if (IsVPNAdapter(adapterName)) {
+                    if (IsVPNAdapter(adapterName) ||
+                        adapter->Type == IF_TYPE_TUNNEL ||
+                        adapter->Type == IF_TYPE_PPP) {
                         return true;
                     }
                     adapter = adapter->Next;
