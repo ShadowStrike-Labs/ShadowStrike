@@ -1711,25 +1711,56 @@ std::vector<std::string> ExtractURLsFromHTML(const std::string& html) {
 
 bool ContainsHomographCharacters(const std::string& text) {
     try {
-        // Simple check for non-ASCII characters that might be homographs
-        for (unsigned char c : text) {
-            if (c > 127) {
-                return true;  // Contains non-ASCII, potentially homograph
+        // A homograph attack substitutes a lookalike character into an otherwise Latin label, so the
+        // label MIXES SCRIPTS - paypal.com with a Cyrillic a is Latin letters plus U+0430. Mixing is
+        // the signal. Testing for the lookalike characters alone would flag every ordinary Russian
+        // domain, since Cyrillic o and a are among the most common Russian letters, and testing for
+        // any non-ASCII byte - which is what this did - reports every internationalised domain.
+        const bool hasNonAscii = std::any_of(text.begin(), text.end(), [](char c) {
+            return static_cast<unsigned char>(c) > 127;
+        });
+        if (!hasNonAscii) {
+            return false;  // pure ASCII cannot contain a lookalike
+        }
+
+        // ToWide passes MB_ERR_INVALID_CHARS and yields an empty string for malformed UTF-8. Such
+        // input cannot be compared against anything and is itself anomalous, so it is reported.
+        const std::wstring wide = Utils::StringUtils::ToWide(text);
+        if (wide.empty()) {
+            return true;
+        }
+
+        // Runs of letters and lookalikes, delimited by everything else, so a scheme, the dots between
+        // labels, digits and punctuation each split the text. The answer is then the same whether a
+        // bare domain or a full URL is passed - the two live callers pass a domain, while the
+        // declaration takes arbitrary text.
+        bool runHasLatin = false;
+        bool runHasLookalike = false;
+        for (const wchar_t wc : wide) {
+            const bool isLatinLetter = (wc >= L'a' && wc <= L'z') || (wc >= L'A' && wc <= L'Z');
+            const bool isLookalike =
+                HOMOGRAPH_CHARS.find(static_cast<char32_t>(wc)) != HOMOGRAPH_CHARS.end();
+
+            if (isLatinLetter) {
+                runHasLatin = true;
+            } else if (isLookalike) {
+                runHasLookalike = true;
+            } else {
+                // Run boundary. Anything else - a dot, a slash, a digit, or a non-Latin letter that
+                // is not a lookalike - ends it.
+                runHasLatin = false;
+                runHasLookalike = false;
+                continue;
+            }
+
+            if (runHasLatin && runHasLookalike) {
+                return true;
             }
         }
 
-        // Check for common Cyrillic lookalikes in UTF-8
-        std::wstring wtext = Utils::StringUtils::ToWide(text);
-        for (wchar_t wc : wtext) {
-            // Cyrillic range: U+0400 to U+04FF
-            if (wc >= 0x0400 && wc <= 0x04FF) {
-                return true;
-            }
-            // Greek range: U+0370 to U+03FF
-            if (wc >= 0x0370 && wc <= 0x03FF) {
-                return true;
-            }
-        }
+        // NOT DETECTED HERE, deliberately: a label written ENTIRELY in lookalikes imitating a Latin
+        // brand is single-script, so mixing cannot see it. That needs confusable-skeleton comparison
+        // against LEGITIMATE_BRAND_DOMAINS, which is a separate mechanism and is filed.
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("ContainsHomographCharacters failed - {}",
