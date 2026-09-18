@@ -391,6 +391,10 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\OutlookScanner.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\ThunderbirdScanner.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailProtection.cpp" />
+    <ClCompile Include="tests\unit\home_unit\EmailHomographAndExtensions_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\KeyloggerProtection.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\SecureBrowser.cpp" />
     <ClCompile Include="tests\unit\home_unit\BankingHookLegitimacy_Tests.cpp" />
