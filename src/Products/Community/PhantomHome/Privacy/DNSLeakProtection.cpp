@@ -1881,12 +1881,16 @@ void DNSLeakProtection::StopMonitoring() {
 
 [[nodiscard]] bool DNSLeakProtection::BlockDomain(const std::string& domain) {
     try {
-        if (!IsValidDomainName(domain)) {
+        // Validated AFTER normalisation, matching ImportBlocklist: a root-terminated FQDN
+        // ("example.com.") is a valid DNS name whose final label is empty, and
+        // IsValidDomainName rejects an empty label. NormalizeDomain strips that dot, so the
+        // canonical form is what gets checked - and it is the form actually stored and queried.
+        std::string normalized = NormalizeDomain(domain);
+
+        if (!IsValidDomainName(normalized)) {
             Utils::Logger::Warn("BlockDomain: Invalid domain name rejected");
             return false;
         }
-
-        std::string normalized = NormalizeDomain(domain);
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_blockedDomains.insert(std::move(normalized));
 
@@ -1922,12 +1926,16 @@ void DNSLeakProtection::StopMonitoring() {
 
 [[nodiscard]] bool DNSLeakProtection::WhitelistDomain(const std::string& domain) {
     try {
-        if (!IsValidDomainName(domain)) {
+        // Validated AFTER normalisation, matching ImportBlocklist: a root-terminated FQDN
+        // ("example.com.") is a valid DNS name whose final label is empty, and
+        // IsValidDomainName rejects an empty label. NormalizeDomain strips that dot, so the
+        // canonical form is what gets checked - and it is the form actually stored and queried.
+        std::string normalized = NormalizeDomain(domain);
+
+        if (!IsValidDomainName(normalized)) {
             Utils::Logger::Warn("WhitelistDomain: Invalid domain name rejected");
             return false;
         }
-
-        std::string normalized = NormalizeDomain(domain);
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_whitelistedDomains.insert(std::move(normalized));
 
