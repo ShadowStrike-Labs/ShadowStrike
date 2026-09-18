@@ -1101,6 +1101,62 @@ public:
         return hooks;
     }
 
+    /// @brief Lowercased real system directories, without a trailing separator.
+    ///
+    /// Resolved from Win32 rather than hardcoded. A substring test against a literal
+    /// "\\windows\\system32\\" accepts any path that merely CONTAINS it, which exempted a binary
+    /// under a user-created directory of that name from keylogger detection.
+    [[nodiscard]] static const std::vector<std::wstring>& SystemDirectoriesLower() {
+        static const std::vector<std::wstring> directories = []() {
+            std::vector<std::wstring> resolved;
+            const auto append = [&resolved](UINT (WINAPI *query)(LPWSTR, UINT)) {
+                wchar_t buffer[MAX_PATH]{};
+                const UINT length = query(buffer, static_cast<UINT>(std::size(buffer)));
+                if (length == 0 || length >= std::size(buffer)) {
+                    // GetSystemWow64DirectoryW fails on a system without WOW64. Not an error.
+                    return;
+                }
+                std::wstring directory(buffer, length);
+                while (!directory.empty() &&
+                       (directory.back() == L'\\' || directory.back() == L'/')) {
+                    directory.pop_back();
+                }
+                std::transform(directory.begin(), directory.end(), directory.begin(), ::towlower);
+                if (!directory.empty()) {
+                    resolved.push_back(std::move(directory));
+                }
+            };
+            append(&::GetSystemDirectoryW);
+            append(&::GetSystemWow64DirectoryW);
+            return resolved;
+        }();
+        return directories;
+    }
+
+    /// @brief Is this path UNDER a real system directory - anchored, with a separator boundary.
+    [[nodiscard]] static bool IsUnderSystemDirectory(const std::wstring& processPath) {
+        if (processPath.empty()) {
+            return false;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path canonical =
+            std::filesystem::weakly_canonical(processPath, ec);
+        std::wstring candidate = ec ? processPath : canonical.wstring();
+        std::transform(candidate.begin(), candidate.end(), candidate.begin(), ::towlower);
+        std::replace(candidate.begin(), candidate.end(), L'/', L'\\');
+
+        for (const std::wstring& directory : SystemDirectoriesLower()) {
+            // Anchored at position 0, and a separator must follow, so System32Extra does not match.
+            if (candidate.size() > directory.size() + 1 &&
+                candidate.compare(0, directory.size(), directory) == 0 &&
+                candidate[directory.size()] == L'\\') {
+                return true;
+            }
+        }
+
+        return false;
+    }
     bool IsLegitimateHook(const KeyboardHookInfo& hook) const {
         // Check our explicit whitelist
         {
@@ -1125,14 +1181,14 @@ public:
         // System processes are considered legitimate
         if (hook.processId <= 4) return true;
 
-        // Signed Microsoft binaries are generally legitimate
-        if (!hook.processPath.empty()) {
-            auto lowerPath = hook.processPath;
-            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
-            if (lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos ||
-                lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) {
-                return true;
-            }
+        // A binary under a REAL system directory is treated as legitimate. The previous test was a
+        // substring search for the literal "\\windows\\system32\\", which accepted any path that
+        // contained it - C:\\Users\\<user>\\windows\\system32\\keylogger.exe among them - and this
+        // function gates remediation, so that exempted the hook from being blocked. The comment that
+        // stood here claimed signed Microsoft binaries; nothing in this module verifies a signature,
+        // which is filed separately.
+        if (IsUnderSystemDirectory(hook.processPath)) {
+            return true;
         }
 
         return false;
