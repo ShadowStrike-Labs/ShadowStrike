@@ -391,6 +391,9 @@
     <!-- tests\unit\home_unit - ModeThresholds.cpp is already in PhantomCoreLib,
          so only the test file needs listing here. -->
     <ClCompile Include="tests\unit\home_unit\ModeThresholds_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\DNSLeakProtection.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\LocationPrivacy.cpp" />
+    <ClCompile Include="tests\unit\home_unit\PrivacyDomainAndGeofence_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\IpClassification_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\IPLeakProtection.cpp" />
     <ClCompile Include="tests\unit\home_unit\ScheduleAndSenderScope_Tests.cpp" />
