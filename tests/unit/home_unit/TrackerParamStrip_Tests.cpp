@@ -42,7 +42,12 @@ protected:
     /// case would run against an EMPTY set and nothing would ever be stripped - the tests would
     /// then describe an uninitialised object rather than the feature.
     static void SetUpTestSuite() {
-        ASSERT_TRUE(TrackerBlocker::Instance().Initialize())
+        // Initialize is not idempotent (filed 288), so the STATE is tested rather than the return value - 
+        // otherwise this suite would only pass when it is the first to initialise the singleton, which is an accident of test ordering.
+        if (!TrackerBlocker::Instance().IsInitialized()) {
+            (void)TrackerBlocker::Instance().Initialize();
+        }
+        ASSERT_TRUE(TrackerBlocker::Instance().IsInitialized())
             << "the tracker blocker could not be initialised, so the strip set is empty and no case "
                "below would mean anything";
     }

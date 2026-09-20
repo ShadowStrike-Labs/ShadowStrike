@@ -70,7 +70,12 @@ protected:
         // enableStratumDetection and enableDeepPacketInspection both default true, and the payload test
         // returns false outright when either is off - so without initialising, every stratum case would
         // pass for the wrong reason.
-        ASSERT_TRUE(PoolConnectionDetector::Instance().Initialize())
+        // Initialize is not idempotent (filed 288), so the STATE is tested rather than the return value - 
+        // otherwise this suite would only pass when it is the first to initialise the singleton, which is an accident of test ordering.
+        if (!PoolConnectionDetector::Instance().IsInitialized()) {
+            (void)PoolConnectionDetector::Instance().Initialize();
+        }
+        ASSERT_TRUE(PoolConnectionDetector::Instance().IsInitialized())
             << "the detector could not be initialised, so no verdict below would mean anything";
     }
 

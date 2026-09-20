@@ -116,7 +116,12 @@ TEST(DownloadExtensionPolicyTest, ATrailingDotDoesNotHideAnExecutable) {
 class DownloadBlockerPolicyTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
-        ASSERT_TRUE(MaliciousDownloadBlocker::Instance().Initialize())
+        // Initialize is not idempotent (filed 288), so the STATE is tested rather than the return value - 
+        // otherwise this suite would only pass when it is the first to initialise the singleton, which is an accident of test ordering.
+        if (!MaliciousDownloadBlocker::Instance().IsInitialized()) {
+            (void)MaliciousDownloadBlocker::Instance().Initialize();
+        }
+        ASSERT_TRUE(MaliciousDownloadBlocker::Instance().IsInitialized())
             << "the blocker could not be initialised, so the blocked-extension set is empty and no case "
                "below would mean anything";
     }

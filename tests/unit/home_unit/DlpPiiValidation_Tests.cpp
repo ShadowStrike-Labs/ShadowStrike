@@ -41,7 +41,12 @@ constexpr const char* kValidCard16 = "4532015112830366";
 class DlpPiiValidationTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
-        ASSERT_TRUE(DataLeakProtection::Instance().Initialize())
+        // Initialize is not idempotent (filed 288), so the STATE is tested rather than the return value - 
+        // otherwise this suite would only pass when it is the first to initialise the singleton, which is an accident of test ordering.
+        if (!DataLeakProtection::Instance().IsInitialized()) {
+            (void)DataLeakProtection::Instance().Initialize();
+        }
+        ASSERT_TRUE(DataLeakProtection::Instance().IsInitialized())
             << "the module could not be initialised, so no verdict below would mean anything";
     }
 

@@ -67,7 +67,12 @@ constexpr std::uint16_t kRpiVid = 0x2E8A;    ///< Raspberry Pi - a suspicious VI
 class BadUSBDeviceIdentityTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
-        ASSERT_TRUE(BadUSBDetector::Instance().Initialize())
+        // Initialize is not idempotent (filed 288), so the STATE is tested rather than the return value - 
+        // otherwise this suite would only pass when it is the first to initialise the singleton, which is an accident of test ordering.
+        if (!BadUSBDetector::Instance().IsInitialized()) {
+            (void)BadUSBDetector::Instance().Initialize();
+        }
+        ASSERT_TRUE(BadUSBDetector::Instance().IsInitialized())
             << "the detector could not be initialised, so no verdict below would mean anything";
     }
 };
