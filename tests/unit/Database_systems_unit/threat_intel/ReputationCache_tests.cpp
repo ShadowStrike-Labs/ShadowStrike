@@ -186,7 +186,12 @@ TEST(BloomFilterTests, Concurrency_ConcurrentAddsAndReads_NoCrash) {
 
 	std::atomic<bool> start{false};
 	for (int t = 0; t < kThreads; ++t) {
-		threads.emplace_back([&]() {
+		// t is captured BY VALUE. Capturing it by reference was a stack-use-after-scope: the workers block
+		// on `start`, which is only released after this loop has ended and t's lifetime with it, so every
+		// worker then read a dead stack slot. AddressSanitizer reports it as a 4-byte read at frame offset
+		// 168 from the std::to_string(t) below. It was also wrong before it was unsafe - all four threads
+		// shared one t, so the per-thread key prefix was never per-thread.
+		threads.emplace_back([&, t]() {
 			while (!start.load(std::memory_order_acquire)) {
 				std::this_thread::yield();
 			}
