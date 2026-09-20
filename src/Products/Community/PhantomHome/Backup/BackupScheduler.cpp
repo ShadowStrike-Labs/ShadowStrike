@@ -1754,13 +1754,28 @@ bool ParseCronExpression(const std::string& expression, SystemTimePoint& nextRun
             continue;
         }
 
-        // Check day-of-month and day-of-week
-        bool domOk = std::find(doms.begin(), doms.end(), candidate.tm_mday) !=
-                     doms.end();
-        bool dowOk = std::find(dows.begin(), dows.end(), candidate.tm_wday) !=
-                     dows.end();
+        // Check day-of-month and day-of-week.
+        //
+        // These combine as a UNION when both are restricted, not an intersection. crontab(5) and POSIX
+        // both specify that when neither the day-of-month nor the day-of-week field is "*", the job runs
+        // when EITHER matches. Requiring both turned "0 2 15 * 5" - the 15th, or any Friday - into "only
+        // when the 15th is a Friday", roughly once every seven months instead of about five times a
+        // month, with no error reported because the expression still parses.
+        //
+        // When one field is "*" the two rules agree, because the unrestricted side always matches, which
+        // is why every ordinary schedule was unaffected.
+        const bool domRestricted = (fields[2] != "*");
+        const bool dowRestricted = (fields[4] != "*");
 
-        if (!domOk || !dowOk) {
+        const bool domOk = std::find(doms.begin(), doms.end(), candidate.tm_mday) !=
+                           doms.end();
+        const bool dowOk = std::find(dows.begin(), dows.end(), candidate.tm_wday) !=
+                           dows.end();
+
+        const bool dayOk = (domRestricted && dowRestricted) ? (domOk || dowOk)
+                                                            : (domOk && dowOk);
+
+        if (!dayOk) {
             candidate.tm_mday++;
             candidate.tm_hour = 0;
             candidate.tm_min = 0;
