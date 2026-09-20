@@ -537,12 +537,58 @@ void AttachmentStatistics::Reset() noexcept {
     return FileTypeCategory::Unknown;
 }
 
+/**
+ * @brief Is a magic category the ENVELOPE of a format the extension names?
+ *
+ * A container's signature describes its wrapper rather than its content. OOXML and ODF documents are
+ * ZIP archives; legacy Office documents and Windows installers are OLE compound documents. In those
+ * pairings the extension is the more useful answer - macro scanning keys on Document, Spreadsheet and
+ * Presentation - and the difference between the two is not a mismatch.
+ *
+ * Without this, making magic bytes authoritative would type every .docx as Archive and so stop macro
+ * scanning on modern Office documents, which would be a detection regression rather than a fix.
+ */
+[[nodiscard]] bool IsConsistentContainer(FileTypeCategory extensionCategory,
+                                         FileTypeCategory magicCategory) noexcept {
+    const bool officeExtension = extensionCategory == FileTypeCategory::Document ||
+                                 extensionCategory == FileTypeCategory::Spreadsheet ||
+                                 extensionCategory == FileTypeCategory::Presentation;
+
+    // OOXML and ODF are ZIP containers.
+    if (officeExtension && magicCategory == FileTypeCategory::Archive) {
+        return true;
+    }
+
+    // Legacy Office is an OLE compound document, which this table categorises as Document - so a .xls
+    // reads as Spreadsheet by extension and Document by magic.
+    if (officeExtension && magicCategory == FileTypeCategory::Document) {
+        return true;
+    }
+
+    // .msi and .msp are OLE compound documents too, and are classified Executable by extension.
+    if (extensionCategory == FileTypeCategory::Executable &&
+        magicCategory == FileTypeCategory::Document) {
+        return true;
+    }
+
+    return false;
+}
 [[nodiscard]] FileTypeCategory ClassifyByMagic(std::span<const uint8_t> header) noexcept {
     for (const auto& sig : g_magicSignatures) {
-        if (header.size() >= sig.signature.size()) {
-            if (std::equal(sig.signature.begin(), sig.signature.end(), header.begin())) {
-                return sig.category;
-            }
+        // signatureLen, not signature.size(). The array is a fixed eight bytes, so comparing all of
+        // it required the file to carry the zero padding as well - matching MZ meant demanding
+        // 4D 5A 00 00 00 00 00 00, which no real PE has. Only the eight-byte OLE signature could
+        // ever match, so magic typing was dead and DetectFileType fell through to the extension.
+        if (sig.signatureLen == 0 || sig.signatureLen > sig.signature.size()) {
+            continue;  // the sentinel; a range-based loop never needed one
+        }
+        if (header.size() < sig.signatureLen) {
+            continue;
+        }
+        if (std::equal(sig.signature.begin(),
+                       sig.signature.begin() + static_cast<std::ptrdiff_t>(sig.signatureLen),
+                       header.begin())) {
+            return sig.category;
         }
     }
 
@@ -1002,27 +1048,37 @@ public:
             }
         }
 
-        FileTypeCategory magicCategory = ClassifyByMagic(header);
+        const FileTypeCategory magicCategory = ClassifyByMagic(header);
+        const FileTypeCategory extensionCategory =
+            ClassifyByExtension(path.extension().string());
+
         if (magicCategory != FileTypeCategory::Unknown) {
+            // For a container format the extension is the more specific answer, and downstream policy
+            // - macro scanning in particular - depends on it.
+            if (IsConsistentContainer(extensionCategory, magicCategory)) {
+                return extensionCategory;
+            }
             return magicCategory;
         }
 
-        // Fallback to extension
-        return ClassifyByExtension(path.extension().string());
+        // No signature matched, so the extension is all there is.
+        return extensionCategory;
     }
 
     [[nodiscard]] bool VerifyExtensionImpl(
         const fs::path& path,
         const std::vector<uint8_t>& header
     ) {
-        FileTypeCategory extensionCat = ClassifyByExtension(path.extension().string());
-        FileTypeCategory magicCat = ClassifyByMagic(header);
+        const FileTypeCategory extensionCat = ClassifyByExtension(path.extension().string());
+        const FileTypeCategory magicCat = ClassifyByMagic(header);
 
         if (magicCat == FileTypeCategory::Unknown) {
-            return true;  // Can't verify
+            return true;  // no signature matched, so there is nothing to contradict the extension
         }
 
-        return extensionCat == magicCat;
+        // A container pairing is not a mismatch: a .docx really is a ZIP and a .msi really is an OLE
+        // compound document.
+        return extensionCat == magicCat || IsConsistentContainer(extensionCat, magicCat);
     }
 
     // ========================================================================
@@ -1523,13 +1579,18 @@ void AttachmentScanner::Shutdown() {
     std::span<const uint8_t> buffer,
     const std::string& fileName
 ) {
-    FileTypeCategory magicCat = ClassifyByMagic(buffer);
+    const FileTypeCategory magicCat = ClassifyByMagic(buffer);
+    const fs::path path(fileName);
+    const FileTypeCategory extensionCat = ClassifyByExtension(path.extension().string());
+
     if (magicCat != FileTypeCategory::Unknown) {
+        if (IsConsistentContainer(extensionCat, magicCat)) {
+            return extensionCat;
+        }
         return magicCat;
     }
 
-    fs::path path(fileName);
-    return ClassifyByExtension(path.extension().string());
+    return extensionCat;
 }
 
 [[nodiscard]] bool AttachmentScanner::IsHighRiskExtension(std::string_view extension) const noexcept {
