@@ -61,6 +61,9 @@
 #include "Products/Community/PhantomHome/CryptoMinersProtection/GPUMiningDetector.hpp"
 #include "Products/Community/PhantomHome/CryptoMinersProtection/PoolConnectionDetector.hpp"
 
+#include "Products/Community/PhantomHome/IoT/IoTDeviceScanner.hpp"
+#include "Products/Community/PhantomHome/IoT/SmartHomeProtection.hpp"
+
 #include "Products/Community/PhantomHome/GameMode/GameModeManager.hpp"
 #include "Products/Community/PhantomHome/GameMode/GameProcessDetector.hpp"
 #include "Products/Community/PhantomHome/GameMode/OverlayProtection.hpp"
@@ -137,6 +140,21 @@ TEST(ModuleSelfTest, GameModeModulesPassTheirOwnChecks) {
     ExpectSelfTestPasses("GameModeManager", ::ShadowStrike::GameMode::GameModeManager::Instance());
     ExpectSelfTestPasses("GameProcessDetector", ::ShadowStrike::GameMode::GameProcessDetector::Instance());
     ExpectSelfTestPasses("OverlayProtection", ::ShadowStrike::GameMode::OverlayProtection::Instance());
+}
+
+// ============================================================================
+// IoT
+//
+// The duplicate-type sweep found no divergence in ShadowStrike::IoT, so these headers share this translation
+// unit. IoT/IPLeakProtection is NOT here: its source file has the same NAME as Privacy/IPLeakProtection.cpp,
+// so MSBuild writes both to IPLeakProtection.obj and one silently overwrites the other - MSB8027, which then
+// leaves Privacy::IsPrivateIP unresolved. That needs an ObjectFileName override or, better, the decision
+// about which of the two modules survives. Filed.
+// ============================================================================
+
+TEST(ModuleSelfTest, IoTModulesPassTheirOwnChecks) {
+    ExpectSelfTestPasses("IoT::IoTDeviceScanner", ::ShadowStrike::IoT::IoTDeviceScanner::Instance());
+    ExpectSelfTestPasses("IoT::SmartHomeProtection", ::ShadowStrike::IoT::SmartHomeProtection::Instance());
 }
 
 }  // namespace
