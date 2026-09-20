@@ -363,6 +363,7 @@
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\sig_builder_input_methods_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\sig_builder_import_methods_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\pattern_store_tests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\sig_store\pattern_name_roundtrip_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\HashStoreTests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\BoyerMooreTests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\sig_store\AhoCorasick_Tests.cpp" />
