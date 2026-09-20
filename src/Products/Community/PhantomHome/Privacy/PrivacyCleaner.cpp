@@ -194,51 +194,83 @@ BrowserPaths GetBrowserPathsInternal(BrowserType browser) {
     wchar_t appDataPath[MAX_PATH] = {};
     wchar_t localAppDataPath[MAX_PATH] = {};
 
-    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath);
-    SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppDataPath);
+    // Both results are checked, as the five other SHGetFolderPathW calls in this file already do. The
+    // buffers are zero-initialised, so ignoring a failure left the base path EMPTY and turned every
+    // profile path below into a RELATIVE one - and GetAllowedCleanerRoots appends these paths to the
+    // allow-list that gates deletion, where weakly_canonical would then resolve them against the
+    // current working directory. The effect is not deleting the wrong files, since DeleteTarget tests
+    // fs::exists first; it is that no real profile path matches any allowed root any more, so cleaning
+    // silently does nothing. An absent base path yields no paths rather than a wrong one.
+    const bool haveAppData =
+        SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath));
+    const bool haveLocalAppData = SUCCEEDED(
+        SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppDataPath));
 
-    fs::path appData = appDataPath;
-    fs::path localAppData = localAppDataPath;
+    if (!haveAppData) {
+        SS_LOG_WARN(L"PrivacyCleaner",
+            L"CSIDL_APPDATA could not be resolved; roaming browser profiles will be omitted");
+    }
+    if (!haveLocalAppData) {
+        SS_LOG_WARN(L"PrivacyCleaner",
+            L"CSIDL_LOCAL_APPDATA could not be resolved; local browser profiles will be omitted");
+    }
+
+    const fs::path appData = haveAppData ? fs::path(appDataPath) : fs::path{};
+    const fs::path localAppData = haveLocalAppData ? fs::path(localAppDataPath) : fs::path{};
 
     switch (browser) {
         case BrowserType::Chrome:
-            paths.profilePaths.push_back(localAppData / "Google" / "Chrome" / "User Data");
+            if (!localAppData.empty()) {
+                paths.profilePaths.push_back(localAppData / "Google" / "Chrome" / "User Data");
+            }
             paths.executablePath = fs::path("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
             paths.processName = "chrome.exe";
             break;
 
         case BrowserType::Firefox:
-            paths.profilePaths.push_back(appData / "Mozilla" / "Firefox" / "Profiles");
+            if (!appData.empty()) {
+                paths.profilePaths.push_back(appData / "Mozilla" / "Firefox" / "Profiles");
+            }
             paths.executablePath = fs::path("C:\\Program Files\\Mozilla Firefox\\firefox.exe");
             paths.processName = "firefox.exe";
             break;
 
         case BrowserType::Edge:
-            paths.profilePaths.push_back(localAppData / "Microsoft" / "Edge" / "User Data");
+            if (!localAppData.empty()) {
+                paths.profilePaths.push_back(localAppData / "Microsoft" / "Edge" / "User Data");
+            }
             paths.executablePath = fs::path("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe");
             paths.processName = "msedge.exe";
             break;
 
         case BrowserType::Opera:
-            paths.profilePaths.push_back(appData / "Opera Software" / "Opera Stable");
+            if (!appData.empty()) {
+                paths.profilePaths.push_back(appData / "Opera Software" / "Opera Stable");
+            }
             paths.executablePath = fs::path("C:\\Program Files\\Opera\\launcher.exe");
             paths.processName = "opera.exe";
             break;
 
         case BrowserType::Brave:
-            paths.profilePaths.push_back(localAppData / "BraveSoftware" / "Brave-Browser" / "User Data");
+            if (!localAppData.empty()) {
+                paths.profilePaths.push_back(localAppData / "BraveSoftware" / "Brave-Browser" / "User Data");
+            }
             paths.executablePath = fs::path("C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe");
             paths.processName = "brave.exe";
             break;
 
         case BrowserType::Vivaldi:
-            paths.profilePaths.push_back(localAppData / "Vivaldi" / "User Data");
+            if (!localAppData.empty()) {
+                paths.profilePaths.push_back(localAppData / "Vivaldi" / "User Data");
+            }
             paths.executablePath = fs::path("C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe");
             paths.processName = "vivaldi.exe";
             break;
 
         case BrowserType::Chromium:
-            paths.profilePaths.push_back(localAppData / "Chromium" / "User Data");
+            if (!localAppData.empty()) {
+                paths.profilePaths.push_back(localAppData / "Chromium" / "User Data");
+            }
             paths.processName = "chromium.exe";
             break;
 
