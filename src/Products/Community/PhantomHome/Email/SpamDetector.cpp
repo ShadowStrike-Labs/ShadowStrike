@@ -155,6 +155,66 @@ double CalculateKeywordDensity(const std::string& text, const std::vector<std::s
 }
 
 /**
+ * @brief Is a CSS property present with a value of exactly zero?
+ *
+ * Searching for the text "opacity:0" also matches opacity:0.95, because the match ends before the
+ * fraction. Ten patterns in HasHiddenText had that shape, and fractional opacity and relative font
+ * sizes are ordinary CSS - so legitimate mail was reported as hiding text. This parses the value.
+ *
+ * Accepts any spelling of zero, including 0, 0.0, .0 and 0px, and rejects every non-zero value.
+ */
+[[nodiscard]] bool HasZeroValuedProperty(const std::string& html, std::string_view property) {
+    size_t searchFrom = 0;
+    while (true) {
+        const size_t found = html.find(property, searchFrom);
+        if (found == std::string::npos) {
+            return false;
+        }
+        searchFrom = found + property.size();
+
+        size_t cursor = searchFrom;
+        while (cursor < html.size() && (html[cursor] == ' ' || html[cursor] == '\t')) {
+            ++cursor;
+        }
+        if (cursor >= html.size() || html[cursor] != ':') {
+            continue;  // the name appeared, but not as a property assignment
+        }
+        ++cursor;
+        while (cursor < html.size() && (html[cursor] == ' ' || html[cursor] == '\t')) {
+            ++cursor;
+        }
+
+        if (cursor < html.size() && (html[cursor] == '+' || html[cursor] == '-')) {
+            ++cursor;  // a signed zero is still zero
+        }
+
+        bool sawDigit = false;
+        bool allZero = true;
+        while (cursor < html.size() && (std::isdigit(static_cast<unsigned char>(html[cursor])) != 0)) {
+            sawDigit = true;
+            if (html[cursor] != '0') {
+                allZero = false;
+            }
+            ++cursor;
+        }
+        if (cursor < html.size() && html[cursor] == '.') {
+            ++cursor;
+            while (cursor < html.size() &&
+                   (std::isdigit(static_cast<unsigned char>(html[cursor])) != 0)) {
+                sawDigit = true;
+                if (html[cursor] != '0') {
+                    allZero = false;
+                }
+                ++cursor;
+            }
+        }
+
+        if (sawDigit && allZero) {
+            return true;
+        }
+    }
+}
+/**
  * @brief Detect hidden text in HTML using comprehensive CSS/style analysis
  */
 bool HasHiddenText(const std::string& html) {
@@ -171,8 +231,9 @@ bool HasHiddenText(const std::string& html) {
     }
 
     // Zero-size or hidden elements
-    if (html.find("font-size:0") != std::string::npos ||
-        html.find("font-size: 0") != std::string::npos ||
+    // font-size is parsed rather than matched: "font-size:0" also matches font-size:0.9em.
+    // display and visibility carry keywords, not numbers, so a substring search is right for them.
+    if (HasZeroValuedProperty(html, "font-size") ||
         html.find("display:none") != std::string::npos ||
         html.find("display: none") != std::string::npos ||
         html.find("visibility:hidden") != std::string::npos ||
@@ -180,9 +241,9 @@ bool HasHiddenText(const std::string& html) {
         return true;
     }
 
-    // Opacity-based hiding
-    if (html.find("opacity:0") != std::string::npos ||
-        html.find("opacity: 0") != std::string::npos) {
+    // Opacity-based hiding. Parsed, not matched: the old test read opacity:0.95 as zero, which is
+    // the most common false positive of the set - a fade effect is ordinary in HTML mail.
+    if (HasZeroValuedProperty(html, "opacity")) {
         return true;
     }
 
@@ -198,12 +259,11 @@ bool HasHiddenText(const std::string& html) {
     }
 
     // Zero-dimension containers
-    if (html.find("width:0") != std::string::npos ||
-        html.find("width: 0") != std::string::npos ||
-        html.find("height:0") != std::string::npos ||
-        html.find("height: 0") != std::string::npos ||
-        html.find("max-height:0") != std::string::npos ||
-        html.find("max-width:0") != std::string::npos) {
+    // Dimensions, parsed for the same reason: width:0.5em is not a zero-dimension container.
+    if (HasZeroValuedProperty(html, "width") ||
+        HasZeroValuedProperty(html, "height") ||
+        HasZeroValuedProperty(html, "max-height") ||
+        HasZeroValuedProperty(html, "max-width")) {
         return true;
     }
 
@@ -1971,6 +2031,25 @@ std::string_view GetSpamVerdictName(SpamVerdict verdict) noexcept {
         case SpamVerdict::Malware: return "Malware";
         default: return "Unknown";
     }
+}
+// ============================================================================
+// UTILITY FUNCTIONS
+//
+// These are declared in SpamDetector.hpp and had no definition anywhere in the tree, so any caller
+// received an unresolved external. Both delegate to the implementation that already existed in this
+// file's anonymous namespace under a different name.
+//
+// CalculateBayesProbability is also declared there and is deliberately NOT defined here: it has no
+// counterpart in this file, and writing a probability combiner means choosing between Graham's method,
+// Robinson's geometric mean and Fisher's chi-squared, which changes results. Filed.
+// ============================================================================
+
+std::vector<std::string> TokenizeForBayes(const std::string& text) {
+    return TokenizeText(text);
+}
+
+bool DetectHiddenText(const std::string& html) {
+    return HasHiddenText(html);
 }
 
 }  // namespace Email
