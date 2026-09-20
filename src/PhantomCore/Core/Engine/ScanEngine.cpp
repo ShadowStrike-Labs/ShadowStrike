@@ -419,9 +419,16 @@ public:
             return;
         }
 
+        // Says what seeding actually buys. It does NOT create a fast path: Stage 1
+        // looks up a hash and a path, and AddPublisher writes neither, so a signed
+        // vendor binary still traverses every stage. What these entries do reach is
+        // EvaluatePublisherTrust, which can stop a heuristic convicting a file whose
+        // publisher is here. That is a false-positive brake, not a speed win, and the
+        // earlier wording claimed the opposite.
         SS_LOG_INFO(L"ScanEngine",
-            L"Whitelist seeded with %u trusted publishers - signature-verified "
-            L"vendor binaries now take the fast path",
+            L"Whitelist seeded with %u trusted publishers - a verified signature from "
+            L"one of them can suppress a heuristic conviction; it does not skip any "
+            L"scan stage",
             seeded);
     }
 
@@ -1927,6 +1934,18 @@ EngineResult ScanEngine::ScanFile(
         // ====================================================================
         // STAGE 1: WHITELIST CHECK (Fastest - Bloom Filter + Trie)
         // ====================================================================
+        //
+        // HASH AND PATH ONLY. Publisher entries are not consulted here, which is
+        // why whitelistHits reads zero on a machine whose whitelist holds nothing
+        // but the publishers seeded at Initialize: both lookups below query indexes
+        // with no entries in them.
+        //
+        // Adding a publisher check here would be a detection regression, not an
+        // optimisation. Vulnerable drivers are VALIDLY SIGNED, several by vendors in
+        // that seed list, so a publisher hit at this point - ahead of the hash and
+        // signature stages - would skip exactly the files a driver blocklist exists
+        // to catch. If a publisher fast path is wanted, it belongs AFTER those
+        // stages, so known-bad still outvotes a trusted signer.
 
         if (m_impl->m_whitelistStore) {
             SS_DIAG_SCOPE("ScanEngine", "stage01-whitelist");
