@@ -27,6 +27,8 @@ EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ShadowStrikePhantomUI", "ShadowStrikePhantomUI.vcxproj", "{B2C38F21-7A4D-4B1B-8F7D-0A0B4C1D2E02}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PhantomSigBuild", "PhantomSigBuild.vcxproj", "{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Installer", "Installer", "{A3B7D0F1-5C2E-4891-B3A4-6D8E9F0C1234}"
 EndProject
 Project("{930C7802-8A8C-48F9-8165-68863BCCD9DD}") = "ShadowStrikePhantomHome", "packaging\installer\ShadowStrikePhantomHome.wixproj", "{D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456}"
@@ -109,6 +111,12 @@ Global
 		{B2C38F21-7A4D-4B1B-8F7D-0A0B4C1D2E02}.Release|x64.ActiveCfg = Release|x64
 		{B2C38F21-7A4D-4B1B-8F7D-0A0B4C1D2E02}.Release|x64.Build.0 = Release|x64
 		{B2C38F21-7A4D-4B1B-8F7D-0A0B4C1D2E02}.Release|x86.ActiveCfg = Release|x64
+		{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}.Debug|x64.ActiveCfg = Debug|x64
+		{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}.Debug|x64.Build.0 = Debug|x64
+		{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}.Debug|x86.ActiveCfg = Debug|x64
+		{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}.Release|x64.ActiveCfg = Release|x64
+		{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}.Release|x64.Build.0 = Release|x64
+		{6B3C91A4-72E8-4D5B-9C10-A5F4E8D27B31}.Release|x86.ActiveCfg = Release|x64
 	{D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456}.Debug|x64.ActiveCfg = Release|x64
 {D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456}.Debug|x64.Build.0 = Release|x64
 {D4C9E1A0-6B3F-4872-A5D7-8E1F0B2C3456}.Release|x64.ActiveCfg = Release|x64
@@ -116,7 +124,8 @@ Global
 {E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567}.Debug|x64.ActiveCfg = Release|x64
 {E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567}.Debug|x64.Build.0 = Release|x64
 {E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567}.Release|x64.ActiveCfg = Release|x64
-{E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567}.Release|x64.Build.0 = Release|x64EndGlobalSection
+{E5D0F2B1-7C4A-4983-B6E8-9F2A1C3D4567}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
