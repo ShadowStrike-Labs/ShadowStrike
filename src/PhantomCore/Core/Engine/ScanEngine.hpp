@@ -301,6 +301,26 @@ struct ScanContext {
 struct EngineResult {
     ScanVerdict verdict = ScanVerdict::Clean;
 
+    /// @brief What this verdict is ABOUT. Empty only when there is no file.
+    ///
+    /// Without it a batch result is unusable. BatchScanResult::results is appended
+    /// under a mutex by N concurrent workers in COMPLETION order, so its index has no
+    /// relationship to the input order: a caller who scans ten thousand files and gets
+    /// three Infected results back could not say which three files they were. The
+    /// hashes are present, so attribution was possible only by re-hashing every input,
+    /// which defeats the point of a batch API.
+    ///
+    /// SET BEFORE ANYTHING CAN FAIL, immediately after the result is constructed, so
+    /// that an Error or a timeout carries it too. A field populated only on the success
+    /// path would leave exactly the results a user most needs to act on - the ones that
+    /// went wrong - still unattributable.
+    ///
+    /// For an archive member this is the archive path and the entry within it, since
+    /// the entry has no path of its own that anything could open. Memory, process, boot
+    /// sector and UEFI scans leave it empty, because for those there is no file, and an
+    /// invented value would be worse than an absent one.
+    std::wstring filePath;
+
     // Threat Details
     std::string threatName;             ///< e.g., "Worm.Win32.Stuxnet"
     std::string threatFamily;           ///< e.g., "Emotet"

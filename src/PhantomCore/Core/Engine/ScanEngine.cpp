@@ -1642,6 +1642,11 @@ EngineResult ScanEngine::ScanFile(
     const ScanContext& context
 ) {
     EngineResult result{};
+
+    // FIRST, before anything can return. Every exit from this function - including
+    // the early refusals, the hash failure and the timeout - carries the path it was
+    // asked about, so a caller can always attribute the verdict to a file.
+    result.filePath = filePath;
     const auto scanStart = steady_clock::now();
 
     // THE DEADLINE THIS FUNCTION IS GIVEN AND HAS NEVER HONOURED.
@@ -4869,6 +4874,7 @@ BatchScanResult ScanEngine::ScanArchive(
                 archivePath.c_str());
 
             EngineResult bombResult{};
+            bombResult.filePath = archivePath;
             bombResult.verdict = ScanVerdict::Infected;
             bombResult.threatName = "Archive.ZipBomb";
             bombResult.threatCategory = "Malware";
@@ -4903,6 +4909,11 @@ BatchScanResult ScanEngine::ScanArchive(
                 // Run the entry through our scan pipeline
                 EngineResult entryResult{};
                 entryResult.sha256 = entry.sha256Hex;
+
+                // The archive AND the member, because the member has no path of its
+                // own that anything could open, and "something in this zip is
+                // malicious" is not actionable for a user or a responder.
+                entryResult.filePath = archivePath + L"|" + entry.path;
 
                 // Check for path traversal in results
                 if (FileSystem::HasFlag(entry.securityFlags,
@@ -4960,10 +4971,10 @@ BatchScanResult ScanEngine::ScanArchive(
                         entryResult.confidence = topDetection.similarity * 100.0f;
                         entryResult.detectionSource = "SignatureStore";
 
-                        // WHICH member of the archive matched. EngineResult carries no
-                        // path field (task 198), and without this the caller learns
-                        // that "something in the zip is malicious" and cannot say what,
-                        // which is not actionable for a user or a responder.
+                        // WHICH member of the archive matched, in the human-readable
+                        // indicator list. EngineResult::filePath now carries the same
+                        // identity in machine-readable form; this line stays because
+                        // the indicators are what a user is shown.
                         entryResult.indicators.push_back(
                             "Archive entry: " +
                             Utils::StringUtils::ToNarrow(entry.path));
