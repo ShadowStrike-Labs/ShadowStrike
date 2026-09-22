@@ -1709,10 +1709,6 @@ private:
  */
 [[nodiscard]] std::wstring GetWindowsDirectory() noexcept;
 
-/**
- * @brief Check if file is a system file.
- */
-[[nodiscard]] bool IsSystemFile(const std::wstring& filePath) noexcept;
 
 /**
  * @brief Enumerate directory files.

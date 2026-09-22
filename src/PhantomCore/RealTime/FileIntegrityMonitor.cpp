@@ -371,11 +371,6 @@ std::wstring GetWindowsDirectory() noexcept {
     return Utils::SystemUtils::GetWindowsDirectoryPath();
 }
 
-bool IsSystemFile(const std::wstring& filePath) noexcept {
-    std::wstring norm = NormalizeFilePath(filePath);
-    return norm.find(L"\\windows\\system32\\") != std::wstring::npos ||
-           norm.find(L"\\windows\\syswow64\\") != std::wstring::npos;
-}
 
 std::vector<std::wstring> EnumerateDirectory(
     const std::wstring& directoryPath, bool recursive) noexcept {
