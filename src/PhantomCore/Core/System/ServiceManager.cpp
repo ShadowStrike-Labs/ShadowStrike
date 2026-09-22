@@ -41,6 +41,7 @@
 #include "../../Core/FileSystem/FileLockManager.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 #include "../Registry/RegistryMonitor.hpp"
+#include "../../Exploits/KernelExploitDetector.hpp"
 
 // Cross-module wiring includes
 // NOTE: Direct #include of RegistryMonitor.hpp, ProcessMonitor.hpp, DriverAnalyzer.hpp,
@@ -2072,8 +2073,60 @@ public:
                 bool isSuspicious = false;
                 std::wstring reasons;
 
-                // [1] Whitelist check — skip known-good services early
-                if (IsServiceWhitelisted(service)) {
+                const bool isDriverService =
+                    (service.serviceType == ServiceType::KernelDriver ||
+                     service.serviceType == ServiceType::FileSystemDriver);
+
+                // [0] BYOVD IDENTIFICATION, AND IT RUNS BEFORE ANY EXEMPTION.
+                //
+                // A hash identifies a file. Where that file happens to be installed has
+                // no bearing on what it is, so an install-location exemption must never
+                // reach this check - it would be the same conflation as trusting a
+                // signature because the chain is trusted without asking who signed.
+                //
+                // The ordering matters because of what came before it. The whitelist
+                // below does `continue`, which skipped EVERY later check, and the driver
+                // branch at [4] sat behind it. So a kernel-driver service installed
+                // under Program Files - which is where an attacker with one elevation
+                // would put a signed vulnerable driver, because it is the least
+                // suspicious place available - was never screened at all.
+                //
+                // Worse, the screening it was skipping did not exist. That branch
+                // computed a SHA-256 of the driver and used it only as
+                // `if (!driverHash.empty())`; the digest was never looked up against
+                // anything, while its comment said "Check against WhiteListStore" and the
+                // call underneath was the PATH whitelist. The hash was read off disk and
+                // thrown away on every enumeration.
+                //
+                // KernelExploitDetector already holds the LOLDrivers and Microsoft
+                // blocklist hashes and is configured by RealTimeProtection with
+                // enableLOLDriversDatabase, so this connects a computed hash to a lookup
+                // that was already there.
+                bool knownVulnerableDriver = false;
+                if (isDriverService && !service.isMicrosoft) {
+                    const std::wstring resolvedDriverPath = ResolveBinaryPath(service.binaryPath);
+                    const std::string driverHash = ComputeFileSHA256(resolvedDriverPath);
+
+                    if (!driverHash.empty() &&
+                        Exploits::KernelExploitDetector::HasInstance() &&
+                        Exploits::KernelExploitDetector::Instance().IsInitialized() &&
+                        Exploits::KernelExploitDetector::Instance().IsVulnerableDriver(driverHash)) {
+                        knownVulnerableDriver = true;
+                        service.threatLevel = ServiceThreatLevel::Malicious;
+                        isSuspicious = true;
+                        reasons += L"Known vulnerable driver, BYOVD - SHA-256 matched the "
+                                   L"vulnerable-driver database; ";
+                    }
+                }
+
+                // [1] Whitelist check - skip known-good services early.
+                //
+                // An identified vulnerable driver is never exempted, whatever its install
+                // location. Everything else keeps the existing exemption, deliberately:
+                // the checks below are location and signature HEURISTICS, and widening
+                // what reaches them would change how much this module reports on an
+                // ordinary machine without identifying anything new.
+                if (!knownVulnerableDriver && IsServiceWhitelisted(service)) {
                     continue;
                 }
 
@@ -2104,20 +2157,28 @@ public:
                     }
                 }
 
-                // [4] Kernel driver services — check for BYOVD
-                if (service.serviceType == ServiceType::KernelDriver ||
-                    service.serviceType == ServiceType::FileSystemDriver) {
+                // [4] Kernel driver services - the heuristic half.
+                //
+                // Identification by hash ran at [0], before any exemption. What is left
+                // here is the judgement about an UNKNOWN driver, and it keeps its
+                // exemption so that report volume on an ordinary machine is unchanged.
+                //
+                // The hash computation that used to open this block has moved to [0].
+                // Note what it was gating: the whitelist test below was already
+                // unreachable-if-false, because a whitelisted service had `continue`d,
+                // so the "always noteworthy" fallback under it could only ever fire when
+                // hashing FAILED. Both are preserved exactly, because a vulnerable driver
+                // now reaches here having bypassed the exemption, and in that case the
+                // whitelist test is legitimately true and neither line should add a
+                // second, weaker reason to a verdict that is already Malicious.
+                if (isDriverService) {
                     if (!service.isMicrosoft) {
-                        // Hash the driver binary for threat intel lookup
-                        std::wstring resolvedDriverPath = ResolveBinaryPath(service.binaryPath);
-                        std::string driverHash = ComputeFileSHA256(resolvedDriverPath);
-                        if (!driverHash.empty()) {
-                            // Check against WhiteListStore — unknown drivers are suspicious
-                            if (!IsServiceWhitelisted(service)) {
+                        if (!IsServiceWhitelisted(service)) {
+                            if (service.threatLevel == ServiceThreatLevel::Unknown) {
                                 service.threatLevel = ServiceThreatLevel::Suspicious;
-                                isSuspicious = true;
-                                reasons += L"Non-whitelisted kernel driver; ";
                             }
+                            isSuspicious = true;
+                            reasons += L"Non-whitelisted kernel driver; ";
                         }
 
                         // Non-Microsoft kernel driver is always noteworthy
@@ -2653,9 +2714,22 @@ public:
         // RegistryMonitor.hpp - which itself pulls ThreatIntelLookup.hpp - builds
         // with zero errors. Whether DriverAnalyzer.hpp specifically has its own
         // problem is untested and must not be assumed either way.
+        // The open question in the comment above is now ANSWERED by measurement:
+        // both DriverAnalyzer.hpp and KernelExploitDetector.hpp include into this
+        // translation unit with zero errors, so the recorded ThreatIntelStore.hpp
+        // obstacle does not exist for either. GetSuspiciousServicesImpl now performs a
+        // real hash lookup through KernelExploitDetector, which is the module that
+        // holds the LOLDrivers and Microsoft blocklist content.
+        //
+        // DriverAnalyzer's RegisterDriverLoadCallback remains unwired, and that is a
+        // different capability: this screens services at enumeration time, whereas the
+        // callback would screen a driver AS IT LOADS. Both are wanted; only the first
+        // is claimed here.
         SS_LOG_INFO(LOG_CATEGORY,
-            L"ServiceManager: driver-service BYOVD screening active via our own whitelist "
-            L"and driver-type checks in GetSuspiciousServices (DriverAnalyzer is not wired)");
+            L"ServiceManager: driver-service BYOVD screening active - SHA-256 of every "
+            L"non-Microsoft driver service is checked against the vulnerable-driver "
+            L"database before any install-location exemption applies "
+            L"(DriverAnalyzer load-time callback is still not wired)");
     }
 
     /**

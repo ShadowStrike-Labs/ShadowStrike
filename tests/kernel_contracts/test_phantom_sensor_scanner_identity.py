@@ -27625,5 +27625,91 @@ class AnchoredPathDecisionContractTests(unittest.TestCase):
             "the exception path grants the exemption. On an ALLOW decision that is "
             "backwards: a path that could not be examined has not earned one.")
 
+
+class BYOVDIdentificationOrderContractTests(unittest.TestCase):
+    """Identification must not sit behind an install-location exemption.
+
+    GetSuspiciousServicesImpl exempts a service whose binary is installed under
+    System32, SysWOW64 or Program Files, and the exemption is a `continue` - it
+    skips every later check. The kernel-driver branch used to sit behind it, so a
+    driver service installed under Program Files was never screened. That is where
+    an attacker with one elevation would place a signed vulnerable driver, because
+    it is the least suspicious location available.
+
+    Worse, the screening being skipped did not exist: the branch computed a SHA-256
+    of the driver and used it only as `if (!driverHash.empty())`. The digest was read
+    off disk and discarded on every enumeration, while the comment above it claimed a
+    WhiteListStore check and the call underneath was the PATH whitelist.
+
+    THE INVARIANT THESE HOLD is an ORDERING one, which is why it is worth a contract
+    rather than a unit test: a hash identifies a file, and where the file is installed
+    has no bearing on what it is. So the lookup must run BEFORE any location
+    exemption, and the exemption must not apply to a driver already identified.
+
+    Deliberately NOT asserted: that unknown third-party drivers reach the heuristic
+    checks. They still do not, and that is a separate decision - widening it would
+    change how much the module reports on an ordinary machine without identifying
+    anything new.
+    """
+
+    def _source(self):
+        return strip_c_comments(read_source(SERVICE_MANAGER_CPP_PATH))
+
+    def test_the_vulnerable_driver_database_is_actually_consulted(self):
+        src = self._source()
+        self.assertIn(
+            "IsVulnerableDriver(driverHash)", src,
+            "the driver hash is no longer looked up against anything. Computing a "
+            "SHA-256 and discarding it is what this replaced - it read the whole "
+            "driver off disk on every enumeration and learned nothing from it.")
+        self.assertNotIn(
+            "if (!driverHash.empty()) {", src,
+            "the hash is being tested for non-emptiness as its only use again, which "
+            "is the original defect.")
+
+    def test_identification_runs_before_the_location_exemption(self):
+        src = self._source()
+        ident = src.find("IsVulnerableDriver(driverHash)")
+        exempt = src.find("IsServiceWhitelisted(service)) {")
+        self.assertNotEqual(ident, -1, "the vulnerable-driver lookup is gone.")
+        self.assertNotEqual(exempt, -1, "the whitelist exemption is gone.")
+        self.assertLess(
+            ident, exempt,
+            "the vulnerable-driver lookup has moved BACK behind the install-location "
+            "exemption. The exemption is a `continue`, so a known vulnerable driver "
+            "under Program Files would be skipped entirely - which is exactly where "
+            "one would be installed.")
+
+    def test_the_exemption_cannot_swallow_an_identified_driver(self):
+        src = self._source()
+        self.assertRegex(
+            src, r"if\s*\(\s*!\s*knownVulnerableDriver\s*&&\s*IsServiceWhitelisted",
+            "the exemption no longer excludes an already-identified vulnerable "
+            "driver, so an install location can once again suppress a positive "
+            "identification.")
+
+    def test_an_identified_vulnerable_driver_is_not_merely_suspicious(self):
+        src = self._source()
+        idx = src.find("knownVulnerableDriver = true;")
+        self.assertNotEqual(idx, -1, "the identification no longer records a verdict.")
+        window = src[max(0, idx - 400):idx + 400]
+        self.assertIn(
+            "ServiceThreatLevel::Malicious", window,
+            "a SHA-256 match against the vulnerable-driver database is an "
+            "IDENTIFICATION, not a heuristic suspicion, and must not be reported at "
+            "the same level as 'this driver is not on our whitelist'.")
+
+    def test_the_lookup_is_guarded_against_an_absent_detector(self):
+        src = self._source()
+        idx = src.find("IsVulnerableDriver(driverHash)")
+        self.assertNotEqual(idx, -1)
+        window = src[max(0, idx - 600):idx + 120]
+        for guard in ("HasInstance()", "IsInitialized()"):
+            self.assertIn(
+                guard, window,
+                "the lookup is no longer guarded by " + guard + ". Calling into an "
+                "uninitialised detector to decide whether a kernel driver is "
+                "vulnerable would fault inside a service enumeration.")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
