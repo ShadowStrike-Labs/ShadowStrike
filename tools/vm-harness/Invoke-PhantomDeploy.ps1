@@ -578,14 +578,31 @@ function Sync-DetectionContentStaging {
                        Select-Object -First 1
     }
 
+    # THE BUILDER IS AN INPUT TOO.
+    #
+    # Comparing the database only against content/ has a blind spot, and it cost real
+    # detection. The database that shipped was built 2026-08-13; four commits repairing
+    # the pattern writer landed 2026-08-14. No content file changed, so this check saw
+    # nothing stale and the database was carried forward for weeks with a pattern index
+    # the runtime could not read - every pattern name loaded as UnnamedPattern_N.
+    #
+    # So a newer phantom-sigbuild.exe forces a rebuild. Rebuilding is cheap (about seven
+    # seconds) and shipping content compiled by a superseded writer is not.
     $needsBuild = $false
     if ((Test-Path $sigBuild) -and $newestInput) {
         if (-not (Test-Path $prebuiltDb)) {
             $needsBuild = $true
             Log "Detection content: no prebuilt database, building from $contentSrcDir"
-        } elseif ((Get-Item $prebuiltDb).LastWriteTimeUtc -lt $newestInput.LastWriteTimeUtc) {
-            $needsBuild = $true
-            Log "Detection content: $($newestInput.Name) is newer than signatures.sdb, rebuilding"
+        } else {
+            $dbTimeUtc      = (Get-Item $prebuiltDb).LastWriteTimeUtc
+            $builderTimeUtc = (Get-Item $sigBuild).LastWriteTimeUtc
+            if ($dbTimeUtc -lt $newestInput.LastWriteTimeUtc) {
+                $needsBuild = $true
+                Log "Detection content: $($newestInput.Name) is newer than signatures.sdb, rebuilding"
+            } elseif ($dbTimeUtc -lt $builderTimeUtc) {
+                $needsBuild = $true
+                Log "Detection content: phantom-sigbuild.exe is newer than signatures.sdb, rebuilding"
+            }
         }
     }
 

@@ -453,4 +453,27 @@ secrets/
 
 # Aggregated third-party YARA packages: fetched at build time, not redistributed.
 # See content/README.md - some upstream sections carry no licence grant.
-content/yara/yara_forge_rules_*.yar
+#
+# BOTH naming styles are covered on purpose. YARA-Forge has shipped these as
+# yara_forge_rules_full.yar and as yara-rules-core.yar / yara-rules-extended.yar,
+# and a pattern matching only the underscore form left the hyphenated packages
+# committable - roughly 25 MB of third-party rules, some carrying no
+# redistribution grant, one 'git add content' away from entering history.
+content/yara/**/*.yar
+content/yara/**/*.yara
+content/yara/*.yar
+content/yara/*.yara
+
+# The compiled detection database is a BUILD OUTPUT, not a source.
+#
+# It is produced deterministically from content/ by phantom-sigbuild, and
+# Invoke-PhantomDeploy builds it on demand when absent or stale, so tracking it
+# buys nothing and costs permanently: every rebuild would add a new
+# multi-hundred-megabyte blob that git keeps forever. Tiered rule packages will
+# make it larger again.
+#
+# THIRD-PARTY-RULES.md is generated beside it and is equally regenerable, but it
+# is small, textual and a redistribution CONDITION of the rule licences, so it
+# stays tracked and reviewable.
+tools/vm-harness/signatures.sdb
+build/installer/staging/Content/signatures.sdb
