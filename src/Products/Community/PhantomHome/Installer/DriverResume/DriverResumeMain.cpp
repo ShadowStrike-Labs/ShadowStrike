@@ -898,6 +898,28 @@ static int RunUninstall()
         return kExitGenericFailure;
     }
 
+    // REVOKE THE TRUST GRANT. Install writes the signing certificate into
+    // LocalMachine Root and TrustedPublisher; nothing removed it, so a machine that
+    // no longer had the product still trusted that key to vouch for any Authenticode
+    // signature. Uninstalling a security product must not leave a CA behind.
+    //
+    // A failure here does NOT fail the uninstall. The driver is already gone, and
+    // reporting failure would leave the product installed from the MSI's point of
+    // view while its kernel component is unloaded, which is worse than a certificate
+    // needing manual removal. It is logged loudly instead.
+    unsigned int certsRemoved = 0;
+    const DWORD certErr = RemoveShadowStrikeRootCert(certsRemoved);
+    if (certErr != ERROR_SUCCESS) {
+        LOG_ERROR(L"RemoveShadowStrikeRootCert failed (0x%08X) after removing %u "
+                  L"certificate(s). The remaining entry grants machine-wide code "
+                  L"signing trust and should be deleted by hand from "
+                  L"certlm.msc -> Trusted Root Certification Authorities.",
+                  certErr, certsRemoved);
+    } else {
+        LOG_INFO(L"Trust grant revoked: %u certificate(s) removed from the Root and "
+                 L"TrustedPublisher stores.", certsRemoved);
+    }
+
     LOG_INFO(L"Uninstall complete.");
     return kExitSuccess;
 }

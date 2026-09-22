@@ -35,6 +35,9 @@
 #  define NOMINMAX
 #endif
 #include <Windows.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 #include <wincrypt.h>
 
 #include <cstdint>
@@ -248,6 +251,158 @@ struct CertContextGuard {
 
 } // anonymous namespace
 
+// ============================================================================
+// Removal - the counterpart that did not exist
+// ============================================================================
+
+const unsigned char kShadowStrikeSignerPublicKeySha256[32] = {
+    0x10, 0xC1, 0x8E, 0xA5, 0xF1, 0xDB, 0x34, 0x06,
+    0x45, 0x3F, 0x85, 0x8D, 0x04, 0x3A, 0x4C, 0xBB,
+    0x17, 0xD8, 0xC0, 0x03, 0xAC, 0xBE, 0xCA, 0xB7,
+    0xBB, 0x4D, 0xB5, 0x69, 0x70, 0xB1, 0xA9, 0xEB
+};
+
+namespace {
+
+/// @brief SHA-256 over a buffer, via BCrypt one-shot. Empty vector on failure.
+[[nodiscard]] bool Sha256(const BYTE* data, DWORD len, BYTE out[32]) noexcept
+{
+    if (data == nullptr || len == 0) {
+        return false;
+    }
+    // BCryptHash is the one-shot form; it opens, hashes and closes internally, so
+    // there is no handle to leak on an error path.
+    const NTSTATUS st = BCryptHash(
+        BCRYPT_SHA256_ALG_HANDLE,
+        nullptr, 0,
+        const_cast<PUCHAR>(data), len,
+        out, 32);
+    return st >= 0;
+}
+
+} // anonymous namespace
+
+DWORD RemoveCertificatesByPublicKeyHash(
+    DWORD systemStoreLocation,
+    const wchar_t* storeName,
+    const unsigned char publicKeySha256[32],
+    unsigned int& removedOut) noexcept
+{
+    removedOut = 0;
+
+    if (storeName == nullptr || publicKeySha256 == nullptr) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    CertStoreGuard store(
+        CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W,
+            0,
+            0,
+            systemStoreLocation,
+            storeName));
+    if (!store.valid()) {
+        const DWORD err = GetLastError();
+        LOG_ERROR(L"RemoveCertificatesByPublicKeyHash: CertOpenStore('%ls') failed "
+                  L"(0x%08X).", storeName, err);
+        return err ? err : ERROR_FUNCTION_FAILED;
+    }
+
+    DWORD firstError = ERROR_SUCCESS;
+
+    // ENUMERATION AND DELETION INTERACT, so the walk is restarted after each
+    // removal. CertDeleteCertificateFromStore FREES the context it is given, which
+    // invalidates the enumeration cursor that produced it; continuing to enumerate
+    // from a freed context is undefined. Restarting is O(n^2) over a store holding
+    // at most a handful of matches, which is not worth optimising into a defect.
+    bool restart = true;
+    while (restart) {
+        restart = false;
+        PCCERT_CONTEXT ctx = nullptr;
+        while ((ctx = CertEnumCertificatesInStore(store.get(), ctx)) != nullptr) {
+            if (ctx->pCertInfo == nullptr) {
+                continue;
+            }
+            const CRYPT_BIT_BLOB& pub = ctx->pCertInfo->SubjectPublicKeyInfo.PublicKey;
+            if (pub.pbData == nullptr || pub.cbData == 0) {
+                continue;
+            }
+
+            BYTE digest[32]{};
+            if (!Sha256(pub.pbData, pub.cbData, digest)) {
+                continue;
+            }
+            if (memcmp(digest, publicKeySha256, sizeof(digest)) != 0) {
+                continue;
+            }
+
+            // A duplicate is needed because deletion consumes the context, and the
+            // enumeration must not be resumed from it afterwards.
+            PCCERT_CONTEXT victim = CertDuplicateCertificateContext(ctx);
+            if (victim == nullptr) {
+                continue;
+            }
+
+            if (CertDeleteCertificateFromStore(victim)) {
+                ++removedOut;
+                LOG_INFO(L"RemoveCertificatesByPublicKeyHash: removed a matching "
+                         L"certificate from the '%ls' store.", storeName);
+            } else {
+                const DWORD err = GetLastError();
+                LOG_ERROR(L"RemoveCertificatesByPublicKeyHash: "
+                          L"CertDeleteCertificateFromStore('%ls') failed (0x%08X).",
+                          storeName, err);
+                if (firstError == ERROR_SUCCESS) {
+                    firstError = err ? err : ERROR_FUNCTION_FAILED;
+                }
+                CertFreeCertificateContext(victim);
+                // Stop rather than spin: a failing delete would otherwise be found
+                // again on the restarted walk, forever.
+                return firstError;
+            }
+
+            // CertDeleteCertificateFromStore released the context on success, so the
+            // cursor is gone. Begin again.
+            restart = true;
+            break;
+        }
+    }
+
+    if (removedOut == 0) {
+        LOG_INFO(L"RemoveCertificatesByPublicKeyHash: no matching certificate in the "
+                 L"'%ls' store - nothing to remove.", storeName);
+    }
+    return firstError;
+}
+
+DWORD RemoveShadowStrikeRootCert(unsigned int& removedOut) noexcept
+{
+    removedOut = 0;
+
+    LOG_INFO(L"RemoveShadowStrikeRootCert: revoking the machine-wide trust grant "
+             L"created at install.");
+
+    // BOTH stores are attempted even if the first fails. Root is the broader grant -
+    // authority to vouch for anything - so abandoning it because TrustedPublisher
+    // errored would leave the more dangerous entry in place.
+    DWORD firstError = ERROR_SUCCESS;
+    for (const wchar_t* storeName : { L"Root", L"TrustedPublisher" }) {
+        unsigned int removedHere = 0;
+        const DWORD err = RemoveCertificatesByPublicKeyHash(
+            CERT_SYSTEM_STORE_LOCAL_MACHINE,
+            storeName,
+            kShadowStrikeSignerPublicKeySha256,
+            removedHere);
+        removedOut += removedHere;
+        if (err != ERROR_SUCCESS && firstError == ERROR_SUCCESS) {
+            firstError = err;
+        }
+    }
+
+    LOG_INFO(L"RemoveShadowStrikeRootCert: %u certificate(s) removed, result 0x%08X.",
+             removedOut, firstError);
+    return firstError;
+}
 DWORD InstallShadowStrikeRootCert(const std::wstring& cerFilePath) noexcept
 {
     if (cerFilePath.empty()) {
