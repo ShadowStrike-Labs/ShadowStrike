@@ -2378,24 +2378,73 @@ public:
         }
     }
 
+    /// @brief Install directories that exempt a service from suspicion analysis.
+    ///
+    /// Resolved from the OS because the comparison below is ANCHORED, and a prefix can
+    /// only be anchored against the real directory.
+    [[nodiscard]] static const std::vector<std::wstring>& ExemptInstallDirsLower() {
+        static const std::vector<std::wstring> dirs = [] {
+            std::vector<std::wstring> out;
+            wchar_t buf[MAX_PATH]{};
+            if (::GetSystemDirectoryW(buf, MAX_PATH) != 0) {
+                out.emplace_back(StringUtils::ToLowerCopy(std::wstring(buf)));
+            }
+            if (::GetSystemWow64DirectoryW(buf, MAX_PATH) != 0) {
+                out.emplace_back(StringUtils::ToLowerCopy(std::wstring(buf)));
+            }
+            for (const wchar_t* var : { L"ProgramFiles", L"ProgramW6432",
+                                        L"ProgramFiles(x86)" }) {
+                wchar_t pf[MAX_PATH]{};
+                const DWORD len = ::GetEnvironmentVariableW(var, pf, MAX_PATH);
+                if (len > 0 && len < MAX_PATH) {
+                    out.emplace_back(StringUtils::ToLowerCopy(std::wstring(pf)));
+                }
+            }
+            return out;
+        }();
+        return dirs;
+    }
+
     /**
-     * @brief Check if a service is whitelisted via path heuristics.
-     * WhitelistStore is instance-based (not singleton). Use path-based safety checks.
+     * @brief Is this service exempt from suspicion analysis on the strength of where
+     *        its binary is installed?
+     *
+     * THIS IS AN ALLOW DECISION AND IT WAS FAIL-OPEN. GetSuspiciousServicesImpl does
+     * `if (IsServiceWhitelisted(service)) continue;`, which skips EVERY later check -
+     * the unsigned-binary test, the suspicious-path test, the ProgramData test, and the
+     * BYOVD kernel-driver analysis. The tests were unanchored substring searches, so a
+     * binary path merely CONTAINING "\program files\" was exempted, and
+     * C:\Users\victim\Program Files\evil.sys satisfies that with one directory any
+     * unprivileged user can create. A malicious kernel-driver service could therefore
+     * skip the vulnerable-driver check entirely.
+     *
+     * Now anchored at position 0 against directories resolved from the OS, with a
+     * separator boundary.
+     *
+     * DELIBERATELY UNCHANGED: the fact that an installation under Program Files is
+     * exempted at all. Narrowing that is a detection-policy decision - it would make
+     * every third-party driver reach the BYOVD path and change what the module reports
+     * on an ordinary machine - so it is filed rather than taken here. Anchoring removes
+     * the part an attacker controls; the policy question is separate.
      */
     [[nodiscard]] bool IsServiceWhitelisted(const ServiceInfo& service) const noexcept {
         try {
             if (service.isMicrosoft) return true;
 
             std::wstring lowerPath = StringUtils::ToLowerCopy(service.binaryPath);
+            if (lowerPath.rfind(L"\\\\?\\", 0) == 0) lowerPath.erase(0, 4);
 
-            // Known-safe Microsoft/Windows paths
-            if (lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos) return true;
-            if (lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) return true;
-            if (lowerPath.find(L"\\program files\\") != std::wstring::npos) return true;
-            if (lowerPath.find(L"\\program files (x86)\\") != std::wstring::npos) return true;
+            for (const auto& dir : ExemptInstallDirsLower()) {
+                if (dir.empty() || lowerPath.size() <= dir.size()) continue;
+                if (lowerPath.compare(0, dir.size(), dir) != 0) continue;
+                const wchar_t boundary = lowerPath[dir.size()];
+                if (boundary == L'\\' || boundary == L'/') return true;
+            }
 
             return false;
         } catch (...) {
+            // Fail CLOSED on an allow decision: a path that could not be examined is
+            // not a path that earned an exemption.
             return false;
         }
     }

@@ -161,6 +161,8 @@ FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
 QUARANTINE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/QuarantineManager.cpp"
+PROCESS_KILLER_CPP_PATH = ROOT / "src/PhantomCore/Core/Process/ProcessKiller.cpp"
+SERVICE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Core/System/ServiceManager.cpp"
 DNS_LEAK_PROTECTION_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/DNSLeakProtection.cpp"
 RECOMMENDATIONS_ENGINE_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Recommendations/RecommendationsEngine.cpp"
 ATTACHMENT_SCANNER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Email/AttachmentScanner.cpp"
@@ -27531,6 +27533,97 @@ class QuarantineCriticalFileContractTests(unittest.TestCase):
             "the exception path returns false, so a path that could not be examined "
             "is treated as safe to quarantine. It must fail CLOSED: refuse to act on "
             "a file that could not be classified.")
+
+
+class AnchoredPathDecisionContractTests(unittest.TestCase):
+    """A path test that gates a security decision must be anchored, not searched.
+
+    The pattern and why it recurs: comparing a path against a hardcoded directory
+    literal with an unanchored substring search. Any unprivileged user can create a
+    directory that satisfies it - one mkdir under the user profile is enough, and a
+    UNC share named to match needs nothing.
+
+    Three instances have now been found, failing in BOTH directions, which is why
+    these are held as contracts rather than left to review:
+
+      KeyloggerProtection::IsLegitimateHook   an ALLOW decision. A keylogger under a
+                                              fake system32 directory was excused.
+      QuarantineManager::IsSystemCriticalFile a REFUSE decision. Malware in the same
+                                              place could not be quarantined.
+      ProcessKiller::IsSystemDirectoryPath    a REFUSE decision, and it defeated its
+                                              own stated purpose - the check exists so
+                                              that malware named csrss.exe outside a
+                                              system directory does not get immunity
+                                              from termination, and the substring gave
+                                              that immunity back.
+      ServiceManager::IsServiceWhitelisted    an ALLOW decision, and the broadest. A
+                                              match makes GetSuspiciousServicesImpl
+                                              `continue`, skipping the unsigned-binary
+                                              test, the suspicious-path test and the
+                                              BYOVD kernel-driver analysis entirely.
+
+    The correct form is to resolve the real directory from the OS and compare anchored
+    at position 0 with a separator boundary. These guards hold that form in the two
+    modules fixed most recently; the other two are held by their own guards and tests.
+    """
+
+    def test_process_killer_anchors_its_system_directory_test(self):
+        src = strip_c_comments(read_source(PROCESS_KILLER_CPP_PATH))
+        self.assertIn(
+            "GetSystemDirectoryW", src,
+            "ProcessKiller no longer resolves the real system directory. An anchored "
+            "prefix can only be anchored against the actual directory.")
+        self.assertRegex(
+            src, r"compare\s*\(\s*0\s*,\s*dir\s*\.\s*size\s*\(\s*\)",
+            "the system-directory test is not anchored at position 0 any more, so "
+            "malware named csrss.exe under C:\\Users\\victim\\windows\\system32\\ "
+            "would be returned as ProcessCriticality::Forbidden - blanket immunity "
+            "from termination, which is exactly what this check exists to prevent.")
+        self.assertNotIn(
+            'lower.find(L"\\\\windows\\\\system32\\\\")', src,
+            "the unanchored substring test is back in ProcessKiller.")
+
+    def test_service_whitelist_anchors_its_install_directory_test(self):
+        src = strip_c_comments(read_source(SERVICE_MANAGER_CPP_PATH))
+        self.assertIn(
+            "ExemptInstallDirsLower", src,
+            "the resolved exempt-directory list is gone from ServiceManager.")
+        self.assertRegex(
+            src, r"lowerPath\s*\.\s*compare\s*\(\s*0\s*,\s*dir\s*\.\s*size",
+            "the service whitelist is not anchored at position 0, so a binary path "
+            "merely CONTAINING a Program Files fragment is exempted. That exemption "
+            "makes GetSuspiciousServicesImpl skip the BYOVD kernel-driver check, so a "
+            "malicious driver service under C:\\Users\\victim\\Program Files\\ would "
+            "never be analysed.")
+        for gone in ('lowerPath.find(L"\\\\program files\\\\")',
+                     'lowerPath.find(L"\\\\windows\\\\system32\\\\")'):
+            self.assertNotIn(
+                gone, src,
+                "an unanchored substring whitelist test is back in ServiceManager: " + gone)
+
+    def test_both_require_a_separator_boundary(self):
+        # Without it a protected directory also covers a sibling whose name merely
+        # begins with it - \Windows\System32 would cover \Windows\System32_backup.
+        for label, path in (("ProcessKiller", PROCESS_KILLER_CPP_PATH),
+                            ("ServiceManager", SERVICE_MANAGER_CPP_PATH)):
+            src = strip_c_comments(read_source(path))
+            self.assertRegex(
+                src, r"boundary\s*==\s*L'\\\\'",
+                label + " dropped the separator boundary check, so a protected "
+                "directory now also covers a sibling whose name begins with it.")
+
+    def test_the_service_whitelist_still_fails_closed(self):
+        src = strip_c_comments(read_source(SERVICE_MANAGER_CPP_PATH))
+        idx = src.find("bool IsServiceWhitelisted")
+        self.assertNotEqual(idx, -1, "IsServiceWhitelisted is gone.")
+        body = src[idx:idx + 2500]
+        catch = body.find("catch")
+        self.assertNotEqual(catch, -1, "IsServiceWhitelisted no longer guards its body.")
+        tail = body[catch:catch + 300]
+        self.assertRegex(
+            tail, r"return\s+false\s*;",
+            "the exception path grants the exemption. On an ALLOW decision that is "
+            "backwards: a path that could not be examined has not earned one.")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

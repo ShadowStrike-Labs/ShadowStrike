@@ -287,17 +287,57 @@ extern "C" {
     return GetExitCodeProcess(hProcess.Get(), &exitCode) && (exitCode == STILL_ACTIVE);
 }
 
-// Best-effort check that a binary path resides in a Windows system directory.
-// Used to guard the critical-process name list against malware masquerading as
-// e.g. csrss.exe from a non-system path.
+// Real system directories, resolved once from the OS.
+//
+// Resolved rather than written down because the test below is an ANCHORED prefix
+// comparison, and a prefix can only be anchored against the actual directory.
+[[nodiscard]] static const std::vector<std::wstring>& SystemDirectoriesLower() {
+    static const std::vector<std::wstring> dirs = [] {
+        std::vector<std::wstring> out;
+        wchar_t buf[MAX_PATH]{};
+        auto lower = [](std::wstring s) {
+            for (auto& c : s) c = static_cast<wchar_t>(::towlower(c));
+            return s;
+        };
+        if (::GetSystemDirectoryW(buf, MAX_PATH) != 0) out.emplace_back(lower(buf));
+        if (::GetSystemWow64DirectoryW(buf, MAX_PATH) != 0) out.emplace_back(lower(buf));
+        if (::GetWindowsDirectoryW(buf, MAX_PATH) != 0) {
+            out.emplace_back(lower(std::wstring(buf) + L"\\WinSxS"));
+        }
+        return out;
+    }();
+    return dirs;
+}
+
+// Does this binary path really live in a Windows system directory?
+//
+// THE CHECK EXISTS TO DEFEAT MASQUERADING, and as an unanchored substring search it
+// handed back the immunity it was written to withhold. GetCriticalityInternal treats
+// a critical-process NAME as authoritative only when the binary is in a system
+// directory - so malware named csrss.exe placed in
+// C:\\Users\\victim\\windows\\system32\\ satisfied the old test and was returned as
+// ProcessCriticality::Forbidden, which is blanket immunity from termination. Creating
+// that directory needs no privilege at all.
+//
+// Now anchored at position 0 against the resolved directories, with a separator
+// boundary so \\Windows\\System32 does not also cover \\Windows\\System32_backup.
 [[nodiscard]] static bool IsSystemDirectoryPath(std::wstring_view path) noexcept {
     if (path.empty()) return false;
+
     std::wstring lower;
     lower.reserve(path.size());
     for (wchar_t c : path) lower.push_back(static_cast<wchar_t>(::towlower(c)));
-    return lower.find(L"\\windows\\system32\\") != std::wstring::npos ||
-           lower.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
-           lower.find(L"\\windows\\winsxs\\")   != std::wstring::npos;
+
+    // A \\?\ prefix would shift every offset and defeat an anchored comparison.
+    if (lower.rfind(L"\\\\?\\", 0) == 0) lower.erase(0, 4);
+
+    for (const auto& dir : SystemDirectoriesLower()) {
+        if (dir.empty() || lower.size() <= dir.size()) continue;
+        if (lower.compare(0, dir.size(), dir) != 0) continue;
+        const wchar_t boundary = lower[dir.size()];
+        if (boundary == L'\\' || boundary == L'/') return true;
+    }
+    return false;
 }
 
 [[nodiscard]] static bool IsCriticalProcessName(std::wstring_view name) noexcept {
