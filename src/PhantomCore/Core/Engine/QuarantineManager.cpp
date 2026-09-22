@@ -1060,38 +1060,128 @@ public:
     // VALIDATION
     // ========================================================================
 
-    [[nodiscard]] bool IsSystemCriticalFile(const std::wstring& filePath) const {
-        try {
-            auto pathLower = StringUtils::ToLowerCopy(filePath);
+    /// @brief Real system directories, resolved once from the OS.
+    ///
+    /// Resolved rather than hardcoded because the check below is an ANCHORED
+    /// prefix test, and a prefix can only be anchored against the actual
+    /// directory. Windows is not always on C:, and %SystemRoot% is not always
+    /// \Windows.
+    [[nodiscard]] static const std::vector<std::wstring>& RealSystemDirectories() {
+        static const std::vector<std::wstring> dirs = [] {
+            std::vector<std::wstring> out;
+            wchar_t buf[MAX_PATH]{};
 
-            // Check for Windows system directories
-            static const std::vector<std::wstring> criticalPaths = {
-                L"\\windows\\system32\\",
-                L"\\windows\\syswow64\\",
-                L"\\windows\\winsxs\\",
-                L"\\program files\\windows defender\\",
-            };
+            if (::GetSystemDirectoryW(buf, MAX_PATH) != 0) {
+                out.emplace_back(StringUtils::ToLowerCopy(std::wstring(buf)));
+            }
+            if (::GetSystemWow64DirectoryW(buf, MAX_PATH) != 0) {
+                out.emplace_back(StringUtils::ToLowerCopy(std::wstring(buf)));
+            }
+            if (::GetWindowsDirectoryW(buf, MAX_PATH) != 0) {
+                const std::wstring win = StringUtils::ToLowerCopy(std::wstring(buf));
+                out.emplace_back(win + L"\\winsxs");
+            }
 
-            for (const auto& critical : criticalPaths) {
-                if (pathLower.find(critical) != std::wstring::npos) {
-                    return true;
+            // Windows Defender, under either Program Files view. Resolved from the
+            // environment rather than assumed, since the localised or redirected
+            // form would not match a hardcoded English path.
+            for (const wchar_t* var : { L"ProgramFiles", L"ProgramW6432",
+                                        L"ProgramFiles(x86)" }) {
+                wchar_t pf[MAX_PATH]{};
+                const DWORD len = ::GetEnvironmentVariableW(var, pf, MAX_PATH);
+                if (len > 0 && len < MAX_PATH) {
+                    out.emplace_back(StringUtils::ToLowerCopy(std::wstring(pf)) +
+                                     L"\\windows defender");
                 }
             }
 
-            // Check for critical system files
-            fs::path p(filePath);
-            auto filename = StringUtils::ToLowerCopy(p.filename().wstring());
+            return out;
+        }();
+        return dirs;
+    }
 
-            static const std::vector<std::wstring> criticalFiles = {
-                L"ntoskrnl.exe", L"hal.dll", L"ntdll.dll",
-                L"kernel32.dll", L"advapi32.dll", L"explorer.exe"
-            };
+    /// @brief True when @p pathLower lies inside @p dirLower.
+    ///
+    /// ANCHORED AT POSITION 0, with a separator boundary, so a directory whose
+    /// name merely begins with the protected one does not match: \windows\system32
+    /// must not cover \windows\system32_backup.
+    [[nodiscard]] static bool PathIsUnder(const std::wstring& pathLower,
+                                          const std::wstring& dirLower) noexcept {
+        if (dirLower.empty() || pathLower.size() <= dirLower.size()) {
+            return false;
+        }
+        if (pathLower.compare(0, dirLower.size(), dirLower) != 0) {
+            return false;
+        }
+        const wchar_t boundary = pathLower[dirLower.size()];
+        return boundary == L'\\' || boundary == L'/';
+    }
 
-            return std::find(criticalFiles.begin(), criticalFiles.end(), filename)
-                != criticalFiles.end();
+    /// @brief Is this file one the machine cannot boot or run without?
+    ///
+    /// THIS DECIDES WHAT QUARANTINE REFUSES, so being wrong in either direction has
+    /// a cost. Too narrow and remediation breaks the machine. Too broad and malware
+    /// becomes unremovable - and the previous implementation was too broad in two
+    /// separate ways, both of which handed an attacker immunity:
+    ///
+    ///   1. The directory test was an UNANCHORED SUBSTRING on literals such as
+    ///      "\windows\system32\". Any unprivileged user can create
+    ///      C:\Users\victim\windows\system32\, and a payload placed there could
+    ///      not be quarantined. The same held for \windows\syswow64\ and for a UNC
+    ///      share named to match.
+    ///
+    ///   2. The filename test matched on the FILENAME ALONE, in any directory. A
+    ///      file called ntdll.dll in Downloads, or explorer.exe in %TEMP%, was
+    ///      protected from quarantine. Naming a payload after a system binary is a
+    ///      standard masquerading technique that this product detects elsewhere, so
+    ///      the check granted immunity to precisely the files most likely to be
+    ///      abusing it.
+    ///
+    /// Both are now anchored against directories resolved from the OS, and a
+    /// critical filename only counts when the file is actually IN one of them.
+    [[nodiscard]] bool IsSystemCriticalFile(const std::wstring& filePath) const {
+        try {
+            if (filePath.empty()) {
+                return false;
+            }
+
+            // Normalise away a \\?\ prefix before comparing. The scan path produces
+            // it for long paths, and leaving it in place would shift every offset and
+            // defeat an anchored comparison.
+            std::wstring path = filePath;
+            if (path.rfind(L"\\\\?\\", 0) == 0) {
+                path.erase(0, 4);
+            }
+
+            // Resolve to an absolute, canonical form so that a relative path or one
+            // containing .. cannot step out of a protected directory after the check.
+            std::error_code ec;
+            fs::path canonical = fs::weakly_canonical(fs::path(path), ec);
+            const std::wstring pathLower = StringUtils::ToLowerCopy(
+                ec ? path : canonical.wstring());
+
+            bool inSystemDirectory = false;
+            for (const auto& dir : RealSystemDirectories()) {
+                if (PathIsUnder(pathLower, dir)) {
+                    inSystemDirectory = true;
+                    break;
+                }
+            }
+
+            if (inSystemDirectory) {
+                return true;
+            }
+
+            // A critical NAME only means anything inside a real system directory,
+            // which the branch above has already established is not the case here.
+            // Outside one, a file called ntdll.dll is a file called ntdll.dll - and
+            // far more likely to be a masquerade than the genuine article.
+            return false;
 
         } catch (...) {
-            return false;
+            // Fail CLOSED: an unexaminable path is treated as critical, so quarantine
+            // refuses rather than acting on a file it could not classify.
+            return true;
         }
     }
 

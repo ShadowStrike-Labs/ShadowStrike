@@ -160,6 +160,7 @@ FILE_UTILS_CPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.cpp"
 FILE_UTILS_HPP_PATH = ROOT / "src/PhantomCore/Utils/FileUtils.hpp"
 DATABASE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Database/DatabaseManager.cpp"
 SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+QUARANTINE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/QuarantineManager.cpp"
 DNS_LEAK_PROTECTION_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/DNSLeakProtection.cpp"
 RECOMMENDATIONS_ENGINE_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Recommendations/RecommendationsEngine.cpp"
 ATTACHMENT_SCANNER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Email/AttachmentScanner.cpp"
@@ -27430,6 +27431,106 @@ class VpnDetectionCriteriaContractTests(unittest.TestCase):
                 "diverged again" % constant,
             )
 
+
+
+class QuarantineCriticalFileContractTests(unittest.TestCase):
+    """What quarantine REFUSES decides whether malware can be removed.
+
+    QuarantineManager::IsSystemCriticalFile gates remediation: QuarantineFile
+    returns SystemFileProtected and does nothing when it answers true. Being wrong
+    in either direction costs something. Too narrow and remediation breaks the
+    machine. Too broad and malware becomes unremovable.
+
+    It was too broad in two separate ways, and both handed an attacker immunity:
+
+      1. The directory test was an UNANCHORED SUBSTRING on literals such as
+         "\\windows\\system32\\". Any unprivileged user can create
+         C:\\Users\\victim\\windows\\system32\\, and a payload placed there could
+         not be quarantined.
+
+      2. The filename test matched the FILENAME ALONE in any directory, so a file
+         called ntdll.dll in Downloads, or explorer.exe in the temp directory, was
+         protected. Naming a payload after a system binary is a standard
+         masquerading technique this product detects elsewhere.
+
+    These are source-level guards because the runtime behaviour cannot be proved
+    safely on a developer machine: the existence check in QuarantineFile runs
+    BEFORE the critical-file check, so observing a genuine refusal requires a file
+    that really exists in a real system directory - and if the check were wrong the
+    test would quarantine it.
+    """
+
+    def _source(self):
+        return strip_c_comments(read_source(QUARANTINE_MANAGER_CPP_PATH))
+
+    def test_system_directories_are_resolved_from_the_os(self):
+        src = self._source()
+        for api in ("GetSystemDirectoryW", "GetSystemWow64DirectoryW",
+                    "GetWindowsDirectoryW"):
+            self.assertIn(
+                api, src,
+                api + " is not called. A protected directory must be resolved from "
+                "the OS, because an anchored prefix test can only be anchored "
+                "against the real directory - Windows is not always on C: and "
+                "%SystemRoot% is not always \\Windows.")
+
+    def test_the_unanchored_substring_test_is_gone(self):
+        src = self._source()
+        # The exact defect: a find() over a hardcoded directory literal, anchored
+        # nowhere, so any path merely CONTAINING it matched.
+        self.assertNotRegex(
+            src, r"pathLower\s*\.\s*find\s*\(\s*critical\s*\)",
+            "IsSystemCriticalFile is matching a directory by unanchored substring "
+            "again. C:\\Users\\victim\\windows\\system32\\payload.exe would become "
+            "unquarantinable, which is remediation immunity an unprivileged user "
+            "can grant themselves by creating a directory.")
+        self.assertNotIn(
+            'L"\\\\windows\\\\system32\\\\"', src,
+            "a hardcoded system32 directory literal is back. It cannot be anchored, "
+            "because the real directory is what a prefix must be compared against.")
+
+    def test_the_directory_comparison_is_anchored_with_a_separator_boundary(self):
+        src = self._source()
+        self.assertIn(
+            "PathIsUnder", src,
+            "the anchored containment helper is gone. Without it the directory test "
+            "is a substring search again.")
+        # Anchored at position 0 - compare(0, size, dir) - not searched for.
+        self.assertRegex(
+            src, r"compare\s*\(\s*0\s*,\s*dirLower\s*\.\s*size\s*\(\s*\)",
+            "the comparison is no longer anchored at position 0, so a protected "
+            "directory name appearing anywhere in the path would match.")
+        # A boundary check, so \windows\system32 does not cover \windows\system32_backup.
+        self.assertRegex(
+            src, r"boundary\s*==\s*L'\\\\'",
+            "the separator boundary check is gone, so a protected directory would "
+            "also cover a sibling whose name merely begins with it.")
+
+    def test_a_critical_filename_alone_no_longer_protects_a_file(self):
+        src = self._source()
+        # The list itself must not come back as a filename-only test.
+        self.assertNotRegex(
+            src, r'criticalFiles\s*=\s*\{',
+            "the filename-only critical list is back. It protected any file called "
+            "ntdll.dll or explorer.exe in ANY directory, which is exactly what a "
+            "masquerading payload is named.")
+
+    def test_an_unexaminable_path_fails_closed(self):
+        src = self._source()
+        # Find the function body and require its catch to return true, not false.
+        idx = src.find("bool IsSystemCriticalFile")
+        self.assertNotEqual(
+            idx, -1, "IsSystemCriticalFile is gone; this guard has nothing to hold.")
+        body = src[idx:idx + 4000]
+        catch = body.find("catch")
+        self.assertNotEqual(
+            catch, -1, "IsSystemCriticalFile no longer guards against an exception.")
+        tail = body[catch:catch + 400]
+        self.assertRegex(
+            tail, r"return\s+true\s*;",
+            "the exception path returns false, so a path that could not be examined "
+            "is treated as safe to quarantine. It must fail CLOSED: refuse to act on "
+            "a file that could not be classified.")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
