@@ -681,8 +681,7 @@ public:
         std::span<const uint8_t> message,
         std::span<const uint8_t> sessionKey);
     [[nodiscard]] bool ValidateKernelDriverAttestation(
-        const std::wstring& driverPath,
-        std::span<const uint8_t> expectedHash);
+        const std::wstring& driverPath);
 
 private:
     mutable std::shared_mutex m_configMutex;
@@ -1204,9 +1203,8 @@ std::vector<uint8_t> CryptoManager::ComputeKernelMessageHMAC(
 }
 
 bool CryptoManager::ValidateKernelDriverAttestation(
-    const std::wstring& driverPath,
-    std::span<const uint8_t> expectedHash) {
-    return m_impl->ValidateKernelDriverAttestation(driverPath, expectedHash);
+    const std::wstring& driverPath) {
+    return m_impl->ValidateKernelDriverAttestation(driverPath);
 }
 
 // ============================================================================
@@ -4989,16 +4987,102 @@ std::vector<uint8_t> CryptoManagerImpl::ComputeKernelMessageHMAC(
     return tag;
 }
 
+// ============================================================================
+// Driver attestation: signer identity, not a self-comparison
+// ============================================================================
+//
+// THE ANCHOR IS COMPILED IN, and that is the whole point of it.
+//
+// This value is the SHA-256 of the signer certificate's SubjectPublicKey bits -
+// CERT_PUBLIC_KEY_INFO::PublicKey.pbData, the DER RSAPublicKey inside the BIT
+// STRING. It is deliberately NOT read from a file at runtime: anything able to
+// replace the driver can replace a .cer sitting beside it, so an anchor loaded
+// from disk establishes nothing. A contract test asserts this constant equals
+// the public key in packaging/signing/ShadowStrike-Dev.cer, so the two cannot
+// drift without a test failing.
+//
+// The PUBLIC KEY is pinned rather than the certificate thumbprint because a
+// thumbprint covers the whole certificate, including its validity dates, so a
+// routine certificate renewal that keeps the same key would break attestation
+// while changing nothing about who signed. Invoke-PhantomDeploy pins the same
+// bytes by the same rule.
+static constexpr std::array<uint8_t, 32> kDriverSignerPublicKeySha256 = {
+    0x10, 0xC1, 0x8E, 0xA5, 0xF1, 0xDB, 0x34, 0x06,
+    0x45, 0x3F, 0x85, 0x8D, 0x04, 0x3A, 0x4C, 0xBB,
+    0x17, 0xD8, 0xC0, 0x03, 0xAC, 0xBE, 0xCA, 0xB7,
+    0xBB, 0x4D, 0xB5, 0x69, 0x70, 0xB1, 0xA9, 0xEB
+};
+
+namespace {
+
+/// @brief Reads the signer certificate's public key bits out of a signed file.
+///
+/// Done with CryptQueryObject directly rather than through PEFileSignatureVerifier.
+/// That verifier returns false on an untrusted root BEFORE it populates the signer
+/// thumbprint, so it yields no identity for exactly the files this check exists to
+/// identify; and it is on the on-access scan path via PackerDetector, where changing
+/// a return value would change detection. Keeping this self-contained means the
+/// attestation decision cannot perturb scanning.
+///
+/// Returns an empty vector on any failure. A caller must treat empty as NO IDENTITY
+/// and refuse, never as a pass.
+[[nodiscard]] std::vector<uint8_t> ReadSignerPublicKeyBits(const std::wstring& filePath) {
+    HCERTSTORE hStore = nullptr;
+    HCRYPTMSG hMsg = nullptr;
+    std::vector<uint8_t> keyBits;
+
+    if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, filePath.c_str(),
+                          CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                          CERT_QUERY_FORMAT_FLAG_BINARY, 0, nullptr, nullptr,
+                          nullptr, &hStore, &hMsg, nullptr)) {
+        return keyBits;
+    }
+
+    // Every exit below must release both handles, so the cleanup is written once.
+    const auto cleanup = [&]() noexcept {
+        if (hMsg) { CryptMsgClose(hMsg); }
+        if (hStore) { CertCloseStore(hStore, 0); }
+    };
+
+    DWORD signerInfoSize = 0;
+    if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_CERT_INFO_PARAM, 0, nullptr, &signerInfoSize) ||
+        signerInfoSize == 0) {
+        cleanup();
+        return keyBits;
+    }
+
+    std::vector<uint8_t> signerInfoBuf(signerInfoSize);
+    if (!CryptMsgGetParam(hMsg, CMSG_SIGNER_CERT_INFO_PARAM, 0,
+                          signerInfoBuf.data(), &signerInfoSize)) {
+        cleanup();
+        return keyBits;
+    }
+
+    auto* signerInfo = reinterpret_cast<CERT_INFO*>(signerInfoBuf.data());
+    PCCERT_CONTEXT cert = CertFindCertificateInStore(
+        hStore, X509_ASN_ENCODING, 0, CERT_FIND_SUBJECT_CERT, signerInfo, nullptr);
+    if (cert == nullptr) {
+        cleanup();
+        return keyBits;
+    }
+
+    const auto& pub = cert->pCertInfo->SubjectPublicKeyInfo.PublicKey;
+    if (pub.pbData != nullptr && pub.cbData > 0) {
+        keyBits.assign(pub.pbData, pub.pbData + pub.cbData);
+    }
+
+    CertFreeCertificateContext(cert);
+    cleanup();
+    return keyBits;
+}
+
+}  // namespace
+
 bool CryptoManagerImpl::ValidateKernelDriverAttestation(
-    const std::wstring& driverPath,
-    std::span<const uint8_t> expectedHash) {
+    const std::wstring& driverPath) {
 
     if (driverPath.empty()) {
         SS_LOG_ERROR(LOG_CATEGORY, L"ValidateKernelDriverAttestation: empty driver path");
-        return false;
-    }
-    if (expectedHash.size() != 32) {
-        SS_LOG_ERROR(LOG_CATEGORY, L"ValidateKernelDriverAttestation: expected 32-byte SHA-256 hash");
         return false;
     }
 
@@ -5041,31 +5125,86 @@ bool CryptoManagerImpl::ValidateKernelDriverAttestation(
         &policyGUID,
         &winTrustData);
 
+    // TRIAGE THE RESULT. Collapsing every non-success to a refusal is wrong in one
+    // specific direction: CERT_E_UNTRUSTEDROOT says only that the MACHINE does not
+    // trust the root, and the signer pin below does not need it to. Accepting that
+    // one code is what lets attestation stop depending on the machine's root store,
+    // which is where the certificate should never have had to be.
+    //
+    // Everything else stays fatal, and each for its own reason:
+    //   TRUST_E_BAD_DIGEST     the file was modified after signing
+    //   TRUST_E_NOSIGNATURE    unsigned, so there is no identity to pin
+    //   CERT_E_REVOKED         the signer was revoked; the key is compromised
+    //   CERT_E_EXPIRED         outside validity, so the signature proves nothing now
+    // An unrecognised code is fatal too - an unknown trust failure is not a pass.
     if (trustResult != ERROR_SUCCESS) {
-        SS_LOG_ERROR(LOG_CATEGORY,
-            L"ValidateKernelDriverAttestation: Authenticode verification FAILED for '%s' (result=0x%08lX)",
+        const bool rootUntrustedOnly =
+            (trustResult == static_cast<LONG>(CERT_E_UNTRUSTEDROOT)) ||
+            (trustResult == static_cast<LONG>(CERT_E_CHAINING));
+        if (!rootUntrustedOnly) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"ValidateKernelDriverAttestation: Authenticode verification FAILED for '%s' "
+                L"(result=0x%08lX) - refusing",
+                driverPath.c_str(), trustResult);
+            return false;
+        }
+        SS_LOG_INFO(LOG_CATEGORY,
+            L"ValidateKernelDriverAttestation: '%s' has a valid signature whose root this "
+            L"machine does not trust (0x%08lX); continuing because trust comes from the "
+            L"pinned signer key, not the root store",
             driverPath.c_str(), trustResult);
-        return false;
     }
 
-    // Step 2: Hash the driver file and compare against expected hash
-    auto fileHash = HashFile(driverPath, HashAlgorithm::SHA256);
-    if (!fileHash.has_value()) {
+    // Step 2: PIN THE SIGNER.
+    //
+    // This replaces a comparison that could not fail. The previous step hashed the
+    // driver and compared it against an expectedHash argument that the ONLY caller
+    // produced by hashing the same file moments earlier - SHA256(f) == SHA256(f).
+    // It reported success on every input, including a driver replaced wholesale,
+    // and the comment above it described verifying a hash against the Authenticode
+    // signature, which is not what hashing a file does.
+    //
+    // Asking WHO signed is strictly stronger than what ran before. The old step 1
+    // accepted any chain terminating in a root this machine trusts, so a driver
+    // signed by any public CA - or by anything an attacker managed to get into the
+    // root store - passed attestation.
+    const auto signerKey = ReadSignerPublicKeyBits(driverPath);
+    if (signerKey.empty()) {
         SS_LOG_ERROR(LOG_CATEGORY,
-            L"ValidateKernelDriverAttestation: failed to hash driver file '%s'",
+            L"ValidateKernelDriverAttestation: no signer identity could be read from '%s' - "
+            L"refusing, because an unidentified signer is not a trusted one",
             driverPath.c_str());
         return false;
     }
 
-    if (!ConstantTimeCompare(fileHash.value(), expectedHash)) {
+    const auto signerKeyHash = Hash(signerKey, HashAlgorithm::SHA256);
+    if (signerKeyHash.size() != kDriverSignerPublicKeySha256.size()) {
         SS_LOG_ERROR(LOG_CATEGORY,
-            L"ValidateKernelDriverAttestation: driver hash MISMATCH for '%s' — possible tamper",
+            L"ValidateKernelDriverAttestation: signer key digest is %zu bytes, expected %zu",
+            signerKeyHash.size(), kDriverSignerPublicKeySha256.size());
+        return false;
+    }
+
+    if (!ConstantTimeCompare(signerKeyHash,
+                             std::span<const uint8_t>(kDriverSignerPublicKeySha256.data(),
+                                                      kDriverSignerPublicKeySha256.size()))) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"ValidateKernelDriverAttestation: '%s' is validly signed by a signer this build "
+            L"does not trust - refusing the channel",
             driverPath.c_str());
         return false;
     }
 
+    // WHAT THIS STILL DOES NOT ESTABLISH, stated so nobody reads more into it.
+    //
+    // The file on disk is not necessarily the image the kernel loaded. An attacker
+    // who can load a driver can leave a correctly signed .sys at this path and run a
+    // different image, and no amount of reading files closes that gap - it is TOCTOU
+    // by construction. Closing it needs the kernel to report a hash of its own loaded
+    // image over the channel, which is driver work and is filed separately.
     SS_LOG_INFO(LOG_CATEGORY,
-        L"ValidateKernelDriverAttestation: driver '%s' passed Authenticode + hash attestation",
+        L"ValidateKernelDriverAttestation: '%s' carries a valid signature from the pinned "
+        L"signer key",
         driverPath.c_str());
     return true;
 }

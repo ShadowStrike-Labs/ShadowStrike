@@ -507,6 +507,7 @@
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelStoreTests.cpp" />
     <!-- selfprotection_unit: added as one batch. -->
     <ClCompile Include="tests\unit\selfprotection_unit\AntiDebug_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\DriverAttestation_Tests.cpp" />
     <ClCompile Include="tests\unit\selfprotection_unit\CertificateValidator_Tests.cpp" />
     <ClCompile Include="tests\unit\selfprotection_unit\CryptoManager_Tests.cpp" />
     <ClCompile Include="tests\unit\selfprotection_unit\DigitalSignatureValidator_Tests.cpp" />

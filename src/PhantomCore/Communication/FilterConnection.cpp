@@ -1285,55 +1285,44 @@ private:
         m_nonceCounter.store(0, std::memory_order_relaxed);
         m_encryptionEstablished.store(true, std::memory_order_release);
 
-        // ── APT DEFENSE: Validate kernel driver attestation ──────────
-        // Before trusting this encrypted channel, verify the driver binary
-        // is Authenticode-signed and matches the expected hash. This blocks
-        // nation-state actors from injecting a rogue driver that speaks our
-        // protocol but exfiltrates data.
+        // ATTEST THE DRIVER BEFORE TRUSTING THE CHANNEL.
+        //
+        // The check is a signer pin. It used to hash the driver here and pass that
+        // hash in as the value to verify against, which made the comparison
+        // SHA256(f) == SHA256(f) and unable to fail, so nothing was attested. The
+        // expected identity is now compiled into CryptoManager and no value is
+        // supplied from here.
         {
             wchar_t systemDir[MAX_PATH]{};
-            GetSystemDirectoryW(systemDir, MAX_PATH);
-            std::wstring driverPath = std::wstring(systemDir) + L"\\drivers\\PhantomSensor.sys";
+            if (GetSystemDirectoryW(systemDir, MAX_PATH) == 0) {
+                Utils::Logger::Error("[FilterConnection] KEX: GetSystemDirectoryW failed, "
+                                     "cannot locate the driver to attest");
+                crypto.SecureZero(m_sessionKey.data(), m_sessionKey.size());
+                m_encryptionEstablished.store(false, std::memory_order_release);
+                return false;
+            }
+            const std::wstring driverPath =
+                std::wstring(systemDir) + L"\\drivers\\PhantomSensor.sys";
 
-            // Hash the driver binary independently to get its actual hash.
-            // This is the hash we expect to verify against the Authenticode signature.
-            auto driverHashOpt = crypto.HashFile(driverPath, HashAlgorithm::SHA256);
-            if (!driverHashOpt.has_value() || driverHashOpt->size() < 32) {
-                Utils::Logger::Error("[FilterConnection] KEX: Failed to hash driver binary at {}",
-                    WideToUtf8String(driverPath));
+            if (!crypto.ValidateKernelDriverAttestation(driverPath)) {
+                Utils::Logger::Error("[FilterConnection] KEX: Driver attestation FAILED for {} "
+                                     "- signature invalid, or signed by a signer this build "
+                                     "does not trust",
+                                     WideToUtf8String(driverPath));
+
                 if (m_enforceDriverAttestation) {
-                    // Hard-fail: cannot trust a channel when we cannot even hash the driver
                     crypto.SecureZero(m_sessionKey.data(), m_sessionKey.size());
                     m_encryptionEstablished.store(false, std::memory_order_release);
+                    Utils::Logger::Error("[FilterConnection] KEX: Connection refused - "
+                                         "driver attestation enforcement active");
                     return false;
                 }
-                Utils::Logger::Warn("[FilterConnection] KEX: Driver hash failed but "
-                                    "enforcement is DISABLED (dev mode)");
+                Utils::Logger::Warn("[FilterConnection] KEX: Driver attestation failed but "
+                                    "enforcement is DISABLED - SOC alert recommended");
             }
             else {
-                // Verify driver Authenticode signature and attestation
-                if (!crypto.ValidateKernelDriverAttestation(driverPath, *driverHashOpt)) {
-                    Utils::Logger::Error("[FilterConnection] KEX: Driver attestation FAILED — "
-                                         "Authenticode signature invalid or hash mismatch for {}",
-                                         WideToUtf8String(driverPath));
-
-                    if (m_enforceDriverAttestation) {
-                        // HARD-FAIL: The driver binary is not trusted.
-                        // Tear down encryption and refuse to communicate.
-                        crypto.SecureZero(m_sessionKey.data(), m_sessionKey.size());
-                        m_encryptionEstablished.store(false, std::memory_order_release);
-                        Utils::Logger::Error("[FilterConnection] KEX: Connection refused — "
-                                             "driver attestation enforcement active");
-                        return false;
-                    }
-                    // Dev/test mode: warn but continue
-                    Utils::Logger::Warn("[FilterConnection] KEX: Driver attestation failed but "
-                                        "enforcement is DISABLED — SOC alert recommended");
-                }
-                else {
-                    Utils::Logger::Info("[FilterConnection] KEX: Driver attestation passed — "
-                                        "Authenticode signature verified");
-                }
+                Utils::Logger::Info("[FilterConnection] KEX: Driver attestation passed - "
+                                    "signature verified against the pinned signer key");
             }
         }
 

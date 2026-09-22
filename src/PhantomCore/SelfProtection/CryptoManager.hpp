@@ -1296,15 +1296,17 @@ public:
     /**
      * @brief Validate that the kernel driver is authentic and untampered.
      * Loads the driver file, checks its Authenticode signature chain,
-     * and verifies its SHA-256 hash against an expected value.
+     * and confirms the signature was produced by the pinned signer key.
      *
      * @param driverPath  Full path to the .sys driver file
-     * @param expectedHash SHA-256 of the known-good driver binary
+     *
+     * Takes no expected value on purpose. The trust anchor is the signer's
+     * public key, compiled into this translation unit, because a value the
+     * caller supplies is a value an attacker who reached the caller can supply.
      * @return true if driver passes all attestation checks
      */
     [[nodiscard]] bool ValidateKernelDriverAttestation(
-        const std::wstring& driverPath,
-        std::span<const uint8_t> expectedHash);
+        const std::wstring& driverPath);
 
 private:
     // ========================================================================
