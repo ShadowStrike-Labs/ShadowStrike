@@ -241,9 +241,14 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
 // anything this build cannot compile. Both are reported: content that vanishes
 // quietly is indistinguishable from content that was never there, which is the
 // failure mode this whole tool exists to avoid.
+// The kept count is reported OUT rather than only logged, because a per-package
+// figure cannot answer the question that matters once more than one package is
+// compiled: how many of those rules survived as distinct rules. Only the caller,
+// which sees every package and then the finished store, can compare the two.
 [[nodiscard]] bool ImportYaraWithLicenseFilter(SignatureBuilder& builder,
                                               const std::wstring& path,
-                                              const Options& opt) {
+                                              const Options& opt,
+                                              std::size_t& rulesSubmittedOut) {
     std::string source;
     {
         std::ifstream in(path, std::ios::binary);
@@ -301,6 +306,11 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
     Info("    rules     : %zu of %zu kept, %zu unlicensed, %zu missing-module",
          report.rulesKept, report.rulesTotal,
          report.rulesDroppedNoLicense, report.rulesDroppedModule);
+
+    // What this package hands to the builder, after withholding. Accumulated by
+    // the caller across every package so the total can be set against the number
+    // of rules the finished store actually holds.
+    rulesSubmittedOut += report.rulesKept;
 
     if (report.rulesKept == 0) {
         Fail("yara: every rule in '%ls' was withheld - refusing to build an empty rule set",
@@ -1394,7 +1404,9 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
 [[nodiscard]] bool VerifyOutput(const std::wstring& path,
                                 bool expectHashes,
                                 bool expectPatterns,
-                                bool expectYara) {
+                                bool expectYara,
+                                std::size_t yaraPackagesSubmitted,
+                                std::size_t yaraRulesSubmitted) {
     ShadowStrike::SignatureStore::SignatureStore store;
 
     const StoreError opened = store.Initialize(path, /*readOnly=*/true);
@@ -1428,6 +1440,34 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
         const auto yaraStats = store.GetYaraStatistics();
         Info("  yara rules : %llu in %llu namespace(s)",
              yaraStats.totalRules, yaraStats.totalNamespaces);
+
+        // THE OVERLAP, which used to be invisible.
+        //
+        // A rule is identified by its name, so a package that redefines a name an
+        // earlier package already supplied contributes nothing new. Compiling the
+        // three tier packages together submitted 25,732 rules and stored 11,116:
+        // 14,616 definitions were absorbed and no line of output said so. The
+        // packages had to be diffed by hand to discover it.
+        //
+        // Reported, NOT rejected. The collapse is the correct outcome - core is a
+        // subset of extended by design - and what is stored is the union, so no
+        // detection is lost. Two things are lost that this line makes visible: the
+        // work of compiling the same rule three times, and the knowledge of which
+        // tier a stored rule came from, without which a user-selectable
+        // aggressiveness level cannot be built on this database.
+        if (yaraPackagesSubmitted > 1 && yaraRulesSubmitted > 0) {
+            const auto stored = static_cast<std::size_t>(yaraStats.totalRules);
+            if (yaraRulesSubmitted > stored) {
+                Info("  yara packs : %zu packages submitted %zu rule(s); %zu stored, "
+                     "%zu name(s) already defined by an earlier package",
+                     yaraPackagesSubmitted, yaraRulesSubmitted, stored,
+                     yaraRulesSubmitted - stored);
+            } else {
+                Info("  yara packs : %zu packages submitted %zu rule(s); %zu stored, "
+                     "no overlap between packages",
+                     yaraPackagesSubmitted, yaraRulesSubmitted, stored);
+            }
+        }
         if (yaraStats.totalRules == 0) {
             Fail("the YARA store opened but reports zero compiled rules");
             ok = false;
@@ -1530,8 +1570,16 @@ int wmain(int argc, wchar_t** argv) {
     for (const auto& f : opt.patternFiles) {
         if (!importStep("patterns", f, builder.ImportPatternsFromFile(f))) { return 2; }
     }
+    // Counted so the overlap between packages can be reported after the build.
+    // Three tier packages are routinely compiled together - core, extended and
+    // full - and core is a subset of extended by design, so most of what is
+    // submitted is a redefinition of a rule an earlier package already provided.
+    // That collapse is correct and it was also completely silent.
+    std::size_t yaraPackagesSubmitted = 0;
+    std::size_t yaraRulesSubmitted    = 0;
     for (const auto& f : opt.yaraFiles) {
-        if (!ImportYaraWithLicenseFilter(builder, f, opt)) { return 2; }
+        if (!ImportYaraWithLicenseFilter(builder, f, opt, yaraRulesSubmitted)) { return 2; }
+        ++yaraPackagesSubmitted;
     }
     for (const auto& d : opt.yaraDirs) {
         if (!importStep("yara-dir", d, builder.ImportYaraRulesFromDirectory(d, opt.yaraNamespace))) { return 2; }
@@ -1609,7 +1657,9 @@ int wmain(int argc, wchar_t** argv) {
         !VerifyOutput(opt.output,
                       pendingHashes   > 0,
                       pendingPatterns > 0,
-                      pendingYara     > 0)) {
+                      pendingYara     > 0,
+                      yaraPackagesSubmitted,
+                      yaraRulesSubmitted)) {
         return 4;
     }
 
