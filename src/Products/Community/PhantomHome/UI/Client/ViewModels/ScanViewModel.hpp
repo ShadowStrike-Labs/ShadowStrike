@@ -36,6 +36,7 @@
 #include <QJsonObject>
 #include <QString>
 #include <QStringList>
+#include <QVariantList>
 #include <memory>
 
 namespace ShadowStrike::PhantomHome::UI::ViewModels {
@@ -49,6 +50,15 @@ class ScanViewModel final : public QObject {
     Q_PROPERTY(quint64 threatsFound READ threatsFound NOTIFY progressChanged)
     Q_PROPERTY(QString currentPath  READ currentPath  NOTIFY progressChanged)
     Q_PROPERTY(QString scanId       READ scanId       NOTIFY stateChanged)
+
+    //
+    // WHAT THE SCAN FOUND. One map per confirmed detection - path, threatName,
+    // detectionSource, quarantined, actionable, pending - so the page can list
+    // the files beside the action. Empty until the scan completes; a count of
+    // threats with no way to see or act on them was the defect this replaces.
+    //
+    Q_PROPERTY(QVariantList detections        READ detections        NOTIFY detectionsChanged)
+    Q_PROPERTY(int          detectionsOmitted READ detectionsOmitted NOTIFY detectionsChanged)
 
     //
     // WHAT THE SCAN IS. Without these the model could describe a scan only
@@ -118,6 +128,8 @@ public:
     [[nodiscard]] quint64 threatsFound() const noexcept;
     [[nodiscard]] QString currentPath()  const noexcept;
     [[nodiscard]] QString scanId()       const noexcept;
+    [[nodiscard]] QVariantList detections()        const;
+    [[nodiscard]] int          detectionsOmitted() const noexcept;
 
     [[nodiscard]] QString scope()         const noexcept;
     [[nodiscard]] QString targetSummary() const noexcept;
@@ -168,6 +180,16 @@ public:
     /** Sends v2 StopScan (static_cast<CommandType>(221)) to the service. */
     Q_INVOKABLE void cancel();
 
+    /**
+     * @brief Quarantine one file the completed scan reported.
+     *
+     * Sends QuarantineDetection (232) with this scan's id and the path exactly as
+     * the service reported it. The service refuses any path the scan did not
+     * report, and refuses a file whose content has changed since it was scanned.
+     * The outcome arrives as detectionActionFinished().
+     */
+    Q_INVOKABLE void quarantineDetection(const QString& path);
+
 signals:
     void stateChanged();
     void progressChanged();
@@ -177,6 +199,11 @@ signals:
     /// they are CLEARED at the start of a new attempt - so a stale reason
     /// cannot outlive the failure it described.
     void lastErrorChanged();
+    void detectionsChanged();
+    /// @p code is the service's stable outcome code ("ok", "content_changed",
+    /// "system_file_protected", ...), so the page can explain a refusal rather
+    /// than only report that one happened.
+    void detectionActionFinished(QString path, bool ok, QString code, QString message);
 
 private:
     struct Impl;
@@ -185,6 +212,8 @@ private:
     // Implementation helpers defined in the .cpp (not part of the public ABI).
     void doStartScan(const QJsonObject& payload);
     void applyProgressUpdate(const QJsonObject& ev);
+    /// Rewrites one detection's map in place. Returns false if it is not listed.
+    bool updateDetection(const QString& path, const QVariantMap& changes);
     void pollProgress();
 
     /// Starts a scan for targets queued while an earlier scan was running.

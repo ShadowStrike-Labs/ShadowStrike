@@ -181,6 +181,9 @@ enum class CommandType : uint32_t {
 
     // Quarantine — see also QuarantineAction=50 (legacy restore/delete verb)
     ListQuarantine          = 230,  ///< List all quarantined items
+    // 231 is the v2 routing code for QuarantineAction (see the note above) and is
+    // deliberately not a named member.
+    QuarantineDetection     = 232,  ///< Quarantine a file a completed scan reported
 
     // Reporting
     GetReports              = 240,  ///< Retrieve historical detection reports

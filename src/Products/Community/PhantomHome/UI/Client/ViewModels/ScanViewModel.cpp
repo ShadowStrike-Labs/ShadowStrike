@@ -23,6 +23,7 @@
 #include <QJsonValue>
 #include <QPointer>
 #include <QTimer>
+#include <QVariantMap>
 
 #include "../IPC/PipeClient.hpp"
 
@@ -48,6 +49,9 @@ struct ScanViewModel::Impl {
     quint64 threatsFound{0};
     QString currentPath;
     QString scanId;
+
+    QVariantList detections;
+    int          detectionsOmitted{0};
 
     // Seeded from the request payload at doStartScan so the surface is
     // correct from the first frame, then confirmed by every poll reply.
@@ -126,6 +130,8 @@ quint64 ScanViewModel::itemsScanned() const noexcept { return m_impl->itemsScann
 quint64 ScanViewModel::threatsFound() const noexcept { return m_impl->threatsFound; }
 QString ScanViewModel::currentPath()  const noexcept { return m_impl->currentPath; }
 QString ScanViewModel::scanId()       const noexcept { return m_impl->scanId; }
+QVariantList ScanViewModel::detections() const { return m_impl->detections; }
+int ScanViewModel::detectionsOmitted() const noexcept { return m_impl->detectionsOmitted; }
 
 QString ScanViewModel::scope()         const noexcept { return m_impl->scope; }
 QString ScanViewModel::targetSummary() const noexcept { return m_impl->targetSummary; }
@@ -207,6 +213,32 @@ void ScanViewModel::applyProgressUpdate(const QJsonObject& ev)
                                                m_impl->filesPerSecond);
     m_impl->bytesPerSecond       = readCounter("bytesPerSecond",
                                                m_impl->bytesPerSecond);
+    // THE DETECTION LIST, replaced only when the reply carries it. The progress
+    // broadcast deliberately does not, so treating an absent key as "empty" would
+    // erase the list on the next push.
+    if (ev.contains(QLatin1String("detections"))) {
+        QVariantList next;
+        const QJsonArray arr = ev.value(QLatin1String("detections")).toArray();
+        next.reserve(arr.size());
+        for (const QJsonValue& v : arr) {
+            const QJsonObject o = v.toObject();
+            const QString path = o.value(QLatin1String("path")).toString();
+            if (path.isEmpty()) continue;
+            QVariantMap m;
+            m.insert(QStringLiteral("path"),            path);
+            m.insert(QStringLiteral("threatName"),      o.value(QLatin1String("threatName")).toString());
+            m.insert(QStringLiteral("detectionSource"), o.value(QLatin1String("detectionSource")).toString());
+            m.insert(QStringLiteral("quarantined"),     o.value(QLatin1String("quarantined")).toBool(false));
+            m.insert(QStringLiteral("actionable"),      o.value(QLatin1String("actionable")).toBool(false));
+            m.insert(QStringLiteral("pending"),         false);
+            next.append(m);
+        }
+        m_impl->detections = std::move(next);
+        m_impl->detectionsOmitted =
+            ev.value(QLatin1String("detectionsOmitted")).toInt(0);
+        emit detectionsChanged();
+    }
+
     if (ev.contains(QLatin1String("scanId"))) {
         const QJsonValue idValue = ev.value(QLatin1String("scanId"));
         if (idValue.isString()) {
@@ -280,6 +312,12 @@ void ScanViewModel::doStartScan(const QJsonObject& payload)
     m_impl->threatsFound = 0;
     m_impl->currentPath.clear();
     m_impl->scanId.clear();
+
+    // The previous scan's detections belong to the previous scan id; acting on
+    // one after this scan starts would cite the wrong scan.
+    m_impl->detections.clear();
+    m_impl->detectionsOmitted = 0;
+    emit detectionsChanged();
 
     m_impl->totalFiles           = 0;
     m_impl->bytesScanned         = 0;
@@ -463,6 +501,63 @@ void ScanViewModel::cancel()
             self->m_impl->stopPollTimer();
             emit self->stateChanged();
         });
+}
+
+// -- Detections --------------------------------------------------------------
+
+bool ScanViewModel::updateDetection(const QString& path, const QVariantMap& changes)
+{
+    for (int i = 0; i < m_impl->detections.size(); ++i) {
+        QVariantMap m = m_impl->detections.at(i).toMap();
+        if (m.value(QStringLiteral("path")).toString() != path) continue;
+        for (auto it = changes.cbegin(); it != changes.cend(); ++it) {
+            m.insert(it.key(), it.value());
+        }
+        m_impl->detections[i] = m;
+        emit detectionsChanged();
+        return true;
+    }
+    return false;
+}
+
+void ScanViewModel::quarantineDetection(const QString& path)
+{
+    if (m_impl->state != Completed || m_impl->scanId.isEmpty()) return;
+
+    // Guarded locally as well as by the service, so a double click sends one
+    // request rather than two that the service then has to refuse.
+    bool eligible = false;
+    for (const QVariant& v : m_impl->detections) {
+        const QVariantMap m = v.toMap();
+        if (m.value(QStringLiteral("path")).toString() != path) continue;
+        eligible = m.value(QStringLiteral("actionable")).toBool() &&
+                   !m.value(QStringLiteral("quarantined")).toBool() &&
+                   !m.value(QStringLiteral("pending")).toBool();
+        break;
+    }
+    if (!eligible) return;
+
+    (void)updateDetection(path, {{QStringLiteral("pending"), true}});
+
+    // Quarantine hashes, encrypts and moves the file, and may have to stop the
+    // process holding it, so the default five-second budget is too short for a
+    // large file. Sixty seconds bounds a stuck service without failing real work.
+    (void)PipeClient::Instance().SendAndExpect(
+        CommandType::QuarantineDetection,
+        QJsonObject{
+            {QLatin1String("scanId"), m_impl->scanId},
+            {QLatin1String("path"),   path}},
+        [self = QPointer<ScanViewModel>(this), path](const Response& r) {
+            if (!self) return;
+            QVariantMap changes{{QStringLiteral("pending"), false}};
+            if (r.ok) changes.insert(QStringLiteral("quarantined"), true);
+            (void)self->updateDetection(path, changes);
+            emit self->detectionActionFinished(
+                path, r.ok,
+                r.ok ? QStringLiteral("ok") : r.errorCode,
+                r.ok ? QString{} : r.errorMessage);
+        },
+        std::chrono::milliseconds{60000});
 }
 
 } // namespace ShadowStrike::PhantomHome::UI::ViewModels

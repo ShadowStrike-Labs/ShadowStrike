@@ -74,6 +74,8 @@
 // PhantomCore subsystems
 #include "../Core/Engine/ScanEngine.hpp"
 #include "../Core/Engine/QuarantineManager.hpp"
+#include "../Utils/HashUtils.hpp"
+#include "ScanDetections.hpp"
 #include "../Config/ConfigManager.hpp"
 #include "../Utils/Logger.hpp"
 
@@ -82,6 +84,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <future>
 #include <map>
 #include <mutex>
@@ -416,6 +419,26 @@ struct HomeIpcDispatcher::Impl {
         std::string           stateStr{"running"};
         std::wstring          currentPath;
         std::future<DirectoryScanResult> future;
+
+        //
+        // WHAT THE SCAN FOUND, kept so the user can act on it.
+        //
+        // The watcher used to read the DirectoryScanResult for its statistics
+        // and destroy it, so a scan could report "3 threats found" and nothing
+        // in the product could say which three. Guarded by stateMutex, and
+        // written BEFORE stateStr becomes "completed" under the same lock, so a
+        // poll that sees the terminal state always sees the list with it.
+        //
+        std::vector<ScanDetections::Detection> detections;
+        std::size_t           detectionsOmitted{0};
+
+        // Start order, for retention. Assigned by AddScan.
+        std::uint64_t         sequence{0};
+
+        // Set when the watcher has taken the result and will touch nothing
+        // more. Only a finished record may be discarded, and only a finished
+        // one may be acted on.
+        std::atomic<bool>     finished{false};
     };
 
     mutable std::shared_mutex                             scanMutex;
@@ -426,9 +449,35 @@ struct HomeIpcDispatcher::Impl {
         return "scan-" + std::to_string(++scanIdCounter);
     }
 
+    std::atomic<std::uint64_t>                           scanSequence{0};
+
+    // BOUNDED. Records were never removed, so the registry grew by one per scan
+    // for the life of the service. That was small while a record held
+    // counters; with a detection list attached it is not. The oldest FINISHED
+    // records go first; a running scan is never discarded, because its own
+    // progress poll would then answer "not found" mid-scan.
     void AddScan(std::shared_ptr<ScanRecord> rec) {
         std::unique_lock<std::shared_mutex> lk(scanMutex);
+        rec->sequence = ++scanSequence;
         activeScans[rec->scanId] = std::move(rec);
+
+        std::vector<ScanDetections::RetentionEntry> entries;
+        entries.reserve(activeScans.size());
+        for (const auto& kv : activeScans) {
+            entries.push_back({kv.second->sequence,
+                               kv.second->finished.load(std::memory_order_acquire)});
+        }
+        const auto evict = ScanDetections::SelectEvictions(std::move(entries));
+        if (evict.empty()) {
+            return;
+        }
+        for (auto it = activeScans.begin(); it != activeScans.end();) {
+            if (std::find(evict.begin(), evict.end(), it->second->sequence) != evict.end()) {
+                it = activeScans.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     [[nodiscard]] std::shared_ptr<ScanRecord> FindScan(const std::string& id) const {
@@ -1191,13 +1240,21 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         // reference to the service in a DETACHED thread that may outlive it.
         std::thread([impl, localId = scanId]() mutable {
             auto r = impl->FindScan(localId);
-            if (!r || !r->future.valid()) return;
+            if (!r) return;
+            if (!r->future.valid()) {
+                // Nothing will ever be collected, so the record is finished now;
+                // otherwise it could never be discarded.
+                r->finished.store(true, std::memory_order_release);
+                return;
+            }
 
             std::uint64_t infected = 0;
             bool failed = false;
+            ScanDetections::Collected collected;
             try {
                 const DirectoryScanResult out = r->future.get();
                 infected = out.statistics.filesInfected;
+                collected = ScanDetections::Collect(out.results);
             } catch (const std::exception& ex) {
                 // std::async re-throws the task's exception from get(). This
                 // thread is detached, so letting one escape would terminate the
@@ -1219,6 +1276,10 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             r->threatsFound.store(infected, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(r->stateMutex);
+                // The list first, the state second, under one lock: a poll that
+                // observes "completed" is guaranteed to observe the detections.
+                r->detections        = std::move(collected.items);
+                r->detectionsOmitted = collected.omitted;
                 r->stateStr = failed ? "failed" : "completed";
             }
             r->percent.store(100.0f, std::memory_order_relaxed);
@@ -1286,6 +1347,8 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
                 entry.duration_ms   = elapsed;
                 HomeReportsStore::Instance().Record(std::move(entry));
             }
+
+            r->finished.store(true, std::memory_order_release);
         }).detach();
 
         nlohmann::json resp{{"ok", true}, {"scanId", scanId}};
@@ -1362,6 +1425,8 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         std::string state, currentPath, scanScope;
         std::vector<std::string> scanTargets;
         std::size_t scanTargetCount = 0;
+        nlohmann::json detections = nlohmann::json::array();
+        std::size_t detectionsOmitted = 0;
         {
             std::lock_guard<std::mutex> lk(r->stateMutex);
             state = r->stateStr;
@@ -1369,6 +1434,16 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             scanScope = r->scope;
             scanTargets = r->targets;
             scanTargetCount = r->targetCount;
+            for (const auto& d : r->detections) {
+                detections.push_back({
+                    {"path",            WideToNarrow(d.path)},
+                    {"threatName",      d.threatName},
+                    {"detectionSource", d.detectionSource},
+                    {"quarantined",     d.quarantined},
+                    {"actionable",      d.Actionable()}
+                });
+            }
+            detectionsOmitted = r->detectionsOmitted;
         }
 
         // EVERY FIELD HERE HAS A PRODUCER, which is why totalBytes is not
@@ -1394,7 +1469,12 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             {"bytesPerSecond",
                              r->bytesPerSecond.load(std::memory_order_relaxed)},
             {"threatsFound", r->threatsFound.load(std::memory_order_relaxed)},
-            {"currentPath",  currentPath}
+            {"currentPath",  currentPath},
+            // EMPTY UNTIL THE SCAN FINISHES, and the omitted count says when the
+            // list was capped, so a client never presents a partial list as the
+            // whole one. threatsFound remains the authoritative count.
+            {"detections",        std::move(detections)},
+            {"detectionsOmitted", detectionsOmitted}
         };
         svc.SendResponseEnvelope(clientId, CommandType::GetScanProgress, requestId, resp.dump());
     });
@@ -1454,6 +1534,173 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
         if (hasMore) resp["nextOffset"] = end;
         svc.SendResponseEnvelope(clientId, CommandType::ListQuarantine, requestId,
             resp.dump());
+    });
+
+    // ==========================================================================
+    // 232 - QuarantineDetection
+    // ==========================================================================
+    //
+    // A SCAN FOUND A THREAT AND THE USER COULD NOT ACT ON IT. This is the action.
+    //
+    // IT IS NOT A "QUARANTINE ANY PATH" COMMAND, and three checks keep it from
+    // becoming one:
+    //
+    //   1. The path must be one the cited scan REPORTED. Anything else is refused
+    //      before QuarantineManager is reached, so an authenticated client cannot
+    //      use this to remove an arbitrary file.
+    //   2. The file is RE-HASHED and must still be the content that was convicted.
+    //      A file replaced or cleaned since the scan is refused with
+    //      content_changed rather than removed on the strength of a verdict about
+    //      something else.
+    //   3. QuarantineRequest::force is NEVER set. It bypasses the system-file
+    //      protection, and nothing a client sends can reach it.
+    //
+    // Only Infected results are listed, matching threatsFound, so a heuristic hit
+    // is never presented to the user as quarantinable malware.
+    //
+    svc.RegisterV2Handler(CommandType::QuarantineDetection,
+        [&svc, impl, CheckAuth, ParseOrReject](std::uint64_t clientId, std::uint32_t,
+                                                std::uint64_t requestId, std::string_view raw)
+    {
+        constexpr CommandType kVerb = CommandType::QuarantineDetection;
+        if (CheckAuth(clientId, requestId, kVerb)) return;
+
+        auto j = ParseOrReject(clientId, requestId, kVerb, raw);
+        if (j.is_discarded()) return;
+
+        const auto Refuse = [&svc, clientId, requestId](std::string_view code,
+                                                        std::string_view message) {
+            svc.SendResponseEnvelope(clientId, CommandType::QuarantineDetection, requestId,
+                MakeErrorResponse(code, message).dump());
+        };
+
+        const auto scanId = Field<std::string>(j, "scanId");
+        const auto pathU8 = Field<std::string>(j, "path");
+        if (!scanId || !pathU8 || pathU8->empty()) {
+            Refuse("missing_field", "scanId and path are required");
+            return;
+        }
+
+        auto r = impl->FindScan(*scanId);
+        if (!r) {
+            Refuse("not_found", "Scan not found");
+            return;
+        }
+
+        const std::wstring requested = NarrowToWide(*pathU8);
+
+        // CLAIM the entry under the record's lock, and copy what is needed out of
+        // it, so the slow work below - hashing and quarantining - runs without the
+        // lock held and a second request for the same file is refused rather than
+        // run twice.
+        std::wstring path;
+        std::string  expectedSha256, threatName, detectionSource;
+        const char*  refusal = nullptr;
+        const char*  refusalMessage = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(r->stateMutex);
+            ScanDetections::Detection* d = nullptr;
+            if (!r->finished.load(std::memory_order_acquire) || r->stateStr != "completed") {
+                refusal = "scan_not_completed";
+                refusalMessage = "Only a completed scan's detections can be quarantined";
+            } else if ((d = ScanDetections::Find(r->detections, requested)) == nullptr) {
+                refusal = "not_in_scan";
+                refusalMessage = "This file is not a detection of the cited scan";
+            } else if (d->quarantined) {
+                refusal = "already_quarantined";
+                refusalMessage = "This detection has already been quarantined";
+            } else if (d->inProgress) {
+                refusal = "in_progress";
+                refusalMessage = "This detection is already being quarantined";
+            } else if (!d->Actionable()) {
+                refusal = "not_actionable";
+                refusalMessage = "This detection carries no fingerprint that can be re-verified";
+            } else {
+                d->inProgress   = true;
+                path            = d->path;
+                expectedSha256  = d->sha256;
+                threatName      = d->threatName;
+                detectionSource = d->detectionSource;
+            }
+        }
+        if (refusal != nullptr) {
+            Refuse(refusal, refusalMessage);
+            return;
+        }
+
+        // Every exit from here releases the claim, recording whether it worked.
+        const auto Release = [r, &requested](bool quarantined) {
+            std::lock_guard<std::mutex> lk(r->stateMutex);
+            if (auto* d = ScanDetections::Find(r->detections, requested)) {
+                d->inProgress = false;
+                d->quarantined = d->quarantined || quarantined;
+            }
+        };
+
+        // RE-VERIFY THE CONTENT. The verdict is about the bytes that were scanned,
+        // not about whatever is at this path now.
+        std::vector<std::uint8_t> digest;
+        Utils::HashUtils::Error hashErr{};
+        if (!Utils::HashUtils::ComputeFile(Utils::HashUtils::Algorithm::SHA256,
+                                           path, digest, &hashErr)) {
+            Release(false);
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec)) {
+                Refuse("file_not_found", "The file is no longer at this location");
+            } else {
+                Refuse("unreadable", "The file could not be read to confirm it is unchanged");
+            }
+            return;
+        }
+        const std::string actualSha256 = Utils::HashUtils::ToHexLower(digest);
+        if (actualSha256.size() != expectedSha256.size() ||
+            !std::equal(actualSha256.begin(), actualSha256.end(), expectedSha256.begin(),
+                        [](char a, char b) {
+                            return (a | 0x20) == (b | 0x20);
+                        })) {
+            Release(false);
+            SS_LOG_WARN(kLogCat,
+                L"QuarantineDetection refused: '%ls' changed since scan %hs",
+                path.c_str(), scanId->c_str());
+            Refuse("content_changed",
+                   "The file has changed since it was scanned. Scan it again first.");
+            return;
+        }
+
+        QuarantineRequest req;
+        req.filePath        = path;
+        req.threatName      = NarrowToWide(threatName);
+        req.detectionSource = NarrowToWide(detectionSource);
+        // req.force stays false. It bypasses the system-file protection.
+
+        QuarantineResult qr{};
+        try {
+            qr = QuarantineManager::Instance().QuarantineFile(req);
+        } catch (const std::exception& ex) {
+            Release(false);
+            SS_LOG_ERROR(kLogCat, L"QuarantineDetection: QuarantineFile threw: %hs", ex.what());
+            Refuse("quarantine_failed", "Quarantine failed unexpectedly");
+            return;
+        }
+
+        if (!qr.IsSuccess()) {
+            Release(false);
+            SS_LOG_WARN(kLogCat, L"QuarantineDetection: '%ls' not quarantined (%hs): %ls",
+                path.c_str(), ScanDetections::QuarantineOutcomeCode(qr.status),
+                qr.message.c_str());
+            Refuse(ScanDetections::QuarantineOutcomeCode(qr.status), WideToNarrow(qr.message));
+            return;
+        }
+
+        Release(true);
+        SS_LOG_INFO(kLogCat, L"QuarantineDetection: '%ls' quarantined as entry %llu (scan %hs)",
+            path.c_str(), qr.entryId, scanId->c_str());
+        nlohmann::json resp{
+            {"ok",             true},
+            {"entryId",        std::to_string(qr.entryId)},
+            {"rebootRequired", qr.rebootRequired}
+        };
+        svc.SendResponseEnvelope(clientId, kVerb, requestId, resp.dump());
     });
 
     // ==========================================================================
@@ -2051,6 +2298,7 @@ void HomeIpcDispatcher::Uninstall(ServiceCommunicator& svc) {
         CommandType::GetScanProgress,
         CommandType::ListQuarantine,
         CommandType::QuarantineAction,
+        CommandType::QuarantineDetection,
         CommandType::GetReports,
         CommandType::ListPGTIFeeds,
         CommandType::SetPGTIFeedEnabled,

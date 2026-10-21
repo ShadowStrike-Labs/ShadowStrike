@@ -163,6 +163,7 @@ SCAN_ENGINE_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
 QUARANTINE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Core/Engine/QuarantineManager.cpp"
 PROCESS_KILLER_CPP_PATH = ROOT / "src/PhantomCore/Core/Process/ProcessKiller.cpp"
 SERVICE_MANAGER_CPP_PATH = ROOT / "src/PhantomCore/Core/System/ServiceManager.cpp"
+SERVICE_COMMUNICATOR_HPP_PATH = ROOT / "src/PhantomCore/Service/ServiceCommunicator.hpp"
 DNS_LEAK_PROTECTION_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Privacy/DNSLeakProtection.cpp"
 RECOMMENDATIONS_ENGINE_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Recommendations/RecommendationsEngine.cpp"
 ATTACHMENT_SCANNER_CPP_PATH = ROOT / "src/Products/Community/PhantomHome/Email/AttachmentScanner.cpp"
@@ -27710,6 +27711,101 @@ class BYOVDIdentificationOrderContractTests(unittest.TestCase):
                 "the lookup is no longer guarded by " + guard + ". Calling into an "
                 "uninitialised detector to decide whether a kernel driver is "
                 "vulnerable would fault inside a service enumeration.")
+
+
+class QuarantineDetectionVerbContractTests(unittest.TestCase):
+    """The verb that lets a user act on a scan result must not be a general
+    "quarantine any file" command.
+
+    QuarantineDetection (232) takes a scan id and a path from an authenticated UI
+    client. Four properties keep it narrow, and each is held here because losing
+    any one of them turns a user action into a primitive:
+
+      1. authentication is checked before anything else;
+      2. the path must be one the cited scan REPORTED, checked before
+         QuarantineManager is reached;
+      3. the file is RE-HASHED and must still be the convicted content, also
+         before QuarantineManager is reached; and
+      4. QuarantineRequest::force is never set - it bypasses the system-file
+         protection, and nothing a client sends may reach it.
+
+    The watcher ordering is held too: the detection list is written before the
+    state becomes "completed", under one lock, so a poll that sees the terminal
+    state always sees the list with it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(HOME_IPC_DISPATCHER_CPP_PATH))
+        start = cls.src.find("RegisterV2Handler(CommandType::QuarantineDetection,")
+        cls.body = ""
+        if start != -1:
+            end = cls.src.find("svc.RegisterV2Handler(", start + 10)
+            cls.body = cls.src[start:end if end != -1 else start + 12000]
+
+    def test_the_verb_is_registered_and_has_a_body(self):
+        self.assertTrue(
+            self.body,
+            "QuarantineDetection is no longer registered. A scan that finds a threat "
+            "again leaves the user with no way to act on it.")
+
+    def test_authentication_is_the_first_check(self):
+        first_call = re.search(r"\{\s*constexpr\s+CommandType\s+kVerb[^;]*;\s*if\s*\(\s*(\w+)\s*\(",
+                               self.body)
+        self.assertIsNotNone(first_call, "the handler no longer opens with its verb constant.")
+        self.assertEqual(
+            first_call.group(1), "CheckAuth",
+            "something now runs before CheckAuth in QuarantineDetection. CheckAuth is "
+            "per-handler, so a handler that does not call it first is reachable "
+            "without authentication.")
+
+    def test_the_path_must_be_one_the_scan_reported(self):
+        # The REFUSAL form specifically. The same lookup also appears in the claim
+        # release helper, so matching the bare call would pass with the check gone.
+        found = re.search(r"\(\s*d\s*=\s*ScanDetections::Find\(\s*r->detections\s*,\s*requested\s*\)\s*\)\s*==\s*nullptr",
+                          self.body)
+        scope = found.start() if found else -1
+        act = self.body.find("QuarantineFile(")
+        self.assertNotEqual(scope, -1,
+            "the handler no longer checks that the path is one of the cited scan's "
+            "detections, so it would quarantine any path a client sends.")
+        self.assertNotEqual(act, -1, "the handler no longer quarantines anything.")
+        self.assertLess(scope, act,
+            "the scope check runs after QuarantineManager is reached, which is too late.")
+
+    def test_the_content_is_reverified_before_acting(self):
+        rehash = self.body.find("HashUtils::ComputeFile(")
+        act = self.body.find("QuarantineFile(")
+        self.assertNotEqual(rehash, -1,
+            "the file is no longer re-hashed, so a file replaced or cleaned since the "
+            "scan would be removed on the strength of a verdict about other bytes.")
+        self.assertLess(rehash, act, "the re-hash runs after the quarantine.")
+        self.assertIn('"content_changed"', self.body,
+            "a changed file is no longer refused with its own code.")
+
+    def test_force_is_never_set(self):
+        self.assertIsNone(
+            re.search(r"\.force\s*=", self.body),
+            "QuarantineDetection sets QuarantineRequest::force. That bypasses the "
+            "system-file protection, so a client could quarantine a file the machine "
+            "cannot boot without.")
+        self.assertNotIn('"force"', self.body,
+            "the handler reads a force field from the request.")
+
+    def test_the_list_is_published_before_the_terminal_state(self):
+        lst = self.src.find("r->detections        = std::move(collected.items);")
+        state = self.src.find('r->stateStr = failed ? "failed" : "completed";')
+        self.assertNotEqual(lst, -1, "the watcher no longer keeps the detections.")
+        self.assertNotEqual(state, -1, "the watcher no longer sets the terminal state.")
+        self.assertLess(lst, state,
+            "the state becomes completed before the detection list is written, so a "
+            "poll can see a finished scan with no detections and show it as clean.")
+
+    def test_the_wire_code_is_pinned(self):
+        hpp = strip_c_comments(read_source(SERVICE_COMMUNICATOR_HPP_PATH))
+        self.assertRegex(hpp, r"QuarantineDetection\s*=\s*232\s*,",
+            "QuarantineDetection is no longer 232. The UI and the service would "
+            "disagree about which verb a message is.")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

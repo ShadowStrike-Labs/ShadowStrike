@@ -339,6 +339,30 @@ PageHost {
     ///
     /// scanChipState below already treated 5 as "critical", so the file
     /// disagreed with itself about whether a failure was distinguishable.
+    /// Why a quarantine did not happen, in the user's terms. The service's code
+    /// is stable; its message is a fallback for codes this page does not know.
+    function quarantineFailureText(code, message) {
+        switch (code) {
+        case "content_changed":
+            return qsTr("The file has changed since it was scanned. Scan it again before quarantining it.")
+        case "file_not_found":
+            return qsTr("The file is no longer at that location.")
+        case "file_in_use":
+            return qsTr("The file is in use. Close the program using it and try again.")
+        case "system_file_protected":
+            return qsTr("This is a protected Windows file and cannot be quarantined.")
+        case "access_denied":
+            return qsTr("Access to the file was denied.")
+        case "reboot_required":
+            return qsTr("The file will be removed when the computer restarts.")
+        case "already_quarantined":
+            return qsTr("This file is already in quarantine.")
+        default:
+            return (message && message.length > 0)
+                   ? message : qsTr("The file could not be quarantined.")
+        }
+    }
+
     function scanStateStr(st) {
         if (st === 1 || st === 2 || st === 3) return "running"
         if (st === 4)                         return "complete"
@@ -802,6 +826,152 @@ PageHost {
                         }
                     }
 
+                    // WHAT THE SCAN FOUND, with the action beside each file.
+                    //
+                    // A scan used to report a count and nothing else, so a user told
+                    // "3 threats found" could not see or remove them. Only confirmed
+                    // detections appear here; the service refuses any file a scan did
+                    // not report, and any file that has changed since it was scanned.
+                    Column {
+                        id:      detectionList
+                        width:   parent.width
+                        spacing: Theme.spacingXS
+                        visible: typeof scanViewModel !== "undefined" &&
+                                 scanViewModel.state === 4 &&
+                                 scanViewModel.detections.length > 0
+
+                        property string statusText: ""
+
+                        Connections {
+                            target: (typeof scanViewModel !== "undefined") ? scanViewModel : null
+                            function onDetectionActionFinished(path, ok, code, message) {
+                                detectionList.statusText = ok
+                                    ? "" : root.quarantineFailureText(code, message)
+                            }
+                            function onDetectionsChanged() {
+                                if (scanViewModel.detections.length === 0)
+                                    detectionList.statusText = ""
+                            }
+                        }
+
+                        Text {
+                            text:           qsTr("Detected files")
+                            color:          Theme.textPrimary
+                            font.family:    Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeBody
+                            font.weight:    Theme.fontWeightBold
+                            Accessible.role: Accessible.Heading
+                            Accessible.name: text
+                        }
+
+                        Repeater {
+                            model: (typeof scanViewModel !== "undefined")
+                                   ? scanViewModel.detections : []
+
+                            delegate: Rectangle {
+                                id:     detectionRow
+                                required property var modelData
+
+                                width:        detectionList.width
+                                height:       56
+                                radius:       Theme.radiusMedium
+                                color:        Theme.bgSurface
+                                border.color: Theme.strokeSubtle
+                                border.width: 1
+
+                                Accessible.role: Accessible.ListItem
+                                Accessible.name: qsTr("%1, %2")
+                                                 .arg(detectionRow.modelData.threatName)
+                                                 .arg(detectionRow.modelData.path)
+
+                                Column {
+                                    anchors.left:           parent.left
+                                    anchors.leftMargin:     Theme.spacingS
+                                    anchors.right:          detectionAction.left
+                                    anchors.rightMargin:    Theme.spacingS
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 2
+
+                                    Text {
+                                        width:          parent.width
+                                        text:           detectionRow.modelData.threatName
+                                        color:          Theme.crit
+                                        font.family:    Theme.fontFamily
+                                        font.pixelSize: Theme.fontSizeLabel
+                                        font.weight:    Theme.fontWeightBold
+                                        elide:          Text.ElideRight
+                                    }
+                                    Text {
+                                        width:          parent.width
+                                        text:           detectionRow.modelData.path
+                                        color:          Theme.textMuted
+                                        font.family:    Theme.fontFamily
+                                        font.pixelSize: Theme.fontSizeMicro
+                                        elide:          Text.ElideMiddle
+                                    }
+                                }
+
+                                Item {
+                                    id:     detectionAction
+                                    width:  150
+                                    height: Theme.controlHeight
+                                    anchors.right:          parent.right
+                                    anchors.rightMargin:    Theme.spacingS
+                                    anchors.verticalCenter: parent.verticalCenter
+
+                                    PrimaryButton {
+                                        anchors.fill: parent
+                                        visible: detectionRow.modelData.actionable &&
+                                                 !detectionRow.modelData.quarantined
+                                        enabled: !detectionRow.modelData.pending
+                                        busy:    detectionRow.modelData.pending
+                                        text:    detectionRow.modelData.pending
+                                                 ? qsTr("Quarantining") : qsTr("Quarantine")
+                                        accessibleName: qsTr("Quarantine %1")
+                                                        .arg(detectionRow.modelData.path)
+                                        onClicked: scanViewModel.quarantineDetection(
+                                                       detectionRow.modelData.path)
+                                    }
+
+                                    // Stated, not hidden: a detection that cannot be
+                                    // re-verified is shown so the user knows it exists.
+                                    Text {
+                                        anchors.centerIn: parent
+                                        visible: detectionRow.modelData.quarantined ||
+                                                 !detectionRow.modelData.actionable
+                                        text:    detectionRow.modelData.quarantined
+                                                 ? qsTr("Quarantined")
+                                                 : qsTr("Cannot be verified")
+                                        color:   detectionRow.modelData.quarantined
+                                                 ? Theme.ok : Theme.textSecondary
+                                        font.family:    Theme.fontFamily
+                                        font.pixelSize: Theme.fontSizeLabel
+                                    }
+                                }
+                            }
+                        }
+
+                        // The list is capped; the count above it is not. Say so.
+                        Text {
+                            visible: typeof scanViewModel !== "undefined" &&
+                                     scanViewModel.detectionsOmitted > 0
+                            text:    qsTr("%1 more detection(s) not listed.")
+                                     .arg(scanViewModel.detectionsOmitted)
+                            color:          Theme.textSecondary
+                            font.family:    Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeLabel
+                        }
+
+                        Text {
+                            visible:        detectionList.statusText !== ""
+                            text:           detectionList.statusText
+                            color:          Theme.warn
+                            font.family:    Theme.fontFamily
+                            font.pixelSize: Theme.fontSizeLabel
+                            wrapMode:       Text.WordWrap
+                            width:          parent.width
+                        }
+                    }
                     Row {
                         spacing: Theme.spacingS
 

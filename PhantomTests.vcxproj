@@ -733,6 +733,7 @@
     <!-- tests\unit\service_unit -->
     <ClCompile Include="tests\unit\service_unit\AntivirusService_Tests.cpp" />
     <ClCompile Include="tests\unit\service_unit\ServiceCommunicator_Tests.cpp" />
+    <ClCompile Include="tests\unit\service_unit\ScanDetections_Tests.cpp" />
     <ClCompile Include="tests\unit\service_unit\ServiceController_Tests.cpp" />
     <ClCompile Include="tests\unit\service_unit\ServiceInstaller_Tests.cpp" />
     <ClCompile Include="tests\unit\service_unit\ServiceMonitor_Tests.cpp" />
