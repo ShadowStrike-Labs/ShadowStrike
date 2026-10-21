@@ -667,7 +667,7 @@ wrong for co.uk and every other multi-label suffix.
     Copy-Item $pslSource (Join-Path $stagingPslDir 'public_suffix_list.dat') -Force
     $pslVersion = (Select-String -Path $pslSource -Pattern '^// VERSION:' |
                    Select-Object -First 1).Line
-    Say ("  staged Public Suffix List: {0} bytes, {1}" -f `
+    Log ("  staged Public Suffix List: {0} bytes, {1}" -f `
         (Get-Item (Join-Path $stagingPslDir 'public_suffix_list.dat')).Length, $pslVersion)
 
     # Report what is actually going into the MSI, decoded from the database header
