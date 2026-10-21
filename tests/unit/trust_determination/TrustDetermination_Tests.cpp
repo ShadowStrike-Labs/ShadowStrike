@@ -262,9 +262,40 @@ namespace {
     // ------------------------------------------------------------------------
     // Catalog only. These carry NO embedded signature at all.
     // ------------------------------------------------------------------------
-    // urlmon.dll is the file the field run tried to quarantine five times.
+    //
+    // THE FILE IS CHOSEN AT RUN TIME, from candidates, because Windows moves
+    // binaries between the two forms. urlmon.dll was catalog-only when this suite
+    // was written and is embedded-signed from build 26200.9711; the premise check
+    // below caught it, which is the check working. Pinning one name means the
+    // suite breaks on every such update, so the first candidate that is ACTUALLY
+    // catalog-only on this host is used. usbmon.dll is excluded here because the
+    // second case already covers it, and two distinct files are the point.
+    //
+    // Measured catalog-only on 26200.9711: usbmon.dll, mshtml.dll, ieframe.dll,
+    // winspool.drv, uxtheme.dll, notepad.exe, calc.exe, cmd.exe, regedit.exe.
+    [[nodiscard]] std::wstring FirstCatalogOnlySystemFile() {
+        for (const wchar_t* leaf : {L"mshtml.dll", L"ieframe.dll", L"uxtheme.dll",
+                                    L"winspool.drv", L"notepad.exe", L"calc.exe",
+                                    L"regedit.exe", L"urlmon.dll"}) {
+            const std::wstring path = SystemFile(leaf);
+            if (path.empty() ||
+                ::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                continue;
+            }
+            if (ReadEmbeddedSignaturePresence(path) == EmbeddedSignature::Absent) {
+                return std::wstring(leaf);
+            }
+        }
+        return {};
+    }
+
     TEST_F(TrustDeterminationTest, CatalogOnlySystemBinaryIsRecognisedAsMicrosoftSigned) {
-        ExpectRecognisedAsMicrosoftSigned(L"urlmon.dll", EmbeddedSignature::Absent,
+        const std::wstring leaf = FirstCatalogOnlySystemFile();
+        ASSERT_FALSE(leaf.empty())
+            << "No catalog-only binary from the candidate list exists on this host, "
+               "so the catalog path is uncovered. Measure the host and extend the list "
+               "rather than dropping the case.";
+        ExpectRecognisedAsMicrosoftSigned(leaf.c_str(), EmbeddedSignature::Absent,
                                           "catalog-only");
     }
 
@@ -274,6 +305,21 @@ namespace {
                                           "catalog-only");
     }
 
+    // urlmon.dll is the file the field run tried to quarantine five times. It is
+    // kept as its own case, in WHICHEVER form this host ships it, because the
+    // regression it records is about this file being recognised at all - and the
+    // form-specific coverage now comes from the cases above.
+    TEST_F(TrustDeterminationTest, FieldConvictedUrlmonIsRecognisedInWhicheverFormItShips) {
+        const std::wstring path = SystemFile(L"urlmon.dll");
+        ASSERT_FALSE(path.empty());
+        const EmbeddedSignature form = ReadEmbeddedSignaturePresence(path);
+        ASSERT_NE(EmbeddedSignature::Unreadable, form)
+            << "Could not read urlmon.dll's certificate directory.";
+        ExpectRecognisedAsMicrosoftSigned(
+            L"urlmon.dll", form,
+            form == EmbeddedSignature::Present ? "embedded-signed" : "catalog-only");
+    }
+
     // ------------------------------------------------------------------------
     // The premise itself, asserted once so the suite cannot quietly become
     // vacuous. If no catalog-only system binary can be found, the two cases
@@ -281,19 +327,17 @@ namespace {
     // ------------------------------------------------------------------------
     TEST_F(TrustDeterminationTest, BothSigningFormsArePresentOnThisHostSoBothPathsAreCovered) {
         const std::wstring embedded = SystemFile(L"kernel32.dll");
-        const std::wstring catalog = SystemFile(L"urlmon.dll");
         ASSERT_FALSE(embedded.empty());
-        ASSERT_FALSE(catalog.empty());
 
         EXPECT_EQ(EmbeddedSignature::Present, ReadEmbeddedSignaturePresence(embedded))
             << "kernel32.dll has no embedded signature on this host, so the "
                "embedded-signature cases are skipping and that path is uncovered.";
 
-        EXPECT_EQ(EmbeddedSignature::Absent, ReadEmbeddedSignaturePresence(catalog))
-            << "urlmon.dll now carries an embedded signature on this host, so the "
-               "catalog-only cases are skipping and the catalog path - which is how "
-               "Windows vouches for a large share of system binaries - is uncovered. "
-               "Find another catalog-only binary rather than dropping the coverage.";
+        EXPECT_FALSE(FirstCatalogOnlySystemFile().empty())
+            << "No catalog-only binary from the candidate list exists on this host, "
+               "so the catalog path - which is how Windows vouches for a large share "
+               "of system binaries - is uncovered. Find another catalog-only binary "
+               "rather than dropping the coverage.";
     }
 
     // ------------------------------------------------------------------------
