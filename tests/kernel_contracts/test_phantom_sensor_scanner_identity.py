@@ -27868,6 +27868,46 @@ class InstallerUninstallActionContractTests(unittest.TestCase):
             "the action must run before RemoveFiles, while DriverResume.exe is still "
             "on disk, and after StopServices, so the service has released the driver.")
 
+class UiAuthNotReadyIsRetriedTests(unittest.TestCase):
+    """The UI must retry an auth_not_ready reply, not treat it as a rejection.
+
+    The service reports RUNNING before the session token exists and answers a
+    handshake in that window with auth_not_ready / retryable=true. Treating it as
+    fatal left the 1.0.114 dashboard on "Service authentication failed" for the
+    whole session.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = read_source(ROOT / "src/Products/Community/PhantomHome/UI/Client/IPC/PipeClient.cpp")
+        start = src.find("bool PipeClient::Impl::PerformAuth(")
+        end = src.find("bool PipeClient::Impl::RunIoLoop(", start)
+        cls.body = src[start:end] if start != -1 and end != -1 else ""
+
+    def test_perform_auth_is_found(self):
+        self.assertTrue(self.body, "PipeClient::Impl::PerformAuth was not found.")
+
+    def test_retryable_reply_returns_before_the_fatal_transition(self):
+        okcheck = self.body.find('GetField<bool>(maybeEnv->payload, "ok")')
+        self.assertNotEqual(okcheck, -1, "the ok=false branch is gone.")
+        branch = self.body[okcheck:]
+        retry = branch.find("if (retryable)")
+        fatal = branch.find("TransitionState(PipeClientState::Fatal")
+        self.assertNotEqual(retry, -1,
+            "the ok=false branch no longer distinguishes a retryable refusal.")
+        self.assertNotEqual(fatal, -1, "the genuine-rejection path is gone.")
+        self.assertLess(retry, fatal,
+            "the retryable check must run before the Fatal transition.")
+        block = branch[retry:fatal]
+        self.assertIn("return false;", block,
+            "a retryable refusal must return to the reconnect loop.")
+        self.assertNotIn("PipeClientState::Fatal", block)
+
+    def test_both_service_markers_are_honoured(self):
+        self.assertIn('reason == "auth_not_ready"', self.body)
+        self.assertIn('GetField<bool>(maybeEnv->payload, "retryable")', self.body)
+
+
 class ReleaseLinksUseFullLtcgTests(unittest.TestCase):
     """Release binaries must not be linked with /LTCG:incremental.
 

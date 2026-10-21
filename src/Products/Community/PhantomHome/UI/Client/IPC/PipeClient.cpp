@@ -831,6 +831,28 @@ bool PipeClient::Impl::PerformAuth(HANDLE hPipe, std::stop_token stoken)
             auto r = GetField<std::string>(maybeEnv->payload.at("error"), "code");
             if (r.has_value()) reason = r.value();
         }
+
+        // NOT READY IS NOT REJECTED. The service reports RUNNING before the
+        // session token file exists (provisioning runs on a detached thread), so
+        // a UI launched at logon can connect into that gap. The service answers
+        // auth_not_ready with retryable=true and provisions the token itself.
+        // Treating that as fatal left the dashboard on "Service authentication
+        // failed" for the whole session, while the tray, which retries,
+        // connected two seconds later.
+        //
+        // Returning false WITHOUT the fatal state sends IoThreadProc into its
+        // capped reconnect backoff, which re-reads ui.token on the next attempt.
+        // A genuine rejection (bad token, unknown session) carries neither
+        // marker and still ends below as fatal.
+        const bool retryable =
+            reason == "auth_not_ready" ||
+            GetField<bool>(maybeEnv->payload, "retryable").value_or(false);
+        if (retryable) {
+            SS_LOG_WARN(kLog, L"Auth handshake not ready yet (%hs) - retrying.",
+                        reason.c_str());
+            return false;
+        }
+
         SS_LOG_ERROR(kLog, L"Auth handshake response: ok=false — %hs", reason.c_str());
         TransitionState(PipeClientState::Fatal, L"Auth rejected — ok=false");
         const QString qReason = QString::fromStdString(reason);
