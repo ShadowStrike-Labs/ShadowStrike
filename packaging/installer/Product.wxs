@@ -119,6 +119,33 @@
                     Execute="deferred"
                     Impersonate="no"
                     Return="ignore"/>
+    <!--
+      ExecDriverUninstall: the counterpart that did not exist.
+
+      DriverResume installs the PhantomSensor kernel service and writes the signing
+      certificate into LocalMachine\Root and TrustedPublisher. MSI owns neither, so
+      MSI's own removal leaves both behind: a registered kernel service pointing at
+      a deleted image, and a machine-wide CA trust grant for a product that is gone.
+      "uninstall" in DriverResume removes both; nothing called it.
+
+      After StopServices, so the user-mode service has released the driver first;
+      that is also before RemoveFiles, so DriverResume.exe still exists to run.
+
+      REMOVE~="ALL" so it runs on a real uninstall only, never on repair or a
+      feature change. NOT UPGRADINGPRODUCTCODE because during a major upgrade the
+      old product is removed by the new package, and tearing the driver down there
+      would unload the sensor the new version is about to keep using.
+
+      Return="ignore": failing to unregister must not abort an uninstall and leave
+      the product half-removed. DriverResume logs any failure with the manual
+      remediation step.
+    -->
+    <CustomAction Id="ExecDriverUninstall"
+                  FileRef="DriverResumeExe"
+                  ExeCommand="--uninstall"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore"/>
     <InstallExecuteSequence>
       <Custom Action="ExecInstallRootCert"
               Before="ExecDriverInstallStg1"
@@ -126,6 +153,9 @@
       <Custom Action="ExecDriverInstallStg1"
               Before="InstallFinalize"
               Condition="NOT Installed"/>
+      <Custom Action="ExecDriverUninstall"
+              After="StopServices"
+              Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE'/>
       <ScheduleReboot After="ExecDriverInstallStg1"
               Condition="NOT Installed"/>
     </InstallExecuteSequence>

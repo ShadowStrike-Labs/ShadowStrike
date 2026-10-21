@@ -27807,5 +27807,66 @@ class QuarantineDetectionVerbContractTests(unittest.TestCase):
             "QuarantineDetection is no longer 232. The UI and the service would "
             "disagree about which verb a message is.")
 
+
+class InstallerUninstallActionContractTests(unittest.TestCase):
+    """Uninstalling the product must take the driver and the trust grant with it.
+
+    DriverResume installs the PhantomSensor kernel service and writes the signing
+    certificate into LocalMachine Root and TrustedPublisher. MSI owns neither, so
+    without this action an uninstall left a registered kernel service pointing at
+    a deleted image and a machine-wide CA trust grant for a product that was gone.
+
+    Each property below has a specific failure if lost:
+      - not deferred / impersonated: runs as the user and cannot touch the SCM
+        or the machine certificate stores;
+      - Return="check": a cleanup failure would abort the uninstall half-done;
+      - no REMOVE~="ALL": it would fire on repair and unregister a working driver;
+      - no NOT UPGRADINGPRODUCTCODE: a major upgrade would unload the sensor the
+        new version is about to use;
+      - after RemoveFiles: DriverResume.exe would already be gone.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = read_source(INSTALLER_PRODUCT_WXS_PATH)
+        cls.src = re.sub(r"<!--.*?-->", "", src, flags=re.S)
+        m = re.search(r'<CustomAction\s+Id="ExecDriverUninstall"(.*?)/>', cls.src, re.S)
+        cls.action = m.group(1) if m else ""
+        m = re.search(r'<Custom\s+Action="ExecDriverUninstall"(.*?)/>', cls.src, re.S)
+        cls.sched = m.group(1) if m else ""
+
+    def test_the_action_exists_and_runs_the_uninstall_mode(self):
+        self.assertTrue(self.action,
+            "ExecDriverUninstall is gone, so uninstalling leaves the kernel service "
+            "and the certificate trust grant behind.")
+        self.assertIn('FileRef="DriverResumeExe"', self.action)
+        self.assertIn('ExeCommand="--uninstall"', self.action)
+
+    def test_it_runs_deferred_as_system(self):
+        self.assertIn('Execute="deferred"', self.action,
+            "an immediate action runs before the script and outside the transaction.")
+        self.assertIn('Impersonate="no"', self.action,
+            "an impersonated action runs as the user and cannot remove a kernel "
+            "service or a LocalMachine certificate.")
+
+    def test_a_cleanup_failure_does_not_abort_the_uninstall(self):
+        self.assertIn('Return="ignore"', self.action,
+            "a failing cleanup would roll back the uninstall and leave the product "
+            "half-removed.")
+
+    def test_it_is_scheduled_only_for_a_real_uninstall(self):
+        self.assertTrue(self.sched, "ExecDriverUninstall is not scheduled at all.")
+        self.assertRegex(self.sched, r'REMOVE~=(?:"|&quot;)ALL(?:"|&quot;)',
+            "without REMOVE~=\"ALL\" the action fires on repair or a feature change "
+            "and unregisters the driver of a working installation.")
+        self.assertIn("NOT UPGRADINGPRODUCTCODE", self.sched,
+            "without this, a major upgrade tears down the sensor the new version "
+            "is about to keep using.")
+
+    def test_it_runs_while_driverresume_still_exists(self):
+        self.assertRegex(self.sched, r'(After="StopServices"|Before="RemoveFiles")',
+            "the action must run before RemoveFiles, while DriverResume.exe is still "
+            "on disk, and after StopServices, so the service has released the driver.")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
