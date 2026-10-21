@@ -27868,5 +27868,31 @@ class InstallerUninstallActionContractTests(unittest.TestCase):
             "the action must run before RemoveFiles, while DriverResume.exe is still "
             "on disk, and after StopServices, so the service has released the driver.")
 
+class ReleaseLinksUseFullLtcgTests(unittest.TestCase):
+    """Release binaries must not be linked with /LTCG:incremental.
+
+    On 1.0.114 an incremental LTCG link kept a stale std::function adapter that
+    called the GetReports handler without its payload and crashed the service.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.targets = re.sub(r"<!--.*?-->", "", read_source(ROOT / "Directory.Build.targets"), flags=re.S)
+        cls.harness = read_source(ROOT / "tools/vm-harness/Invoke-PhantomDeploy.ps1")
+
+    def test_targets_select_full_ltcg_for_release(self):
+        self.assertRegex(self.targets,
+            r"<ItemDefinitionGroup\s+Condition=\"'\$\(Configuration\)' == 'Release'[^\"]*\">\s*"
+            r"<Link>\s*<LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>",
+            "Directory.Build.targets no longer forces full LTCG on Release links.")
+        self.assertNotIn("UseFastLinkTimeCodeGeneration", self.targets)
+
+    def test_deploy_refuses_incrementally_linked_binaries(self):
+        self.assertIn("-match '/LTCG:incremental'", self.harness,
+            "the deploy harness no longer checks how shipped binaries were linked.")
+        for proj in ("'Service'", "'UI'", "'Tray'", "'DriverResume'"):
+            self.assertIn(proj, self.harness)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

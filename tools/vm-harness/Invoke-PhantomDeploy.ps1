@@ -500,6 +500,22 @@ if (-not $SkipBuild) {
         /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /m /nologo /v:minimal
     if ($LASTEXITCODE -ne 0) { Die "DriverResume build failed" }
 
+    # Shipped binaries must come from a FULL link-time code generation pass.
+    # /LTCG:incremental reuses code from the previous link's .iobj, and on 1.0.114
+    # it kept a stale IPC handler adapter that dropped the request payload and
+    # crashed the service on every logon. Directory.Build.targets selects full
+    # LTCG for Release; this refuses to package anything that bypassed it.
+    foreach ($proj in @('Service','UI','Tray','DriverResume')) {
+        $tlog = Get-ChildItem (Join-Path $RepoRoot "build\Release\$proj") -Recurse -Filter 'link.command.1.tlog' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+        if (-not $tlog) { Die "No link record for $proj under build\Release\$proj; cannot confirm how it was linked." }
+        $linkCmd = [IO.File]::ReadAllText($tlog.FullName, [Text.Encoding]::Unicode)
+        if ($linkCmd -match '/LTCG:incremental') {
+            Die "$proj was linked with /LTCG:incremental. Release binaries must use full LTCG (Directory.Build.targets)."
+        }
+    }
+    Log "Link mode verified: full LTCG for service, UI, tray and DriverResume."
+
     Sync-QtRuntimeStaging
 
     # -- Sign C++ artifacts BEFORE they get embedded into the MSI. ---------

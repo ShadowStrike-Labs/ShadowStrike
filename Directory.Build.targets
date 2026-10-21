@@ -1,0 +1,27 @@
+<Project>
+  <!--
+    ShadowStrike solution-wide MSBuild overrides, applied after each project's own
+    settings.
+
+    Release builds link with FULL link-time code generation, never /LTCG:incremental.
+
+    Rationale: with WholeProgramOptimization on, the VC defaults select
+    UseFastLinkTimeCodeGeneration (/LTCG:incremental), which keeps code from the
+    previous link in a .iobj and regenerates only what it judges changed. On the
+    1.0.114 service it kept a stale std::function adapter for the GetReports IPC
+    handler after an edit to HomeIpcDispatcher.cpp renumbered its lambdas. The
+    adapter called the new handler without passing its std::string_view payload,
+    the handler read a garbage pointer from the empty stack slot, and the service
+    crashed (0xC0000005) on the UI's fifth request after every logon.
+
+    A full LTCG link of the same objects produced a correct adapter. Full LTCG
+    costs link time and nothing else, and shipped binaries must not depend on
+    the state of a previous link. tools/vm-harness/Invoke-PhantomDeploy.ps1
+    refuses to package a binary whose link record shows /LTCG:incremental.
+  -->
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release' and '$(WholeProgramOptimization)' == 'true'">
+    <Link>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>
