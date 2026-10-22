@@ -28060,5 +28060,32 @@ class SetInfoBlockReasonIsNamedTests(unittest.TestCase):
         self.assertIn("C_ASSERT(PSI_BEHAVIOR_MASS_DELETE        == SS_SETINFO_BLOCK_MASS_DELETE);", psi)
 
 
+class SignatureDeterminationPoolTests(unittest.TestCase):
+    """Trust verification is drained by a bounded pool, not one thread (task 330).
+
+    One below-normal thread held the queue at its cap through first boot and
+    dropped 1249 requests; every Microsoft binary that misses the fast path is a
+    full scan, which kept the CPU pinned.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"))
+
+    def test_pool_is_bounded_between_two_and_four(self):
+        self.assertIn("std::clamp(hw / 2u, 2u, 4u)", self.src)
+        i = self.src.find("std::clamp(hw / 2u, 2u, 4u)")
+        self.assertIn("&RealTimeProtectionImpl::SignatureDeterminationLoop", self.src[i:i + 600])
+
+    def test_every_worker_is_joined_on_stop(self):
+        i = self.src.find("m_sigDetermStop.store(true, std::memory_order_release);")
+        self.assertNotEqual(i, -1)
+        tail = self.src[i:i + 600]
+        self.assertIn("m_sigDetermCv.notify_all();", tail,
+            "notify_one would leave all but one worker in its timed wait")
+        self.assertIn("for (auto& worker : m_sigDetermThreads)", tail)
+        self.assertIn("worker.join();", tail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

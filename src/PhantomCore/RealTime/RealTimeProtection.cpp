@@ -439,7 +439,7 @@ public:
     std::mutex                                       m_sigDetermMutex;
     std::condition_variable                          m_sigDetermCv;
     std::atomic<bool>                                m_sigDetermStop{ false };
-    std::unique_ptr<std::thread>                     m_sigDetermThread;
+    std::vector<std::thread>                         m_sigDetermThreads;
     // Same reasoning as the deep-scan queue above: instant depth under-reports a
     // queue that fills and drains between samples, and an unbounded per-drop
     // report amplifies the busy condition it is describing.
@@ -1013,9 +1013,35 @@ public:
             // path. Must exist before the filter starts accepting scan requests,
             // or the first wave of requests has nowhere to send its trust
             // look-ups and the fast path never warms.
+            //
+            // A POOL, NOT ONE THREAD. One below-normal thread drained this queue
+            // and could not keep up with first boot: on the 1.0.115 VM run it held
+            // the queue at its 1024 cap for two minutes and dropped 1249 requests,
+            // with each verification averaging 79 ms while the scan storm held the
+            // CPU. A dropped request is not lost detection - the file simply takes
+            // the full pipeline on its next access - but every Microsoft binary
+            // that misses the fast path is a full scan, and that work is what kept
+            // the CPU pinned, which in turn slowed this thread further.
+            //
+            // WinVerifyTrust and the validator are safe to call concurrently (the
+            // validator's state is behind its own shared_mutex, and the on-access
+            // path already calls it from every scan thread). Bounded at 4 so the
+            // pool cannot itself become the storm, at least 2 so a single slow
+            // revocation lookup cannot stall the whole queue.
+            //
             m_sigDetermStop.store(false, std::memory_order_release);
-            m_sigDetermThread = std::make_unique<std::thread>(
-                &RealTimeProtectionImpl::SignatureDeterminationLoop, this);
+            {
+                const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+                const unsigned workers = std::clamp(hw / 2u, 2u, 4u);
+                m_sigDetermThreads.reserve(workers);
+                for (unsigned w = 0; w < workers; ++w) {
+                    m_sigDetermThreads.emplace_back(
+                        &RealTimeProtectionImpl::SignatureDeterminationLoop, this);
+                }
+                Utils::Logger::Info(
+                    "RealTimeProtection: signature determination pool started with {} worker(s)",
+                    workers);
+            }
 
             // 7. Update protection status
             m_protectionStatus.isProtected = true;
@@ -1181,10 +1207,12 @@ public:
         // shutdown the way the original in-line call could stall a file operation.
         m_sigDetermStop.store(true, std::memory_order_release);
         m_sigDetermCv.notify_all();
-        if (m_sigDetermThread && m_sigDetermThread->joinable()) {
-            m_sigDetermThread->join();
+        for (auto& worker : m_sigDetermThreads) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
-        m_sigDetermThread.reset();
+        m_sigDetermThreads.clear();
 
         // Deferred self-protection baseline (installation integrity + APT sweep).
         // Joined here, BEFORE the detection components/kernel channel are torn down,
