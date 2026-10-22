@@ -161,7 +161,8 @@ struct AmsiProvider::Impl {
     std::atomic<std::uint64_t>  clean{0};
 
     // Detection infrastructure (initialised once in Initialize())
-    std::unique_ptr<SignatureStore::SignatureStore>  sigStore;
+    // Shared with ScanEngine and USBScanner (SignatureStore::OpenShared).
+    std::shared_ptr<SignatureStore::SignatureStore>  sigStore;
     std::unique_ptr<ThreatIntel::ThreatIntelStore>  threatIntel;
     mutable std::shared_mutex                        lifecycleMutex;
     bool                                            initialized{false};
@@ -489,7 +490,6 @@ bool AmsiProvider::Initialize() {
     // ScanBuffer() returns a no-op result), so the store MUST be opened
     // against the on-disk signatures database. The DB path is taken from
     // ConfigManager; absent/empty path or open failure are non-fatal.
-    m_impl->sigStore = std::make_unique<SignatureStore::SignatureStore>();
     {
         auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
         std::wstring sigDbPath =
@@ -512,16 +512,16 @@ bool AmsiProvider::Initialize() {
         }
 
         {
-            const auto sigStatus =
-                m_impl->sigStore->Initialize(sigDbPath, /*readOnly=*/true);
-            if (!sigStatus.IsSuccess()) {
+            SignatureStore::StoreError sigStatus{};
+            m_impl->sigStore =
+                SignatureStore::SignatureStore::OpenShared(sigDbPath, &sigStatus);
+            if (!m_impl->sigStore) {
                 SS_LOG_WARN(kLogCategory,
-                    L"Initialize: SignatureStore::Initialize('%ls') failed "
+                    L"Initialize: SignatureStore::OpenShared('%ls') failed "
                     L"code=%u win32=%lu; hash/pattern scanning disabled",
                     sigDbPath.c_str(),
                     static_cast<unsigned>(sigStatus.code),
                     static_cast<unsigned long>(sigStatus.win32Error));
-                m_impl->sigStore.reset();
             } else {
                 SS_LOG_INFO(kLogCategory,
                     L"Initialize: SignatureStore opened (path='%ls')",

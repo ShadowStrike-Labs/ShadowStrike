@@ -386,18 +386,16 @@ public:
                 signatureDbPath.c_str());
         }
 
-        // YARA ONLY. SignatureStore is a composite that opens its own internal
-        // HashStore and PatternStore against the same path, but the scan path
-        // sets enableHashLookup=false and enablePatternScan=false because the
-        // two standalone stores above own those layers. Without these toggles
-        // initialisation would map signatures.sdb twice more for components
-        // that are never queried.
-        m_signatureStore.SetHashStoreEnabled(false);
-        m_signatureStore.SetPatternStoreEnabled(false);
-        m_signatureStore.SetYaraStoreEnabled(true);
-        const auto signatureStoreError =
-            m_signatureStore.Initialize(signatureDbPath, true);
-        if (!signatureStoreError.IsSuccess()) {
+        // YARA ONLY on this path: the scan below sets enableHashLookup=false and
+        // enablePatternScan=false per call, because the two standalone stores
+        // above own those layers. The store itself is the process-wide one shared
+        // with ScanEngine and AmsiProvider, so its components are configured for
+        // all of them and must not be switched off here; the per-scan options are
+        // what restrict this caller to YARA.
+        SignatureStore::StoreError signatureStoreError{};
+        m_signatureStore = SignatureStore::SignatureStore::OpenShared(
+            signatureDbPath, &signatureStoreError);
+        if (!m_signatureStore) {
             SS_LOG_WARN(LOG_CATEGORY,
                 L"SignatureStore init failed (code=%d win32=%lu %hs) for %ls - "
                 L"USB YARA detection is DISABLED",
@@ -414,7 +412,7 @@ public:
         SS_LOG_INFO(LOG_CATEGORY,
             L"USB detection layers: hash=%ls yara=%ls pattern=%ls (database: %ls)",
             m_hashStore.IsInitialized() ? L"on" : L"off",
-            m_signatureStore.IsInitialized() ? L"on" : L"off",
+            (m_signatureStore && m_signatureStore->IsInitialized()) ? L"on" : L"off",
             m_patternStore.IsInitialized() ? L"on" : L"off",
             signatureDbPath.c_str());
 
@@ -721,13 +719,13 @@ public:
 
         // ── Phase 3 (C2): SignatureStore / YARA scan ────────────────────────
         // Use SignatureStore with YARA-only (hash & pattern handled separately).
-        if (m_signatureStore.IsInitialized()) {
+        if (m_signatureStore && m_signatureStore->IsInitialized()) {
             SignatureStore::ScanOptions sigOpts;
             sigOpts.enableHashLookup  = false;   // handled in Phase 2
             sigOpts.enablePatternScan = false;   // handled in Phase 4
             sigOpts.enableYaraScan    = true;
 
-            auto sigResult = m_signatureStore.ScanFile(widePath, sigOpts);
+            auto sigResult = m_signatureStore->ScanFile(widePath, sigOpts);
 
             for (auto& det : sigResult.detections) {
                 DetectedThreat threat;
@@ -1562,7 +1560,8 @@ private:
     // Detection stores (owned; optionally initialized)
     HashStore::HashStore           m_hashStore;
     PatternStore::PatternStore     m_patternStore;
-    SignatureStore::SignatureStore  m_signatureStore;
+    // Process-wide, shared with ScanEngine and AmsiProvider (OpenShared).
+    std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
 
     // Scan state (atomics for lock-free reads from worker thread)
     std::atomic<bool> m_scanActive{false};

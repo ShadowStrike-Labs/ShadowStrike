@@ -192,7 +192,9 @@ public:
     std::shared_ptr<ThreadPool> m_threadPool;
 
     // Subsystem instances (using infrastructure)
-    std::unique_ptr<SignatureStore::SignatureStore> m_signatureStore;
+    // Shared with AmsiProvider and USBScanner through SignatureStore::OpenShared;
+    // released on shutdown, never Close()d, so the other owners keep scanning.
+    std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::unique_ptr<Whitelist::WhitelistStore> m_whitelistStore;
     std::unique_ptr<ThreatIntel::ThreatIntelDatabase> m_threatIntelDB;
     std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
@@ -718,10 +720,10 @@ public:
                 SS_LOG_INFO(L"ScanEngine", L"Initializing SignatureStore at %hs",
                     StringUtils::ToNarrow(m_config.signatureDbPath).c_str());
 
-                m_signatureStore = std::make_unique<SignatureStore::SignatureStore>();
-
-                auto sigResult = m_signatureStore->Initialize(m_config.signatureDbPath);
-                if (!sigResult) {
+                SignatureStore::StoreError sigResult{};
+                m_signatureStore = SignatureStore::SignatureStore::OpenShared(
+                    m_config.signatureDbPath, &sigResult);
+                if (!m_signatureStore) {
                     // A missing or unreadable signature database must NOT take the
                     // whole engine down: heuristics, behaviour, emulation and the
                     // kernel telemetry paths are all still valuable, and failing
@@ -1142,7 +1144,8 @@ public:
         }
 
         if (m_signatureStore) {
-            m_signatureStore->Close();
+            // Release only. The store is shared; Close() here would stop YARA,
+            // hash and pattern scanning in AmsiProvider and USBScanner as well.
             m_signatureStore.reset();
         }
 
@@ -5441,7 +5444,9 @@ bool ScanEngine::ReloadDatabases() {
 
         std::unique_lock lock(m_impl->m_configMutex);
 
-        // Reload SignatureStore
+        // Reload SignatureStore. It is shared, so this in-place reload also gives
+        // AmsiProvider and USBScanner the new rules; the store's own lock keeps
+        // it from running under any scan in progress.
         if (m_impl->m_signatureStore) {
             m_impl->m_signatureStore->Close();
             auto result = m_impl->m_signatureStore->Initialize(m_impl->m_config.signatureDbPath);

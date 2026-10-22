@@ -1519,6 +1519,100 @@ TEST_F(SignatureStoreQueryCacheTest, AReloadRetiresEveryCachedResult) {
 }
 
 // ============================================================================
+// OpenShared: one read-only instance per database file
+// ============================================================================
+
+namespace {
+
+class SignatureStoreSharedTest : public ::testing::Test {
+protected:
+    fs::path dir_;
+    fs::path dbA_;
+    fs::path dbB_;
+
+    static void Build(const fs::path& p) {
+        BuildConfiguration cfg{};
+        cfg.outputPath = p.wstring();
+        cfg.overwriteExisting = true;
+        cfg.initialDatabaseSize = 4ull * 1024ull * 1024ull;
+        SignatureBuilder builder(cfg);
+        ASSERT_TRUE(builder.AddPattern("C3 5A 7E 91 0D B4 68 2F", "SharedMarker",
+                                       ThreatLevel::High).IsSuccess());
+        ASSERT_TRUE(builder.Build().IsSuccess());
+    }
+
+    void SetUp() override {
+        dir_ = fs::temp_directory_path() /
+               ("ss_shared_store_" + std::to_string(::GetCurrentProcessId()));
+        std::error_code ec;
+        fs::remove_all(dir_, ec);
+        fs::create_directories(dir_);
+        dbA_ = dir_ / "a.sdb";
+        dbB_ = dir_ / "b.sdb";
+        ASSERT_NO_FATAL_FAILURE(Build(dbA_));
+        ASSERT_NO_FATAL_FAILURE(Build(dbB_));
+    }
+
+    void TearDown() override {
+        std::error_code ec;
+        fs::remove_all(dir_, ec);
+    }
+};
+
+} // namespace
+
+TEST_F(SignatureStoreSharedTest, TheSameFileYieldsOneInstanceWhateverItsSpelling) {
+    auto first = SignatureStore::OpenShared(dbA_.wstring());
+    ASSERT_TRUE(first);
+    EXPECT_TRUE(first->IsInitialized());
+
+    // Upper case and forward slashes name the same file and must not load a
+    // second copy of the rules.
+    std::wstring respelled = dbA_.wstring();
+    for (auto& c : respelled) c = (c == L'\\') ? L'/' : static_cast<wchar_t>(::towupper(c));
+    auto second = SignatureStore::OpenShared(respelled);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first.get(), second.get());
+}
+
+TEST_F(SignatureStoreSharedTest, DifferentFilesYieldDifferentInstances) {
+    auto a = SignatureStore::OpenShared(dbA_.wstring());
+    auto b = SignatureStore::OpenShared(dbB_.wstring());
+    ASSERT_TRUE(a);
+    ASSERT_TRUE(b);
+    EXPECT_NE(a.get(), b.get());
+}
+
+TEST_F(SignatureStoreSharedTest, TheStoreIsReleasedWithItsLastOwner) {
+    auto owner = SignatureStore::OpenShared(dbA_.wstring());
+    ASSERT_TRUE(owner);
+    std::weak_ptr<SignatureStore> watch = owner;
+    owner.reset();
+    EXPECT_TRUE(watch.expired()) << "the registry must not keep the rules alive by itself";
+}
+
+TEST_F(SignatureStoreSharedTest, AMissingDatabaseReturnsNullAndTheReason) {
+    StoreError err{};
+    auto none = SignatureStore::OpenShared((dir_ / "absent.sdb").wstring(), &err);
+    EXPECT_FALSE(none);
+    EXPECT_FALSE(err.IsSuccess());
+}
+
+TEST_F(SignatureStoreSharedTest, AClosedSharedStoreIsReopenedForEveryOwner) {
+    auto a = SignatureStore::OpenShared(dbA_.wstring());
+    auto b = SignatureStore::OpenShared(dbA_.wstring());
+    ASSERT_EQ(a.get(), b.get());
+
+    a->Close();   // e.g. a reload that failed half way
+    EXPECT_FALSE(b->IsInitialized()) << "owners share one instance, so they share its state";
+
+    auto c = SignatureStore::OpenShared(dbA_.wstring());
+    ASSERT_TRUE(c);
+    EXPECT_EQ(a.get(), c.get());
+    EXPECT_TRUE(b->IsInitialized()) << "reopening restores scanning for every owner";
+}
+
+// ============================================================================
 // Entry Point
 // ============================================================================
 

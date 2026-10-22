@@ -28087,5 +28087,54 @@ class SignatureDeterminationPoolTests(unittest.TestCase):
         self.assertIn("worker.join();", tail)
 
 
+class SharedSignatureStoreTests(unittest.TestCase):
+    """The service's scanners share one signature store (task 227).
+
+    ScanEngine, AmsiProvider and USBScanner each compiled the full YARA rule set
+    from signatures.sdb: 11116 rules three times, about 150-170 MB of committed
+    memory per copy. A private copy, or an owner that Close()s the shared one on
+    its own shutdown, brings that back or silently stops the other scanners.
+    """
+
+    ENGINE = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+    AMSI = ROOT / "src/Products/Community/PhantomHome/AmsiProvider/AmsiProvider.cpp"
+    USB = ROOT / "src/Products/Community/PhantomHome/USB_Protection/USBScanner.cpp"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = {p: strip_c_comments(read_source(p)) for p in (cls.ENGINE, cls.AMSI, cls.USB)}
+
+    def test_every_scanner_opens_the_shared_store(self):
+        for path, src in self.src.items():
+            with self.subTest(path=path.name):
+                self.assertIn("SignatureStore::SignatureStore::OpenShared(", src)
+                self.assertNotRegex(src, r"make_(unique|shared)<\s*SignatureStore::SignatureStore\s*>",
+                    "a private SignatureStore compiles the YARA rules again")
+                self.assertNotRegex(src, r"\n\s*SignatureStore::SignatureStore\s+m_\w+\s*;",
+                    "a by-value SignatureStore member is a private copy")
+
+    def test_engine_closes_the_store_only_to_reload_it(self):
+        src = self.src[self.ENGINE]
+        closes = [m.start() for m in re.finditer(r"m_signatureStore->Close\(\)", src)]
+        self.assertEqual(1, len(closes),
+            "Close() on the shared store outside the reload stops AMSI and USB scanning")
+        reload_at = src.find("bool ScanEngine::ReloadDatabases()")
+        self.assertNotEqual(-1, reload_at)
+        self.assertGreater(closes[0], reload_at)
+        self.assertIn("m_signatureStore->Initialize(", src[closes[0]:closes[0] + 300])
+
+    def test_usb_does_not_reconfigure_the_shared_store(self):
+        src = self.src[self.USB]
+        self.assertNotRegex(src, r"m_signatureStore->Set\w*Enabled\(",
+            "disabling a component on the shared store disables it for ScanEngine and AMSI")
+        i = src.find("m_signatureStore->ScanFile(")
+        self.assertNotEqual(-1, i)
+        opts = src[max(0, i - 400):i]
+        self.assertIn("sigOpts.enableHashLookup  = false;", opts)
+        self.assertIn("sigOpts.enablePatternScan = false;", opts)
+        self.assertIn("if (m_signatureStore && m_signatureStore->IsInitialized()) {", src,
+            "the YARA layer must degrade, not crash, when the shared store did not open")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

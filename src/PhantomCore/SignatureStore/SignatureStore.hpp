@@ -745,6 +745,27 @@ namespace ShadowStrike {
             // FACTORY METHODS
             // ========================================================================
 
+            // The process-wide read-only store for databasePath, opened on first use.
+            //
+            // Every scanner in the service reads the same signatures.sdb, and each
+            // private instance compiled the full YARA rule set again: the 1.0.117
+            // service loaded 11116 rules three times (ScanEngine, AmsiProvider,
+            // USBScanner), about 150-170 MB of committed memory per copy. Callers
+            // naming the same file now receive the same instance.
+            //
+            // Sharing is safe because every scan holds m_globalLock shared and
+            // Close()/Initialize() hold it exclusively, so a reload by one owner is
+            // seen by all of them and never runs under a scan in progress. Owners
+            // must therefore release the pointer on shutdown, not Close() it - a
+            // Close() would end scanning for every other owner too.
+            //
+            // The registry holds weak references: the store is released when its
+            // last owner lets go. Returns null, with the reason in *error, when the
+            // database cannot be opened.
+            [[nodiscard]] static std::shared_ptr<SignatureStore> OpenShared(
+                const std::wstring& databasePath,
+                StoreError* error = nullptr
+            ) noexcept;
             // Create new database using builder
             [[nodiscard]] static StoreError CreateDatabase(
                 const std::wstring& outputPath,

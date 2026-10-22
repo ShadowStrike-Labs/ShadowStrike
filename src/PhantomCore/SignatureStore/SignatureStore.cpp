@@ -44,6 +44,8 @@
 #include <execution>
 #include <future>
 #include <filesystem>
+#include <map>
+#include <mutex>
 
 namespace ShadowStrike {
 namespace SignatureStore {
@@ -478,6 +480,84 @@ void SignatureStore::Close() noexcept {
     }
 
     SS_LOG_INFO(L"SignatureStore", L"Closed successfully");
+}
+
+std::shared_ptr<SignatureStore> SignatureStore::OpenShared(
+    const std::wstring& databasePath,
+    StoreError* error
+) noexcept {
+    const auto fail = [error](StoreError e) noexcept {
+        if (error) *error = std::move(e);
+        return std::shared_ptr<SignatureStore>{};
+    };
+
+    if (databasePath.empty()) {
+        return fail(StoreError{ SignatureStoreError::InvalidFormat, 0,
+                                "Database path cannot be empty" });
+    }
+
+    try {
+        // One key per FILE, not per spelling: relative paths, '/' separators and
+        // case differences must not produce a second copy of the same rules.
+        std::wstring key = databasePath;
+        const DWORD needed = ::GetFullPathNameW(databasePath.c_str(), 0, nullptr, nullptr);
+        if (needed != 0) {
+            std::wstring full(needed, L'\0');
+            const DWORD written =
+                ::GetFullPathNameW(databasePath.c_str(), needed, full.data(), nullptr);
+            if (written != 0 && written < needed) {
+                full.resize(written);
+                key = std::move(full);
+            }
+        }
+        if (!key.empty()) {
+            ::CharLowerBuffW(key.data(), static_cast<DWORD>(key.size()));
+        }
+
+        static std::mutex s_registryMutex;
+        static std::map<std::wstring, std::weak_ptr<SignatureStore>> s_registry;
+
+        // Held across Initialize on purpose: concurrent first callers at service
+        // start must wait for the one load and share it, not each start their own.
+        std::lock_guard<std::mutex> lock(s_registryMutex);
+
+        for (auto it = s_registry.begin(); it != s_registry.end();) {
+            it = it->second.expired() ? s_registry.erase(it) : std::next(it);
+        }
+
+        std::shared_ptr<SignatureStore> store;
+        if (const auto found = s_registry.find(key); found != s_registry.end()) {
+            store = found->second.lock();
+        }
+        const bool created = !store;
+        if (created) {
+            store = std::make_shared<SignatureStore>();
+        }
+
+        // An existing instance can be closed if an owner's reload failed;
+        // reopening it here restores scanning for every owner at once.
+        if (!store->IsInitialized()) {
+            StoreError err = store->Initialize(databasePath, /*readOnly=*/true);
+            if (!err.IsSuccess()) {
+                return fail(std::move(err));
+            }
+        }
+
+        if (created) {
+            s_registry[key] = store;
+            SS_LOG_INFO(L"SignatureStore", L"Shared store opened: %ls", databasePath.c_str());
+        } else {
+            SS_LOG_INFO(L"SignatureStore", L"Shared store reused: %ls", databasePath.c_str());
+        }
+        return store;
+    }
+    catch (const std::bad_alloc&) {
+        return fail(StoreError{ SignatureStoreError::OutOfMemory, 0,
+                                "Out of memory opening the shared signature store" });
+    }
+    catch (const std::exception& e) {
+        return fail(StoreError{ SignatureStoreError::Unknown, 0, e.what() });
+    }
 }
 
 SignatureStore::InitializationStatus SignatureStore::GetStatus() const noexcept {
