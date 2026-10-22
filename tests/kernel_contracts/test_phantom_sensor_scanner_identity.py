@@ -24295,7 +24295,10 @@ class KernelDenialTraceabilityContractTests(unittest.TestCase):
             -1, position,
             "the service does not handle the file-operation event, so the path "
             "arrives and is discarded - which is the state this change fixed")
-        window = consumer[position:position + 4000]
+        # The handler is the case block itself, up to the next message case. A
+        # fixed character window broke when the reason decoding grew.
+        end = consumer.find("case FilterMessageType_", position + len(marker))
+        window = consumer[position:end if end != -1 else len(consumer)]
         self.assertTrue(
             "if (op->WasBlocked == 0) {" in window,
             "the handler no longer distinguishes a refused operation from an "
@@ -24310,7 +24313,11 @@ class KernelDenialTraceabilityContractTests(unittest.TestCase):
         would have become a read past the end of a payload."""
         consumer = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
         position = consumer.find("case FilterMessageType_FileOperationEvent:")
-        window = consumer[position:position + 4000]
+        marker = "case FilterMessageType_FileOperationEvent:"
+        # The handler is the case block itself, up to the next message case. A
+        # fixed character window broke when the reason decoding grew.
+        end = consumer.find("case FilterMessageType_", position + len(marker))
+        window = consumer[position:end if end != -1 else len(consumer)]
         self.assertTrue(
             "if (nameBytes > availableBytes) {" in window,
             "the handler trusts FileNameBytes without bounding it against what was "
@@ -27932,6 +27939,125 @@ class ReleaseLinksUseFullLtcgTests(unittest.TestCase):
             "the deploy harness no longer checks how shipped binaries were linked.")
         for proj in ("'Service'", "'UI'", "'Tray'", "'DriverResume'"):
             self.assertIn(proj, self.harness)
+
+
+def _psi_function(src, name):
+    """Body of a C function definition (not its prototype) in PreSetInfo.c."""
+    i = 0
+    while True:
+        i = src.find(name + "(", i)
+        if i == -1:
+            return ""
+        head = src.find(")", i)
+        nxt = src[head + 1:head + 40].lstrip()
+        if nxt.startswith("{"):
+            start = src.find("{", head)
+            return src[start:_matching_delimiter(src, start, "{", "}") + 1]
+        i = head + 1
+
+
+class DataDestructionCountsOnlyPreexistingDataTests(unittest.TestCase):
+    """A process deleting files it created itself is not destroying data (task 329).
+
+    Counting those made long-running processes cross the lifetime threshold and
+    lose the ability to delete anything (Update Orchestrator's store.db-journal).
+    Deletes of files someone else created must still count in full.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psi = read_source(ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreSetInfo.c")
+        cls.poc = read_source(ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PostCreate.c")
+        cls.metrics = _psi_function(cls.psi, "PsipUpdateProcessMetrics")
+        cls.own = _psi_function(cls.psi, "PsipIsOwnArtifactDeletion")
+
+    def test_own_artifact_deletes_do_not_reach_the_destruction_counters(self):
+        self.assertTrue(self.metrics, "PsipUpdateProcessMetrics body not found")
+        i = self.metrics.find("if (IsOwnArtifact)")
+        self.assertNotEqual(i, -1, "the own-artifact branch is gone")
+        branch = self.metrics[i:self.metrics.find("} else {", i)]
+        self.assertNotIn("RecentDeletes", branch)
+        self.assertNotIn("TotalDeletes", branch)
+        rest = self.metrics[self.metrics.find("} else {", i):]
+        self.assertIn("InterlockedIncrement(&context->RecentDeletes)", rest,
+            "deletes of files the process did not create must still be counted")
+        self.assertIn("InterlockedIncrement64(&context->TotalDeletes)", rest)
+
+    def test_own_artifact_requires_matching_pid_and_process_create_time(self):
+        self.assertIn("CreatorProcessId == HandleToULong(PsGetCurrentProcessId())", self.own)
+        self.assertIn("CreatorProcessCreateTime.QuadPart ==", self.own,
+            "pid alone is reusable; the creator's process create time must match too")
+        self.assertIn("PsGetProcessCreateTimeQuadPart(PsGetCurrentProcess())", self.own)
+        self.assertIn("PocIsValidStreamContext(streamContext)", self.own)
+
+    def test_creator_is_recorded_only_for_files_this_open_created(self):
+        i = self.poc.find("streamContext->CreatorProcessId =")
+        self.assertNotEqual(i, -1, "PostCreate no longer records the creator")
+        guard = self.poc[max(0, i - 200):i]
+        self.assertIn("Data->IoStatus.Information == FILE_CREATED", guard,
+            "an opened or overwritten file must not be attributed to the opener")
+
+    def test_the_full_stream_context_definition_is_the_one_compiled_here(self):
+        a = self.psi.find('#include "PostCreate.h"')
+        b = self.psi.find('#include "../../Shared/SharedDefs.h"')
+        self.assertNotEqual(a, -1)
+        self.assertLess(a, b, "SharedDefs.h first would compile its 40-byte "
+            "SHADOWSTRIKE_STREAM_CONTEXT and read creator fields out of bounds")
+
+
+class DataDestructionServicingExemptionTests(unittest.TestCase):
+    """Windows component-store maintenance is allowed only by location AND identity."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psi = read_source(ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreSetInfo.c")
+        cls.fn = _psi_function(cls.psi, "PsipIsWindowsServicingDeletion")
+
+    def test_identity_is_required_and_checked_after_the_path(self):
+        p = self.fn.find("RtlPrefixUnicodeString(&root, &relative, TRUE)")
+        s = self.fn.find("ShadowStrikeValidateProcessSignature(")
+        self.assertNotEqual(p, -1)
+        self.assertNotEqual(s, -1, "a location alone must never exempt a delete")
+        self.assertLess(p, s, "ordinary deletes must not pay for a signature lookup")
+        self.assertIn("if (!inStore)", self.fn[p:s])
+
+    def test_only_windows_signers_qualify(self):
+        tail = self.fn[self.fn.find("ShadowStrikeValidateProcessSignature("):]
+        self.assertIn("signer == ShadowSignerWindows", tail)
+        self.assertNotIn("ShadowSignerAuthenticode", tail,
+            "any Authenticode signer would let any signed program wipe these stores")
+        self.assertIn("!isSigned", tail)
+
+    def test_paths_are_anchored_after_the_volume(self):
+        self.assertIn("NameInfo->Volume.Length", self.fn)
+        self.assertIn("KeGetCurrentIrql() != PASSIVE_LEVEL", self.fn)
+
+    def test_exemption_applies_only_where_destruction_would_block(self):
+        i = self.psi.find("PsipDetectDataDestruction(processContext)")
+        self.assertNotEqual(i, -1)
+        block = self.psi[i:self.psi.find("goto CompleteOperation", i)]
+        self.assertIn("PsipIsWindowsServicingDeletion(nameInfo)", block)
+        self.assertIn("ServicingDeletesAllowed", block)
+        r = self.psi.find("PsipDetectRansomwareBehavior(processContext)")
+        rblock = self.psi[r:self.psi.find("PsipDetectDataDestruction(processContext)", r)]
+        self.assertNotIn("PsipIsWindowsServicingDeletion", rblock,
+            "the ransomware rule must not inherit the servicing exemption")
+
+
+class SetInfoBlockReasonIsNamedTests(unittest.TestCase):
+    """A rename/delete refusal is logged with its rule, not 'unspecified'."""
+
+    def test_service_log_names_the_data_destruction_rule(self):
+        src = read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp")
+        i = src.find("KERNEL DENIED access")
+        window = src[max(0, i - 4000):i]
+        self.assertIn("op->InfoClass != SS_FILE_OP_INFOCLASS_CREATE", window)
+        self.assertIn("SS_SETINFO_BLOCK_MASS_DELETE", window)
+        self.assertIn("data destruction", window)
+
+    def test_wire_bits_are_pinned_to_the_driver_flags(self):
+        psi = read_source(ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreSetInfo.c")
+        self.assertIn("C_ASSERT(PSI_BEHAVIOR_MASS_DELETE        == SS_SETINFO_BLOCK_MASS_DELETE);", psi)
 
 
 if __name__ == "__main__":

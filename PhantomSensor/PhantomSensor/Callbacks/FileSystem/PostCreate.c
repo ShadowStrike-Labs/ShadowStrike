@@ -810,6 +810,19 @@ Return Value:
     KeQuerySystemTime(&streamContext->LastAccessTime);
     streamContext->OpenCount = 1;
 
+    //
+    // Record who created the file, if this open created it. IRP_MJ_CREATE's
+    // post-operation runs in the originating thread, so the current process is
+    // the creator. Any other disposition (opened, overwritten, superseded)
+    // leaves the fields zero: the data either predates this process or was
+    // replaced by it, and neither is "a file this process made".
+    //
+    if (Data->IoStatus.Information == FILE_CREATED) {
+        streamContext->CreatorProcessId = HandleToULong(PsGetCurrentProcessId());
+        streamContext->CreatorProcessCreateTime.QuadPart =
+            PsGetProcessCreateTimeQuadPart(PsGetCurrentProcess());
+    }
+
     // ========================================================================
     // PHASE 5: QUERY FILE INFORMATION
     // ========================================================================

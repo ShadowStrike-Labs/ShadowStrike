@@ -78,6 +78,13 @@
  * ============================================================================
  */
 
+//
+// PostCreate.h FIRST. It and Shared/SharedDefs.h both define
+// SHADOWSTRIKE_STREAM_CONTEXT under one guard, and the first definition wins;
+// this file reads the full one PostCreate allocates (creator identity, signature).
+// Every other user of the type includes it first for the same reason.
+//
+#include "PostCreate.h"
 #include "PreSetInfo.h"
 #include "FileSystemCallbacks.h"
 #include "FileBackupEngine.h"
@@ -96,6 +103,7 @@
 #include "../../ETW/TelemetryEvents.h"
 #include "../../Performance/LookasideLists.h"
 #include "USBDeviceControl.h"
+#include "../../Utilities/ProcessUtils.h"
 #include <ntstrsafe.h>
 
 //
@@ -413,6 +421,8 @@ typedef struct _PSI_GLOBAL_STATE {
         volatile LONG64 SelfProtectionBlocks;
         volatile LONG64 RansomwareBlocks;
         volatile LONG64 DestructionBlocks;
+        volatile LONG64 OwnArtifactDeletes;       // Deletes of files the deleter created
+        volatile LONG64 ServicingDeletesAllowed;  // Over-threshold OS servicing deletes allowed
         volatile LONG64 CredentialAccessBlocks;
         volatile LONG64 SystemFileBlocks;
         volatile LONG64 ExclusionSkips;
@@ -468,7 +478,19 @@ PsipUpdateProcessMetrics(
     _In_ FILE_INFORMATION_CLASS InfoClass,
     _In_opt_ PCUNICODE_STRING FileName,
     _In_opt_ PCUNICODE_STRING NewFileName,
-    _In_ BOOLEAN IsConfirmedDeletion
+    _In_ BOOLEAN IsConfirmedDeletion,
+    _In_ BOOLEAN IsOwnArtifact
+    );
+
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN
+PsipIsOwnArtifactDeletion(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects
+    );
+
+static BOOLEAN
+PsipIsWindowsServicingDeletion(
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
     );
 
 static BOOLEAN
@@ -1316,7 +1338,8 @@ ShadowStrikePreSetInformation(
             infoClass,
             &nameInfo->Name,
             newFileNameAllocated ? &newFileName : NULL,
-            isActualDeletion
+            isActualDeletion,
+            isActualDeletion && PsipIsOwnArtifactDeletion(FltObjects)
             );
 
         //
@@ -1363,8 +1386,17 @@ ShadowStrikePreSetInformation(
             processContext = PsipLookupProcessContext(requestorPid, FALSE);
             if (processContext != NULL) {
                 if (PsipDetectDataDestruction(processContext)) {
-                    if (infoClass == FileDispositionInformation ||
-                        infoClass == FileDispositionInformationEx) {
+                    if ((infoClass == FileDispositionInformation ||
+                         infoClass == FileDispositionInformationEx) &&
+                        PsipIsWindowsServicingDeletion(nameInfo)) {
+                        //
+                        // Windows maintaining its own component stores. Counted,
+                        // and the process stays marked as a destruction suspect,
+                        // so nothing else about it is trusted.
+                        //
+                        InterlockedIncrement64(&g_PsiState.Stats.ServicingDeletesAllowed);
+                    } else if (infoClass == FileDispositionInformation ||
+                               infoClass == FileDispositionInformationEx) {
 
                         shouldBlock = TRUE;
                         blockReason = PSI_BEHAVIOR_MASS_DELETE;
@@ -1863,7 +1895,8 @@ PsipUpdateProcessMetrics(
     _In_ FILE_INFORMATION_CLASS InfoClass,
     _In_opt_ PCUNICODE_STRING FileName,
     _In_opt_ PCUNICODE_STRING NewFileName,
-    _In_ BOOLEAN IsConfirmedDeletion
+    _In_ BOOLEAN IsConfirmedDeletion,
+    _In_ BOOLEAN IsOwnArtifact
     )
 {
     PPSI_PROCESS_CONTEXT context;
@@ -1887,9 +1920,27 @@ PsipUpdateProcessMetrics(
             // FSC-3: Only count confirmed deletions (DeleteFile=TRUE / FILE_DISPOSITION_DELETE).
             // Undelete operations (clearing delete flag) must NOT inflate ransomware counters.
             //
+            //
+            // A DELETION IS EVIDENCE OF DESTRUCTION ONLY IF SOMETHING THAT
+            // EXISTED BEFORE THE DELETER IS LOST. A process removing a file it
+            // created itself - a SQLite journal, a download staging file, a
+            // build intermediate - destroys nothing. Counting those made every
+            // long-running process that uses temporary files cross the lifetime
+            // threshold and lose the ability to delete anything: the Update
+            // Orchestrator's store.db-journal was refused this way in the field.
+            //
+            // The attacker cases still count in full: ransomware deletes the
+            // ORIGINAL it read, a wiper deletes files it did not make, and the
+            // creator identity cannot be forged from user mode because PostCreate
+            // records it in the kernel at FILE_CREATED.
+            //
             if (IsConfirmedDeletion) {
-                InterlockedIncrement(&context->RecentDeletes);
-                InterlockedIncrement64(&context->TotalDeletes);
+                if (IsOwnArtifact) {
+                    InterlockedIncrement64(&g_PsiState.Stats.OwnArtifactDeletes);
+                } else {
+                    InterlockedIncrement(&context->RecentDeletes);
+                    InterlockedIncrement64(&context->TotalDeletes);
+                }
             }
             break;
 
@@ -1933,6 +1984,147 @@ PsipUpdateProcessMetrics(
     }
 
     PsipDereferenceProcessContext(context);
+}
+
+
+// ============================================================================
+// DATA-DESTRUCTION PRECISION (task 329)
+// ============================================================================
+
+//
+// The wire names the SetInfo reasons; these must stay the same bits.
+//
+C_ASSERT(PSI_BEHAVIOR_MASS_RENAME        == SS_SETINFO_BLOCK_MASS_RENAME);
+C_ASSERT(PSI_BEHAVIOR_MASS_DELETE        == SS_SETINFO_BLOCK_MASS_DELETE);
+C_ASSERT(PSI_BEHAVIOR_EXTENSION_CHANGE   == SS_SETINFO_BLOCK_EXTENSION_CHANGE);
+C_ASSERT(PSI_BEHAVIOR_CREDENTIAL_ACCESS  == SS_SETINFO_BLOCK_CREDENTIAL_ACCESS);
+C_ASSERT(PSI_BEHAVIOR_SYSTEM_FILE_ACCESS == SS_SETINFO_BLOCK_SYSTEM_FILE_ACCESS);
+C_ASSERT(PSI_BEHAVIOR_AV_TAMPERING       == SS_SETINFO_BLOCK_AV_TAMPERING);
+
+/**
+ * @brief TRUE if the file being deleted was created by the deleting process.
+ *
+ * Reads the creator identity PostCreate recorded at FILE_CREATED. The fields are
+ * written once, before FltSetStreamContext publishes the context, and never
+ * change afterwards, so no context lock is needed to read them.
+ *
+ * Fails toward COUNTING the delete: no context, an invalid context, a context
+ * created by another open path, or any mismatch returns FALSE, which is the
+ * behaviour this rule had before the distinction existed.
+ */
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN
+PsipIsOwnArtifactDeletion(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects
+    )
+{
+    PSHADOWSTRIKE_STREAM_CONTEXT streamContext = NULL;
+    BOOLEAN own = FALSE;
+
+    if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
+        return FALSE;
+    }
+
+    if (!NT_SUCCESS(FltGetStreamContext(FltObjects->Instance,
+                                        FltObjects->FileObject,
+                                        (PFLT_CONTEXT*)&streamContext))) {
+        return FALSE;
+    }
+
+    if (PocIsValidStreamContext(streamContext) &&
+        streamContext->CreatorProcessId != 0 &&
+        streamContext->CreatorProcessId == HandleToULong(PsGetCurrentProcessId()) &&
+        streamContext->CreatorProcessCreateTime.QuadPart ==
+            PsGetProcessCreateTimeQuadPart(PsGetCurrentProcess())) {
+        own = TRUE;
+    }
+
+    FltReleaseContext(streamContext);
+    return own;
+}
+
+/**
+ * @brief TRUE for a delete that is Windows maintaining a Windows component store.
+ *
+ * BOTH conditions are required; neither is sufficient alone.
+ *
+ *   Location - the file is under a store owned by the OS servicing stack:
+ *     \Program Files\WindowsApps\     AppX packages (AppXSvc removes uninstalled
+ *                                     and superseded packages from \Deleted)
+ *     \ProgramData\USOPrivate\        Update Orchestrator state
+ *     \Windows\SoftwareDistribution\  Windows Update downloads
+ *     \Windows\WinSxS\                component store cleanup (TiWorker)
+ *   Matched volume-relative, at the start of the path, so a directory of the
+ *   same name elsewhere does not qualify.
+ *
+ *   Identity - the deleting process image carries a Windows or Microsoft Code
+ *   Integrity signing level (ShadowStrikeValidateProcessSignature). A file
+ *   location alone never exempts anything; an attacker can create a folder
+ *   called WindowsApps but cannot make its process Windows-signed.
+ *
+ * Only consulted once the process has already crossed the destruction
+ * threshold, and the path is tested before the signature, so ordinary deletes
+ * never pay for a signature lookup. Not PASSIVE_LEVEL means FALSE: the
+ * signature query cannot run, and the delete is judged exactly as before.
+ */
+static BOOLEAN
+PsipIsWindowsServicingDeletion(
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    )
+{
+    static const PCWSTR kServicingRoots[] = {
+        L"\\Program Files\\WindowsApps\\",
+        L"\\ProgramData\\USOPrivate\\",
+        L"\\Windows\\SoftwareDistribution\\",
+        L"\\Windows\\WinSxS\\",
+    };
+    UNICODE_STRING relative;
+    BOOLEAN inStore = FALSE;
+    BOOLEAN isSigned = FALSE;
+    SHADOW_SIGNER_TYPE signer = ShadowSignerNone;
+    ULONG i;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL || NameInfo == NULL) {
+        return FALSE;
+    }
+
+    //
+    // FltParseFileNameInformation has run, so Volume is the device prefix of
+    // Name. Anything else is not a path this check can anchor.
+    //
+    if (NameInfo->Volume.Length == 0 ||
+        NameInfo->Name.Length <= NameInfo->Volume.Length ||
+        NameInfo->Name.Buffer != NameInfo->Volume.Buffer) {
+        return FALSE;
+    }
+
+    relative.Buffer = (PWCH)((PUCHAR)NameInfo->Name.Buffer + NameInfo->Volume.Length);
+    relative.Length = (USHORT)(NameInfo->Name.Length - NameInfo->Volume.Length);
+    relative.MaximumLength = relative.Length;
+
+    for (i = 0; i < RTL_NUMBER_OF(kServicingRoots); i++) {
+        UNICODE_STRING root;
+        RtlInitUnicodeString(&root, kServicingRoots[i]);
+        if (RtlPrefixUnicodeString(&root, &relative, TRUE)) {
+            inStore = TRUE;
+            break;
+        }
+    }
+
+    if (!inStore) {
+        return FALSE;
+    }
+
+    if (!NT_SUCCESS(ShadowStrikeValidateProcessSignature(PsGetCurrentProcessId(),
+                                                        &isSigned,
+                                                        &signer)) ||
+        !isSigned) {
+        return FALSE;
+    }
+
+    return (signer == ShadowSignerWindows ||
+            signer == ShadowSignerWinTcb ||
+            signer == ShadowSignerWinSystem);
 }
 
 static BOOLEAN

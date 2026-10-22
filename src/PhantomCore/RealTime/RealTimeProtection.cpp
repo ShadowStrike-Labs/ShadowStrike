@@ -6451,6 +6451,28 @@ public:
                     reason = L"scan verdict or threat score over the block threshold";
                     break;
                 default:
+                    //
+                    // A rename/delete/link refusal carries PreSetInformation's
+                    // behaviour BITMASK. Tested most specific first: the
+                    // ransomware rule sets both MASS bits, the data-destruction
+                    // rule sets MASS_DELETE alone.
+                    //
+                    if (op->InfoClass != SS_FILE_OP_INFOCLASS_CREATE) {
+                        const std::uint32_t b = op->BlockReason;
+                        if ((b & SS_SETINFO_BLOCK_MASS_RENAME) && (b & SS_SETINFO_BLOCK_MASS_DELETE)) {
+                            reason = L"ransomware behaviour (mass rename and delete)";
+                        } else if (b & SS_SETINFO_BLOCK_EXTENSION_CHANGE) {
+                            reason = L"ransomware extension rename";
+                        } else if (b & SS_SETINFO_BLOCK_MASS_DELETE) {
+                            reason = L"data destruction (mass deletion of pre-existing files)";
+                        } else if (b & SS_SETINFO_BLOCK_AV_TAMPERING) {
+                            reason = L"self-protection (product file)";
+                        } else if (b & SS_SETINFO_BLOCK_SYSTEM_FILE_ACCESS) {
+                            reason = L"protected system file";
+                        } else if (b & SS_SETINFO_BLOCK_CREDENTIAL_ACCESS) {
+                            reason = L"credential store hard link";
+                        }
+                    }
                     break;
                 }
 

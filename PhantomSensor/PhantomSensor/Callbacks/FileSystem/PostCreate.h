@@ -329,6 +329,24 @@ typedef struct _SHADOWSTRIKE_STREAM_CONTEXT {
     LARGE_INTEGER LastAccessTime;       ///< Last access to this context
 
     //
+    // Creator identity.
+    //
+    // Set ONLY when the open that produced this context created the file
+    // (IoStatus.Information == FILE_CREATED); zero otherwise, including for
+    // every file that existed before it was opened. PreSetInfo reads it to tell
+    // a process removing a file it made itself (a SQLite journal, a temp file)
+    // from a process destroying data that existed before it - the distinction
+    // the data-destruction rule exists to draw.
+    //
+    // The create time is kept with the pid so a recycled pid cannot inherit
+    // another process's files. It cannot be forged from user mode: the kernel
+    // records it at the moment of creation.
+    //
+    UINT32 CreatorProcessId;            ///< Pid that created the file, 0 if unknown
+    UINT32 Reserved5;                   ///< Alignment
+    LARGE_INTEGER CreatorProcessCreateTime; ///< PsGetProcessCreateTimeQuadPart of that pid
+
+    //
     // Synchronization
     //
     EX_PUSH_LOCK Lock;                  ///< Context lock

@@ -456,6 +456,21 @@ C_ASSERT(FIELD_OFFSET(SHADOWSTRIKE_FILE_OPERATION_EVENT, FileNameBytes)  == 28);
 #define SS_FILE_BLOCK_REASON_CREATE_SCAN_VERDICT      0x105u
 
 //
+// BlockReason values for a refused RENAME, DELETE or LINK (PreSetInformation).
+//
+// A BITMASK, not an enumeration: the ransomware rule refuses with both MASS bits
+// set at once. The values are PreSetInfo's own behaviour flags; PreSetInfo.c
+// pins them with C_ASSERT so the two cannot drift. They sit far below the
+// CREATE reasons above, which keeps the two producers' spaces disjoint.
+//
+#define SS_SETINFO_BLOCK_MASS_RENAME           0x00000001u
+#define SS_SETINFO_BLOCK_MASS_DELETE           0x00000002u
+#define SS_SETINFO_BLOCK_EXTENSION_CHANGE      0x00000004u
+#define SS_SETINFO_BLOCK_CREDENTIAL_ACCESS     0x00000010u
+#define SS_SETINFO_BLOCK_SYSTEM_FILE_ACCESS    0x00000020u
+#define SS_SETINFO_BLOCK_AV_TAMPERING          0x00000040u
+
+//
 // 1b. Behavioural Alert (FilterMessageType_BehavioralAlert)
 //
 // THE FIRST TWO FIELDS ARE NOT FREE CHOICES. BehaviorBlocker::
