@@ -89,6 +89,11 @@ foreach ($s in 'wuauserv','UsoSvc') {
     sc.exe stop $s | Out-Null
 }
 Get-Process mrt -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# An idle guest at the logon screen requests ACPI sleep and VMware suspends the
+# VM in the middle of a run. Test environment only; undone by the next revert.
+powercfg.exe /change standby-timeout-ac 0 | Out-Null
+powercfg.exe /change hibernate-timeout-ac 0 | Out-Null
+powercfg.exe /hibernate off | Out-Null
 "wuauserv=" + (Get-Service wuauserv).StartType + " UsoSvc=" + (Get-Service UsoSvc).StartType + " MRT-offer=off"
 '@
 Step "Windows Update paused for this run: $($wu.Output.Trim())"
