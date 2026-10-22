@@ -124,7 +124,7 @@ namespace ShadowStrike {
 
             // Check cache first
             if (options.enableResultCache && m_resultCacheEnabled.load()) {
-                auto cached = CheckQueryCache(buffer);
+                auto cached = CheckQueryCache(buffer, options);
                 if (cached.has_value()) {
                     m_queryCacheHits.fetch_add(1, std::memory_order_relaxed);
                     return *cached;
@@ -134,8 +134,12 @@ namespace ShadowStrike {
 
             // Execute scan (parallel or sequential) under shared_lock to prevent Close() TOCTOU
             ScanResult result;
+            uint64_t scanGeneration = 0;
             {
                 std::shared_lock<std::shared_mutex> scanLock(m_globalLock);
+                // Read under the lock Close() takes exclusively, so the value names
+                // the databases this scan actually ran against.
+                scanGeneration = m_storeGeneration.load(std::memory_order_acquire);
                 if (options.parallelExecution && options.threadCount > 1) {
                     result = ExecuteParallelScan(buffer, options);
                 }
@@ -175,7 +179,7 @@ namespace ShadowStrike {
             // Cache result
             if (options.enableResultCache && m_resultCacheEnabled.load()) {
 
-                AddToQueryCache(buffer, result);
+                AddToQueryCache(buffer, options, result, scanGeneration);
             }
 
             return result;

@@ -777,14 +777,33 @@ namespace ShadowStrike {
                 const ScanOptions& options
             ) const noexcept;
 
+            // The cache is keyed on the buffer AND on the options that shape the
+            // result. Callers on the same store run different engine subsets over
+            // the same bytes - ScanEngine's memory path runs a hash-only scan and
+            // then a pattern+YARA scan of one buffer - so a content-only key
+            // answered the second call with the first call's hash-only result and
+            // YARA never ran.
             [[nodiscard]] std::optional<ScanResult> CheckQueryCache(
-                std::span<const uint8_t> buffer
+                std::span<const uint8_t> buffer,
+                const ScanOptions& options
             ) const noexcept;
 
+            // storeGeneration is the value of m_storeGeneration observed while the
+            // scan held m_globalLock. A result computed against databases that were
+            // closed before it could be inserted is refused, so a reload can never
+            // be answered from the previous rule set.
             void AddToQueryCache(
                 std::span<const uint8_t> buffer,
-                const ScanResult& result
+                const ScanOptions& options,
+                const ScanResult& result,
+                uint64_t storeGeneration
             ) const noexcept;
+
+            // Fingerprint of every ScanOptions field that changes WHICH detections a
+            // completed scan reports. Timeouts, threading and profiling are excluded
+            // because they do not change the matches of a scan that finished;
+            // unfinished scans are never cached.
+            [[nodiscard]] static uint64_t ResultShapeKey(const ScanOptions& options) noexcept;
 
             void MergeResults(
                 ScanResult& target,
@@ -817,9 +836,14 @@ namespace ShadowStrike {
 
             struct QueryCacheEntry {
                 std::array<uint8_t, 32> bufferHash;               // SHA-256 of buffer
+                uint64_t optionsKey{ 0 };                         // ResultShapeKey of the producing scan
+                uint64_t storeGeneration{ 0 };                    // m_storeGeneration at scan time
                 ScanResult result;
                 uint64_t timestamp;
             };
+            // Advanced by Close(). Cache entries from an earlier generation are
+            // never served, whatever their content hash.
+            mutable std::atomic<uint64_t> m_storeGeneration{ 1 };
             static constexpr size_t QUERY_CACHE_SIZE = 1000;
             mutable std::vector<QueryCacheEntry> m_queryCache{};
             mutable std::atomic<uint64_t> m_queryCacheAccessCounter{ 0 };

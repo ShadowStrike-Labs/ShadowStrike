@@ -1417,6 +1417,108 @@ TEST_F(SignatureStoreTest, Close_WhileNotInitialized) {
 }
 
 // ============================================================================
+// Query cache must be keyed on the scan options, not only on the bytes
+// ============================================================================
+//
+// Callers on one store run different engine subsets over the same buffer.
+// ScanEngine's memory path runs a hash-only scan and then a pattern+YARA scan
+// of one buffer; with a content-only cache key the second call was answered with
+// the first call's result, so pattern and YARA matching never ran on it.
+
+namespace {
+
+class SignatureStoreQueryCacheTest : public ::testing::Test {
+protected:
+    fs::path db_;
+    SignatureStore store_;
+    // Marker bytes the database's only pattern matches, framed so a match is not
+    // an artefact of the buffer edges.
+    const std::vector<uint8_t> payload_{
+        0x00, 0x11, 0x22, 0xC3, 0x5A, 0x7E, 0x91, 0x0D, 0xB4, 0x68, 0x2F, 0x33, 0x44 };
+
+    void SetUp() override {
+        db_ = fs::temp_directory_path() /
+              ("ss_query_cache_" + std::to_string(::GetCurrentProcessId()) + ".sdb");
+        std::error_code ec;
+        fs::remove(db_, ec);
+
+        BuildConfiguration cfg{};
+        cfg.outputPath = db_.wstring();
+        cfg.overwriteExisting = true;
+        cfg.initialDatabaseSize = 4ull * 1024ull * 1024ull;
+        SignatureBuilder builder(cfg);
+        ASSERT_TRUE(builder.AddPattern("C3 5A 7E 91 0D B4 68 2F", "QueryCacheMarker",
+                                       ThreatLevel::High).IsSuccess());
+        ASSERT_TRUE(builder.Build().IsSuccess());
+        ASSERT_TRUE(store_.Initialize(db_.wstring(), /*readOnly=*/true).IsSuccess());
+        store_.ClearAllCaches();
+    }
+
+    void TearDown() override {
+        store_.Close();
+        std::error_code ec;
+        fs::remove(db_, ec);
+    }
+
+    static ScanOptions HashOnly() {
+        ScanOptions o{};
+        o.enableHashLookup = true;
+        o.enablePatternScan = false;
+        o.enableYaraScan = false;
+        o.enableResultCache = true;
+        return o;
+    }
+    static ScanOptions PatternOnly() {
+        ScanOptions o{};
+        o.enableHashLookup = false;
+        o.enablePatternScan = true;
+        o.enableYaraScan = false;
+        o.enableResultCache = true;
+        return o;
+    }
+};
+
+} // namespace
+
+TEST_F(SignatureStoreQueryCacheTest, HashOnlyScanDoesNotAnswerALaterPatternScan) {
+    const auto first = store_.ScanBuffer(payload_, HashOnly());
+    ASSERT_TRUE(first.patternMatches.empty()) << "precondition: hash-only runs no patterns";
+
+    const auto second = store_.ScanBuffer(payload_, PatternOnly());
+    EXPECT_FALSE(second.cacheHit)
+        << "a result computed with different engines was replayed from the cache";
+    EXPECT_FALSE(second.patternMatches.empty())
+        << "the pattern must still match after a hash-only scan of the same bytes";
+}
+
+TEST_F(SignatureStoreQueryCacheTest, PatternScanDoesNotAnswerALaterPatternDisabledScan) {
+    const auto first = store_.ScanBuffer(payload_, PatternOnly());
+    ASSERT_FALSE(first.patternMatches.empty()) << "precondition: the pattern matches";
+
+    const auto second = store_.ScanBuffer(payload_, HashOnly());
+    EXPECT_FALSE(second.cacheHit);
+    EXPECT_TRUE(second.patternMatches.empty())
+        << "a scan with pattern matching disabled reported pattern matches";
+}
+
+TEST_F(SignatureStoreQueryCacheTest, IdenticalOptionsStillHitTheCache) {
+    // Non-vacuity: the two tests above would also pass if caching were simply off.
+    const auto first = store_.ScanBuffer(payload_, PatternOnly());
+    ASSERT_FALSE(first.cacheHit);
+    const auto second = store_.ScanBuffer(payload_, PatternOnly());
+    EXPECT_TRUE(second.cacheHit) << "the same scan repeated must be served from the cache";
+    EXPECT_EQ(first.patternMatches.size(), second.patternMatches.size());
+}
+
+TEST_F(SignatureStoreQueryCacheTest, AReloadRetiresEveryCachedResult) {
+    ASSERT_FALSE(store_.ScanBuffer(payload_, PatternOnly()).cacheHit);
+    store_.Close();
+    ASSERT_TRUE(store_.Initialize(db_.wstring(), /*readOnly=*/true).IsSuccess());
+    EXPECT_FALSE(store_.ScanBuffer(payload_, PatternOnly()).cacheHit)
+        << "a result computed before the databases were reopened was served after it";
+}
+
+// ============================================================================
 // Entry Point
 // ============================================================================
 

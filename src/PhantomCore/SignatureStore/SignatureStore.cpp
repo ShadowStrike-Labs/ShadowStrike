@@ -412,6 +412,7 @@ void SignatureStore::Close() noexcept {
         SS_LOG_ERROR(L"SignatureStore", L"Close: Failed to acquire lock within timeout");
         // Force close anyway - this is a critical operation
         m_initialized.store(false, std::memory_order_release);
+        m_storeGeneration.fetch_add(1, std::memory_order_acq_rel);
         return;
     }
 
@@ -455,6 +456,12 @@ void SignatureStore::Close() noexcept {
     // Mark uninitialized BEFORE releasing lock to prevent new operations from starting
     m_initialized.store(false, std::memory_order_release);
 
+    // Retire every cached result computed against the databases just closed.
+    // ClearQueryCache below empties the cache, but a scan that finished under the
+    // old databases can still insert its result after that clear; the generation
+    // check in CheckQueryCache is what keeps such an entry from being served once
+    // a reload has opened a different rule set.
+    m_storeGeneration.fetch_add(1, std::memory_order_acq_rel);
     // Clear ONLY the SignatureStore-level query cache here. The component
     // sub-stores have just been Close()'d above (still under the exclusive
     // lock) and their caches were released as part of their own Close().
@@ -2177,7 +2184,8 @@ ScanResult SignatureStore::ExecuteSequentialScan(
 }
 
 std::optional<ScanResult> SignatureStore::CheckQueryCache(
-    std::span<const uint8_t> buffer
+    std::span<const uint8_t> buffer,
+    const ScanOptions& options
 ) const noexcept {
     // ========================================================================
     // TITANIUM CACHE LOOKUP - THREAD-SAFE WITH VALIDATION
@@ -2255,7 +2263,9 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
         hashMatches &= (entry.bufferHash[i] == hash->data[i]);
     }
     
-    if (hashMatches && entry.timestamp != 0) {
+    if (hashMatches && entry.timestamp != 0 &&
+        entry.optionsKey == ResultShapeKey(options) &&
+        entry.storeGeneration == m_storeGeneration.load(std::memory_order_acquire)) {
         // Cache hit - return copy of result (avoid reference lifetime issues)
         SS_LOG_DEBUG(L"SignatureStore", L"CheckQueryCache: Cache hit at index %zu", cacheIdx);
         ScanResult cached = entry.result;
@@ -2268,7 +2278,9 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
 
 void SignatureStore::AddToQueryCache(
     std::span<const uint8_t> buffer,
-    const ScanResult& result
+    const ScanOptions& options,
+    const ScanResult& result,
+    uint64_t storeGeneration
 ) const noexcept {
     // ========================================================================
     // TITANIUM CACHE UPDATE - THREAD-SAFE WITH VALIDATION
@@ -2276,6 +2288,13 @@ void SignatureStore::AddToQueryCache(
     
     // VALIDATION 1: Quick check if caching is enabled
     if (!m_queryCacheEnabled.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Only a COMPLETE scan may be replayed. A timed-out or partly failed scan
+    // reports a subset of what the buffer would match; caching it would hand that
+    // subset to every later caller as if it were the full answer.
+    if (result.timedOut || result.errorCount != 0) {
         return;
     }
     
@@ -2345,8 +2364,57 @@ void SignatureStore::AddToQueryCache(
     auto& entry = m_queryCache[cacheIdx];
 
     std::memcpy(entry.bufferHash.data(), hash->data.data(), 32);
+    entry.optionsKey = ResultShapeKey(options);
+    entry.storeGeneration = storeGeneration;
     entry.result = result;
-    entry.timestamp = m_queryCacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
+    // +1: timestamp 0 marks an empty slot in CheckQueryCache, so the counter's
+    // first value must never be stored or the first result cached is unreachable.
+    entry.timestamp = m_queryCacheAccessCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t SignatureStore::ResultShapeKey(const ScanOptions& options) noexcept {
+    // FNV-1a over the fields that decide which detections a finished scan
+    // reports. Strings are length-prefixed so {"ab","c"} and {"a","bc"} differ.
+    uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&h](uint64_t v) noexcept {
+        for (int i = 0; i < 8; ++i) {
+            h ^= (v >> (i * 8)) & 0xFFu;
+            h *= 1099511628211ULL;
+        }
+    };
+    const auto mixStrings = [&](const std::vector<std::string>& v) noexcept {
+        mix(v.size());
+        for (const auto& s : v) {
+            mix(s.size());
+            for (const char c : s) mix(static_cast<uint8_t>(c));
+        }
+    };
+
+    mix(options.enableHashLookup);
+    mix(options.enablePatternScan);
+    mix(options.enableYaraScan);
+    mix(options.GetValidatedMaxResults());
+    mix(options.stopOnFirstMatch);
+    mix(static_cast<uint64_t>(options.minThreatLevel));
+    mixStrings(options.tagFilter);
+    mix(options.hashTypesEnabled.size());
+    for (const auto t : options.hashTypesEnabled) mix(static_cast<uint64_t>(t));
+
+    const auto& y = options.yaraOptions;
+    mix(y.maxMatchesPerRule);
+    mix(y.scanFlags);
+    mix(y.captureMatchData);
+    mix(y.fastMode);
+    mix(y.maxFileSizeBytes);
+    mix(static_cast<uint64_t>(y.minThreatLevel));
+    mixStrings(y.namespaceFilter);
+    mixStrings(y.tagFilter);
+
+    const auto& p = options.patternOptions;
+    mix(p.exactMatch);
+    mix(p.maxResults);
+    mix(static_cast<uint64_t>(p.minThreatLevel));
+    return h;
 }
 
 void SignatureStore::MergeResults(
