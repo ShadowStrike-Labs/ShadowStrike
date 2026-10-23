@@ -388,7 +388,11 @@ public:
 
     [[nodiscard]] bool DisassembleBuffer(const uint8_t* buffer, size_t size, uint64_t baseAddress,
                                           bool is64Bit, std::vector<DisassembledInstruction>& out,
-                                          size_t maxInstructions = 0) const noexcept {
+                                          size_t maxInstructions = 0,
+                                          bool* limitReached = nullptr) const noexcept {
+        if (limitReached) {
+            *limitReached = false;
+        }
         if (!m_disasmInitialized || !buffer || size == 0) {
             return false;
         }
@@ -398,7 +402,17 @@ public:
         size_t instrCount = 0;
         size_t limit = maxInstructions > 0 ? maxInstructions : MetamorphicConstants::MAX_INSTRUCTIONS;
 
-        out.reserve(std::min(size / 4, limit));
+        // THE UP-FRONT RESERVE IS BOUNDED SEPARATELY FROM THE DECODE LIMIT.
+        //
+        // A record is about 474 bytes, and this used to reserve min(size/4, limit)
+        // of them before decoding a single byte. With the 10,000,000 default limit a
+        // 17 MB non-PE file (a WER .etl trace) reserved 4.4 million records - 2.0 GB
+        // committed at once - and random bytes decode to more than size/4
+        // instructions, so the vector then grew 1.5x while the old block was still
+        // held: the 2.0 GB / 5.8 GB service spikes measured on 1.0.118. The reserve
+        // is only an allocation hint; growth past it is amortised as usual.
+        constexpr size_t kMaxInitialReserve = 64u * 1024u;
+        out.reserve(std::min({ size / 4, limit, kMaxInitialReserve }));
 
         while (offset < size && instrCount < limit) {
             DisassembledInstruction instr = {};
@@ -439,6 +453,12 @@ public:
             out.push_back(instr);
             offset += instr.length;
             ++instrCount;
+        }
+
+        // Stopped by the limit with bytes left over: the caller analysed a prefix,
+        // and must be able to say so rather than report the buffer as examined.
+        if (limitReached) {
+            *limitReached = (instrCount >= limit && offset < size);
         }
 
         return !out.empty();
@@ -1134,12 +1154,13 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool AnalyzeCFG(const uint8_t* buffer, size_t size, uint64_t baseAddress,
-                                   bool is64Bit, CFGAnalysisInfo& out) const noexcept {
+                                   bool is64Bit, CFGAnalysisInfo& out,
+                                   size_t maxInstructions = MetamorphicConstants::MAX_INSTRUCTIONS) const noexcept {
         out = CFGAnalysisInfo();
 
         std::vector<DisassembledInstruction> instructions;
         if (!DisassembleBuffer(buffer, size, baseAddress, is64Bit, instructions,
-                               MetamorphicConstants::MAX_INSTRUCTIONS)) {
+                               maxInstructions)) {
             return false;
         }
 
@@ -1930,6 +1951,33 @@ MetamorphicResult MetamorphicDetector::AnalyzeBuffer(
 // INTERNAL ANALYSIS
 // ============================================================================
 
+namespace {
+
+// Record one disassembly pass on the result. A pass the instruction limit cut
+// short analysed a prefix of the code, so the result is marked truncated - the
+// same contract the time budget uses - instead of reading as a full examination.
+void NoteDecodePass(MetamorphicResult& result, size_t decoded, bool hitLimit,
+                    size_t limit, const wchar_t* stage) noexcept {
+    if (decoded > result.largestDecodePass) {
+        result.largestDecodePass = decoded;
+    }
+    if (!hitLimit) {
+        return;
+    }
+    result.analysisTruncated = true;
+    try {
+        result.errors.push_back({
+            static_cast<uint32_t>(ERROR_MORE_DATA),
+            std::wstring(L"Instruction limit of ") + std::to_wstring(limit) +
+                L" reached; the rest of the code region was not decoded",
+            stage });
+    } catch (...) {
+        // The truncation flag is already set; only the explanatory entry is lost.
+    }
+}
+
+} // namespace
+
 void MetamorphicDetector::AnalyzeFileInternal(
     const uint8_t* buffer,
     size_t size,
@@ -2228,9 +2276,12 @@ void MetamorphicDetector::AnalyzeFileInternal(
 
         std::vector<Impl::DisassembledInstruction> instructions;
         if (outOfTime(L"DisassembleBuffer")) { return; }
+        bool primaryHitLimit = false;
         if (m_impl->DisassembleBuffer(codeBuffer, codeSize, baseAddress, is64Bit, instructions,
-                                       config.maxInstructions)) {
+                                       config.maxInstructions, &primaryHitLimit)) {
             result.instructionsAnalyzed = instructions.size();
+            NoteDecodePass(result, instructions.size(), primaryHitLimit,
+                           config.maxInstructions, L"primary disassembly");
 
             if (outOfTime(L"post-disassembly")) { return; }
 
@@ -2281,7 +2332,7 @@ void MetamorphicDetector::AnalyzeFileInternal(
                 // defaults to false, so a CFG that was never analysed used to read as a
                 // control flow that is not flattened.
                 if (m_impl->AnalyzeCFG(codeBuffer, codeSize, baseAddress, is64Bit,
-                                       result.cfgAnalysis) &&
+                                       result.cfgAnalysis, config.maxInstructions) &&
                     result.cfgAnalysis.isFlattened) {
                     auto detection = MetamorphicDetectionBuilder()
                         .Technique(MetamorphicTechnique::OBF_ControlFlowFlattening)
@@ -2300,19 +2351,19 @@ void MetamorphicDetector::AnalyzeFileInternal(
 
             // Deep technique analysis — complementary to Impl:: quick checks above
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanMetamorphic)) {
-                AnalyzeMetamorphicTechniques(codeBuffer, codeSize, result);
+                AnalyzeMetamorphicTechniques(codeBuffer, codeSize, config.maxInstructions, result);
             }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanPolymorphic)) {
-                AnalyzePolymorphicTechniques(codeBuffer, codeSize, result);
+                AnalyzePolymorphicTechniques(codeBuffer, codeSize, config.maxInstructions, result);
             }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanSelfModifying)) {
-                AnalyzeSelfModifyingTechniques(codeBuffer, codeSize, result);
+                AnalyzeSelfModifyingTechniques(codeBuffer, codeSize, config.maxInstructions, result);
             }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanObfuscation)) {
-                AnalyzeObfuscationTechniques(codeBuffer, codeSize, result);
+                AnalyzeObfuscationTechniques(codeBuffer, codeSize, config.maxInstructions, result);
             }
             if (HasFlag(config.flags, MetamorphicAnalysisFlags::ScanVMProtection)) {
-                AnalyzeVMProtection(codeBuffer, codeSize, result);
+                AnalyzeVMProtection(codeBuffer, codeSize, config.maxInstructions, result);
             }
         }
     }
@@ -3489,6 +3540,7 @@ void MetamorphicDetector::ResetStatistics() noexcept {
 void MetamorphicDetector::AnalyzeMetamorphicTechniques(
     const uint8_t* buffer,
     size_t size,
+    size_t maxInstructions,
     MetamorphicResult& result) noexcept
 {
     if (!buffer || size < 16 || !m_impl->m_disasmInitialized) {
@@ -3497,10 +3549,12 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
 
     // Disassemble for analysis
     std::vector<Impl::DisassembledInstruction> instructions;
+    bool hitLimit = false;
     if (!m_impl->DisassembleBuffer(buffer, size, 0, result.peAnalysis.is64Bit,
-                                    instructions, MetamorphicConstants::MAX_INSTRUCTIONS)) {
+                                    instructions, maxInstructions, &hitLimit)) {
         return;
     }
+    NoteDecodePass(result, instructions.size(), hitLimit, maxInstructions, L"metamorphic stage");
 
     if (instructions.size() < 10) {
         return;
@@ -3960,6 +4014,7 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
 void MetamorphicDetector::AnalyzePolymorphicTechniques(
     const uint8_t* buffer,
     size_t size,
+    size_t maxInstructions,
     MetamorphicResult& result) noexcept
 {
     if (!buffer || size < 32 || !m_impl->m_disasmInitialized) {
@@ -3967,10 +4022,12 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
     }
 
     std::vector<Impl::DisassembledInstruction> instructions;
+    bool hitLimit = false;
     if (!m_impl->DisassembleBuffer(buffer, size, 0, result.peAnalysis.is64Bit,
-                                    instructions, MetamorphicConstants::MAX_INSTRUCTIONS)) {
+                                    instructions, maxInstructions, &hitLimit)) {
         return;
     }
+    NoteDecodePass(result, instructions.size(), hitLimit, maxInstructions, L"polymorphic stage");
 
     if (instructions.size() < 20) {
         return;
@@ -4272,6 +4329,7 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
 void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
     const uint8_t* buffer,
     size_t size,
+    size_t maxInstructions,
     MetamorphicResult& result) noexcept
 {
     if (!buffer || size < 32 || !m_impl->m_disasmInitialized) {
@@ -4279,10 +4337,12 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
     }
 
     std::vector<Impl::DisassembledInstruction> instructions;
+    bool hitLimit = false;
     if (!m_impl->DisassembleBuffer(buffer, size, 0, result.peAnalysis.is64Bit,
-                                    instructions, MetamorphicConstants::MAX_INSTRUCTIONS)) {
+                                    instructions, maxInstructions, &hitLimit)) {
         return;
     }
+    NoteDecodePass(result, instructions.size(), hitLimit, maxInstructions, L"self-modifying stage");
 
     // ========================================================================
     // Dynamic Code Generation Pattern Detection
@@ -4504,6 +4564,7 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
 void MetamorphicDetector::AnalyzeObfuscationTechniques(
     const uint8_t* buffer,
     size_t size,
+    size_t maxInstructions,
     MetamorphicResult& result) noexcept
 {
     if (!buffer || size < 32 || !m_impl->m_disasmInitialized) {
@@ -4511,10 +4572,12 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
     }
 
     std::vector<Impl::DisassembledInstruction> instructions;
+    bool hitLimit = false;
     if (!m_impl->DisassembleBuffer(buffer, size, 0, result.peAnalysis.is64Bit,
-                                    instructions, MetamorphicConstants::MAX_INSTRUCTIONS)) {
+                                    instructions, maxInstructions, &hitLimit)) {
         return;
     }
+    NoteDecodePass(result, instructions.size(), hitLimit, maxInstructions, L"obfuscation stage");
 
     if (instructions.size() < 20) {
         return;
@@ -4868,6 +4931,7 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
 void MetamorphicDetector::AnalyzeVMProtection(
     const uint8_t* buffer,
     size_t size,
+    size_t maxInstructions,
     MetamorphicResult& result) noexcept
 {
     if (!buffer || size < 64 || !m_impl->m_disasmInitialized) {
@@ -4875,10 +4939,12 @@ void MetamorphicDetector::AnalyzeVMProtection(
     }
 
     std::vector<Impl::DisassembledInstruction> instructions;
+    bool hitLimit = false;
     if (!m_impl->DisassembleBuffer(buffer, size, 0, result.peAnalysis.is64Bit,
-                                    instructions, MetamorphicConstants::MAX_INSTRUCTIONS)) {
+                                    instructions, maxInstructions, &hitLimit)) {
         return;
     }
+    NoteDecodePass(result, instructions.size(), hitLimit, maxInstructions, L"VM-protection stage");
 
     if (instructions.size() < 50) {
         return;

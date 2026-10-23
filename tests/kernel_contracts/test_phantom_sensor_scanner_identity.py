@@ -12051,7 +12051,7 @@ class DiscardedAnalysisResultContractTests(unittest.TestCase):
             "AnalyzeCFG is called as a bare statement again, so isFlattened is read from "
             "a CFG that may never have been analysed")
         self.assertTrue(
-            "result.cfgAnalysis) &&" in code,
+            "result.cfgAnalysis, config.maxInstructions) &&" in code,
             "the CFG result is no longer conjoined with the isFlattened read it guards")
 
     def test_a_failed_adapter_enumeration_cannot_produce_a_sandbox_verdict(self):
@@ -28134,6 +28134,22 @@ class SharedSignatureStoreTests(unittest.TestCase):
         self.assertIn("sigOpts.enablePatternScan = false;", opts)
         self.assertIn("if (m_signatureStore && m_signatureStore->IsInitialized()) {", src,
             "the YARA layer must degrade, not crash, when the shared store did not open")
+
+
+class MetamorphicDecodeLimitTests(unittest.TestCase):
+    """Every metamorphic disassembly pass honours the caller's instruction limit (227).
+
+    The deep stages decoded with MetamorphicConstants::MAX_INSTRUCTIONS (10M) at
+    ~474 bytes per record; on-access asks for 64K, and a 17 MB non-PE file committed
+    2.0 GB and then 5.8 GB on 1.0.118.
+    """
+
+    def test_no_metamorphic_stage_decodes_with_the_offline_limit(self):
+        meta = strip_c_comments(read_source(ROOT / "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.cpp"))
+        self.assertNotIn("instructions, MetamorphicConstants::MAX_INSTRUCTIONS", meta,
+            "a stage decodes with the 10M offline limit instead of the caller's; at ~474 "
+            "bytes per instruction that is the 2-6 GB on-access spike")
+        self.assertEqual(5, meta.count("instructions, maxInstructions, &hitLimit)"))
 
 
 if __name__ == "__main__":

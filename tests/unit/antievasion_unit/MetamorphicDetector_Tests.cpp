@@ -420,4 +420,66 @@ TEST(MetamorphicDetector_RegisterReassignment,
     detector.Shutdown();
 }
 
+// ============================================================================
+// Every disassembly pass honours the caller's instruction limit (task 227)
+// ============================================================================
+//
+// The primary pass used config.maxInstructions, but the five deep stages each
+// decoded the code region again with MetamorphicConstants::MAX_INSTRUCTIONS
+// (10,000,000) at ~474 bytes per record. On a 17 MB non-PE file the on-access
+// path, which asks for 64K instructions, committed 2.0 GB and then 5.8 GB.
+
+namespace {
+
+// The default flags are what the on-access path runs: the primary pass plus the
+// metamorphic and polymorphic stages. The three deeper stages have no caller in
+// the product (MetamorphicReachabilityContractTests) and take the same limit by
+// the same code; DetectionStoresAreOpenedTests pins that in source.
+MetamorphicAnalysisConfig DefaultStagesLimitedTo(size_t maxInstructions) {
+    MetamorphicAnalysisConfig cfg{};
+    cfg.maxInstructions = maxInstructions;
+    cfg.timeoutMs = 0;   // no deadline: only the instruction limit may stop a pass
+    return cfg;
+}
+
+} // namespace
+
+TEST(MetamorphicDetector_DecodeLimit, NoStageDecodesPastTheCallerLimit) {
+    MetamorphicDetector detector;
+    ASSERT_TRUE(detector.Initialize());
+
+    // One-byte NOPs: every byte decodes, so an unbounded pass would decode one
+    // instruction per byte - 1,048,576 of them.
+    const std::vector<uint8_t> code(1u << 20, 0x90);
+    constexpr size_t kLimit = 4096;
+
+    const auto result = detector.AnalyzeBuffer(code.data(), code.size(),
+                                               DefaultStagesLimitedTo(kLimit));
+
+    ASSERT_GT(result.largestDecodePass, 0u) << "nothing was decoded, so nothing was tested";
+    EXPECT_LE(result.largestDecodePass, kLimit)
+        << "a disassembly pass decoded past MetamorphicAnalysisConfig::maxInstructions";
+    EXPECT_TRUE(result.analysisTruncated)
+        << "the code region was cut short by the limit, so the result must not read "
+           "as a complete examination";
+
+    detector.Shutdown();
+}
+
+TEST(MetamorphicDetector_DecodeLimit, ARegionWithinTheLimitIsNotMarkedTruncated) {
+    // Non-vacuity for the test above: truncation must come from the limit, not be
+    // reported for every analysis.
+    MetamorphicDetector detector;
+    ASSERT_TRUE(detector.Initialize());
+
+    const std::vector<uint8_t> code(1024, 0x90);
+    const auto result = detector.AnalyzeBuffer(code.data(), code.size(),
+                                               DefaultStagesLimitedTo(4096));
+
+    ASSERT_GT(result.largestDecodePass, 0u);
+    EXPECT_FALSE(result.analysisTruncated);
+
+    detector.Shutdown();
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

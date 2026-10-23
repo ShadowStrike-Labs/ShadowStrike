@@ -1695,6 +1695,14 @@ namespace ShadowStrike {
             /// @brief Instructions disassembled
             uint64_t instructionsAnalyzed = 0;
 
+            /// @brief Most instructions decoded by any single disassembly pass.
+            ///
+            /// Every stage decodes the code region separately, so this - not
+            /// instructionsAnalyzed, which is the primary pass only - is what bounds
+            /// the memory one analysis can commit (~474 bytes per instruction). It
+            /// never exceeds config.maxInstructions.
+            uint64_t largestDecodePass = 0;
+
             /// @brief Functions analyzed
             uint32_t functionsAnalyzed = 0;
 
@@ -1821,6 +1829,7 @@ namespace ShadowStrike {
                 analysisComplete = false;
                 fromCache = false;
                 analysisTruncated = false;
+                largestDecodePass = 0;
                 fuzzyHash.clear();
                 tlshHash.clear();
                 ngramProfile.clear();
@@ -2274,33 +2283,43 @@ namespace ShadowStrike {
                 MetamorphicResult& result
             ) noexcept;
 
+            // maxInstructions is the caller's MetamorphicAnalysisConfig::maxInstructions.
             void AnalyzeMetamorphicTechniques(
                 const uint8_t* buffer,
                 size_t size,
+                size_t maxInstructions,
                 MetamorphicResult& result
             ) noexcept;
 
+            // maxInstructions is the caller's MetamorphicAnalysisConfig::maxInstructions.
             void AnalyzePolymorphicTechniques(
                 const uint8_t* buffer,
                 size_t size,
+                size_t maxInstructions,
                 MetamorphicResult& result
             ) noexcept;
 
+            // maxInstructions is the caller's MetamorphicAnalysisConfig::maxInstructions.
             void AnalyzeSelfModifyingTechniques(
                 const uint8_t* buffer,
                 size_t size,
+                size_t maxInstructions,
                 MetamorphicResult& result
             ) noexcept;
 
+            // maxInstructions is the caller's MetamorphicAnalysisConfig::maxInstructions.
             void AnalyzeObfuscationTechniques(
                 const uint8_t* buffer,
                 size_t size,
+                size_t maxInstructions,
                 MetamorphicResult& result
             ) noexcept;
 
+            // maxInstructions is the caller's MetamorphicAnalysisConfig::maxInstructions.
             void AnalyzeVMProtection(
                 const uint8_t* buffer,
                 size_t size,
+                size_t maxInstructions,
                 MetamorphicResult& result
             ) noexcept;
 
