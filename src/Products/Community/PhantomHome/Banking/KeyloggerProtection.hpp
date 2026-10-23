@@ -134,6 +134,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "Common.hpp"   // DetectionAction
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/MemoryUtils.hpp"
@@ -294,16 +295,9 @@ enum class InputFieldType : uint8_t {
     Generic     = 9
 };
 
-/**
- * @brief Detection action
- */
-enum class DetectionAction : uint8_t {
-    None            = 0,
-    Alert           = 1,
-    Block           = 2,
-    Terminate       = 3,
-    Quarantine      = 4
-};
+// DetectionAction is defined once for the namespace, in Common.hpp. This header
+// used to declare Terminate = 3 and Quarantine = 4, the reverse of
+// BankingTrojanDetector.hpp.
 
 /**
  * @brief Module status

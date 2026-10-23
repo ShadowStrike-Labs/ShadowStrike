@@ -1137,6 +1137,7 @@
     <ClInclude Include="src\Products\Community\PhantomEDR\Vulnerability\VulnTypes.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Banking\BankingTrojanDetector.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Banking\CertificatePinning.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\Banking\Common.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Banking\KeyloggerProtection.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Banking\ScreenshotBlocker.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Banking\SecureBrowser.hpp" />

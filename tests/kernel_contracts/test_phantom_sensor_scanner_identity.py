@@ -28197,5 +28197,26 @@ class DetectionStoresAreOpenedTests(unittest.TestCase):
         self.assertIn("SignatureStore::SignatureStore::OpenShared(", self.src[self.PA])
 
 
+class BankingDetectionActionTests(unittest.TestCase):
+    """ShadowStrike::Banking has one DetectionAction (task 305).
+
+    BankingTrojanDetector.hpp and KeyloggerProtection.hpp each declared one, with
+    Quarantine and Terminate transposed, so a stored 3 meant a different response
+    depending on which module wrote it.
+    """
+
+    def test_only_common_hpp_defines_it(self):
+        folder = ROOT / "src/Products/Community/PhantomHome/Banking"
+        owners = sorted(p.name for p in folder.rglob("*.hpp")
+                        if "enum class DetectionAction" in strip_c_comments(read_source(p)))
+        self.assertEqual(["Common.hpp"], owners)
+
+    def test_both_modules_include_it(self):
+        folder = ROOT / "src/Products/Community/PhantomHome/Banking"
+        for name in ("BankingTrojanDetector.hpp", "KeyloggerProtection.hpp"):
+            with self.subTest(header=name):
+                self.assertIn('#include "Common.hpp"', read_source(folder / name))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

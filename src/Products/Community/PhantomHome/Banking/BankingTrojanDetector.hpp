@@ -140,6 +140,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "Common.hpp"   // DetectionAction
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
@@ -360,17 +361,7 @@ enum class WebInjectType : uint8_t {
     VideoCapture    = 6     ///< Video recording
 };
 
-/**
- * @brief Detection action
- */
-enum class DetectionAction : uint8_t {
-    None            = 0,
-    Alert           = 1,    ///< Alert only
-    Block           = 2,    ///< Block operation
-    Quarantine      = 3,    ///< Quarantine process
-    Terminate       = 4,    ///< Terminate process
-    Remediate       = 5     ///< Full remediation
-};
+// DetectionAction is defined once for the namespace, in Common.hpp.
 
 /**
  * @brief Module status

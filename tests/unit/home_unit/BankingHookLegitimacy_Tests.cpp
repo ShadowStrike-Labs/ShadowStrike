@@ -46,6 +46,14 @@
 #include "Products/Community/PhantomHome/Banking/KeyloggerProtection.hpp"
 #include "Products/Community/PhantomHome/Banking/SecureBrowser.hpp"
 
+// DetectionAction is one type for the whole Banking namespace (Common.hpp, task 305).
+// KeyloggerProtection.hpp used to declare Terminate = 3 and Quarantine = 4, the
+// reverse of BankingTrojanDetector.hpp, so a serialised 3 meant a different
+// response depending on which module wrote it.
+static_assert(static_cast<int>(ShadowStrike::Banking::DetectionAction::Quarantine) == 3);
+static_assert(static_cast<int>(ShadowStrike::Banking::DetectionAction::Terminate) == 4);
+static_assert(static_cast<int>(ShadowStrike::Banking::DetectionAction::Remediate) == 5);
+
 namespace {
 
 using ShadowStrike::Banking::KeyboardHookInfo;
