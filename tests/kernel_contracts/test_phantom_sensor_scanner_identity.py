@@ -28361,5 +28361,28 @@ class ServiceStartLoadTests(unittest.TestCase):
         self.assertLess(probe, init)
 
 
+class PreMainBootTraceTests(unittest.TestCase):
+    """The service writes a boot-trace line before any library static runs (334).
+
+    A .CRT$XCT entry inside PhantomCoreLib was meant to, and never survived the
+    whole-program link: no boot log from 1.0.117 to 1.0.121 holds its line. So a
+    start that missed SCM's 30 s window left an empty log. The constructor lives
+    in the service project under init_seg(compiler), where no archive member can
+    be left out.
+    """
+
+    VCX = ROOT / "ShadowStrikePhantomService.vcxproj"
+    SRC = ROOT / "src/PhantomCore/Service/PreMainTrace.cpp"
+
+    def test_compiled_into_the_service_image(self):
+        self.assertIn('<ClCompile Include="src\\PhantomCore\\Service\\PreMainTrace.cpp">', read_source(self.VCX))
+
+    def test_runs_in_the_compiler_init_segment(self):
+        src = strip_c_comments(read_source(self.SRC))
+        self.assertIn("#pragma init_seg(compiler)", src)
+        self.assertIn("ShadowStrikeAppendBootTrace(", src)
+        self.assertIn("GetProcessTimes(", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

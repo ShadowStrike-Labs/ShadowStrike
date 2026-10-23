@@ -131,6 +131,9 @@
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\Service\PreMainTrace.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Service\ServiceMain.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>

@@ -113,27 +113,6 @@ extern "C" void ShadowStrikeAppendBootTrace(const wchar_t* stage) noexcept {
     AppendBootTraceLine(stage);
 }
 
-// ---------------------------------------------------------------------------
-// PRE-WMAIN STATIC INITIALIZER
-// Runs from the .CRT$XCT section, AFTER the CRT is initialized but BEFORE
-// any user C++ static constructors. This lets us prove the PE loaded, the
-// CRT armed, and the process is about to enter user globals -- invaluable
-// when a static initializer throws and dies before wmain.
-// ---------------------------------------------------------------------------
-namespace {
-int ShadowStrikePreWmainInitializer() noexcept {
-    AppendBootTraceLine(L"pre-wmain-static-initializer");
-    return 0;
-}
-} // namespace
-
-#pragma section(".CRT$XCT", read)
-__declspec(allocate(".CRT$XCT"))
-extern "C" int (* const g_ssPreWmainInit)() = &ShadowStrikePreWmainInitializer;
-
-// Force the linker to keep the symbol even with /OPT:REF.
-#ifdef _M_X64
-#pragma comment(linker, "/include:g_ssPreWmainInit")
-#else
-#pragma comment(linker, "/include:_g_ssPreWmainInit")
-#endif
+// The pre-main line is written by PreMainTrace.cpp in the service project. A
+// .CRT$XCT entry here never survived the whole-program link of this library:
+// no boot log from 1.0.117 to 1.0.121 contains its line (task 334).
