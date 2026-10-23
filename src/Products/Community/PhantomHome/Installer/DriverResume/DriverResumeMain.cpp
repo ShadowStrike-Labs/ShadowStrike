@@ -681,6 +681,13 @@ static int RunStage2()
             LOG_ERROR(L"Stage 2: service start watchdog could not be registered (0x%08X). "
                       L"A first-boot start that times out will stay stopped until the next boot.",
                       wdErr);
+        } else if (const DWORD runErr = ShadowStrike::Installer::RunServiceWatchdogTaskNow();
+                   runErr != ERROR_SUCCESS) {
+            // Stage 2 runs DURING the first boot after install, so the boot trigger
+            // just registered first fires on the second boot. Starting the task now
+            // is what covers this boot - the one measured to fail.
+            LOG_ERROR(L"Stage 2: service start watchdog could not be started for this boot "
+                      L"(0x%08X); it will first act on the next boot.", runErr);
         }
     }
 
@@ -887,16 +894,13 @@ static int RunInstallNow()
 // ────────────────────────────────────────────────────────────────────────────
 //  --start-service
 // ────────────────────────────────────────────────────────────────────────────
-static int RunStartService()
+// An already-running service is a status query. A start that ran out of time is
+// retried with a fresh SCM window, a bounded number of times; any other failure is a
+// configuration fault that a retry would only repeat, so it is reported once.
+static int StartHomeServiceWithRetry()
 {
     using namespace ShadowStrike::Installer;
 
-    LOG_INFO(L"=== Mode: --start-service ===");
-
-    // Run by the boot watchdog task and by hand. An already-running service is a
-    // status query. A start that ran out of time is retried with a fresh SCM window,
-    // a bounded number of times; any other failure is a configuration fault that a
-    // retry would only repeat, so it is reported once.
     DWORD err = ERROR_SUCCESS;
     for (unsigned attempt = 1; attempt <= kServiceStartMaxAttempts; ++attempt) {
         err = StartHomeServiceBestEffort(attempt == 1 ? L"start request" : L"retry after start timeout");
@@ -920,6 +924,27 @@ static int RunStartService()
     LOG_ERROR(L"Home service did not start after %u attempts (last 0x%08X).",
               kServiceStartMaxAttempts, err);
     return kExitGenericFailure;
+}
+
+static int RunStartService()
+{
+    LOG_INFO(L"=== Mode: --start-service ===");
+    return StartHomeServiceWithRetry();
+}
+
+// Run by the \ShadowStrike\PhantomServiceStartWatchdog task (task 334): wait until
+// SCM's own delayed auto-start has had its chance, then make sure the service runs.
+static int RunServiceWatchdog()
+{
+    using namespace ShadowStrike::Installer;
+
+    LOG_INFO(L"=== Mode: --service-watchdog ===");
+    const ULONGLONG waitMs = ServiceWatchdogRemainingWaitMs(GetTickCount64());
+    if (waitMs > 0) {
+        LOG_INFO(L"Waiting %llu ms for the delayed auto-start window to pass.", waitMs);
+        Sleep(static_cast<DWORD>(waitMs));   // bounded by kServiceWatchdogMinUptimeMs
+    }
+    return StartHomeServiceWithRetry();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1008,7 +1033,8 @@ static int InnerMain(int argc, wchar_t* argv[])
     if (argc < 2) {
         LOG_ERROR(L"No mode argument. Usage: ShadowStrikeDriverResume.exe "
                   L"[--stage1 | --stage1-msi | --stage2 | --install-now | "
-                  L"--start-service | --uninstall | --install-root-cert [path]]");
+                  L"--start-service | --service-watchdog | --uninstall | "
+                  L"--install-root-cert [path]]");
         FlushLogger();
         return kExitBadArgs;
     }
@@ -1026,6 +1052,8 @@ static int InnerMain(int argc, wchar_t* argv[])
         result = RunInstallNow();
     else if (mode == L"--start-service")
         result = RunStartService();
+    else if (mode == ShadowStrike::Installer::kServiceWatchdogVerb)
+        result = RunServiceWatchdog();
     else if (mode == L"--uninstall")
         result = RunUninstall();
     else if (mode == L"--install-root-cert")

@@ -28406,14 +28406,21 @@ class ServiceStartWatchdogWiringTests(unittest.TestCase):
         j = self.src.find("static int Run", m.end())
         return self.src[m.start():j if j != -1 else len(self.src)]
 
-    def test_stage2_registers_the_watchdog(self):
-        self.assertIn("RegisterServiceWatchdogTask(", self._body("RunStage2"))
+    def test_stage2_registers_the_watchdog_and_covers_this_boot(self):
+        body = self._body("RunStage2")
+        self.assertIn("RegisterServiceWatchdogTask(", body)
+        self.assertIn("RunServiceWatchdogTaskNow()", body,
+            "Stage 2 runs during the first boot; a boot trigger alone first fires on the second")
+
+    def test_the_task_verb_is_dispatched(self):
+        self.assertIn("mode == ShadowStrike::Installer::kServiceWatchdogVerb", self.src)
+        self.assertIn("StartHomeServiceWithRetry()", self._body("RunServiceWatchdog"))
 
     def test_uninstall_removes_it(self):
         self.assertIn("DeleteServiceWatchdogTask()", self._body("RunUninstall"))
 
     def test_start_service_retries_only_timeouts_and_is_bounded(self):
-        body = self._body("RunStartService")
+        body = self._body("StartHomeServiceWithRetry")
         self.assertIn("attempt <= kServiceStartMaxAttempts", body)
         self.assertIn("IsRetryableServiceStartFailure(err)", body)
 

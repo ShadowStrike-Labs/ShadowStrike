@@ -24,6 +24,8 @@ namespace {
 
 using ShadowStrike::Installer::BuildServiceWatchdogTaskXml;
 using ShadowStrike::Installer::IsRetryableServiceStartFailure;
+using ShadowStrike::Installer::ServiceWatchdogRemainingWaitMs;
+using ShadowStrike::Installer::kServiceWatchdogMinUptimeMs;
 
 const std::wstring kExe = L"C:\\Program Files\\ShadowStrike\\Phantom\\ShadowStrikeDriverResume.exe";
 
@@ -31,13 +33,14 @@ TEST(ServiceStartWatchdog, TheTaskRunsTheInstalledBinaryAsSystemAtBoot) {
     const std::wstring xml = BuildServiceWatchdogTaskXml(kExe);
     ASSERT_FALSE(xml.empty());
     EXPECT_NE(std::wstring::npos, xml.find(L"<Command>" + kExe + L"</Command>"));
-    EXPECT_NE(std::wstring::npos, xml.find(L"<Arguments>--start-service</Arguments>"));
+    EXPECT_NE(std::wstring::npos, xml.find(L"<Arguments>--service-watchdog</Arguments>"));
     EXPECT_NE(std::wstring::npos, xml.find(L"<UserId>S-1-5-18</UserId>")) << "LocalSystem by SID";
     EXPECT_NE(std::wstring::npos, xml.find(L"<BootTrigger>"));
-    EXPECT_NE(std::wstring::npos, xml.find(L"<Delay>PT4M</Delay>"))
-        << "after SCM's own delayed auto-start attempt and its 30 s window";
-    EXPECT_NE(std::wstring::npos, xml.find(L"<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>"))
-        << "bounded: 3 attempts x (30 s + 60 s) fits well inside";
+    EXPECT_EQ(std::wstring::npos, xml.find(L"<Delay>"))
+        << "the wait lives in the watchdog, measured from boot; a trigger delay would add to "
+           "it when Stage 2 starts the task late in the first boot";
+    EXPECT_NE(std::wstring::npos, xml.find(L"<ExecutionTimeLimit>PT15M</ExecutionTimeLimit>"))
+        << "bounded: a 4 min wait plus 3 attempts x (30 s + 60 s) fits inside";
     EXPECT_NE(std::wstring::npos, xml.find(L"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
 }
 
@@ -61,6 +64,14 @@ TEST(ServiceStartWatchdog, XmlSpecialCharactersInThePathAreEscaped) {
     ASSERT_FALSE(xml.empty());
     EXPECT_NE(std::wstring::npos, xml.find(L"<Command>C:\\R&amp;D\\ShadowStrikeDriverResume.exe</Command>"));
     EXPECT_EQ(std::wstring::npos, xml.find(L"R&D")) << "a raw ampersand makes the task XML invalid";
+}
+
+TEST(ServiceStartWatchdog, ItWaitsOnlyUntilTheDelayedStartWindowHasPassed) {
+    EXPECT_EQ(kServiceWatchdogMinUptimeMs, ServiceWatchdogRemainingWaitMs(0));
+    EXPECT_EQ(kServiceWatchdogMinUptimeMs - 60'000, ServiceWatchdogRemainingWaitMs(60'000));
+    EXPECT_EQ(0u, ServiceWatchdogRemainingWaitMs(kServiceWatchdogMinUptimeMs))
+        << "Stage 2 starts the task minutes into the first boot; it must not wait again";
+    EXPECT_EQ(0u, ServiceWatchdogRemainingWaitMs(86'400'000ULL));
 }
 
 TEST(ServiceStartWatchdog, OnlyATimedOutStartIsRetried) {

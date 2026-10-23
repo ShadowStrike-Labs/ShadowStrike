@@ -22,7 +22,7 @@
  *
  * THE FIX. A SYSTEM scheduled task, registered by Stage 2 and removed by uninstall, runs
  * ShadowStrikeDriverResume.exe --start-service once per boot, after the delayed
- * auto-start window. If the service is already running that is a status query; if SCM
+ * auto-start window (ServiceWatchdogRemainingWaitMs). If the service is already running that is a status query; if SCM
  * gave up, it starts it again with a fresh 30 s window, retrying a bounded number of
  * times. It does not restart a service someone stopped later in the session: it runs
  * once, at boot.
@@ -50,9 +50,21 @@ namespace ShadowStrike::Installer {
 inline constexpr wchar_t kServiceWatchdogTaskFolder[] = L"\\ShadowStrike";
 inline constexpr wchar_t kServiceWatchdogTaskName[]   = L"PhantomServiceStartWatchdog";
 
-/// Boot delay before the check: after SCM's delayed auto-start (about 2 min after
-/// boot) has had its own attempt and its 30 s connect window.
-inline constexpr wchar_t kServiceWatchdogBootDelay[]  = L"PT4M";
+/// Command-line verb the task runs. Distinct from --start-service, which acts at once.
+inline constexpr wchar_t kServiceWatchdogVerb[] = L"--service-watchdog";
+
+/// The watchdog acts only once the machine has been up this long: after SCM's delayed
+/// auto-start (about 2 min after boot) has had its own attempt and its 30 s window.
+/// This is the ONE place the boot delay lives. The task's boot trigger has no delay of
+/// its own, and Stage 2 starts the task immediately, because Stage 2 itself runs during
+/// the first boot after install - a boot trigger registered then would first fire on
+/// the second boot, and the first boot is the one measured to fail.
+inline constexpr ULONGLONG kServiceWatchdogMinUptimeMs = 240'000;
+
+/// How long the watchdog must still wait, given the current uptime. Pure.
+[[nodiscard]] constexpr ULONGLONG ServiceWatchdogRemainingWaitMs(ULONGLONG uptimeMs) noexcept {
+    return uptimeMs >= kServiceWatchdogMinUptimeMs ? 0 : kServiceWatchdogMinUptimeMs - uptimeMs;
+}
 
 /// Attempts per boot, and the pause between them, for a start that times out.
 inline constexpr unsigned kServiceStartMaxAttempts = 3;
@@ -74,6 +86,9 @@ inline constexpr DWORD    kServiceStartRetryDelayMs = 60'000;
 
 /// Register (create or replace) the watchdog task. Requires administrator or SYSTEM.
 [[nodiscard]] DWORD RegisterServiceWatchdogTask(const std::wstring& driverResumePath);
+
+/// Start the registered task now, so the boot in progress is covered too.
+[[nodiscard]] DWORD RunServiceWatchdogTaskNow();
 
 /// Delete the watchdog task. Absence is success.
 [[nodiscard]] DWORD DeleteServiceWatchdogTask();

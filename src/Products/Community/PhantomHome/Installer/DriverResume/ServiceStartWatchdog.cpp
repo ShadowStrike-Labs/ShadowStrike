@@ -150,9 +150,6 @@ std::wstring BuildServiceWatchdogTaskXml(const std::wstring& driverResumePath) {
            L"  <Triggers>\r\n"
            L"    <BootTrigger>\r\n"
            L"      <Enabled>true</Enabled>\r\n"
-           L"      <Delay>";
-    xml += kServiceWatchdogBootDelay;
-    xml += L"</Delay>\r\n"
            L"    </BootTrigger>\r\n"
            L"  </Triggers>\r\n"
            L"  <Principals>\r\n"
@@ -170,7 +167,7 @@ std::wstring BuildServiceWatchdogTaskXml(const std::wstring& driverResumePath) {
            L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
            L"    <Enabled>true</Enabled>\r\n"
            L"    <Hidden>true</Hidden>\r\n"
-           L"    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>\r\n"
+           L"    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>\r\n"
            L"    <Priority>4</Priority>\r\n"
            L"  </Settings>\r\n"
            L"  <Actions Context=\"System\">\r\n"
@@ -178,7 +175,9 @@ std::wstring BuildServiceWatchdogTaskXml(const std::wstring& driverResumePath) {
            L"      <Command>";
     AppendXmlEscaped(xml, driverResumePath);
     xml += L"</Command>\r\n"
-           L"      <Arguments>--start-service</Arguments>\r\n"
+           L"      <Arguments>";
+    xml += kServiceWatchdogVerb;
+    xml += L"</Arguments>\r\n"
            L"    </Exec>\r\n"
            L"  </Actions>\r\n"
            L"</Task>\r\n";
@@ -222,8 +221,31 @@ DWORD RegisterServiceWatchdogTask(const std::wstring& driverResumePath) {
                   static_cast<unsigned>(hr));
         return static_cast<DWORD>(hr);
     }
-    LOG_INFO(L"Service start watchdog task registered: %ls\\%ls (boot + %ls).",
-             kServiceWatchdogTaskFolder, kServiceWatchdogTaskName, kServiceWatchdogBootDelay);
+    LOG_INFO(L"Service start watchdog task registered: %ls\\%ls (acts at uptime >= %llu ms).",
+             kServiceWatchdogTaskFolder, kServiceWatchdogTaskName, kServiceWatchdogMinUptimeMs);
+    return ERROR_SUCCESS;
+}
+
+DWORD RunServiceWatchdogTaskNow() {
+    TaskFolderSession session;
+    DWORD err = session.Open(/*createIfMissing=*/false);
+    if (err != ERROR_SUCCESS) return err;
+
+    Bstr name(kServiceWatchdogTaskName);
+    if (!name) return ERROR_OUTOFMEMORY;
+    ComPtr<IRegisteredTask> task;
+    HRESULT hr = session.folder()->GetTask(name.get(), &task);
+    if (FAILED(hr)) return static_cast<DWORD>(hr);
+
+    VARIANT noParams;
+    ::VariantInit(&noParams);
+    ComPtr<IRunningTask> running;
+    hr = task->Run(noParams, &running);
+    if (FAILED(hr)) {
+        LOG_ERROR(L"Service start watchdog: Run failed (0x%08X).", static_cast<unsigned>(hr));
+        return static_cast<DWORD>(hr);
+    }
+    LOG_INFO(L"Service start watchdog started for the current boot.");
     return ERROR_SUCCESS;
 }
 
