@@ -1354,7 +1354,7 @@ public:
     // CALLBACKS
     // ========================================================================
 
-    void RegisterDetectionCallback(DetectionCallback cb) {
+    void RegisterDetectionCallback(KeyloggerDetectionCallback cb) {
         std::unique_lock lock(m_mutex);
         m_detectionCallback = std::move(cb);
         SS_LOG_DEBUG(LOG_CATEGORY, L"Detection callback registered");
@@ -1539,7 +1539,7 @@ private:
         }
 
         // Fire callback (outside lock to avoid potential deadlock)
-        DetectionCallback cb;
+        KeyloggerDetectionCallback cb;
         {
             std::shared_lock lock(m_mutex);
             cb = m_detectionCallback;
@@ -1658,7 +1658,7 @@ private:
 
     std::deque<KeyloggerDetectionEvent> m_detectionHistory;
 
-    DetectionCallback m_detectionCallback;
+    KeyloggerDetectionCallback m_detectionCallback;
     ErrorCallback m_errorCallback;
 };
 
@@ -1946,7 +1946,7 @@ void KeyloggerProtection::RemoveFromWhitelist(uint32_t processId) {
     m_impl->RemoveFromWhitelist(processId);
 }
 
-void KeyloggerProtection::RegisterDetectionCallback(DetectionCallback callback) {
+void KeyloggerProtection::RegisterDetectionCallback(KeyloggerDetectionCallback callback) {
     m_impl->RegisterDetectionCallback(std::move(callback));
 }
 

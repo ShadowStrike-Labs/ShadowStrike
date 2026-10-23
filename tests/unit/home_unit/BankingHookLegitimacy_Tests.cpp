@@ -28,11 +28,8 @@
  * chase.com - so what is pinned here is the PRIORITY, namely that a configured whitelist is consulted before
  * that heuristic is ever reached.
  *
- * NOTE ON HEADERS: KeyloggerProtection.hpp, SecureBrowser.hpp and ScreenshotBlocker.hpp are the three
- * Banking headers whose ModuleStatus is behind SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED, so they may share
- * a translation unit. BankingTrojanDetector.hpp, CertificatePinning.hpp and TransactionMonitor.hpp may not
- * join them, and beyond ModuleStatus the namespace also has divergent DetectionAction, DetectionCallback and
- * ValidationResult declarations. Filed.
+ * NOTE ON HEADERS: every Banking header may share a translation unit. The namespace-wide types live in
+ * Banking/Common.hpp, and BankingHeadersCompose_Tests.cpp includes all six to keep it that way.
  */
 
 #include "pch.h"

@@ -144,6 +144,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "Common.hpp"   // DetectionAction, ModuleStatus
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -318,21 +319,7 @@ enum class SecurityEventType : uint8_t {
     CertificateWarning  = 11
 };
 
-/**
- * @brief Module status
- */
-#ifndef SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
-#define SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
-#endif  // SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
+// ModuleStatus is defined once for the namespace, in Common.hpp.
 
 // ============================================================================
 // STRUCTURES

@@ -127,6 +127,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "Common.hpp"   // DetectionAction, ModuleStatus
 #include "../Utils/Logger.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
@@ -295,18 +296,7 @@ enum class RevocationMethod : uint8_t {
     Both            = 3     ///< CRL and OCSP
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+// ModuleStatus is defined once for the namespace, in Common.hpp.
 
 // ============================================================================
 // STRUCTURES

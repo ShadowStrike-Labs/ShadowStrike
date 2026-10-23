@@ -28218,5 +28218,43 @@ class BankingDetectionActionTests(unittest.TestCase):
                 self.assertIn('#include "Common.hpp"', read_source(folder / name))
 
 
+class BankingNamespaceTypesTests(unittest.TestCase):
+    """Banking's namespace-wide types are defined once and its headers compose (291).
+
+    ModuleStatus was declared in six headers, three behind an #ifndef guard and one
+    with Scanning inserted at 3; ThreatSeverity in two. Per-module types that only
+    shared a name (DetectionCallback, ValidationResult) now carry module names.
+    BankingHeadersCompose_Tests.cpp includes every Banking header so a new
+    collision fails the build instead of waiting for the first file that needs two.
+    """
+
+    BANK = ROOT / "src/Products/Community/PhantomHome/Banking"
+    COMPOSE = ROOT / "tests/unit/home_unit/BankingHeadersCompose_Tests.cpp"
+
+    def _definers(self, pattern):
+        return sorted(p.name for p in self.BANK.rglob("*.hpp")
+                      if re.search(pattern, strip_c_comments(read_source(p))))
+
+    def test_shared_enums_live_only_in_common(self):
+        for name in ("ModuleStatus", "ThreatSeverity"):
+            with self.subTest(type=name):
+                self.assertEqual(["Common.hpp"], self._definers(r"enum class %s\b" % name))
+
+    def test_the_include_order_guard_is_gone(self):
+        for folder in ("src", "tests/unit"):
+            for p in (ROOT / folder).rglob("*.*"):
+                if p.suffix.lower() in (".cpp", ".hpp", ".h"):
+                    self.assertNotIn("SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED",
+                                     strip_c_comments(read_source(p)), p.name)
+
+    def test_every_banking_header_is_composed(self):
+        src = read_source(self.COMPOSE)
+        for p in sorted(self.BANK.glob("*.hpp")):
+            if p.name == "Common.hpp":
+                continue
+            with self.subTest(header=p.name):
+                self.assertIn('#include "Products/Community/PhantomHome/Banking/%s"' % p.name, src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

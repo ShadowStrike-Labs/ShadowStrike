@@ -47,4 +47,32 @@ enum class DetectionAction : uint8_t {
     Remediate  = 5    ///< Full remediation
 };
 
+/// Lifecycle state of a Banking module. Values are stable: modules log and
+/// serialise them numerically (ScreenshotBlocker::ToJson writes "status").
+///
+/// Six headers used to declare this, three behind an #ifndef guard added so one
+/// file would compile; BankingTrojanDetector's copy inserted an unused Scanning at
+/// 3 and shifted every later value, so 6 meant Error in five modules and Stopped
+/// in the sixth. This is the seven-value shape the five shared.
+enum class ModuleStatus : uint8_t {
+    Uninitialized = 0,
+    Initializing  = 1,
+    Running       = 2,
+    Paused        = 3,
+    Stopping      = 4,
+    Stopped       = 5,
+    Error         = 6
+};
+
+/// Severity of a Banking detection. Identical in BankingTrojanDetector.hpp and
+/// KeyloggerProtection.hpp, which still made it a redefinition in any file that
+/// included both. Serialised numerically.
+enum class ThreatSeverity : uint8_t {
+    None     = 0,
+    Low      = 1,
+    Medium   = 2,
+    High     = 3,
+    Critical = 4
+};
+
 } // namespace ShadowStrike::Banking

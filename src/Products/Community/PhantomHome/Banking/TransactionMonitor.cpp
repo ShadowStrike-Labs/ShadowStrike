@@ -127,15 +127,15 @@ std::atomic<bool> TransactionMonitor::s_instanceCreated{false};
     }
 }
 
-[[nodiscard]] std::string_view GetValidationResultName(ValidationResult result) noexcept {
+[[nodiscard]] std::string_view GetValidationResultName(TransactionValidationResult result) noexcept {
     switch (result) {
-        case ValidationResult::Valid:       return "Valid";
-        case ValidationResult::Suspicious:  return "Suspicious";
-        case ValidationResult::Blocked:     return "Blocked";
-        case ValidationResult::UserConfirm: return "UserConfirm";
-        case ValidationResult::OOBVerify:   return "OOBVerify";
-        case ValidationResult::Timeout:     return "Timeout";
-        case ValidationResult::Error:       return "Error";
+        case TransactionValidationResult::Valid:       return "Valid";
+        case TransactionValidationResult::Suspicious:  return "Suspicious";
+        case TransactionValidationResult::Blocked:     return "Blocked";
+        case TransactionValidationResult::UserConfirm: return "UserConfirm";
+        case TransactionValidationResult::OOBVerify:   return "OOBVerify";
+        case TransactionValidationResult::Timeout:     return "Timeout";
+        case TransactionValidationResult::Error:       return "Error";
         default:                            return "Unknown";
     }
 }
@@ -522,7 +522,7 @@ public:
 
         // Validate amount range before conversion to cents
         if (context.amount < 0.0 || context.amount > 1e15) {
-            result.validationResult = ValidationResult::Error;
+            result.validationResult = TransactionValidationResult::Error;
             result.findings.push_back("Invalid transaction amount: out of range");
             SS_LOG_WARN(LOG_CATEGORY, L"Transaction rejected: amount out of valid range");
             return result;
@@ -599,10 +599,10 @@ public:
                 }
             }
 
-            if (result.validationResult == ValidationResult::Blocked) {
+            if (result.validationResult == TransactionValidationResult::Blocked) {
                 m_stats.transactionsBlocked++;
             }
-            if (result.validationResult == ValidationResult::UserConfirm) {
+            if (result.validationResult == TransactionValidationResult::UserConfirm) {
                 m_stats.userConfirmations++;
             }
 
@@ -628,7 +628,7 @@ public:
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Validation error: %hs", ex.what());
-            result.validationResult = ValidationResult::Error;
+            result.validationResult = TransactionValidationResult::Error;
         }
 
         result.analysisDuration = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
@@ -847,23 +847,23 @@ public:
     void CalculateRiskLevel(AnomalyDetectionResult& result) {
         if (result.riskScore >= 80.0) {
             result.riskLevel = TransactionRiskLevel::Critical;
-            result.validationResult = ValidationResult::Blocked;
+            result.validationResult = TransactionValidationResult::Blocked;
             result.isAnomalous = true;
         } else if (result.riskScore >= 60.0) {
             result.riskLevel = TransactionRiskLevel::High;
-            result.validationResult = ValidationResult::OOBVerify;
+            result.validationResult = TransactionValidationResult::OOBVerify;
             result.isAnomalous = true;
         } else if (result.riskScore >= 40.0) {
             result.riskLevel = TransactionRiskLevel::Medium;
-            result.validationResult = ValidationResult::UserConfirm;
+            result.validationResult = TransactionValidationResult::UserConfirm;
             result.isAnomalous = true;
         } else if (result.riskScore > 0.0) {
             result.riskLevel = TransactionRiskLevel::Low;
-            result.validationResult = ValidationResult::Valid;
+            result.validationResult = TransactionValidationResult::Valid;
             result.isAnomalous = false; // Just low risk warning
         } else {
             result.riskLevel = TransactionRiskLevel::Safe;
-            result.validationResult = ValidationResult::Valid;
+            result.validationResult = TransactionValidationResult::Valid;
             result.isAnomalous = false;
         }
     }

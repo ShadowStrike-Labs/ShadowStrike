@@ -140,7 +140,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "Common.hpp"   // DetectionAction
+#include "Common.hpp"   // DetectionAction, ModuleStatus, ThreatSeverity
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
@@ -309,16 +309,7 @@ enum class DetectionMethod : uint16_t {
     YaraRuleMatch       = 10    ///< YARA rule match
 };
 
-/**
- * @brief Threat severity
- */
-enum class ThreatSeverity : uint8_t {
-    None        = 0,
-    Low         = 1,
-    Medium      = 2,
-    High        = 3,
-    Critical    = 4
-};
+// ThreatSeverity is defined once for the namespace, in Common.hpp.
 
 /**
  * @brief Hook type
@@ -363,19 +354,7 @@ enum class WebInjectType : uint8_t {
 
 // DetectionAction is defined once for the namespace, in Common.hpp.
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is defined once for the namespace, in Common.hpp.
 
 // ============================================================================
 // STRUCTURES

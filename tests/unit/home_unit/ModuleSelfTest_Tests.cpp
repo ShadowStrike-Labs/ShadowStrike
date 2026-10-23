@@ -24,10 +24,10 @@
  * Neither failure was visible, because a self-test nobody runs is a comment. This file runs them.
  *
  * SCOPE. Four namespaces the duplicate-type sweep showed to be collision-free, so their headers can share one
- * translation unit. Banking, Backup and Privacy cannot be added here - Banking has six ModuleStatus
- * declarations and divergent DetectionAction, DetectionCallback and ValidationResult, and Backup has three
- * ModuleStatus declarations and two incompatible callback aliases, so including two headers from either fails
- * to compile. Those are filed; when they are consolidated, their modules belong in this file too.
+ * translation unit. Backup cannot be added here - it has three ModuleStatus declarations and two
+ * incompatible callback aliases, so including two of its headers fails to compile (filed). Banking's headers
+ * now compose (Banking/Common.hpp, BankingHeadersCompose_Tests.cpp); its modules belong here once their
+ * implementations are linked into this binary (task 264).
  *
  * Initialize is not idempotent (filed 288): the second call returns false, indistinguishable from a genuine
  * failure. So state is tested first, initialisation attempted only if needed, and the state re-checked rather

@@ -134,7 +134,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "Common.hpp"   // DetectionAction
+#include "Common.hpp"   // DetectionAction, ModuleStatus, ThreatSeverity
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/MemoryUtils.hpp"
@@ -268,16 +268,7 @@ enum class ProtectionMode : uint8_t {
     Aggressive          = 3     ///< Maximum protection
 };
 
-/**
- * @brief Threat severity
- */
-enum class ThreatSeverity : uint8_t {
-    None        = 0,
-    Low         = 1,
-    Medium      = 2,
-    High        = 3,
-    Critical    = 4
-};
+// ThreatSeverity is defined once for the namespace, in Common.hpp.
 
 /**
  * @brief Input field type
@@ -299,21 +290,7 @@ enum class InputFieldType : uint8_t {
 // used to declare Terminate = 3 and Quarantine = 4, the reverse of
 // BankingTrojanDetector.hpp.
 
-/**
- * @brief Module status
- */
-#ifndef SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
-#define SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
-#endif  // SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
+// ModuleStatus is defined once for the namespace, in Common.hpp.
 
 // ============================================================================
 // STRUCTURES
@@ -646,7 +623,7 @@ struct KeyloggerProtectionConfiguration {
 // ============================================================================
 
 /// @brief Detection callback
-using DetectionCallback = std::function<void(const KeyloggerDetectionEvent&)>;
+using KeyloggerDetectionCallback = std::function<void(const KeyloggerDetectionEvent&)>;
 
 /// @brief Error callback
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
@@ -955,7 +932,7 @@ public:
     /**
      * @brief Register detection callback
      */
-    void RegisterDetectionCallback(DetectionCallback callback);
+    void RegisterDetectionCallback(KeyloggerDetectionCallback callback);
     
     /**
      * @brief Register error callback

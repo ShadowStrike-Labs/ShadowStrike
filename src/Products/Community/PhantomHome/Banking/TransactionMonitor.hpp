@@ -139,6 +139,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "Common.hpp"   // DetectionAction, ModuleStatus
 #include "../Utils/Logger.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
@@ -289,7 +290,7 @@ enum class TransactionType : uint8_t {
 /**
  * @brief Validation result
  */
-enum class ValidationResult : uint8_t {
+enum class TransactionValidationResult : uint8_t {
     Valid           = 0,    ///< Transaction validated
     Suspicious      = 1,    ///< Needs review
     Blocked         = 2,    ///< Transaction blocked
@@ -325,18 +326,7 @@ enum class BeneficiaryTrust : uint8_t {
     Whitelisted     = 4     ///< User whitelisted
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+// ModuleStatus is defined once for the namespace, in Common.hpp.
 
 // ============================================================================
 // STRUCTURES
@@ -549,7 +539,7 @@ struct AnomalyDetectionResult {
     TransactionRiskLevel riskLevel = TransactionRiskLevel::Safe;
     
     /// @brief Validation result
-    ValidationResult validationResult = ValidationResult::Valid;
+    TransactionValidationResult validationResult = TransactionValidationResult::Valid;
     
     /// @brief Detected attack vectors
     std::vector<AttackVector> detectedVectors;
@@ -803,7 +793,7 @@ struct TransactionMonitorConfiguration {
 using AnomalyCallback = std::function<void(const AnomalyDetectionResult&, const TransactionContext&)>;
 
 /// @brief Validation callback
-using ValidationCallback = std::function<ValidationResult(const TransactionContext&)>;
+using ValidationCallback = std::function<TransactionValidationResult(const TransactionContext&)>;
 
 /// @brief User confirmation callback (returns true if user approves)
 using UserConfirmationCallback = std::function<bool(const TransactionContext&, const std::string& reason)>;
@@ -1185,7 +1175,7 @@ private:
 /**
  * @brief Get validation result name
  */
-[[nodiscard]] std::string_view GetValidationResultName(ValidationResult result) noexcept;
+[[nodiscard]] std::string_view GetValidationResultName(TransactionValidationResult result) noexcept;
 
 /**
  * @brief Get DOM change type name
