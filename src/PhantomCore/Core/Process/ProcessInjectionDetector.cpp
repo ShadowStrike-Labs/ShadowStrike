@@ -572,8 +572,6 @@ struct ProcessInjectionDetector::Impl {
     std::atomic<RealTime::MemoryProtection*>     m_memoryProtection{nullptr};
 
     /// @brief Infrastructure
-    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntel;
-    std::shared_ptr<PatternStore::PatternStore> m_patternStore;
 
     /// @brief Cleanup thread
     std::thread m_cleanupThread;
@@ -777,10 +775,6 @@ bool ProcessInjectionDetector::Impl::Initialize(
         m_config = config;
         m_threadPool = threadPool;
         m_selfPid = ::GetCurrentProcessId();
-
-        // Initialize infrastructure
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
-        m_patternStore = std::make_shared<PatternStore::PatternStore>();
 
         // Wire kernel driver integration — register to receive thread
         // creation, handle alert, and process creation events from the

@@ -163,7 +163,7 @@ struct AmsiProvider::Impl {
     // Detection infrastructure (initialised once in Initialize())
     // Shared with ScanEngine and USBScanner (SignatureStore::OpenShared).
     std::shared_ptr<SignatureStore::SignatureStore>  sigStore;
-    std::unique_ptr<ThreatIntel::ThreatIntelStore>  threatIntel;
+    std::shared_ptr<ThreatIntel::ThreatIntelStore>  threatIntel;   // ThreatIntelStore::Shared()
     mutable std::shared_mutex                        lifecycleMutex;
     bool                                            initialized{false};
 };
@@ -530,12 +530,17 @@ bool AmsiProvider::Initialize() {
         }
     }
 
-    // ThreatIntelStore — best-effort; null out if init fails
-    m_impl->threatIntel =
-        std::make_unique<ThreatIntel::ThreatIntelStore>();
-    if (!m_impl->threatIntel->Initialize()) {
+    // ThreatIntelStore - the process-wide store, best-effort.
+    //
+    // A default-constructed store's Initialize() opens a NEW, EMPTY database under
+    // %TEMP% named per process and per instance (StoreConfig::CreateDefault), so
+    // this provider's reputation lookups could never match an indicator the
+    // service holds: every script hash was looked up in a file that only this
+    // instance had ever written to.
+    m_impl->threatIntel = ThreatIntel::ThreatIntelStore::Shared();
+    if (!m_impl->threatIntel || !m_impl->threatIntel->IsInitialized()) {
         SS_LOG_WARN(kLogCategory,
-            L"Initialize: ThreatIntelStore failed to initialise; "
+            L"Initialize: shared ThreatIntelStore unavailable; "
             L"hash reputation lookups will be skipped");
         m_impl->threatIntel.reset();
     }

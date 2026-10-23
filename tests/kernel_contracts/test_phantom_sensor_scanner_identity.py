@@ -28152,5 +28152,50 @@ class MetamorphicDecodeLimitTests(unittest.TestCase):
         self.assertEqual(5, meta.count("instructions, maxInstructions, &hitLimit)"))
 
 
+class DetectionStoresAreOpenedTests(unittest.TestCase):
+    """Detectors receive the opened process-wide stores (tasks 227, 333).
+
+    A default-constructed SignatureStore opens nothing, and a default-configured
+    ThreatIntelStore opens a fresh empty file under %TEMP%. AmsiProvider,
+    ProcessAnalyzer and RealTimeProtection each held one, so their hash,
+    reputation and signature lookups missed whatever the databases contained.
+    """
+
+    AMSI = ROOT / "src/Products/Community/PhantomHome/AmsiProvider/AmsiProvider.cpp"
+    PA = ROOT / "src/PhantomCore/Core/Process/ProcessAnalyzer.cpp"
+    RTP = ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = {p: strip_c_comments(read_source(p)) for p in (cls.AMSI, cls.PA, cls.RTP)}
+
+    def test_no_private_threat_intel_or_signature_store(self):
+        for path, src in self.src.items():
+            with self.subTest(path=path.name):
+                self.assertNotRegex(src, r"make_(unique|shared)<\s*(ThreatIntel::)?ThreatIntelStore\s*>",
+                    "a private ThreatIntelStore opens an empty per-process file")
+                self.assertNotRegex(src, r"make_(unique|shared)<\s*SignatureStore::SignatureStore\s*>",
+                    "a constructed SignatureStore is never opened")
+
+    def test_threat_intel_consumers_use_the_shared_store(self):
+        for path in (self.AMSI, self.PA):
+            with self.subTest(path=path.name):
+                self.assertIn("ThreatIntel::ThreatIntelStore::Shared()", self.src[path])
+
+    def test_rtp_opens_the_shared_store_after_seeding(self):
+        src = self.src[self.RTP]
+        seed = src.find("SeedSignatureDatabaseFromBaseline()")
+        opened = src.find("m_sharedSignatureStore = SignatureStore::SignatureStore::OpenShared(")
+        wired = src.find("InitializeAntiEvasionDetectors();")
+        self.assertNotEqual(-1, seed)
+        self.assertNotEqual(-1, opened)
+        self.assertNotEqual(-1, wired)
+        self.assertLess(seed, opened, "before seeding a fresh install has no database to open")
+        self.assertLess(opened, wired, "detectors are handed the store when they are initialised")
+
+    def test_process_analyzer_opens_the_shared_signature_store(self):
+        self.assertIn("SignatureStore::SignatureStore::OpenShared(", self.src[self.PA])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

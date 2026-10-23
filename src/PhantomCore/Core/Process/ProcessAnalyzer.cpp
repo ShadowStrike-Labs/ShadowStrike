@@ -74,6 +74,7 @@
 #include "../../SignatureStore/SignatureStore.hpp"
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../Utils/DataStorePaths.hpp"
 
 // Process detection modules (full orchestration suite)
 #include "ProcessInjectionDetector.hpp"
@@ -618,7 +619,6 @@ public:
     std::atomic<uint64_t> m_nextCallbackId{1};
 
     /// @brief Infrastructure integrations
-    std::shared_ptr<HashStore::HashStore> m_hashStore;
     std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntel;
     std::shared_ptr<Whitelist::WhitelistStore> m_whitelist;
@@ -727,17 +727,24 @@ bool ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
 
         m_config = config;
 
-        // Create infrastructure store instances. These are instance-based (not
-        // singletons), so each ProcessAnalyzer owns its own. The stores
-        // self-initialize from their on-disk databases when constructed.
-        m_hashStore = std::make_shared<HashStore::HashStore>();
-        m_signatureStore = std::make_shared<SignatureStore::SignatureStore>();
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
+        // The detection stores are the process-wide ones. Constructing them here,
+        // as this used to, opened nothing: no store opens itself on construction,
+        // and the default ThreatIntelStore configuration names a fresh empty file
+        // under %TEMP%. Every hash, certificate and reputation lookup below
+        // therefore missed, whatever the databases held. The signature store's
+        // own hash component answers the known-malware lookup, so no separate
+        // HashStore is opened against the same file.
+        m_signatureStore = SignatureStore::SignatureStore::OpenShared(
+            Utils::DataStorePaths::SignatureDatabase());
+        m_threatIntel = ThreatIntel::ThreatIntelStore::Shared();
+        if (m_threatIntel && !m_threatIntel->IsInitialized()) {
+            m_threatIntel.reset();
+        }
         m_whitelist = std::make_shared<Whitelist::WhitelistStore>();
 
         // Log store readiness for diagnostics
-        SS_LOG_INFO(L"ProcessAnalyzer", L"HashStore initialized: %s",
-            (m_hashStore && m_hashStore->IsInitialized()) ? L"yes" : L"no");
+        SS_LOG_INFO(L"ProcessAnalyzer", L"ThreatIntelStore initialized: %s",
+            m_threatIntel ? L"yes" : L"no");
         SS_LOG_INFO(L"ProcessAnalyzer", L"SignatureStore initialized: %s",
             (m_signatureStore && m_signatureStore->IsInitialized()) ? L"yes" : L"no");
 
@@ -772,7 +779,6 @@ bool ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
         SS_LOG_ERROR(L"ProcessAnalyzer", L"Initialization failed - %S", e.what());
         m_initialized.store(false, std::memory_order_release);
         // Drop any partially-constructed stores so a retry starts clean.
-        m_hashStore.reset();
         m_signatureStore.reset();
         m_threatIntel.reset();
         m_whitelist.reset();
@@ -2523,14 +2529,14 @@ std::pair<bool, std::wstring> ProcessAnalyzerImpl::IsKnownMaliciousInternal(uint
             return {false, L""};
         }
 
-        // Check hash against HashStore known malware database
-        if (m_hashStore && m_hashStore->IsInitialized()) {
+        // Known-malware hash lookup through the shared signature store
+        if (m_signatureStore && m_signatureStore->IsInitialized()) {
             SignatureStore::HashValue hv{};
             hv.type = SignatureStore::HashType::SHA256;
             hv.length = static_cast<uint8_t>(std::min<size_t>(hashBytes.size(), hv.data.size()));
             std::memcpy(hv.data.data(), hashBytes.data(), hv.length);
 
-            auto detection = m_hashStore->LookupHash(hv);
+            auto detection = m_signatureStore->LookupHash(hv);
             if (detection.has_value()) {
                 return {true, Utils::StringUtils::ToWide(detection->signatureName)};
             }

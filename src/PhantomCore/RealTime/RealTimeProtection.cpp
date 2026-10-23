@@ -629,7 +629,8 @@ public:
         // Create shared ThreatIntel stores — injected into detectors needing IOC correlation
         try {
             m_sharedHashStore = std::make_shared<HashStore::HashStore>();
-            m_sharedSignatureStore = std::make_shared<SignatureStore::SignatureStore>();
+            // m_sharedSignatureStore is opened in Initialize, after the database
+            // has been seeded from the shipped baseline - see step 1.9 there.
             m_sharedPatternStore = std::make_shared<PatternStore::PatternStore>();
             // Use the process-wide store rather than a private instance. The
             // previous fresh object was never initialized, so every consumer it
@@ -850,6 +851,24 @@ public:
                     "RealTimeProtection: no usable signature database is present. "
                     "Hash, pattern and YARA matching will be unavailable this session; "
                     "behavioural and heuristic detection are unaffected.");
+            }
+
+            // 1.10 Open the process-wide signature store for the evasion detectors.
+            //
+            // The object this replaced was constructed and never initialised, so
+            // DebuggerEvasion, Metamorphic and Packer detectors held a store that
+            // answered nothing. Sharing costs no further memory - ScanEngine, AMSI
+            // and USB hold the same instance - and adds no on-access work: packer
+            // YARA runs only under PackerAnalysisFlags::DeepScan and the metamorphic
+            // fuzzy lookup only with EnableFuzzyHashing, neither set in line. It is
+            // opened here, after seeding, because before it a fresh install has no
+            // database to open; the detectors are wired after this point.
+            m_sharedSignatureStore = SignatureStore::SignatureStore::OpenShared(
+                Utils::DataStorePaths::SignatureDatabase());
+            if (!m_sharedSignatureStore) {
+                Utils::Logger::Error(
+                    "RealTimeProtection: shared SignatureStore unavailable - evasion "
+                    "detectors run without signature correlation");
             }
 
             // 2. Initialize Scan Engine
