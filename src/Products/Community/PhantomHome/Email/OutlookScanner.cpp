@@ -87,6 +87,7 @@
 
 #include "pch.h"
 #include "OutlookScanner.hpp"
+#include "PhantomCore/Utils/FileExtensionRisk.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
@@ -177,15 +178,6 @@ namespace {
 
     // Outlook folder types
     constexpr int OL_FOLDER_JUNK_EMAIL = 23;
-
-    // Dangerous file extensions
-    const std::vector<std::wstring> DANGEROUS_EXTENSIONS = {
-        L".exe", L".com", L".bat", L".cmd", L".scr", L".pif",
-        L".vbs", L".js", L".jse", L".wsf", L".wsh",
-        L".msi", L".msp", L".cpl", L".dll", L".sys",
-        L".hta", L".reg", L".ps1", L".psm1",
-        L".lnk", L".inf", L".ade", L".adp", L".app"
-    };
 
     // Macro-enabled Office extensions
     const std::vector<std::wstring> MACRO_EXTENSIONS = {
@@ -371,15 +363,9 @@ namespace {
 }
 
 [[nodiscard]] static bool IsDangerousExtension(const std::wstring& filename) noexcept {
-    std::wstring lowerFilename = StringUtils::ToLowerCopy(filename);
-
-    for (const auto& ext : DANGEROUS_EXTENSIONS) {
-        if (lowerFilename.ends_with(ext)) {
-            return true;
-        }
-    }
-
-    return false;
+    // The shared list (task 309). This copy lacked .jar and .vbe.
+    using namespace Utils::FileExtensionRisk;
+    return IsExecutableContentExtension(LastExtension(std::wstring_view(filename)));
 }
 
 [[nodiscard]] static bool IsMacroEnabled(const std::wstring& filename) noexcept {

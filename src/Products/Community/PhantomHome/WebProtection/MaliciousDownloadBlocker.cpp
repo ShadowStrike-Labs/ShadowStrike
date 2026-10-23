@@ -34,6 +34,7 @@
  */
 
 #include "MaliciousDownloadBlocker.hpp"
+#include "PhantomCore/Utils/FileExtensionRisk.hpp"
 #include "SafeBrowsingAPI.hpp"
 
 #include <algorithm>
@@ -2078,11 +2079,11 @@ std::string_view GetThreatIndicatorName(ThreatIndicator indicator) noexcept {
 }
 
 bool IsHighRiskFile(const fs::path& filePath) {
-    std::string ext = NarrowToLower(filePath.extension().string());
-    for (const auto* hrExt : DownloadBlockerConstants::HIGH_RISK_EXTENSIONS) {
-        if (ext == hrExt) return true;
-    }
-    return false;
+    // The shared list (task 309). This copy lacked .vbe, .psm1 and .psd1. The
+    // extension is still taken from std::filesystem, so "evil.exe." keeps its
+    // measured behaviour (see DownloadExtensionPolicy_Tests).
+    return Utils::FileExtensionRisk::IsExecutableContentExtension(
+        std::wstring_view(filePath.extension().native()));
 }
 
 std::string DetectFileType(const fs::path& filePath) {

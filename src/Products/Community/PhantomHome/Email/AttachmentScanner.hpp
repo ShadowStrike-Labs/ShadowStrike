@@ -173,13 +173,8 @@ namespace AttachmentConstants {
     /// @brief Maximum extraction size (500 MB)
     inline constexpr size_t MAX_EXTRACTION_SIZE = 500 * 1024 * 1024;
     
-    /// @brief High-risk file extensions
-    inline constexpr const char* HIGH_RISK_EXTENSIONS[] = {
-        ".exe", ".dll", ".scr", ".com", ".bat", ".cmd",
-        ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
-        ".ps1", ".psm1", ".psd1", ".msi", ".msp",
-        ".hta", ".lnk", ".pif", ".reg", ".inf"
-    };
+    // High-risk (executable-content) extensions: Utils::FileExtensionRisk, shared
+    // with every other attachment and download check (task 309).
     
     /// @brief Archive extensions
     inline constexpr const char* ARCHIVE_EXTENSIONS[] = {

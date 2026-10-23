@@ -29,6 +29,7 @@
 
 #include "pch.h"
 #include "AttachmentScanner.hpp"
+#include "PhantomCore/Utils/FileExtensionRisk.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
@@ -221,13 +222,8 @@ static constexpr std::array<MagicSignature, 11> g_magicSignatures = {{
  * @brief Detect if extension is high-risk.
  */
 [[nodiscard]] bool IsHighRiskExtensionImpl(std::string_view extension) noexcept {
-    for (const auto& ext : AttachmentConstants::HIGH_RISK_EXTENSIONS) {
-        if (StringUtils::ToLowerCopy(StringUtils::ToWide(extension)) ==
-            StringUtils::ToLowerCopy(StringUtils::ToWide(ext))) {
-            return true;
-        }
-    }
-    return false;
+    // The shared list (task 309). This copy lacked .cpl and .jar.
+    return Utils::FileExtensionRisk::IsExecutableContentExtension(extension);
 }
 
 /**

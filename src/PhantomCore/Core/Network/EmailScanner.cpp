@@ -48,6 +48,7 @@
 
 #include "pch.h"
 #include "EmailScanner.hpp"
+#include "../../Utils/FileExtensionRisk.hpp"
 
 // Infrastructure includes
 #include "../../Utils/Logger.hpp"
@@ -236,11 +237,6 @@ constexpr size_t kMaxBodyTextRetained      = 4ULL * 1024 * 1024;   // 4 MB plain
 }
 
 // Dangerous archive extensions for risk elevation
-static const std::array<std::string_view, 14> kDangerousArchiveExtensions = {
-    ".exe", ".dll", ".scr", ".bat", ".cmd", ".ps1",
-    ".vbs", ".js",  ".hta", ".wsf", ".msi", ".com",
-    ".pif", ".cpl"
-};
 
 /**
  * @brief RFC 2047 encoded-word decoder.
@@ -446,17 +442,10 @@ std::string ExtractMIMEParameter(const std::string& headerValue, const std::stri
  * @brief Check if a filename extension is dangerous (executable content).
  */
 bool IsDangerousExtension(const std::string& filename) {
-    size_t dotPos = filename.rfind('.');
-    if (dotPos == std::string::npos) return false;
-
-    std::string ext = filename.substr(dotPos);
-    // Case-insensitive comparison
-    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-
-    for (const auto& dangerous : kDangerousArchiveExtensions) {
-        if (ext == dangerous) return true;
-    }
-    return false;
+    // The shared list (task 309). This 14-entry copy lacked .jar, .js(e), .lnk,
+    // .reg, .vbe, .wsh, .inf and the PowerShell module formats among others.
+    using namespace Utils::FileExtensionRisk;
+    return IsExecutableContentExtension(LastExtension(std::string_view(filename)));
 }
 
 /**

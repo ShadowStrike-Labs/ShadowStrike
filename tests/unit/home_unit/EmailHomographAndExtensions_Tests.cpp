@@ -152,20 +152,14 @@ TEST(EmailExtensionPolicy, TheOrdinaryDocumentFormatsAreNotDangerous) {
     }
 }
 
-TEST(EmailExtensionPolicy, ThreeExtensionsAreAbsentFromThisListAndPresentInASibling) {
-    // PINNED AS IT BEHAVES, NOT AS IT SHOULD. This product has THREE dangerous-extension lists and no one of
-    // them is a superset: EmailProtection has 20 entries, AttachmentScanner 22, MaliciousDownloadBlocker 21,
-    // and the union is 25. Filed rather than synchronised, because copying entries between duplicated lists
-    // fixes today and guarantees the next divergence.
-    //
-    // If any of these starts passing, the lists were consolidated - which is the fix the filing asks for.
-    // Update the filing and this case rather than reverting.
-    EXPECT_FALSE(IsDangerousExtension(".inf"))
-        << "a setup information file, which both sibling lists treat as high risk";
-    EXPECT_FALSE(IsDangerousExtension(".vbe"))
-        << "encoded VBScript - the standard way to obscure a .vbs, which this list does treat as dangerous";
-    EXPECT_FALSE(IsDangerousExtension(".psm1")) << "a PowerShell module, where .ps1 is covered";
-    EXPECT_FALSE(IsDangerousExtension(".psd1")) << "a PowerShell manifest";
+TEST(EmailExtensionPolicy, TheFormatsThisListUsedToMissAreDangerous) {
+    // This list had 20 entries and lacked these four, each present in a sibling list. All checks now share
+    // Utils::FileExtensionRisk (task 309), so the gap cannot reopen in one place only.
+    EXPECT_TRUE(IsDangerousExtension(".inf")) << "a setup information file";
+    EXPECT_TRUE(IsDangerousExtension(".vbe"))
+        << "encoded VBScript - the standard way to obscure a .vbs, which this list always treated as dangerous";
+    EXPECT_TRUE(IsDangerousExtension(".psm1")) << "a PowerShell module, where .ps1 is covered";
+    EXPECT_TRUE(IsDangerousExtension(".psd1")) << "a PowerShell manifest";
 }
 
 TEST(EmailMimePolicy, TheExecutableMimeTypesAreBlockedCaseInsensitively) {

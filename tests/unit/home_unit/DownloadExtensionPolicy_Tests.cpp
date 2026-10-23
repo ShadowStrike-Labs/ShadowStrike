@@ -41,11 +41,13 @@ namespace {
 
 namespace fs = std::filesystem;
 
-/// DownloadBlockerConstants::HIGH_RISK_EXTENSIONS, restated so removing one fails a case here.
+/// The extensions this blocker always flagged, plus the three it lacked before the lists were shared
+/// (.vbe, .psm1, .psd1 - task 309). Restated here so removing one from the shared list fails a case.
 const std::vector<std::string>& HighRiskExtensions() {
     static const std::vector<std::string> exts = {
         ".exe", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".js",  ".jse", ".wsh", ".wsf", ".scr",
-        ".hta", ".pif", ".reg", ".msi", ".msp", ".dll", ".cpl", ".jar", ".lnk", ".inf"};
+        ".hta", ".pif", ".reg", ".msi", ".msp", ".dll", ".cpl", ".jar", ".lnk", ".inf",
+        ".vbe", ".psm1", ".psd1"};
     return exts;
 }
 
@@ -58,7 +60,7 @@ const std::vector<std::string>& HighRiskExtensions() {
 TEST(DownloadExtensionPolicyTest, EveryBuiltInHighRiskExtensionIsRecognised) {
     for (const auto& ext : HighRiskExtensions()) {
         EXPECT_TRUE(IsHighRiskFile(fs::path("C:/downloads/installer" + ext)))
-            << ext << " is in HIGH_RISK_EXTENSIONS but was not recognised";
+            << ext << " is executable content but was not recognised";
     }
 }
 

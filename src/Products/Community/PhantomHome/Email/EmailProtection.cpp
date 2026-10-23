@@ -49,6 +49,8 @@
 
 #include "pch.h"
 #include "EmailProtection.hpp"
+#include "PhantomCore/Utils/FileExtensionRisk.hpp"
+
 
 // ============================================================================
 // SUBSYSTEM INCLUDES
@@ -343,25 +345,8 @@ namespace EmailParsing {
      * @brief Check if extension is dangerous (case-insensitive, no allocation)
      */
     bool IsDangerousExtension(std::string_view extension) {
-        static const std::array<std::string_view, 20> dangerous = {
-            ".exe", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".js",
-            ".jse", ".wsh", ".wsf", ".scr", ".hta", ".pif", ".reg",
-            ".msi", ".msp", ".dll", ".cpl", ".jar", ".lnk"
-        };
-
-        // Case-insensitive comparison without allocation
-        for (const auto& ext : dangerous) {
-            if (extension.length() == ext.length()) {
-                bool match = true;
-                for (size_t i = 0; i < extension.length() && match; ++i) {
-                    char a = static_cast<char>(std::tolower(static_cast<unsigned char>(extension[i])));
-                    char b = ext[i];  // known lowercase
-                    match = (a == b);
-                }
-                if (match) return true;
-            }
-        }
-        return false;
+        // The shared list (task 309). This copy lacked .inf, .vbe, .psm1 and .psd1.
+        return Utils::FileExtensionRisk::IsExecutableContentExtension(extension);
     }
 
     /**

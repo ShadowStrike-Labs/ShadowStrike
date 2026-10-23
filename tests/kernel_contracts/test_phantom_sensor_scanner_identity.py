@@ -28282,5 +28282,39 @@ class BackupNamespaceTypesTests(unittest.TestCase):
                 self.assertIn('#include "Products/Community/PhantomHome/Backup/%s"' % p.name, src)
 
 
+class SharedExecutableExtensionListTests(unittest.TestCase):
+    """Attachment and download checks share one executable-extension list (task 309).
+
+    Five copies used to decide this and none was a superset of another: the email
+    attachment scanner missed .cpl, two others missed .vbe. A local copy reopens a
+    gap in one place only, where nobody compares it.
+    """
+
+    H = ROOT / "src/Products/Community/PhantomHome"
+    CONSUMERS = {
+        "EmailProtection.cpp": H / "Email/EmailProtection.cpp",
+        "AttachmentScanner.cpp": H / "Email/AttachmentScanner.cpp",
+        "OutlookScanner.cpp": H / "Email/OutlookScanner.cpp",
+        "MaliciousDownloadBlocker.cpp": H / "WebProtection/MaliciousDownloadBlocker.cpp",
+        "EmailScanner.cpp": ROOT / "src/PhantomCore/Core/Network/EmailScanner.cpp",
+    }
+    HEADERS = (H / "Email/EmailProtection.hpp", H / "Email/AttachmentScanner.hpp",
+               H / "WebProtection/MaliciousDownloadBlocker.hpp")
+    # A brace list holding both of these is an executable-extension list.
+    LIST = re.compile(r'\{[^{}]*"\.exe"[^{}]*"\.(scr|hta|pif)"[^{}]*\}', re.S)
+
+    def test_every_consumer_asks_the_shared_list(self):
+        for name, path in self.CONSUMERS.items():
+            src = strip_c_comments(read_source(path))
+            with self.subTest(file=name):
+                self.assertIn("FileExtensionRisk", src)
+                self.assertIsNone(self.LIST.search(src), "a local executable-extension list is back")
+
+    def test_no_header_restates_the_list(self):
+        for path in self.HEADERS:
+            with self.subTest(header=path.name):
+                self.assertIsNone(self.LIST.search(strip_c_comments(read_source(path))))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

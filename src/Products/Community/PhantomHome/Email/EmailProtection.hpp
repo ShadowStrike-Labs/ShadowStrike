@@ -183,13 +183,6 @@ namespace EmailProtectionConstants {
     /// @brief Queue size
     inline constexpr size_t DEFAULT_QUEUE_SIZE = 10000;
 
-    /// @brief Known dangerous attachment extensions
-    inline constexpr const char* DANGEROUS_EXTENSIONS[] = {
-        ".exe", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".js",
-        ".jse", ".wsh", ".wsf", ".scr", ".hta", ".pif", ".reg",
-        ".msi", ".msp", ".dll", ".cpl", ".jar", ".lnk"
-    };
-
     /// @brief Archive extensions requiring deep scan
     inline constexpr const char* ARCHIVE_EXTENSIONS[] = {
         ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
