@@ -430,9 +430,25 @@ extern "C" int wmain(int argc, wchar_t* argv[]) {
     // The pre-wmain boot trace has already run from a .CRT$XCT initializer
     // in BootTrace.cpp; this is the wmain-body trace.
     {
+        // How long the process existed before reaching wmain: image and import
+        // mapping, DllMain of every static import, and C++ static initialisers
+        // (task 334). The 1.0.120/121 first-boot failures never reached this
+        // line, so on a failing start the absence of the line is the measurement
+        // and on a good start this number is the margin left under SCM's 30 s.
+        ULONGLONG sinceCreateMs = 0;
+        {
+            FILETIME created{}, exited{}, kernel{}, user{}, now{};
+            ::GetSystemTimeAsFileTime(&now);
+            if (::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+                const ULONGLONG c = (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+                const ULONGLONG n = (static_cast<ULONGLONG>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+                sinceCreateMs = (n > c) ? (n - c) / 10000ULL : 0ULL;
+            }
+        }
         wchar_t tag[512] = {};
         (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
-                             L"wmain-entry argc=%d arg0=%ls arg1=%ls",
+                             L"wmain-entry sinceProcessCreateMs=%llu argc=%d arg0=%ls arg1=%ls",
+                             sinceCreateMs,
                              argc,
                              (argc >= 1 && argv && argv[0]) ? argv[0] : L"<none>",
                              (argc >= 2 && argv && argv[1]) ? argv[1] : L"<none>");
@@ -441,6 +457,23 @@ extern "C" int wmain(int argc, wchar_t* argv[]) {
 
     InstallProcessWideHandlers();
     ::ShadowStrikeAppendBootTrace(L"handlers-installed");
+
+    // DLL SEARCH ORDER: application directory, System32 and explicitly added
+    // directories only - never the current directory or PATH.
+    //
+    // The service runs as LocalSystem, so a DLL resolved by name from a
+    // user-writable PATH entry is a privilege escalation. That matters more since
+    // onnxruntime.dll became delay-loaded (task 334): it is now resolved at first
+    // use, through the process default search order, instead of by the loader
+    // at start. Set before any module is loaded by name.
+    if (!::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {
+        wchar_t tag[96] = {};
+        (void)::_snwprintf_s(tag, _countof(tag), _TRUNCATE,
+                             L"SetDefaultDllDirectories-FAIL err=%lu", ::GetLastError());
+        ::ShadowStrikeAppendBootTrace(tag);
+    } else {
+        ::ShadowStrikeAppendBootTrace(L"dll-search-order-hardened");
+    }
 
     // Map the diagnostic trace ring before anything else runs, so start-up is
     // covered too - the two hardest failures so far both happened during Start().

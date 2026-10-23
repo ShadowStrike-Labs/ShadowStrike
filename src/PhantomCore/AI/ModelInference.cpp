@@ -512,6 +512,25 @@ bool ModelInference::Initialize(const CortexConfig& config) noexcept {
         // -----------------------------------------------------------
         // 1. Obtain the ORT C API
         // -----------------------------------------------------------
+        //
+        // onnxruntime.dll is DELAY-LOADED by the service (task 334), so the
+        // first call into it is where the loader runs. A missing or unloadable
+        // DLL would surface there as an SEH exception from the delay-load
+        // helper, which noexcept turns into termination. Load it explicitly
+        // first - from the application directory or System32 only, never the
+        // current directory or PATH - so absence is an ordinary failure. In a
+        // binary that imports it normally the module is already present and
+        // this is a lookup.
+        if (::GetModuleHandleW(L"onnxruntime.dll") == nullptr &&
+            ::LoadLibraryExW(L"onnxruntime.dll", nullptr,
+                             LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                             LOAD_LIBRARY_SEARCH_SYSTEM32) == nullptr) {
+            SS_LOG_ERROR(kLogTag,
+                L"Initialize: onnxruntime.dll could not be loaded (win32=%lu)",
+                ::GetLastError());
+            return false;
+        }
+
         const OrtApiBase* apiBase = OrtGetApiBase();
         if (!apiBase) {
             SS_LOG_ERROR(kLogTag, L"Initialize: OrtGetApiBase() returned null");

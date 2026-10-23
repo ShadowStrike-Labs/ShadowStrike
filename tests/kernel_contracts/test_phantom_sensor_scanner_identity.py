@@ -28316,5 +28316,50 @@ class SharedExecutableExtensionListTests(unittest.TestCase):
                 self.assertIsNone(self.LIST.search(strip_c_comments(read_source(path))))
 
 
+class ServiceStartLoadTests(unittest.TestCase):
+    """The service does not load ONNX Runtime at start, and resolves DLLs safely (334).
+
+    1.0.120 missed SCM's 30 s connect window on a first boot without reaching its
+    first static initialiser, so the time went to mapping the image and its
+    static imports. onnxruntime.dll (11.5 MB) was one of them although no model
+    ships. It is delay-loaded and only started when a model file exists; the DLL
+    search order is restricted first, because a LocalSystem service resolving a
+    name through PATH is a privilege escalation.
+    """
+
+    VCX = ROOT / "ShadowStrikePhantomService.vcxproj"
+    MAIN = ROOT / "src/PhantomCore/Service/ServiceMain.cpp"
+    INF = ROOT / "src/PhantomCore/AI/ModelInference.cpp"
+    CTX = ROOT / "src/PhantomCore/AI/PhantomCortex.cpp"
+
+    def test_onnxruntime_is_delay_loaded(self):
+        vcx = read_source(self.VCX)
+        self.assertRegex(vcx, r"<DelayLoadDLLs>[^<]*\bonnxruntime\.dll\b")
+        self.assertIn("delayimp.lib", vcx)
+
+    def test_search_order_is_hardened_before_the_service_runs(self):
+        src = strip_c_comments(read_source(self.MAIN))
+        body = src[src.find('extern "C" int wmain('):]
+        hard = body.find("SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)")
+        run = body.find("AntivirusService::Instance().Run()")
+        self.assertNotEqual(-1, hard)
+        self.assertLess(hard, run)
+
+    def test_a_missing_runtime_is_a_failure_not_a_crash(self):
+        src = strip_c_comments(read_source(self.INF))
+        load = src.find('::LoadLibraryExW(L"onnxruntime.dll"')
+        first_call = src.find("OrtGetApiBase()")
+        self.assertNotEqual(-1, load)
+        self.assertLess(load, first_call, "the delay-load helper would raise SEH under noexcept")
+        self.assertNotIn("LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS", src)
+
+    def test_no_model_means_no_runtime(self):
+        src = strip_c_comments(read_source(self.CTX))
+        probe = src.find("anyModelPresent = cache.GetModelPath(")
+        init = src.find("inference.Initialize(config)")
+        self.assertNotEqual(-1, probe)
+        self.assertLess(probe, init)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

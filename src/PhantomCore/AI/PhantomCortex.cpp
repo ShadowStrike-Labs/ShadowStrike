@@ -276,17 +276,7 @@ bool PhantomCortex::Initialize(const CortexConfig& config) noexcept {
         }
         SS_LOG_INFO(LOG_CATEGORY, L"FeatureExtractor initialized successfully");
 
-        // ---- Step 2: Initialize ModelInference (ORT environment) ----
-        auto& inference = ModelInference::Instance();
-        if (!inference.Initialize(config)) {
-            SS_LOG_ERROR(LOG_CATEGORY,
-                L"ModelInference (ONNX Runtime) initialization failed — PhantomCortex cannot operate");
-            m_impl->modelLoadErrors.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        SS_LOG_INFO(LOG_CATEGORY, L"ModelInference (ONNX Runtime) initialized successfully");
-
-        // ---- Step 3: Initialize ModelCache (file management) ----
+        // ---- Step 2: Initialize ModelCache (file management) ----
         auto& cache = ModelCache::Instance();
         if (!cache.Initialize(config.modelDirectory)) {
             SS_LOG_ERROR(LOG_CATEGORY,
@@ -296,6 +286,39 @@ bool PhantomCortex::Initialize(const CortexConfig& config) noexcept {
             return false;
         }
         SS_LOG_INFO(LOG_CATEGORY, L"ModelCache initialized successfully");
+
+        // ---- Step 3: Start ONNX Runtime only when there is a model to run ----
+        //
+        // onnxruntime.dll is delay-loaded (task 334): 11.5 MB that the service
+        // used to map and initialise on every start, before StartServiceCtrl-
+        // Dispatcher, although no model ships yet. Creating the ORT environment
+        // is what loads it, so with no model file present the runtime is never
+        // touched. The outcome is the one Step 7 already gives a model-less
+        // install - non-operational, reported at ERROR - reached without
+        // starting a runtime that would have nothing to execute.
+        bool anyModelPresent = false;
+        for (size_t i = 0; i < CortexConstants::MODEL_COUNT && !anyModelPresent; ++i) {
+            anyModelPresent = cache.GetModelPath(static_cast<CortexModelType>(i)).has_value();
+        }
+        if (!anyModelPresent) {
+            m_impl->operational = false;
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"PhantomCortex has NO model files in '%ls' - ML detection is "
+                L"UNAVAILABLE and ONNX Runtime is not loaded. The engine reports "
+                L"itself non-operational so callers skip inference rather than "
+                L"receive benign verdicts from a layer that is not running.",
+                config.modelDirectory.c_str());
+            return false;
+        }
+
+        auto& inference = ModelInference::Instance();
+        if (!inference.Initialize(config)) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"ModelInference (ONNX Runtime) initialization failed — PhantomCortex cannot operate");
+            m_impl->modelLoadErrors.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        SS_LOG_INFO(LOG_CATEGORY, L"ModelInference (ONNX Runtime) initialized successfully");
 
         // ---- Step 4: Load all available models ----
         uint32_t modelsLoaded = 0;
