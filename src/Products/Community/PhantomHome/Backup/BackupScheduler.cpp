@@ -268,7 +268,7 @@ public:
     bool Initialize(const SchedulerConfiguration& config) {
         std::unique_lock lock(m_mutex);
         auto status = m_status.load(std::memory_order_acquire);
-        if (status != ModuleStatus::Uninitialized && status != ModuleStatus::Stopped) {
+        if (status != SchedulerModuleStatus::Uninitialized && status != SchedulerModuleStatus::Stopped) {
             SS_LOG_WARN(LOG_CATEGORY, L"Already initialized (status=%u)",
                 static_cast<unsigned>(status));
             return true;
@@ -279,13 +279,13 @@ public:
             return false;
         }
 
-        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
+        m_status.store(SchedulerModuleStatus::Initializing, std::memory_order_release);
         m_config = config;
         m_stats.Reset();
 
         InitializeCpuBaseline();
 
-        m_status.store(ModuleStatus::Running, std::memory_order_release);
+        m_status.store(SchedulerModuleStatus::Running, std::memory_order_release);
         m_running.store(m_config.enabled, std::memory_order_release);
 
         if (m_config.enabled) {
@@ -293,7 +293,7 @@ public:
                 m_thread = std::thread(&BackupSchedulerImpl::SchedulerLoop, this);
             } catch (const std::exception& ex) {
                 m_running.store(false, std::memory_order_release);
-                m_status.store(ModuleStatus::Error, std::memory_order_release);
+                m_status.store(SchedulerModuleStatus::Error, std::memory_order_release);
                 SS_LOG_ERROR(LOG_CATEGORY,
                     L"Initialize: failed to start scheduler thread: %hs",
                     ex.what());
@@ -312,13 +312,13 @@ public:
         {
             std::unique_lock lock(m_mutex);
             const auto status = m_status.load(std::memory_order_acquire);
-            if (status == ModuleStatus::Stopped ||
-                status == ModuleStatus::Uninitialized) {
+            if (status == SchedulerModuleStatus::Stopped ||
+                status == SchedulerModuleStatus::Uninitialized) {
                 return;
             }
             SS_LOG_INFO(LOG_CATEGORY, L"Shutting down scheduler");
             m_running.store(false, std::memory_order_release);
-            m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+            m_status.store(SchedulerModuleStatus::Stopping, std::memory_order_release);
             m_cv.notify_all();
         }
         if (m_thread.joinable()) {
@@ -326,16 +326,16 @@ public:
         }
         {
             std::unique_lock lock(m_mutex);
-            m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+            m_status.store(SchedulerModuleStatus::Stopped, std::memory_order_release);
         }
         SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
     }
 
     bool IsInitialized() const noexcept {
-        return m_status.load(std::memory_order_acquire) != ModuleStatus::Uninitialized;
+        return m_status.load(std::memory_order_acquire) != SchedulerModuleStatus::Uninitialized;
     }
 
-    ModuleStatus GetStatus() const noexcept {
+    SchedulerModuleStatus GetStatus() const noexcept {
         return m_status.load(std::memory_order_acquire);
     }
 
@@ -370,17 +370,17 @@ public:
                 L"Cannot start: previous scheduler thread is still joinable");
             return;
         }
-        if (m_status.load(std::memory_order_relaxed) == ModuleStatus::Uninitialized) {
+        if (m_status.load(std::memory_order_relaxed) == SchedulerModuleStatus::Uninitialized) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Cannot start: not initialized");
             return;
         }
         m_running.store(true, std::memory_order_release);
-        m_status.store(ModuleStatus::Running, std::memory_order_release);
+        m_status.store(SchedulerModuleStatus::Running, std::memory_order_release);
         try {
             m_thread = std::thread(&BackupSchedulerImpl::SchedulerLoop, this);
         } catch (const std::exception& ex) {
             m_running.store(false, std::memory_order_release);
-            m_status.store(ModuleStatus::Error, std::memory_order_release);
+            m_status.store(SchedulerModuleStatus::Error, std::memory_order_release);
             SS_LOG_ERROR(LOG_CATEGORY,
                 L"Start: failed to start scheduler thread: %hs",
                 ex.what());
@@ -395,23 +395,23 @@ public:
 
     void Pause() {
         std::unique_lock lock(m_mutex);
-        if (m_status.load(std::memory_order_relaxed) == ModuleStatus::Running) {
-            m_status.store(ModuleStatus::Paused, std::memory_order_release);
+        if (m_status.load(std::memory_order_relaxed) == SchedulerModuleStatus::Running) {
+            m_status.store(SchedulerModuleStatus::Paused, std::memory_order_release);
             SS_LOG_INFO(LOG_CATEGORY, L"Scheduler paused");
         }
     }
 
     void Resume() {
         std::unique_lock lock(m_mutex);
-        if (m_status.load(std::memory_order_relaxed) == ModuleStatus::Paused) {
-            m_status.store(ModuleStatus::Running, std::memory_order_release);
+        if (m_status.load(std::memory_order_relaxed) == SchedulerModuleStatus::Paused) {
+            m_status.store(SchedulerModuleStatus::Running, std::memory_order_release);
             m_cv.notify_one();
             SS_LOG_INFO(LOG_CATEGORY, L"Scheduler resumed");
         }
     }
 
     bool IsRunning() const noexcept {
-        return m_status.load(std::memory_order_acquire) == ModuleStatus::Running;
+        return m_status.load(std::memory_order_acquire) == SchedulerModuleStatus::Running;
     }
 
     // ========================================================================
@@ -958,7 +958,7 @@ public:
 
             {
                 std::unique_lock lock(m_mutex);
-                if (m_status.load(std::memory_order_relaxed) == ModuleStatus::Running) {
+                if (m_status.load(std::memory_order_relaxed) == SchedulerModuleStatus::Running) {
                     ProcessSchedulesLocked(newlyQueued);
                     ProcessQueueLocked(sysConditions, toDispatch, throttleReason);
                 }
@@ -1393,7 +1393,7 @@ private:
 
     mutable std::shared_mutex m_mutex;
     std::atomic<bool> m_running{false};
-    std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
+    std::atomic<SchedulerModuleStatus> m_status{SchedulerModuleStatus::Uninitialized};
     std::thread m_thread;
     std::condition_variable_any m_cv;
 
@@ -1449,7 +1449,7 @@ bool BackupScheduler::IsInitialized() const noexcept {
     return m_impl->IsInitialized();
 }
 
-ModuleStatus BackupScheduler::GetStatus() const noexcept {
+SchedulerModuleStatus BackupScheduler::GetStatus() const noexcept {
     return m_impl->GetStatus();
 }
 

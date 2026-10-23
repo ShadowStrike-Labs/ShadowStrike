@@ -258,7 +258,7 @@ enum class DayOfWeek : uint8_t {
 /**
  * @brief Module status
  */
-enum class ModuleStatus : uint8_t {
+enum class SchedulerModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -584,7 +584,7 @@ public:
     [[nodiscard]] bool Initialize(const SchedulerConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] SchedulerModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const SchedulerConfiguration& config);
     [[nodiscard]] SchedulerConfiguration GetConfiguration() const;

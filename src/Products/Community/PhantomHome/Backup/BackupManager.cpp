@@ -376,7 +376,7 @@ public:
     BackupConfiguration m_config;
     VaultInfo m_vaultInfo;
     BackupStatistics m_stats;
-    std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
+    std::atomic<BackupModuleStatus> m_status{BackupModuleStatus::Uninitialized};
 
     // Internal Data
     std::vector<BackupPoint> m_backups;
@@ -400,8 +400,8 @@ public:
     std::vector<uint8_t> m_vaultVerifyTag;
 
     // Callbacks
-    std::vector<ProgressCallback> m_progressCallbacks;
-    std::vector<CompletionCallback> m_completionCallbacks;
+    std::vector<BackupProgressCallback> m_progressCallbacks;
+    std::vector<BackupCompletionCallback> m_completionCallbacks;
     std::vector<FileCallback> m_fileCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
 
@@ -417,11 +417,11 @@ public:
 
     bool Initialize(const BackupConfiguration& config) {
         std::unique_lock lock(m_mutex);
-        if (m_status == ModuleStatus::Running) {
+        if (m_status == BackupModuleStatus::Running) {
             SS_LOG_WARN(L"BackupManager", L"Already initialized, skipping re-initialization");
             return true;
         }
-        if (m_status != ModuleStatus::Uninitialized && m_status != ModuleStatus::Stopped) {
+        if (m_status != BackupModuleStatus::Uninitialized && m_status != BackupModuleStatus::Stopped) {
             SS_LOG_WARN(L"BackupManager", L"Cannot initialize from state %d",
                         static_cast<int>(m_status.load()));
             return false;
@@ -433,7 +433,7 @@ public:
         }
 
         m_config = config;
-        m_status = ModuleStatus::Initializing;
+        m_status = BackupModuleStatus::Initializing;
         m_stopRequested = false;
 
         std::error_code ec;
@@ -453,7 +453,7 @@ public:
         }
 
         m_stats.Reset();
-        m_status = ModuleStatus::Running;
+        m_status = BackupModuleStatus::Running;
 
         SS_LOG_INFO(L"BackupManager", L"Initialized successfully. Vault path: %ls, Status: %hs",
                     m_config.defaultVault.vaultPath.c_str(),
@@ -464,9 +464,9 @@ public:
     void Shutdown() {
         {
             std::unique_lock lock(m_mutex);
-            if (m_status == ModuleStatus::Stopped || m_status == ModuleStatus::Uninitialized) return;
+            if (m_status == BackupModuleStatus::Stopped || m_status == BackupModuleStatus::Uninitialized) return;
 
-            m_status = ModuleStatus::Stopping;
+            m_status = BackupModuleStatus::Stopping;
             m_stopRequested.store(true, std::memory_order_release);
 
             // Cancel all active backup operations
@@ -489,7 +489,7 @@ public:
             m_opStates.clear();
             m_activeBackups.clear();
             m_vaultKey.Clear();
-            m_status = ModuleStatus::Stopped;
+            m_status = BackupModuleStatus::Stopped;
         }
 
         SS_LOG_INFO(L"BackupManager", L"Shutdown complete. All worker threads joined.");
@@ -807,7 +807,7 @@ public:
         Utils::CryptoUtils::SecureByteBuffer threadKey;
         {
             std::shared_lock lock(m_mutex);
-            if (m_status != ModuleStatus::Running) {
+            if (m_status != BackupModuleStatus::Running) {
                 NotifyError("BackupManager is not running", 102);
                 return {};
             }
@@ -1720,7 +1720,7 @@ public:
 
     void NotifyProgress(const BackupProgress& progress) {
         // Copy callbacks to invoke outside the lock
-        std::vector<ProgressCallback> cbs;
+        std::vector<BackupProgressCallback> cbs;
         {
             std::shared_lock lock(m_callbackMutex);
             cbs = m_progressCallbacks;
@@ -1734,7 +1734,7 @@ public:
     }
 
     void NotifyCompletion(const BackupPoint& bp) {
-        std::vector<CompletionCallback> cbs;
+        std::vector<BackupCompletionCallback> cbs;
         {
             std::shared_lock lock(m_callbackMutex);
             cbs = m_completionCallbacks;
@@ -1852,10 +1852,10 @@ void BackupManager::Shutdown() {
 }
 
 bool BackupManager::IsInitialized() const noexcept {
-    return m_impl->m_status == ModuleStatus::Running;
+    return m_impl->m_status == BackupModuleStatus::Running;
 }
 
-ModuleStatus BackupManager::GetStatus() const noexcept {
+BackupModuleStatus BackupManager::GetStatus() const noexcept {
     return m_impl->m_status;
 }
 
@@ -2083,13 +2083,13 @@ uint32_t BackupManager::GetRetentionDays() const noexcept {
 // CALLBACK REGISTRATION
 // ============================================================================
 
-void BackupManager::RegisterProgressCallback(ProgressCallback callback) {
+void BackupManager::RegisterProgressCallback(BackupProgressCallback callback) {
     if (!callback) return;
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_progressCallbacks.push_back(std::move(callback));
 }
 
-void BackupManager::RegisterCompletionCallback(CompletionCallback callback) {
+void BackupManager::RegisterCompletionCallback(BackupCompletionCallback callback) {
     if (!callback) return;
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_completionCallbacks.push_back(std::move(callback));

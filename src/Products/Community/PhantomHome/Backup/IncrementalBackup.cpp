@@ -414,7 +414,7 @@ bool IncrementalConfiguration::IsValid() const noexcept {
 class IncrementalBackupImpl {
 public:
     IncrementalBackupImpl() noexcept
-        : m_status(ModuleStatus::Uninitialized)
+        : m_status(IncrementalModuleStatus::Uninitialized)
         , m_initialized(false)
     {
         SS_LOG_INFO(LOG_CATEGORY, L"Creating IncrementalBackup implementation");
@@ -437,12 +437,12 @@ public:
         }
 
         SS_LOG_INFO(LOG_CATEGORY, L"Initializing IncrementalBackup");
-        m_status.store(ModuleStatus::Initializing, std::memory_order_release);
+        m_status.store(IncrementalModuleStatus::Initializing, std::memory_order_release);
 
         try {
             if (!config.IsValid()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration: check chunking/buffer/thread params");
-                m_status.store(ModuleStatus::Error, std::memory_order_release);
+                m_status.store(IncrementalModuleStatus::Error, std::memory_order_release);
                 return false;
             }
 
@@ -455,7 +455,7 @@ public:
             }
 
             m_initialized.store(true, std::memory_order_release);
-            m_status.store(ModuleStatus::Ready, std::memory_order_release);
+            m_status.store(IncrementalModuleStatus::Ready, std::memory_order_release);
             m_stats.startTime.store(Clock::now(), std::memory_order_relaxed);
 
             SS_LOG_INFO(LOG_CATEGORY, L"IncrementalBackup initialized successfully");
@@ -463,7 +463,7 @@ public:
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Initialization failed: %hs", ex.what());
-            m_status.store(ModuleStatus::Error, std::memory_order_release);
+            m_status.store(IncrementalModuleStatus::Error, std::memory_order_release);
             return false;
         }
     }
@@ -474,7 +474,7 @@ public:
         }
 
         SS_LOG_INFO(LOG_CATEGORY, L"Shutting down IncrementalBackup");
-        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+        m_status.store(IncrementalModuleStatus::Stopping, std::memory_order_release);
 
         // Step 1: Signal all active syncs to cancel (shared lock is sufficient
         // because we only write to atomic cancelFlag).
@@ -514,7 +514,7 @@ public:
         m_chunkCache.clear();
 
         m_initialized.store(false, std::memory_order_release);
-        m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+        m_status.store(IncrementalModuleStatus::Stopped, std::memory_order_release);
 
         SS_LOG_INFO(LOG_CATEGORY, L"IncrementalBackup shutdown complete");
     }
@@ -523,7 +523,7 @@ public:
         return m_initialized.load(std::memory_order_acquire);
     }
 
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept {
+    [[nodiscard]] IncrementalModuleStatus GetStatus() const noexcept {
         return m_status.load(std::memory_order_acquire);
     }
 
@@ -559,7 +559,7 @@ public:
             SS_LOG_ERROR(LOG_CATEGORY, L"StartSync called before initialization");
             return "";
         }
-        if (m_status.load(std::memory_order_acquire) == ModuleStatus::Stopping) {
+        if (m_status.load(std::memory_order_acquire) == IncrementalModuleStatus::Stopping) {
             SS_LOG_WARN(LOG_CATEGORY, L"StartSync rejected: module is shutting down");
             return "";
         }
@@ -1315,12 +1315,12 @@ public:
     // CALLBACK MANAGEMENT
     // ========================================================================
 
-    void RegisterProgressCallback(ProgressCallback cb) noexcept {
+    void RegisterProgressCallback(SyncProgressCallback cb) noexcept {
         std::unique_lock lock(m_callbackMutex);
         m_progressCallback = std::move(cb);
     }
 
-    void RegisterCompletionCallback(CompletionCallback cb) noexcept {
+    void RegisterCompletionCallback(SyncCompletionCallback cb) noexcept {
         std::unique_lock lock(m_callbackMutex);
         m_completionCallback = std::move(cb);
     }
@@ -1923,7 +1923,7 @@ private:
     mutable std::shared_mutex m_dedupMutex;
     mutable std::shared_mutex m_callbackMutex;
 
-    std::atomic<ModuleStatus> m_status;
+    std::atomic<IncrementalModuleStatus> m_status;
     std::atomic<bool> m_initialized;
 
     IncrementalConfiguration m_config;
@@ -1935,8 +1935,8 @@ private:
     std::unordered_map<std::array<uint8_t, 32>, DedupIndexEntry, ArrayHash> m_dedupIndex;
     std::unordered_map<std::array<uint8_t, 32>, std::vector<uint8_t>, ArrayHash> m_chunkCache;
 
-    ProgressCallback m_progressCallback;
-    CompletionCallback m_completionCallback;
+    SyncProgressCallback m_progressCallback;
+    SyncCompletionCallback m_completionCallback;
     ChunkCallback m_chunkCallback;
     ChangeCallback m_changeCallback;
     ErrorCallback m_errorCallback;
@@ -1975,7 +1975,7 @@ bool IncrementalBackup::IsInitialized() const noexcept {
     return m_impl->IsInitialized();
 }
 
-ModuleStatus IncrementalBackup::GetStatus() const noexcept {
+IncrementalModuleStatus IncrementalBackup::GetStatus() const noexcept {
     return m_impl->GetStatus();
 }
 
@@ -2133,11 +2133,11 @@ void IncrementalBackup::SetCompressionLevel(int level) {
     m_impl->SetCompressionLevel(level);
 }
 
-void IncrementalBackup::RegisterProgressCallback(ProgressCallback callback) {
+void IncrementalBackup::RegisterProgressCallback(SyncProgressCallback callback) {
     m_impl->RegisterProgressCallback(std::move(callback));
 }
 
-void IncrementalBackup::RegisterCompletionCallback(CompletionCallback callback) {
+void IncrementalBackup::RegisterCompletionCallback(SyncCompletionCallback callback) {
     m_impl->RegisterCompletionCallback(std::move(callback));
 }
 

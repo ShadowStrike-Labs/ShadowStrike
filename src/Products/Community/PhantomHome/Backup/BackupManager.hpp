@@ -260,7 +260,7 @@ enum class EncryptionMode : uint8_t {
 /**
  * @brief Module status
  */
-enum class ModuleStatus : uint8_t {
+enum class BackupModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -627,8 +627,8 @@ struct BackupConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using ProgressCallback = std::function<void(const BackupProgress&)>;
-using CompletionCallback = std::function<void(const BackupPoint&)>;
+using BackupProgressCallback = std::function<void(const BackupProgress&)>;
+using BackupCompletionCallback = std::function<void(const BackupPoint&)>;
 using FileCallback = std::function<bool(const fs::path&)>;  // Return false to skip
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
@@ -658,7 +658,7 @@ public:
     [[nodiscard]] bool Initialize(const BackupConfiguration& config);
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] BackupModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const BackupConfiguration& config);
     [[nodiscard]] BackupConfiguration GetConfiguration() const;
@@ -792,8 +792,8 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterProgressCallback(ProgressCallback callback);
-    void RegisterCompletionCallback(CompletionCallback callback);
+    void RegisterProgressCallback(BackupProgressCallback callback);
+    void RegisterCompletionCallback(BackupCompletionCallback callback);
     void RegisterFileCallback(FileCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();

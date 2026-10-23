@@ -29,11 +29,8 @@
  */
 
 /*
- * SPLIT NOTE. BackupManager.hpp and IncrementalBackup.hpp CANNOT be included in one translation unit. Both
- * declare ShadowStrike::Backup::ModuleStatus with different enumerators, and both declare ProgressCallback
- * and CompletionCallback as different function types, so the compiler reports C2011 and two C2371s. Filed;
- * see the Backup type-collision task. This is the same constraint the Banking headers impose, and the same
- * reason a test file was split there.
+ * HEADERS. Every Backup header may share a translation unit since task 302 gave each module's status enum
+ * and callback aliases its own name; BackupHeadersCompose_Tests.cpp includes all four to keep it so.
  */
 
 #include "pch.h"

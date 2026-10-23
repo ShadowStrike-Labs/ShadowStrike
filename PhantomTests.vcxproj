@@ -411,6 +411,7 @@
     <ClCompile Include="tests\unit\home_unit\EmailHomographAndExtensions_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\KeyloggerProtection.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\SecureBrowser.cpp" />
+    <ClCompile Include="tests\unit\home_unit\BackupHeadersCompose_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\BankingHeadersCompose_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\BankingHookLegitimacy_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupManager.cpp" />

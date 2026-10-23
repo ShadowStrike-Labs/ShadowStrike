@@ -246,7 +246,7 @@ enum class SyncStatus : uint8_t {
 /**
  * @brief Module status
  */
-enum class ModuleStatus : uint8_t {
+enum class IncrementalModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Ready           = 2,
@@ -586,8 +586,8 @@ struct IncrementalConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using ProgressCallback = std::function<void(const SyncProgress&)>;
-using CompletionCallback = std::function<void(const SyncResult&)>;
+using SyncProgressCallback = std::function<void(const SyncProgress&)>;
+using SyncCompletionCallback = std::function<void(const SyncResult&)>;
 using ChunkCallback = std::function<void(const ChunkDescriptor&)>;
 using ChangeCallback = std::function<void(const FileChangeRecord&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
@@ -617,7 +617,7 @@ public:
     [[nodiscard]] bool Initialize(const IncrementalConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] IncrementalModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const IncrementalConfiguration& config);
     [[nodiscard]] IncrementalConfiguration GetConfiguration() const;
@@ -731,8 +731,8 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterProgressCallback(ProgressCallback callback);
-    void RegisterCompletionCallback(CompletionCallback callback);
+    void RegisterProgressCallback(SyncProgressCallback callback);
+    void RegisterCompletionCallback(SyncCompletionCallback callback);
     void RegisterChunkCallback(ChunkCallback callback);
     void RegisterChangeCallback(ChangeCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);

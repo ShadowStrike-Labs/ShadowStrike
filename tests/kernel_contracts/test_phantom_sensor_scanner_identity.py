@@ -28256,5 +28256,31 @@ class BankingNamespaceTypesTests(unittest.TestCase):
                 self.assertIn('#include "Products/Community/PhantomHome/Banking/%s"' % p.name, src)
 
 
+class BackupNamespaceTypesTests(unittest.TestCase):
+    """Backup's per-module status enums and callbacks carry module names (task 302).
+
+    BackupManager, BackupScheduler and IncrementalBackup each declared
+    Backup::ModuleStatus with different enumerators (4 = Restoring or Paused), and
+    two declared ProgressCallback/CompletionCallback as different types.
+    BackupHeadersCompose_Tests.cpp includes every Backup header.
+    """
+
+    BACKUP = ROOT / "src/Products/Community/PhantomHome/Backup"
+    COMPOSE = ROOT / "tests/unit/home_unit/BackupHeadersCompose_Tests.cpp"
+
+    def test_no_bare_shared_names(self):
+        for p in sorted(self.BACKUP.glob("*.hpp")):
+            src = strip_c_comments(read_source(p))
+            with self.subTest(header=p.name):
+                self.assertNotRegex(src, r"enum class ModuleStatus\b")
+                self.assertNotRegex(src, r"using (Progress|Completion)Callback\b")
+
+    def test_every_backup_header_is_composed(self):
+        src = read_source(self.COMPOSE)
+        for p in sorted(self.BACKUP.glob("*.hpp")):
+            with self.subTest(header=p.name):
+                self.assertIn('#include "Products/Community/PhantomHome/Backup/%s"' % p.name, src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

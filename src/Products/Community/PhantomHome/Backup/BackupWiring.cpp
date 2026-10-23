@@ -25,12 +25,9 @@
  *      order.  Wiring them separately would duplicate lifecycle management
  *      and bypass BackupManager's internal sequencing.
  *
- *   2. Header ODR constraint.  BackupScheduler.hpp, BackupManager.hpp, and
- *      IncrementalBackup.hpp each independently declare
- *      ShadowStrike::Backup::ModuleStatus.  Including more than one of these
- *      headers in the same translation unit triggers a C2011 redefinition
- *      error.  The upstream headers rely on the project PCH to absorb
- *      duplicates; a standalone wiring TU cannot use that mechanism.
+ *   2. One owner of the lifecycle.  The Backup headers compose (each module's
+ *      status enum carries its own name since task 302), but the sub-modules'
+ *      lifecycles are still BackupManager's to sequence.
  *
  *   3. Startup ordering.  BackupManager is the natural start boundary:
  *      nothing in the Backup subsystem is independently useful without a
