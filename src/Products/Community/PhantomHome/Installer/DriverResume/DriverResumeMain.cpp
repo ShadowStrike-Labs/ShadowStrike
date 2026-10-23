@@ -76,6 +76,7 @@
 
 #include "DriverInstaller.hpp"
 #include "TestSigningPivot.hpp"
+#include "ServiceStartWatchdog.hpp"
 #include "RootCertInstall.hpp"
 #include "SecureBootCheck.hpp"
 #include "Stage1Diagnostics.hpp"
@@ -666,6 +667,23 @@ static int RunStage2()
     LOG_INFO(L"Home service start deferred to SCM delayed-auto-start "
              L"(prevents post-FilterLoad ConnectNotify storm on first boot).");
 
+    // SCM does not retry a start that missed its 30 s connect window - its failure
+    // actions apply only to a running service that dies - so register the boot-time
+    // watchdog that does (task 334, ServiceStartWatchdog.hpp). Failure here does not
+    // fail Stage 2: the service is installed and SCM still starts it on its own.
+    {
+        wchar_t ownExe[MAX_PATH + 1] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, ownExe, MAX_PATH);
+        const DWORD wdErr = (n == 0 || n >= MAX_PATH)
+            ? ERROR_BAD_PATHNAME
+            : ShadowStrike::Installer::RegisterServiceWatchdogTask(ownExe);
+        if (wdErr != ERROR_SUCCESS) {
+            LOG_ERROR(L"Stage 2: service start watchdog could not be registered (0x%08X). "
+                      L"A first-boot start that times out will stay stopped until the next boot.",
+                      wdErr);
+        }
+    }
+
     // Best-effort Defender exclusions post-success.  Failure here MUST NOT
     // fail Stage 2 -- signed binaries should pass Defender on their own.
     {
@@ -871,9 +889,37 @@ static int RunInstallNow()
 // ────────────────────────────────────────────────────────────────────────────
 static int RunStartService()
 {
+    using namespace ShadowStrike::Installer;
+
     LOG_INFO(L"=== Mode: --start-service ===");
-    const DWORD err = StartHomeServiceBestEffort(L"explicit command");
-    return err == ERROR_SUCCESS ? kExitSuccess : kExitGenericFailure;
+
+    // Run by the boot watchdog task and by hand. An already-running service is a
+    // status query. A start that ran out of time is retried with a fresh SCM window,
+    // a bounded number of times; any other failure is a configuration fault that a
+    // retry would only repeat, so it is reported once.
+    DWORD err = ERROR_SUCCESS;
+    for (unsigned attempt = 1; attempt <= kServiceStartMaxAttempts; ++attempt) {
+        err = StartHomeServiceBestEffort(attempt == 1 ? L"start request" : L"retry after start timeout");
+        if (err == ERROR_SUCCESS) {
+            if (attempt > 1) {
+                LOG_WARN(L"Home service started on attempt %u of %u after earlier start timeouts.",
+                         attempt, kServiceStartMaxAttempts);
+            }
+            return kExitSuccess;
+        }
+        if (!IsRetryableServiceStartFailure(err)) {
+            LOG_ERROR(L"Home service start failed with a non-transient error (0x%08X); not retrying.", err);
+            return kExitGenericFailure;
+        }
+        if (attempt < kServiceStartMaxAttempts) {
+            LOG_WARN(L"Home service start timed out (attempt %u of %u); retrying in %lu ms.",
+                     attempt, kServiceStartMaxAttempts, kServiceStartRetryDelayMs);
+            Sleep(kServiceStartRetryDelayMs);
+        }
+    }
+    LOG_ERROR(L"Home service did not start after %u attempts (last 0x%08X).",
+              kServiceStartMaxAttempts, err);
+    return kExitGenericFailure;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -890,6 +936,12 @@ static int RunUninstall()
         DWORD err = GetLastError();
         LOG_ERROR(L"OpenSCManagerW failed (0x%08X).", err);
         return kExitInsufficientPriv;
+    }
+
+    // The watchdog task would otherwise run a deleted binary as SYSTEM at every boot.
+    // Removed first, and best-effort: an uninstall must not fail over a task.
+    if (const DWORD wdErr = DeleteServiceWatchdogTask(); wdErr != ERROR_SUCCESS) {
+        LOG_WARN(L"Service start watchdog task could not be removed (0x%08X).", wdErr);
     }
 
     DWORD err = UninstallDriver(scm.get());

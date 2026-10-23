@@ -28384,5 +28384,39 @@ class PreMainBootTraceTests(unittest.TestCase):
         self.assertIn("GetProcessTimes(", src)
 
 
+class ServiceStartWatchdogWiringTests(unittest.TestCase):
+    """A first-boot start that times out is retried at boot (task 334).
+
+    SCM applies no failure action when a start misses its 30 s connect window
+    (measured, Test-RecoveryOnStartTimeout.ps1), and 5 of 9 fresh-install first
+    boots did. Stage 2 registers a SYSTEM boot task that runs --start-service;
+    uninstall must remove it, or a deleted binary path keeps running as SYSTEM.
+    """
+
+    MAIN = ROOT / "src/Products/Community/PhantomHome/Installer/DriverResume/DriverResumeMain.cpp"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = strip_c_comments(read_source(cls.MAIN))
+
+    def _body(self, name):
+        # The definition, not the forward declaration: the name followed by its body.
+        m = re.search(r"static int " + name + r"\(\)\s*\{", self.src)
+        self.assertIsNotNone(m, name)
+        j = self.src.find("static int Run", m.end())
+        return self.src[m.start():j if j != -1 else len(self.src)]
+
+    def test_stage2_registers_the_watchdog(self):
+        self.assertIn("RegisterServiceWatchdogTask(", self._body("RunStage2"))
+
+    def test_uninstall_removes_it(self):
+        self.assertIn("DeleteServiceWatchdogTask()", self._body("RunUninstall"))
+
+    def test_start_service_retries_only_timeouts_and_is_bounded(self):
+        body = self._body("RunStartService")
+        self.assertIn("attempt <= kServiceStartMaxAttempts", body)
+        self.assertIn("IsRetryableServiceStartFailure(err)", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
