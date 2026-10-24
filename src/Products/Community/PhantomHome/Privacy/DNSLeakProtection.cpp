@@ -342,9 +342,18 @@ public:
     // DNS cache
     std::unordered_map<std::string, DNSCacheEntry> m_dnsCache;
 
-    // Blocklists
+    // Blocklists. The whitelist was write-only until task 298: WhitelistDomain stored
+    // into it and returned true, and no decision read it.
     std::unordered_set<std::string> m_blockedDomains;
     std::unordered_set<std::string> m_whitelistedDomains;
+
+    // The resolve decision for a normalised name; caller holds m_mutex (shared or
+    // unique). Whitelist first: that is what a whitelist is for, and an imported
+    // blocklist would otherwise put a name back on every re-import.
+    [[nodiscard]] bool IsRefusedLocked(const std::string& normalized) const {
+        return m_whitelistedDomains.count(normalized) == 0 &&
+               m_blockedDomains.count(normalized) > 0;
+    }
 
     // Event history
     std::vector<DNSLeakEvent> m_recentLeaks;
@@ -1280,6 +1289,7 @@ void DNSLeakProtection::Shutdown() {
         // Clear caches
         m_impl->m_dnsCache.clear();
         m_impl->m_blockedDomains.clear();
+        m_impl->m_whitelistedDomains.clear();
         m_impl->m_recentLeaks.clear();
         m_impl->m_recentHijacks.clear();
 
@@ -1783,7 +1793,7 @@ void DNSLeakProtection::StopMonitoring() {
         // Check if domain is blocked
         {
             std::shared_lock lock(m_impl->m_mutex);
-            if (m_impl->m_blockedDomains.count(normalized) > 0) {
+            if (m_impl->IsRefusedLocked(normalized)) {
                 response.status = DNSResponseStatus::Blocked;
                 m_impl->m_stats.blockedDomains++;
                 return response;
@@ -1921,7 +1931,7 @@ void DNSLeakProtection::StopMonitoring() {
 [[nodiscard]] bool DNSLeakProtection::IsDomainBlocked(const std::string& domain) {
     std::string normalized = NormalizeDomain(domain);
     std::shared_lock lock(m_impl->m_mutex);
-    return m_impl->m_blockedDomains.count(normalized) > 0;
+    return m_impl->IsRefusedLocked(normalized);
 }
 
 [[nodiscard]] bool DNSLeakProtection::WhitelistDomain(const std::string& domain) {
@@ -1946,6 +1956,23 @@ void DNSLeakProtection::StopMonitoring() {
         Utils::Logger::Error("WhitelistDomain failed: {}", e.what());
         return false;
     }
+}
+
+[[nodiscard]] bool DNSLeakProtection::UnwhitelistDomain(const std::string& domain) {
+    try {
+        const std::string normalized = NormalizeDomain(domain);
+        std::unique_lock lock(m_impl->m_mutex);
+        return m_impl->m_whitelistedDomains.erase(normalized) > 0;
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("UnwhitelistDomain failed: {}", e.what());
+        return false;
+    }
+}
+
+[[nodiscard]] bool DNSLeakProtection::IsDomainWhitelisted(const std::string& domain) {
+    const std::string normalized = NormalizeDomain(domain);
+    std::shared_lock lock(m_impl->m_mutex);
+    return m_impl->m_whitelistedDomains.count(normalized) > 0;
 }
 
 [[nodiscard]] bool DNSLeakProtection::ImportBlocklist(const fs::path& listPath) {

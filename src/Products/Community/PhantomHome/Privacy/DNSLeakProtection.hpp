@@ -765,11 +765,21 @@ public:
     /// @brief Unblock domain
     [[nodiscard]] bool UnblockDomain(const std::string& domain);
     
-    /// @brief Is domain blocked
+    /// @brief Whether resolving this exact name would be refused: on the blocklist and
+    ///        not whitelisted. The same decision ResolveDomain makes.
     [[nodiscard]] bool IsDomainBlocked(const std::string& domain);
     
-    /// @brief Whitelist domain
+    /// @brief Whitelist an exact name: it resolves even if a blocklist (typically an
+    ///        imported one that over-blocks) lists it. Affects the resolve decision
+    ///        only - leak and hijack reports about the name are unchanged - and
+    ///        covers the name itself, not its subdomains.
     [[nodiscard]] bool WhitelistDomain(const std::string& domain);
+
+    /// @brief Remove a name from the whitelist.
+    [[nodiscard]] bool UnwhitelistDomain(const std::string& domain);
+
+    /// @brief Whether this exact name is whitelisted.
+    [[nodiscard]] bool IsDomainWhitelisted(const std::string& domain);
     
     /// @brief Import blocklist
     [[nodiscard]] bool ImportBlocklist(const fs::path& listPath);

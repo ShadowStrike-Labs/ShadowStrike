@@ -167,6 +167,31 @@ TEST_F(DnsBlocklistKeyTest, NormalisingFirstDidNotWidenWhatCountsAsADomain) {
     EXPECT_FALSE(Dns().IsDomainBlocked("example..com")) << "and nothing was stored under any of those";
 }
 
+TEST_F(DnsBlocklistKeyTest, AWhitelistedNameIsNotRefusedEvenWhenBlocklisted) {
+    // Task 298: WhitelistDomain stored the name and returned true, and no decision read it, so an
+    // over-blocking imported list could not be corrected.
+    ASSERT_TRUE(Dns().BlockDomain("needed.example.com"));
+    ASSERT_TRUE(Dns().IsDomainBlocked("needed.example.com")) << "precondition";
+
+    ASSERT_TRUE(Dns().WhitelistDomain("Needed.Example.COM."));
+    EXPECT_TRUE(Dns().IsDomainWhitelisted("needed.example.com")) << "normalised like the blocklist";
+    EXPECT_FALSE(Dns().IsDomainBlocked("needed.example.com")) << "the whitelist takes precedence";
+
+    EXPECT_TRUE(Dns().UnwhitelistDomain("needed.example.com"));
+    EXPECT_TRUE(Dns().IsDomainBlocked("needed.example.com")) << "and removing it restores the block";
+    EXPECT_TRUE(Dns().UnblockDomain("needed.example.com"));
+}
+
+TEST_F(DnsBlocklistKeyTest, AWhitelistEntryCoversOnlyTheNameItself) {
+    ASSERT_TRUE(Dns().BlockDomain("ads.whitelisted.example"));
+    ASSERT_TRUE(Dns().WhitelistDomain("whitelisted.example"));
+    EXPECT_TRUE(Dns().IsDomainBlocked("ads.whitelisted.example"))
+        << "whitelisting a parent must not unblock its subdomains";
+    EXPECT_TRUE(Dns().UnwhitelistDomain("whitelisted.example"));
+    EXPECT_TRUE(Dns().UnblockDomain("ads.whitelisted.example"));
+    EXPECT_FALSE(Dns().WhitelistDomain("bad..name")) << "validated like BlockDomain";
+}
+
 TEST_F(DnsBlocklistKeyTest, AnUnknownDomainIsNotBlocked) {
     // Non-vacuity: without this the cases above would pass against a predicate that always answers true.
     EXPECT_FALSE(Dns().IsDomainBlocked("never.blocked.example.org"));
