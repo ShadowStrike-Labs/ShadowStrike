@@ -727,3 +727,18 @@ TEST_F(NetworkUtilsTest, Stress_MultipleAdapterQueries) {
         EXPECT_FALSE(adapters.empty());
     }
 }
+
+// UrlComponents::query keeps its leading '?' and fragment drops its '#' (task 278). Pinned
+// because one consumer reattaches the query verbatim and another must strip the '?' before
+// splitting; a silent change to either half breaks one of them.
+TEST(NetworkUtilsUrlContract, TheQueryKeepsItsDelimiterAndTheFragmentDoesNot) {
+    UrlComponents c;
+    ASSERT_TRUE(ParseUrl(L"https://example.com/a/b?x=1&y=2#frag", c));
+    EXPECT_EQ(std::wstring(L"/a/b"), c.path);
+    EXPECT_EQ(std::wstring(L"?x=1&y=2"), c.query);
+    EXPECT_EQ(std::wstring(L"frag"), c.fragment);
+
+    UrlComponents none;
+    ASSERT_TRUE(ParseUrl(L"https://example.com/a", none));
+    EXPECT_TRUE(none.query.empty()) << "no query means empty, not a lone '?'";
+}

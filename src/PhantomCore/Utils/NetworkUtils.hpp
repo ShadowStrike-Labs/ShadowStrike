@@ -433,7 +433,11 @@ namespace ShadowStrike {
 				std::wstring host;
 				uint16_t port = 0;
 				std::wstring path;
+				// The query INCLUDING its leading '?' ("?a=1&b=2"), or empty when the URL has none.
+				// Kept so a caller can reattach it verbatim; a caller that splits it on '&' must drop
+				// the '?' first, or the first key reads "?a" and matches nothing (task 278).
 				std::wstring query;
+				// The fragment WITHOUT its leading '#'.
 				std::wstring fragment;
 			};
 
