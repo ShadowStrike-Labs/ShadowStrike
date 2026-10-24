@@ -8,21 +8,10 @@
  * @file IoTDeviceRiskScore_Tests.cpp
  * @brief The 0-100 risk score for a discovered device, and the point at which it stops discriminating.
  *
- * IoTDeviceInfo::GetOverallRiskScore is what the IoT page ranks discovered devices by, so it decides
- * which device a user is told to deal with first. It sums four independent contributions and clamps to
- * 100.
- *
- * THE SCALE SATURATES BEFORE THE EVIDENCE RUNS OUT, and that is what these cases record.
- * VulnerabilityLevel::Critical is 5 and the level contributes level * 20, so Critical alone reaches
- * exactly 100. Default credentials add 30, a suspected compromise adds 50, and every open service
- * without authentication adds 10 - and none of it can move a Critical device's score, because the clamp
- * has already been reached. Two Critical devices, one of them compromised with default credentials and
- * three exposed unauthenticated services, are reported as equally risky. An analyst ranking by this
- * number cannot tell them apart.
- *
- * The cases below assert the contributions that DO discriminate, at a vulnerability level low enough to
- * leave headroom, and separately pin the saturation so the limitation is visible rather than folklore.
- * It is filed.
+ * IoTDeviceInfo::GetOverallRiskScore ranks discovered devices. The vulnerability level holds at most
+ * 60 of the 100 points and the concrete findings (risk factors, default credentials, a suspected
+ * compromise, unauthenticated open services) at most 40 (task 277). Before, the level contributed
+ * level * 20, so Critical alone was the clamp and every finding on a Critical device was discarded.
  */
 
 #include "pch.h"
@@ -132,23 +121,35 @@ TEST(IoTDeviceRiskScoreTest, MoreExposedServicesRaiseTheScore) {
         << "three exposed unauthenticated services scored no higher than one";
 }
 
-TEST(IoTDeviceRiskScoreTest, ACriticalDeviceSaturatesTheScaleAndStopsDiscriminating) {
-    // CURRENT BEHAVIOUR, pinned so the limitation cannot be forgotten. Critical is level 5 and the
-    // level contributes level * 20, which is exactly the clamp, so nothing else can move the number.
-    // The consequence is that a Critical device cannot be ranked against another Critical device, which
-    // is precisely when ranking matters most. Filed.
+TEST(IoTDeviceRiskScoreTest, FindingsStillRankCriticalDevices) {
     auto critical = CleanDevice();
     critical.vulnerabilityLevel = VulnerabilityLevel::Critical;
+    auto compromised = critical;
+    compromised.isPotentiallyCompromised = true;
+    auto compromisedWithCreds = compromised;
+    compromisedWithCreds.hasDefaultCredentials = true;
 
-    auto criticalAndWorse = critical;
-    criticalAndWorse.hasDefaultCredentials = true;
-    criticalAndWorse.isPotentiallyCompromised = true;
-    criticalAndWorse.services = {ExposedService(false), ExposedService(false), ExposedService(false)};
+    EXPECT_LT(critical.GetOverallRiskScore(), compromised.GetOverallRiskScore())
+        << "a suspected compromise did not raise a Critical device above a bare Critical one";
+    EXPECT_LT(compromised.GetOverallRiskScore(), compromisedWithCreds.GetOverallRiskScore());
+    EXPECT_EQ(100, compromisedWithCreds.GetOverallRiskScore());
+}
 
-    EXPECT_EQ(100, critical.GetOverallRiskScore());
-    EXPECT_EQ(critical.GetOverallRiskScore(), criticalAndWorse.GetOverallRiskScore())
-        << "if this now fails, the level weighting was changed so the scale keeps discriminating at "
-           "Critical - update the filing and this comment rather than restoring the saturation";
+TEST(IoTDeviceRiskScoreTest, TheLevelAloneNeverReachesTheTop) {
+    auto critical = CleanDevice();
+    critical.vulnerabilityLevel = VulnerabilityLevel::Critical;
+    EXPECT_EQ(60, critical.GetOverallRiskScore());
+}
+
+TEST(IoTDeviceRiskScoreTest, AnInformationalLevelWeighsLessThanFourRiskFactors) {
+    // Informational carried 20 of 100, more than four risk factors together.
+    auto info = CleanDevice();
+    info.vulnerabilityLevel = VulnerabilityLevel::Informational;
+    auto fourFactors = CleanDevice();
+    fourFactors.risks = RiskFactor::OpenTelnet | RiskFactor::UPnPEnabled | RiskFactor::WPSEnabled |
+                        RiskFactor::NoEncryption;
+    EXPECT_LT(info.GetOverallRiskScore(), fourFactors.GetOverallRiskScore());
+    EXPECT_GT(info.GetOverallRiskScore(), 0);
 }
 
 }  // namespace

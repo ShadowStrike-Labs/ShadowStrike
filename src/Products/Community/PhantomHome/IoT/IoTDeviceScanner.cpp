@@ -69,6 +69,7 @@
 #include <algorithm>
 #include <thread>
 #include <future>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <numeric>
@@ -2471,27 +2472,28 @@ void IoTScanStatistics::Reset() noexcept {
 }
 
 [[nodiscard]] int IoTDeviceInfo::GetOverallRiskScore() const {
-    int score = 0;
+    // Two shares of the 0-100 range (task 277). The level contributed level * 20, so
+    // Critical alone reached the clamp and nothing else could move a Critical device:
+    // a compromised Critical device with default credentials ranked equal to a bare one.
+    // The level now holds at most 60 and the concrete findings at most 40, so findings
+    // still separate devices at Critical. Informational weighs 3, not 20: a finding
+    // that is informational is not a fifth of the maximum risk.
+    static constexpr std::array<int, 6> kLevelPoints = {0, 3, 15, 30, 45, 60};
+    static constexpr int kMaxFindingPoints = 40;
 
-    // Base score from vulnerability level
-    score += static_cast<int>(vulnerabilityLevel) * 20;
+    const auto level = static_cast<size_t>(vulnerabilityLevel);
+    const int levelPoints = level < kLevelPoints.size() ? kLevelPoints[level] : kLevelPoints.back();
 
-    // Add points for each risk factor (portable popcount)
-    uint32_t riskBits = static_cast<uint32_t>(risks);
-    score += std::popcount(riskBits) * 5;
-
-    // Critical flags
-    if (hasDefaultCredentials) score += 30;
-    if (isPotentiallyCompromised) score += 50;
-
-    // Open services without auth
+    int findings = std::popcount(static_cast<uint32_t>(risks)) * 2;
+    if (isPotentiallyCompromised) findings += 25;
+    if (hasDefaultCredentials) findings += 15;
     for (const auto& svc : services) {
         if (svc.isOpen && !svc.requiresAuth) {
-            score += 10;
+            findings += 5;
         }
     }
 
-    return std::min(score, 100);
+    return levelPoints + std::min(findings, kMaxFindingPoints);
 }
 
 [[nodiscard]] std::string IoTScanProgress::ToJson() const {
