@@ -30,7 +30,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace ShadowStrike {
 namespace CryptoMiners {
@@ -72,6 +74,44 @@ enum class ModuleStatus : uint8_t {
  * @brief Common error callback shared by all CryptoMinersProtection modules.
  */
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+
+/**
+ * @brief Cryptocurrency being mined. ONE enum for the module (task 281):
+ *        CryptoMinerDetector and PoolConnectionDetector each declared an identical
+ *        layout under different names, so a value converted between them silently.
+ *        MinedCryptocurrency is an alias of this.
+ */
+enum class Cryptocurrency : uint8_t {
+    Unknown     = 0,
+    Bitcoin     = 1,
+    Ethereum    = 2,
+    Monero      = 3,
+    Litecoin    = 4,
+    Ravencoin   = 5,
+    Zcash       = 6,
+    EthClassic  = 7,
+    Ergo        = 8,
+    Other       = 255
+};
+
+/**
+ * @brief Whether an address has the form of a wallet of this currency. Fails closed
+ *        for Unknown and Other. The one validator for the module (defined in
+ *        CryptoMinerDetector.cpp); the regex table PoolConnectionDetector kept beside
+ *        it disagreed on Monero integrated addresses, shielded Zcash and ltc1 Litecoin.
+ */
+/// Display name of a currency (defined in CryptoMinerDetector.cpp).
+[[nodiscard]] std::string_view GetCryptocurrencyName(Cryptocurrency crypto) noexcept;
+
+[[nodiscard]] bool ValidateWalletAddress(std::string_view address, Cryptocurrency crypto);
+
+/**
+ * @brief The currency whose wallet form an address has, tried in a fixed order
+ *        (Bitcoin, Ethereum, Monero, Litecoin, Zcash, Ravencoin, Ergo). Ethereum
+ *        Classic addresses are EVM addresses, indistinguishable from Ethereum's, so
+ *        they classify as Ethereum. Nullopt when no form matches.
+ */
+[[nodiscard]] std::optional<Cryptocurrency> ClassifyWalletAddress(std::string_view address);
 
 } // namespace CryptoMiners
 } // namespace ShadowStrike

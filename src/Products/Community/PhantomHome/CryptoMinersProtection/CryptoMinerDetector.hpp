@@ -311,21 +311,7 @@ enum class MiningAlgorithm : uint8_t {
     ProgPow         = 11    ///< ProgPow variants
 };
 
-/**
- * @brief Cryptocurrency being mined
- */
-enum class Cryptocurrency : uint8_t {
-    Unknown     = 0,
-    Bitcoin     = 1,
-    Ethereum    = 2,
-    Monero      = 3,
-    Litecoin    = 4,
-    Ravencoin   = 5,
-    Zcash       = 6,
-    EthClassic  = 7,
-    Ergo        = 8,
-    Other       = 255
-};
+// Cryptocurrency is defined in CryptoMinersTypes.hpp, shared with PoolConnectionDetector.
 
 /**
  * @brief Detection source
@@ -1184,10 +1170,7 @@ private:
  */
 [[nodiscard]] std::string_view GetMiningAlgorithmName(MiningAlgorithm algorithm) noexcept;
 
-/**
- * @brief Get cryptocurrency name
- */
-[[nodiscard]] std::string_view GetCryptocurrencyName(Cryptocurrency crypto) noexcept;
+// GetCryptocurrencyName is declared in CryptoMinersTypes.hpp.
 
 /**
  * @brief Get detection source name
@@ -1204,10 +1187,7 @@ private:
  */
 [[nodiscard]] bool IsMiningPort(uint16_t port) noexcept;
 
-/**
- * @brief Validate wallet address format
- */
-[[nodiscard]] bool ValidateWalletAddress(std::string_view address, Cryptocurrency crypto);
+// ValidateWalletAddress and ClassifyWalletAddress are declared in CryptoMinersTypes.hpp.
 
 }  // namespace CryptoMiners
 }  // namespace ShadowStrike

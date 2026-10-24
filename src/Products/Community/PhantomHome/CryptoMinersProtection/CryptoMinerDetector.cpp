@@ -446,20 +446,6 @@ struct ProcessRecord {
     }
 }
 
-[[nodiscard]] Cryptocurrency MapPoolCurrency(MinedCryptocurrency currency) {
-    switch (currency) {
-        case MinedCryptocurrency::Bitcoin: return Cryptocurrency::Bitcoin;
-        case MinedCryptocurrency::Ethereum: return Cryptocurrency::Ethereum;
-        case MinedCryptocurrency::Monero: return Cryptocurrency::Monero;
-        case MinedCryptocurrency::Litecoin: return Cryptocurrency::Litecoin;
-        case MinedCryptocurrency::Ravencoin: return Cryptocurrency::Ravencoin;
-        case MinedCryptocurrency::Zcash: return Cryptocurrency::Zcash;
-        case MinedCryptocurrency::EthClassic: return Cryptocurrency::EthClassic;
-        case MinedCryptocurrency::Ergo: return Cryptocurrency::Ergo;
-        default: return Cryptocurrency::Unknown;
-    }
-}
-
 [[nodiscard]] MiningProtocol MapPoolProtocol(PoolProtocolType protocol) {
     switch (protocol) {
         case PoolProtocolType::Stratum: return MiningProtocol::Stratum;
@@ -1806,7 +1792,7 @@ bool CryptoMinerDetectorImpl::DetectNetworkMining(uint32_t processId, MinerDetec
             result.walletAddresses.push_back(mapped.walletAddress);
         }
         if (result.cryptocurrency == Cryptocurrency::Unknown) {
-            result.cryptocurrency = MapPoolCurrency(connection.cryptocurrency);
+            result.cryptocurrency = connection.cryptocurrency;   // one enum since task 281
         }
     }
 
@@ -3796,6 +3782,18 @@ bool ValidateWalletAddress(std::string_view address, Cryptocurrency crypto) {
             // that look interchangeable.
             return false;
     }
+}
+
+std::optional<Cryptocurrency> ClassifyWalletAddress(std::string_view address) {
+    // EthClassic is omitted: its addresses are EVM addresses, identical to Ethereum's.
+    for (const auto crypto : { Cryptocurrency::Bitcoin, Cryptocurrency::Ethereum, Cryptocurrency::Monero,
+                               Cryptocurrency::Litecoin, Cryptocurrency::Zcash, Cryptocurrency::Ravencoin,
+                               Cryptocurrency::Ergo }) {
+        if (ValidateWalletAddress(address, crypto)) {
+            return crypto;
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace CryptoMiners

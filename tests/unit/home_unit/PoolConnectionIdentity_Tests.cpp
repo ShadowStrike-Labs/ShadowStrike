@@ -34,6 +34,7 @@
 #include "Products/Community/PhantomHome/CryptoMinersProtection/PoolConnectionDetector.hpp"
 
 #include <cstdint>
+#include <type_traits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -200,44 +201,45 @@ TEST_F(PoolConnectionIdentityTest, BinaryPayloadIsNotInspectedAsText) {
 // The two wallet validators - the reason both headers are included here
 // ============================================================================================
 
-TEST(PoolWalletValidatorTest, TheTwoValidatorsAgreeOnEveryProbe) {
-    // CryptoMinerDetector and PoolConnectionDetector each declare ValidateWalletAddress, over two enums
-    // whose layouts are identical value for value. A maintainer would reasonably treat them as
-    // interchangeable. They were built on different mechanisms - a hand-written character-class switch
-    // and a compiled regex table - and until recently they disagreed in the dangerous direction, with
-    // one accepting any string containing no whitespace.
-    //
-    // This case requires them to answer alike. It is the enforcement of the filing that records the
-    // duplication, so that if they drift again a test fails rather than the divergence shipping.
-    struct Probe {
-        const char* address;
-        Cryptocurrency a;
-        MinedCryptocurrency b;
-    };
-    const std::vector<Probe> probes = {
-        {"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", Cryptocurrency::Bitcoin, MinedCryptocurrency::Bitcoin},
-        {"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0", Cryptocurrency::Ethereum,
-         MinedCryptocurrency::Ethereum},
-        {"not-an-address", Cryptocurrency::Bitcoin, MinedCryptocurrency::Bitcoin},
-        {"", Cryptocurrency::Bitcoin, MinedCryptocurrency::Bitcoin},
-        {"C:\\Windows\\System32", Cryptocurrency::Unknown, MinedCryptocurrency::Unknown},
-        {"--config=miner.conf", Cryptocurrency::Unknown, MinedCryptocurrency::Unknown},
-        {"hello world", Cryptocurrency::Other, MinedCryptocurrency::Other},
-    };
-    for (const auto& p : probes) {
-        const bool viaMiner = ValidateWalletAddress(p.address, p.a);
-        const bool viaPool = ValidateWalletAddress(p.address, p.b);
-        EXPECT_EQ(viaMiner, viaPool)
-            << "the two wallet validators disagree for \"" << p.address
-            << "\" - one of the duplicated implementations was changed alone";
+TEST(PoolWalletValidatorTest, ThereIsOneCurrencyTypeAndOneValidator) {
+    // Task 281: two enums with identical layouts and two validators that disagreed. One of each now;
+    // a value can no longer be converted between look-alike types, and nothing can drift.
+    static_assert(std::is_same_v<MinedCryptocurrency, Cryptocurrency>);
+    EXPECT_EQ(GetMinedCryptocurrencyName(MinedCryptocurrency::EthClassic),
+              GetCryptocurrencyName(Cryptocurrency::EthClassic));
+}
+
+TEST(PoolWalletValidatorTest, FormsTheRegexTableRejectedAreRecognised) {
+    // The pool module's regex copy demanded exactly 95 Monero characters, transparent-only Zcash and
+    // [LM]-only Litecoin, so a payload carrying an integrated Monero address (106), a shielded Zcash
+    // address or a bech32 Litecoin address yielded no wallet.
+    const std::string integratedMonero = "4" + std::string("A") + std::string(104, '1');
+    ASSERT_EQ(106u, integratedMonero.size());
+    EXPECT_TRUE(ValidateWalletAddress(integratedMonero, Cryptocurrency::Monero));
+    EXPECT_EQ(Cryptocurrency::Monero, ClassifyWalletAddress(integratedMonero));
+
+    const std::string shieldedZcash = "zs" + std::string(76, 'q');
+    EXPECT_EQ(Cryptocurrency::Zcash, ClassifyWalletAddress(shieldedZcash));
+
+    const std::string bech32Litecoin = "ltc1" + std::string(39, 'q');
+    EXPECT_EQ(Cryptocurrency::Litecoin, ClassifyWalletAddress(bech32Litecoin));
+}
+
+TEST(PoolWalletValidatorTest, ClassificationIsFixedAndFailsClosed) {
+    EXPECT_EQ(Cryptocurrency::Bitcoin, ClassifyWalletAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"));
+    EXPECT_EQ(Cryptocurrency::Ethereum, ClassifyWalletAddress("0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0"))
+        << "an EVM address classifies as Ethereum; Ethereum Classic is indistinguishable";
+    for (const char* junk : {"", "not-an-address", "C:\\Windows\\System32", "--config=miner.conf",
+                             "stratum+tcp://pool.example.com:3333", "worker1"}) {
+        EXPECT_FALSE(ClassifyWalletAddress(junk).has_value()) << junk;
     }
 }
 
-TEST(PoolWalletValidatorTest, NeitherValidatorAcceptsAnUndeterminedCurrency) {
-    EXPECT_FALSE(ValidateWalletAddress("not-an-address", Cryptocurrency::Unknown));
-    EXPECT_FALSE(ValidateWalletAddress("not-an-address", MinedCryptocurrency::Unknown));
-    EXPECT_FALSE(ValidateWalletAddress("C:\\Windows\\System32", MinedCryptocurrency::Unknown))
-        << "a Windows path was accepted as a wallet address for an undetermined currency";
+TEST(PoolWalletValidatorTest, NeitherAnUndeterminedNorAnOtherCurrencyValidatesAnything) {
+    for (const auto c : {Cryptocurrency::Unknown, Cryptocurrency::Other}) {
+        EXPECT_FALSE(ValidateWalletAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", c));
+        EXPECT_FALSE(ValidateWalletAddress("C:\\Windows\\System32", c));
+    }
 }
 
 }  // namespace ShadowStrike::CryptoMiners::Test

@@ -120,21 +120,8 @@ static const std::array<std::string_view, 15> STRATUM_PATTERNS = {
     R"("difficulty")", R"("target")", R"("job_id")"
 };
 
-struct WalletPattern {
-    MinedCryptocurrency crypto;
-    std::string_view pattern;
-};
-
-static const std::array<WalletPattern, 8> WALLET_PATTERNS = {{
-    {MinedCryptocurrency::Bitcoin, R"(^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$|^bc1[a-z0-9]{39,59}$)"},
-    {MinedCryptocurrency::Ethereum, R"(^0x[a-fA-F0-9]{40}$)"},
-    {MinedCryptocurrency::Monero, R"(^4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}$|^8[0-9AB][1-9A-HJ-NP-Za-km-z]{93}$)"},
-    {MinedCryptocurrency::Litecoin, R"(^[LM][a-km-zA-HJ-NP-Z1-9]{26,33}$)"},
-    {MinedCryptocurrency::Zcash, R"(^t1[a-zA-Z0-9]{33}$|^t3[a-zA-Z0-9]{33}$)"},
-    {MinedCryptocurrency::Ravencoin, R"(^R[a-km-zA-HJ-NP-Z1-9]{33}$)"},
-    {MinedCryptocurrency::EthClassic, R"(^0x[a-fA-F0-9]{40}$)"},
-    {MinedCryptocurrency::Ergo, R"(^9[a-zA-Z0-9]{50,}$)"}
-}};
+// Wallet forms: ValidateWalletAddress / ClassifyWalletAddress (CryptoMinersTypes.hpp). The
+// regex table that stood here duplicated them and disagreed on several forms (task 281).
 
 static const std::array<std::string_view, 12> PROXY_KEYWORDS = {
     "proxy", "relay", "gateway", "forward", "tunnel", "vpn",
@@ -749,32 +736,11 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
     return std::find(config.monitorPorts.begin(), config.monitorPorts.end(), port) != config.monitorPorts.end();
 }
 
-[[nodiscard]] const std::vector<std::pair<MinedCryptocurrency, std::regex>>& CompiledWalletPatterns() {
-    static const auto patterns = [] {
-        std::vector<std::pair<MinedCryptocurrency, std::regex>> compiled;
-        compiled.reserve(PoolSignatures::WALLET_PATTERNS.size());
-        for (const auto& entry : PoolSignatures::WALLET_PATTERNS) {
-            compiled.emplace_back(entry.crypto,
-                std::regex(std::string(entry.pattern), std::regex_constants::optimize));
-        }
-        return compiled;
-    }();
-
-    return patterns;
-}
-
 [[nodiscard]] std::optional<MinedCryptocurrency> MatchWalletCrypto(std::string_view candidate) {
     if (candidate.empty() || candidate.size() > kMaxWalletCandidateLength) {
         return std::nullopt;
     }
-
-    for (const auto& [crypto, pattern] : CompiledWalletPatterns()) {
-        if (std::regex_match(candidate.begin(), candidate.end(), pattern)) {
-            return crypto;
-        }
-    }
-
-    return std::nullopt;
+    return ClassifyWalletAddress(candidate);
 }
 
 [[nodiscard]] std::optional<std::string> ExtractWalletCandidate(std::string_view login) {
@@ -1589,17 +1555,10 @@ MinedCryptocurrency PoolConnectionDetectorImpl::DetectCryptocurrency(const std::
 }
 
 bool PoolConnectionDetectorImpl::ValidateWalletAddressInternal(std::string_view address, MinedCryptocurrency crypto) const {
-    if (address.empty() || address.size() > kMaxWalletCandidateLength) {
+    if (address.size() > kMaxWalletCandidateLength) {
         return false;
     }
-
-    for (const auto& [entryCrypto, pattern] : CompiledWalletPatterns()) {
-        if (entryCrypto == crypto && std::regex_match(address.begin(), address.end(), pattern)) {
-            return true;
-        }
-    }
-
-    return false;
+    return ValidateWalletAddress(address, crypto);
 }
 
 std::vector<PoolConnectionInfo> PoolConnectionDetectorImpl::GetActiveConnectionsInternal() {
@@ -2676,19 +2635,7 @@ std::string_view GetStratumCommandName(StratumCommand cmd) noexcept {
 }
 
 std::string_view GetMinedCryptocurrencyName(MinedCryptocurrency crypto) noexcept {
-    switch (crypto) {
-        case MinedCryptocurrency::Unknown: return "Unknown";
-        case MinedCryptocurrency::Bitcoin: return "Bitcoin";
-        case MinedCryptocurrency::Ethereum: return "Ethereum";
-        case MinedCryptocurrency::Monero: return "Monero";
-        case MinedCryptocurrency::Litecoin: return "Litecoin";
-        case MinedCryptocurrency::Ravencoin: return "Ravencoin";
-        case MinedCryptocurrency::Zcash: return "Zcash";
-        case MinedCryptocurrency::EthClassic: return "Ethereum Classic";
-        case MinedCryptocurrency::Ergo: return "Ergo";
-        case MinedCryptocurrency::Other: return "Other";
-        default: return "Unknown";
-    }
+    return GetCryptocurrencyName(crypto);   // one enum, one set of names
 }
 
 bool IsStratumPort(uint16_t port) noexcept {
@@ -2700,18 +2647,5 @@ bool IsStratumPort(uint16_t port) noexcept {
     return false;
 }
 
-bool ValidateWalletAddress(std::string_view address, MinedCryptocurrency crypto) {
-    if (address.empty() || address.size() > kMaxWalletCandidateLength) {
-        return false;
-    }
-
-    for (const auto& [entryCrypto, pattern] : CompiledWalletPatterns()) {
-        if (entryCrypto == crypto && std::regex_match(address.begin(), address.end(), pattern)) {
-            return true;
-        }
-    }
-
-    return false;
-}
 
 }  // namespace ShadowStrike::CryptoMiners

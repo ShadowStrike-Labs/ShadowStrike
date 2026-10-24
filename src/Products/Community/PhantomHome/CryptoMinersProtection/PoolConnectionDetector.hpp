@@ -260,21 +260,8 @@ enum class StratumCommand : uint8_t {
     KeepAlive           = 13    ///< keepalived
 };
 
-/**
- * @brief Cryptocurrency being mined
- */
-enum class MinedCryptocurrency : uint8_t {
-    Unknown     = 0,
-    Bitcoin     = 1,
-    Ethereum    = 2,
-    Monero      = 3,
-    Litecoin    = 4,
-    Ravencoin   = 5,
-    Zcash       = 6,
-    EthClassic  = 7,
-    Ergo        = 8,
-    Other       = 255
-};
+/// The module's single currency enum (CryptoMinersTypes.hpp, task 281).
+using MinedCryptocurrency = Cryptocurrency;
 
 // ModuleStatus defined in CryptoMinersTypes.hpp
 
@@ -665,7 +652,7 @@ private:
 [[nodiscard]] std::string_view GetStratumCommandName(StratumCommand cmd) noexcept;
 [[nodiscard]] std::string_view GetMinedCryptocurrencyName(MinedCryptocurrency crypto) noexcept;
 [[nodiscard]] bool IsStratumPort(uint16_t port) noexcept;
-[[nodiscard]] bool ValidateWalletAddress(std::string_view address, MinedCryptocurrency crypto);
+// ValidateWalletAddress is declared in CryptoMinersTypes.hpp.
 
 }  // namespace CryptoMiners
 }  // namespace ShadowStrike
