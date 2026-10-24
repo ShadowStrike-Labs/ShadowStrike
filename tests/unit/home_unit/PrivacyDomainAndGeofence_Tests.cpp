@@ -234,23 +234,34 @@ TEST(GeofenceContainment, ARectangleIsBoundedByTwoOppositeCorners) {
     EXPECT_TRUE(reversed.Contains(At(20.0, 30.0)));
 }
 
-TEST(GeofenceContainment, ARectangleCrossingTheAntimeridianCoversTheWrongHalfOfTheWorld) {
-    // PINNED AS IT BEHAVES TODAY, NOT AS IT SHOULD. Taking min and max of the two corner longitudes
-    // discards which corner was east, so a region from +170 to -170 - twenty degrees wide across the date
-    // line - is read as the 340 degrees between them instead.
-    //
-    // If this case starts failing, the rectangle was taught to wrap. That is the improvement the filing
-    // asks for: update the filing and this comment rather than restoring the old expectations.
+TEST(GeofenceContainment, ARectangleCrossingTheAntimeridianCoversOnlyTheNarrowSpan) {
+    // Task 299: min/max of the corner longitudes read +170..-170 - twenty degrees across the date
+    // line - as the 340 degrees around the rest of the world. The narrower reading is taken.
     GeofenceRegion fence;
     fence.shape = GeofenceShape::Rectangle;
     fence.boundaries = {At(-10.0, 170.0), At(10.0, -170.0)};
 
-    EXPECT_FALSE(fence.Contains(At(0.0, 175.0)))
-        << "inside the intended region, currently excluded";
-    EXPECT_FALSE(fence.Contains(At(0.0, -175.0)))
-        << "also inside the intended region, currently excluded";
-    EXPECT_TRUE(fence.Contains(At(0.0, 0.0)))
-        << "the far side of the planet, currently included";
+    EXPECT_TRUE(fence.Contains(At(0.0, 175.0)));
+    EXPECT_TRUE(fence.Contains(At(0.0, -175.0)));
+    EXPECT_TRUE(fence.Contains(At(0.0, 180.0))) << "the antimeridian itself";
+    EXPECT_TRUE(fence.Contains(At(0.0, 170.0))) << "an edge is inside - inclusive, as before";
+    EXPECT_FALSE(fence.Contains(At(0.0, 0.0))) << "the far side of the planet";
+    EXPECT_FALSE(fence.Contains(At(0.0, 169.0)));
+    EXPECT_FALSE(fence.Contains(At(20.0, 175.0))) << "latitude still bounds it";
+
+    GeofenceRegion reversed = fence;
+    reversed.boundaries = {At(10.0, -170.0), At(-10.0, 170.0)};
+    EXPECT_TRUE(reversed.Contains(At(0.0, 175.0))) << "corner order still does not matter";
+    EXPECT_FALSE(reversed.Contains(At(0.0, 0.0)));
+}
+
+TEST(GeofenceContainment, AHalfPlanetWideRectangleIsStillReadDirectly) {
+    // The boundary of the rule: a span of exactly 180 degrees is taken as written.
+    GeofenceRegion fence;
+    fence.shape = GeofenceShape::Rectangle;
+    fence.boundaries = {At(-10.0, -90.0), At(10.0, 90.0)};
+    EXPECT_TRUE(fence.Contains(At(0.0, 0.0)));
+    EXPECT_FALSE(fence.Contains(At(0.0, 180.0)));
 }
 
 TEST(GeofenceContainment, APolygonUsesRayCasting) {

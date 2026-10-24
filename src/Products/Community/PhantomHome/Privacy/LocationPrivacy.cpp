@@ -221,8 +221,21 @@ bool GeofenceRegion::Contains(const GeoLocation& location) const {
             double minLon = std::min(boundaries[0].longitude, boundaries[1].longitude);
             double maxLon = std::max(boundaries[0].longitude, boundaries[1].longitude);
 
-            return location.latitude >= minLat && location.latitude <= maxLat &&
-                   location.longitude >= minLon && location.longitude <= maxLon;
+            if (location.latitude < minLat || location.latitude > maxLat) {
+                return false;
+            }
+
+            // LONGITUDE WRAPS AT +/-180 (task 299). Two unordered corners name two
+            // possible boxes - the span between them and its complement across the
+            // date line - and min/max always chose the first, so +170..-170 (20
+            // degrees over the antimeridian) became the 340 degrees around the rest of
+            // the world. The NARROWER reading is taken: a geofence wider than half the
+            // planet is not a meaningful privacy area, and this keeps the documented
+            // property that corner order does not matter. Latitude does not wrap.
+            if (maxLon - minLon <= 180.0) {
+                return location.longitude >= minLon && location.longitude <= maxLon;
+            }
+            return location.longitude >= maxLon || location.longitude <= minLon;
         }
     }
 
