@@ -917,7 +917,7 @@ public:
             // Check for install.rdf (legacy XUL)
             if (data.type == AddonType::Unknown) {
                 for (const auto& entry : entries) {
-                    if (entry.filename == "install.rdf") {
+                    if (IsXpiEntryNamed(entry.filename, "install.rdf")) {
                         data.type = AddonType::LegacyXUL;
                         break;
                     }
@@ -927,15 +927,13 @@ public:
             // Check signature: look for META-INF/mozilla.rsa
             data.signature.status = SignatureStatus::Missing;
             for (const auto& entry : entries) {
-                if (entry.filename == "META-INF/mozilla.rsa" ||
-                    entry.filename == "META-INF/MOZILLA.RSA") {
+                if (IsXpiEntryNamed(entry.filename, "META-INF/mozilla.rsa")) {
                     data.signature.status = SignatureStatus::Valid;
                     data.signature.isMozillaSigned = true;
                     data.signature.signerName = "Mozilla Add-ons";
                     break;
                 }
-                if (entry.filename == "META-INF/mozilla.sf" ||
-                    entry.filename == "META-INF/MOZILLA.SF") {
+                if (IsXpiEntryNamed(entry.filename, "META-INF/mozilla.sf")) {
                     // Signature manifest exists but RSA not confirmed yet
                     if (data.signature.status == SignatureStatus::Missing) {
                         data.signature.status = SignatureStatus::Invalid;
@@ -1165,12 +1163,10 @@ public:
             bool hasRsa = false;
             bool hasSf  = false;
             for (const auto& entry : entries) {
-                if (entry.filename == "META-INF/mozilla.rsa" ||
-                    entry.filename == "META-INF/MOZILLA.RSA") {
+                if (IsXpiEntryNamed(entry.filename, "META-INF/mozilla.rsa")) {
                     hasRsa = true;
                 }
-                if (entry.filename == "META-INF/mozilla.sf" ||
-                    entry.filename == "META-INF/MOZILLA.SF") {
+                if (IsXpiEntryNamed(entry.filename, "META-INF/mozilla.sf")) {
                     hasSf = true;
                 }
             }
@@ -1923,6 +1919,17 @@ ParseFirefoxManifest(const fs::path& manifestPath) {
             manifestPath.string(), e.what());
         return std::nullopt;
     }
+}
+
+bool IsXpiEntryNamed(std::string_view entryName, std::string_view expected) noexcept {
+    if (entryName.size() != expected.size()) return false;
+    for (size_t i = 0; i < entryName.size(); ++i) {
+        const auto lower = [](char c) noexcept {
+            return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        };
+        if (lower(entryName[i]) != lower(expected[i])) return false;
+    }
+    return true;
 }
 
 bool IsFirefoxDangerousPermission(const std::string& permission) {

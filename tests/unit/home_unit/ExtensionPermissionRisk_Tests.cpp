@@ -253,4 +253,24 @@ TEST(ExtensionPermissionParityTest, EachBrowserOnlyNamesPermissionsItsOwnApiProv
         << "Chrome does not implement browserSettings";
 }
 
+TEST(FirefoxXpiEntryName, TheLegacyManifestAndSignatureFilesMatchInAnyCase) {
+    // Task 268: install.rdf was compared exactly, so INSTALL.RDF or Install.rdf left a legacy XUL
+    // addon - full chrome privileges, verdict Legacy - classified Unknown.
+    using ShadowStrike::WebBrowser::IsXpiEntryNamed;
+    for (const char* name : {"install.rdf", "INSTALL.RDF", "Install.rdf", "iNsTaLl.RdF"}) {
+        EXPECT_TRUE(IsXpiEntryNamed(name, "install.rdf")) << name;
+    }
+    EXPECT_TRUE(IsXpiEntryNamed("META-INF/Mozilla.rsa", "META-INF/mozilla.rsa"))
+        << "a spelling the two-literal comparison never listed";
+    EXPECT_TRUE(IsXpiEntryNamed("meta-inf/MOZILLA.SF", "META-INF/mozilla.sf"));
+}
+
+TEST(FirefoxXpiEntryName, OnlyTheWholeNameMatches) {
+    using ShadowStrike::WebBrowser::IsXpiEntryNamed;
+    EXPECT_FALSE(IsXpiEntryNamed("sub/install.rdf", "install.rdf")) << "the manifest must be at the root";
+    EXPECT_FALSE(IsXpiEntryNamed("install.rdf.bak", "install.rdf"));
+    EXPECT_FALSE(IsXpiEntryNamed("install.rd", "install.rdf"));
+    EXPECT_FALSE(IsXpiEntryNamed("", "install.rdf"));
+}
+
 }  // namespace ShadowStrike::WebBrowser::PermissionTest

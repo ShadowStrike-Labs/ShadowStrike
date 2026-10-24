@@ -843,6 +843,11 @@ private:
 /// @brief Is dangerous permission
 [[nodiscard]] bool IsFirefoxDangerousPermission(const std::string& permission);
 
+/// Whether an XPI archive entry name equals an expected name, ignoring ASCII case.
+/// Entry names in the wild vary in case (INSTALL.RDF, META-INF/Mozilla.rsa); a
+/// list of spellings only covers the ones someone thought of (task 268).
+[[nodiscard]] bool IsXpiEntryNamed(std::string_view entryName, std::string_view expected) noexcept;
+
 }  // namespace WebBrowser
 }  // namespace ShadowStrike
 
