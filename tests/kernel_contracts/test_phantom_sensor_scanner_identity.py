@@ -28425,5 +28425,41 @@ class ServiceStartWatchdogWiringTests(unittest.TestCase):
         self.assertIn("IsRetryableServiceStartFailure(err)", body)
 
 
+class PoolHostListsAreDisjointTests(unittest.TestCase):
+    """Each built-in pool host has exactly one classification (task 284).
+
+    MALICIOUS_POOL_HOSTNAMES is consulted before KNOWN_POOL_HOSTNAMES, so a host in
+    both is unreachable as KnownPublic and nothing behavioural shows it - six Monero
+    pools sat in both. A host that is a dot-boundary subdomain of an entry in the
+    same list is redundant for the same reason.
+    """
+
+    SRC = ROOT / "src/Products/Community/PhantomHome/CryptoMinersProtection/PoolConnectionDetector.cpp"
+
+    @classmethod
+    def setUpClass(cls):
+        src = strip_c_comments(read_source(cls.SRC))
+        def hosts(name):
+            m = re.search(name + r" = std::to_array<std::string_view>\(\{(.*?)\}\);", src, re.S)
+            assert m, name + " is no longer sized from its contents"
+            return re.findall(r'"([^"]+)"', m.group(1))
+        cls.known = hosts("KNOWN_POOL_HOSTNAMES")
+        cls.malicious = hosts("MALICIOUS_POOL_HOSTNAMES")
+
+    def test_the_lists_are_disjoint(self):
+        self.assertEqual([], sorted(set(self.known) & set(self.malicious)))
+
+    def test_no_list_holds_a_duplicate_or_a_shadowed_subdomain(self):
+        for name, hosts in (("KNOWN", self.known), ("MALICIOUS", self.malicious)):
+            with self.subTest(list=name):
+                self.assertEqual(len(hosts), len(set(hosts)), "duplicate entry")
+                shadowed = [a for a in hosts for b in hosts if a != b and a.endswith("." + b)]
+                self.assertEqual([], shadowed)
+
+    def test_no_known_host_is_a_subdomain_of_a_malicious_one(self):
+        shadowed = [k for k in self.known for m in self.malicious if k.endswith("." + m)]
+        self.assertEqual([], shadowed, "the malicious match would always win")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

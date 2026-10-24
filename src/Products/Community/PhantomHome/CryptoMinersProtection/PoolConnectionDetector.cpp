@@ -58,10 +58,14 @@ using Json = nlohmann::json;
 
 namespace PoolSignatures {
 
-static const std::array<std::string_view, 80> KNOWN_POOL_HOSTNAMES = {
-    "pool.supportxmr.com", "xmr.nanopool.org", "pool.minexmr.com",
+// Each built-in host is in EXACTLY ONE of these two lists (task 284). MALICIOUS is consulted first,
+// so a host in both was unreachable as KnownPublic: six Monero pools were. Monero pools stay in
+// MALICIOUS - the coin-by-coin split around them (xmr.nanopool.org malicious, eth/zec.nanopool.org
+// public) is a deliberate stance on the cryptojacking coin of choice. Sized from their contents:
+// a declared size larger than the list padded it with empty strings.
+static const auto KNOWN_POOL_HOSTNAMES = std::to_array<std::string_view>({
     "xmr-eu1.nanopool.org", "xmr-us1.nanopool.org", "xmr-asia1.nanopool.org",
-    "monerohash.com", "xmrpool.eu", "monero.crypto-pool.fr",
+    "monero.crypto-pool.fr",
     "stratum.slushpool.com", "btc.ss.poolin.com", "btc.viabtc.com",
     "stratum.antpool.com", "ss.btc.com", "stratum.f2pool.com",
     "eth.nanopool.org", "eth-eu1.nanopool.org", "eth-us-east1.nanopool.org",
@@ -72,17 +76,17 @@ static const std::array<std::string_view, 80> KNOWN_POOL_HOSTNAMES = {
     "zec.flypool.org", "zec.slushpool.com", "ltc.antpool.com",
     "ltc.f2pool.com", "ltc.viabtc.com", "etc.ethermine.org",
     "etc.2miners.com", "etc.nanopool.org", "ergo.2miners.com",
-    "ergo.herominers.com", "pool.hashvault.pro", "mining-pool.eu",
+    "ergo.herominers.com", "mining-pool.eu",
     "yiimp.eu", "pool.mn", "mine.zpool.ca", "prohashing.com",
     "stratum.nicehash.com", "stratum.eu.nicehash.com", "stratum.usa.nicehash.com",
     "stratum.hk.nicehash.com", "stratum.jp.nicehash.com", "stratum.in.nicehash.com",
     "pool.btc.com", "ss.antpool.com", "stratum-btc.antpool.com",
     "stratum-eth.antpool.com", "pool.bw.com", "miningpoolhub.com",
-    "multipool.us", "hub.miningpoolhub.com", "pool.electroneum.com",
+    "multipool.us", "pool.electroneum.com",
     "pool.cortexminer.com", "pool.woolypooly.com"
-};
+});
 
-static const std::array<std::string_view, 50> MALICIOUS_POOL_HOSTNAMES = {
+static const auto MALICIOUS_POOL_HOSTNAMES = std::to_array<std::string_view>({
     "monerohash.com", "moneroocean.stream", "xmr.pool.minergate.com",
     "pool.minexmr.com", "mine.moneropool.com", "xmr.crypto-pool.fr",
     "pooldd.com", "pool.supportxmr.com", "xmrpool.eu",
@@ -94,10 +98,10 @@ static const std::array<std::string_view, 50> MALICIOUS_POOL_HOSTNAMES = {
     "hiddenpool.net", "secretmine.com", "stealthpool.org",
     "miningproxy.org", "proxypool.io", "cryptoproxy.net",
     "onionpool.com", "torpool.org", "darknetmine.com",
-    "monero.herominers.com", "xmr.nanopool.org", "gulf.moneroocean.stream",
+    "monero.herominers.com", "xmr.nanopool.org",
     "pool.hashvault.pro", "fastpool.xyz", "cryptonight.net",
     "mine.c3pool.com", "xmr-eu.dwarfpool.com", "xmr.suprnova.cc"
-};
+});
 
 static const std::array<std::string_view, 20> STRATUM_METHODS = {
     "mining.subscribe", "mining.authorize", "mining.submit",

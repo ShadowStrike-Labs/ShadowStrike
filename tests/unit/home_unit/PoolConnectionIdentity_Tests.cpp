@@ -16,12 +16,9 @@
  *
  * TWO STRUCTURAL PROPERTIES ARE ASSERTED THAT ARE NOT ABOUT ANY SINGLE INPUT.
  *
- * First, the two built-in hostname lists must not overlap. MALICIOUS_POOL_HOSTNAMES is consulted before
- * KNOWN_POOL_HOSTNAMES, so a host in both can only ever be reported KnownMalicious and its entry in the
- * second list is unreachable. Six hosts are currently in both, all of them legitimate public Monero
- * pools, which makes the code's own KnownPublic classification dead for exactly the hosts a user is
- * most likely to have chosen deliberately. Pinned below as it stands and filed, because deciding whether
- * mining on a public pool is malware or merely unwanted is a policy question, not a cleanup.
+ * First, every built-in host has one classification. MALICIOUS_POOL_HOSTNAMES is consulted before
+ * KNOWN_POOL_HOSTNAMES, so a host in both was only ever KnownMalicious; six Monero pools were, until
+ * task 284 left them in the malicious list only. A contract test keeps the lists disjoint.
  *
  * Second, this file includes BOTH CryptoMinerDetector.hpp and PoolConnectionDetector.hpp in one
  * translation unit. They declare two wallet validators with the same name over two currency enums with
@@ -45,7 +42,7 @@
 namespace ShadowStrike::CryptoMiners::Test {
 namespace {
 
-/// The six hostnames measured to appear in BOTH built-in lists.
+/// The six Monero pools that used to appear in BOTH built-in lists (task 284).
 const std::vector<std::string>& HostsInBothLists() {
     static const std::vector<std::string> hosts = {
         "monerohash.com", "pool.hashvault.pro", "pool.minexmr.com",
@@ -115,26 +112,34 @@ TEST_F(PoolConnectionIdentityTest, AHostIsMatchedOnLabelBoundariesNotSubstrings)
         << "the listed name appearing as a PREFIX label was matched, which reverses the suffix rule";
 }
 
-TEST_F(PoolConnectionIdentityTest, SixLegitimatePublicPoolsAreClassifiedMaliciousBecauseTheyAreInBothLists) {
-    // PINNED, NOT ENDORSED. These six appear in MALICIOUS_POOL_HOSTNAMES and in KNOWN_POOL_HOSTNAMES.
-    // The malicious list is consulted first, so the KnownPublic classification the code deliberately
-    // provides is unreachable for exactly these hosts - the ones a user is most likely to have chosen
-    // on purpose.
-    //
-    // The surrounding policy looks intentional: nanopool is split by coin, with xmr.nanopool.org treated
-    // as malicious while eth.nanopool.org and zec.nanopool.org are known-public. So Monero pools being
-    // treated as malicious is a deliberate stance. The duplication is not - it is two lists edited
-    // independently. Filed. If a case here fails, the lists were reconciled: update the filing and this
-    // case rather than restoring the duplicate entry.
+TEST_F(PoolConnectionIdentityTest, EachBuiltInHostHasExactlyOneClassification) {
+    // Task 284: six Monero pools were in BOTH built-in lists, so their KnownPublic entries were
+    // unreachable. They now sit only in the malicious list, consistent with the coin-by-coin split
+    // the lists already made around them.
     for (const auto& host : HostsInBothLists()) {
-        EXPECT_TRUE(Pool().IsPoolHostname(host))
-            << host << " is in both built-in lists and must still be identified as a pool";
+        const auto info = Pool().GetPoolInfo(host, 3333);
+        ASSERT_TRUE(info.has_value()) << host;
+        EXPECT_EQ(PoolStatus::KnownMalicious, info->status) << host;
+    }
+    // Anti-vacuity: the public classification is reachable at all.
+    for (const char* host : {"eth.nanopool.org", "zec.nanopool.org", "stratum.slushpool.com"}) {
+        const auto info = Pool().GetPoolInfo(host, 3333);
+        ASSERT_TRUE(info.has_value()) << host;
+        EXPECT_EQ(PoolStatus::KnownPublic, info->status) << host;
     }
 }
 
 // ============================================================================================
 // Endpoints and the configured blacklist
 // ============================================================================================
+
+TEST_F(PoolConnectionIdentityTest, AHostEndingInADotIsNotMatchedByAnEmptyListSlot) {
+    // The built-in lists were std::arrays sized larger than their contents, so the spare slots held
+    // empty strings - and the dot-boundary match accepts an empty suffix for any host ending in '.'.
+    EXPECT_FALSE(Pool().IsPoolHostname("example.com.")) << "a trailing dot matched a padding slot";
+    EXPECT_FALSE(Pool().IsPoolHostname("."));
+    EXPECT_FALSE(Pool().IsPoolHostname(""));
+}
 
 TEST_F(PoolConnectionIdentityTest, AKnownPoolHostIsAnEndpointOnAMiningPort) {
     EXPECT_TRUE(Pool().IsPoolEndpoint("coinhive.com", 3333));
