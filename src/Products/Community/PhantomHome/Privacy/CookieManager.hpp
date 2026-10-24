@@ -623,6 +623,10 @@ public:
     
     /// @brief Check if cookie is tracking cookie
     [[nodiscard]] bool IsTrackingCookie(const BrowserCookie& cookie);
+
+    /// The scope assigned to a cookie when it is read from a browser store. A cookie
+    /// whose domain is a tracker's (built-in or user-added) is ThirdParty.
+    [[nodiscard]] CookieScope GetCookieScope(const BrowserCookie& cookie);
     
     /// @brief Get known trackers
     [[nodiscard]] std::vector<TrackerInfo> GetKnownTrackers();

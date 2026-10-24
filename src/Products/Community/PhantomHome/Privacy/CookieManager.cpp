@@ -855,28 +855,54 @@ public:
     /**
      * @brief Check if cookie is tracking cookie
      */
+    /**
+     * @brief The ONE answer to "is this domain a tracker's" (task 263).
+     *
+     * IsTrackingCookieInternal, DetermineScope and IsTrackerDomain each answered it on
+     * their own: DetermineScope compared the FULL domain with KNOWN_TRACKERS, whose
+     * entries are registrable domains, so tracker.doubleclick.net was a tracking cookie
+     * whose scope was not ThirdParty, and it ignored user-added trackers entirely.
+     *
+     * Built-in entries match on the registrable domain. A user-added domainPattern is a
+     * pattern, as its name says, and keeps its substring meaning; it is compared without
+     * regard to case, since domain names have none.
+     *
+     * @param domain Output of SanitizeDomain (lowercase, no leading or trailing dot).
+     * @pre The caller holds m_trackerMutex, shared or exclusive.
+     */
+    [[nodiscard]] bool IsTrackerDomainLocked(const std::string& domain) const {
+        if (domain.empty()) {
+            return false;
+        }
+        if (KNOWN_TRACKERS.count(GetBaseDomain(domain)) > 0) {
+            return true;
+        }
+        for (const auto& [id, tracker] : m_trackers) {
+            if (!tracker.isActive || tracker.domainPattern.empty()) {
+                continue;
+            }
+            std::string pattern = tracker.domainPattern;
+            std::transform(pattern.begin(), pattern.end(), pattern.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (domain.find(pattern) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     [[nodiscard]] bool IsTrackingCookieInternal(const BrowserCookie& cookie) const noexcept {
         try {
-            // Check domain against known trackers
-            std::string baseDomain = GetBaseDomain(cookie.domain);
+            const std::string domain = SanitizeDomain(cookie.domain);
 
             std::shared_lock lock(m_trackerMutex);
 
-            // Check built-in list
-            if (KNOWN_TRACKERS.count(baseDomain) > 0) {
+            if (IsTrackerDomainLocked(domain)) {
                 return true;
             }
 
-            // Check custom trackers
             for (const auto& [id, tracker] : m_trackers) {
                 if (!tracker.isActive) continue;
-
-                // Check domain pattern
-                if (!tracker.domainPattern.empty()) {
-                    if (cookie.domain.find(tracker.domainPattern) != std::string::npos) {
-                        return true;
-                    }
-                }
 
                 // Check cookie name pattern
                 if (!tracker.cookiePattern.empty()) {
@@ -905,20 +931,18 @@ public:
      */
     [[nodiscard]] CookieScope DetermineScope(const BrowserCookie& cookie) const noexcept {
         try {
-            // Third-party if domain doesn't match typical first-party patterns
-            std::string domain = cookie.domain;
+            const std::string domain = SanitizeDomain(cookie.domain);
             if (domain.empty()) {
                 return CookieScope::FirstParty;
             }
 
-            // Remove leading dot
-            if (domain[0] == '.') {
-                domain = domain.substr(1);
-            }
-
-            // Known third-party indicators
-            if (KNOWN_TRACKERS.count(domain) > 0) {
-                return CookieScope::ThirdParty;
+            // A tracker's cookie is third-party wherever it is read. Checked before the
+            // cross-site rule, as before; only the tracker match itself changed (task 263).
+            {
+                std::shared_lock lock(m_trackerMutex);
+                if (IsTrackerDomainLocked(domain)) {
+                    return CookieScope::ThirdParty;
+                }
             }
 
             // Check if cross-site tracking
@@ -1560,25 +1584,8 @@ bool CookieManager::IsTrackerDomain(const std::string& domain) {
             return false;
         }
 
-        std::string baseDomain = GetBaseDomain(sanitized);
-
-        // Check built-in list
-        if (KNOWN_TRACKERS.count(baseDomain) > 0) {
-            return true;
-        }
-
-        // Check custom trackers
         std::shared_lock lock(m_impl->m_trackerMutex);
-        for (const auto& [id, tracker] : m_impl->m_trackers) {
-            if (!tracker.isActive) continue;
-
-            if (!tracker.domainPattern.empty() &&
-                sanitized.find(tracker.domainPattern) != std::string::npos) {
-                return true;
-            }
-        }
-
-        return false;
+        return m_impl->IsTrackerDomainLocked(sanitized);
 
     } catch (...) {
         return false;
@@ -1587,6 +1594,10 @@ bool CookieManager::IsTrackerDomain(const std::string& domain) {
 
 bool CookieManager::IsTrackingCookie(const BrowserCookie& cookie) {
     return m_impl->IsTrackingCookieInternal(cookie);
+}
+
+CookieScope CookieManager::GetCookieScope(const BrowserCookie& cookie) {
+    return m_impl->DetermineScope(cookie);
 }
 
 std::vector<TrackerInfo> CookieManager::GetKnownTrackers() {

@@ -158,5 +158,72 @@ TEST_F(CookieIdentityTest, TenantsOfASharedHostAreThirdPartyToEachOther) {
     EXPECT_TRUE(IsThirdPartyCookie("a.github.io", "b.github.io"));
 }
 
+// ============================================================================================
+// One tracker-domain decision (task 263)
+// ============================================================================================
+
+[[nodiscard]] BrowserCookie CookieFrom(const std::string& domain) {
+    BrowserCookie c;
+    c.name = "plain";
+    c.domain = domain;
+    c.isSecure = true;
+    c.sameSite = SameSitePolicy::Lax;
+    return c;
+}
+
+TEST_F(CookieIdentityTest, ATrackerSubdomainCookieIsTrackingAndThirdParty) {
+    // DetermineScope compared the full domain with a list of registrable domains, so the
+    // common case - a tracker serving from a subdomain - was tracking but not third-party.
+    auto& cm = CookieManager::Instance();
+    for (const char* d : {"doubleclick.net", ".doubleclick.net", "stats.g.doubleclick.net",
+                          "WWW.Google-Analytics.com"}) {
+        const BrowserCookie c = CookieFrom(d);
+        EXPECT_TRUE(cm.IsTrackingCookie(c)) << d;
+        EXPECT_TRUE(cm.IsTrackerDomain(d)) << d;
+        EXPECT_EQ(CookieScope::ThirdParty, cm.GetCookieScope(c)) << d;
+    }
+}
+
+TEST_F(CookieIdentityTest, ANonTrackerIsNotThirdPartyByTrackerMatch) {
+    auto& cm = CookieManager::Instance();
+    for (const char* d : {"example.com", "doubleclick.net.example.com", "notdoubleclick.net"}) {
+        const BrowserCookie c = CookieFrom(d);
+        EXPECT_FALSE(cm.IsTrackerDomain(d)) << d;
+        EXPECT_EQ(CookieScope::FirstParty, cm.GetCookieScope(c)) << d;
+    }
+}
+
+TEST_F(CookieIdentityTest, ACrossSiteCookieOfATrackerIsThirdPartyAndOfAnyoneElseCrossSite) {
+    // The tracker check precedes the cross-site rule; that order is kept.
+    auto& cm = CookieManager::Instance();
+    BrowserCookie tracker = CookieFrom("ads.doubleclick.net");
+    tracker.sameSite = SameSitePolicy::None;
+    tracker.isSecure = false;
+    EXPECT_EQ(CookieScope::ThirdParty, cm.GetCookieScope(tracker));
+    BrowserCookie other = CookieFrom("shop.example.com");
+    other.sameSite = SameSitePolicy::None;
+    other.isSecure = false;
+    EXPECT_EQ(CookieScope::CrossSite, cm.GetCookieScope(other));
+}
+
+TEST_F(CookieIdentityTest, AUserAddedTrackerDecidesScopeAsWellAsTracking) {
+    // The scope path ignored user-added trackers altogether.
+    auto& cm = CookieManager::Instance();
+    TrackerInfo t;
+    t.trackerId = "task263-test-tracker";
+    t.domainPattern = "Metrics.Example-Tracker.test";
+    t.isActive = true;
+    ASSERT_TRUE(cm.AddTracker(t));
+    const BrowserCookie c = CookieFrom(".cdn.metrics.example-tracker.test");
+    const bool tracking = cm.IsTrackingCookie(c);
+    const bool byDomain = cm.IsTrackerDomain("cdn.metrics.example-tracker.test");
+    const CookieScope scope = cm.GetCookieScope(c);
+    ASSERT_TRUE(cm.RemoveTracker(t.trackerId));
+    EXPECT_TRUE(tracking);
+    EXPECT_TRUE(byDomain);
+    EXPECT_EQ(CookieScope::ThirdParty, scope);
+    EXPECT_EQ(CookieScope::FirstParty, cm.GetCookieScope(c)) << "removal is honoured";
+}
+
 }  // namespace
 }  // namespace ShadowStrike::Privacy::Test
