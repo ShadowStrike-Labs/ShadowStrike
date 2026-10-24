@@ -2592,8 +2592,13 @@ SecurityRiskLevel GetEncryptionRiskLevel(WirelessEncryption enc) noexcept {
             return SecurityRiskLevel::Secure;
         case WirelessEncryption::Mixed:
             return SecurityRiskLevel::Medium;
+        // Undetermined encryption (task 283): an unrecognised vendor banner, a router
+        // that refused to answer, or a downgrade. Medium asks the user to look, and is
+        // above every correctly configured mode; the old default, Informational, was
+        // calmer than WPA2. An out-of-range value gets the same answer.
+        case WirelessEncryption::Unknown:
         default:
-            return SecurityRiskLevel::Informational;
+            return SecurityRiskLevel::Medium;
     }
 }
 

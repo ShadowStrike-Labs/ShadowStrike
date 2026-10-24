@@ -133,16 +133,28 @@ TEST(WiFiSecurityScoreTest, SignalStrengthBandsDoNotInvert) {
     }
 }
 
-TEST(WiFiSecurityScoreTest, AnUnrecognisedEncryptionTypeCurrentlyRatesAboveWep) {
-    // CURRENT BEHAVIOUR, pinned rather than endorsed. The switch's default arm awards 10 points, so a
-    // cipher the parser did not recognise rates above WEP's 5 and an open network's 0. That is
-    // optimistic where a security rating should be conservative, and it is filed for a ruling. If the
-    // default is lowered, this case fails and the decision is visible rather than accidental.
+TEST(WiFiSecurityScoreTest, AnUnrecognisedEncryptionEarnsNoMoreThanAnOpenNetwork) {
+    // Task 274: the default arm awarded 10, rating an unidentified cipher above WEP. A security
+    // rating must not reward what it could not measure.
     const auto unknown = NetworkWith(EncryptionType::Unknown);
-    const auto wep = NetworkWith(EncryptionType::WEP);
-    EXPECT_GT(unknown.GetOverallScore(), wep.GetOverallScore())
-        << "if this now fails, the default arm was made conservative - update the filing and this "
-           "comment rather than restoring the old value";
+    EXPECT_LE(unknown.GetOverallScore(), NetworkWith(EncryptionType::Open).GetOverallScore());
+    EXPECT_LT(unknown.GetOverallScore(), NetworkWith(EncryptionType::WEP).GetOverallScore());
+    EXPECT_EQ(unknown.GetOverallScore(),
+              NetworkWith(static_cast<EncryptionType>(200)).GetOverallScore())
+        << "an out-of-range value is as unknown as Unknown";
+}
+
+TEST(WiFiSecurityScoreTest, TransitionAndOpportunisticModesRateByTheirWeakestGuarantee) {
+    // Both used to fall into the catch-all. Mixed admits WPA2 clients; OWE encrypts without
+    // authenticating the access point.
+    EXPECT_EQ(NetworkWith(EncryptionType::WPA2_WPA3_Mixed).GetOverallScore(),
+              NetworkWith(EncryptionType::WPA2_Personal).GetOverallScore());
+    EXPECT_LT(NetworkWith(EncryptionType::WPA2_WPA3_Mixed).GetOverallScore(),
+              NetworkWith(EncryptionType::WPA3_SAE).GetOverallScore());
+    EXPECT_EQ(NetworkWith(EncryptionType::OWE).GetOverallScore(),
+              NetworkWith(EncryptionType::WPA_Personal).GetOverallScore());
+    EXPECT_GT(NetworkWith(EncryptionType::OWE).GetOverallScore(),
+              NetworkWith(EncryptionType::Open).GetOverallScore());
 }
 
 }  // namespace

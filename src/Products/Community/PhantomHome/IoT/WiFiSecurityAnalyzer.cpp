@@ -2163,10 +2163,16 @@ int WiFiNetworkInfo::GetOverallScore() const {
             break;
         case EncryptionType::WPA2_Personal:
         case EncryptionType::WPA2_Enterprise:
+        // Transition mode: WPA2 clients are still admitted, so the network is only
+        // as strong as WPA2 for them.
+        case EncryptionType::WPA2_WPA3_Mixed:
             score += 30;
             break;
         case EncryptionType::WPA_Personal:
         case EncryptionType::WPA_Enterprise:
+        // Opportunistic Wireless Encryption: traffic is encrypted but the access
+        // point is not authenticated, so an evil twin is not prevented.
+        case EncryptionType::OWE:
             score += 15;
             break;
         case EncryptionType::WEP:
@@ -2175,8 +2181,13 @@ int WiFiNetworkInfo::GetOverallScore() const {
         case EncryptionType::Open:
             score += 0;
             break;
+        // An encryption the parser could not identify earns nothing (task 274). The
+        // old catch-all awarded 10, rating "unknown" above WEP; a security rating
+        // must not reward what it could not measure.
+        case EncryptionType::Unknown:
         default:
-            score += 10;
+            score += 0;
+            break;
     }
 
     // PMF enabled (+10 points)

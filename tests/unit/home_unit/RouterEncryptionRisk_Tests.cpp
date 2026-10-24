@@ -71,19 +71,12 @@ TEST(RouterEncryptionRiskTest, AMixedModeNetworkIsNoSaferThanItsWeakestMember) {
     EXPECT_GE(Risk(WirelessEncryption::Mixed), Risk(WirelessEncryption::WPA_Personal));
 }
 
-TEST(RouterEncryptionRiskTest, AnUndeterminedEncryptionIsReportedCalmerThanWpa2) {
-    // PINNED, NOT ENDORSED. Unknown matches no case label and reaches `default:`, which returns
-    // Informational - level 1 of 5, calmer than WPA2's Low. So a router whose encryption could not be
-    // determined is presented as safer than one correctly configured with WPA2, and a parse failure
-    // reads to the user as reassurance.
-    //
-    // Filed as a second instance of the shape already recorded for the WiFi security score. If this case
-    // now fails, the mapping was made conservative - update the filings and delete this case rather than
-    // restoring the calmer answer.
-    EXPECT_LT(Risk(WirelessEncryption::Unknown), Risk(WirelessEncryption::WPA2_Personal))
-        << "an undetermined encryption mode is no longer reported as calmer than WPA2";
-    EXPECT_EQ(static_cast<int>(SecurityRiskLevel::Informational),
-              Risk(WirelessEncryption::Unknown));
+TEST(RouterEncryptionRiskTest, AnUndeterminedEncryptionIsRiskierThanAnyCorrectConfiguration) {
+    // Task 283: Unknown reached `default:` and was reported Informational, calmer than WPA2, so a
+    // parse failure read to the user as reassurance.
+    EXPECT_GT(Risk(WirelessEncryption::Unknown), Risk(WirelessEncryption::WPA2_Personal));
+    EXPECT_GT(Risk(WirelessEncryption::Unknown), Risk(WirelessEncryption::WPA3_SAE));
+    EXPECT_EQ(static_cast<int>(SecurityRiskLevel::Medium), Risk(WirelessEncryption::Unknown));
 }
 
 TEST(RouterEncryptionRiskTest, AValueOutsideTheEnumIsNotReportedAsSecure) {
