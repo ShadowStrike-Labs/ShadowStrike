@@ -3866,7 +3866,13 @@ bool IsBlockedMimeType(std::string_view mimeType) {
         "application/x-shellscript"
     };
 
-    std::string lower = NarrowToLower(std::string(mimeType));
+    // A Content-Type header carries parameters ("application/x-msdownload;
+    // charset=utf-8"), and the exact lookup missed every such header. Only the
+    // type/subtype before the first ';' is compared, trimmed of whitespace.
+    std::string_view essence = mimeType.substr(0, mimeType.find(';'));
+    while (!essence.empty() && (essence.front() == ' ' || essence.front() == '\t')) essence.remove_prefix(1);
+    while (!essence.empty() && (essence.back() == ' ' || essence.back() == '\t')) essence.remove_suffix(1);
+    std::string lower = NarrowToLower(std::string(essence));
     return blocked.contains(lower);
 }
 

@@ -173,9 +173,13 @@ TEST(EmailMimePolicy, TheExecutableMimeTypesAreBlockedCaseInsensitively) {
     EXPECT_FALSE(IsBlockedMimeType("text/plain"));
     EXPECT_FALSE(IsBlockedMimeType("application/pdf"));
     EXPECT_FALSE(IsBlockedMimeType(""));
-    EXPECT_FALSE(IsBlockedMimeType("application/x-msdownload; charset=utf-8"))
-        << "the lookup is exact, so a parameter is not stripped first - worth knowing, since a real "
-           "Content-Type header often carries one";
+    // A real Content-Type header carries parameters; only the type/subtype is compared.
+    EXPECT_TRUE(IsBlockedMimeType("application/x-msdownload; charset=utf-8"));
+    EXPECT_TRUE(IsBlockedMimeType("  Application/X-MSDownload ;name=\"a.exe\""));
+    EXPECT_FALSE(IsBlockedMimeType("text/plain; charset=application/x-msdownload"))
+        << "a parameter value is not the type";
+    EXPECT_FALSE(IsBlockedMimeType("application/x-msdownloadx"));
+    EXPECT_FALSE(IsBlockedMimeType(";"));
 }
 
 }  // namespace
