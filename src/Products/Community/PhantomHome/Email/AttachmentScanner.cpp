@@ -95,13 +95,23 @@ struct MagicSignature {
     size_t signatureLen;
     FileTypeCategory category;
     std::string_view mimeType;
+    /// Where the signature sits. Most are at 0; TAR's "ustar" is at 257 and an ISO 9660
+    /// volume descriptor's "CD001" at 32769, which a table compared only at byte 0 could
+    /// never match (task 313).
+    size_t offset = 0;
 };
 
-// M-7 FIX: Use constexpr arrays instead of static vector (no heap at startup)
-static constexpr std::array<MagicSignature, 11> g_magicSignatures = {{
+// The first match wins, so executables stay first. Formats with a signature too short to
+// be distinctive on its own (BMP "BM", ICO, a script shebang) are deliberately absent: they
+// would type ordinary text by its first two bytes.
+static constexpr auto g_magicSignatures = std::to_array<MagicSignature>({
     // Executables
     {{0x4D, 0x5A, 0, 0, 0, 0, 0, 0}, 2, FileTypeCategory::Executable, "application/x-msdownload"},  // PE (MZ)
     {{0x7F, 0x45, 0x4C, 0x46, 0, 0, 0, 0}, 4, FileTypeCategory::Executable, "application/x-elf"},  // ELF
+    {{0xFE, 0xED, 0xFA, 0xCE, 0, 0, 0, 0}, 4, FileTypeCategory::Executable, "application/x-mach-binary"},  // Mach-O 32 BE
+    {{0xFE, 0xED, 0xFA, 0xCF, 0, 0, 0, 0}, 4, FileTypeCategory::Executable, "application/x-mach-binary"},  // Mach-O 64 BE
+    {{0xCE, 0xFA, 0xED, 0xFE, 0, 0, 0, 0}, 4, FileTypeCategory::Executable, "application/x-mach-binary"},  // Mach-O 32 LE
+    {{0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0}, 4, FileTypeCategory::Executable, "application/x-mach-binary"},  // Mach-O 64 LE
 
     // Archives
     {{0x50, 0x4B, 0x03, 0x04, 0, 0, 0, 0}, 4, FileTypeCategory::Archive, "application/zip"},  // ZIP
@@ -109,17 +119,39 @@ static constexpr std::array<MagicSignature, 11> g_magicSignatures = {{
     {{0x52, 0x61, 0x72, 0x21, 0, 0, 0, 0}, 4, FileTypeCategory::Archive, "application/x-rar"},  // RAR
     {{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0}, 6, FileTypeCategory::Archive, "application/x-7z-compressed"},  // 7z
     {{0x1F, 0x8B, 0, 0, 0, 0, 0, 0}, 2, FileTypeCategory::Archive, "application/gzip"},  // GZIP
+    {{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0, 0}, 6, FileTypeCategory::Archive, "application/x-xz"},  // XZ
+    {{0x28, 0xB5, 0x2F, 0xFD, 0, 0, 0, 0}, 4, FileTypeCategory::Archive, "application/zstd"},  // Zstandard
+    {{0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0, 0}, 6, FileTypeCategory::Archive, "application/x-bzip2", 4},  // BZIP2 block after "BZh9"
+    {{0x4D, 0x53, 0x43, 0x46, 0x00, 0x00, 0x00, 0x00}, 8, FileTypeCategory::Archive, "application/vnd.ms-cab-compressed"},  // CAB
+    {{0x75, 0x73, 0x74, 0x61, 0x72, 0, 0, 0}, 5, FileTypeCategory::Archive, "application/x-tar", 257},  // TAR "ustar"
 
     // Documents
     {{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1}, 8, FileTypeCategory::Document, "application/vnd.ms-office"},  // OLE/DOC
     {{0x25, 0x50, 0x44, 0x46, 0, 0, 0, 0}, 4, FileTypeCategory::PDF, "application/pdf"},  // PDF
+    {{0x7B, 0x5C, 0x72, 0x74, 0x66, 0, 0, 0}, 5, FileTypeCategory::Document, "application/rtf"},  // RTF "{\rtf"
 
     // Disk Images
-    {{0x43, 0x44, 0x30, 0x30, 0x31, 0, 0, 0}, 5, FileTypeCategory::DiskImage, "application/x-iso9660-image"},  // ISO
+    {{0x43, 0x44, 0x30, 0x30, 0x31, 0, 0, 0}, 5, FileTypeCategory::DiskImage, "application/x-iso9660-image", 0x8001},  // ISO
+    {{0x76, 0x68, 0x64, 0x78, 0x66, 0x69, 0x6C, 0x65}, 8, FileTypeCategory::DiskImage, "application/x-vhdx"},  // "vhdxfile"
+    {{0x63, 0x6F, 0x6E, 0x65, 0x63, 0x74, 0x69, 0x78}, 8, FileTypeCategory::DiskImage, "application/x-vhd"},  // "conectix"
 
-    // Sentinel for iteration
-    {{0, 0, 0, 0, 0, 0, 0, 0}, 0, FileTypeCategory::Unknown, ""},
-}};
+    // Images
+    {{0xFF, 0xD8, 0xFF, 0, 0, 0, 0, 0}, 3, FileTypeCategory::Media, "image/jpeg"},  // JPEG
+    {{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, 8, FileTypeCategory::Media, "image/png"},  // PNG
+    {{0x47, 0x49, 0x46, 0x38, 0, 0, 0, 0}, 4, FileTypeCategory::Media, "image/gif"},  // GIF87a / GIF89a
+    {{0x57, 0x45, 0x42, 0x50, 0, 0, 0, 0}, 4, FileTypeCategory::Media, "image/webp", 8},  // RIFF....WEBP
+    {{0x49, 0x49, 0x2A, 0x00, 0, 0, 0, 0}, 4, FileTypeCategory::Media, "image/tiff"},  // TIFF little-endian
+    {{0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 0}, 4, FileTypeCategory::Media, "image/tiff"},  // TIFF big-endian
+});
+
+/// Bytes a caller must read for every signature to be reachable: the ISO 9660 descriptor
+/// ends at 32774. Reading 64 left TAR and ISO unmatchable.
+constexpr size_t kMagicProbeBytes = []() {
+    size_t n = 0;
+    for (const auto& sig : g_magicSignatures) n = std::max(n, sig.offset + sig.signatureLen);
+    return n;
+}();
+static_assert(kMagicProbeBytes == 0x8001 + 5);
 
 /**
  * @brief Calculate Shannon entropy over a single buffer.
@@ -520,14 +552,23 @@ void AttachmentStatistics::Reset() noexcept {
         return FileTypeCategory::PDF;
     }
 
+    // Disk images, BEFORE archives: .iso and .img are also in ARCHIVE_EXTENSIONS (they are
+    // extracted like one), and checked second they typed as Archive - a mismatch against
+    // the ISO signature on every genuine image.
+    if (ext == ".iso" || ext == ".img" || ext == ".vhd" || ext == ".vhdx") {
+        return FileTypeCategory::DiskImage;
+    }
+
     // Archives
     if (IsArchiveExtensionImpl(extension)) {
         return FileTypeCategory::Archive;
     }
 
-    // Disk Images
-    if (ext == ".iso" || ext == ".img" || ext == ".vhd" || ext == ".vhdx") {
-        return FileTypeCategory::DiskImage;
+    // Images. Without these, a JPEG signature would make every photo.jpg a mismatch.
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".jfif" || ext == ".jpe" || ext == ".png" ||
+        ext == ".gif" || ext == ".webp" || ext == ".tif" || ext == ".tiff" || ext == ".bmp" ||
+        ext == ".ico") {
+        return FileTypeCategory::Media;
     }
 
     return FileTypeCategory::Unknown;
@@ -578,12 +619,12 @@ void AttachmentStatistics::Reset() noexcept {
         if (sig.signatureLen == 0 || sig.signatureLen > sig.signature.size()) {
             continue;  // the sentinel; a range-based loop never needed one
         }
-        if (header.size() < sig.signatureLen) {
+        if (header.size() < sig.offset || header.size() - sig.offset < sig.signatureLen) {
             continue;
         }
         if (std::equal(sig.signature.begin(),
                        sig.signature.begin() + static_cast<std::ptrdiff_t>(sig.signatureLen),
-                       header.begin())) {
+                       header.begin() + static_cast<std::ptrdiff_t>(sig.offset))) {
             return sig.category;
         }
     }
@@ -795,18 +836,21 @@ public:
                 return result;
             }
 
-            // Read file header for magic byte detection
-            std::vector<uint8_t> fileHeader(1024);
+            // Read enough for every magic signature; the entropy and PE checks keep
+            // measuring the first KiB, as they always have.
+            std::vector<uint8_t> magicProbe(kMagicProbeBytes);
             {
                 std::ifstream file(path, std::ios::binary);
                 if (file) {
-                    file.read(reinterpret_cast<char*>(fileHeader.data()), fileHeader.size());
-                    fileHeader.resize(file.gcount());
+                    file.read(reinterpret_cast<char*>(magicProbe.data()), magicProbe.size());
+                    magicProbe.resize(file.gcount());
                 }
             }
+            const std::span<const uint8_t> fileHeader(
+                magicProbe.data(), std::min<size_t>(magicProbe.size(), 1024));
 
             // Verify extension matches content
-            result.extensionMatchesContent = VerifyExtensionImpl(path, fileHeader);
+            result.extensionMatchesContent = VerifyExtensionImpl(path, magicProbe);
             if (!result.extensionMatchesContent) {
                 result.threats = static_cast<AttachmentThreatType>(
                     static_cast<uint32_t>(result.threats) |
@@ -1035,7 +1079,7 @@ public:
 
     [[nodiscard]] FileTypeCategory DetectFileTypeImpl(const fs::path& path) {
         // First try by magic bytes
-        std::vector<uint8_t> header(64);
+        std::vector<uint8_t> header(kMagicProbeBytes);
         {
             std::ifstream file(path, std::ios::binary);
             if (file) {
@@ -1070,6 +1114,12 @@ public:
 
         if (magicCat == FileTypeCategory::Unknown) {
             return true;  // no signature matched, so there is nothing to contradict the extension
+        }
+
+        // An image under a name with no recognised extension (an inline "image001", a
+        // .heic export) contradicts nothing; flagging it would mark ordinary mail.
+        if (extensionCat == FileTypeCategory::Unknown && magicCat == FileTypeCategory::Media) {
+            return true;
         }
 
         // A container pairing is not a mismatch: a .docx really is a ZIP and a .msi really is an OLE
@@ -1598,7 +1648,7 @@ void AttachmentScanner::Shutdown() {
         return false;
     }
 
-    std::vector<uint8_t> header(64);
+    std::vector<uint8_t> header(kMagicProbeBytes);
     {
         std::ifstream file(path, std::ios::binary);
         if (file) {

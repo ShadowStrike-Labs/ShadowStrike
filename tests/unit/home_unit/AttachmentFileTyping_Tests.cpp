@@ -32,7 +32,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -153,11 +157,6 @@ TEST_F(AttachmentTypingTest, AZipRenamedToAnExecutableIsStillReportedAsWhatItIs)
 // ============================================================================
 
 TEST_F(AttachmentTypingTest, AnUnrecognisedSignatureFallsBackToTheExtension) {
-    // There is no JPEG signature in the table, so an image types by name. Pinned as it behaves: if this
-    // starts returning something else, a signature was added and the container rules need revisiting.
-    EXPECT_EQ(FileTypeCategory::Document, TypeOf(kJpeg, "photo.doc"))
-        << "no JPEG signature exists in the table, so the extension decides";
-
     const std::vector<uint8_t> plain{'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o'};
     EXPECT_EQ(FileTypeCategory::Executable, TypeOf(plain, "tool.exe"));
 }
@@ -183,6 +182,91 @@ TEST_F(AttachmentTypingTest, AllZeroBytesAreNotTypedByTheSentinel) {
     const std::vector<uint8_t> zeros(16, 0x00);
     EXPECT_EQ(FileTypeCategory::Document, TypeOf(zeros, "letter.doc"))
         << "the extension decides, rather than the sentinel claiming the file";
+}
+
+// ============================================================================
+// Signatures at an offset, images and the newer containers (task 313)
+// ============================================================================
+
+/// `bytes` placed at `offset` in an otherwise zero buffer of `total` bytes.
+[[nodiscard]] std::vector<uint8_t> At(size_t offset, std::initializer_list<uint8_t> bytes, size_t total) {
+    std::vector<uint8_t> v(total, 0x00);
+    std::copy(bytes.begin(), bytes.end(), v.begin() + static_cast<std::ptrdiff_t>(offset));
+    return v;
+}
+
+TEST_F(AttachmentTypingTest, AnIsoIsRecognisedByItsVolumeDescriptorAt32769) {
+    const auto iso = At(0x8001, {'C', 'D', '0', '0', '1'}, 0x8001 + 5);
+    EXPECT_EQ(FileTypeCategory::DiskImage, TypeOf(iso, "invoice.pdf"))
+        << "an ISO renamed to a document is typed by its content";
+    EXPECT_EQ(FileTypeCategory::DiskImage, TypeOf(iso, "disk.iso"));
+    EXPECT_EQ(FileTypeCategory::Document, TypeOf(At(0, {'C', 'D', '0', '0', '1'}, 64), "notes.doc"))
+        << "CD001 at byte 0 is not an ISO";
+    EXPECT_EQ(FileTypeCategory::Document, TypeOf(At(0x8001, {'C', 'D', '0', '0'}, 0x8001 + 4), "notes.doc"))
+        << "a buffer ending inside the signature does not match";
+}
+
+TEST_F(AttachmentTypingTest, ATarIsRecognisedByUstarAt257) {
+    EXPECT_EQ(FileTypeCategory::Archive, TypeOf(At(257, {'u', 's', 't', 'a', 'r'}, 512), "report.pdf"))
+        << "a .doc name would be the OOXML container rule, so a non-Office name is used";
+}
+
+TEST_F(AttachmentTypingTest, ImagesAreConfirmedByContentAndAreNotAMismatchUnderTheirOwnNames) {
+    const std::vector<uint8_t> png{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0};
+    const std::vector<uint8_t> gif{'G', 'I', 'F', '8', '9', 'a', 0, 0};
+    const auto webp = At(0, {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P'}, 16);
+    EXPECT_EQ(FileTypeCategory::Media, TypeOf(kJpeg, "photo.jpg"));
+    EXPECT_EQ(FileTypeCategory::Media, TypeOf(png, "photo.png"));
+    EXPECT_EQ(FileTypeCategory::Media, TypeOf(gif, "anim.gif"));
+    EXPECT_EQ(FileTypeCategory::Media, TypeOf(webp, "photo.webp"));
+    EXPECT_EQ(FileTypeCategory::Media, TypeOf(kJpeg, "photo.doc"))
+        << "content decides: a JPEG named .doc is an image, not a document to macro-scan";
+    EXPECT_EQ(FileTypeCategory::Executable, TypeOf(kPe, "photo.jpg"));
+}
+
+TEST_F(AttachmentTypingTest, TheNewerArchivesAndRtfAreRecognised) {
+    // Non-Office names: an Office name over a ZIP-like envelope is the container rule.
+    EXPECT_EQ(FileTypeCategory::Archive, TypeOf({0xFD, '7', 'z', 'X', 'Z', 0x00, 0, 4}, "a.pdf"));
+    EXPECT_EQ(FileTypeCategory::Archive, TypeOf({0x28, 0xB5, 0x2F, 0xFD, 0, 0}, "a.pdf"));
+    EXPECT_EQ(FileTypeCategory::Archive,
+              TypeOf({'B', 'Z', 'h', '9', 0x31, 0x41, 0x59, 0x26, 0x53, 0x59}, "a.pdf"));
+    EXPECT_EQ(FileTypeCategory::Archive, TypeOf({'M', 'S', 'C', 'F', 0, 0, 0, 0, 0x10, 0}, "a.pdf"));
+    EXPECT_EQ(FileTypeCategory::Document, TypeOf({'{', '\\', 'r', 't', 'f', '1'}, "a.pdf"))
+        << "RTF content under another name is typed by content";
+    EXPECT_EQ(FileTypeCategory::Executable, TypeOf({0xCF, 0xFA, 0xED, 0xFE, 7, 0, 0, 1}, "a.pdf"));
+}
+
+TEST_F(AttachmentTypingTest, AGenuineImageOrIsoIsNotAnExtensionMismatch) {
+    // Read from disk, so the probe length and the extension table are exercised together.
+    const auto dir = std::filesystem::temp_directory_path() / L"ss_task313";
+    std::filesystem::create_directories(dir);
+    const auto write = [&dir](const wchar_t* name, const std::vector<uint8_t>& bytes) {
+        const auto p = dir / name;
+        std::ofstream(p, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()),
+                                                 static_cast<std::streamsize>(bytes.size()));
+        return p;
+    };
+    const auto iso = At(0x8001, {'C', 'D', '0', '0', '1'}, 0x8001 + 5);
+    const bool jpgOk = Scanner().VerifyExtension(write(L"photo.jpg", kJpeg));
+    const bool inlineOk = Scanner().VerifyExtension(write(L"image001", kJpeg));
+    const bool isoOk = Scanner().VerifyExtension(write(L"disk.iso", iso));
+    const bool disguised = Scanner().VerifyExtension(write(L"invoice.pdf", iso));
+    const bool jpegAsDoc = Scanner().VerifyExtension(write(L"letter.doc", kJpeg));
+    const FileTypeCategory isoType = Scanner().DetectFileType(dir / L"invoice.pdf");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    EXPECT_TRUE(jpgOk);
+    EXPECT_TRUE(inlineOk) << "an image under a name with no known extension contradicts nothing";
+    EXPECT_TRUE(isoOk) << ".iso typed as Archive would contradict its own signature";
+    EXPECT_FALSE(disguised) << "an ISO named .pdf is a mismatch";
+    EXPECT_FALSE(jpegAsDoc);
+    EXPECT_EQ(FileTypeCategory::DiskImage, isoType) << "the file path reads far enough for offset 32769";
+}
+
+TEST_F(AttachmentTypingTest, AShortSignatureIsNotClaimedByOrdinaryText) {
+    // BMP ("BM"), ICO and a shebang are deliberately not in the table.
+    EXPECT_EQ(FileTypeCategory::Document, TypeOf({'B', 'M', 'W', ' ', 'r', 'e'}, "a.doc"));
+    EXPECT_EQ(FileTypeCategory::Document, TypeOf({'#', '!', '/', 'b', 'i', 'n'}, "a.doc"));
 }
 
 // ============================================================================
