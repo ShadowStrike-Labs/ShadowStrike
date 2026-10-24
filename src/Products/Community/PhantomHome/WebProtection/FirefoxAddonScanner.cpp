@@ -647,8 +647,12 @@ public:
             }
         }
 
+        // The addon's risk level is derived from its verdict by CalculateRiskLevel below
+        // and nowhere else; a level assigned here was overwritten (task 289). Permission
+        // severity is reported per permission and in riskScore. Critical at the addon
+        // level is reserved for a Malicious verdict: an ad blocker holding <all_urls> is
+        // powerful, not malware.
         if (result.dangerousPermissionsCount > 5) {
-            result.riskLevel = std::max(result.riskLevel, AddonRiskLevel::High);
             if (result.verdict == AddonVerdict::Unknown ||
                 result.verdict == AddonVerdict::Safe) {
                 result.verdict = AddonVerdict::OverPrivileged;
@@ -1443,6 +1447,7 @@ private:
         return AddonVerdict::Safe;
     }
 
+    /// The ONLY source of AddonScanResult::riskLevel: a function of the verdict.
     AddonRiskLevel CalculateRiskLevel(const AddonScanResult& result) {
         switch (result.verdict) {
             case AddonVerdict::Malicious:       return AddonRiskLevel::Critical;

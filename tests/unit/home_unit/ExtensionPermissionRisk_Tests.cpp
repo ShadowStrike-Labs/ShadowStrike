@@ -44,6 +44,8 @@
 #include "Products/Community/PhantomHome/WebProtection/ChromeExtensionScanner.hpp"
 #include "Products/Community/PhantomHome/WebProtection/FirefoxAddonScanner.hpp"
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -251,6 +253,33 @@ TEST(ExtensionPermissionParityTest, EachBrowserOnlyNamesPermissionsItsOwnApiProv
         << "browserSettings is a Firefox API and must be listed";
     EXPECT_FALSE(IsDangerousPermission("browserSettings"))
         << "Chrome does not implement browserSettings";
+}
+
+TEST_F(FirefoxPermissionTest, TheAddonRiskLevelFollowsItsVerdict) {
+    // Task 289. A std::max(riskLevel, High) on the over-privileged path was overwritten by
+    // CalculateRiskLevel a few lines later, so the addon level was never raised by permissions; it is
+    // a function of the verdict alone. Six dangerous permissions make the verdict OverPrivileged and
+    // the level Medium; one all-websites grant alone changes neither.
+    const auto dir = std::filesystem::temp_directory_path() / L"ss_task289";
+    const auto write = [&dir](const wchar_t* sub, const char* perms) {
+        const auto d = dir / sub;
+        std::filesystem::create_directories(d);
+        std::ofstream(d / L"manifest.json")
+            << R"({"manifest_version":2,"name":"t","version":"1.0","permissions":[)" << perms << "]}";
+        return d;
+    };
+    const auto six = Scanner().ScanAddonFolder(
+        write(L"six", R"("tabs","cookies","history","bookmarks","downloads","nativeMessaging")"));
+    const auto allUrls = Scanner().ScanAddonFolder(write(L"all", R"("<all_urls>")"));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+
+    EXPECT_EQ(6, six.dangerousPermissionsCount);
+    EXPECT_EQ(AddonVerdict::OverPrivileged, six.verdict);
+    EXPECT_EQ(AddonRiskLevel::Medium, six.riskLevel);
+    EXPECT_EQ(1, allUrls.dangerousPermissionsCount);
+    EXPECT_NE(AddonRiskLevel::Critical, allUrls.riskLevel)
+        << "Critical at the addon level is reserved for a Malicious verdict";
 }
 
 TEST(FirefoxXpiEntryName, TheLegacyManifestAndSignatureFilesMatchInAnyCase) {
