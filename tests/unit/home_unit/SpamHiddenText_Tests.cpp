@@ -29,7 +29,10 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "Products/Community/PhantomHome/Email/SpamDetector.hpp"
 
@@ -172,6 +175,55 @@ TEST(SpamTokenizer, BigramsAreEmittedAlongsideSingleWords) {
 TEST(SpamTokenizer, EmptyTextYieldsNoTokens) {
     EXPECT_TRUE(TokenizeForBayes("").empty());
     EXPECT_TRUE(TokenizeForBayes("!!! ,,, ...").empty()) << "punctuation alone is not a token";
+}
+
+// ============================================================================================
+// The name mappers declared in SpamDetector.hpp (task 312)
+// ============================================================================================
+
+TEST(SpamNames, EveryIndicatorFlagHasItsOwnName) {
+    using ShadowStrike::Email::GetSpamIndicatorName;
+    using ShadowStrike::Email::SpamIndicator;
+    std::set<std::string_view> names;
+    for (int bit = 0; bit < 20; ++bit) {
+        const auto flag = static_cast<SpamIndicator>(1u << bit);
+        const auto name = GetSpamIndicatorName(flag);
+        EXPECT_NE("Unknown", name) << "bit " << bit;
+        names.insert(name);
+    }
+    EXPECT_EQ(20u, names.size()) << "two flags share a name";
+    EXPECT_EQ("HiddenText", GetSpamIndicatorName(SpamIndicator::HiddenText));
+    EXPECT_EQ("None", GetSpamIndicatorName(SpamIndicator::None));
+    EXPECT_EQ("Unknown", GetSpamIndicatorName(SpamIndicator::HiddenText | SpamIndicator::RBLListed))
+        << "a set is not one flag";
+    EXPECT_EQ("Unknown", GetSpamIndicatorName(static_cast<SpamIndicator>(1u << 25)));
+}
+
+TEST(SpamNames, ASetSplitsIntoItsFlagsInBitOrder) {
+    using ShadowStrike::Email::SpamIndicator;
+    using ShadowStrike::Email::SplitSpamIndicators;
+    const auto set = SpamIndicator::GrayMail | SpamIndicator::BayesianScore | SpamIndicator::HiddenText;
+    const std::vector<SpamIndicator> expected = {SpamIndicator::BayesianScore, SpamIndicator::HiddenText,
+                                                 SpamIndicator::GrayMail};
+    EXPECT_EQ(expected, SplitSpamIndicators(set));
+    EXPECT_TRUE(SplitSpamIndicators(SpamIndicator::None).empty());
+}
+
+TEST(SpamNames, TheResultJsonNamesTheIndicatorsThatFired) {
+    ShadowStrike::Email::SpamAnalysisResult r;
+    r.indicators = ShadowStrike::Email::SpamIndicator::RBLListed | ShadowStrike::Email::SpamIndicator::HiddenText;
+    const std::string json = r.ToJson();
+    EXPECT_NE(std::string::npos, json.find("\"indicators\": [\"RBLListed\", \"HiddenText\"]")) << json;
+}
+
+TEST(SpamNames, EveryRblResultHasAName) {
+    using ShadowStrike::Email::GetRBLResultName;
+    using ShadowStrike::Email::RBLResult;
+    EXPECT_EQ("NotListed", GetRBLResultName(RBLResult::NotListed));
+    EXPECT_EQ("Listed", GetRBLResultName(RBLResult::Listed));
+    EXPECT_EQ("Timeout", GetRBLResultName(RBLResult::Timeout));
+    EXPECT_EQ("Error", GetRBLResultName(RBLResult::Error));
+    EXPECT_EQ("Unknown", GetRBLResultName(static_cast<RBLResult>(200)));
 }
 
 }  // namespace

@@ -759,15 +759,21 @@ private:
 // ============================================================================
 
 [[nodiscard]] std::string_view GetSpamVerdictName(SpamVerdict verdict) noexcept;
+/// @brief Name of ONE indicator flag. "None" for no flag; "Unknown" for a value that is
+///        not exactly one defined flag - split a set with SplitSpamIndicators first.
 [[nodiscard]] std::string_view GetSpamIndicatorName(SpamIndicator indicator) noexcept;
+
+/// @brief The defined flags set in `indicators`, lowest bit first.
+[[nodiscard]] std::vector<SpamIndicator> SplitSpamIndicators(SpamIndicator indicators);
+
 [[nodiscard]] std::string_view GetRBLResultName(RBLResult result) noexcept;
 
 /// @brief Tokenize text for Bayesian analysis
 [[nodiscard]] std::vector<std::string> TokenizeForBayes(const std::string& text);
 
-/// @brief Calculate Bayesian probability
-[[nodiscard]] double CalculateBayesProbability(
-    const std::vector<std::pair<std::string, double>>& tokenProbabilities);
+// CalculateBayesProbability was declared here and never defined. It is not: the one
+// token combiner is BayesianClassifier::ClassifyProbability in SpamDetector.cpp, and a
+// second, free combiner could only drift from it (task 312).
 
 /// @brief Detect hidden text in HTML
 [[nodiscard]] bool DetectHiddenText(const std::string& html);

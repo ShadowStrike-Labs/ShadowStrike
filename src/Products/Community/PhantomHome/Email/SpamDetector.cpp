@@ -488,6 +488,14 @@ std::string SpamAnalysisResult::ToJson() const {
     oss << "  \"reputationScore\": " << reputationScore << ",\n";
     oss << "  \"confidence\": " << confidence << ",\n";
     oss << "  \"summary\": \"" << summary << "\",\n";
+    oss << "  \"indicators\": [";
+    {
+        const auto flags = SplitSpamIndicators(indicators);
+        for (size_t i = 0; i < flags.size(); ++i) {
+            oss << (i ? ", " : "") << "\"" << GetSpamIndicatorName(flags[i]) << "\"";
+        }
+    }
+    oss << "],\n";
     oss << "  \"analysisDuration\": " << analysisDuration.count() << "\n";
     oss << "}";
     return oss.str();
@@ -2036,13 +2044,61 @@ std::string_view GetSpamVerdictName(SpamVerdict verdict) noexcept {
 // UTILITY FUNCTIONS
 //
 // These are declared in SpamDetector.hpp and had no definition anywhere in the tree, so any caller
-// received an unresolved external. Both delegate to the implementation that already existed in this
-// file's anonymous namespace under a different name.
-//
-// CalculateBayesProbability is also declared there and is deliberately NOT defined here: it has no
-// counterpart in this file, and writing a probability combiner means choosing between Graham's method,
-// Robinson's geometric mean and Fisher's chi-squared, which changes results. Filed.
+// received an unresolved external. The first two delegate to the implementation that already existed
+// in this file's anonymous namespace under a different name; the name mappers follow
+// GetSpamVerdictName (task 312).
 // ============================================================================
+
+namespace {
+constexpr std::array<std::pair<SpamIndicator, std::string_view>, 20> kSpamIndicatorNames = {{
+    {SpamIndicator::BayesianScore, "BayesianScore"},
+    {SpamIndicator::KeywordDensity, "KeywordDensity"},
+    {SpamIndicator::RBLListed, "RBLListed"},
+    {SpamIndicator::SuspiciousHeaders, "SuspiciousHeaders"},
+    {SpamIndicator::HiddenText, "HiddenText"},
+    {SpamIndicator::ImageSpam, "ImageSpam"},
+    {SpamIndicator::CharacterAbuse, "CharacterAbuse"},
+    {SpamIndicator::HTMLObfuscation, "HTMLObfuscation"},
+    {SpamIndicator::BulkMailer, "BulkMailer"},
+    {SpamIndicator::ForgedHeaders, "ForgedHeaders"},
+    {SpamIndicator::MissingHeaders, "MissingHeaders"},
+    {SpamIndicator::SuspiciousTimestamp, "SuspiciousTimestamp"},
+    {SpamIndicator::BadReputation, "BadReputation"},
+    {SpamIndicator::ExcessiveRecipients, "ExcessiveRecipients"},
+    {SpamIndicator::Base64Abuse, "Base64Abuse"},
+    {SpamIndicator::UnusualCharset, "UnusualCharset"},
+    {SpamIndicator::SuspiciousLinks, "SuspiciousLinks"},
+    {SpamIndicator::HighBounceRate, "HighBounceRate"},
+    {SpamIndicator::NewSender, "NewSender"},
+    {SpamIndicator::GrayMail, "GrayMail"},
+}};
+}  // namespace
+
+std::string_view GetSpamIndicatorName(SpamIndicator indicator) noexcept {
+    if (indicator == SpamIndicator::None) return "None";
+    for (const auto& [flag, name] : kSpamIndicatorNames) {
+        if (flag == indicator) return name;
+    }
+    return "Unknown";
+}
+
+std::vector<SpamIndicator> SplitSpamIndicators(SpamIndicator indicators) {
+    std::vector<SpamIndicator> flags;
+    for (const auto& [flag, name] : kSpamIndicatorNames) {
+        if ((indicators & flag) == flag) flags.push_back(flag);
+    }
+    return flags;
+}
+
+std::string_view GetRBLResultName(RBLResult result) noexcept {
+    switch (result) {
+        case RBLResult::NotListed: return "NotListed";
+        case RBLResult::Listed: return "Listed";
+        case RBLResult::Timeout: return "Timeout";
+        case RBLResult::Error: return "Error";
+        default: return "Unknown";
+    }
+}
 
 std::vector<std::string> TokenizeForBayes(const std::string& text) {
     return TokenizeText(text);
