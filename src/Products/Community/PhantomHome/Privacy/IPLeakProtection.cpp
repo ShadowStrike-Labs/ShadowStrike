@@ -116,25 +116,7 @@ namespace {
     /**
      * @brief Known VPN adapter patterns
      */
-    constexpr const char* VPN_ADAPTER_PATTERNS[] = {
-        "TAP-Windows",
-        "WireGuard",
-        "OpenVPN",
-        "NordVPN",
-        "ExpressVPN",
-        "ProtonVPN",
-        "Surfshark",
-        "CyberGhost",
-        "IPVanish",
-        "Mullvad",
-        "Private Internet Access",
-        "TunnelBear",
-        "Hotspot Shield",
-        "VyprVPN",
-        "IPSec",
-        "L2TP",
-        "PPTP"
-    };
+    // VPN adapter names: Privacy::kVpnAdapterNamePatterns (Common.hpp), shared with DNSLeakProtection.
 
     /**
      * @brief Public IP check services
@@ -596,11 +578,8 @@ public:
      * @brief Check if adapter is VPN
      */
     [[nodiscard]] bool IsVPNAdapterInternal(const std::string& name, const std::string& description) const {
-        for (const auto* pattern : VPN_ADAPTER_PATTERNS) {
-            if (name.find(pattern) != std::string::npos ||
-                description.find(pattern) != std::string::npos) {
-                return true;
-            }
+        if (IsVpnAdapterName(name) || IsVpnAdapterName(description)) {
+            return true;
         }
 
         // Check configured patterns
@@ -2783,13 +2762,7 @@ void IPLeakStatistics::Reset() noexcept {
 }
 
 [[nodiscard]] bool IsVPNAdapter(const std::string& name, const std::string& description) {
-    for (const auto* pattern : VPN_ADAPTER_PATTERNS) {
-        if (name.find(pattern) != std::string::npos ||
-            description.find(pattern) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
+    return IsVpnAdapterName(name) || IsVpnAdapterName(description);
 }
 
 }  // namespace ShadowStrike::Privacy

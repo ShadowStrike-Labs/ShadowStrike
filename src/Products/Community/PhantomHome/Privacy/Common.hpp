@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -341,6 +342,33 @@ inline void SecureClearString(std::string& str) noexcept {
 [[nodiscard]] constexpr bool IsHalfConfiguredPermissionWindow(
         const std::optional<int>& fromHour, const std::optional<int>& toHour) noexcept {
     return fromHour.has_value() != toHour.has_value();
+}
+
+/// Substrings that identify a VPN adapter by its name or description - the ONE list
+/// for the Privacy modules (task 297). DNSLeakProtection held the first ten of
+/// IPLeakProtection's seventeen, so Private Internet Access, TunnelBear, Hotspot
+/// Shield and VyprVPN were VPNs to one and not the other; the enterprise clients
+/// (AnyConnect, GlobalProtect, Pulse/Juniper, FortiClient) were in neither.
+///
+/// A name list can only lag the market. Callers test the interface type
+/// (IF_TYPE_TUNNEL, IF_TYPE_PPP) FIRST, and this list is the supplement for TAP-style
+/// adapters that report as ordinary Ethernet. Matching is case-sensitive substring,
+/// as both copies were.
+inline constexpr std::array<std::string_view, 23> kVpnAdapterNamePatterns = {
+    "TAP-Windows", "WireGuard", "OpenVPN", "NordVPN", "ExpressVPN", "ProtonVPN",
+    "Surfshark", "CyberGhost", "IPVanish", "Mullvad", "Private Internet Access",
+    "TunnelBear", "Hotspot Shield", "VyprVPN", "IPSec", "L2TP", "PPTP",
+    "AnyConnect", "PANGP", "GlobalProtect", "Pulse Secure", "Juniper Networks Virtual",
+    "Fortinet",
+};
+
+/// Whether an adapter name or description contains a known VPN pattern.
+[[nodiscard]] constexpr bool IsVpnAdapterName(std::string_view text) noexcept {
+    if (text.empty()) return false;
+    for (const auto pattern : kVpnAdapterNamePatterns) {
+        if (text.find(pattern) != std::string_view::npos) return true;
+    }
+    return false;
 }
 
 }  // namespace Privacy

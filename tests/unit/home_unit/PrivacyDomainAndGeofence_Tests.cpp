@@ -38,6 +38,7 @@
 
 #include <string>
 
+#include "Products/Community/PhantomHome/Privacy/IPLeakProtection.hpp"
 #include "Products/Community/PhantomHome/Privacy/DNSLeakProtection.hpp"
 #include "Products/Community/PhantomHome/Privacy/LocationPrivacy.hpp"
 
@@ -190,6 +191,27 @@ TEST_F(DnsBlocklistKeyTest, AWhitelistEntryCoversOnlyTheNameItself) {
     EXPECT_TRUE(Dns().UnwhitelistDomain("whitelisted.example"));
     EXPECT_TRUE(Dns().UnblockDomain("ads.whitelisted.example"));
     EXPECT_FALSE(Dns().WhitelistDomain("bad..name")) << "validated like BlockDomain";
+}
+
+TEST(PrivacyVpnAdapterNames, BothLeakModulesRecogniseTheSameAdapters) {
+    // Task 297: DNSLeakProtection's list was the first ten of IPLeakProtection's seventeen. One list
+    // now; these were the names only the larger copy knew, plus enterprise clients neither knew.
+    for (const char* desc : {"Private Internet Access Network Adapter", "TunnelBear Adapter V9",
+                             "Hotspot Shield 7.9.0", "VyprVPN TAP adapter",
+                             "Cisco AnyConnect Secure Mobility Client Virtual Miniport Adapter for Windows x64",
+                             "PANGP Virtual Ethernet Adapter", "Fortinet SSL VPN Virtual Ethernet Adapter",
+                             "WireGuard Tunnel", "TAP-Windows Adapter V9"}) {
+        EXPECT_TRUE(ShadowStrike::Privacy::IsVpnAdapterName(desc)) << desc;
+        EXPECT_TRUE(ShadowStrike::Privacy::IsVPNAdapter("", desc)) << "IPLeakProtection: " << desc;
+    }
+}
+
+TEST(PrivacyVpnAdapterNames, OrdinaryAdaptersAreNotVpns) {
+    for (const char* desc : {"Intel(R) Ethernet Connection (7) I219-V", "Realtek PCIe GbE Family Controller",
+                             "Intel(R) Wi-Fi 6 AX201 160MHz", "Hyper-V Virtual Ethernet Adapter", ""}) {
+        EXPECT_FALSE(ShadowStrike::Privacy::IsVpnAdapterName(desc)) << desc;
+        EXPECT_FALSE(ShadowStrike::Privacy::IsVPNAdapter(desc, desc)) << desc;
+    }
 }
 
 TEST_F(DnsBlocklistKeyTest, AnUnknownDomainIsNotBlocked) {

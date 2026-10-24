@@ -168,29 +168,9 @@ namespace {
     /**
      * @brief Known VPN adapters
      */
-    constexpr const char* VPN_ADAPTERS[] = {
-        "TAP-Windows",
-        "WireGuard",
-        "OpenVPN",
-        "NordVPN",
-        "ExpressVPN",
-        "ProtonVPN",
-        "Surfshark",
-        "CyberGhost",
-        "IPVanish",
-        "Mullvad"
-    };
-
-    /**
-     * @brief Check if adapter is VPN
-     */
+    // VPN adapter names: Privacy::kVpnAdapterNamePatterns, shared with IPLeakProtection.
     [[nodiscard]] bool IsVPNAdapter(const std::string& adapterName) {
-        for (const auto* vpnName : VPN_ADAPTERS) {
-            if (adapterName.find(vpnName) != std::string::npos) {
-                return true;
-            }
-        }
-        return false;
+        return IsVpnAdapterName(adapterName);
     }
 
     /**
