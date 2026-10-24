@@ -360,28 +360,39 @@ std::string GameModeProfile::ToJson() const {
 
 // Fix #20: Treat startMinutes == endMinutes as 24-hour schedule ("always active")
 bool GameModeSchedule::IsActiveNow() const {
-    if (!enabled) return false;
+    return IsActiveAt(GetCurrentDayOfWeek(), GetCurrentMinutesFromMidnight());
+}
 
-    uint8_t currentDay = GetCurrentDayOfWeek();
-    uint16_t currentMinutes = GetCurrentMinutesFromMidnight();
+bool GameModeSchedule::IsActiveAt(uint8_t dayOfWeek, uint16_t minutesFromMidnight) const noexcept {
+    if (!enabled || dayOfWeek > 6) return false;
 
-    // Check day of week
-    uint8_t dayBit = (1 << currentDay);
-    if (!(daysOfWeek & dayBit)) return false;
+    const auto dayEnabled = [this](uint8_t day) noexcept {
+        return (daysOfWeek & static_cast<uint8_t>(1u << day)) != 0;
+    };
 
-    // Edge case: startMinutes == endMinutes means 24-hour schedule
+    // startMinutes == endMinutes is the documented 24-hour form for the selected days.
     if (startMinutes == endMinutes) {
-        return true;
+        return dayEnabled(dayOfWeek);
     }
 
-    // Check time range
     if (startMinutes < endMinutes) {
-        // Normal range (e.g., 9:00 to 17:00)
-        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
-    } else {
-        // Overnight range (e.g., 22:00 to 2:00)
-        return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+        // Same-day window (e.g. 09:00-17:00).
+        return dayEnabled(dayOfWeek) &&
+               minutesFromMidnight >= startMinutes && minutesFromMidnight < endMinutes;
     }
+
+    // Overnight window (e.g. 22:00-02:00), task 275. A selected day owns the window that
+    // STARTS on it: Monday 22:00-02:00 runs Monday 22:00 to Tuesday 02:00. So the evening
+    // part belongs to today's bit and the early-morning part to YESTERDAY's. Gating both
+    // on today's bit, as before, cut the window at midnight and instead activated it on
+    // the selected day's own early morning.
+    if (minutesFromMidnight >= startMinutes) {
+        return dayEnabled(dayOfWeek);
+    }
+    if (minutesFromMidnight < endMinutes) {
+        return dayEnabled(static_cast<uint8_t>((dayOfWeek + 6) % 7));
+    }
+    return false;
 }
 
 std::string GameModeSchedule::ToJson() const {

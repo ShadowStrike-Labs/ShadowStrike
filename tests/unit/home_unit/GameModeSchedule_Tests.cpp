@@ -18,13 +18,8 @@
  * protection-suppressing feature - that a schedule which is off, or whose mask excludes every day, is
  * never active regardless of the time.
  *
- * A LIMITATION IS RECORDED RATHER THAN WORKED AROUND. The overnight branch returns
- * "currentMinutes >= startMinutes || currentMinutes < endMinutes", but the day mask is checked against
- * TODAY before that. So a schedule of 22:00 to 02:00 enabled only on Monday is active on Monday from
- * 22:00 to midnight and, separately, on Monday from 00:00 to 02:00 - it does NOT continue into Tuesday
- * morning, which is what "Monday night" ordinarily means. That is filed as a semantics question. It is
- * not asserted here because doing so would require freezing the clock, and a test that only passes on
- * certain days is worse than no test.
+ * OVERNIGHT WINDOWS (task 275) are asserted through IsActiveAt, which takes the moment explicitly: a
+ * selected day owns the window that starts on it, so Monday 22:00-02:00 runs into Tuesday morning.
  */
 
 #include "pch.h"
@@ -116,4 +111,49 @@ TEST(GameModeScheduleTest, AnIdenticalStartAndEndMeansTwentyFourHours) {
 }
 
 }  // namespace
+// Days: 0 Sunday, 1 Monday, 2 Tuesday. Monday-only, 22:00 to 02:00.
+[[nodiscard]] GameModeSchedule MondayNight() {
+    GameModeSchedule s{};
+    s.enabled = true;
+    s.daysOfWeek = static_cast<uint8_t>(1u << 1);
+    s.startMinutes = 22 * 60;
+    s.endMinutes = 2 * 60;
+    return s;
+}
+
+TEST(GameModeScheduleTest, AnOvernightWindowContinuesIntoTheNextMorning) {
+    const auto s = MondayNight();
+    EXPECT_TRUE(s.IsActiveAt(1, 22 * 60)) << "Monday 22:00, the start";
+    EXPECT_TRUE(s.IsActiveAt(1, 23 * 60 + 59));
+    EXPECT_TRUE(s.IsActiveAt(2, 0)) << "Tuesday 00:00: the window crossed midnight";
+    EXPECT_TRUE(s.IsActiveAt(2, 1 * 60 + 59)) << "Tuesday 01:59";
+    EXPECT_FALSE(s.IsActiveAt(2, 2 * 60)) << "Tuesday 02:00, the end is exclusive";
+}
+
+TEST(GameModeScheduleTest, AnOvernightWindowDoesNotStartOnTheSelectedDaysOwnMorning) {
+    // The old gate checked TODAY's bit for both halves, so Monday 00:00-02:00 was active and
+    // Tuesday morning was not - the window sat at the wrong end of the day.
+    const auto s = MondayNight();
+    EXPECT_FALSE(s.IsActiveAt(1, 1 * 60)) << "Monday 01:00 belongs to a Sunday-night window";
+    EXPECT_FALSE(s.IsActiveAt(2, 22 * 60)) << "Tuesday evening is not selected";
+    EXPECT_FALSE(s.IsActiveAt(1, 12 * 60)) << "between end and start";
+}
+
+TEST(GameModeScheduleTest, SaturdayNightWrapsToSunday) {
+    auto s = MondayNight();
+    s.daysOfWeek = static_cast<uint8_t>(1u << 6);
+    EXPECT_TRUE(s.IsActiveAt(0, 60)) << "Sunday 01:00 belongs to Saturday night";
+    EXPECT_FALSE(s.IsActiveAt(6, 60)) << "Saturday 01:00 belongs to Friday night";
+}
+
+TEST(GameModeScheduleTest, ASameDayWindowIsUnchanged) {
+    auto s = MondayNight();
+    s.startMinutes = 9 * 60;
+    s.endMinutes = 17 * 60;
+    EXPECT_TRUE(s.IsActiveAt(1, 9 * 60));
+    EXPECT_FALSE(s.IsActiveAt(1, 17 * 60));
+    EXPECT_FALSE(s.IsActiveAt(2, 10 * 60));
+    EXPECT_FALSE(s.IsActiveAt(9, 10 * 60)) << "an invalid day is never active";
+}
+
 }  // namespace ShadowStrike::GameMode::Test

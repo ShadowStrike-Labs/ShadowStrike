@@ -368,6 +368,11 @@ struct GameModeSchedule {
     bool enabled = true;
     
     [[nodiscard]] bool IsActiveNow() const;
+
+    /// The same decision for an explicit moment (dayOfWeek 0 = Sunday, minutes since
+    /// midnight), so the overnight case can be tested without the wall clock.
+    [[nodiscard]] bool IsActiveAt(uint8_t dayOfWeek, uint16_t minutesFromMidnight) const noexcept;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
