@@ -402,7 +402,8 @@ public:
         return result;
     }
 
-    [[nodiscard]] DeviceAnalysisResult AnalyzeDevice(uint16_t vendorId, uint16_t productId) {
+    [[nodiscard]] DeviceAnalysisResult AnalyzeDevice(uint16_t vendorId, uint16_t productId,
+                                                     bool presentsAsKeyboard) {
         std::unique_lock lock(m_mutex);
 
         m_stats.totalDevicesAnalyzed++;
@@ -414,7 +415,7 @@ public:
             return DeviceAnalysisResult::KnownBadDevice;
         }
 
-        if (IsSuspiciousVendor(vendorId)) {
+        if (presentsAsKeyboard && IsSuspiciousVendor(vendorId)) {
             m_stats.suspiciousDevicesDetected++;
             return DeviceAnalysisResult::Suspicious;
         }
@@ -673,7 +674,7 @@ public:
             }
 
             // Test 3: Safe device check
-            auto result = AnalyzeDevice(0x046D, 0xC52B);
+            auto result = AnalyzeDevice(0x046D, 0xC52B, true);
             if (result == DeviceAnalysisResult::KnownBadDevice) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: False positive on safe device");
                 return false;
@@ -1076,6 +1077,10 @@ private:
         return false;
     }
 
+    /// Microcontroller families attack tools are built on. NOT a verdict on its own: these
+    /// vendor ids cover entire product lines and shared community ranges, so a match counts
+    /// only with a keyboard interface (task 280), as the FTDI exclusion in KNOWN_BAD_DEVICES
+    /// argues for a single vendor.
     [[nodiscard]] bool IsSuspiciousVendor(uint16_t vendorId) const {
         switch (vendorId) {
             case 0x16C0:  // Teensy
@@ -1106,12 +1111,18 @@ private:
             return DeviceAnalysisResult::AnomalousDescriptor;
         }
 
-        if (IsSuspiciousVendor(desc.vendorId)) {
+        if (PresentsAsKeyboard(desc) && IsSuspiciousVendor(desc.vendorId)) {
             m_stats.suspiciousDevicesDetected++;
             return DeviceAnalysisResult::Suspicious;
         }
 
         return DeviceAnalysisResult::Safe;
+    }
+
+    /// HID class with the keyboard protocol, as GetDeviceDescriptorInternal records a
+    /// device whose top-level collection is a generic-desktop keyboard.
+    [[nodiscard]] static bool PresentsAsKeyboard(const HIDDeviceDescriptor& desc) noexcept {
+        return desc.classCode == 0x03 && desc.protocolCode == 0x01;
     }
 
     void LogDeviceAnalysis(const HIDDeviceDescriptor& desc, DeviceAnalysisResult result) {
@@ -1937,8 +1948,9 @@ DeviceAnalysisResult BadUSBDetector::AnalyzeDeviceDescriptor(const std::string& 
     return m_impl->AnalyzeDeviceDescriptor(devicePath);
 }
 
-DeviceAnalysisResult BadUSBDetector::AnalyzeDevice(uint16_t vendorId, uint16_t productId) {
-    return m_impl->AnalyzeDevice(vendorId, productId);
+DeviceAnalysisResult BadUSBDetector::AnalyzeDevice(uint16_t vendorId, uint16_t productId,
+                                                   bool presentsAsKeyboard) {
+    return m_impl->AnalyzeDevice(vendorId, productId, presentsAsKeyboard);
 }
 
 std::optional<HIDDeviceDescriptor> BadUSBDetector::GetDeviceDescriptor(

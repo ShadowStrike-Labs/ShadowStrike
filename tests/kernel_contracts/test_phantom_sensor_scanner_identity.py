@@ -28461,5 +28461,28 @@ class PoolHostListsAreDisjointTests(unittest.TestCase):
         self.assertEqual([], shadowed, "the malicious match would always win")
 
 
+class SuspiciousUsbVendorNeedsAKeyboardTests(unittest.TestCase):
+    """A microcontroller vendor id counts only with a keyboard interface (task 280).
+
+    The descriptor path has no unit-test entry point, so the corroboration is held here.
+    """
+
+    SRC = ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.cpp"
+
+    def test_every_use_of_the_vendor_check_is_corroborated(self):
+        src = strip_c_comments(read_source(self.SRC))
+        uses = [l.strip() for l in src.splitlines()
+                if "IsSuspiciousVendor(" in l and "bool IsSuspiciousVendor(" not in l]
+        self.assertEqual(2, len(uses), uses)
+        for line in uses:
+            self.assertRegex(line, r"(presentsAsKeyboard|PresentsAsKeyboard\(desc\))\s*&&\s*IsSuspiciousVendor\(")
+
+    def test_keyboard_means_the_hid_keyboard_protocol(self):
+        src = strip_c_comments(read_source(self.SRC))
+        m = re.search(r"static bool PresentsAsKeyboard\(const HIDDeviceDescriptor& desc\) noexcept \{(.*?)\n    \}", src, re.S)
+        self.assertIsNotNone(m)
+        self.assertRegex(m.group(1), r"desc\.classCode == 0x03 && desc\.protocolCode == 0x01")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

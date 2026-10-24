@@ -631,10 +631,22 @@ public:
     [[nodiscard]] DeviceAnalysisResult AnalyzeDeviceDescriptor(
         const std::string& devicePath);
     
-    /// @brief Analyze device by VID/PID
+    /**
+     * @brief Analyze a device by VID/PID and whether it presents a keyboard.
+     *
+     * A listed attack tool (exact VID AND PID) is KnownBadDevice. A vendor id of one of
+     * the microcontroller families attack tools are built on is Suspicious ONLY when the
+     * device also presents a keyboard (task 280): the vendor ids are shared by every
+     * STM32 board, Raspberry Pi Pico and community project, and keystroke injection is
+     * the attack. A Rubber Ducky with a modified product id is still a keyboard.
+     *
+     * @param presentsAsKeyboard The device exposes a HID keyboard interface. Pass false
+     *        when the class is not known; the keystroke-rate analysis still applies.
+     */
     [[nodiscard]] DeviceAnalysisResult AnalyzeDevice(
         uint16_t vendorId,
-        uint16_t productId);
+        uint16_t productId,
+        bool presentsAsKeyboard);
     
     /// @brief Get device descriptor info
     [[nodiscard]] std::optional<HIDDeviceDescriptor> GetDeviceDescriptor(

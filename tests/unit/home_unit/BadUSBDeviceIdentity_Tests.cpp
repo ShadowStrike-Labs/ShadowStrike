@@ -17,14 +17,10 @@
  *   too many legitimate FTDI-based devices exist - serial adapters, lab equipment, industrial
  *   controllers - and the false-positive rate would be unacceptable.
  *
- *   IsSuspiciousVendor matches a VID ALONE, for six silicon vendors, and AnalyzeDevice returns
- *   Suspicious on that basis with no reference to the product id.
- *
- * The second does precisely what the first documents as unacceptable. Every STM32 board, every
- * Raspberry Pi Pico, and every device on the shared community vendor ids is reported Suspicious
- * whatever it actually is. That contrast is pinned below rather than corrected here, because
- * narrowing the vendor check would drop coverage of an attack tool that ships a modified product id -
- * a detection tradeoff for the owner to decide, not a cleanup. Filed.
+ *   IsSuspiciousVendor matches a VID alone, for six microcontroller vendors. It used to decide a
+ *   Suspicious verdict by itself - every STM32 board and Raspberry Pi Pico - which is what the FTDI
+ *   note calls unacceptable. Since task 280 it counts only when the device also presents a keyboard,
+ *   so an attack tool with a modified product id is still caught and a serial adapter is not.
  *
  * Also pinned: the free IsVIDPIDKnownMalicious and the member IsKnownBadDevice are separate copies of
  * the same loop over the same table. They cannot disagree on data, only on logic, so they are required
@@ -139,7 +135,7 @@ TEST_F(BadUSBDeviceIdentityTest, TheTwoCopiesOfTheKnownBadCheckAgree) {
 TEST_F(BadUSBDeviceIdentityTest, AKnownAttackToolIsReportedAsKnownBad) {
     auto& detector = BadUSBDetector::Instance();
     for (const auto& [vid, pid] : KnownBadPairs()) {
-        EXPECT_EQ(DeviceAnalysisResult::KnownBadDevice, detector.AnalyzeDevice(vid, pid))
+        EXPECT_EQ(DeviceAnalysisResult::KnownBadDevice, detector.AnalyzeDevice(vid, pid, true))
             << "VID_" << std::hex << vid << " PID_" << pid << " is a listed attack tool";
     }
 }
@@ -148,24 +144,35 @@ TEST_F(BadUSBDeviceIdentityTest, AnOrdinaryDeviceIsReportedSafe) {
     // Anti-vacuity for the case below: the analyser must be capable of answering Safe, or "Suspicious"
     // would carry no information.
     auto& detector = BadUSBDetector::Instance();
-    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(0x046D, 0xC52B));
-    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(kFtdiVid, kFtdiPid))
+    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(0x046D, 0xC52B, true));
+    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(kFtdiVid, kFtdiPid, true))
         << "an FTDI serial adapter must be Safe - that is the whole point of the exclusion note";
 }
 
-TEST_F(BadUSBDeviceIdentityTest, AWholeSiliconVendorIsReportedSuspiciousRegardlessOfProduct) {
-    // PINNED, NOT ENDORSED. AnalyzeDevice consults IsSuspiciousVendor, which matches the vendor id
-    // alone, so every product from six silicon vendors is Suspicious whatever it is. The product ids
-    // used here are arbitrary and unrelated to any attack tool.
-    //
-    // This is the behaviour the FTDI exclusion note argues against, applied to STMicroelectronics and
-    // Raspberry Pi among others. Filed. If this case now fails, the vendor check was made precise -
-    // update the filing and delete this case rather than restoring vendor-wide matching.
+TEST_F(BadUSBDeviceIdentityTest, AMicrocontrollerVendorAloneIsNotSuspicious) {
+    // An STM32 virtual COM port and a Raspberry Pi Pico in its boot loader present no keyboard.
     auto& detector = BadUSBDetector::Instance();
-    EXPECT_EQ(DeviceAnalysisResult::Suspicious, detector.AnalyzeDevice(kStmVid, 0x5740))
-        << "an STMicroelectronics device is no longer condemned by its vendor id alone";
-    EXPECT_EQ(DeviceAnalysisResult::Suspicious, detector.AnalyzeDevice(kRpiVid, 0x0003))
-        << "a Raspberry Pi device is no longer condemned by its vendor id alone";
+    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(kStmVid, 0x5740, false));
+    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(kRpiVid, 0x0003, false));
+}
+
+TEST_F(BadUSBDeviceIdentityTest, AMicrocontrollerVendorPresentingAKeyboardIsSuspicious) {
+    // The coverage the vendor check exists for: an attack tool with a modified product id is still a
+    // keyboard. Unlisted product ids, so the exact-match table cannot be what catches them.
+    auto& detector = BadUSBDetector::Instance();
+    for (const std::uint16_t vid : {0x16C0, 0x16D0, 0x1FC9, 0x2E8A, 0x1D6B, 0x0483}) {
+        EXPECT_EQ(DeviceAnalysisResult::Suspicious, detector.AnalyzeDevice(vid, 0x7777, true))
+            << "VID_" << std::hex << vid;
+    }
+    EXPECT_EQ(DeviceAnalysisResult::Safe, detector.AnalyzeDevice(0x046D, 0xC31C, true))
+        << "an ordinary keyboard vendor is not suspicious";
+}
+
+TEST_F(BadUSBDeviceIdentityTest, AListedAttackToolIsKnownBadWithoutKeyboardEvidence) {
+    auto& detector = BadUSBDetector::Instance();
+    for (const auto& [vid, pid] : KnownBadPairs()) {
+        EXPECT_EQ(DeviceAnalysisResult::KnownBadDevice, detector.AnalyzeDevice(vid, pid, false));
+    }
 }
 
 TEST_F(BadUSBDeviceIdentityTest, TheVendorIdAndProductIdAreNotInterchangeable) {
@@ -177,7 +184,7 @@ TEST_F(BadUSBDeviceIdentityTest, TheVendorIdAndProductIdAreNotInterchangeable) {
     EXPECT_FALSE(IsVIDPIDKnownMalicious(0x0483, 0x16C0))
         << "the reversed pair was treated as the same device, so the two id fields are being compared "
            "without regard to which is which";
-    EXPECT_NE(DeviceAnalysisResult::KnownBadDevice, detector.AnalyzeDevice(0x0483, 0x16C0));
+    EXPECT_NE(DeviceAnalysisResult::KnownBadDevice, detector.AnalyzeDevice(0x0483, 0x16C0, true));
 }
 
 }  // namespace

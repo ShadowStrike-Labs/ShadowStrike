@@ -735,7 +735,12 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
             m_stats.devicesBlocked.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_WARN(L"USBMonitor", L"Known BadUSB device blocked: VID_%04X&PID_%04X", device.vid, device.pid);
         } else {
-            auto analysisResult = badUsb.AnalyzeDevice(device.vid, device.pid);
+            // The device class is not yet resolved on this path (classCode is reported
+            // Unknown, see GetDeviceInfoFromPnP), so only a device typed as a keyboard can
+            // corroborate a microcontroller vendor id. A vendor-only Suspicious here never
+            // blocked anything; the keystroke-rate analysis is the live defence.
+            auto analysisResult = badUsb.AnalyzeDevice(device.vid, device.pid,
+                                                       device.type == DeviceType::HIDKeyboard);
             if (analysisResult != DeviceAnalysisResult::Safe) {
                 SS_LOG_WARN(L"USBMonitor", L"BadUSB suspicious device: %hs (Analysis: %hs)",
                     RedactDeviceIdentifier(device.deviceId).c_str(), GetDeviceAnalysisResultName(analysisResult).data());
