@@ -72,6 +72,7 @@
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
+#include <atomic>
 #include <algorithm>
 #include <numeric>
 #include <sstream>
@@ -209,25 +210,19 @@ uint64_t GenerateEventId() {
  * @brief Check if current time is within allowed hours
  */
 bool IsWithinAllowedHours(const std::optional<int>& fromHour, const std::optional<int>& toHour) {
-    if (!fromHour.has_value() || !toHour.has_value()) {
-        return true;  // No restriction
+    // Logged once per process: this runs on every access check.
+    static std::atomic<bool> s_reportedHalfWindow{ false };
+    if (IsHalfConfiguredPermissionWindow(fromHour, toHour) &&
+        !s_reportedHalfWindow.exchange(true, std::memory_order_relaxed)) {
+        SS_LOG_WARN(L"Privacy", L"A microphone whitelist entry sets only one of allowFromHour/allowToHour; "
+                    L"access is denied until both are set.");
     }
-
-    auto now = SystemClock::now();
-    auto now_t = SystemClock::to_time_t(now);
-    std::tm tm;
-    localtime_s(&tm, &now_t);
-    int currentHour = tm.tm_hour;
-
-    int from = fromHour.value();
-    int to = toHour.value();
-
-    if (from < to) {
-        return currentHour >= from && currentHour < to;
-    } else {
-        // Wraps around midnight
-        return currentHour >= from || currentHour < to;
+    auto now_t = SystemClock::to_time_t(SystemClock::now());
+    std::tm tm{};
+    if (localtime_s(&tm, &now_t) != 0) {
+        return !fromHour.has_value() && !toHour.has_value();
     }
+    return IsHourWithinPermissionWindow(fromHour, toHour, tm.tm_hour);
 }
 
 /**

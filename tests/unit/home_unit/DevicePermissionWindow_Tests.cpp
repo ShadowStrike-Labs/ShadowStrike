@@ -36,6 +36,7 @@
 #include "Products/Community/PhantomHome/Privacy/WebCamProtector.hpp"
 
 #include <optional>
+#include <utility>
 
 namespace ShadowStrike {
 namespace {
@@ -166,24 +167,54 @@ TEST(DevicePermissionWindowTest, TheTwoImplementationsAgreeOnEveryReachableInput
     }
 }
 
-TEST(DevicePermissionWindowTest, AHalfConfiguredWindowCurrentlyImposesNoRestriction) {
-    // CURRENT BEHAVIOUR, pinned rather than endorsed. IsWithinAllowedHours returns true when EITHER
-    // bound is absent, so an entry with a start hour and no end hour permits access around the clock
-    // rather than being treated conservatively. For a microphone or camera permission that is a
-    // fail-open, and it is filed. Both devices are asserted so a fix cannot land on one only.
-    auto audio = UnrestrictedAudio();
-    audio.allowFromHour = 9;
-    audio.allowToHour = std::nullopt;
-    auto camera = UnrestrictedCamera();
-    camera.allowFromHour = 9;
-    camera.allowToHour = std::nullopt;
+TEST(DevicePermissionWindowTest, AHalfConfiguredWindowDeniesOnBothDevices) {
+    // Task 276: either bound absent used to read as "no restriction", so allowFromHour = 9 alone
+    // granted the microphone and camera round the clock. Both devices share one rule now.
+    for (const auto& [from, to] : { std::pair<std::optional<int>, std::optional<int>>{ 9, std::nullopt },
+                                    std::pair<std::optional<int>, std::optional<int>>{ std::nullopt, 17 } }) {
+        auto audio = UnrestrictedAudio();
+        audio.allowFromHour = from;
+        audio.allowToHour = to;
+        auto camera = UnrestrictedCamera();
+        camera.allowFromHour = from;
+        camera.allowToHour = to;
+        EXPECT_FALSE(audio.IsCurrentlyAllowed());
+        EXPECT_FALSE(camera.IsCurrentlyAllowed());
+    }
+}
 
-    EXPECT_TRUE(audio.IsCurrentlyAllowed())
-        << "if this now fails, the half-configured window was made restrictive - update the filing "
-           "and this comment rather than restoring the permissive behaviour";
-    EXPECT_TRUE(camera.IsCurrentlyAllowed())
-        << "if this now fails, the half-configured window was made restrictive - update the filing "
-           "and this comment rather than restoring the permissive behaviour";
+// The shared window rule, with the hour supplied - deterministic, no wall clock.
+TEST(DevicePermissionWindowTest, TheWindowRuleAdmitsExactlyTheConfiguredHours) {
+    using Privacy::IsHourWithinPermissionWindow;
+    const std::optional<int> none;
+    EXPECT_TRUE(IsHourWithinPermissionWindow(none, none, 3)) << "no bounds: unrestricted";
+
+    EXPECT_TRUE(IsHourWithinPermissionWindow(9, 17, 9));
+    EXPECT_TRUE(IsHourWithinPermissionWindow(9, 17, 16));
+    EXPECT_FALSE(IsHourWithinPermissionWindow(9, 17, 17)) << "end is exclusive";
+    EXPECT_FALSE(IsHourWithinPermissionWindow(9, 17, 8));
+
+    EXPECT_TRUE(IsHourWithinPermissionWindow(22, 6, 23)) << "wraps midnight";
+    EXPECT_TRUE(IsHourWithinPermissionWindow(22, 6, 0));
+    EXPECT_TRUE(IsHourWithinPermissionWindow(22, 6, 5));
+    EXPECT_FALSE(IsHourWithinPermissionWindow(22, 6, 6));
+    EXPECT_FALSE(IsHourWithinPermissionWindow(22, 6, 12));
+}
+
+TEST(DevicePermissionWindowTest, MalformedWindowsDenyRatherThanGuess) {
+    using Privacy::IsHourWithinPermissionWindow;
+    const std::optional<int> none;
+    for (int h = 0; h < 24; ++h) {
+        EXPECT_FALSE(IsHourWithinPermissionWindow(9, none, h)) << "only a start, hour " << h;
+        EXPECT_FALSE(IsHourWithinPermissionWindow(none, 17, h)) << "only an end, hour " << h;
+        EXPECT_FALSE(IsHourWithinPermissionWindow(9, 9, h)) << "empty window, hour " << h;
+    }
+    EXPECT_FALSE(IsHourWithinPermissionWindow(-1, 17, 10)) << "bound out of range";
+    EXPECT_FALSE(IsHourWithinPermissionWindow(9, 24, 10)) << "bound out of range";
+    EXPECT_FALSE(IsHourWithinPermissionWindow(9, 17, 25)) << "hour out of range";
+    EXPECT_TRUE(Privacy::IsHalfConfiguredPermissionWindow(9, none));
+    EXPECT_FALSE(Privacy::IsHalfConfiguredPermissionWindow(none, none));
+    EXPECT_FALSE(Privacy::IsHalfConfiguredPermissionWindow(9, 17));
 }
 
 }  // namespace

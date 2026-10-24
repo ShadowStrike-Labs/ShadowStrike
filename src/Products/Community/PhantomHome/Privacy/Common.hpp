@@ -301,5 +301,47 @@ inline void SecureClearString(std::string& str) noexcept {
 
 #endif // _WIN32
 
+/// Whether a device permission window admits the given local hour (0-23).
+///
+/// Shared by MicrophoneGuard and WebCamProtector, which held byte-identical private
+/// copies (task 276). The rules:
+///   - no bounds at all: no time restriction, admitted;
+///   - exactly ONE bound: a half-configured window is a configuration error and is
+///     DENIED. The copies read it as "no restriction", so an entry meant to allow the
+///     microphone or camera from 09:00 allowed it round the clock - a fail-open on a
+///     recording device. A missing bound is not inferred as midnight either: that
+///     would invent a window the user never entered;
+///   - a bound or the hour outside 0-23: denied;
+///   - from == to: an empty window, denied (the copies' wrap branch read it as 24 h);
+///   - from > to: wraps midnight, e.g. 22-06.
+[[nodiscard]] constexpr bool IsHourWithinPermissionWindow(
+        const std::optional<int>& fromHour,
+        const std::optional<int>& toHour,
+        int hour) noexcept {
+    if (!fromHour.has_value() && !toHour.has_value()) {
+        return true;
+    }
+    if (!fromHour.has_value() || !toHour.has_value()) {
+        return false;
+    }
+    const int from = *fromHour;
+    const int to = *toHour;
+    if (from < 0 || from > 23 || to < 0 || to > 23 || hour < 0 || hour > 23) {
+        return false;
+    }
+    if (from == to) {
+        return false;
+    }
+    return (from < to) ? (hour >= from && hour < to)
+                       : (hour >= from || hour < to);
+}
+
+/// True when exactly one bound is set - the case IsHourWithinPermissionWindow
+/// denies, so callers can log the malformed entry instead of failing silently.
+[[nodiscard]] constexpr bool IsHalfConfiguredPermissionWindow(
+        const std::optional<int>& fromHour, const std::optional<int>& toHour) noexcept {
+    return fromHour.has_value() != toHour.has_value();
+}
+
 }  // namespace Privacy
 }  // namespace ShadowStrike
