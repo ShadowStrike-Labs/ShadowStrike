@@ -23,10 +23,9 @@
  * should not silently widen them: the PID set is exact, the process name is compared with _wcsicmp rather
  * than searched, and the explicit path whitelist is an exact match on a canonicalised path.
  *
- * IsDomainAllowed is a four-tier decision and the tiers have priority. Its last tier falls back to
- * IsBankingDomain, which is separately filed as unfit - it matches secure.bank.phishing-site.com and misses
- * chase.com - so what is pinned here is the PRIORITY, namely that a configured whitelist is consulted before
- * that heuristic is ever reached.
+ * IsDomainAllowed is a tiered decision: exact per-session lists, then the loaded banking list (an entry
+ * or its subdomain). With nothing configured it refuses. It no longer falls back to IsBankingDomain, a
+ * keyword heuristic any registrant can satisfy (task 293).
  *
  * NOTE ON HEADERS: every Banking header may share a translation unit. The namespace-wide types live in
  * Banking/Common.hpp, and BankingHeadersCompose_Tests.cpp includes all six to keep it that way.
@@ -38,6 +37,8 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "Products/Community/PhantomHome/Banking/KeyloggerProtection.hpp"
@@ -193,17 +194,53 @@ TEST(SecureBrowserDomainPolicy, AnUnknownSessionFallsThroughToThePolicyTiers) {
     EXPECT_FALSE(browser.IsDomainAllowed("no-such-session", "definitely-not-a-bank.example"));
 }
 
-TEST(SecureBrowserDomainPolicy, TheHeuristicTierIsTheLastResortAndIsKnownToBeUnfit) {
-    // IsBankingDomain is tier four of IsDomainAllowed. It is separately filed: it substring-matches a list
-    // of twelve suffixes despite a comment claiming exact matching, so it accepts a lookalike and misses
-    // most real banks. Pinned as it behaves so the priority order stays visible - a configured whitelist
-    // must be consulted first. If these expectations change, update the filing rather than the test.
+TEST(SecureBrowserDomainPolicy, TheBankingHeuristicIsAnchored) {
     using ShadowStrike::Banking::IsBankingDomain;
-    EXPECT_TRUE(IsBankingDomain("secure.bank.phishing-site.com"))
-        << "a lookalike currently passes, which is why the heuristic must stay the last tier";
-    EXPECT_FALSE(IsBankingDomain("chase.com"))
-        << "a real bank currently fails the heuristic";
-    EXPECT_FALSE(IsBankingDomain("")) << "and an empty domain is refused";
+    // The substring rules accepted every one of these attacker-registrable names.
+    for (const char* lookalike : {"secure.bank.phishing-site.com", "myibank.evil.com",
+                                  "fakebanking.attacker.net", "x.bank.evil.com", "evil.bank.example"}) {
+        EXPECT_FALSE(IsBankingDomain(lookalike)) << lookalike;
+    }
+    // TLD rule as the last label, keyword rule as a whole label.
+    for (const char* looksLikeABank : {"secure.bank", "example.bank.", "Online-Banking.example.com",
+                                       "ebanking.example.co.uk", "acme.insurance"}) {
+        EXPECT_TRUE(IsBankingDomain(looksLikeABank)) << looksLikeABank;
+    }
+    EXPECT_FALSE(IsBankingDomain("chase.com")) << "a keyword heuristic cannot know real banks";
+    EXPECT_FALSE(IsBankingDomain("bank")) << "a single label is not a site";
+    EXPECT_FALSE(IsBankingDomain(""));
+    EXPECT_FALSE(IsBankingDomain("10.0.0.1"));
+}
+
+TEST(SecureBrowserDomainPolicy, NothingConfiguredMeansNothingIsAllowed) {
+    // The heuristic is not an allow decision: a name that satisfies it is still refused.
+    auto& browser = ShadowStrike::Banking::SecureBrowser::Instance();
+    EXPECT_FALSE(browser.IsDomainAllowed("no-such-session", "banking.attacker.example"));
+    EXPECT_FALSE(browser.IsDomainAllowed("no-such-session", "evil.bank"));
+}
+
+TEST(SecureBrowserDomainPolicy, ALoadedBankAllowsItsSubdomainsAndNothingElse) {
+    auto& browser = ShadowStrike::Banking::SecureBrowser::Instance();
+    const auto dir = std::filesystem::temp_directory_path() / L"ss_task293";
+    std::filesystem::create_directories(dir);
+    const auto list = dir / L"banks.txt";
+    const auto empty = dir / L"empty.txt";
+    { std::ofstream(list) << "# banks\n  Chase.com.  \nhsbc.co.uk\n"; }
+    { std::ofstream(empty) << "# none\n"; }
+    ASSERT_TRUE(browser.LoadBankingDomains(list));
+    const bool exact = browser.IsDomainAllowed("no-such-session", "chase.com");
+    const bool sub = browser.IsDomainAllowed("no-such-session", "WWW.chase.com.");
+    const bool other = browser.IsDomainAllowed("no-such-session", "online.hsbc.co.uk");
+    const bool lookalike = browser.IsDomainAllowed("no-such-session", "chase.com.evil.test");
+    const bool prefix = browser.IsDomainAllowed("no-such-session", "notchase.com");
+    ASSERT_TRUE(browser.LoadBankingDomains(empty));   // leave the singleton unconfigured
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    EXPECT_TRUE(exact);
+    EXPECT_TRUE(sub);
+    EXPECT_TRUE(other);
+    EXPECT_FALSE(lookalike);
+    EXPECT_FALSE(prefix);
 }
 
 }  // namespace

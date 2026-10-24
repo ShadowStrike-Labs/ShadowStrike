@@ -28461,6 +28461,27 @@ class PoolHostListsAreDisjointTests(unittest.TestCase):
         self.assertEqual([], shadowed, "the malicious match would always win")
 
 
+class BankingHeuristicNeverGrantsTrustTests(unittest.TestCase):
+    """IsBankingDomain is a keyword heuristic any registrant can satisfy (task 293).
+
+    It may suggest protection; it must not decide SecureBrowser::IsDomainAllowed,
+    whose last tier used to fall back to it.
+    """
+
+    SRC = ROOT / "src/Products/Community/PhantomHome/Banking/SecureBrowser.cpp"
+
+    def test_is_domain_allowed_does_not_consult_the_heuristic(self):
+        src = strip_c_comments(read_source(self.SRC))
+        m = re.search(r"bool SecureBrowser::IsDomainAllowed\([^)]*\)\s*const\s*\{(.*?)\n\}", src, re.S)
+        self.assertIsNotNone(m, "IsDomainAllowed definition not found")
+        self.assertNotIn("IsBankingDomain", m.group(1))
+
+    def test_the_loaded_list_matches_at_a_label_boundary(self):
+        src = strip_c_comments(read_source(self.SRC))
+        m = re.search(r"bool SecureBrowser::IsDomainAllowed\([^)]*\)\s*const\s*\{(.*?)\n\}", src, re.S)
+        self.assertIn("IsSameOrSubdomainOf", m.group(1))
+
+
 class SuspiciousUsbVendorNeedsAKeyboardTests(unittest.TestCase):
     """A microcontroller vendor id counts only with a keyboard interface (task 280).
 

@@ -914,7 +914,9 @@ public:
     void RemoveAllowedDomain(const std::string& sessionId, const std::string& domain);
 
     /**
-     * @brief Check if domain is allowed
+     * @brief Whether a secure session may navigate to a domain. Exact per-session lists
+     *        first, then the loaded banking list (the domain or a subdomain of an entry);
+     *        with nothing configured, false. Never decided by IsBankingDomain.
      */
     [[nodiscard]] bool IsDomainAllowed(const std::string& sessionId,
                                        const std::string& domain) const;
@@ -1039,7 +1041,10 @@ private:
 [[nodiscard]] std::string_view GetSecurityEventTypeName(SecurityEventType type) noexcept;
 
 /**
- * @brief Check if domain is banking domain
+ * @brief Whether a host name LOOKS like a bank's: a .bank/.insurance/.finance TLD or a
+ *        banking keyword as a whole label. A heuristic for suggesting protection; any
+ *        registrant can satisfy it, so it must never grant trust, and it does not
+ *        recognise banks on ordinary names (chase.com).
  */
 [[nodiscard]] bool IsBankingDomain(std::string_view domain);
 

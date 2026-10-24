@@ -35,6 +35,7 @@
 #include "KeyloggerProtection.hpp"
 #include "ScreenshotBlocker.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/DomainUtils.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -227,30 +228,58 @@ namespace {
 
 } // anonymous namespace
 
-[[nodiscard]] bool IsBankingDomain(std::string_view domain) {
-    if (domain.empty() || domain.size() > 253) return false;
-
+/// Lowercase, without a trailing dot; empty for an empty or over-long name.
+[[nodiscard]] static std::string NormalizeHostName(std::string_view domain) {
+    if (domain.empty() || domain.size() > 253) return {};
     std::string d(domain);
     std::transform(d.begin(), d.end(), d.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    while (!d.empty() && d.back() == '.') d.pop_back();
+    return d;
+}
+
+[[nodiscard]] bool IsBankingDomain(std::string_view domain) {
+    if (domain.empty() || domain.size() > 253) return false;
+
+    std::string d = NormalizeHostName(domain);
+    if (d.empty()) return false;
 
     // Reject domains that are pure IP addresses
-    if (std::all_of(d.begin(), d.end(), [](char c) { return std::isdigit(c) || c == '.'; })) {
+    if (std::all_of(d.begin(), d.end(), [](char c) {
+            return std::isdigit(static_cast<unsigned char>(c)) || c == '.'; })) {
         return false;
     }
 
-    // Known banking TLDs / suffixes (exact-match on registrable domain segments)
-    static const std::array<std::string_view, 12> knownSuffixes = {
-        ".bank", ".insurance", ".finance",
-        "online-banking.", "secure.bank", "ebanking.",
-        "mybank.", "netbank.", "ibank.", "banking.",
-        "payments.", "treasury."
-    };
+    // A KEYWORD HEURISTIC, NOT A BANK LIST (task 293). It cannot recognise chase.com, and
+    // every rule is satisfiable by a name an attacker registers (banking.attacker.example),
+    // so it may SUGGEST that a site looks like a bank and must never grant trust -
+    // IsDomainAllowed does not consult it. The rules were unanchored substring searches,
+    // so secure.bank.phishing-site.com and fakebanking.attacker.net matched; a TLD rule now
+    // has to be the last label and a keyword a whole label.
+    static constexpr std::array<std::string_view, 3> kBankingTlds = {
+        "bank", "insurance", "finance"};
+    static constexpr std::array<std::string_view, 8> kBankingLabels = {
+        "online-banking", "ebanking", "mybank", "netbank", "ibank", "banking",
+        "payments", "treasury"};
 
-    for (const auto& suffix : knownSuffixes) {
-        if (d.find(suffix) != std::string::npos) return true;
+    const std::string_view host(d);
+    const size_t lastDot = host.rfind('.');
+    if (lastDot == std::string_view::npos) return false;   // a single label is not a site
+    const std::string_view tld = host.substr(lastDot + 1);
+    if (std::find(kBankingTlds.begin(), kBankingTlds.end(), tld) != kBankingTlds.end()) {
+        return true;
     }
 
+    // Every label except the TLD.
+    size_t start = 0;
+    while (start < lastDot) {
+        const size_t dot = host.find('.', start);
+        const std::string_view label = host.substr(start, dot - start);
+        if (std::find(kBankingLabels.begin(), kBankingLabels.end(), label) != kBankingLabels.end()) {
+            return true;
+        }
+        start = dot + 1;
+    }
     return false;
 }
 
@@ -1215,10 +1244,11 @@ public:
             // Skip comments and empty lines
             if (line.empty() || line[0] == '#') continue;
 
-            // Basic domain validation
-            if (line.size() > 253) continue;
+            // Stored normalised: IsDomainAllowed compares normalised names.
+            std::string normalized = NormalizeHostName(line);
+            if (normalized.empty()) continue;
 
-            domains.push_back(std::move(line));
+            domains.push_back(std::move(normalized));
         }
 
         m_bankingDomains = std::move(domains);
@@ -1560,14 +1590,20 @@ bool SecureBrowser::IsDomainAllowed(const std::string& sessionId, const std::str
         return std::find(allowed.begin(), allowed.end(), domain) != allowed.end();
     }
 
-    // 3. Check globally-loaded banking domains
+    // 3. Globally-loaded banking domains: a listed bank or one of its subdomains, so
+    //    www.chase.com is allowed by a chase.com entry and chase.com.evil.test is not.
     if (!m_impl->m_bankingDomains.empty()) {
-        return std::find(m_impl->m_bankingDomains.begin(),
-                         m_impl->m_bankingDomains.end(), domain) != m_impl->m_bankingDomains.end();
+        const std::string host = NormalizeHostName(domain);
+        return std::any_of(m_impl->m_bankingDomains.begin(), m_impl->m_bankingDomains.end(),
+            [&host](const std::string& bank) {
+                return Utils::Domain::IsSameOrSubdomainOf(host, bank);
+            });
     }
 
-    // 4. Fallback to heuristic only if no whitelists are configured
-    return IsBankingDomain(domain);
+    // 4. Nothing configured: refuse. This tier used to fall back to IsBankingDomain, a
+    //    keyword heuristic any registrant can satisfy, which made it an allow decision an
+    //    attacker could choose (task 293).
+    return false;
 }
 
 // Callbacks

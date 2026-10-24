@@ -165,6 +165,21 @@ private:
 ///        should measure. Empty when the host has no subdomain.
 [[nodiscard]] std::string Subdomain(std::string_view host, SuffixScope scope);
 
+/// @brief True when `host` is `domain` itself or a subdomain of it, at a label boundary:
+///        www.example.com and example.com are under example.com; notexample.com and
+///        example.com.evil.test are not. Compared as given - normalise case and a trailing
+///        dot first. An empty domain matches nothing.
+[[nodiscard]] constexpr bool IsSameOrSubdomainOf(std::string_view host,
+                                                 std::string_view domain) noexcept {
+    if (domain.empty() || host.size() < domain.size()) {
+        return false;
+    }
+    if (host.size() == domain.size()) {
+        return host == domain;
+    }
+    return host.ends_with(domain) && host[host.size() - domain.size() - 1] == '.';
+}
+
 }  // namespace Domain
 }  // namespace Utils
 }  // namespace ShadowStrike

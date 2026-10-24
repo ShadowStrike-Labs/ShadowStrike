@@ -278,4 +278,18 @@ TEST_F(DomainUtilsTest, RegistrableLabelIsConsistentWithItsNeighbours) {
                " domain, so one of the three is wrong";
     }
 }
+// The label-boundary test six modules hand-write; one definition since task 293.
+using ShadowStrike::Utils::Domain::IsSameOrSubdomainOf;
+static_assert(IsSameOrSubdomainOf("example.com", "example.com"));
+static_assert(IsSameOrSubdomainOf("www.example.com", "example.com"));
+
+TEST(DomainBoundary, ASubdomainMatchesOnlyAtALabelBoundary) {
+    EXPECT_TRUE(IsSameOrSubdomainOf("a.b.example.com", "example.com"));
+    EXPECT_FALSE(IsSameOrSubdomainOf("notexample.com", "example.com"));
+    EXPECT_FALSE(IsSameOrSubdomainOf("example.com.evil.test", "example.com"));
+    EXPECT_FALSE(IsSameOrSubdomainOf("example.com", "www.example.com")) << "a parent is not a subdomain";
+    EXPECT_FALSE(IsSameOrSubdomainOf("example.co", "example.com"));
+    EXPECT_FALSE(IsSameOrSubdomainOf("example.com", "")) << "an empty domain matches nothing";
+    EXPECT_FALSE(IsSameOrSubdomainOf("", ""));
+}
 }  // namespace
