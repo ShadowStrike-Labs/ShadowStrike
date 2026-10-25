@@ -29281,5 +29281,77 @@ class EmulatorHandlerSetsAreAllRegisteredTests(unittest.TestCase):
         self.assertEqual([], empty, "a DLL registration body is empty again")
 
 
+class StringIndicatorsHaveStoredTextTests(unittest.TestCase):
+    """A Domain, URL or Email indicator is matched by stored, interned text (task 345).
+
+    The database had no string pool. ParseIOC set only stringRef.stringLength, so every string
+    indicator was stored as (offset 0, length) and FindIOC compared that pair: a looked-up domain
+    matched any stored domain of the same length and took its reputation, and a second
+    same-length domain was refused as its duplicate.
+    """
+
+    TI = ROOT / "src/PhantomCore/ThreatIntel"
+
+    def _src(self, name):
+        return strip_c_comments(read_source(self.TI / name))
+
+    def test_the_database_opens_its_string_store_and_revokes_textless_entries(self):
+        db = self._src("ThreatIntelDatabase.cpp")
+        body = extract_c_function(db, "ThreatIntelDatabase::Open")
+        opened = body.find("m_strings.Open(StringStorePathFor(config.filePath), config.readOnly)")
+        self.assertNotEqual(-1, opened, "the database no longer opens its string store")
+        self.assertLess(body.index("RevokeUnresolvableStringEntries();"), body.index("RebuildHashIndex();"))
+        revoke = extract_c_function(db, "ThreatIntelDatabase::RevokeUnresolvableStringEntries")
+        self.assertIn("m_strings.IsValidRef(", revoke)
+        self.assertIn("IOCFlags::Revoked", revoke)
+
+    def test_an_entry_without_stored_text_is_refused_on_add_and_update(self):
+        mgr = self._src("ThreatIntelIOCManager.cpp")
+        for name in ("ThreatIntelIOCManager::AddIOC", "ThreatIntelIOCManager::UpdateIOC"):
+            body = extract_c_function(mgr, name)
+            guard = body.find("IsValidStringRef(entry.value.stringRef.stringOffset")
+            self.assertNotEqual(-1, guard, "%s accepts a string entry with no stored text" % name)
+            self.assertLess(guard, body.index("GetMutableEntry("),
+                            "%s writes the entry before checking its text" % name)
+
+    def test_a_lookup_resolves_the_text_and_never_stores_it(self):
+        mgr = self._src("ThreatIntelIOCManager.cpp")
+        find = extract_c_function(mgr, "ThreatIntelIOCManager::FindIOC")
+        self.assertIn("m_impl->database->FindString(canonical)", find)
+        self.assertNotIn("InternString", find, "a lookup must not write the looked-up text")
+        self.assertIn("if (!stored.has_value()) {\n            return std::nullopt;", find)
+        store = self._src("ThreatIntelStore.cpp")
+        self.assertIn("m_impl->iocManager->ParseAndStoreIOC(type, value, entry)", store)
+        self.assertNotIn("m_impl->iocManager->ParseIOC(type, value, entry)", store)
+
+    def test_the_text_file_is_excluded_from_self_scans(self):
+        paths = strip_c_comments(read_source(ROOT / "src/PhantomCore/Utils/DataStorePaths.cpp"))
+        self.assertIn('return ThreatIntelDatabase() + L".strings";', paths)
+        owned = extract_c_function(paths, "GetOwnedDataFiles")
+        self.assertIn("files.push_back(ThreatIntelStringStore());", owned,
+                      "the indicator texts are not self-excluded, so scanning them matches them")
+        db = self._src("ThreatIntelDatabase.cpp")
+        self.assertIn('return databasePath + L".strings";', db)
+
+
+class ThreatIntelIndexOwnsItsViewTests(unittest.TestCase):
+    """The index keeps a copy of the database view, not the caller's object (task 353).
+
+    ThreatIntelStore::Initialize passed a local MemoryMappedView and the index stored its address,
+    so every later string read dereferenced a dead stack object.
+    """
+
+    def test_the_view_is_a_value_and_texts_come_from_the_string_store(self):
+        internal = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelIndex_Internal.hpp"))
+        self.assertNotIn("const MemoryMappedView* view", internal)
+        self.assertIn("MemoryMappedView view{};", internal)
+        core = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelIndex_Core.cpp"))
+        self.assertNotIn("m_impl->view = &view;", core)
+        mods = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelIndex_Modifications.cpp"))
+        self.assertNotIn("m_impl->view->", mods)
+        store = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelStore.cpp"))
+        self.assertIn("m_impl->index->SetStringSource(&m_impl->database->Strings());", store)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

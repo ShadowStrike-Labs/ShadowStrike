@@ -518,6 +518,7 @@
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelIOCManager_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelLookup_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelStoreTests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelStringStore_Tests.cpp" />
     <!-- selfprotection_unit: added as one batch. -->
     <ClCompile Include="tests\unit\selfprotection_unit\AntiDebug_Tests.cpp" />
     <ClCompile Include="tests\unit\selfprotection_unit\DriverAttestation_Tests.cpp" />

@@ -714,6 +714,9 @@
     <ClCompile Include="src\PhantomCore\ThreatIntel\ReputationCache.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelStringStore.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelDatabase.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -2544,6 +2547,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\ThreatIntel\ReputationCache.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelStringStore.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelDatabase.hpp">

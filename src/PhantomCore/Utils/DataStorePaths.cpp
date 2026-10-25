@@ -213,15 +213,19 @@ bool IsDataDirectoryHardened() noexcept {
 std::wstring SignatureDatabase()      { return GetDataDirectory() + L"\\signatures.sdb"; }
 std::wstring WhitelistDatabase()      { return GetDataDirectory() + L"\\whitelist.wdb"; }
 std::wstring ThreatIntelDatabase()    { return GetDataDirectory() + L"\\threatintel.tidb"; }
+std::wstring ThreatIntelStringStore() { return ThreatIntelDatabase() + L".strings"; }
 std::wstring HashReputationDatabase() { return GetDataDirectory() + L"\\hashes.hdb"; }
 
 std::vector<std::wstring> GetOwnedDataFiles() {
     std::vector<std::wstring> files;
-    files.reserve(5);
+    files.reserve(6);
 
     files.push_back(SignatureDatabase());
     files.push_back(WhitelistDatabase());
     files.push_back(ThreatIntelDatabase());
+    // The indicator texts are malicious URLs and domains verbatim, so scanning the file
+    // matches the very indicators it stores.
+    files.push_back(ThreatIntelStringStore());
     files.push_back(HashReputationDatabase());
 
     // The installer's read-only baseline copy. Same content as the working

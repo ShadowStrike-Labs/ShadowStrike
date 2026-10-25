@@ -393,6 +393,20 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         m_stats.lastModifiedTimestamp = m_header->lastUpdateTime;
     }
     
+    // The text of string-valued entries lives beside the database. Without it those
+    // entries cannot be told apart, so the database does not open without it.
+    if (!m_strings.Open(StringStorePathFor(config.filePath), config.readOnly)) {
+        m_region.Close();
+        m_header = nullptr;
+        m_entries = nullptr;
+        m_stats.isOpen = false;
+        return false;
+    }
+    m_revokedUnresolvableStrings = 0;
+    if (!config.readOnly) {
+        RevokeUnresolvableStringEntries();
+    }
+
     // Build hash index for O(1) lookups
     // This is critical for enterprise-grade performance with large datasets
     RebuildHashIndex();
@@ -400,6 +414,67 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
     m_isOpen.store(true, std::memory_order_release);
     
     return true;
+}
+
+void ThreatIntelDatabase::RevokeUnresolvableStringEntries() noexcept {
+    if (!m_entries || !m_header) {
+        return;
+    }
+    const size_t count = static_cast<size_t>(m_header->totalActiveEntries);
+    for (size_t i = 0; i < count; ++i) {
+        IOCEntry& entry = m_entries[i];
+        if (!IsStringValuedType(entry.type) || HasFlag(entry.flags, IOCFlags::Revoked)) {
+            continue;
+        }
+        if (!m_strings.IsValidRef(entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength)) {
+            entry.flags = entry.flags | IOCFlags::Revoked;
+            ++m_revokedUnresolvableStrings;
+        }
+    }
+    if (m_revokedUnresolvableStrings > 0) {
+        m_region.Flush();
+    }
+}
+
+bool ThreatIntelDatabase::IsStringValuedType(IOCType type) noexcept {
+    switch (type) {
+        case IOCType::Domain:
+        case IOCType::URL:
+        case IOCType::Email:
+        case IOCType::JA3:
+        case IOCType::JA3S:
+        case IOCType::RegistryKey:
+        case IOCType::ProcessName:
+        case IOCType::MutexName:
+        case IOCType::NamedPipe:
+        case IOCType::CertFingerprint:
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::wstring ThreatIntelDatabase::StringStorePathFor(const std::wstring& databasePath) {
+    return databasePath + L".strings";
+}
+
+std::optional<InternedString> ThreatIntelDatabase::InternString(std::string_view text) noexcept {
+    if (m_config.readOnly || !m_isOpen.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    return m_strings.Intern(text);
+}
+
+std::optional<InternedString> ThreatIntelDatabase::FindString(std::string_view text) const noexcept {
+    return m_strings.Find(text);
+}
+
+std::string_view ThreatIntelDatabase::GetString(uint64_t offset, uint32_t length) const noexcept {
+    return m_strings.Get(offset, length);
+}
+
+bool ThreatIntelDatabase::IsValidStringRef(uint64_t offset, uint32_t length) const noexcept {
+    return m_strings.IsValidRef(offset, length);
 }
 
 bool ThreatIntelDatabase::Open(const std::wstring& path) noexcept {
@@ -430,6 +505,7 @@ void ThreatIntelDatabase::Close() noexcept {
     
     // Close mapped region
     m_region.Close();
+    m_strings.Close();
     
     // Clear pointers
     m_header = nullptr;
@@ -1174,6 +1250,7 @@ bool ThreatIntelDatabase::Flush() noexcept {
     }
     
     bool result = m_region.Flush();
+    result = m_strings.Flush() && result;
     
     if (result) {
         m_stats.flushCount++;
@@ -1965,6 +2042,10 @@ bool DatabaseFileExists(const std::wstring& path) noexcept {
 
 bool DeleteDatabaseFile(const std::wstring& path) noexcept {
     try {
+        // The string store goes with its database: a later database at this path must not
+        // inherit texts whose entries are gone.
+        std::error_code ignored;
+        std::filesystem::remove(ThreatIntelDatabase::StringStorePathFor(path), ignored);
         return std::filesystem::remove(path);
     } catch (...) {
         return false;
@@ -1989,6 +2070,15 @@ bool BackupDatabase(const std::wstring& sourcePath, const std::wstring& backupPa
             backupPath,
             std::filesystem::copy_options::overwrite_existing
         );
+        // A backup without the string store would restore entries that resolve to nothing.
+        const std::wstring sourceStrings = ThreatIntelDatabase::StringStorePathFor(sourcePath);
+        if (std::filesystem::exists(sourceStrings)) {
+            std::filesystem::copy_file(
+                sourceStrings,
+                ThreatIntelDatabase::StringStorePathFor(backupPath),
+                std::filesystem::copy_options::overwrite_existing
+            );
+        }
         return true;
     } catch (...) {
         return false;

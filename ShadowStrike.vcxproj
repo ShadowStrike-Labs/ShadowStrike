@@ -1073,6 +1073,7 @@
     <ClCompile Include="src\PhantomCore\SignatureStore\YaraRuleStore.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ReputationCache.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelDatabase.cpp" />
+    <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelStringStore.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelExporter.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelFeedManager_parsers.cpp" />
@@ -1666,6 +1667,7 @@
     <ClInclude Include="src\PhantomCore\SignatureStore\YaraRuleStore.hpp" />
     <ClInclude Include="src\PhantomCore\ThreatIntel\ReputationCache.hpp" />
     <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelDatabase.hpp" />
+    <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelStringStore.hpp" />
     <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelExporter.hpp" />
     <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.hpp" />
     <ClInclude Include="src\PhantomCore\ThreatIntel\ThreatIntelFeedManager_Util.hpp" />

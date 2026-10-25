@@ -91,6 +91,10 @@ namespace ShadowStrike::Utils::DataStorePaths {
 /// @brief Threat-intel store database (IOC / reputation lookups).
 [[nodiscard]] std::wstring ThreatIntelDatabase();
 
+/// @brief Text of the threat-intel store's domain, URL and email indicators. Always the
+/// database path plus ".strings" (ThreatIntelDatabase::StringStorePathFor).
+[[nodiscard]] std::wstring ThreatIntelStringStore();
+
 /// @brief Hash-reputation store database (bloom-filtered known-bad hashes).
 [[nodiscard]] std::wstring HashReputationDatabase();
 

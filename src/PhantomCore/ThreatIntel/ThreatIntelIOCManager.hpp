@@ -1025,6 +1025,31 @@ public:
         std::string_view value,
         IOCEntry& entry
     ) const noexcept;
+
+    /**
+     * @brief Parse an IOC value and, for a string-valued type, also return its canonical text
+     * @param canonicalText Receives the normalized text a Domain, URL or Email is stored and
+     *        matched by; left empty for types whose value is held inline
+     */
+    [[nodiscard]] bool ParseIOC(
+        IOCType type,
+        std::string_view value,
+        IOCEntry& entry,
+        std::string* canonicalText
+    ) const noexcept;
+
+    /**
+     * @brief Parse an IOC value and store the text of a string-valued one
+     *
+     * The entry's string reference names the stored canonical text, so the entry can be
+     * added. Fails for a string-valued type the parser does not canonicalize, and when the
+     * text cannot be stored.
+     */
+    [[nodiscard]] bool ParseAndStoreIOC(
+        IOCType type,
+        std::string_view value,
+        IOCEntry& entry
+    ) noexcept;
     
     // =========================================================================
     // DEDUPLICATION

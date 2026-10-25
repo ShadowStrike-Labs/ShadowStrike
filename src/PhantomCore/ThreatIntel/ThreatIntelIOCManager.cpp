@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -1113,6 +1113,7 @@ private:
 /**
  * @brief Internal implementation using Pimpl pattern for ABI stability
  */
+
 class ThreatIntelIOCManager::Impl {
 public:
     Impl() = default;
@@ -1254,6 +1255,19 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
                 errorMsg
             );
         }
+    }
+    
+    // A string-valued entry is its text. One whose reference names no stored text
+    // compares equal to every other such entry of the same length, which turns a
+    // lookup of any domain into a match on an unrelated one (task 345). Refuse it.
+    if (ThreatIntelDatabase::IsStringValuedType(entry.type) &&
+        !m_impl->database->IsValidStringRef(entry.value.stringRef.stringOffset,
+                                            entry.value.stringRef.stringLength)) {
+        m_impl->stats.validationErrors.fetch_add(1, std::memory_order_relaxed);
+        return IOCOperationResult::Error(
+            ThreatIntelError::InvalidEntry,
+            "String-valued IOC has no stored text; add it with ParseAndStoreIOC"
+        );
     }
     
     // Deduplication check
@@ -1431,6 +1445,16 @@ IOCOperationResult ThreatIntelIOCManager::UpdateIOC(
         return IOCOperationResult::Error(
             ThreatIntelError::InvalidEntry,
             "Invalid entry ID (zero)"
+        );
+    }
+
+    // Same rule as AddIOC: an update may not leave a string-valued entry without its text.
+    if (ThreatIntelDatabase::IsStringValuedType(entry.type) &&
+        !m_impl->database->IsValidStringRef(entry.value.stringRef.stringOffset,
+                                            entry.value.stringRef.stringLength)) {
+        return IOCOperationResult::Error(
+            ThreatIntelError::InvalidEntry,
+            "String-valued IOC has no stored text"
         );
     }
     
@@ -2027,19 +2051,43 @@ std::optional<IOCEntry> ThreatIntelIOCManager::FindIOC(
         return std::nullopt;
     }
     
-    // Normalize value for comparison
-    std::string normalizedValue = IOCNormalizer::Normalize(type, value);
-    
-    // Check deduplicator first (fast path)
-    const auto entryId = m_impl->deduplicator->CheckDuplicate(type, normalizedValue);
-    if (entryId.has_value()) {
-        return GetIOC(entryId.value(), options);
-    }
-    
-    // Parse the search value for type-specific comparison
     IOCEntry searchEntry{};
-    if (!ParseIOC(type, normalizedValue, searchEntry)) {
-        return std::nullopt;  // Invalid search value
+    if (ThreatIntelDatabase::IsStringValuedType(type)) {
+        // A string-valued indicator is matched by its canonical text, the same text
+        // ParseAndStoreIOC stored. Equal texts share one reference, so the reference
+        // found here is the identity the stored entries carry. A text the database
+        // never stored is a definite miss: no entry can hold it.
+        std::string canonical;
+        if (!ParseIOC(type, value, searchEntry, &canonical) || canonical.empty()) {
+            return std::nullopt;
+        }
+        const auto stored = m_impl->database->FindString(canonical);
+        if (!stored.has_value()) {
+            return std::nullopt;
+        }
+        searchEntry.value.stringRef.stringOffset = stored->offset;
+        searchEntry.value.stringRef.stringLength = stored->length;
+
+        const auto entryId = m_impl->deduplicator->CheckDuplicate(type, BuildDedupKey(searchEntry));
+        if (entryId.has_value()) {
+            if (auto found = GetIOC(entryId.value(), options)) {
+                return found;
+            }
+        }
+    } else {
+        // Normalize value for comparison
+        std::string normalizedValue = IOCNormalizer::Normalize(type, value);
+
+        // Check deduplicator first (fast path)
+        const auto entryId = m_impl->deduplicator->CheckDuplicate(type, normalizedValue);
+        if (entryId.has_value()) {
+            return GetIOC(entryId.value(), options);
+        }
+
+        // Parse the search value for type-specific comparison
+        if (!ParseIOC(type, normalizedValue, searchEntry)) {
+            return std::nullopt;  // Invalid search value
+        }
     }
     
     // Fallback: linear scan with type-specific comparison
@@ -2125,7 +2173,8 @@ std::optional<IOCEntry> ThreatIntelIOCManager::FindIOC(
             case IOCType::ProcessName:
             case IOCType::MutexName:
             case IOCType::NamedPipe: {
-                // Compare meaningful stringRef fields only (not the uninitialized padding)
+                // Interned references: equal references are equal texts, and the search
+                // reference is a real record, so an entry can only match its own text.
                 if (searchEntry.value.stringRef.stringOffset == entry->value.stringRef.stringOffset &&
                     searchEntry.value.stringRef.stringLength == entry->value.stringRef.stringLength) {
                     matches = true;
@@ -2205,6 +2254,22 @@ bool ThreatIntelIOCManager::ExistsIOC(
         return false;
     }
     
+    if (ThreatIntelDatabase::IsStringValuedType(type)) {
+        // Dedup keys of string-valued entries are their interned references.
+        IOCEntry probe{};
+        std::string canonical;
+        if (!ParseIOC(type, value, probe, &canonical) || canonical.empty()) {
+            return false;
+        }
+        const auto stored = m_impl->database->FindString(canonical);
+        if (!stored.has_value()) {
+            return false;
+        }
+        probe.value.stringRef.stringOffset = stored->offset;
+        probe.value.stringRef.stringLength = stored->length;
+        return m_impl->deduplicator->CheckDuplicate(type, BuildDedupKey(probe)).has_value();
+    }
+
     const auto entryId = m_impl->deduplicator->CheckDuplicate(type, value);
     return entryId.has_value();
 }
@@ -2695,6 +2760,42 @@ bool ThreatIntelIOCManager::ParseIOC(
     std::string_view value,
     IOCEntry& entry
 ) const noexcept {
+    return ParseIOC(type, value, entry, nullptr);
+}
+
+bool ThreatIntelIOCManager::ParseAndStoreIOC(
+    IOCType type,
+    std::string_view value,
+    IOCEntry& entry
+) noexcept {
+    std::string canonical;
+    if (!ParseIOC(type, value, entry, &canonical)) {
+        return false;
+    }
+    if (!ThreatIntelDatabase::IsStringValuedType(type)) {
+        return true;
+    }
+    if (canonical.empty() || m_impl->database == nullptr) {
+        return false;
+    }
+    const auto stored = m_impl->database->InternString(canonical);
+    if (!stored.has_value()) {
+        return false;
+    }
+    entry.value.stringRef.stringOffset = stored->offset;
+    entry.value.stringRef.stringLength = stored->length;
+    return true;
+}
+
+bool ThreatIntelIOCManager::ParseIOC(
+    IOCType type,
+    std::string_view value,
+    IOCEntry& entry,
+    std::string* canonicalText
+) const noexcept {
+    if (canonicalText != nullptr) {
+        canonicalText->clear();
+    }
     // Trim whitespace
     value = TrimWhitespace(value);
     
@@ -2897,9 +2998,12 @@ bool ThreatIntelIOCManager::ParseIOC(
                 return false;
             }
             
-            // Store as string reference (actual storage handled by database)
+            // The reference is set by whoever stores the text (ParseAndStoreIOC) or looks
+            // it up (FindIOC); the canonical text is what both of them use.
             entry.value.stringRef.stringLength = static_cast<uint32_t>(normalized.length());
-            // stringOffset will be set when entry is committed to database
+            if (canonicalText != nullptr) {
+                *canonicalText = std::move(normalized);
+            }
             
             return true;
         }
@@ -2920,14 +3024,34 @@ bool ThreatIntelIOCManager::ParseIOC(
                     );
                 }
             }
+
+            // The host is case-insensitive (RFC 3986 3.2.2), so it is folded too: otherwise
+            // http://EVIL.example/x and http://evil.example/x are two indicators. Userinfo
+            // and everything after the authority keep their case.
+            {
+                const size_t authorityStart = normalized.find("://") + 3;
+                size_t authorityEnd = normalized.find_first_of("/?#", authorityStart);
+                if (authorityEnd == std::string::npos) {
+                    authorityEnd = normalized.size();
+                }
+                const size_t at = normalized.rfind('@', authorityEnd);
+                const size_t hostStart = (at != std::string::npos && at >= authorityStart) ? at + 1 : authorityStart;
+                for (size_t i = hostStart; i < authorityEnd; ++i) {
+                    normalized[i] = static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(normalized[i]))
+                    );
+                }
+            }
             
             // Validate URL
             if (!IsValidURL(normalized)) {
                 return false;
             }
             
-            // Store as string reference
             entry.value.stringRef.stringLength = static_cast<uint32_t>(normalized.length());
+            if (canonicalText != nullptr) {
+                *canonicalText = std::move(normalized);
+            }
             
             return true;
         }
@@ -2940,8 +3064,10 @@ bool ThreatIntelIOCManager::ParseIOC(
                 return false;
             }
             
-            // Store as string reference
             entry.value.stringRef.stringLength = static_cast<uint32_t>(normalized.length());
+            if (canonicalText != nullptr) {
+                *canonicalText = std::move(normalized);
+            }
             
             return true;
         }

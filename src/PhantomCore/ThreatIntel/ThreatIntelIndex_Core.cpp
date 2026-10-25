@@ -108,7 +108,8 @@ StoreError ThreatIntelIndex::Initialize(
     // diagnostic error so callers can react.
     try {
         // Store view and header
-        m_impl->view = &view;
+        m_impl->view = view;
+        m_impl->hasView = true;
         m_impl->header = header;
         m_impl->buildOptions = options;
 
@@ -208,7 +209,9 @@ StoreError ThreatIntelIndex::Initialize(
             hashIndex.reset();
         }
         m_impl->bloomFilters.clear();
-        m_impl->view = nullptr;
+        m_impl->view = MemoryMappedView{};
+        m_impl->hasView = false;
+        m_impl->strings = nullptr;
         m_impl->header = nullptr;
         return StoreError::WithMessage(
             ThreatIntelError::OutOfMemory,
@@ -225,7 +228,9 @@ StoreError ThreatIntelIndex::Initialize(
             hashIndex.reset();
         }
         m_impl->bloomFilters.clear();
-        m_impl->view = nullptr;
+        m_impl->view = MemoryMappedView{};
+        m_impl->hasView = false;
+        m_impl->strings = nullptr;
         m_impl->header = nullptr;
         return StoreError::WithMessage(
             ThreatIntelError::Unknown,
@@ -236,6 +241,11 @@ StoreError ThreatIntelIndex::Initialize(
 
 bool ThreatIntelIndex::IsInitialized() const noexcept {
     return m_initialized.load(std::memory_order_acquire);
+}
+
+void ThreatIntelIndex::SetStringSource(const ThreatIntelStringStore* strings) noexcept {
+    std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    m_impl->strings = strings;
 }
 
 void ThreatIntelIndex::Shutdown() noexcept {
@@ -259,7 +269,9 @@ void ThreatIntelIndex::Shutdown() noexcept {
 
     m_impl->bloomFilters.clear();
 
-    m_impl->view = nullptr;
+    m_impl->view = MemoryMappedView{};
+    m_impl->hasView = false;
+    m_impl->strings = nullptr;
     m_impl->header = nullptr;
 
     m_initialized.store(false, std::memory_order_release);

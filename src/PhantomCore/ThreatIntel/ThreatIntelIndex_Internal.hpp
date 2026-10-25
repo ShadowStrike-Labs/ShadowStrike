@@ -252,8 +252,24 @@ public:
     // MEMORY-MAPPED VIEW
     // =========================================================================
     
-    /// Pointer to memory-mapped database view (NOT owned)
-    const MemoryMappedView* view{nullptr};
+    /// The database view, held by value. It was a pointer to the caller's MemoryMappedView,
+    /// and ThreatIntelStore passed a local of its Initialize, so every string read after
+    /// Initialize returned dereferenced a dead stack object (task 353).
+    MemoryMappedView view{};
+    bool hasView{false};
+
+    /// Where indicator texts live (the database's string store, NOT owned). When set it is
+    /// the only source of text; the view is the fallback for databases built in memory.
+    const ThreatIntelStringStore* strings{nullptr};
+
+    [[nodiscard]] bool CanReadStrings() const noexcept { return strings != nullptr || hasView; }
+
+    [[nodiscard]] std::string_view ReadString(uint64_t offset, size_t length) const noexcept {
+        if (strings != nullptr) {
+            return length <= UINT32_MAX ? strings->Get(offset, static_cast<uint32_t>(length)) : std::string_view{};
+        }
+        return hasView ? view.GetString(offset, length) : std::string_view{};
+    }
     
     /// Pointer to database header (NOT owned, lives in memory-mapped region)
     const ThreatIntelDatabaseHeader* header{nullptr};

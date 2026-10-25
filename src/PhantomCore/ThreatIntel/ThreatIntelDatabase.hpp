@@ -35,6 +35,7 @@
 #pragma once
 
 #include "ThreatIntelFormat.hpp"
+#include "ThreatIntelStringStore.hpp"
 
 #include <string>
 #include <string_view>
@@ -446,6 +447,37 @@ public:
      * that can be used with the hash-based index.
      */
     [[nodiscard]] static std::string FormatIOCValueForIndex(const IOCEntry& entry) noexcept;
+
+    // =========================================================================
+    // Indicator text (Domain, URL, Email and the other string-valued types)
+    // =========================================================================
+
+    /// True for the IOC types whose value is a reference into the string store.
+    [[nodiscard]] static bool IsStringValuedType(IOCType type) noexcept;
+
+    /// The string store file that belongs to a database file.
+    [[nodiscard]] static std::wstring StringStorePathFor(const std::wstring& databasePath);
+
+    /// The reference for text, storing it if new. Equal texts always get the same reference,
+    /// so a reference identifies its text exactly. Fails on a read-only or closed database.
+    [[nodiscard]] std::optional<InternedString> InternString(std::string_view text) noexcept;
+
+    /// The reference for text if the database holds it. Never writes.
+    [[nodiscard]] std::optional<InternedString> FindString(std::string_view text) const noexcept;
+
+    /// The text a reference names; empty when it names nothing. Valid until Close().
+    [[nodiscard]] std::string_view GetString(uint64_t offset, uint32_t length) const noexcept;
+
+    /// True when (offset, length) names exactly one stored text.
+    [[nodiscard]] bool IsValidStringRef(uint64_t offset, uint32_t length) const noexcept;
+
+    /// The store itself, for readers that resolve many references (the index).
+    [[nodiscard]] const ThreatIntelStringStore& Strings() const noexcept { return m_strings; }
+
+    /// String-valued entries revoked at the last open because their reference named no text.
+    [[nodiscard]] size_t GetRevokedUnresolvableStringEntries() const noexcept {
+        return m_revokedUnresolvableStrings;
+    }
     
     /**
      * @brief Find entry by IOCEntry (convenience overload)
@@ -666,6 +698,17 @@ private:
     
     /// Mapped region
     MappedRegion m_region;
+
+    /// Text of string-valued entries (<database>.strings)
+    ThreatIntelStringStore m_strings;
+
+    /// See GetRevokedUnresolvableStringEntries
+    size_t m_revokedUnresolvableStrings = 0;
+
+    /// Revokes every string-valued entry whose reference names no stored text. Such entries
+    /// were written before the string store existed (offset 0, or a hash in the offset field)
+    /// and compare equal to the wrong indicators.
+    void RevokeUnresolvableStringEntries() noexcept;
     
     /// Header pointer (cached)
     ThreatIntelDatabaseHeader* m_header = nullptr;

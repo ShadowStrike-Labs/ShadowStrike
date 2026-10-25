@@ -340,6 +340,7 @@
     <ClCompile Include="src\PhantomCore\ThreatIntel\ReputationCache.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelBloomFilter.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelDatabase.cpp" />
+    <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelStringStore.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelExporter.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelFeedManager_parsers.cpp" />
     <ClCompile Include="src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp" />

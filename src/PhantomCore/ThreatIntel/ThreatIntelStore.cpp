@@ -777,6 +777,8 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
 
         IndexBuildOptions indexOpts = IndexBuildOptions::Default();
         auto initError = m_impl->index->Initialize(view, header, indexOpts);
+        // Indicator texts live in the database's string store, not in the mapped file.
+        m_impl->index->SetStringSource(&m_impl->database->Strings());
         if (initError.code != ThreatIntelError::Success) {
             Utils::Logger::Instance().LogEx(
                 Utils::LogLevel::Error,
@@ -1698,8 +1700,9 @@ bool ThreatIntelStore::AddIOC(
         return false;
     }
 
+    // ParseAndStoreIOC stores the text of a Domain, URL or Email, so the entry names it.
     IOCEntry entry{};
-    if (!m_impl->iocManager->ParseIOC(type, value, entry)) {
+    if (!m_impl->iocManager->ParseAndStoreIOC(type, value, entry)) {
         return false;
     }
 

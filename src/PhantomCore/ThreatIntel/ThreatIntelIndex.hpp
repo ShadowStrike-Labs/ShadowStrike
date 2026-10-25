@@ -96,6 +96,8 @@
 namespace ShadowStrike {
 namespace ThreatIntel {
 
+class ThreatIntelStringStore;
+
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -1036,6 +1038,14 @@ public:
      * @brief Check if index is initialized
      */
     [[nodiscard]] bool IsInitialized() const noexcept;
+
+    /**
+     * @brief Read indicator texts from this string store instead of the database view
+     *
+     * The store must outlive the index or be cleared first (nullptr). Set by
+     * ThreatIntelStore to its database's store right after Initialize.
+     */
+    void SetStringSource(const ThreatIntelStringStore* strings) noexcept;
     
     /**
      * @brief Shutdown and release resources

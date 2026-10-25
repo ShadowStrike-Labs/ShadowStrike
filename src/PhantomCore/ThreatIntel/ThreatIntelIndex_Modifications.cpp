@@ -193,10 +193,10 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::Domain:
-                if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
                     // Get domain string from view and canonicalize so the trie key
                     // and bloom-filter hash match the form that LookupDomain uses.
-                    std::string_view rawDomain = m_impl->view->GetString(
+                    std::string_view rawDomain = m_impl->ReadString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
@@ -219,8 +219,8 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::URL:
-                if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view url = m_impl->view->GetString(
+                if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view url = m_impl->ReadString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
@@ -239,8 +239,8 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::Email:
-                if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view email = m_impl->view->GetString(
+                if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view email = m_impl->ReadString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
@@ -263,8 +263,8 @@ namespace ThreatIntel {
                 if (m_impl->genericIndex) {
                     uint64_t key = 0;
 
-                    if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view value = m_impl->view->GetString(
+                    if (entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view value = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -361,9 +361,9 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::Domain:
-                if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
                     // Canonicalize before lookup so the key matches what Insert stored.
-                    std::string_view rawDomain = m_impl->view->GetString(
+                    std::string_view rawDomain = m_impl->ReadString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
@@ -383,8 +383,8 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::URL:
-                if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view url = m_impl->view->GetString(
+                if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view url = m_impl->ReadString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
@@ -400,8 +400,8 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::Email:
-                if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view email = m_impl->view->GetString(
+                if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view email = m_impl->ReadString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
                     );
@@ -421,8 +421,8 @@ namespace ThreatIntel {
                 if (m_impl->genericIndex) {
                     uint64_t key = 0;
 
-                    if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view value = m_impl->view->GetString(
+                    if (entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view value = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -487,8 +487,8 @@ namespace ThreatIntel {
                         m_impl->hashIndexes[algoIndex]->Lookup(entry.value.hash, value);
                 }
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        const auto rawDomain = m_impl->view->GetString(
+                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        const auto rawDomain = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -497,8 +497,8 @@ namespace ThreatIntel {
                     }
                     return false;
                 case IOCType::URL:
-                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        const auto url = m_impl->view->GetString(
+                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        const auto url = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -506,8 +506,8 @@ namespace ThreatIntel {
                     }
                     return false;
                 case IOCType::Email:
-                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        const auto email = m_impl->view->GetString(
+                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        const auto email = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -517,8 +517,8 @@ namespace ThreatIntel {
                 default:
                     if (m_impl->genericIndex) {
                         uint64_t key = 0;
-                        if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            const auto stringValue = m_impl->view->GetString(
+                        if (entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            const auto stringValue = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength
                             );
@@ -560,8 +560,8 @@ namespace ThreatIntel {
                 }
                 break;
             case IOCType::Domain:
-                if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view rawDomain = m_impl->view->GetString(
+                if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view rawDomain = m_impl->ReadString(
                         oldEntry.value.stringRef.stringOffset,
                         oldEntry.value.stringRef.stringLength
                     );
@@ -572,8 +572,8 @@ namespace ThreatIntel {
                 }
                 break;
             case IOCType::URL:
-                if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view url = m_impl->view->GetString(
+                if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view url = m_impl->ReadString(
                         oldEntry.value.stringRef.stringOffset,
                         oldEntry.value.stringRef.stringLength
                     );
@@ -581,8 +581,8 @@ namespace ThreatIntel {
                 }
                 break;
             case IOCType::Email:
-                if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view email = m_impl->view->GetString(
+                if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view email = m_impl->ReadString(
                         oldEntry.value.stringRef.stringOffset,
                         oldEntry.value.stringRef.stringLength
                     );
@@ -590,10 +590,10 @@ namespace ThreatIntel {
                 }
                 break;
             default:
-                if (m_impl->genericIndex && m_impl->view) {
+                if (m_impl->genericIndex && m_impl->CanReadStrings()) {
                     uint64_t key = 0;
                     if (oldEntry.value.stringRef.stringOffset > 0) {
-                        std::string_view value = m_impl->view->GetString(
+                        std::string_view value = m_impl->ReadString(
                             oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength
                         );
@@ -673,8 +673,8 @@ namespace ThreatIntel {
                 }
                 break;
             case IOCType::Domain:
-                if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view rawDomain = m_impl->view->GetString(
+                if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view rawDomain = m_impl->ReadString(
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
@@ -694,8 +694,8 @@ namespace ThreatIntel {
                 }
                 break;
             case IOCType::URL:
-                if (m_impl->urlIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view url = m_impl->view->GetString(
+                if (m_impl->urlIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view url = m_impl->ReadString(
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
@@ -711,8 +711,8 @@ namespace ThreatIntel {
                 }
                 break;
             case IOCType::Email:
-                if (m_impl->emailIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                    std::string_view email = m_impl->view->GetString(
+                if (m_impl->emailIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                    std::string_view email = m_impl->ReadString(
                         newEntry.value.stringRef.stringOffset,
                         newEntry.value.stringRef.stringLength
                     );
@@ -730,8 +730,8 @@ namespace ThreatIntel {
             default:
                 if (m_impl->genericIndex) {
                     uint64_t key = 0;
-                    if (newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view value = m_impl->view->GetString(
+                    if (newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view value = m_impl->ReadString(
                             newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength
                         );
@@ -773,8 +773,8 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                    if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto rawDomain = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
                         const std::string d = NormalizeDomain(rawDomain);
                         if (!d.empty()) {
@@ -783,24 +783,24 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::URL:
-                    if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                    if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto u = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
                         rollbackOk = m_impl->urlIndex->Insert(u, originalOldIndexValue);
                     }
                     break;
                 case IOCType::Email:
-                    if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                    if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto e = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
                         rollbackOk = m_impl->emailIndex->Insert(e, originalOldIndexValue);
                     }
                     break;
                 default:
-                    if (m_impl->genericIndex && m_impl->view) {
+                    if (m_impl->genericIndex && m_impl->CanReadStrings()) {
                         uint64_t key = 0;
                         if (oldEntry.value.stringRef.stringOffset > 0) {
-                            auto v = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                            auto v = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                                 oldEntry.value.stringRef.stringLength);
                             key = HashString(v);
                         } else {
@@ -884,8 +884,8 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view rawDomain = m_impl->view->GetString(
+                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view rawDomain = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -897,8 +897,8 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::URL:
-                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view url = m_impl->view->GetString(
+                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view url = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -909,8 +909,8 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::Email:
-                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view email = m_impl->view->GetString(
+                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view email = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
                         );
@@ -923,8 +923,8 @@ namespace ThreatIntel {
                 default:
                     if (m_impl->genericIndex) {
                         uint64_t key = 0;
-                        if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            std::string_view value = m_impl->view->GetString(
+                        if (entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            std::string_view value = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength
                             );
@@ -1007,8 +1007,8 @@ namespace ThreatIntel {
                             m_impl->hashIndexes[algoIndex]->Lookup(entry.value.hash, value);
                     }
                     case IOCType::Domain:
-                        if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            const auto rawDomain = m_impl->view->GetString(
+                        if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            const auto rawDomain = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength
                             );
@@ -1017,8 +1017,8 @@ namespace ThreatIntel {
                         }
                         return false;
                     case IOCType::URL:
-                        if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            const auto url = m_impl->view->GetString(
+                        if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            const auto url = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength
                             );
@@ -1026,8 +1026,8 @@ namespace ThreatIntel {
                         }
                         return false;
                     case IOCType::Email:
-                        if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            const auto email = m_impl->view->GetString(
+                        if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            const auto email = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength
                             );
@@ -1037,8 +1037,8 @@ namespace ThreatIntel {
                     default:
                         if (m_impl->genericIndex) {
                             uint64_t key = 0;
-                            if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                                const auto stringValue = m_impl->view->GetString(
+                            if (entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                                const auto stringValue = m_impl->ReadString(
                                     entry.value.stringRef.stringOffset,
                                     entry.value.stringRef.stringLength
                                 );
@@ -1075,8 +1075,8 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                    if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto rawDomain = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
                         const std::string d = NormalizeDomain(rawDomain);
                         if (!d.empty()) {
@@ -1085,15 +1085,15 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::URL:
-                    if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                    if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto u = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
                         removeSuccess = m_impl->urlIndex->Remove(u);
                     }
                     break;
                 case IOCType::Email:
-                    if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                    if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto e = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                             oldEntry.value.stringRef.stringLength);
                         removeSuccess = m_impl->emailIndex->Remove(e);
                     }
@@ -1101,8 +1101,8 @@ namespace ThreatIntel {
                 default:
                     if (m_impl->genericIndex) {
                         uint64_t key = 0;
-                        if (oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            auto v = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                        if (oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            auto v = m_impl->ReadString(oldEntry.value.stringRef.stringOffset,
                                 oldEntry.value.stringRef.stringLength);
                             key = HashString(v);
                         }
@@ -1144,8 +1144,8 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto rawDomain = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
+                    if (m_impl->domainIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto rawDomain = m_impl->ReadString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
                         const std::string d = NormalizeDomain(rawDomain);
                         if (!d.empty()) {
@@ -1155,16 +1155,16 @@ namespace ThreatIntel {
                     }
                     break;
                 case IOCType::URL:
-                    if (m_impl->urlIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto u = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
+                    if (m_impl->urlIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto u = m_impl->ReadString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
                         IndexValue indexValue(newEntry.entryId, newOffset);
                         insertSuccess = m_impl->urlIndex->Insert(u, indexValue);
                     }
                     break;
                 case IOCType::Email:
-                    if (m_impl->emailIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        auto e = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
+                    if (m_impl->emailIndex && newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        auto e = m_impl->ReadString(newEntry.value.stringRef.stringOffset,
                             newEntry.value.stringRef.stringLength);
                         IndexValue indexValue(newEntry.entryId, newOffset);
                         insertSuccess = m_impl->emailIndex->Insert(e, indexValue);
@@ -1173,8 +1173,8 @@ namespace ThreatIntel {
                 default:
                     if (m_impl->genericIndex) {
                         uint64_t key = 0;
-                        if (newEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            auto v = m_impl->view->GetString(newEntry.value.stringRef.stringOffset,
+                        if (newEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            auto v = m_impl->ReadString(newEntry.value.stringRef.stringOffset,
                                 newEntry.value.stringRef.stringLength);
                             key = HashString(v);
                         }
@@ -1210,8 +1210,8 @@ namespace ThreatIntel {
                         }
                         break;
                     case IOCType::Domain:
-                        if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            auto rawDomain = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                        if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            auto rawDomain = m_impl->ReadString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
                             const std::string d = NormalizeDomain(rawDomain);
                             if (!d.empty()) {
                                 rollbackOk = m_impl->domainIndex->Insert(d, originalOldIndexValue);
@@ -1219,22 +1219,22 @@ namespace ThreatIntel {
                         }
                         break;
                     case IOCType::URL:
-                        if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                        if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            auto u = m_impl->ReadString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
                             rollbackOk = m_impl->urlIndex->Insert(u, originalOldIndexValue);
                         }
                         break;
                     case IOCType::Email:
-                        if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                        if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            auto e = m_impl->ReadString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
                             rollbackOk = m_impl->emailIndex->Insert(e, originalOldIndexValue);
                         }
                         break;
                     default:
                         if (m_impl->genericIndex) {
                             uint64_t key = 0;
-                            if (oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                                auto v = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                            if (oldEntry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                                auto v = m_impl->ReadString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
                                 key = HashString(v);
                             } else {
                                 std::memcpy(&key, oldEntry.value.raw, sizeof(uint64_t));
@@ -1328,8 +1328,8 @@ namespace ThreatIntel {
                     break;
 
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view rawDomain = m_impl->view->GetString(
+                    if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view rawDomain = m_impl->ReadString(
                             entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
                         const std::string domain = NormalizeDomain(rawDomain);
                         if (domain.empty()) {
@@ -1348,8 +1348,8 @@ namespace ThreatIntel {
                     break;
 
                 case IOCType::URL:
-                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view url = m_impl->view->GetString(
+                    if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view url = m_impl->ReadString(
                             entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
                         IndexValue indexValue(entry.entryId, entryOffset);
                         success = m_impl->urlIndex->Insert(url, indexValue);
@@ -1364,8 +1364,8 @@ namespace ThreatIntel {
                     break;
 
                 case IOCType::Email:
-                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                        std::string_view email = m_impl->view->GetString(
+                    if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                        std::string_view email = m_impl->ReadString(
                             entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
                         IndexValue indexValue(entry.entryId, entryOffset);
                         success = m_impl->emailIndex->Insert(email, indexValue);
@@ -1382,8 +1382,8 @@ namespace ThreatIntel {
                 default:
                     if (m_impl->genericIndex) {
                         uint64_t key = 0;
-                        if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
-                            std::string_view value = m_impl->view->GetString(
+                        if (entry.value.stringRef.stringOffset > 0 && m_impl->CanReadStrings()) {
+                            std::string_view value = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset, entry.value.stringRef.stringLength);
                             key = HashString(value);
                         } else {
@@ -1535,9 +1535,9 @@ namespace ThreatIntel {
                     break;
 
                 case IOCType::Domain:
-                    if (m_impl->domainIndex && m_impl->view && 
+                    if (m_impl->domainIndex && m_impl->CanReadStrings() && 
                         entry.value.stringRef.stringOffset > 0) {
-                        std::string_view rawDomain = m_impl->view->GetString(
+                        std::string_view rawDomain = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength);
                         const std::string domain = NormalizeDomain(rawDomain);
@@ -1557,9 +1557,9 @@ namespace ThreatIntel {
                     break;
 
                 case IOCType::URL:
-                    if (m_impl->urlIndex && m_impl->view && 
+                    if (m_impl->urlIndex && m_impl->CanReadStrings() && 
                         entry.value.stringRef.stringOffset > 0) {
-                        std::string_view url = m_impl->view->GetString(
+                        std::string_view url = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength);
                         IndexValue indexValue(entry.entryId, entryOffset);
@@ -1575,9 +1575,9 @@ namespace ThreatIntel {
                     break;
 
                 case IOCType::Email:
-                    if (m_impl->emailIndex && m_impl->view && 
+                    if (m_impl->emailIndex && m_impl->CanReadStrings() && 
                         entry.value.stringRef.stringOffset > 0) {
-                        std::string_view email = m_impl->view->GetString(
+                        std::string_view email = m_impl->ReadString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength);
                         IndexValue indexValue(entry.entryId, entryOffset);
@@ -1596,8 +1596,8 @@ namespace ThreatIntel {
                     // Generic index for other types
                     if (m_impl->genericIndex) {
                         uint64_t key = 0;
-                        if (m_impl->view && entry.value.stringRef.stringOffset > 0) {
-                            std::string_view value = m_impl->view->GetString(
+                        if (m_impl->CanReadStrings() && entry.value.stringRef.stringOffset > 0) {
+                            std::string_view value = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength);
                             key = HashString(value);
@@ -1716,9 +1716,9 @@ namespace ThreatIntel {
                         }
                         break;
                     case IOCType::Domain:
-                        if (m_impl->domainIndex && m_impl->view && 
+                        if (m_impl->domainIndex && m_impl->CanReadStrings() && 
                             entry.value.stringRef.stringOffset > 0) {
-                            std::string_view rawDomain = m_impl->view->GetString(
+                            std::string_view rawDomain = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength);
                             const std::string domain = NormalizeDomain(rawDomain);
@@ -1738,9 +1738,9 @@ namespace ThreatIntel {
                         }
                         break;
                     case IOCType::URL:
-                        if (m_impl->urlIndex && m_impl->view && 
+                        if (m_impl->urlIndex && m_impl->CanReadStrings() && 
                             entry.value.stringRef.stringOffset > 0) {
-                            std::string_view url = m_impl->view->GetString(
+                            std::string_view url = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength);
                             IndexValue indexValue(entry.entryId, entryOffset);
@@ -1775,9 +1775,9 @@ namespace ThreatIntel {
                         }
                         break;
                     case IOCType::Email:
-                        if (m_impl->emailIndex && m_impl->view && 
+                        if (m_impl->emailIndex && m_impl->CanReadStrings() && 
                             entry.value.stringRef.stringOffset > 0) {
-                            std::string_view email = m_impl->view->GetString(
+                            std::string_view email = m_impl->ReadString(
                                 entry.value.stringRef.stringOffset,
                                 entry.value.stringRef.stringLength);
                             IndexValue indexValue(entry.entryId, entryOffset);
@@ -1795,8 +1795,8 @@ namespace ThreatIntel {
                     default:
                         if (m_impl->genericIndex) {
                             uint64_t key = 0;
-                            if (m_impl->view && entry.value.stringRef.stringOffset > 0) {
-                                std::string_view value = m_impl->view->GetString(
+                            if (m_impl->CanReadStrings() && entry.value.stringRef.stringOffset > 0) {
+                                std::string_view value = m_impl->ReadString(
                                     entry.value.stringRef.stringOffset,
                                     entry.value.stringRef.stringLength);
                                 key = HashString(value);
