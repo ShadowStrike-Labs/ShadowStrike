@@ -1859,54 +1859,38 @@ void BrowserProtection::ResetStatistics() {
 bool BrowserProtection::SelfTest() {
     SS_LOG_INFO(LOG_CATEGORY, L"SelfTest: beginning browser protection verification");
 
-    // Test 1: Blocklist operations
-    bool addOk = AddToBlocklist("test-selftest-malware.example.com");
-    if (!addOk) {
-        SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: could not add domain to blocklist");
+    // A SelfTest reads live state and never changes it (tasks 248, 341). This one used
+    // to add its own names to the user's blocklist and allowlist and then remove them,
+    // which deleted a user's entry of the same name and ignored every removal result.
+    // The list decisions are checked on the functions the lists use instead.
+
+    // Test 1: list entries are normalised before they are stored or compared
+    if (NormalizeDomainCandidate("Shop.Example.COM.") != "shop.example.com" ||
+        !NormalizeDomainCandidate("a..example.com").empty() ||
+        !NormalizeDomainCandidate("http://example.com").empty() ||
+        !NormalizeDomainCandidate("user@example.com").empty() ||
+        !NormalizeDomainCandidate("-example.com").empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: list entry normalisation is wrong");
         return false;
     }
 
-    bool isBlocked = IsInBlocklist("test-selftest-malware.example.com");
-    if (!isBlocked) {
-        SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: added domain not found in blocklist");
-        RemoveFromBlocklist("test-selftest-malware.example.com");
+    // Test 2: an entry covers itself and its subdomains, and nothing else
+    if (!DomainEndsWith("example.com", "example.com") ||
+        !DomainEndsWith("login.example.com", "example.com") ||
+        DomainEndsWith("notexample.com", "example.com") ||
+        DomainEndsWith("example.com.evil.test", "example.com")) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: list suffix matching is wrong");
         return false;
     }
 
-    // Test 2: Allowlist operations
-    bool allowOk = AddToAllowlist("test-selftest-safe.example.com");
-    if (!allowOk) {
-        SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: could not add domain to allowlist");
-        RemoveFromBlocklist("test-selftest-malware.example.com");
-        return false;
-    }
-
-    bool isAllowed = IsInAllowlist("test-selftest-safe.example.com");
-    if (!isAllowed) {
-        SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: added domain not found in allowlist");
-        RemoveFromBlocklist("test-selftest-malware.example.com");
-        RemoveFromAllowlist("test-selftest-safe.example.com");
-        return false;
-    }
-
-    // Test 3: URL category function returns a valid result
-    URLCategory cat = GetURLCategory("https://www.google.com");
-    (void)cat; // Category may vary; just verify no crash
-
-    // Test 4: Risk score returns within range
+    // Test 3: Risk score returns within range
     int score = GetURLRiskScore("https://example.com");
     if (score < 0 || score > 100) {
         SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: risk score %d out of range [0,100]", score);
-        RemoveFromBlocklist("test-selftest-malware.example.com");
-        RemoveFromAllowlist("test-selftest-safe.example.com");
         return false;
     }
 
-    // Cleanup
-    RemoveFromBlocklist("test-selftest-malware.example.com");
-    RemoveFromAllowlist("test-selftest-safe.example.com");
-
-    SS_LOG_INFO(LOG_CATEGORY, L"SelfTest: all 4 verification checks passed");
+    SS_LOG_INFO(LOG_CATEGORY, L"SelfTest: all 3 verification checks passed");
     return true;
 }
 

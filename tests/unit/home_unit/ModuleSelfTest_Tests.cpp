@@ -114,6 +114,31 @@ TEST(ModuleSelfTest, WebProtectionModulesPassTheirOwnChecks) {
 // USB protection
 // ============================================================================
 
+// The BrowserProtection self-test used to add its own names to the live lists and remove them
+// again, so a user entry with the same name was deleted (task 248). The names below are the
+// ones it used; a self-test must leave every entry exactly where it found it.
+TEST(ModuleSelfTest, BrowserProtectionSelfTestLeavesTheUsersListsAlone) {
+    auto& bp = ::ShadowStrike::WebBrowser::BrowserProtection::Instance();
+    if (!bp.IsInitialized()) {
+        (void)bp.Initialize();
+    }
+    ASSERT_TRUE(bp.IsInitialized());
+    const std::string blocked = "test-selftest-malware.example.com";
+    const std::string allowed = "test-selftest-safe.example.com";
+    ASSERT_TRUE(bp.AddToBlocklist(blocked));
+    ASSERT_TRUE(bp.AddToAllowlist(allowed));
+
+    const bool ok = bp.SelfTest();
+    const bool stillBlocked = bp.IsInBlocklist(blocked);
+    const bool stillAllowed = bp.IsInAllowlist(allowed);
+    (void)bp.RemoveFromBlocklist(blocked);
+    (void)bp.RemoveFromAllowlist(allowed);
+
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(stillBlocked) << "the self-test removed a user's blocklist entry";
+    EXPECT_TRUE(stillAllowed) << "the self-test removed a user's allowlist entry";
+}
+
 TEST(ModuleSelfTest, UsbProtectionModulesPassTheirOwnChecks) {
     ExpectSelfTestPasses("BadUSBDetector", ::ShadowStrike::USB::BadUSBDetector::Instance());
     ExpectSelfTestPasses("DeviceControlManager", ::ShadowStrike::USB::DeviceControlManager::Instance());

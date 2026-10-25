@@ -28624,6 +28624,7 @@ class SelfTestsDoNotChangeLiveStateTests(unittest.TestCase):
         "IoT/RouterSecurityChecker.cpp": [r"ResetStatistics\(\)"],
         "Banking/KeyloggerProtection.cpp": [r"OpenClipboard\("],
         "Privacy/PrivacyCleaner.cpp": [r"shadowstrike_test_erase", r"std::ofstream"],
+        "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
     }
 
     @staticmethod
