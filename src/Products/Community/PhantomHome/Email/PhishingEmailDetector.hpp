@@ -720,6 +720,11 @@ private:
 [[nodiscard]] std::vector<std::string> ExtractURLsFromHTML(const std::string& html);
 [[nodiscard]] bool ContainsHomographCharacters(const std::string& text);
 
+/// The ASCII a reader would take `domain` for: punycode labels decoded, every lookalike mapped to
+/// the Latin letter it imitates, lower-cased. Empty when nothing was substituted (the domain is
+/// already ASCII) or when a character has no Latin lookalike (ordinary non-Latin text).
+[[nodiscard]] std::optional<std::string> ConfusableSkeleton(const std::string& domain);
+
 }  // namespace Email
 }  // namespace ShadowStrike
 

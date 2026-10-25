@@ -27,10 +27,12 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 
 #include "Products/Community/PhantomHome/Email/EmailProtection.hpp"
 #include "Products/Community/PhantomHome/Email/PhishingEmailDetector.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
 
 namespace {
 
@@ -193,6 +195,53 @@ TEST(EmailShortenedLinks, TheHostMustBeTheShortener) {
                             "https://example.com/?next=bit.ly", "https://notbit.ly.example/x"}) {
         EXPECT_FALSE(detector.AnalyzeURL(url).isShortened) << url;
     }
+}
+
+// Task 310: a domain whose confusable skeleton spells a brand imitates it, whether its label is
+// mixed-script or written entirely in lookalikes - which mixing alone cannot see.
+constexpr const char* kCyrillicY = "\xD1\x83";        // U+0443, looks like 'y'
+constexpr const char* kCyrillicPalochka = "\xD3\x8F"; // U+04CF, looks like 'l'
+constexpr const char* kCyrillicEs = "\xD1\x81";       // U+0441, looks like 'c'
+
+std::string AllLookalikePaypal() {
+    return std::string(kCyrillicP) + kCyrillicA + kCyrillicY + kCyrillicP + kCyrillicA + kCyrillicPalochka;
+}
+
+TEST(EmailConfusableSkeleton, ASkeletonIsTheAsciiAReaderSees) {
+    using ShadowStrike::Email::ConfusableSkeleton;
+    EXPECT_EQ(std::optional<std::string>("paypal.com"), ConfusableSkeleton(AllLookalikePaypal() + ".com"));
+    EXPECT_EQ(std::optional<std::string>("paypal.com"), ConfusableSkeleton(std::string("p") + kCyrillicA + "ypal.com"));
+    EXPECT_FALSE(ConfusableSkeleton("paypal.com").has_value()) << "nothing was substituted";
+    EXPECT_FALSE(ConfusableSkeleton(std::string(kCyrillicCh) + kCyrillicA + kCyrillicT + ".com").has_value())
+        << "a letter with no Latin lookalike is ordinary Cyrillic text";
+}
+
+TEST(EmailConfusableSkeleton, APunycodeLinkIsDecodedFirst) {
+    const std::wstring unicode = ShadowStrike::Utils::StringUtils::ToWide(AllLookalikePaypal() + ".com");
+    wchar_t ascii[256]{};
+    const int n = ::IdnToAscii(0, unicode.c_str(), static_cast<int>(unicode.size()), ascii, 256);
+    ASSERT_GT(n, 0);
+    const std::string puny = ShadowStrike::Utils::StringUtils::ToNarrow(std::wstring(ascii, static_cast<size_t>(n)));
+    ASSERT_EQ(0u, puny.rfind("xn--", 0)) << puny;
+    EXPECT_EQ(std::optional<std::string>("paypal.com"), ShadowStrike::Email::ConfusableSkeleton(puny));
+}
+
+TEST(EmailConfusableSkeleton, ALookalikeOfABrandIsImpersonationAndAnOrdinaryWordIsNot) {
+    auto& detector = ShadowStrike::Email::PhishingEmailDetector::Instance();
+    if (!detector.IsInitialized()) (void)detector.Initialize();
+    EXPECT_EQ(std::optional<std::string>("paypal"), detector.DetectBrandImpersonation(AllLookalikePaypal() + ".com"))
+        << "an all-Cyrillic paypal is single-script, so mixing never saw it";
+    EXPECT_EQ(std::optional<std::string>("paypal"),
+              detector.DetectBrandImpersonation(AllLookalikePaypal() + "-secure.example"));
+    // Spelled entirely in lookalikes, but the skeleton (coco) names no brand.
+    const std::string coco = std::string(kCyrillicEs) + kCyrillicO + kCyrillicEs + kCyrillicO + ".com";
+    EXPECT_FALSE(detector.DetectBrandImpersonation(coco).has_value());
+    EXPECT_FALSE(ContainsHomographCharacters(coco)) << "single-script Cyrillic stays clean";
+    // The skeleton (paws) CONTAINS a brand (aws) without being it; a whole token must match.
+    const std::string paws = std::string(kCyrillicP) + kCyrillicA + "\xD4\x9D" /* U+051D w */ +
+                             "\xD1\x95" /* U+0455 s */ + ".com";
+    EXPECT_EQ(std::optional<std::string>("paws.com"), ShadowStrike::Email::ConfusableSkeleton(paws));
+    EXPECT_FALSE(detector.DetectBrandImpersonation(paws).has_value());
 }
 
 }  // namespace

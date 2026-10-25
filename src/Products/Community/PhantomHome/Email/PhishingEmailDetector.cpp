@@ -119,7 +119,11 @@ namespace {
         {0x0458, 'j'}, {0x0405, 'S'}, {0x0410, 'A'}, {0x0412, 'B'},
         {0x0415, 'E'}, {0x041A, 'K'}, {0x041C, 'M'}, {0x041D, 'H'},
         {0x041E, 'O'}, {0x0420, 'P'}, {0x0421, 'C'}, {0x0422, 'T'},
-        {0x0425, 'X'}, {0x03BF, 'o'}, {0x03C1, 'p'}
+        {0x0425, 'X'}, {0x03BF, 'o'}, {0x03C1, 'p'},
+        // Unicode confusables (UTS #39) for the Latin letters the set above could not spell, so a
+        // brand such as paypal (l) or google (g has none; l does) can be imitated and seen (task 310).
+        {0x0455, 's'}, {0x04BB, 'h'}, {0x04CF, 'l'}, {0x0501, 'd'}, {0x051B, 'q'},
+        {0x051D, 'w'}, {0x03B1, 'a'}, {0x03B9, 'i'}, {0x03BA, 'k'}, {0x03BD, 'v'}
     };
     
     // Legitimate brand domains for impersonation checks
@@ -140,6 +144,30 @@ namespace {
         {"usps", {"usps.com"}}
     };
     
+    /// The brand a skeleton spells, as a whole DNS label or a hyphen-separated part of one. Whole
+    /// tokens only: an ordinary Russian word skeletonises to a string that is not a brand name,
+    /// which is what keeps this from flagging single-script Cyrillic domains.
+    [[nodiscard]] std::optional<std::string> BrandNamedBySkeleton(const std::string& skeleton) {
+        size_t start = 0;
+        while (start <= skeleton.size()) {
+            const size_t end = skeleton.find_first_of(".-", start);
+            const std::string_view token(skeleton.data() + start,
+                                         (end == std::string::npos ? skeleton.size() : end) - start);
+            if (!token.empty()) {
+                for (const char* brand : PhishingConstants::COMMONLY_SPOOFED_BRANDS) {
+                    if (token == brand) return std::string(brand);
+                }
+                for (const auto& [brand, domains] : LEGITIMATE_BRAND_DOMAINS) {
+                    (void)domains;
+                    if (token == brand) return brand;
+                }
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        return std::nullopt;
+    }
+
     // Pre-compiled static regex patterns (P0-6 fix: avoid recompilation)
     const std::regex& GetDomainRegex() {
         static const std::regex regex(R"(https?://([^/:]+))", std::regex::icase | std::regex::optimize);
@@ -840,6 +868,15 @@ public:
     }
 
     std::optional<std::string> DetectBrandImpersonationInternal(const std::string& domain) const {
+        // A domain that only LOOKS like a brand: its confusable skeleton names the brand while
+        // the domain itself cannot be the brand's, because it is not ASCII (task 310). This sees
+        // an all-lookalike label, which mixed-script detection cannot, and attributes a mixed one.
+        if (const auto skeleton = ConfusableSkeleton(domain)) {
+            if (auto brand = BrandNamedBySkeleton(*skeleton)) {
+                return brand;
+            }
+        }
+
         std::string lowerDomain = AsciiToLower(domain);
 
         for (const auto& brand : PhishingConstants::COMMONLY_SPOOFED_BRANDS) {
@@ -1720,6 +1757,47 @@ std::vector<std::string> ExtractURLsFromHTML(const std::string& html) {
     return urls;
 }
 
+std::optional<std::string> ConfusableSkeleton(const std::string& domain) {
+    try {
+        std::wstring wide = Utils::StringUtils::ToWide(domain);
+        if (wide.empty()) return std::nullopt;
+
+        // Links carry IDNs as punycode (xn--...); decode so the skeleton sees the characters a
+        // reader is shown. A label that fails to decode is not trusted and yields no skeleton.
+        std::wstring lowered(wide);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](wchar_t c) { return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c; });
+        if (lowered.rfind(L"xn--", 0) == 0 || lowered.find(L".xn--") != std::wstring::npos) {
+            wchar_t decoded[256]{};
+            const int n = ::IdnToUnicode(0, wide.c_str(), static_cast<int>(wide.size()),
+                                         decoded, static_cast<int>(std::size(decoded)));
+            if (n <= 0) return std::nullopt;
+            wide.assign(decoded, static_cast<size_t>(n));
+        }
+
+        std::string skeleton;
+        skeleton.reserve(wide.size());
+        bool substituted = false;
+        for (const wchar_t wc : wide) {
+            if (wc < 0x80) {
+                skeleton.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(wc))));
+                continue;
+            }
+            const auto it = HOMOGRAPH_CHARS.find(static_cast<char32_t>(wc));
+            if (it == HOMOGRAPH_CHARS.end()) {
+                return std::nullopt;   // a letter with no Latin lookalike: real non-Latin text
+            }
+            skeleton.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(it->second))));
+            substituted = true;
+        }
+        if (!substituted) return std::nullopt;
+        return skeleton;
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("ConfusableSkeleton failed - {}", e.what());
+        return std::nullopt;
+    }
+}
+
 bool ContainsHomographCharacters(const std::string& text) {
     try {
         // A homograph attack substitutes a lookalike character into an otherwise Latin label, so the
@@ -1770,8 +1848,8 @@ bool ContainsHomographCharacters(const std::string& text) {
         }
 
         // NOT DETECTED HERE, deliberately: a label written ENTIRELY in lookalikes imitating a Latin
-        // brand is single-script, so mixing cannot see it. That needs confusable-skeleton comparison
-        // against LEGITIMATE_BRAND_DOMAINS, which is a separate mechanism and is filed.
+        // brand is single-script, so mixing cannot see it. ConfusableSkeleton and the brand check
+        // in DetectBrandImpersonationInternal see it instead (task 310).
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("ContainsHomographCharacters failed - {}",
