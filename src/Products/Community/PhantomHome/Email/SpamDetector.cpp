@@ -1459,14 +1459,11 @@ public:
             // Determine verdict
             if (result.spamScore >= m_config.spamThreshold) {
                 result.isSpam = true;
-
-                if (HasIndicator(result.indicators, SpamIndicator::RBLListed)) {
-                    result.verdict = SpamVerdict::Spam;
-                    m_stats.spamDetected.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    result.verdict = SpamVerdict::Spam;
-                    m_stats.spamDetected.fetch_add(1, std::memory_order_relaxed);
-                }
+                // One outcome. A branch on RBLListed here had two identical arms (task 294);
+                // an RBL listing is already counted in rblHits where it is detected, and
+                // carried in indicators and rblScore.
+                result.verdict = SpamVerdict::Spam;
+                m_stats.spamDetected.fetch_add(1, std::memory_order_relaxed);
             } else if (result.spamScore <= m_config.hamThreshold) {
                 result.verdict = SpamVerdict::Ham;
                 m_stats.hamDetected.fetch_add(1, std::memory_order_relaxed);
