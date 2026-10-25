@@ -28929,5 +28929,55 @@ class KeyboardHookTrustIsBySignatureTests(unittest.TestCase):
         self.assertIn("HasInstance()", helper, "must fail closed without constructing the engine")
 
 
+class KeyboardHookTrustIsBySignatureTests(unittest.TestCase):
+    """A suspicious keyboard hook is excused by its process's signature, not its folder (task 307).
+
+    The System32 exemption excused any binary an administrator-level attacker placed there and
+    refused signed binaries elsewhere; the comment above it claimed a signature check nothing made.
+    """
+
+    CPP = ROOT / "src/Products/Community/PhantomHome/Banking/KeyloggerProtection.cpp"
+
+    def test_the_exemption_asks_the_shared_publisher_trust_policy(self):
+        src = strip_c_comments(read_source(self.CPP))
+        body = src[src.index("bool IsLegitimateHook(const KeyboardHookInfo& hook) const {"):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("HasTrustedPublisherSignature(hook.processPath)", body)
+        self.assertNotRegex(body, r"(?i)system32|GetSystemDirectory|IsUnderSystemDirectory")
+        helper = src[src.index("static bool HasTrustedPublisherSignature("):]
+        helper = helper[:helper.index("\n    }\n")]
+        self.assertIn("EvaluatePublisherTrust(processPath).trusted", helper)
+        self.assertIn("HasInstance()", helper, "must fail closed without constructing the engine")
+
+
+class ZeroTrustDecisionsArePersistedAndRevocableTests(unittest.TestCase):
+    """AlwaysBlock survives restart, and every standing decision can be withdrawn (task 269)."""
+
+    HOME = ROOT / "src/Products/Community/PhantomHome/ZeroTrustGuard/ZeroTrustPromptQueue.cpp"
+    IPC = ROOT / "src/PhantomCore/Service/HomeIpcDispatcher.cpp"
+
+    def test_always_block_is_persisted_and_loaded(self):
+        src = strip_c_comments(read_source(self.HOME))
+        arm = src[src.index("case UserChoice::AlwaysBlock: {"):]
+        arm = arm[:arm.index("break;")]
+        self.assertIn("kDenyKeyPrefix", arm)
+        self.assertIn("cfg.SetValue<std::string>(key + \"_path\"", arm)
+        load = src[src.index("void ZeroTrustPromptQueue::LoadPersistedDecisions()"):]
+        self.assertIn("m_impl->m_alwaysDenyPaths.insert(", load[:load.index("\n}\n")])
+
+    def test_revocation_reaches_memory_configuration_and_ipc(self):
+        src = strip_c_comments(read_source(self.HOME))
+        body = src[src.index("bool ZeroTrustPromptQueue::Revoke("):]
+        body = body[:body.index("\n}\n")]
+        for needle in ("m_alwaysAllowPaths.erase", "m_alwaysAllowPublishers.erase",
+                       "m_alwaysDenyPaths.erase", "cfg.DeleteValue(base, Layer::User)",
+                       "cfg.DeleteValue(base + suffix, Layer::User)"):
+            self.assertIn(needle, body)
+        ipc = strip_c_comments(read_source(self.IPC))
+        self.assertIn("RegisterV2Handler(CommandType::RevokeZeroTrustDecision", ipc)
+        self.assertIn("ZeroTrustPromptQueue::Instance().Revoke(", ipc)
+        self.assertIn('{"decisions",', ipc)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -28,8 +28,9 @@
  * UserChoice::AlwaysAllow and UserChoice::AlwaysBlock register the image path
  * and publisher subject into persistent or in-memory caches that are checked
  * by ZeroTrustGuard::Evaluate() before the scored path. AlwaysAllow is
- * persisted to ConfigManager; AlwaysBlock is held in an in-memory deny-cache
- * owned by this queue (caller is responsible for persistence if needed).
+ * persisted to ConfigManager; AlwaysBlock is persisted by path (blocking
+ * by path is the safe direction: a swapped binary is blocked, never trusted). Both can
+ * be listed and revoked (task 269).
  *
  * THREAD SAFETY:
  * ==============
@@ -162,7 +163,7 @@ public:
      *   AlwaysAllow → remove from queue; persist path to always-allow set;
      *                 future Evaluate() calls with this path return Allow
      *                 without scoring.
-     *   AlwaysBlock → remove from queue; add path to in-memory deny cache;
+     *   AlwaysBlock → remove from queue; persist path to always-deny set;
      *                 future Evaluate() calls with this path return Block
      *                 without scoring.
      *
@@ -198,18 +199,42 @@ public:
                                        std::wstring_view publisherSubject) const;
 
     /**
-     * @brief Check whether the given image path is in the in-memory deny
-     *        cache (added by AlwaysBlock resolution).
+     * @brief Check whether the given image path is in the always-deny set
+     *        (added by AlwaysBlock resolution, persisted across restarts).
      */
     [[nodiscard]] bool IsAlwaysDenied(std::wstring_view imagePath) const;
+
+    // ---- Standing decisions (task 269) -------------------------------------
+
+    /// @brief What a standing decision is bound to.
+    enum class DecisionKind : std::uint8_t {
+        AllowPath      = 0,   ///< Always allow this image path.
+        AllowPublisher = 1,   ///< Always allow anything signed by this publisher subject.
+        DenyPath       = 2,   ///< Always block this image path.
+    };
+
+    struct StandingDecision {
+        DecisionKind kind = DecisionKind::AllowPath;
+        std::wstring subject;   ///< The path or the publisher subject.
+    };
+
+    /// @brief Every standing AlwaysAllow / AlwaysBlock decision, for the UI to list.
+    [[nodiscard]] std::vector<StandingDecision> StandingDecisions() const;
+
+    /**
+     * @brief Withdraw a standing decision from memory and from persisted configuration.
+     *        A later launch of the subject is evaluated, and prompted if uncertain, again.
+     * @return true if the decision existed.
+     */
+    [[nodiscard]] bool Revoke(DecisionKind kind, std::wstring_view subject);
 
     // ---- Lifecycle ---------------------------------------------------------
 
     /**
-     * @brief Load persisted always-allow entries from ConfigManager.
+     * @brief Load persisted always-allow and always-deny entries from ConfigManager.
      *        Must be called once at service startup before Evaluate() is used.
      */
-    void LoadPersistedAllowList();
+    void LoadPersistedDecisions();
 
     /**
      * @brief Signal all DequeueBlocking callers to return nullopt.

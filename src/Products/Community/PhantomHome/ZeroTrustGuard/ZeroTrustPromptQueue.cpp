@@ -29,7 +29,8 @@
  *   bridges into it by converting PromptEntry → ZeroTrustPromptItem.
  * - AlwaysAllow entries are persisted to ConfigManager under
  *   "Home/ZeroTrust/AlwaysAllow/" keys so they survive service restarts.
- * - AlwaysBlock entries are in-memory only (per specification).
+ * - AlwaysBlock entries are persisted under "Home/ZeroTrust/AlwaysDeny/" (task 269).
+ * - Every standing decision can be listed and revoked (StandingDecisions, Revoke).
  * - Capacity: 64. Retention: 60 s. Pruned on every mutating call.
  */
 
@@ -64,6 +65,7 @@
 namespace {
 constexpr const char*    kAllowKeyPrefix     = "Home/ZeroTrust/AlwaysAllow/";
 constexpr const char*    kAllowPubKeyPrefix  = "Home/ZeroTrust/AlwaysAllowPub/";
+constexpr const char*    kDenyKeyPrefix      = "Home/ZeroTrust/AlwaysDeny/";
 constexpr const wchar_t* kLogCat             = L"ZeroTrustPromptQueue.Home";
 constexpr const wchar_t* kLogCatCore         = L"ZeroTrustPromptQueue.Core";
 
@@ -536,7 +538,7 @@ bool ZeroTrustPromptQueue::Resolve(std::uint64_t id, UserChoice choice) {
             //   - the publisher-subject entry (so any signed binary from the
             //     same trusted publisher is honoured).
             //
-            // AlwaysBlock is in-memory only by spec.
+            // AlwaysBlock is persisted by path; see its arm below.
             // ----------------------------------------------------------------
             const bool persist =
                 ::ShadowStrike::Config::ConfigManager::HasInstance()
@@ -621,10 +623,30 @@ bool ZeroTrustPromptQueue::Resolve(std::uint64_t id, UserChoice choice) {
                 }
             }
 
+            // Persisted by path, unlike an unsigned AlwaysAllow: binding a BLOCK to a path
+            // fails safe (a binary swapped in at that path is blocked, never trusted), so
+            // there is no replay risk. It was in-memory only, so a user's explicit "always
+            // block" was forgotten at the next service start (task 269).
+            bool persisted = false;
+            if (!imagePath.empty() && ::ShadowStrike::Config::ConfigManager::HasInstance()) {
+                auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+                using Layer = ::ShadowStrike::Config::ConfigLayer;
+                const std::string key = std::string(kDenyKeyPrefix) + Fnv1aHexW(imagePath);
+                const std::string narrowPath = WideToUtf8(imagePath);
+                persisted = !narrowPath.empty() &&
+                            cfg.SetValue<bool>(key, true, Layer::User) &&
+                            cfg.SetValue<std::string>(key + "_path", narrowPath, Layer::User);
+                if (!persisted) {
+                    SS_LOG_WARN(kLogCat,
+                        L"ZeroTrustPromptQueue.Home: AlwaysBlock could not be persisted; session-only");
+                }
+            }
+
             SS_LOG_WARN(kLogCat,
                 L"ZeroTrustPromptQueue.Home: id=%llu AlwaysBlock registered "
-                L"for '%.128ls'",
-                static_cast<unsigned long long>(id), imagePath.c_str());
+                L"for '%.128ls' (persisted=%hs)",
+                static_cast<unsigned long long>(id), imagePath.c_str(),
+                persisted ? "true" : "false");
             break;
         }
     }
@@ -672,7 +694,81 @@ bool ZeroTrustPromptQueue::IsAlwaysDenied(std::wstring_view imagePath) const {
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-void ZeroTrustPromptQueue::LoadPersistedAllowList() {
+std::vector<ZeroTrustPromptQueue::StandingDecision> ZeroTrustPromptQueue::StandingDecisions() const {
+    std::vector<StandingDecision> out;
+    std::scoped_lock lock(m_impl->m_mutex);
+    out.reserve(m_impl->m_alwaysAllowPaths.size() + m_impl->m_alwaysAllowPublishers.size() +
+                m_impl->m_alwaysDenyPaths.size());
+    for (const auto& p : m_impl->m_alwaysAllowPaths) out.push_back({DecisionKind::AllowPath, p});
+    for (const auto& p : m_impl->m_alwaysAllowPublishers) out.push_back({DecisionKind::AllowPublisher, p});
+    for (const auto& p : m_impl->m_alwaysDenyPaths) out.push_back({DecisionKind::DenyPath, p});
+    return out;
+}
+
+bool ZeroTrustPromptQueue::Revoke(DecisionKind kind, std::wstring_view subject) {
+    if (subject.empty()) return false;
+    const std::wstring key(subject);
+    const char* prefix = nullptr;
+    const char* suffix = nullptr;
+    bool existed = false;
+    {
+        std::scoped_lock lock(m_impl->m_mutex);
+        switch (kind) {
+            case DecisionKind::AllowPath:
+                existed = m_impl->m_alwaysAllowPaths.erase(key) > 0;
+                prefix = kAllowKeyPrefix;    suffix = "_path";
+                break;
+            case DecisionKind::AllowPublisher:
+                existed = m_impl->m_alwaysAllowPublishers.erase(key) > 0;
+                prefix = kAllowPubKeyPrefix; suffix = "_pub";
+                break;
+            case DecisionKind::DenyPath:
+                existed = m_impl->m_alwaysDenyPaths.erase(key) > 0;
+                prefix = kDenyKeyPrefix;     suffix = "_path";
+                break;
+            default:
+                return false;
+        }
+    }
+
+    // Persisted keys are removed even when memory held nothing, so a decision persisted
+    // by an earlier run and never loaded cannot come back at the next start. Outside the
+    // queue mutex, as in Resolve, so ConfigManager's locks are never taken under ours.
+    if (::ShadowStrike::Config::ConfigManager::HasInstance()) {
+        auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+        using Layer = ::ShadowStrike::Config::ConfigLayer;
+        const std::string base = std::string(prefix) + Fnv1aHexW(key);
+        const bool hadValue = cfg.DeleteValue(base, Layer::User);
+        const bool hadSubject = cfg.DeleteValue(base + suffix, Layer::User);
+        existed = existed || hadValue || hadSubject;
+
+        // LoadPersistedDecisions honours any key with this prefix and suffix, whatever its
+        // digest, so every entry naming this subject is removed - otherwise an entry under a
+        // different key name would bring the decision back at the next start.
+        const std::string narrow = WideToUtf8(key);
+        const std::string pfx(prefix);
+        const std::string_view sfx(suffix);
+        for (const auto& [name, value] : cfg.GetAllValues(Layer::User)) {
+            const auto* text = std::get_if<std::string>(&value);
+            if (!text || *text != narrow) continue;
+            if (name.size() < pfx.size() + sfx.size() || name.compare(0, pfx.size(), pfx) != 0 ||
+                name.compare(name.size() - sfx.size(), sfx.size(), sfx) != 0) {
+                continue;
+            }
+            (void)cfg.DeleteValue(name, Layer::User);
+            (void)cfg.DeleteValue(name.substr(0, name.size() - sfx.size()), Layer::User);
+            existed = true;
+        }
+    }
+
+    SS_LOG_INFO(kLogCat, L"ZeroTrustPromptQueue.Home: revoked %hs decision for '%.128ls' (existed=%hs)",
+                kind == DecisionKind::DenyPath ? "always-block"
+                    : kind == DecisionKind::AllowPublisher ? "always-allow publisher" : "always-allow",
+                key.c_str(), existed ? "true" : "false");
+    return existed;
+}
+
+void ZeroTrustPromptQueue::LoadPersistedDecisions() {
     if (!::ShadowStrike::Config::ConfigManager::HasInstance()) {
         return;
     }
@@ -687,11 +783,13 @@ void ZeroTrustPromptQueue::LoadPersistedAllowList() {
 
     const std::string allowPrefix    = kAllowKeyPrefix;
     const std::string allowPubPrefix = kAllowPubKeyPrefix;
+    const std::string denyPrefix     = kDenyKeyPrefix;
     constexpr std::string_view kPathSuffix = "_path";
     constexpr std::string_view kPubSuffix  = "_pub";
 
     std::size_t loadedPaths = 0;
     std::size_t loadedPubs  = 0;
+    std::size_t loadedDeny  = 0;
 
     {
         std::scoped_lock lock(m_impl->m_mutex);
@@ -737,12 +835,31 @@ void ZeroTrustPromptQueue::LoadPersistedAllowList() {
                 ++loadedPubs;
                 continue;
             }
+
+            // Always-deny siblings: "<denyPrefix><digest>_path" -> narrow UTF-8 path.
+            if (key.size() >= denyPrefix.size() + kPathSuffix.size()
+                && key.compare(0, denyPrefix.size(), denyPrefix) == 0
+                && key.compare(key.size() - kPathSuffix.size(),
+                               kPathSuffix.size(), kPathSuffix) == 0)
+            {
+                if (strPtr->size() > kMaxImagePathChars * 4) {
+                    SS_LOG_WARN(kLogCat,
+                        L"ZeroTrustPromptQueue.Home: persisted deny entry exceeds cap; skipped");
+                    continue;
+                }
+                std::wstring wpath = Utf8ToWide(*strPtr);
+                if (wpath.empty()) continue;
+                TruncateInPlace(wpath, kMaxImagePathChars);
+                m_impl->m_alwaysDenyPaths.insert(std::move(wpath));
+                ++loadedDeny;
+                continue;
+            }
         }
     }
 
     SS_LOG_INFO(kLogCat,
-        L"ZeroTrustPromptQueue.Home: Loaded %zu always-allow path(s), %zu publisher(s)",
-        loadedPaths, loadedPubs);
+        L"ZeroTrustPromptQueue.Home: Loaded %zu always-allow path(s), %zu publisher(s), %zu always-block path(s)",
+        loadedPaths, loadedPubs, loadedDeny);
 }
 
 void ZeroTrustPromptQueue::Stop() {

@@ -12,13 +12,10 @@
  * reached. That policy is the difference between a bounded queue and unbounded growth driven by
  * process launches, so it is asserted rather than trusted.
  *
- * WHAT THESE CASES DELIBERATELY DO NOT DO: they never resolve a prompt with AlwaysAllow or
- * AlwaysBlock. Those decisions are permanent - there is no API on the class and no IPC verb that
- * removes an entry from the always-allow or always-deny sets, and the allow decision is persisted
- * to ConfigManager for signed binaries. A test that granted one would leave state behind for every
- * later test in the process and possibly on disk. That missing revocation path is filed as its own
- * defect; until it exists, the always-* arms are not safely testable and saying so is more honest
- * than polluting the suite to reach them.
+ * STANDING DECISIONS (task 269). AlwaysAllow and AlwaysBlock used to be permanent: nothing could
+ * remove one, and AlwaysBlock was forgotten at restart while AlwaysAllow survived. Both can now be
+ * listed and revoked, AlwaysBlock is persisted, and every case that grants one revokes it, so no
+ * state outlives the test.
  */
 
 #include "pch.h"
@@ -26,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include "Products/Community/PhantomHome/ZeroTrustGuard/ZeroTrustPromptQueue.hpp"
+#include "PhantomCore/Config/ConfigManager.hpp"
 
 #include <chrono>
 #include <set>
@@ -127,6 +125,73 @@ TEST_F(ZeroTrustPromptQueueTest, TheSessionOfAQueuedPromptCanBeSet) {
     EXPECT_TRUE(queue.SetProcessSessionId(id, 7))
         << "the session id captured at the Evaluate call site could not be attached to its prompt";
     (void)queue.Resolve(id, ZeroTrustPromptQueue::UserChoice::Allow);
+}
+
+using DK = ZeroTrustPromptQueue::DecisionKind;
+
+[[nodiscard]] bool Lists(const ZeroTrustPromptQueue& q, DK kind, const std::wstring& subject) {
+    for (const auto& d : q.StandingDecisions()) {
+        if (d.kind == kind && d.subject == subject) return true;
+    }
+    return false;
+}
+
+/// The persisted always-block entry for `path`, read back from configuration.
+[[nodiscard]] bool DenyIsPersisted(const std::wstring& path) {
+    auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+    const std::string want(path.begin(), path.end());   // ASCII test paths
+    for (const auto& [key, value] : cfg.GetAllValues(::ShadowStrike::Config::ConfigLayer::User)) {
+        const auto* text = std::get_if<std::string>(&value);
+        if (text && *text == want && key.rfind("Home/ZeroTrust/AlwaysDeny/", 0) == 0) return true;
+    }
+    return false;
+}
+
+TEST_F(ZeroTrustPromptQueueTest, AnAlwaysBlockIsPersistedListedAndRevocable) {
+    (void)::ShadowStrike::Config::ConfigManager::Instance();
+    const std::wstring path = L"C:\\test\\zt-always-block-probe.exe";
+    const auto id = queue.Enqueue(MakeItem(path));
+    ASSERT_NE(0u, id);
+    ASSERT_TRUE(queue.Resolve(id, ZeroTrustPromptQueue::UserChoice::AlwaysBlock));
+
+    EXPECT_TRUE(queue.IsAlwaysDenied(path));
+    EXPECT_TRUE(Lists(queue, DK::DenyPath, path));
+    EXPECT_TRUE(DenyIsPersisted(path)) << "an always-block was forgotten at restart";
+
+    EXPECT_TRUE(queue.Revoke(DK::DenyPath, path));
+    EXPECT_FALSE(queue.IsAlwaysDenied(path));
+    EXPECT_FALSE(Lists(queue, DK::DenyPath, path));
+    EXPECT_FALSE(DenyIsPersisted(path)) << "a revoked block would return at the next start";
+    EXPECT_FALSE(queue.Revoke(DK::DenyPath, path)) << "revoking twice reports a decision that is gone";
+}
+
+TEST_F(ZeroTrustPromptQueueTest, APersistedBlockIsRestoredAtStartAndRevokedEverywhere) {
+    auto& cfg = ::ShadowStrike::Config::ConfigManager::Instance();
+    const std::wstring path = L"C:\\test\\zt-restart-probe.exe";
+    // An entry written by an earlier run, under a key name this run would not compute.
+    ASSERT_TRUE(cfg.SetValue<std::string>("Home/ZeroTrust/AlwaysDeny/0000000000000000_path",
+                                          "C:\\test\\zt-restart-probe.exe"));
+    queue.LoadPersistedDecisions();
+    EXPECT_TRUE(queue.IsAlwaysDenied(path)) << "a persisted always-block was not restored";
+
+    EXPECT_TRUE(queue.Revoke(DK::DenyPath, path));
+    EXPECT_FALSE(DenyIsPersisted(path)) << "an entry under another key name survived revocation";
+    queue.LoadPersistedDecisions();
+    EXPECT_FALSE(queue.IsAlwaysDenied(path));
+}
+
+TEST_F(ZeroTrustPromptQueueTest, AnAlwaysAllowCanBeRevoked) {
+    // Unsigned, so session-only by design: nothing persisted, but it must still be undoable.
+    const std::wstring path = L"C:\\test\\zt-always-allow-probe.exe";
+    const auto id = queue.Enqueue(MakeItem(path));
+    ASSERT_TRUE(queue.Resolve(id, ZeroTrustPromptQueue::UserChoice::AlwaysAllow));
+    EXPECT_TRUE(queue.IsAlwaysAllowed(path, L""));
+    EXPECT_TRUE(Lists(queue, DK::AllowPath, path));
+
+    EXPECT_TRUE(queue.Revoke(DK::AllowPath, path));
+    EXPECT_FALSE(queue.IsAlwaysAllowed(path, L""));
+    EXPECT_FALSE(queue.Revoke(DK::AllowPublisher, path)) << "a path is not a publisher";
+    EXPECT_FALSE(queue.Revoke(DK::AllowPath, L""));
 }
 
 }  // namespace

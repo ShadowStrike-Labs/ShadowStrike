@@ -34,6 +34,7 @@
  *   280  GetZeroTrustState      — query ZeroTrustGuard config
  *   281  SetZeroTrustConfig     — update ZeroTrustGuard config
  *   282  AnswerZeroTrustPrompt  — resolve a pending ZeroTrust prompt
+ *   283  RevokeZeroTrustDecision — withdraw a standing always-allow / always-block
  *   260  SubscribeEvents        — acknowledged; push is auto
  *
  * Security contract:
@@ -246,6 +247,19 @@ template<typename T>
     std::string out(static_cast<std::size_t>(need), '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
         out.data(), need, nullptr, nullptr);
+    return out;
+}
+
+/// Standing zero-trust decisions for 280's response, so the UI can list and revoke them (283).
+[[nodiscard]] nlohmann::json ZeroTrustDecisionsJson() {
+    using Queue = ::ShadowStrike::Products::Home::ZeroTrust::ZeroTrustPromptQueue;
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& d : Queue::Instance().StandingDecisions()) {
+        const char* kind = d.kind == Queue::DecisionKind::DenyPath       ? "denyPath"
+                         : d.kind == Queue::DecisionKind::AllowPublisher ? "allowPublisher"
+                                                                         : "allowPath";
+        out.push_back({{"kind", kind}, {"subject", WideToNarrow(d.subject)}});
+    }
     return out;
 }
 
@@ -2144,7 +2158,8 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             {"minStaticBenign",        cfg.minStaticBenign},
             {"uncertainBehavior",      static_cast<int>(cfg.uncertainBehavior)},
             {"zeroTrustMode",          cfg.zeroTrustMode},
-            {"prompts",                std::move(prompts)}
+            {"prompts",                std::move(prompts)},
+            {"decisions",              ZeroTrustDecisionsJson()}
         };
         svc.SendResponseEnvelope(clientId, CommandType::GetZeroTrustState, requestId,
             resp.dump());
@@ -2268,6 +2283,47 @@ void HomeIpcDispatcher::Install(ServiceCommunicator& svc) {
             resp.dump());
     });
 
+    // ==========================================================================
+    // 283 - RevokeZeroTrustDecision (task 269)
+    // ==========================================================================
+    // A standing AlwaysAllow could only be undone by editing configuration by hand. The UI
+    // lists decisions from 280's "decisions" and withdraws one here. Same authentication as
+    // 281: revoking an always-block weakens policy exactly as much as a config change can.
+    svc.RegisterV2Handler(CommandType::RevokeZeroTrustDecision,
+        [&svc, CheckAuth, ParseOrReject](std::uint64_t clientId, std::uint32_t,
+                                          std::uint64_t requestId, std::string_view raw)
+    {
+        if (CheckAuth(clientId, requestId, CommandType::RevokeZeroTrustDecision)) return;
+
+        auto j = ParseOrReject(clientId, requestId, CommandType::RevokeZeroTrustDecision, raw);
+        if (j.is_discarded()) return;
+
+        const auto kind    = Field<std::string>(j, "kind");
+        const auto subject = Field<std::string>(j, "subject");
+        using DK = ZeroTrustPromptQueue::DecisionKind;
+        std::optional<DK> dk;
+        if (kind) {
+            if      (*kind == "allowPath")      dk = DK::AllowPath;
+            else if (*kind == "allowPublisher") dk = DK::AllowPublisher;
+            else if (*kind == "denyPath")       dk = DK::DenyPath;
+        }
+        const std::wstring wideSubject = subject ? NarrowToWide(*subject) : std::wstring{};
+        if (!dk || wideSubject.empty() || wideSubject.size() > 32768) {
+            svc.SendResponseEnvelope(clientId, CommandType::RevokeZeroTrustDecision, requestId,
+                MakeErrorResponse("invalid_value",
+                    "kind must be allowPath, allowPublisher or denyPath, and subject valid UTF-8").dump());
+            return;
+        }
+
+        SS_LOG_INFO(kLogCat, L"RevokeZeroTrustDecision kind=[%hs] clientId=%llu", kind->c_str(), clientId);
+        const bool ok = ZeroTrustPromptQueue::Instance().Revoke(*dk, wideSubject);
+        nlohmann::json resp{{"ok", ok}};
+        if (!ok) {
+            resp["error"] = {{"code", "not_found"}, {"message", "No such standing decision"}};
+        }
+        svc.SendResponseEnvelope(clientId, CommandType::RevokeZeroTrustDecision, requestId, resp.dump());
+    });
+
     SS_LOG_INFO(kLogCat, L"HomeIpcDispatcher: all handlers installed");
 }
 
@@ -2308,6 +2364,7 @@ void HomeIpcDispatcher::Uninstall(ServiceCommunicator& svc) {
         CommandType::GetZeroTrustState,
         CommandType::SetZeroTrustConfig,
         CommandType::AnswerZeroTrustPrompt,
+        CommandType::RevokeZeroTrustDecision,
         static_cast<CommandType>(220),
         static_cast<CommandType>(221),
         static_cast<CommandType>(231),

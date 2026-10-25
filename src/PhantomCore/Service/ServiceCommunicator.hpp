@@ -201,6 +201,7 @@ enum class CommandType : uint32_t {
     GetZeroTrustState       = 280,  ///< Query current Zero-Trust posture
     SetZeroTrustConfig      = 281,  ///< Update Zero-Trust policy
     AnswerZeroTrustPrompt   = 282,  ///< User response to a Zero-Trust prompt
+    RevokeZeroTrustDecision = 283,  ///< Withdraw a standing always-allow / always-block
 
     // Recommendations
     GetRecommendations      = 290,  ///< List pending security recommendations

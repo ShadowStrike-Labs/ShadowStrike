@@ -301,7 +301,7 @@ bool ZeroTrustGuard::Initialize() {
     }
 
     // Load persisted always-allow entries into the prompt queue.
-    ZeroTrustPromptQueue::Instance().LoadPersistedAllowList();
+    ZeroTrustPromptQueue::Instance().LoadPersistedDecisions();
 
     m_impl->m_initialized.store(true, std::memory_order_release);
 
