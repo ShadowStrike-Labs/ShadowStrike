@@ -210,20 +210,7 @@ namespace SecureBrowserConstants {
     // BROWSER PATHS
     // ========================================================================
 
-    /// @brief Default Chrome path patterns
-    inline constexpr const wchar_t* CHROME_PATH_PATTERNS[] = {
-        L"%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe",
-        L"%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe",
-        L"%LocalAppData%\\Google\\Chrome\\Application\\chrome.exe"
-    };
-
-    /// @brief Default Edge path
-    inline constexpr const wchar_t* EDGE_PATH =
-        L"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe";
-
-    /// @brief Default Firefox path
-    inline constexpr const wchar_t* FIREFOX_PATH =
-        L"%ProgramFiles%\\Mozilla Firefox\\firefox.exe";
+    // Browser install locations: PhantomCore/Utils/BrowserLocator.hpp (task 316).
 
 }  // namespace SecureBrowserConstants
 

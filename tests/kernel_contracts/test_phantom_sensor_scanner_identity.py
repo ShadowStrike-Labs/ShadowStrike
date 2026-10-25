@@ -28666,5 +28666,26 @@ class DomainBoundaryHasOneDefinitionTests(unittest.TestCase):
         self.assertEqual([], offenders)
 
 
+class BrowserIdentityComesFromTheLocatorTests(unittest.TestCase):
+    """Browser executables come from Utils::Browser, not literals (task 316).
+
+    Chromium runs as chrome.exe, so acting on processes by name alone acts on Google
+    Chrome; PrivacyCleaner must filter by image path where the locator requires it.
+    """
+
+    PC = ROOT / "src/Products/Community/PhantomHome/Privacy/PrivacyCleaner.cpp"
+    SB = ROOT / "src/Products/Community/PhantomHome/Banking/SecureBrowser.cpp"
+
+    def test_no_browser_executable_literal(self):
+        for path in (self.PC, self.SB):
+            with self.subTest(path=path.name):
+                src = strip_c_comments(read_source(path))
+                self.assertIsNone(re.search(r'"[^"]*\\\\(chrome|msedge|firefox|brave|vivaldi|launcher)\.exe"', src))
+
+    def test_close_and_running_checks_filter_by_image_path(self):
+        src = strip_c_comments(read_source(self.PC))
+        self.assertGreaterEqual(src.count("ProcessIsBrowser("), 3)   # definition + 2 uses
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

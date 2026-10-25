@@ -90,6 +90,8 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/ProcessUtils.hpp"
+#include "../../../../PhantomCore/Utils/BrowserLocator.hpp"
+#include <optional>
 
 // Windows-specific headers
 #ifdef _WIN32
@@ -168,9 +170,42 @@ constexpr auto kDirIterOpts = fs::directory_options::skip_permission_denied;
  */
 struct BrowserPaths {
     std::vector<fs::path> profilePaths;
-    fs::path executablePath;
+    fs::path executablePath;   ///< Empty when not found where installs are looked for.
     std::string processName;
+    /// The image name is shared with another browser (Chromium runs as chrome.exe), so a
+    /// process belongs to this browser only if its image path is executablePath.
+    bool matchImagePath = false;
 };
+
+[[nodiscard]] std::optional<Utils::Browser::InstalledBrowser> ToInstalledBrowser(BrowserType b) noexcept {
+    using IB = Utils::Browser::InstalledBrowser;
+    switch (b) {
+        case BrowserType::Chrome:   return IB::Chrome;
+        case BrowserType::Firefox:  return IB::Firefox;
+        case BrowserType::Edge:     return IB::Edge;
+        case BrowserType::Opera:    return IB::Opera;
+        case BrowserType::Brave:    return IB::Brave;
+        case BrowserType::Vivaldi:  return IB::Vivaldi;
+        case BrowserType::Chromium: return IB::Chromium;
+        default:                    return std::nullopt;
+    }
+}
+
+/// Whether process `pid`, already known to carry the browser's image name, is the browser.
+[[nodiscard]] bool ProcessIsBrowser(DWORD pid, const BrowserPaths& paths) {
+    if (!paths.matchImagePath) {
+        return true;
+    }
+    if (paths.executablePath.empty()) {
+        return false;   // cannot tell Chromium from Chrome without its path
+    }
+    const auto image = Utils::ProcessUtils::GetProcessPath(pid);
+    if (!image) {
+        return false;
+    }
+    std::error_code ec;
+    return fs::equivalent(fs::path(*image), paths.executablePath, ec) && !ec;
+}
 
 /**
  * @brief Gutmann pass patterns for passes 5-31 (27 deterministic passes).
@@ -223,59 +258,54 @@ BrowserPaths GetBrowserPathsInternal(BrowserType browser) {
             if (!localAppData.empty()) {
                 paths.profilePaths.push_back(localAppData / "Google" / "Chrome" / "User Data");
             }
-            paths.executablePath = fs::path("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe");
-            paths.processName = "chrome.exe";
             break;
 
         case BrowserType::Firefox:
             if (!appData.empty()) {
                 paths.profilePaths.push_back(appData / "Mozilla" / "Firefox" / "Profiles");
             }
-            paths.executablePath = fs::path("C:\\Program Files\\Mozilla Firefox\\firefox.exe");
-            paths.processName = "firefox.exe";
             break;
 
         case BrowserType::Edge:
             if (!localAppData.empty()) {
                 paths.profilePaths.push_back(localAppData / "Microsoft" / "Edge" / "User Data");
             }
-            paths.executablePath = fs::path("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe");
-            paths.processName = "msedge.exe";
             break;
 
         case BrowserType::Opera:
             if (!appData.empty()) {
                 paths.profilePaths.push_back(appData / "Opera Software" / "Opera Stable");
             }
-            paths.executablePath = fs::path("C:\\Program Files\\Opera\\launcher.exe");
-            paths.processName = "opera.exe";
             break;
 
         case BrowserType::Brave:
             if (!localAppData.empty()) {
                 paths.profilePaths.push_back(localAppData / "BraveSoftware" / "Brave-Browser" / "User Data");
             }
-            paths.executablePath = fs::path("C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe");
-            paths.processName = "brave.exe";
             break;
 
         case BrowserType::Vivaldi:
             if (!localAppData.empty()) {
                 paths.profilePaths.push_back(localAppData / "Vivaldi" / "User Data");
             }
-            paths.executablePath = fs::path("C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe");
-            paths.processName = "vivaldi.exe";
             break;
 
         case BrowserType::Chromium:
             if (!localAppData.empty()) {
                 paths.profilePaths.push_back(localAppData / "Chromium" / "User Data");
             }
-            paths.processName = "chromium.exe";
             break;
 
         default:
             break;
+    }
+    // Executable and process identity come from the shared locator (task 316): the
+    // literals that stood in each case were never checked and missed x86 and per-user
+    // installs, and Chromium had none.
+    if (const auto installed = ToInstalledBrowser(browser)) {
+        paths.executablePath = Utils::Browser::FindBrowserExecutable(*installed);
+        paths.processName = Utils::StringUtils::ToNarrow(std::wstring(Utils::Browser::ProcessImageName(*installed)));
+        paths.matchImagePath = Utils::Browser::ImagePathMatchRequired(*installed);
     }
 #endif
 
@@ -2410,6 +2440,12 @@ bool PrivacyCleanerImpl::SelfTest() {
                 return false;
             }
 
+            // A FRESH file, created exclusively under a random name (task 341). The fixed
+            // name was opened with truncation in the temp directory, which other users can
+            // write to as well: a pre-planted hard link or symlink of that name would have
+            // had a privileged caller overwrite, then securely erase, the file it pointed
+            // at. CREATE_NEW refuses any existing name, links included.
+            fs::path testFile;
             {
                 std::random_device rd;
                 const auto tag = std::format(L"ss_selftest_{:08x}{:08x}.tmp", rd(), rd());
@@ -2451,12 +2487,6 @@ bool PrivacyCleanerImpl::SelfTest() {
         }
 
         // Test 3: Preserved domain management
-            // A FRESH file, created exclusively under a random name (task 341). The fixed
-            // name was opened with truncation in the temp directory, which other users can
-            // write to as well: a pre-planted hard link or symlink of that name would have
-            // had a privileged caller overwrite, then securely erase, the file it pointed
-            // at. CREATE_NEW refuses any existing name, links included.
-            fs::path testFile;
         {
             const std::string testDomain = "selftest.shadowstrike.internal";
             AddPreservedDomain(testDomain);
@@ -2882,7 +2912,15 @@ bool IsBrowserRunning(BrowserType browser) {
 
     try {
         std::wstring processNameW = Utils::StringUtils::ToWide(paths.processName);
-        return Utils::ProcessUtils::IsProcessRunning(processNameW);
+        if (!paths.matchImagePath) {
+            return Utils::ProcessUtils::IsProcessRunning(processNameW);
+        }
+        for (const auto pid : Utils::ProcessUtils::GetProcessIdsByName(processNameW)) {
+            if (ProcessIsBrowser(pid, paths)) {
+                return true;
+            }
+        }
+        return false;
     } catch (...) {
         return false;
     }
@@ -2911,7 +2949,8 @@ bool CloseBrowser(BrowserType browser) {
         std::vector<DWORD> pids;
         if (Process32FirstW(hSnapshot, &pe32)) {
             do {
-                if (Utils::StringUtils::IEquals(pe32.szExeFile, processNameW)) {
+                if (Utils::StringUtils::IEquals(pe32.szExeFile, processNameW) &&
+                    ProcessIsBrowser(pe32.th32ProcessID, paths)) {
                     pids.push_back(pe32.th32ProcessID);
                 }
             } while (Process32NextW(hSnapshot, &pe32));

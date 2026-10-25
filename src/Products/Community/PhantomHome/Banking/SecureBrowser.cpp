@@ -36,6 +36,7 @@
 #include "ScreenshotBlocker.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../../../../PhantomCore/Utils/DomainUtils.hpp"
+#include "../../../../PhantomCore/Utils/BrowserLocator.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -948,47 +949,20 @@ public:
             return it->second;
         }
 
-        // 2. Detect default paths
+        // 2. The shared locator (task 316). Brave and Chromium are launched with the
+        //    same Chromium flags as Chrome and Edge, but had no path, so they could not
+        //    be launched at all.
+        using IB = ::ShadowStrike::Utils::Browser::InstalledBrowser;
+        IB installed;
         switch (type) {
-            case BrowserType::Chrome: {
-                for (const auto* pattern : SecureBrowserConstants::CHROME_PATH_PATTERNS) {
-                    std::wstring expanded = ExpandEnvPath(pattern);
-                    if (!expanded.empty() && std::filesystem::exists(expanded)) {
-                        return expanded;
-                    }
-                }
-                return L"";
-            }
-            case BrowserType::Edge: {
-                std::wstring expanded = ExpandEnvPath(SecureBrowserConstants::EDGE_PATH);
-                if (!expanded.empty() && std::filesystem::exists(expanded)) {
-                    return expanded;
-                }
-                return L"";
-            }
-            case BrowserType::Firefox: {
-                std::wstring expanded = ExpandEnvPath(SecureBrowserConstants::FIREFOX_PATH);
-                if (!expanded.empty() && std::filesystem::exists(expanded)) {
-                    return expanded;
-                }
-                return L"";
-            }
-            default:
-                return L"";
+            case BrowserType::Chrome:   installed = IB::Chrome; break;
+            case BrowserType::Edge:     installed = IB::Edge; break;
+            case BrowserType::Firefox:  installed = IB::Firefox; break;
+            case BrowserType::Brave:    installed = IB::Brave; break;
+            case BrowserType::Chromium: installed = IB::Chromium; break;
+            default:                    return L"";
         }
-    }
-
-    std::wstring ExpandEnvPath(const std::wstring& path) const {
-        // Query required buffer size first
-        DWORD required = ::ExpandEnvironmentStringsW(path.c_str(), nullptr, 0);
-        if (required == 0) return path;
-
-        std::vector<wchar_t> buffer(static_cast<size_t>(required));
-        DWORD ret = ::ExpandEnvironmentStringsW(path.c_str(), buffer.data(), required);
-        if (ret > 0 && ret <= required) {
-            return std::wstring(buffer.data());
-        }
-        return path;
+        return ::ShadowStrike::Utils::Browser::FindBrowserExecutable(installed).wstring();
     }
 
     std::wstring CreateIsolatedProfile(const std::string& sessionId) {
@@ -1529,8 +1503,9 @@ std::vector<BrowserType> SecureBrowser::DetectInstalledBrowsers() const {
     std::vector<BrowserType> browsers;
 
     // Check each browser type through existing path resolution
-    static const std::array<BrowserType, 3> typesToCheck = {
-        BrowserType::Chrome, BrowserType::Edge, BrowserType::Firefox
+    static const std::array<BrowserType, 5> typesToCheck = {
+        BrowserType::Chrome, BrowserType::Edge, BrowserType::Firefox,
+        BrowserType::Brave, BrowserType::Chromium
     };
 
     for (BrowserType type : typesToCheck) {

@@ -31,8 +31,11 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
+#include "PhantomCore/Utils/BrowserLocator.hpp"
 #include "Products/Community/PhantomHome/Privacy/PrivacyCleaner.hpp"
 
 namespace {
@@ -117,25 +120,84 @@ TEST(CleanerBrowserPaths, EachBrowserHasItsOwnProfileLocation) {
     }
 }
 
-TEST(CleanerBrowserPaths, SixOfSevenBrowsersHaveARecordedExecutablePath) {
-    // PINNED AS IT BEHAVES, and the asymmetry is the finding. Six cases in the switch set executablePath;
-    // Chromium's sets only profilePaths and processName, so GetBrowserPath(Chromium) returns nothing.
-    //
-    // The six that are set are hardcoded literals, so a path is returned whether or not the browser is
-    // installed and whether or not it lives there - Chrome is frequently under Program Files (x86) or in
-    // LOCALAPPDATA for a per-user install. SecureBrowser::GetBrowserPath solves this properly by expanding
-    // several patterns and testing fs::exists on each, returning empty when none match. Copying that here is
-    // filed; if these start returning empty, that landed - update the filing rather than this case.
+/// Points %LocalAppData% at a scratch directory for the life of the object, so a per-user install
+/// can be planted without depending on what this machine has installed.
+class ScopedLocalAppData {
+public:
+    ScopedLocalAppData() : m_dir(std::filesystem::temp_directory_path() / L"ss_task316_lad") {
+        std::filesystem::create_directories(m_dir);
+        wchar_t buf[32768] = {};
+        const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, 32768);
+        m_had = n > 0 && n < 32768;
+        m_old = m_had ? std::wstring(buf, n) : std::wstring{};
+        ::SetEnvironmentVariableW(L"LOCALAPPDATA", m_dir.c_str());
+    }
+    ~ScopedLocalAppData() {
+        ::SetEnvironmentVariableW(L"LOCALAPPDATA", m_had ? m_old.c_str() : nullptr);
+        std::error_code ec;
+        std::filesystem::remove_all(m_dir, ec);
+    }
+    [[nodiscard]] std::filesystem::path Plant(const std::filesystem::path& relative) const {
+        const auto p = m_dir / relative;
+        std::filesystem::create_directories(p.parent_path());
+        std::ofstream(p) << "not a browser";
+        return p;
+    }
+private:
+    std::filesystem::path m_dir;
+    std::wstring m_old;
+    bool m_had = false;
+};
+
+TEST(CleanerBrowserPaths, AnExecutablePathIsReturnedOnlyWhenItExists) {
+    // Task 316: six literals were returned whether or not the browser was installed there, and Chromium
+    // had none. Every answer is now either empty or an existing absolute file.
     for (const BrowserType browser : kAllBrowsers) {
         const auto path = GetBrowserPath(browser);
-        if (browser == BrowserType::Chromium) {
-            EXPECT_TRUE(path.empty())
-                << "Chromium gained an executable path, which is the gap this case records";
-            continue;
-        }
-        EXPECT_FALSE(path.empty()) << Name(browser) << " has no recorded executable path";
-        EXPECT_TRUE(path.is_absolute()) << Name(browser) << ": '" << path.string() << "'";
+        if (path.empty()) continue;
+        EXPECT_TRUE(path.is_absolute()) << Name(browser);
+        EXPECT_TRUE(std::filesystem::is_regular_file(path)) << Name(browser) << ": " << path.string();
     }
+}
+
+TEST(CleanerBrowserPaths, APerUserInstallIsFound) {
+    // Chromium's only install form is per-user; Vivaldi and Opera default to per-user too.
+    ScopedLocalAppData lad;
+    const auto chromium = lad.Plant(L"Chromium\\Application\\chrome.exe");
+    const auto vivaldi = lad.Plant(L"Vivaldi\\Application\\vivaldi.exe");
+    std::error_code ec;
+    EXPECT_TRUE(std::filesystem::equivalent(chromium, GetBrowserPath(BrowserType::Chromium), ec));
+    EXPECT_TRUE(std::filesystem::equivalent(vivaldi, GetBrowserPath(BrowserType::Vivaldi), ec));
+}
+
+TEST(CleanerBrowserPaths, ChromiumIsNotMistakenForGoogleChrome) {
+    // Chromium runs as chrome.exe. Detection must match the image path, or IsBrowserRunning(Chromium)
+    // would answer for Chrome and CloseBrowser(Chromium) would terminate it. A Chromium executable
+    // that is not running cannot be running, whatever chrome.exe processes exist.
+    ScopedLocalAppData lad;
+    (void)lad.Plant(L"Chromium\\Application\\chrome.exe");
+    EXPECT_FALSE(IsBrowserRunning(BrowserType::Chromium));
+}
+
+TEST(BrowserLocator, EveryBrowserHasEnvironmentAnchoredCandidates) {
+    using ShadowStrike::Utils::Browser::ExecutablePathPatterns;
+    using ShadowStrike::Utils::Browser::ImagePathMatchRequired;
+    using ShadowStrike::Utils::Browser::InstalledBrowser;
+    using ShadowStrike::Utils::Browser::ProcessImageName;
+    for (const auto b : {InstalledBrowser::Chrome, InstalledBrowser::Edge, InstalledBrowser::Firefox,
+                         InstalledBrowser::Opera, InstalledBrowser::Brave, InstalledBrowser::Vivaldi,
+                         InstalledBrowser::Chromium}) {
+        const auto patterns = ExecutablePathPatterns(b);
+        EXPECT_GE(patterns.size(), 2u);
+        for (const auto p : patterns) {
+            EXPECT_EQ(L'%', p.front()) << "a candidate not anchored on a known folder is a relative guess";
+            EXPECT_TRUE(p.ends_with(L".exe"));
+        }
+        EXPECT_FALSE(ProcessImageName(b).empty());
+        EXPECT_EQ(b == InstalledBrowser::Chromium, ImagePathMatchRequired(b))
+            << "only an image name shared with another browser needs a path match";
+    }
+    EXPECT_EQ(ProcessImageName(InstalledBrowser::Chrome), ProcessImageName(InstalledBrowser::Chromium));
 }
 
 TEST(CleanerBrowserPaths, TheRunningCheckAnswersWithoutThrowing) {
