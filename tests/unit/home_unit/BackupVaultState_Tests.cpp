@@ -20,8 +20,7 @@
  * So the invariants pinned here are coverage, strict monotonicity, and the size bounds, checked over
  * incompressible data, uniform data and every size around the minimum.
  *
- * RabinFingerprint is a public exported function with no caller anywhere in the tree - the chunker uses a
- * gear hash instead - so these are the only cases that exercise it. Pinned because it is public API.
+ * The chunking algorithm choice is pinned in BackupChunking_Tests.cpp (task 303).
  *
  * The vault predicates are pinned only for the states reachable without a real encrypted vault on disk.
  * That is deliberately narrow: what matters and is cheap to guarantee is that they never contradict each

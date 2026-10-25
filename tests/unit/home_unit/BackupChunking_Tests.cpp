@@ -20,8 +20,8 @@
  * So the invariants pinned here are coverage, strict monotonicity, and the size bounds, checked over
  * incompressible data, uniform data and every size around the minimum.
  *
- * RabinFingerprint is a public exported function with no caller anywhere in the tree - the chunker uses a
- * gear hash instead - so these are the only cases that exercise it. Pinned because it is public API.
+ * ChunkingAlgorithm offers exactly what the chunker implements, Fixed and FastCDC (task 303). RabinKarp,
+ * Buzhash and Gear were accepted and silently chunked as FastCDC, and the uncalled RabinFingerprint is gone.
  *
  * The vault predicates are pinned only for the states reachable without a real encrypted vault on disk.
  * That is deliberately narrow: what matters and is cheap to guarantee is that they never contradict each
@@ -49,7 +49,8 @@ namespace {
 
 using ShadowStrike::Backup::ChunkingOptions;
 using ShadowStrike::Backup::FindChunkBoundaries;
-using ShadowStrike::Backup::RabinFingerprint;
+using ShadowStrike::Backup::ChunkingAlgorithm;
+using ShadowStrike::Backup::GetChunkingAlgorithmName;
 
 // A deterministic byte sequence with no structure a chunker could exploit. A fixed 64-bit LCG rather than
 // std::mt19937 with a random seed, so a failure is reproducible.
@@ -181,32 +182,21 @@ TEST(BackupChunking, ContentDefinedBoundariesSurviveAnInsertionAtTheFront) {
 }
 
 // ============================================================================
-// RabinFingerprint - public, and called by nothing else in the tree
+// The algorithm choice (task 303)
 // ============================================================================
 
-TEST(BackupRabinFingerprint, IsDeterministicAndOrderSensitive) {
-    const std::vector<uint8_t> forward{1u, 2u, 3u, 4u, 5u};
-    const std::vector<uint8_t> backward{5u, 4u, 3u, 2u, 1u};
-
-    EXPECT_EQ(RabinFingerprint(forward), RabinFingerprint(forward)) << "deterministic";
-    EXPECT_NE(RabinFingerprint(forward), RabinFingerprint(backward))
-        << "a hash used to place chunk boundaries must depend on byte order";
-
-    const std::vector<uint8_t> empty;
-    EXPECT_EQ(0u, RabinFingerprint(empty)) << "the identity for an empty span";
-}
-
-TEST(BackupRabinFingerprint, DistinguishesSingleByteInputs) {
-    // Non-vacuity: a constant function would satisfy determinism above.
-    std::vector<uint64_t> seen;
-    for (int value = 0; value < 64; ++value) {
-        const std::vector<uint8_t> one{static_cast<uint8_t>(value)};
-        seen.push_back(RabinFingerprint(one));
+TEST(BackupChunkingAlgorithm, OnlyImplementedAlgorithmsAreValid) {
+    ChunkingOptions options;
+    options.algorithm = ChunkingAlgorithm::Fixed;
+    EXPECT_TRUE(options.IsValid());
+    options.algorithm = ChunkingAlgorithm::FastCDC;
+    EXPECT_TRUE(options.IsValid());
+    for (const uint8_t removed : {1u, 2u, 4u, 200u}) {   // RabinKarp, Buzhash, Gear, junk
+        options.algorithm = static_cast<ChunkingAlgorithm>(removed);
+        EXPECT_FALSE(options.IsValid()) << "value " << int{removed} << " is not an implemented algorithm";
     }
-    const std::size_t before = seen.size();
-    std::sort(seen.begin(), seen.end());
-    seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
-    EXPECT_EQ(before, seen.size()) << "64 distinct bytes produced a collision among single-byte inputs";
+    EXPECT_EQ("Fixed", GetChunkingAlgorithmName(ChunkingAlgorithm::Fixed));
+    EXPECT_EQ("FastCDC", GetChunkingAlgorithmName(ChunkingAlgorithm::FastCDC));
 }
 
 }  // namespace

@@ -161,8 +161,6 @@ namespace IncrementalConstants {
     /// @brief Hash table size for dedup
     inline constexpr size_t DEDUP_HASH_TABLE_SIZE = 1 << 20;      // 1M entries
     
-    /// @brief Rabin fingerprint polynomial
-    inline constexpr uint64_t RABIN_POLYNOMIAL = 0x3DA3358B4DC173;
     
     /// @brief Rolling hash window size
     inline constexpr size_t ROLLING_WINDOW_SIZE = 64;
@@ -187,10 +185,10 @@ namespace fs = std::filesystem;
  */
 enum class ChunkingAlgorithm : uint8_t {
     Fixed           = 0,    ///< Fixed-size blocks
-    RabinKarp       = 1,    ///< Rabin-Karp rolling hash
-    Buzhash         = 2,    ///< Buzhash algorithm
-    FastCDC         = 3,    ///< FastCDC algorithm
-    Gear            = 4     ///< Gear-based CDC
+    FastCDC         = 3     ///< Content-defined: gear hash with normalised chunking
+    // RabinKarp (1), Buzhash (2) and Gear (4) were removed (task 303): the chunker
+    // ran FastCDC for all three while reporting the name chosen. The values are
+    // not reused; nothing persists this enum.
 };
 
 /**
@@ -765,9 +763,6 @@ private:
 [[nodiscard]] std::string_view GetChunkHashAlgorithmName(ChunkHashAlgorithm algorithm) noexcept;
 [[nodiscard]] std::string_view GetChangeTypeName(ChangeType type) noexcept;
 [[nodiscard]] std::string_view GetSyncStatusName(SyncStatus status) noexcept;
-
-/// @brief Calculate Rabin fingerprint
-[[nodiscard]] uint64_t RabinFingerprint(std::span<const uint8_t> data);
 
 /// @brief Calculate content hash
 [[nodiscard]] std::array<uint8_t, 32> CalculateChunkHash(

@@ -243,10 +243,7 @@ std::atomic<bool> IncrementalBackup::s_instanceCreated{false};
 [[nodiscard]] std::string_view GetChunkingAlgorithmName(ChunkingAlgorithm algorithm) noexcept {
     switch (algorithm) {
         case ChunkingAlgorithm::Fixed:     return "Fixed";
-        case ChunkingAlgorithm::RabinKarp: return "RabinKarp";
-        case ChunkingAlgorithm::Buzhash:   return "Buzhash";
         case ChunkingAlgorithm::FastCDC:   return "FastCDC";
-        case ChunkingAlgorithm::Gear:      return "Gear";
         default:                           return "Unknown";
     }
 }
@@ -364,6 +361,11 @@ std::string SyncProgress::ToJson() const {
 }
 
 bool ChunkingOptions::IsValid() const noexcept {
+    // An algorithm the chunker does not implement is invalid rather than silently
+    // run as another one.
+    if (algorithm != ChunkingAlgorithm::Fixed && algorithm != ChunkingAlgorithm::FastCDC) {
+        return false;
+    }
     return minChunkSize > 0 &&
            maxChunkSize >= minChunkSize &&
            avgChunkSize >= minChunkSize &&
@@ -1235,62 +1237,8 @@ public:
         return hash;
     }
 
-    // ========================================================================
-    // CHUNK BOUNDARY DETECTION
-    // ========================================================================
-
-    [[nodiscard]] std::vector<size_t> FindChunkBoundaries(
-        std::span<const uint8_t> data,
-        const ChunkingOptions& options
-    ) noexcept {
-        std::vector<size_t> boundaries;
-
-        if (data.empty()) return boundaries;
-        if (data.size() <= options.minChunkSize) {
-            boundaries.push_back(data.size());
-            return boundaries;
-        }
-
-        size_t pos = 0;
-        while (pos < data.size()) {
-            size_t remaining = data.size() - pos;
-            if (remaining <= options.minChunkSize) {
-                boundaries.push_back(data.size());
-                break;
-            }
-
-            size_t searchStart = pos + options.minChunkSize;
-            size_t searchEnd = std::min(pos + options.maxChunkSize, data.size());
-
-            // Normalised FastCDC: two masks for better average chunk size targeting
-            uint64_t fingerprint = 0;
-            size_t cutPoint = searchEnd;
-            size_t midpoint = pos + options.avgChunkSize;
-
-            uint64_t maskS = (1ULL << 15) - 1;  // strict mask (smaller chunks)
-            uint64_t maskL = (1ULL << 13) - 1;  // lenient mask (larger chunks)
-            if (options.avgChunkSize >= 65536) {
-                maskS = (1ULL << 16) - 1;
-                maskL = (1ULL << 14) - 1;
-            }
-
-            bool found = false;
-            for (size_t i = searchStart; i < searchEnd; ++i) {
-                fingerprint = (fingerprint << 1) + GEAR_MATRIX[data[i]];
-                uint64_t mask = (i < midpoint) ? maskS : maskL;
-                if ((fingerprint & mask) == 0) {
-                    cutPoint = i + 1;
-                    found = true;
-                    break;
-                }
-            }
-
-            boundaries.push_back(cutPoint);
-            pos = cutPoint;
-        }
-
-        return boundaries;
-    }
+    // Chunk boundaries: the free FindChunkBoundaries below. A member copy stood here and
+    // had drifted from it (task 303); unqualified calls in this class resolved to it.
 
     // ========================================================================
     // SETTER METHODS
@@ -2223,15 +2171,6 @@ std::string IncrementalBackup::GetVersionString() noexcept {
 // ============================================================================
 // FREE FUNCTION IMPLEMENTATIONS
 // ============================================================================
-
-uint64_t RabinFingerprint(std::span<const uint8_t> data) {
-    uint64_t fp = 0;
-    for (uint8_t byte : data) {
-        fp = (fp << 1) ^ (fp >> 63) ^
-             (static_cast<uint64_t>(byte) * IncrementalConstants::RABIN_POLYNOMIAL);
-    }
-    return fp;
-}
 
 std::array<uint8_t, 32> CalculateChunkHash(
     std::span<const uint8_t> data,
