@@ -1289,7 +1289,13 @@ PerformanceOptimizer::~PerformanceOptimizer() {
         if (m_impl->m_status != OptimizerStatus::Uninitialized &&
             m_impl->m_status != OptimizerStatus::Stopped) {
             Utils::Logger::Warn("PerformanceOptimizer already initialized");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            const auto s = m_impl->m_status.load(std::memory_order_acquire);
+            return s == OptimizerStatus::Normal || s == OptimizerStatus::Optimized ||
+                   s == OptimizerStatus::Boosted;
         }
 
         m_impl->m_status = OptimizerStatus::Initializing;

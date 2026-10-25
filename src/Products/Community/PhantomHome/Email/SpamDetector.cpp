@@ -1161,6 +1161,14 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
+            // Idempotent (task 288). Without this guard a second Initialize replaced the
+            // Bayesian classifier, the RBL checker and the reputation tracker, discarding
+            // every trained token and sender reputation while reporting success.
+            if (m_initialized) {
+                Logger::Warn("SpamDetector: Already initialized");
+                return true;
+            }
+
             Logger::Info("SpamDetector: Initializing...");
 
             if (!config.IsValid()) {

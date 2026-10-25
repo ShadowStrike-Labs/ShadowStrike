@@ -28570,5 +28570,43 @@ class SingletonDependenciesConstructedFirstTests(unittest.TestCase):
                     self.assertRegex(m.group(1), r"\b" + dep + r"::Instance\(\)", dep)
 
 
+class InitializeIsIdempotentTests(unittest.TestCase):
+    """A second Initialize on a running PhantomHome module is success (task 288).
+
+    Twelve modules logged "already initialized" and returned false, which a caller
+    cannot tell from a failure; two had no guard and rebuilt their state. Some of
+    these modules start threads in Initialize or are not linked into the unit-test
+    binary, so the rule is held here for all of them.
+    """
+
+    HOME = ROOT / "src/Products/Community/PhantomHome"
+
+    def test_no_already_initialised_branch_answers_false(self):
+        offenders = []
+        for path in sorted(self.HOME.rglob("*.cpp")):
+            src = strip_c_comments(read_source(path))
+            for m in re.finditer(r"(?i)already initiali[sz]ed[^\n]*\n(?:[ \t]*\n)*[ \t]*return false;", src):
+                offenders.append(path.name + ":" + str(src[:m.start()].count("\n") + 1))
+        self.assertEqual([], offenders)
+
+    def _guarded_before(self, rel, signature, marker):
+        src = strip_c_comments(read_source(self.HOME / rel))
+        i = src.index(signature)
+        body = src[i:i + 3000]
+        self.assertIn("if (m_initialized)", body)
+        self.assertLess(body.index("if (m_initialized)"), body.index(marker),
+                        rel + ": the re-entry guard must come before the state it protects")
+
+    def test_spam_detector_does_not_rebuild_its_classifier(self):
+        self._guarded_before("Email/SpamDetector.cpp",
+                             "bool Initialize(const SpamDetectorConfiguration& config) {",
+                             "std::make_unique<BayesianClassifier>()")
+
+    def test_outlook_scanner_does_not_reinitialise_com(self):
+        self._guarded_before("Email/OutlookScanner.cpp",
+                             "bool Initialize(const OutlookScannerConfiguration& config) {",
+                             "CoInitializeEx(")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

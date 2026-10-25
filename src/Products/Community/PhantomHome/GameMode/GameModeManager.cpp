@@ -647,7 +647,12 @@ bool GameModeManagerImpl::Initialize(const GameModeConfiguration& config) {
     try {
         if (m_initialized) {
             Utils::Logger::Warn("GameModeManager already initialized");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            const auto s = m_status.load(std::memory_order_acquire);
+            return s == GameModeStatus::Inactive || s == GameModeStatus::Active;
         }
 
         m_status = GameModeStatus::Initializing;
@@ -2255,11 +2260,6 @@ bool GameModeManager::HasInstance() noexcept {
 
 GameModeManager::GameModeManager()
     : m_impl(std::make_unique<GameModeManagerImpl>()) {
-    s_instanceCreated = true;
-}
-
-GameModeManager::~GameModeManager() {
-    s_instanceCreated = false;
     // Construct the singletons this one calls from its threads and its destructor
     // first: function-local statics are destroyed in reverse order of completed
     // construction, so they now outlive this object at process exit instead of
@@ -2267,6 +2267,11 @@ GameModeManager::~GameModeManager() {
     (void)GameProcessDetector::Instance();
     (void)OverlayProtection::Instance();
     (void)PerformanceOptimizer::Instance();
+    s_instanceCreated = true;
+}
+
+GameModeManager::~GameModeManager() {
+    s_instanceCreated = false;
 }
 
 // Forward all public methods to implementation

@@ -282,7 +282,12 @@ public:
         if (m_status != BadUSBModuleStatus::Uninitialized &&
             m_status != BadUSBModuleStatus::Stopped) {
             SS_LOG_WARN(LOG_CATEGORY, L"Already initialized or running");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            return m_status == BadUSBModuleStatus::Running ||
+                   m_status == BadUSBModuleStatus::Monitoring;
         }
 
         m_status = BadUSBModuleStatus::Initializing;

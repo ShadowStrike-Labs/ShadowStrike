@@ -28,7 +28,7 @@
  * BackupHeadersCompose_Tests.cpp); their modules belong here once their implementations are linked into
  * this binary (task 264).
  *
- * Initialize is not idempotent (filed 288): the second call returns false, indistinguishable from a genuine
+ * Initialize was not idempotent (288, fixed): the second call returned false, indistinguishable from a genuine
  * failure. So state is tested first, initialisation attempted only if needed, and the state re-checked rather
  * than the return value trusted.
  */
@@ -79,6 +79,12 @@ void ExpectSelfTestPasses(const char* moduleName, T& instance) {
     }
     ASSERT_TRUE(instance.IsInitialized())
         << moduleName << " could not be initialised, so its self-test was not reached";
+
+    // Task 288: Initialize on a running module is success, and leaves it running.
+    EXPECT_TRUE(instance.Initialize())
+        << moduleName << "::Initialize returned false on an already-initialised module, which a caller "
+                         "cannot tell from a real failure";
+    EXPECT_TRUE(instance.IsInitialized()) << moduleName << " stopped being initialised after a second Initialize";
 
     EXPECT_TRUE(instance.SelfTest())
         << moduleName << "::SelfTest returned false. Read the module's own error log line - the self-test "

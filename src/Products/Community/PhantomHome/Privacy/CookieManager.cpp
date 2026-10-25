@@ -1052,7 +1052,11 @@ bool CookieManager::Initialize(const CookieConfiguration& config) {
             m_impl->m_status != ModuleStatus::Stopped &&
             m_impl->m_status != ModuleStatus::Error) {
             Utils::Logger::Warn("CookieManager: Already initialized");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            return m_impl->m_status == ModuleStatus::Running;
         }
 
         // If recovering from a prior failed Initialize, clear residual state

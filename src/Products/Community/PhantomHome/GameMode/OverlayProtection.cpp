@@ -1700,7 +1700,12 @@ bool OverlayProtection::Initialize(const OverlayProtectionConfiguration& config)
             m_impl->m_status != OverlayProtectionStatus::Stopped &&
             m_impl->m_status != OverlayProtectionStatus::Error) {
             Utils::Logger::Warn("OverlayProtection: Already initialized");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            return m_impl->m_status == OverlayProtectionStatus::Running ||
+                   m_impl->m_status == OverlayProtectionStatus::Protected;
         }
 
         // Validate configuration

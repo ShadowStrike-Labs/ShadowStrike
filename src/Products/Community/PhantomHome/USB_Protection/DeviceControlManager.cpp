@@ -147,7 +147,11 @@ public:
         if (m_status != DCModuleStatus::Uninitialized &&
             m_status != DCModuleStatus::Stopped) {
             SS_LOG_WARN(LOG_CATEGORY, L"Already initialized or running");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            return m_status == DCModuleStatus::Running;
         }
 
         m_status = DCModuleStatus::Initializing;

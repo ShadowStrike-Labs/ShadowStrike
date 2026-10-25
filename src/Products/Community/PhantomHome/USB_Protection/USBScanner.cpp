@@ -314,7 +314,12 @@ public:
         if (m_status != ScannerModuleStatus::Uninitialized &&
             m_status != ScannerModuleStatus::Stopped) {
             SS_LOG_WARN(LOG_CATEGORY, L"USBScanner already initialized");
-            return false;
+            // Idempotent (task 288): a second Initialize on a running module is success, so a
+            // defensive second owner does not read "already initialised" as a failure. A module
+            // left in a transitional or failed state still answers false. The new configuration
+            // is NOT applied; that is UpdateConfiguration's job.
+            const auto s = m_status.load(std::memory_order_acquire);
+            return s == ScannerModuleStatus::Running || s == ScannerModuleStatus::Scanning;
         }
 
         if (!config.IsValid()) {

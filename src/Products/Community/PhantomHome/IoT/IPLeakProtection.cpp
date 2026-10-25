@@ -883,7 +883,11 @@ bool IPLeakProtectionImpl::Initialize(const IPLeakProtectionConfiguration& confi
 
             if (m_isActive) {
                 Utils::Logger::Warn("IPLeakProtection already initialized");
-                return false;
+                // Idempotent (task 288): a second Initialize on a running module is success, so a
+                // defensive second owner does not read "already initialised" as a failure. A module
+                // left in a transitional or failed state still answers false. The new configuration
+                // is NOT applied; that is UpdateConfiguration's job.
+                return true;   // m_isActive is what IsInitialized reports
             }
 
             m_status = ModuleStatus::Initializing;
@@ -2579,10 +2583,6 @@ bool IPLeakProtection::HasInstance() noexcept {
 
 IPLeakProtection::IPLeakProtection()
     : m_impl(std::make_unique<IPLeakProtectionImpl>()) {
-    s_instanceCreated = true;
-}
-
-IPLeakProtection::~IPLeakProtection() {
     // Construct the singletons this one calls from its threads and its destructor
     // first: function-local statics are destroyed in reverse order of completed
     // construction, so they now outlive this object at process exit instead of
@@ -2591,6 +2591,10 @@ IPLeakProtection::~IPLeakProtection() {
     (void)RouterSecurityChecker::Instance();
     (void)SmartHomeProtection::Instance();
     (void)WiFiSecurityAnalyzer::Instance();
+    s_instanceCreated = true;
+}
+
+IPLeakProtection::~IPLeakProtection() {
     s_instanceCreated = false;
 }
 

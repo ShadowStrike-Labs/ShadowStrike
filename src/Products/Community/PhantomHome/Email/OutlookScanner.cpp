@@ -951,6 +951,15 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
+            // Idempotent (task 288). Without this guard a second Initialize called
+            // CoInitializeEx again and overwrote the recorded apartment thread: one COM
+            // reference leaked, and from another thread Shutdown skipped the first one's
+            // CoUninitialize as a thread mismatch.
+            if (m_initialized) {
+                Logger::Warn("OutlookScanner: Already initialized");
+                return true;
+            }
+
             if (!config.IsValid()) {
                 Logger::Error("OutlookScanner: Invalid configuration");
                 return false;
@@ -2933,6 +2942,12 @@ OutlookScanner& OutlookScanner::Instance() noexcept {
 
 OutlookScanner::OutlookScanner()
     : m_impl(std::make_unique<OutlookScannerImpl>()) {
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)PhishingEmailDetector::Instance();
+    (void)SpamDetector::Instance();
     Logger::Info("OutlookScanner instance created");
 }
 
@@ -2942,12 +2957,6 @@ OutlookScanner::~OutlookScanner() {
     }
     Logger::Info("OutlookScanner instance destroyed");
 }
-    // Construct the singletons this one calls from its threads and its destructor
-    // first: function-local statics are destroyed in reverse order of completed
-    // construction, so they now outlive this object at process exit instead of
-    // being destroyed under its running threads (task 339).
-    (void)PhishingEmailDetector::Instance();
-    (void)SpamDetector::Instance();
 
 // ============================================================================
 // PUBLIC INTERFACE IMPLEMENTATION
