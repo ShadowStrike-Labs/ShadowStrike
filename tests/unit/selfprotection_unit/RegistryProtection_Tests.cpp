@@ -393,4 +393,41 @@ TEST(RegistryImageHijackTests, OnlyAPerExecutableKeyIsAnImageExecutionOptionsKey
         L"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\a.exe"));
 }
 
+// Task 243: a restore that only rewrote the baseline's values left every added value in place.
+TEST_F(RegistryProtectionLiveTest, ARestoreRemovesAValueAddedSinceTheBaseline) {
+    ScratchKey key;
+    key.SetString(L"Keep", L"1");
+    ASSERT_TRUE(Module().ProtectKey(key.Path(), KeyProtectionType::Full, true));
+    key.SetString(L"Keep", L"2");
+    key.SetString(L"Added", L"C:\\evil.exe");
+
+    ASSERT_TRUE(Module().RestoreFromSnapshot(key.Path()));
+    EXPECT_EQ(key.GetString(L"Keep"), std::optional<std::wstring>(L"1"));
+    EXPECT_FALSE(key.GetString(L"Added").has_value()) << "the value added since the baseline survived";
+    EXPECT_EQ(key.ValueCount(), 1u);
+}
+
+TEST_F(RegistryProtectionLiveTest, AnAbsentBaselineIsRestoredWithoutCreatingTheKey) {
+    ScratchKey key;
+    ASSERT_FALSE(key.Exists());
+    ASSERT_TRUE(Module().ProtectKey(key.Path(), KeyProtectionType::Full, true));
+    EXPECT_TRUE(Module().RestoreFromSnapshot(key.Path()));
+    EXPECT_FALSE(key.Exists()) << "restoring an absence manufactured the key";
+}
+
+TEST_F(RegistryProtectionLiveTest, AKeyThatAppearedLosesItsValuesAndKeepsItsSubkeys) {
+    ScratchKey key;
+    ASSERT_FALSE(key.Exists());
+    ASSERT_TRUE(Module().ProtectKey(key.Path(), KeyProtectionType::Full, true));
+    key.SetString(L"Debugger", L"C:\\evil.exe");
+    key.SetDword(L"UseFilter", 1);
+    key.SetString(L"Debugger", L"C:\\evil.exe", L"filter1");
+
+    ASSERT_TRUE(Module().RestoreFromSnapshot(key.Path()));
+    EXPECT_TRUE(key.Exists()) << "the restore deleted the key";
+    EXPECT_EQ(key.ValueCount(), 0u) << "values added after an absent baseline survived the restore";
+    EXPECT_TRUE(key.SubkeyExists(L"filter1")) << "the restore deleted a subkey";
+    EXPECT_TRUE(key.HijackValues().empty()) << "the key still redirects the image";
+}
+
 }  // namespace

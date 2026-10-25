@@ -25064,26 +25064,37 @@ class RegistryDefensiveKeyBaselineContractTests(unittest.TestCase):
             "KeySnapshot::keyExisted must default to TRUE so every snapshot taken of a "
             "key that exists keeps its meaning without being set explicitly")
 
-    def test_restore_refuses_a_baseline_that_recorded_an_absence(self):
-        """PINS ORDERING. The refusal must precede the Create call, not follow it.
+    def test_restore_of_an_absent_baseline_never_creates_the_key(self):
+        """PINS ORDERING. An absent baseline leaves the function before Create is reached.
 
-        RestoreFromSnapshot calls Create(), so restoring an absent baseline would
-        MANUFACTURE the IFEO key this module exists to keep from appearing. Restoring
-        absence would instead mean deleting the key, which is a destructive registry
-        operation needing its own design and authorization.
+        RestoreFromSnapshot calls Create(), so restoring an absent baseline through it would
+        MANUFACTURE the IFEO key this module exists to keep from appearing. Since task 243 an
+        absent baseline is restored by RestoreAbsentBaseline, which opens the key, removes the
+        values (all of them were added since) and deletes no key.
         """
         body = self._restore_body()
         self.assertTrue(
             "if (!snapshotToRestore->keyExisted) {" in body,
-            "restore no longer refuses an absent baseline, so restoring one would create "
+            "restore no longer recognises an absent baseline, so restoring one would create "
             "an IFEO key for our own executable")
-        refusal = body.index("!snapshotToRestore->keyExisted")
+        handoff = body.find("return RestoreAbsentBaseline(")
         create = body.find("regKey.Create(")
+        self.assertNotEqual(-1, handoff, "an absent baseline is no longer handed to RestoreAbsentBaseline")
         self.assertNotEqual(-1, create, "the Create call is gone; re-check this guard")
         self.assertLess(
-            refusal, create,
-            "the absent-baseline refusal must come BEFORE the key is created, otherwise "
-            "the key exists by the time the code declines to restore it")
+            handoff, create,
+            "the absent-baseline restore must return BEFORE the key is created, otherwise "
+            "the key exists by the time the baseline says it should not")
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        absent = extract_c_function(source, "RestoreAbsentBaseline")
+        self.assertIn("regKey.Open(", absent, "the absent-baseline restore no longer opens the key")
+        for forbidden in ("Create(", "RegDeleteKey", "RegDeleteTree", "DeleteKey("):
+            self.assertNotIn(
+                forbidden, absent,
+                "the absent-baseline restore now calls %s; it must neither make the key "
+                "appear nor delete it" % forbidden)
+        self.assertIn("RemoveValuesNotIn(regKey, normalized, {})", absent,
+                      "the absent-baseline restore no longer removes the values added since")
 
     def test_absence_covers_both_ways_the_registry_says_not_there(self):
         source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
@@ -29096,6 +29107,27 @@ class RegistryImageHijackIsDetectedTests(unittest.TestCase):
         self.assertIn("if (statusChanged &&", poll,
                       "the poll acts on every interval again, so a persisting violation logs and "
                       "retries forever")
+
+
+class RegistryRestoreIsSubtractiveTests(unittest.TestCase):
+    """Restoring a baseline removes the values added since it (task 243)."""
+
+    def test_restore_removes_values_before_writing_the_baseline(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        body = source[source.index("bool RestoreFromSnapshot(std::wstring_view keyPath, uint32_t version)"):]
+        body = body[:body.index("bool RestoreAbsentBaseline(")]
+        remove = body.find("RemoveValuesNotIn(regKey, normalized, keep)")
+        self.assertNotEqual(-1, remove, "restore no longer removes values the baseline did not have")
+        self.assertLess(remove, body.index("RegSetValueExW("))
+
+    def test_only_values_outside_the_baseline_are_deleted_and_each_is_logged(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        body = extract_c_function(source, "RemoveValuesNotIn")
+        self.assertIn("Utils::StringUtils::IEquals(name, value.name)", body,
+                      "value names are no longer compared case-insensitively")
+        self.assertIn("if (inBaseline) {", body)
+        self.assertIn("Restore removed a value added since the baseline", body)
+        self.assertNotIn("RegDeleteKey", body)
 
 
 if __name__ == "__main__":

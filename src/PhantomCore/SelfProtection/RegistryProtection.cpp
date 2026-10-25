@@ -1263,6 +1263,7 @@ public:
         std::vector<RestoreEntry> entriesToRestore;
         std::wstring normalized;
         uint32_t restoredVersion = 0;
+        bool baselineIsAbsence = false;
         {
             std::shared_lock lock(m_mutex);
             normalized = NormalizeKeyPath(keyPath);
@@ -1293,16 +1294,13 @@ public:
                 return false;
             }
 
-            // A baseline that recorded the key as ABSENT cannot be restored by writing.
-            // Restoring absence would mean DELETING the key, a destructive registry
-            // operation needing its own design and authorization; and Create() below
-            // would instead manufacture the very artefact this module exists to keep
-            // from appearing. Refuse, and say so.
+            // A baseline that recorded the key as ABSENT is restored without Create(),
+            // which would manufacture the very artefact this module exists to keep from
+            // appearing, and without deleting the key, which takes its subkeys with it.
+            // RestoreAbsentBaseline removes the values instead: a baseline with no key
+            // had no values, so every value present was added since.
             if (!snapshotToRestore->keyExisted) {
-                SS_LOG_WARN(LOG_CATEGORY,
-                    L"Refusing to restore a baseline that recorded the key as absent:"
-                    L" %ls (version=%u)", normalized.c_str(), snapshotToRestore->version);
-                return false;
+                baselineIsAbsence = true;
             }
 
             restoredVersion = snapshotToRestore->version;
@@ -1329,6 +1327,10 @@ public:
             return false;
         }
 
+        if (baselineIsAbsence) {
+            return RestoreAbsentBaseline(normalized, rootKey, subKey, restoredVersion);
+        }
+
         Utils::RegistryUtils::RegistryKey regKey;
         Utils::RegistryUtils::OpenOptions opts;
         opts.access = KEY_ALL_ACCESS;
@@ -1338,7 +1340,16 @@ public:
             return false;
         }
 
-        bool success = true;
+        // A restore that only rewrites the baseline's values is a merge: a value added
+        // since - a Debugger, a Run entry - survives it while the log says "restored"
+        // (task 243). Remove every value the baseline did not have, by name, first.
+        std::vector<std::wstring> keep;
+        keep.reserve(entriesToRestore.size());
+        for (const auto& entry : entriesToRestore) {
+            keep.push_back(entry.name);
+        }
+        bool success = RemoveValuesNotIn(regKey, normalized, keep);
+
         for (const auto& entry : entriesToRestore) {
             const LSTATUS st = RegSetValueExW(regKey.Handle(), entry.name.c_str(), 0,
                 static_cast<DWORD>(entry.type), entry.data.data(),
@@ -1357,6 +1368,77 @@ public:
                 normalized.c_str(), restoredVersion);
         }
 
+        return success;
+    }
+
+    // Restores a baseline that recorded the key as absent. The key is opened, never
+    // created: when it is still absent there is nothing to restore. When it has
+    // appeared, its values are removed - every one was added since - and the key and
+    // its subkeys are left in place. Without the values of the key itself, an Image
+    // File Execution Options key has no Debugger, no VerifierDlls and no UseFilter, so
+    // nothing below it is consulted either.
+    [[nodiscard]] bool RestoreAbsentBaseline(const std::wstring& normalized, HKEY rootKey,
+                                             const std::wstring& subKey, uint32_t version) {
+        Utils::RegistryUtils::RegistryKey regKey;
+        Utils::RegistryUtils::OpenOptions opts;
+        opts.access = KEY_QUERY_VALUE | KEY_SET_VALUE;
+        Utils::RegistryUtils::Error openErr;
+        if (!regKey.Open(rootKey, subKey, opts, &openErr)) {
+            if (IsKeyAbsentError(openErr.win32)) {
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"Snapshot restored for: %ls (version=%u, key absent as in the baseline)",
+                    normalized.c_str(), version);
+                m_stats.snapshotsRestored.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to open key for restore: %ls (win32=%lu %ls)",
+                normalized.c_str(), openErr.win32, DescribeKeyOpenError(openErr.win32));
+            return false;
+        }
+
+        const bool success = RemoveValuesNotIn(regKey, normalized, {});
+        if (success) {
+            m_stats.snapshotsRestored.fetch_add(1, std::memory_order_relaxed);
+            SS_LOG_INFO(LOG_CATEGORY,
+                L"Snapshot restored for: %ls (version=%u, baseline had no key; values removed,"
+                L" key kept)", normalized.c_str(), version);
+        }
+        return success;
+    }
+
+    // Deletes every value of an open key whose name is not in keep. Registry value names
+    // are case-insensitive, so the comparison is too. Each deletion is logged with its
+    // name, because it removes data the restore did not write.
+    [[nodiscard]] bool RemoveValuesNotIn(Utils::RegistryUtils::RegistryKey& regKey,
+                                         const std::wstring& normalized,
+                                         const std::vector<std::wstring>& keep) {
+        std::vector<Utils::RegistryUtils::ValueInfo> current;
+        Utils::RegistryUtils::Error enumErr;
+        if (!regKey.EnumValues(current, &enumErr)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Cannot list values for restore: %ls (win32=%lu)",
+                normalized.c_str(), enumErr.win32);
+            return false;
+        }
+
+        bool success = true;
+        for (const auto& value : current) {
+            const bool inBaseline = std::any_of(keep.begin(), keep.end(),
+                [&](const std::wstring& name) {
+                    return Utils::StringUtils::IEquals(name, value.name);
+                });
+            if (inBaseline) {
+                continue;
+            }
+            const LSTATUS st = RegDeleteValueW(regKey.Handle(), value.name.c_str());
+            if (st == ERROR_SUCCESS || st == ERROR_FILE_NOT_FOUND) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Restore removed a value added since the baseline: %ls\\%ls",
+                    normalized.c_str(), value.name.c_str());
+            } else {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to remove value during restore: %ls\\%ls (error=%lu)",
+                    normalized.c_str(), value.name.c_str(), st);
+                success = false;
+            }
+        }
         return success;
     }
 
