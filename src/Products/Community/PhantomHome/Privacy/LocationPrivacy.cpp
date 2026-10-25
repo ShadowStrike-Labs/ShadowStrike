@@ -1662,7 +1662,9 @@ bool LocationPrivacyImpl::SelfTest() {
         }
         Utils::Logger::Info("[OK] Geofence containment test passed");
 
-        // Test 5: Mock location
+        // Test 5: Mock location. A self-test reads live state and never changes it (task 341): a mock location the
+        // user had set is restored rather than cleared.
+        const auto priorMock = GetMockLocation();
         SetMockLocation(testLoc);
         auto mockLoc = GetMockLocation();
         if (!mockLoc.has_value()) {
@@ -1673,7 +1675,11 @@ bool LocationPrivacyImpl::SelfTest() {
 
         // Cleanup
         (void)RemoveGeofence(testRegion.regionId);
-        ClearMockLocation();
+        if (priorMock.has_value()) {
+            SetMockLocation(*priorMock);
+        } else {
+            ClearMockLocation();
+        }
 
         Utils::Logger::Info("All LocationPrivacy self-tests passed!");
         return true;

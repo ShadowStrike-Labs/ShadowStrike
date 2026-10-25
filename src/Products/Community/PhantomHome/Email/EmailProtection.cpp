@@ -3509,17 +3509,23 @@ bool EmailProtection::SelfTest() {
     Utils::Logger::Info("EmailProtection: Running self-test...");
 
     try {
-        // Test 1: Initialization
+        // Test 1: Initialization. A self-test reads live state and never changes it (task 341): a running module
+        // keeps its configuration; one the self-test started is shut down again.
         EmailProtectionConfiguration config;
         config.enabled = true;
         config.scanAttachments = true;
         config.detectPhishing = true;
         config.detectSpam = true;
 
-        if (!Initialize(config)) {
+        const bool wasInitialized = IsInitialized();
+        if (!wasInitialized && !Initialize(config)) {
             Utils::Logger::Error("EmailProtection: Self-test failed - Initialization");
             return false;
         }
+        struct ShutdownIfStarted {
+            EmailProtection& self; bool started;
+            ~ShutdownIfStarted() { if (started) self.Shutdown(); }
+        } restore{*this, !wasInitialized};
 
         // Test 2: Email parsing
         EmailMessage testMessage;

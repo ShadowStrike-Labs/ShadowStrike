@@ -1921,33 +1921,9 @@ bool WebcamProtector::SelfTest() {
             }
         }
 
-        // Test 4: Camera block/unblock (restores original state)
-        {
-            bool wasBlocked = IsCameraBlocked();
-            if (!SetCameraBlocked(true)) {
-                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - SetCameraBlocked(true)");
-                return false;
-            }
-            if (!IsCameraBlocked()) {
-                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - block camera");
-                (void)SetCameraBlocked(wasBlocked);
-                return false;
-            }
-            if (!SetCameraBlocked(false)) {
-                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - SetCameraBlocked(false)");
-                (void)SetCameraBlocked(wasBlocked);
-                return false;
-            }
-            if (IsCameraBlocked()) {
-                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - unblock camera");
-                (void)SetCameraBlocked(wasBlocked);
-                return false;
-            }
-            if (!SetCameraBlocked(wasBlocked)) {
-                SS_LOG_WARN(L"WebcamProtector",
-                    L"Self-test: failed to restore prior blocked state");
-            }
-        }
+        // Test 4 (camera block/unblock) was removed: A self-test reads live state and never changes it (task 341).
+        // It restored the prior state, but between the calls a camera the user had
+        // blocked was UNBLOCKED, which a self-test must never do.
 
         // Test 5: Statistics snapshot
         {

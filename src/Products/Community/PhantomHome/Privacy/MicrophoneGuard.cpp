@@ -2301,27 +2301,14 @@ bool MicrophoneGuard::SelfTest() {
             return false;
         }
 
-        // Test 5: Protection control
-        if (!SetGlobalMute(true)) {
-            Utils::Logger::Error("MicrophoneGuard: Self-test failed - SetGlobalMute(true)");
-            return false;
-        }
-        if (!IsGloballyMuted()) {
-            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Global mute");
-            return false;
-        }
+        // A self-test reads live state and never changes it (task 341). The global-mute toggle is gone: it set
+        // mute and then UNMUTE unconditionally, so a self-test silently undid a user's
+        // global microphone mute. Statistics are no longer reset and the default trusted
+        // apps are no longer re-imported (that re-added entries a user had removed).
 
-        if (!SetGlobalMute(false)) {
-            Utils::Logger::Error("MicrophoneGuard: Self-test failed - SetGlobalMute(false)");
-            return false;
-        }
-        if (IsGloballyMuted()) {
-            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Global unmute");
-            return false;
-        }
-
-        // Test 6: Process blocking
-        uint32_t testPid = GetCurrentProcessId();
+        // Test 6: Process blocking, on a PID no process can have: Windows PIDs are
+        // multiples of four, so an odd PID is never live and never already blocked.
+        constexpr uint32_t testPid = 0x7FFFFFFF;
         if (!BlockAudioForProcess(testPid)) {
             Utils::Logger::Error("MicrophoneGuard: Self-test failed - Block process");
             return false;
@@ -2332,18 +2319,12 @@ bool MicrophoneGuard::SelfTest() {
             return false;
         }
 
-        // Test 7: Statistics
-        auto stats = GetStatistics();
-        ResetStatistics();
-        stats = GetStatistics();
-        if (stats.totalAccessAttempts != 0) {
-            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Statistics reset");
-            return false;
-        }
+        // Test 7: Statistics are readable.
+        (void)GetStatistics();
 
-        // Test 8: Default trusted apps
-        if (!ImportDefaultTrustedApps()) {
-            Utils::Logger::Error("MicrophoneGuard: Self-test failed - Import default apps");
+        // Test 8: The default trusted-app list exists (read, not imported).
+        if (std::size(MicrophoneConstants::DEFAULT_TRUSTED_APPS) == 0) {
+            Utils::Logger::Error("MicrophoneGuard: Self-test failed - no default trusted apps");
             return false;
         }
 

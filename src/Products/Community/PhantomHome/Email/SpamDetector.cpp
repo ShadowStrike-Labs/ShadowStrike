@@ -1815,9 +1815,23 @@ public:
                 return false;
             }
 
-            // Test training
-            MarkAsSpam("Buy cheap viagra pills online now!");
-            MarkAsHam("Meeting scheduled for tomorrow at 10 AM");
+            // Test training on a PRIVATE classifier. A self-test reads live state and never changes it (task 341):
+            // MarkAsSpam/MarkAsHam trained the user's live model with these samples on
+            // every run and fired the training callbacks.
+            {
+                BayesianClassifier scratch;
+                for (int i = 0; i < 3; ++i) {
+                    scratch.LearnSpam(TokenizeText("buy cheap pills online now", false));
+                    scratch.LearnHam(TokenizeText("meeting scheduled tomorrow morning", false));
+                }
+                std::vector<std::pair<std::string, double>> top;
+                const double spamP = scratch.ClassifyProbability(TokenizeText("cheap pills now", false), top);
+                const double hamP = scratch.ClassifyProbability(TokenizeText("meeting tomorrow", false), top);
+                if (!(spamP > hamP)) {
+                    Logger::Error("SelfTest: the Bayesian classifier does not separate spam from ham");
+                    return false;
+                }
+            }
 
             // Test analysis
             auto result = Analyze(

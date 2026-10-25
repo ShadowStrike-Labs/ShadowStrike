@@ -1475,12 +1475,8 @@ public:
             return false;
         }
 
-        // 4. Verify clipboard access
-        if (::OpenClipboard(nullptr)) {
-            ::CloseClipboard();
-        } else {
-            SS_LOG_WARN(LOG_CATEGORY, L"Self-test WARNING: clipboard access unavailable");
-        }
+        // A clipboard probe stood here: it took the system clipboard (making other
+        // applications' OpenClipboard fail meanwhile) and asserted nothing (task 341).
 
         SS_LOG_INFO(LOG_CATEGORY, L"Self-test PASSED (pid=%u, name=%s)",
                     ownPid, ownName.value().c_str());

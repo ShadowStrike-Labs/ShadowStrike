@@ -2404,20 +2404,31 @@ bool PrivacyCleanerImpl::SelfTest() {
         // Test 1: Secure erase single pass
         {
             std::error_code ec;
-            fs::path testFile = fs::temp_directory_path(ec) / "shadowstrike_test_erase.tmp";
+            const fs::path tempDir = fs::temp_directory_path(ec);
             if (ec) {
                 SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test: cannot get temp directory");
                 return false;
             }
 
             {
-                std::ofstream file(testFile, std::ios::binary);
-                if (!file) {
+                std::random_device rd;
+                const auto tag = std::format(L"ss_selftest_{:08x}{:08x}.tmp", rd(), rd());
+                testFile = tempDir / tag;
+                const HANDLE h = ::CreateFileW(testFile.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                               FILE_ATTRIBUTE_TEMPORARY, nullptr);
+                if (h == INVALID_HANDLE_VALUE) {
                     SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test: cannot create test file");
                     return false;
                 }
-                file << "Test data for secure erase";
-                file.close();
+                static constexpr char kData[] = "Test data for secure erase";
+                DWORD written = 0;
+                const BOOL ok = ::WriteFile(h, kData, sizeof(kData) - 1, &written, nullptr);
+                ::CloseHandle(h);
+                if (!ok || written != sizeof(kData) - 1) {
+                    fs::remove(testFile, ec);
+                    SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test: cannot write test file");
+                    return false;
+                }
             }
 
             if (!SecureEraseFile(testFile, SecureEraseMethod::SinglePass)) {
@@ -2440,6 +2451,12 @@ bool PrivacyCleanerImpl::SelfTest() {
         }
 
         // Test 3: Preserved domain management
+            // A FRESH file, created exclusively under a random name (task 341). The fixed
+            // name was opened with truncation in the temp directory, which other users can
+            // write to as well: a pre-planted hard link or symlink of that name would have
+            // had a privileged caller overwrite, then securely erase, the file it pointed
+            // at. CREATE_NEW refuses any existing name, links included.
+            fs::path testFile;
         {
             const std::string testDomain = "selftest.shadowstrike.internal";
             AddPreservedDomain(testDomain);

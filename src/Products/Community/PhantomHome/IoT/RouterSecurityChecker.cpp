@@ -2349,16 +2349,23 @@ bool RouterSecurityChecker::SelfTest() {
     try {
         ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: Starting self-test");
 
-        // Test 1: Initialization
+        // Test 1: Initialization. A self-test reads live state and never changes it (task 341): a running checker
+        // keeps its configuration, and one the self-test started is shut down again,
+        // as PoolConnectionDetector::SelfTest does.
         RouterCheckerConfiguration config;
         config.enabled = true;
         config.autoAssessOnStartup = false;
         config.defaultAssessmentConfig.timeoutMs = 10000;
 
-        if (!Initialize(config)) {
+        const bool wasInitialized = IsInitialized();
+        if (!wasInitialized && !Initialize(config)) {
             ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test failed - Initialization");
             return false;
         }
+        struct ShutdownIfStarted {
+            RouterSecurityChecker& self; bool started;
+            ~ShutdownIfStarted() { if (started) self.Shutdown(); }
+        } restore{*this, !wasInitialized};
 
         // Test 2: Configuration validation
         if (!config.IsValid()) {
@@ -2378,13 +2385,8 @@ bool RouterSecurityChecker::SelfTest() {
             ::ShadowStrike::Utils::Logger::Info("RouterSecurityChecker: DNS servers: {}", dnsServers.size());
         }
 
-        // Test 5: Statistics
-        ResetStatistics();
-        auto stats = GetStatistics();
-        if (stats.totalAssessments.load() != 0) {
-            ::ShadowStrike::Utils::Logger::Error("RouterSecurityChecker: Self-test failed - Statistics reset");
-            return false;
-        }
+        // Test 5: Statistics are readable (no longer reset: that erased live counters).
+        (void)GetStatistics();
 
         // Test 6: Default credentials database
         auto credDb = GetDefaultCredentialsDatabase();

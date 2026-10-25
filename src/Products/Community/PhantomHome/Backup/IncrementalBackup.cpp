@@ -1107,6 +1107,19 @@ public:
         return true;
     }
 
+    /// Undo one AddChunkToIndex reference; erase the entry if the reference created it.
+    void ReleaseChunkReference(const std::array<uint8_t, 32>& hash, bool existedBefore) noexcept {
+        std::unique_lock lock(m_dedupMutex);
+        const auto it = m_dedupIndex.find(hash);
+        if (it == m_dedupIndex.end()) return;
+        if (!existedBefore) {
+            m_dedupIndex.erase(it);
+            m_stats.uniqueChunks.fetch_sub(1, std::memory_order_relaxed);
+        } else if (it->second.refCount > 1) {
+            it->second.refCount--;
+        }
+    }
+
     [[nodiscard]] bool ChunkExists(const std::array<uint8_t, 32>& hash) noexcept {
         std::shared_lock lock(m_dedupMutex);
         return m_dedupIndex.count(hash) > 0;
@@ -2141,7 +2154,13 @@ bool IncrementalBackup::SelfTest() {
         return false;
     }
 
-    // Test dedup
+    // Test dedup, and take the test reference back out: the index is persisted, and a
+    // self-test entry would claim a chunk is stored that never was (task 341).
+    const bool chunkWasIndexed = ChunkExists(chunks[0].hash);
+    struct RemoveTestReference {
+        IncrementalBackupImpl& self; std::array<uint8_t, 32> hash; bool wasIndexed;
+        ~RemoveTestReference() { self.ReleaseChunkReference(hash, wasIndexed); }
+    } releaseTestChunk{*m_impl, chunks[0].hash, chunkWasIndexed};
     if (!AddChunkToIndex(chunks[0])) {
         SS_LOG_ERROR(LOG_CATEGORY, L"Self-test FAILED: AddChunkToIndex returned false");
         return false;

@@ -2337,6 +2337,8 @@ bool CookieManager::SelfTest() {
             std::string baseDomain = GetBaseDomain(".example.com");
             if (baseDomain != "example.com") {
                 Utils::Logger::Error("CookieManager: Self-test failed (base domain)");
+            // An id and a reserved .invalid domain no user entry can carry, so the
+            // round trip cannot overwrite or remove a real whitelist entry (task 341).
                 return false;
             }
         }
@@ -2344,8 +2346,8 @@ bool CookieManager::SelfTest() {
         // Test 4: Whitelist
         {
             CookieWhitelistEntry entry;
-            entry.entryId = "TEST-001";
-            entry.domainPattern = "test.com";
+            entry.entryId = "__SS_SELFTEST__";
+            entry.domainPattern = "selftest.invalid";
             entry.enabled = true;
 
             if (!AddToWhitelist(entry)) {
@@ -2353,12 +2355,12 @@ bool CookieManager::SelfTest() {
                 return false;
             }
 
-            if (!IsDomainWhitelisted("test.com")) {
+            if (!IsDomainWhitelisted("selftest.invalid")) {
                 Utils::Logger::Error("CookieManager: Self-test failed (whitelist check)");
                 return false;
             }
 
-            if (!RemoveFromWhitelist("TEST-001")) {
+            if (!RemoveFromWhitelist("__SS_SELFTEST__")) {
                 Utils::Logger::Error("CookieManager: Self-test failed (whitelist remove)");
                 return false;
             }

@@ -28608,5 +28608,45 @@ class InitializeIsIdempotentTests(unittest.TestCase):
                              "CoInitializeEx(")
 
 
+class SelfTestsDoNotChangeLiveStateTests(unittest.TestCase):
+    """A module SelfTest reads live state and never changes it (tasks 338, 341).
+
+    Measured: BadUSB's killed shells, MicrophoneGuard's unmuted a muted microphone,
+    WebcamProtector's unblocked a blocked camera, SpamDetector's trained the live model,
+    and PrivacyCleaner's opened a fixed name in the shared temp directory with truncation.
+    """
+
+    HOME = ROOT / "src/Products/Community/PhantomHome"
+    FORBIDDEN = {
+        "Privacy/MicrophoneGuard.cpp": [r"SetGlobalMute\(", r"ResetStatistics\(\)", r"ImportDefaultTrustedApps\(\)"],
+        "Privacy/WebCamProtector.cpp": [r"SetCameraBlocked\("],
+        "Email/SpamDetector.cpp": [r"MarkAsSpam\(", r"MarkAsHam\("],
+        "IoT/RouterSecurityChecker.cpp": [r"ResetStatistics\(\)"],
+        "Banking/KeyloggerProtection.cpp": [r"OpenClipboard\("],
+        "Privacy/PrivacyCleaner.cpp": [r"shadowstrike_test_erase", r"std::ofstream"],
+    }
+
+    @staticmethod
+    def _self_test_bodies(src):
+        for m in re.finditer(r"bool\s+(?:\w+::)?SelfTest\s*\(\s*\)\s*(?:const\s*)?(?:noexcept\s*)?\{", src):
+            i, depth = m.end(), 1
+            while depth and i < len(src):
+                depth += {"{": 1, "}": -1}.get(src[i], 0)
+                i += 1
+            yield src[m.end():i]
+
+    def test_no_live_state_mutation_in_a_self_test(self):
+        for rel, patterns in self.FORBIDDEN.items():
+            bodies = "\n".join(self._self_test_bodies(strip_c_comments(read_source(self.HOME / rel))))
+            self.assertTrue(bodies, rel + ": SelfTest not found")
+            for pattern in patterns:
+                with self.subTest(rel=rel, pattern=pattern):
+                    self.assertIsNone(re.search(pattern, bodies))
+
+    def test_the_cleaner_self_test_creates_its_file_exclusively(self):
+        bodies = "\n".join(self._self_test_bodies(strip_c_comments(read_source(self.HOME / "Privacy/PrivacyCleaner.cpp"))))
+        self.assertIn("CREATE_NEW", bodies)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
