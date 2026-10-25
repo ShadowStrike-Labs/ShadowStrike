@@ -1240,6 +1240,16 @@ bool ThreatIntelFeedManager::Config::Validate(std::string* errorMsg) const {
         return false;
     }
     
+    if (initialSyncDelaySeconds > 3600) {
+        if (errorMsg) *errorMsg = "initialSyncDelaySeconds too high (max 3600)";
+        return false;
+    }
+    
+    if (failedSyncRetrySeconds < 30 || failedSyncRetrySeconds > 86400) {
+        if (errorMsg) *errorMsg = "failedSyncRetrySeconds out of range (30-86400)";
+        return false;
+    }
+    
     return true;
 }
 
@@ -1502,12 +1512,13 @@ bool ThreatIntelFeedManager::Start() {
         return false;
     }
     
-    // Schedule initial sync for all enabled feeds
+    // Schedule the first sync of every enabled feed shortly after start, not one full
+    // interval out: a service restarted more often than its shortest interval never synced.
     {
         std::shared_lock<std::shared_mutex> lock(m_feedsMutex);
         for (const auto& [feedId, context] : m_feeds) {
             if (context && context->config.enabled) {
-                ScheduleNextSync(*context);
+                ScheduleInitialSync(*context);
             }
         }
     }
@@ -1779,7 +1790,7 @@ bool ThreatIntelFeedManager::AddFeed(const ThreatFeedConfig& config) {
             std::shared_lock<std::shared_mutex> readLock(m_feedsMutex);
             auto it = m_feeds.find(feedId);
             if (it != m_feeds.end() && it->second) {
-                ScheduleNextSync(*it->second);
+                ScheduleInitialSync(*it->second);
             }
         }
         
@@ -2013,7 +2024,7 @@ bool ThreatIntelFeedManager::EnableFeed(const std::string& feedId) {
     if (m_running.load(std::memory_order_acquire) && ctx) {
         // Safe: shared_ptr ownership guarantees the context is alive even if
         // RemoveFeed has erased the map entry concurrently.
-        ScheduleNextSync(*ctx);
+        ScheduleInitialSync(*ctx);
     }
     
     return true;
@@ -3257,8 +3268,42 @@ SyncResult ThreatIntelFeedManager::ExecuteSync(
         EmitEvent(FeedEventType::SyncFailed, context.config.feedId, e.what());
     }
     
-    // Schedule next sync
-    ScheduleNextSync(context);
+    // A failure is retried within minutes; a success waits the feed's full interval.
+    if (result.success) {
+        ScheduleNextSync(context);
+    } else {
+        ScheduleRetryAfterFailure(context);
+    }
+    
+    // Every outcome is logged: a feed that never syncs was indistinguishable in the
+    // field from one that had not reached its interval yet (task 259).
+    {
+        const uint64_t next = context.stats.nextScheduledSync.load(std::memory_order_acquire);
+        const uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
+        const unsigned long long inSeconds = next > now ? static_cast<unsigned long long>(next - now) : 0ULL;
+        if (result.success) {
+            SS_LOG_INFO(L"ThreatIntelFeedManager",
+                        L"Feed '%S' synced: %llu fetched, %llu new, %llu updated, %llu dropped, %llu bytes, %llu ms; next in %llu s",
+                        context.config.feedId.c_str(),
+                        static_cast<unsigned long long>(result.totalFetched),
+                        static_cast<unsigned long long>(result.newIOCs),
+                        static_cast<unsigned long long>(result.updatedIOCs),
+                        static_cast<unsigned long long>(result.invalidIOCs),
+                        static_cast<unsigned long long>(result.bytesDownloaded),
+                        static_cast<unsigned long long>(result.durationMs), inSeconds);
+        } else {
+            // An endpoint that carries its credential in the URL may echo it in an error,
+            // so only the status code is logged for those.
+            const bool urlHasSecret = context.config.endpoint.pathContainsCredentials ||
+                                      context.config.auth.apiKeyInQuery;
+            SS_LOG_WARN(L"ThreatIntelFeedManager",
+                        L"Feed '%S' sync failed (status %S): %S; retry in %llu s",
+                        context.config.feedId.c_str(),
+                        result.errorCode.empty() ? "-" : result.errorCode.c_str(),
+                        urlHasSecret ? "detail withheld (credential-bearing URL)" : result.errorMessage.c_str(),
+                        inSeconds);
+        }
+    }
     
     // Note: Don't decrement m_activeSyncCount here - WorkerThread will do it
     m_stats.syncingFeeds.fetch_sub(1, std::memory_order_relaxed);
@@ -5112,6 +5157,53 @@ void ThreatIntelFeedManager::ScheduleNextSync(FeedContext& context) {
     }
     
     context.stats.nextScheduledSync.store(nextSync, std::memory_order_release);
+}
+
+void ThreatIntelFeedManager::ScheduleInitialSync(FeedContext& context) {
+    if (!context.config.enabled || context.config.syncIntervalSeconds == 0) {
+        context.stats.nextScheduledSync.store(0, std::memory_order_release);
+        return;
+    }
+    
+    const uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
+    const uint64_t delay = m_config.initialSyncDelaySeconds;
+    uint64_t spread = 0;
+    if (delay > 0) {
+        thread_local std::mt19937_64 gen(std::random_device{}());
+        spread = std::uniform_int_distribution<uint64_t>(0, delay)(gen);
+    }
+    uint64_t due = now + delay + spread;
+    
+    // A feed that synced less than one interval ago (a Stop/Start in the same process, or
+    // restored state) keeps its regular schedule instead of downloading again at once.
+    const uint64_t lastSuccess = context.stats.lastSuccessfulSync.load(std::memory_order_acquire);
+    if (lastSuccess > 0 && lastSuccess <= now) {
+        const uint64_t regular = lastSuccess + context.config.syncIntervalSeconds;
+        if (regular > due) {
+            due = regular;
+        }
+    }
+    
+    // 0 means "not scheduled" to SchedulerThread, so a feed due immediately is stored as 1.
+    context.stats.nextScheduledSync.store(std::max<uint64_t>(due, 1), std::memory_order_release);
+}
+
+void ThreatIntelFeedManager::ScheduleRetryAfterFailure(FeedContext& context) {
+    if (!context.config.enabled || context.config.syncIntervalSeconds == 0) {
+        context.stats.nextScheduledSync.store(0, std::memory_order_release);
+        return;
+    }
+    
+    const uint64_t interval = context.config.syncIntervalSeconds;
+    const uint32_t failures = std::max<uint32_t>(1, context.stats.consecutiveErrors.load(std::memory_order_acquire));
+    uint64_t delay = m_config.failedSyncRetrySeconds;
+    for (uint32_t i = 1; i < failures && delay < interval; ++i) {
+        delay *= 2;
+    }
+    delay = std::min(delay, interval);
+    
+    const uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
+    context.stats.nextScheduledSync.store(now + delay, std::memory_order_release);
 }
 
 namespace {

@@ -1318,6 +1318,18 @@ public:
         /// @brief Enable persistent feed state
         bool persistState = true;
         
+        /// @brief Seconds before a feed's first sync once it is running (Start, or AddFeed /
+        ///        EnableFeed on a running manager). Each feed adds a random share of the same
+        ///        delay again so feeds do not start together. 0 = due at the next scheduler tick.
+        ///        A full sync interval here meant a service restarted more often than hourly
+        ///        never synced at all (task 259).
+        uint32_t initialSyncDelaySeconds = 60;
+        
+        /// @brief Seconds before retrying a failed sync, doubled per consecutive failure and
+        ///        capped at the feed's own interval, so a feed that fails at boot (network not up
+        ///        yet) is retried within minutes rather than after its 1-6 hour interval.
+        uint32_t failedSyncRetrySeconds = 300;
+        
         /// @brief Validate configuration
         [[nodiscard]] bool Validate(std::string* errorMsg = nullptr) const;
     };
@@ -1726,6 +1738,14 @@ private:
     
     /// @brief Schedule next sync for feed
     void ScheduleNextSync(FeedContext& context);
+    
+    /// @brief Schedule a feed's first sync after it starts running (Config::initialSyncDelaySeconds),
+    ///        or its regular next sync if it already synced more recently than one interval ago.
+    void ScheduleInitialSync(FeedContext& context);
+    
+    /// @brief Schedule the retry of a failed sync (Config::failedSyncRetrySeconds, doubled per
+    ///        consecutive failure, capped at the feed's interval).
+    void ScheduleRetryAfterFailure(FeedContext& context);
     
     /// @brief Give parsed entries the feed's identity: source, default reputation, confidence and
     ///        TTL where the parser set none, dropping entries outside allowedTypes and string
