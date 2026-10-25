@@ -156,9 +156,9 @@ template<typename Func>
  * how much regression is tolerated.
  *
  * Safe for these callers and NOT safe in general: every operation compared here
- * is a pure read, so repeating and interleaving them has no side effects.
- * BatchAdd_FasterThanSingleAdd must stay single-shot for exactly that reason -
- * its loops mutate the filters.
+ * is a pure read, so repeating and interleaving them has no side effects. BatchAdd
+ * mutates its filter, so its tests compare results exactly and time fresh filters
+ * (BloomFilter_Batch, BatchAddCostStaysInTheProbeCostClass) instead.
  */
 template<typename FuncA, typename FuncB>
 void MeasureBestOfInterleavedNanoseconds(FuncA&& funcA, FuncB&& funcB,
@@ -975,29 +975,55 @@ TEST(BloomFilter_Performance, MightContain_UnderTargetLatency) {
         << "Average MightContain latency " << avgNs << "ns exceeds target " << targetNsPerOp << "ns";
 }
 
-TEST(BloomFilter_Performance, BatchAdd_FasterThanSingleAdd) {
-    BloomFilter filter1(100000, 0.01);
-    BloomFilter filter2(100000, 0.01);
-    ASSERT_TRUE(filter1.InitializeForBuild());
-    ASSERT_TRUE(filter2.InitializeForBuild());
-    
+// BatchAdd's contract is that it is the same operation as a loop of Add, done in one call.
+// That is deterministic and is asserted exactly: the two filters must be bit-identical.
+//
+// This replaced BatchAdd_FasterThanSingleAdd (task 266), a single-shot wall-clock ratio
+// that failed under CPU load and passed in isolation, so a green suite described the
+// machine rather than the code. It could not be made best-of because its loops mutate
+// the filter. Equality now carries the meaning; the cost check below uses fresh filters
+// per run, so it can be repeated, and a per-element ceiling instead of a ratio.
+TEST(BloomFilter_Batch, BatchAddIsBitIdenticalToRepeatedAdd) {
+    BloomFilter single(100000, 0.01);
+    BloomFilter batch(100000, 0.01);
+    ASSERT_TRUE(single.InitializeForBuild());
+    ASSERT_TRUE(batch.InitializeForBuild());
+
     const auto hashes = GenerateTestHashes(10000);
-    
-    // Single add timing
-    const int64_t singleNs = MeasureNanoseconds([&]() {
-        for (uint64_t h : hashes) {
-            filter1.Add(h);
-        }
-    });
-    
-    // Batch add timing
-    const int64_t batchNs = MeasureNanoseconds([&]() {
-        [[maybe_unused]] const size_t added = filter2.BatchAdd(hashes);
-    });
-    
-    // Batch should be at least as fast (allowing for measurement variance)
-    EXPECT_LE(batchNs, singleNs * 1.5)
-        << "BatchAdd (" << batchNs << "ns) should not be much slower than single Add (" << singleNs << "ns)";
+    for (uint64_t h : hashes) {
+        single.Add(h);
+    }
+    EXPECT_EQ(hashes.size(), batch.BatchAdd(hashes));
+
+    std::vector<uint8_t> singleBytes;
+    std::vector<uint8_t> batchBytes;
+    ASSERT_TRUE(single.Serialize(singleBytes));
+    ASSERT_TRUE(batch.Serialize(batchBytes));
+    ASSERT_FALSE(batchBytes.empty());
+    EXPECT_EQ(singleBytes, batchBytes) << "BatchAdd set different bits from the Add loop";
+    EXPECT_EQ(single.GetElementsAdded(), batch.GetElementsAdded());
+    for (uint64_t h : hashes) {
+        ASSERT_TRUE(batch.MightContain(h)) << "a batch-added hash is reported absent";
+    }
+}
+
+TEST(BloomFilter_Performance, BatchAddCostStaysInTheProbeCostClass) {
+    // Fresh filters per run keep every run identical, so best-of is valid here. The ceiling
+    // is about ninety times the cost measured on the build host (~11 ns per element for the
+    // sibling BatchQuery), so it catches an allocation or lock per element and cannot fail
+    // because a machine is merely busy.
+    const auto hashes = GenerateTestHashes(10000);
+    int64_t bestNs = std::numeric_limits<int64_t>::max();
+    for (int run = 0; run < 5; ++run) {
+        BloomFilter filter(100000, 0.01);
+        ASSERT_TRUE(filter.InitializeForBuild());
+        bestNs = std::min(bestNs, MeasureNanoseconds([&]() {
+            [[maybe_unused]] const size_t added = filter.BatchAdd(hashes);
+        }));
+    }
+    constexpr int64_t kMaxNsPerElement = 1000;
+    EXPECT_LE(bestNs / static_cast<int64_t>(hashes.size()), kMaxNsPerElement)
+        << "BatchAdd cost " << bestNs << "ns for " << hashes.size() << " elements";
 }
 
 // ============================================================================
@@ -1408,14 +1434,6 @@ TEST(BloomFilter_Performance, BatchQuery_FasterThanSingleQuery) {
     // store the results somewhere, so storing them is what makes the loop a
     // genuine substitute and the ratio a genuine measurement of the batch path.
     // Both sides now write into the same buffer.
-    //
-    // NOTE: BatchAdd_FasterThanSingleAdd is deliberately NOT converted. Its loops
-    // MUTATE the filters, so repeating them would keep adding the same hashes -
-    // inflating the element count and eventually running into the configured
-    // capacity, at which point a refused BatchAdd would time as nearly free and
-    // the test would pass for the wrong reason. Making a test pass by letting it
-    // measure less is worse than leaving it single-shot; it has ample margin
-    // because BatchAdd genuinely avoids 10,000 separate calls.
     //
     // The output buffer is allocated BEFORE either window opens. It used to be
     // allocated between them, so the batch side alone paid for a 10 KB heap
