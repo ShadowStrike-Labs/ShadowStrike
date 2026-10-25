@@ -832,6 +832,16 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
             );
         }
 
+        // Synced indicators go into THIS store. Without a target the manager took its
+        // "validate only" path and discarded every parsed indicator (task 259).
+        //
+        // Non-owning: an aliasing shared_ptr over an empty owner. The store owns the feed
+        // manager and Shutdown() stops it before any subsystem is released, so the manager
+        // never outlives `this`. An owning pointer would form a cycle that kept the store
+        // alive past teardown and skipped its final flush.
+        m_impl->feedManager->SetTargetStore(
+            std::shared_ptr<ThreatIntelStore>(std::shared_ptr<ThreatIntelStore>{}, this));
+
         // Initialize statistics
         m_impl->stats.createdAt = std::chrono::system_clock::now();
         m_impl->stats.lastUpdateAt = m_impl->stats.createdAt;
@@ -1073,6 +1083,13 @@ void ThreatIntelStore::Shutdown() {
         return;
     }
 
+    // Stop the feed manager BEFORE taking the store lock: a sync in progress writes
+    // through BulkAddIOCsWithStats, which takes that lock, so stopping it under the lock
+    // would leave its worker waiting while Stop waits for the worker.
+    if (m_impl->feedManager) {
+        m_impl->feedManager->Shutdown();
+    }
+
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
     Utils::Logger::Instance().LogEx(
@@ -1083,11 +1100,6 @@ void ThreatIntelStore::Shutdown() {
         __FUNCTIONW__,
         L"Shutting down ThreatIntelStore"
     );
-
-    // Stop feed updates
-    if (m_impl->feedManager) {
-        // Feed manager will be shut down via destructor
-    }
 
     // Flush pending changes
     if (m_impl->database && m_impl->database->IsOpen()) {
