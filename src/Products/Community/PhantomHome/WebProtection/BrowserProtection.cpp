@@ -1640,6 +1640,15 @@ bool BrowserProtection::HasInstance() noexcept {
 }
 
 BrowserProtection::BrowserProtection() : m_impl(std::make_unique<BrowserProtectionImpl>()) {
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)AdBlocker::Instance();
+    (void)MaliciousDownloadBlocker::Instance();
+    (void)PhishingDetector::Instance();
+    (void)SafeBrowsingAPI::Instance();
+    (void)TrackerBlocker::Instance();
     s_instanceCreated.store(true);
 }
 

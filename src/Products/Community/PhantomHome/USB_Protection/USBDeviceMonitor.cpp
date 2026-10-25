@@ -1387,6 +1387,14 @@ bool USBDeviceMonitor::HasInstance() noexcept {
 
 USBDeviceMonitor::USBDeviceMonitor()
     : m_impl(std::make_unique<USBDeviceMonitorImpl>()) {
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)DeviceControlManager::Instance();
+    (void)BadUSBDetector::Instance();
+    (void)USBAutorunBlocker::Instance();
+    (void)USBScanner::Instance();
     s_instanceCreated.store(true, std::memory_order_release);
 }
 

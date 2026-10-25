@@ -2260,6 +2260,13 @@ GameModeManager::GameModeManager()
 
 GameModeManager::~GameModeManager() {
     s_instanceCreated = false;
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)GameProcessDetector::Instance();
+    (void)OverlayProtection::Instance();
+    (void)PerformanceOptimizer::Instance();
 }
 
 // Forward all public methods to implementation

@@ -2583,6 +2583,14 @@ IPLeakProtection::IPLeakProtection()
 }
 
 IPLeakProtection::~IPLeakProtection() {
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)IoTDeviceScanner::Instance();
+    (void)RouterSecurityChecker::Instance();
+    (void)SmartHomeProtection::Instance();
+    (void)WiFiSecurityAnalyzer::Instance();
     s_instanceCreated = false;
 }
 

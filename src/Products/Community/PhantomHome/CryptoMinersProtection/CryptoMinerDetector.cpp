@@ -2858,6 +2858,16 @@ bool CryptoMinerDetector::HasInstance() noexcept {
 
 CryptoMinerDetector::CryptoMinerDetector()
     : m_impl(std::make_unique<CryptoMinerDetectorImpl>()) {
+    // The destructor shuts the four sub-detectors down, so they must outlive this
+    // object. Function-local statics are destroyed in reverse order of completed
+    // construction, and these were first constructed later, in Initialize - so at
+    // process exit they were destroyed first and ~CryptoMinerDetector called Shutdown
+    // on freed objects (an access violation in PoolConnectionDetectorImpl::Shutdown,
+    // task 339). Constructing them here completes their construction first.
+    (void)CPUUsageAnalyzer::Instance();
+    (void)GPUMiningDetector::Instance();
+    (void)BrowserMinerDetector::Instance();
+    (void)PoolConnectionDetector::Instance();
 }
 
 CryptoMinerDetector::~CryptoMinerDetector() {

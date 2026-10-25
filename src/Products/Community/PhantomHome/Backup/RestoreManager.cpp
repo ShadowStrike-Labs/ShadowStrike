@@ -1345,6 +1345,11 @@ bool RestoreManager::HasInstance() noexcept {
 }
 
 RestoreManager::RestoreManager() : m_impl(std::make_unique<RestoreManagerImpl>()) {
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)BackupManager::Instance();
     s_instanceCreated.store(true, std::memory_order_release);
 }
 

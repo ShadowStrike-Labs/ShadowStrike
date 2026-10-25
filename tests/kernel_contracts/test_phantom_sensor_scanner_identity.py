@@ -28530,5 +28530,45 @@ class BadUsbSelfTestTypesAtHumanSpeedTests(unittest.TestCase):
         self.assertIn("human-speed typing was detected as an attack", body[:6000])
 
 
+class SingletonDependenciesConstructedFirstTests(unittest.TestCase):
+    """A composite singleton constructs the singletons it uses first (task 339).
+
+    Function-local statics are destroyed in reverse order of completed construction.
+    These composites first touched their sub-modules in Initialize, so at process exit
+    the sub-modules were destroyed first and the composite's destructor or threads used
+    freed objects: an access violation in PoolConnectionDetectorImpl::Shutdown and a
+    hang in GameModeManagerImpl::Shutdown, both measured.
+    """
+
+    HOME = ROOT / "src/Products/Community/PhantomHome"
+    COMPOSITES = {
+        ("CryptoMinersProtection/CryptoMinerDetector.cpp", "CryptoMinerDetector"):
+            ["CPUUsageAnalyzer", "GPUMiningDetector", "BrowserMinerDetector", "PoolConnectionDetector"],
+        ("GameMode/GameModeManager.cpp", "GameModeManager"):
+            ["GameProcessDetector", "OverlayProtection", "PerformanceOptimizer"],
+        ("Email/EmailProtection.cpp", "EmailProtection"):
+            ["AttachmentScanner", "PhishingEmailDetector", "SpamDetector", "OutlookScanner", "ThunderbirdScanner"],
+        ("Email/OutlookScanner.cpp", "OutlookScanner"): ["PhishingEmailDetector", "SpamDetector"],
+        ("IoT/IPLeakProtection.cpp", "IPLeakProtection"):
+            ["IoTDeviceScanner", "RouterSecurityChecker", "SmartHomeProtection", "WiFiSecurityAnalyzer"],
+        ("WebProtection/BrowserProtection.cpp", "BrowserProtection"):
+            ["AdBlocker", "MaliciousDownloadBlocker", "PhishingDetector", "SafeBrowsingAPI", "TrackerBlocker"],
+        ("Backup/RestoreManager.cpp", "RestoreManager"): ["BackupManager"],
+        ("Banking/SecureBrowser.cpp", "SecureBrowser"): ["KeyloggerProtection", "ScreenshotBlocker"],
+        ("USB_Protection/USBDeviceMonitor.cpp", "USBDeviceMonitor"):
+            ["DeviceControlManager", "BadUSBDetector", "USBAutorunBlocker", "USBScanner"],
+        ("ZeroTrustGuard/ZeroTrustGuard.cpp", "ZeroTrustGuard"): ["ZeroTrustGuard", "ZeroTrustPromptQueue"],
+    }
+
+    def test_each_constructor_constructs_its_dependencies(self):
+        for (rel, cls), deps in self.COMPOSITES.items():
+            src = strip_c_comments(read_source(self.HOME / rel))
+            m = re.search(r"\n" + cls + r"::" + cls + r"\(\)[^{]*\{(.*?)\n\}", src, re.S)
+            with self.subTest(module=cls):
+                self.assertIsNotNone(m, "constructor not found")
+                for dep in deps:
+                    self.assertRegex(m.group(1), r"\b" + dep + r"::Instance\(\)", dep)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

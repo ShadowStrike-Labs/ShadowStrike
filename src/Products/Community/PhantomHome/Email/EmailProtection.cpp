@@ -2732,6 +2732,15 @@ bool EmailProtection::HasInstance() noexcept {
 EmailProtection::EmailProtection()
     : m_impl(std::make_unique<EmailProtectionImpl>())
 {
+    // Construct the singletons this one calls from its threads and its destructor
+    // first: function-local statics are destroyed in reverse order of completed
+    // construction, so they now outlive this object at process exit instead of
+    // being destroyed under its running threads (task 339).
+    (void)AttachmentScanner::Instance();
+    (void)PhishingEmailDetector::Instance();
+    (void)SpamDetector::Instance();
+    (void)OutlookScanner::Instance();
+    (void)ThunderbirdScanner::Instance();
     Utils::Logger::Info("EmailProtection: Constructor called");
 }
 
