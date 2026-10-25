@@ -175,6 +175,18 @@ TEST_F(BadUSBDeviceIdentityTest, AListedAttackToolIsKnownBadWithoutKeyboardEvide
     }
 }
 
+TEST_F(BadUSBDeviceIdentityTest, TheSelfTestNeverReachesEnforcement) {
+    // Task 338. SelfTest fed 200 keystrokes per second through the live pipeline, which the module
+    // correctly judged an attack - and its response terminated every recently started cmd, pwsh,
+    // powershell, wscript, cscript and mshta process on the machine running the test.
+    auto& detector = BadUSBDetector::Instance();
+    const auto before = detector.GetStatistics().attacksDetected;
+    EXPECT_TRUE(detector.SelfTest());
+    EXPECT_EQ(before, detector.GetStatistics().attacksDetected)
+        << "the self-test was detected as an attack, so it ran the real response";
+    EXPECT_FALSE(detector.IsAttackInProgress());
+}
+
 TEST_F(BadUSBDeviceIdentityTest, TheVendorIdAndProductIdAreNotInterchangeable) {
     // 0x0483 is BOTH a suspicious vendor id (STMicroelectronics) and the product id of the Teensy HID
     // entry, whose vendor id is 0x16C0. Reversing the pair must not produce a known-bad verdict, which

@@ -680,25 +680,41 @@ public:
                 return false;
             }
 
-            // Test 4: Keystroke processing
+            // Test 4: Keystroke processing at HUMAN speed, and no detection for it.
+            //
+            // This fed 20 keystrokes 5 ms apart (200 CPS) through the live pipeline. That
+            // IS an attack by this module's own thresholds, so a self-test ran the real
+            // response: TerminateLaunchedProcesses killed every cmd, pwsh, powershell,
+            // wscript, cscript and mshta process on the machine created in the last 30
+            // seconds (task 338). A self-test must never reach enforcement. 150 ms apart
+            // is about 7 CPS, under MAX_HUMAN_CPS and with no interval below
+            // MIN_HUMAN_INTERVAL_MS, and the check below makes "no false positive on
+            // human typing" part of what the self-test asserts.
             {
-                TimePoint now = Clock::now();
+                const uint64_t attacksBefore = m_stats.attacksDetected.load(std::memory_order_relaxed);
+                const TimePoint start = Clock::now() - std::chrono::seconds(4);
                 for (int i = 0; i < 20; i++) {
                     ProcessKeyboardEvent(
                         static_cast<uint16_t>('A' + i), true,
-                        now + std::chrono::milliseconds(i * 5), "SELFTEST");
+                        start + std::chrono::milliseconds(i * 150), "SELFTEST");
                 }
 
-                auto stats = GetCurrentInputStatistics();
+                const auto stats = GetCurrentInputStatistics();
+                const bool detected = IsAttackInProgress() ||
+                    m_stats.attacksDetected.load(std::memory_order_relaxed) != attacksBefore;
+                ResetAnalysis();
+
                 if (stats.totalKeystrokes < 20) {
                     SS_LOG_ERROR(LOG_CATEGORY,
                         L"Self-test failed: Keystroke count mismatch (got %llu)",
                         static_cast<unsigned long long>(stats.totalKeystrokes));
-                    ResetAnalysis();
                     return false;
                 }
-
-                ResetAnalysis();
+                if (detected) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Self-test failed: human-speed typing was detected as an attack");
+                    return false;
+                }
             }
 
             SS_LOG_INFO(LOG_CATEGORY, L"Self-test completed successfully");

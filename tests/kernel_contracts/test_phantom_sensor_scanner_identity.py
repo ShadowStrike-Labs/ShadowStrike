@@ -28505,5 +28505,30 @@ class SuspiciousUsbVendorNeedsAKeyboardTests(unittest.TestCase):
         self.assertRegex(m.group(1), r"desc\.classCode == 0x03 && desc\.protocolCode == 0x01")
 
 
+class BadUsbSelfTestTypesAtHumanSpeedTests(unittest.TestCase):
+    """BadUSBDetector::SelfTest must never trigger the real response (task 338).
+
+    It fed keystrokes 5 ms apart through the live pipeline, which the module judged an
+    attack, and TerminateLaunchedProcesses killed every recently started cmd, pwsh,
+    powershell, wscript, cscript and mshta on the machine. This is held at the source
+    because a unit-test mutation that restores it would kill the test runner's shell.
+    """
+
+    SRC = ROOT / "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.cpp"
+
+    def test_the_self_test_interval_is_below_human_speed_thresholds(self):
+        src = strip_c_comments(read_source(self.SRC))
+        body = src[src.index("bool SelfTest() {"):]
+        body = body[:body.index("\n    }\n")]
+        steps = [int(n) for n in re.findall(r"std::chrono::milliseconds\(i \* (\d+)\)", body)]
+        self.assertEqual(1, len(steps), steps)
+        self.assertGreaterEqual(steps[0], 100, "faster than 10 keystrokes per second")
+
+    def test_the_self_test_fails_when_it_is_detected(self):
+        src = strip_c_comments(read_source(self.SRC))
+        body = src[src.index("bool SelfTest() {"):]
+        self.assertIn("human-speed typing was detected as an attack", body[:6000])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
