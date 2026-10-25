@@ -30,6 +30,18 @@ namespace ShadowStrike {
 
         namespace {
 
+        // A parsed entry before the parser fills it. IOCEntry has no member initialisers, so
+        // `IOCEntry entry;` left every field the parser does not set indeterminate, and a
+        // zeroed entry is no better: reputation 0 is Safe. A feed indicator whose meaning
+        // the payload does not state is Unknown, which the feed manager then replaces with
+        // the feed's default reputation (task 259).
+        [[nodiscard]] IOCEntry BlankFeedEntry() noexcept {
+            IOCEntry entry{};
+            entry.reputation = ReputationLevel::Unknown;
+            entry.confidence = ConfidenceLevel::None;
+            return entry;
+        }
+
         // Maximum nesting depth accepted by JSON / STIX / TAXII parsers.
         // nlohmann::json::parse is recursive descent; an attacker-supplied
         // payload of "[[[[[[..." can otherwise blow the worker thread's
@@ -230,7 +242,7 @@ namespace ShadowStrike {
                 outEntries.reserve(reserveCount);
 
                 for (const auto& item : *iocArray) {
-                    IOCEntry entry;
+                    IOCEntry entry = BlankFeedEntry();
                     if (ParseIOCEntry(&item, entry, config)) {
                         outEntries.push_back(std::move(entry));
 
@@ -375,7 +387,7 @@ namespace ShadowStrike {
                         return false;
                     }
 
-                    IOCEntry entry;
+                    IOCEntry entry = BlankFeedEntry();
                     if (ParseIOCEntry(&item, entry, config)) {
                         if (!callback(entry)) {
                             return true;  // Callback requested stop
@@ -850,7 +862,7 @@ namespace ShadowStrike {
                     }
 
                     // Create IOC entry
-                    IOCEntry entry;
+                    IOCEntry entry = BlankFeedEntry();
 
                     // Determine type
                     IOCType iocType = IOCType::Domain;  // Default
@@ -1169,7 +1181,7 @@ namespace ShadowStrike {
                             continue;
                         }
 
-                        IOCEntry entry;
+                        IOCEntry entry = BlankFeedEntry();
 
                         if (ParseSTIXPattern(pattern, entry)) {
                             // Extract metadata safely

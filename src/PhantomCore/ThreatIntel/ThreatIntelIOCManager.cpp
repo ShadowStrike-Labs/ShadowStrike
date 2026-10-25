@@ -2032,7 +2032,7 @@ std::optional<IOCEntry> ThreatIntelIOCManager::FindIOC(
     }
     
     // Parse the search value for type-specific comparison
-    IOCEntry searchEntry;
+    IOCEntry searchEntry{};
     if (!ParseIOC(type, normalizedValue, searchEntry)) {
         return std::nullopt;  // Invalid search value
     }
@@ -3409,7 +3409,8 @@ IOCBulkImportResult ThreatIntelIOCManager::ImportSTIXBundle(
                 if (objectStr.find("\"type\"") != std::string_view::npos &&
                     objectStr.find("\"indicator\"") != std::string_view::npos) {
                     
-                    IOCEntry entry;
+                    IOCEntry entry{};
+                    entry.reputation = ReputationLevel::Unknown;   // zero is Safe; the pattern states no verdict
                     entry.flags = IOCFlags::Enabled;
                     entry.source = ThreatIntelSource::MISP;  // STIX/TAXII compatible source
                     entry.createdTime = GetCurrentTimestamp();
@@ -3447,7 +3448,7 @@ IOCBulkImportResult ThreatIntelIOCManager::ImportSTIXBundle(
                                             std::string_view ipStr = pattern.substr(
                                                 valueStart + 1, valueEnd - valueStart - 1
                                             );
-                                            IOCEntry parsed;
+                                            IOCEntry parsed{};
                                             if (ParseIOC(IOCType::IPv4, ipStr, parsed)) {
                                                 entry.value.ipv4 = parsed.value.ipv4;
                                                 entries.push_back(entry);
@@ -3463,7 +3464,7 @@ IOCBulkImportResult ThreatIntelIOCManager::ImportSTIXBundle(
                                             std::string_view ipStr = pattern.substr(
                                                 valueStart + 1, valueEnd - valueStart - 1
                                             );
-                                            IOCEntry parsed;
+                                            IOCEntry parsed{};
                                             if (ParseIOC(IOCType::IPv6, ipStr, parsed)) {
                                                 entry.value.ipv6 = parsed.value.ipv6;
                                                 entries.push_back(entry);
@@ -3523,7 +3524,7 @@ IOCBulkImportResult ThreatIntelIOCManager::ImportSTIXBundle(
                                             std::string_view hashStr = pattern.substr(
                                                 valueStart + 1, valueEnd - valueStart - 1
                                             );
-                                            IOCEntry parsed;
+                                            IOCEntry parsed{};
                                             if (ParseIOC(IOCType::FileHash, hashStr, parsed)) {
                                                 entry.value.hash = parsed.value.hash;
                                                 entries.push_back(entry);

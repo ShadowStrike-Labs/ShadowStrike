@@ -4526,7 +4526,7 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
         std::vector<IOCEntry> batch;
         batch.reserve(batchSize);
 
-        IOCEntry entry;
+        IOCEntry entry{};
         ImportProgress progress{};
         progress.totalEntries = reader.GetEstimatedTotal().value_or(0);
 
