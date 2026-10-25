@@ -17,6 +17,7 @@
 #include "BrowserMinerDetector.hpp"
 
 #include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Utils/DomainUtils.hpp"
 #include "../../../../PhantomCore/Utils/FileUtils.hpp"
 #include "../../../../PhantomCore/Utils/StringUtils.hpp"
 
@@ -131,17 +132,8 @@ void AppendEvidence(std::string& evidence, std::string_view item) {
 }
 
 [[nodiscard]] bool DomainMatches(std::string_view candidate, std::string_view rule) noexcept {
-    if (candidate.empty() || rule.empty()) {
-        return false;
-    }
-
-    if (candidate == rule) {
-        return true;
-    }
-
-    return candidate.size() > rule.size() &&
-           candidate.ends_with(rule) &&
-           candidate[candidate.size() - rule.size() - 1] == '.';
+    // Exact, or a subdomain at a label boundary; empty matches nothing (task 336).
+    return !candidate.empty() && Utils::Domain::IsSameOrSubdomainOf(candidate, rule);
 }
 
 [[nodiscard]] std::string NormalizeDomainValue(std::string_view input) {

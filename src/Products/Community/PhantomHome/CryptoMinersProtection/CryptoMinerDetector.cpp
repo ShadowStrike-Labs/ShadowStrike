@@ -5,6 +5,7 @@
 #include "CPUUsageAnalyzer.hpp"
 #include "GPUMiningDetector.hpp"
 #include "PoolConnectionDetector.hpp"
+#include "../../../../PhantomCore/Utils/DomainUtils.hpp"
 #include "PhantomCore/Core/Engine/QuarantineManager.hpp"
 
 #include "PhantomCore/Utils/HashUtils.hpp"
@@ -2360,8 +2361,7 @@ bool CryptoMinerDetectorImpl::IsMiningPoolInternal(const std::string& host, uint
             return true;
         }
         for (const auto& [address, info] : m_poolDatabase) {
-            if (normalized == address ||
-                (normalized.size() > address.size() && normalized.ends_with(address) && normalized[normalized.size() - address.size() - 1] == '.')) {
+            if (Utils::Domain::IsSameOrSubdomainOf(normalized, address)) {
                 if (port == 0 || info.port == 0 || info.port == port || IsMiningPort(port)) {
                     return true;
                 }
@@ -2380,7 +2380,8 @@ std::optional<MiningPoolInfo> CryptoMinerDetectorImpl::GetPoolInfoInternal(const
     }
 
     for (const auto& [address, info] : m_poolDatabase) {
-        if (normalized.size() > address.size() && normalized.ends_with(address) && normalized[normalized.size() - address.size() - 1] == '.') {
+        // The exact key was looked up above, so only subdomains reach here.
+        if (Utils::Domain::IsSameOrSubdomainOf(normalized, address)) {
             return info;
         }
     }

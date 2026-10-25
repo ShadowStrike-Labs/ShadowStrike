@@ -36,6 +36,7 @@
 #include "PhishingDetector.hpp"
 #include "MaliciousDownloadBlocker.hpp"
 #include "SafeBrowsingAPI.hpp"
+#include "../../../../PhantomCore/Utils/DomainUtils.hpp"
 #include "TrackerBlocker.hpp"
 #include "PhantomCore/Utils/NetworkUtils.hpp"
 #include "PhantomCore/Utils/StringUtils.hpp"
@@ -203,12 +204,7 @@ namespace {
     }
 
     bool DomainEndsWith(const std::string& domain, const std::string& suffix) {
-        if (domain.size() < suffix.size()) return false;
-        if (domain == suffix) return true;
-        if (domain.size() > suffix.size() && domain[domain.size() - suffix.size() - 1] == '.') {
-            return domain.compare(domain.size() - suffix.size(), suffix.size(), suffix) == 0;
-        }
-        return false;
+        return Utils::Domain::IsSameOrSubdomainOf(domain, suffix);   // task 336
     }
 
     // Map well-known TLDs/domains to URL categories

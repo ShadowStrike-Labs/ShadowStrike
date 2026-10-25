@@ -28,6 +28,7 @@
 #include "pch.h"
 #include "PoolConnectionDetector.hpp"
 
+#include "../../../../PhantomCore/Utils/DomainUtils.hpp"
 #include "../../../../PhantomCore/Utils/FileUtils.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 #include "../../../../PhantomCore/Utils/StringUtils.hpp"
@@ -252,15 +253,7 @@ struct EnumeratedConnection {
 }
 
 [[nodiscard]] bool HasDotBoundarySuffix(std::string_view host, std::string_view suffix) {
-    if (host == suffix) {
-        return true;
-    }
-
-    if (host.size() <= suffix.size()) {
-        return false;
-    }
-
-    return host.ends_with(suffix) && host[host.size() - suffix.size() - 1] == '.';
+    return Utils::Domain::IsSameOrSubdomainOf(host, suffix);   // task 336
 }
 
 [[nodiscard]] size_t CountMissingEndpointIndicators(
@@ -842,6 +835,13 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
         }
         parsed = Json::parse(line, nullptr, false);
         if (!parsed.is_discarded() && parsed.is_object()) {
+            return line;
+        }
+    }
+
+    return std::nullopt;
+}
+
 /// True when a DNS label of `host` names Ethereum as pools do: exactly "eth", or "eth"
 /// followed by a digit or '-' (eth1, eth-eu1). A substring test labelled bethesda.com,
 /// method.example and ethernet-updates.example Ethereum Stratum (task 267).
@@ -859,13 +859,6 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
         start = dot + 1;
     }
     return false;
-}
-
-            return line;
-        }
-    }
-
-    return std::nullopt;
 }
 
 [[nodiscard]] PoolProtocolType DetermineProtocol(const ParsedEndpoint& endpoint, bool encrypted) {

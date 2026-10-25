@@ -28648,5 +28648,23 @@ class SelfTestsDoNotChangeLiveStateTests(unittest.TestCase):
         self.assertIn("CREATE_NEW", bodies)
 
 
+class DomainBoundaryHasOneDefinitionTests(unittest.TestCase):
+    """The 'same domain or subdomain' test is Utils::Domain::IsSameOrSubdomainOf (task 336).
+
+    Seven hand-written copies existed; a copy that drops the label-boundary character
+    turns notexample.com into a subdomain of example.com.
+    """
+
+    def test_no_hand_written_label_boundary_outside_domain_utils(self):
+        offenders = []
+        for path in sorted((ROOT / "src").rglob("*.[ch]pp")):
+            if path.name == "DomainUtils.hpp":
+                continue
+            src = strip_c_comments(read_source(path))
+            if re.search(r"\.size\(\)\s*-\s*\w+\.size\(\)\s*-\s*1\]\s*==\s*'\.'", src):
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual([], offenders)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

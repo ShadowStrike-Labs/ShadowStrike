@@ -992,10 +992,7 @@ public:
                     std::transform(lowerPattern.begin(), lowerPattern.end(),
                                    lowerPattern.begin(), toLowerChar);
 
-                    if (lowerDomain == lowerPattern ||
-                        (lowerDomain.size() > lowerPattern.size() &&
-                         lowerDomain.ends_with(lowerPattern) &&
-                         lowerDomain[lowerDomain.size() - lowerPattern.size() - 1] == '.')) {
+                    if (Utils::Domain::IsSameOrSubdomainOf(lowerDomain, lowerPattern)) {
                         return true;
                     }
                 }
@@ -1290,10 +1287,7 @@ std::vector<BrowserCookie> CookieManager::GetCookiesForDomain(const std::string&
             [&sanitized](const BrowserCookie& cookie) {
                 std::string cookieDomain = SanitizeDomain(cookie.domain);
                 return !cookieDomain.empty() &&
-                       (cookieDomain == sanitized ||
-                        (cookieDomain.size() > sanitized.size() &&
-                         cookieDomain.ends_with(sanitized) &&
-                         cookieDomain[cookieDomain.size() - sanitized.size() - 1] == '.'));
+                       Utils::Domain::IsSameOrSubdomainOf(cookieDomain, sanitized);
             });
 
         Utils::Logger::Debug("CookieManager: Found {} cookies for requested domain",
@@ -2337,14 +2331,14 @@ bool CookieManager::SelfTest() {
             std::string baseDomain = GetBaseDomain(".example.com");
             if (baseDomain != "example.com") {
                 Utils::Logger::Error("CookieManager: Self-test failed (base domain)");
-            // An id and a reserved .invalid domain no user entry can carry, so the
-            // round trip cannot overwrite or remove a real whitelist entry (task 341).
                 return false;
             }
         }
 
         // Test 4: Whitelist
         {
+            // An id and a reserved .invalid domain no user entry can carry, so the
+            // round trip cannot overwrite or remove a real whitelist entry (task 341).
             CookieWhitelistEntry entry;
             entry.entryId = "__SS_SELFTEST__";
             entry.domainPattern = "selftest.invalid";
