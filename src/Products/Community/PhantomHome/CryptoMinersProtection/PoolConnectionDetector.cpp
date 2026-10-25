@@ -842,6 +842,25 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
         }
         parsed = Json::parse(line, nullptr, false);
         if (!parsed.is_discarded() && parsed.is_object()) {
+/// True when a DNS label of `host` names Ethereum as pools do: exactly "eth", or "eth"
+/// followed by a digit or '-' (eth1, eth-eu1). A substring test labelled bethesda.com,
+/// method.example and ethernet-updates.example Ethereum Stratum (task 267).
+[[nodiscard]] bool HasEthereumPoolLabel(std::string_view host) noexcept {
+    size_t start = 0;
+    while (start <= host.size()) {
+        const size_t dot = host.find('.', start);
+        const std::string_view label = host.substr(start, dot == std::string_view::npos ? std::string_view::npos : dot - start);
+        if (label.size() >= 3 && (label[0] == 'e' || label[0] == 'E') && (label[1] == 't' || label[1] == 'T') &&
+            (label[2] == 'h' || label[2] == 'H') &&
+            (label.size() == 3 || label[3] == '-' || (label[3] >= '0' && label[3] <= '9'))) {
+            return true;
+        }
+        if (dot == std::string_view::npos) break;
+        start = dot + 1;
+    }
+    return false;
+}
+
             return line;
         }
     }
@@ -862,7 +881,7 @@ void InsertEndpointIndicators(std::unordered_set<std::string>& indicators, const
     if (endpoint.host.find("nicehash") != std::string::npos) {
         return PoolProtocolType::NiceHashStratum;
     }
-    if (endpoint.host.find("eth") != std::string::npos) {
+    if (HasEthereumPoolLabel(endpoint.host)) {
         return encrypted ? PoolProtocolType::StratumOverTls : PoolProtocolType::EthereumStratum;
     }
     if (encrypted) {

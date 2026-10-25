@@ -134,6 +134,22 @@ TEST_F(PoolConnectionIdentityTest, EachBuiltInHostHasExactlyOneClassification) {
 // Endpoints and the configured blacklist
 // ============================================================================================
 
+TEST_F(PoolConnectionIdentityTest, EthereumStratumIsInferredFromALabelNotASubstring) {
+    // Task 267. "eth" anywhere in the host labelled bethesda.com and method.example Ethereum Stratum.
+    // The label only names the protocol of an endpoint already judged a pool (here by port 3333).
+    const auto protocolOf = [](const char* host) {
+        const auto info = Pool().GetPoolInfo(host, 3333);
+        return info.has_value() && !info->protocols.empty() ? info->protocols.front() : PoolProtocolType::Unknown;
+    };
+    for (const char* host : {"eth.pool.example", "eth-eu1.pool.example", "eth2.miners.example", "ETH.pool.example"}) {
+        EXPECT_EQ(PoolProtocolType::EthereumStratum, protocolOf(host)) << host;
+    }
+    for (const char* host : {"bethesda.example", "method.example", "ethernet-updates.example", "weth.example",
+                             "pool.example"}) {
+        EXPECT_EQ(PoolProtocolType::Stratum, protocolOf(host)) << host;
+    }
+}
+
 TEST_F(PoolConnectionIdentityTest, AHostEndingInADotIsNotMatchedByAnEmptyListSlot) {
     // The built-in lists were std::arrays sized larger than their contents, so the spare slots held
     // empty strings - and the dot-boundary match accepts an empty suffix for any host ending in '.'.
