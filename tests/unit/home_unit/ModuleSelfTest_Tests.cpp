@@ -178,7 +178,7 @@ TEST(ModuleSelfTest, GameModeModulesPassTheirOwnChecks) {
 // The duplicate-type sweep found no divergence in ShadowStrike::IoT, so these headers share this translation
 // unit. IoT/IPLeakProtection is NOT here: its source file has the same NAME as Privacy/IPLeakProtection.cpp,
 // so MSBuild writes both to IPLeakProtection.obj and one silently overwrites the other - MSB8027, which then
-// leaves Privacy::IsPrivateIP unresolved. That needs an ObjectFileName override or, better, the decision
+// leaves Privacy symbols unresolved. That needs an ObjectFileName override or, better, the decision
 // about which of the two modules survives. Filed.
 // ============================================================================
 

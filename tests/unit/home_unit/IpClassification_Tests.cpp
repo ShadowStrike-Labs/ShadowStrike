@@ -17,22 +17,25 @@
  * bits, so it spans fe80:: to febf::, and comparing the literal text "fe80" reported fe90::, fea0:: and
  * febf:: as public.
  *
- * TWO IMPLEMENTATIONS OF THIS PREDICATE EXIST IN THE PRODUCT. ShadowStrike::Privacy::IsPrivateIP compares
- * text; ShadowStrike::IoT::IsPrivateIP delegates to an inet_pton and bit-mask version. Only the Privacy one
- * is exercised here, because including both headers would mean deciding which is canonical - and that
- * decision is filed rather than made by a test. Two behaviours where they still differ are pinned below with
- * that filing named, so the divergence cannot narrow silently.
+ * ONE IMPLEMENTATION (task 295). The Privacy and IoT IPLeakProtection modules each carried their own
+ * IsPrivateIP and IsIPv6Address and they disagreed; both now call Utils::Ip, which parses before it
+ * classifies. The two cases this file once pinned as divergence now assert the converged answer.
  */
 
 #include "pch.h"
 
 #include <gtest/gtest.h>
 
-#include "Products/Community/PhantomHome/Privacy/IPLeakProtection.hpp"
+#include "PhantomCore/Utils/IpClassification.hpp"
 
 #include <string>
 
-namespace ShadowStrike::Privacy::IpTest {
+namespace ShadowStrike::Utils::Ip::IpTest {
+
+namespace {
+bool IsPrivateIP(const char* text) { return IsPrivateOrLocalAddress(text); }
+bool IsIPv6Address(const char* text) { return IsIPv6Literal(text); }
+}  // namespace
 
 // ============================================================================================
 // IPv4 private ranges
@@ -123,15 +126,21 @@ TEST(PrivateIpV6Test, CarrierGradeNatIsNotTreatedAsPrivate) {
     EXPECT_FALSE(IsPrivateIP("100.127.255.254"));
 }
 
-TEST(PrivateIpV4Test, AMalformedAddressIsNotValidatedBeforeClassification) {
-    // PINNED, NOT ENDORSED. This implementation compares text and never parses the address, so an octet
-    // outside 0-255 is still classified by its prefix. The sibling implementation in IoT/IPLeakProtection
-    // rejects it, because that one parses with inet_pton first.
-    //
-    // Filed together with the duplication. If this case now fails, the two implementations were converged -
-    // which is the recommended outcome; delete this case and note it on the filing.
-    EXPECT_TRUE(IsPrivateIP("10.999.999.999"))
-        << "the address is now validated before classification, so the implementations may have converged";
+TEST(PrivateIpV4Test, AnAddressIsParsedBeforeItIsClassified) {
+    // The Privacy copy compared text and called this private by its "10." prefix.
+    EXPECT_FALSE(IsPrivateIP("10.999.999.999")) << "an octet above 255 is not an address";
+    EXPECT_FALSE(IsPrivateIP("10.0.0")) << "three octets are not an address";
+    EXPECT_FALSE(IsPrivateIP("10.0.0.1 ")) << "trailing text is not an address";
+    EXPECT_FALSE(IsPrivateIP("10.example.com"));
+}
+
+TEST(PrivateIpV6Test, AZoneSuffixIsIgnoredAndAMappedAddressIsClassifiedByItsIPv4) {
+    // Windows reports adapter link-local addresses with a zone (fe80::1%12); inet_pton alone
+    // refuses those, which reported every one as a public IPv6 leak.
+    EXPECT_TRUE(IsPrivateIP("fe80::1%12"));
+    EXPECT_FALSE(IsPrivateIP("fe80::1%")) << "a bare % names no zone";
+    EXPECT_TRUE(IsPrivateIP("::ffff:192.168.1.10"));
+    EXPECT_FALSE(IsPrivateIP("::ffff:8.8.8.8"));
 }
 
 // ============================================================================================
@@ -150,14 +159,19 @@ TEST(IpV6DetectionTest, AnIPv4AddressIsNotIPv6) {
     EXPECT_FALSE(IsIPv6Address(""));
 }
 
-TEST(IpV6DetectionTest, TheTestIsAColonAndNothingMore) {
-    // PINNED AS MEASURED. The predicate is a single find(':'), so anything containing a colon qualifies -
-    // including a host with a port, which is a shape a caller could plausibly pass. Recorded so the
-    // looseness is a known property rather than a surprise, and so a caller knows to strip a port first.
-    EXPECT_TRUE(IsIPv6Address("example.com:8080"))
-        << "a host:port is no longer reported as IPv6, so the predicate was tightened - good, but check "
-           "callers that relied on the loose behaviour";
-    EXPECT_TRUE(IsIPv6Address("not:an:address"));
+TEST(IpV6DetectionTest, AColonDoesNotMakeAnAddress) {
+    // Both copies were a single find(':'), so a host with a port was "IPv6".
+    EXPECT_FALSE(IsIPv6Address("example.com:8080"));
+    EXPECT_FALSE(IsIPv6Address("not:an:address"));
+    EXPECT_FALSE(IsIPv6Address("[::1]")) << "brackets belong to a URL, not to the address";
+    EXPECT_TRUE(IsIPv6Address("fe80::1%12"));
 }
 
-}  // namespace ShadowStrike::Privacy::IpTest
+TEST(IpV4DetectionTest, OnlyADottedQuadIsIPv4) {
+    EXPECT_TRUE(IsIPv4Literal("192.168.1.1"));
+    EXPECT_FALSE(IsIPv4Literal("::1"));
+    EXPECT_FALSE(IsIPv4Literal("192.168.1"));
+    EXPECT_FALSE(IsIPv4Literal(""));
+}
+
+}  // namespace ShadowStrike::Utils::Ip::IpTest

@@ -63,6 +63,7 @@
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/Timer.hpp"
 #include "../Utils/HashUtils.hpp"
+#include "../../../../PhantomCore/Utils/IpClassification.hpp"
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
 #include <winhttp.h>
@@ -2002,8 +2003,8 @@ void IPLeakProtection::StopVPNMonitoring() {
     if (publicIPStr.has_value()) {
         IPAddressInfo info;
         info.address = publicIPStr.value();
-        info.isIPv6 = IsIPv6Address(info.address);
-        info.isPrivate = IsPrivateIP(info.address);
+        info.isIPv6 = Utils::Ip::IsIPv6Literal(info.address);
+        info.isPrivate = Utils::Ip::IsPrivateOrLocalAddress(info.address);
 
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_currentPublicIP = info.address;
@@ -2024,7 +2025,7 @@ void IPLeakProtection::StopVPNMonitoring() {
             IPAddressInfo info;
             info.address = ipv4;
             info.isIPv6 = false;
-            info.isPrivate = IsPrivateIP(ipv4);
+            info.isPrivate = Utils::Ip::IsPrivateOrLocalAddress(ipv4);
             info.isVPN = adapter.isVPN;
             info.adapterName = adapter.name;
             addresses.push_back(info);
@@ -2034,7 +2035,7 @@ void IPLeakProtection::StopVPNMonitoring() {
             IPAddressInfo info;
             info.address = ipv6;
             info.isIPv6 = true;
-            info.isPrivate = IsPrivateIP(ipv6);
+            info.isPrivate = Utils::Ip::IsPrivateOrLocalAddress(ipv6);
             info.isVPN = adapter.isVPN;
             info.adapterName = adapter.name;
             addresses.push_back(info);
@@ -2680,69 +2681,6 @@ void IPLeakStatistics::Reset() noexcept {
         case WebRTCBlockMethod::Combined: return "Combined";
         default: return "Unknown";
     }
-}
-
-[[nodiscard]] bool IsPrivateIP(const std::string& ip) {
-    if (ip.empty()) return false;
-
-    // IPv4 private ranges per RFC 1918 + loopback
-    if (ip.find(':') == std::string::npos) {
-        // Parse first two octets for 172.16-31.x.x check
-        if (ip.substr(0, 3) == "10.") return true;
-        if (ip.substr(0, 8) == "192.168.") return true;
-        if (ip.substr(0, 4) == "127.") return true;
-        if (ip.substr(0, 8) == "169.254.") return true;  // link-local (RFC 3927)
-
-        // 172.16.0.0 - 172.31.255.255
-        if (ip.size() >= 6 && ip.substr(0, 4) == "172.") {
-            auto dotPos = ip.find('.', 4);
-            if (dotPos != std::string::npos && dotPos > 4) {
-                try {
-                    int secondOctet = std::stoi(ip.substr(4, dotPos - 4));
-                    if (secondOctet >= 16 && secondOctet <= 31) return true;
-                } catch (...) {
-                    // Malformed IP, not private
-                }
-            }
-        }
-        return false;
-    }
-
-    // IPv6 private/special ranges
-    if (ip == "::1") return true;  // loopback
-
-    // Unique Local Addresses: fc00::/7 (fc.. and fd..)
-    if (ip.size() >= 2) {
-        char c0 = static_cast<char>(std::tolower(static_cast<unsigned char>(ip[0])));
-        char c1 = static_cast<char>(std::tolower(static_cast<unsigned char>(ip[1])));
-        if (c0 == 'f' && (c1 == 'c' || c1 == 'd')) return true;
-    }
-
-    // Link-local: fe80::/10
-    //
-    // The prefix fixes only TEN bits, so the range is fe80:: through febf:: - the third hex digit
-    // may be 8, 9, a or b. Comparing the literal text "fe80" covered a sixteenth of the range and
-    // reported fe90::, fea0:: and febf:: as public. The sibling implementation in
-    // IoT/IPLeakProtection masks the two significant bits of the second byte for the same reason.
-    if (ip.size() >= 3) {
-        std::string prefix3;
-        prefix3.reserve(3);
-        for (size_t i = 0; i < 3 && i < ip.size(); ++i) {
-            prefix3 += static_cast<char>(std::tolower(static_cast<unsigned char>(ip[i])));
-        }
-        if (prefix3.size() == 3 && prefix3[0] == 'f' && prefix3[1] == 'e') {
-            const char third = prefix3[2];
-            if (third == '8' || third == '9' || third == 'a' || third == 'b') {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-[[nodiscard]] bool IsIPv6Address(const std::string& ip) {
-    return ip.find(':') != std::string::npos;
 }
 
 [[nodiscard]] AdapterType DetectAdapterType(const std::string& description) {

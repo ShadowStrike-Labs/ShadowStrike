@@ -36,6 +36,7 @@
 #include "IPLeakProtection.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 #include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/IpClassification.hpp"
 #include "../../../../PhantomCore/Utils/SystemUtils.hpp"
 #include "../../../../PhantomCore/Utils/StringUtils.hpp"
 #include "../../../../PhantomCore/Utils/FileUtils.hpp"
@@ -169,38 +170,7 @@ std::string GenerateEventId() {
 // HELPER: IP classification
 // ============================================================================
 
-bool IsPrivateIPAddress(const std::string& ip) {
-    if (ip.empty()) return false;
-
-    if (ip.find(':') == std::string::npos) {
-        struct in_addr addr;
-        if (inet_pton(AF_INET, ip.c_str(), &addr) == 1) {
-            uint32_t ipVal = ntohl(addr.s_addr);
-            if ((ipVal & 0xFF000000) == 0x0A000000) return true;   // 10.0.0.0/8
-            if ((ipVal & 0xFFF00000) == 0xAC100000) return true;   // 172.16.0.0/12
-            if ((ipVal & 0xFFFF0000) == 0xC0A80000) return true;   // 192.168.0.0/16
-            if ((ipVal & 0xFF000000) == 0x7F000000) return true;   // 127.0.0.0/8
-            if ((ipVal & 0xFFFF0000) == 0xA9FE0000) return true;   // 169.254.0.0/16
-        }
-    } else {
-        // Case-insensitive prefix matching for IPv6
-        struct in6_addr addr6;
-        if (inet_pton(AF_INET6, ip.c_str(), &addr6) != 1) return false;
-        // ::1 loopback
-        static const struct in6_addr loopback = IN6ADDR_LOOPBACK_INIT;
-        if (memcmp(&addr6, &loopback, sizeof(addr6)) == 0) return true;
-        // fe80::/10 link-local
-        if (addr6.s6_bytes[0] == 0xFE && (addr6.s6_bytes[1] & 0xC0) == 0x80) return true;
-        // fc00::/7 unique-local
-        if ((addr6.s6_bytes[0] & 0xFE) == 0xFC) return true;
-    }
-
-    return false;
-}
-
-bool IsIPv6Addr(const std::string& ip) {
-    return ip.find(':') != std::string::npos;
-}
+// Address classification is Utils::Ip (IpClassification.hpp, task 295).
 
 /// @brief Check if address is Teredo tunnel (2001:0000::/32)
 bool IsTeredoAddress(const struct in6_addr& addr6) {
@@ -1251,7 +1221,7 @@ WebRTCLeakInfo IPLeakProtectionImpl::CheckWebRTCLeak() {
                     }
 
                     if (!localStr.empty()) {
-                        if (IsPrivateIPAddress(localStr)) {
+                        if (Utils::Ip::IsPrivateOrLocalAddress(localStr)) {
                             result.localIPs.push_back(localStr);
                         } else {
                             result.publicIPs.push_back(localStr);
@@ -1430,7 +1400,7 @@ IPLeakDetectionResult IPLeakProtectionImpl::CheckIPv6Leak() {
                         std::string ipv6(ipStr);
 
                         // Skip private/link-local/loopback
-                        if (!IsPrivateIPAddress(ipv6)) {
+                        if (!Utils::Ip::IsPrivateOrLocalAddress(ipv6)) {
                             std::string leakDetail;
 
                             // Detect Teredo tunneling (2001:0000::/32)
@@ -1514,8 +1484,8 @@ IPAddressInfo IPLeakProtectionImpl::GetPublicIP() {
         }
 
         info.ipAddress = publicIP;
-        info.isIPv6 = IsIPv6Addr(publicIP);
-        info.isPrivate = IsPrivateIPAddress(publicIP);
+        info.isIPv6 = Utils::Ip::IsIPv6Literal(publicIP);
+        info.isPrivate = Utils::Ip::IsPrivateOrLocalAddress(publicIP);
 
         // Determine if the public IP belongs to a VPN adapter
         auto vpnAdapters = DetectVPNAdapters();
@@ -2504,7 +2474,7 @@ bool IPLeakProtectionImpl::CheckDNSServerType(const std::string& dnsIP, DNSServe
     }
 
     // Check if private IP (likely router/ISP DNS)
-    if (IsPrivateIPAddress(dnsIP)) {
+    if (Utils::Ip::IsPrivateOrLocalAddress(dnsIP)) {
         info.serverType = DNSServerType::ISP;
         info.isISPDNS = true;
         info.ispName = "ISP/Router DNS";
@@ -2856,14 +2826,6 @@ std::string_view GetDNSServerTypeName(DNSServerType type) noexcept {
         case DNSServerType::DoT: return "DoT";
         default: return "Unknown";
     }
-}
-
-bool IsPrivateIP(const std::string& ip) noexcept {
-    return IsPrivateIPAddress(ip);
-}
-
-bool IsIPv6Address(const std::string& ip) noexcept {
-    return IsIPv6Addr(ip);
 }
 
 LeakSeverity CalculateLeakSeverity(LeakType type, bool vpnRequired) noexcept {

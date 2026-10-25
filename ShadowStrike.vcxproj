@@ -698,6 +698,7 @@
     <ClCompile Include="src\PhantomCore\Utils\Logger.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkSecurity_SSL_TLS.cpp" />
+    <ClCompile Include="src\PhantomCore\Utils\IpClassification.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkUtilsMacAdress.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkUtils_Adapter.cpp" />

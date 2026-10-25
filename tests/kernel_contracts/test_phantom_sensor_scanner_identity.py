@@ -28625,6 +28625,7 @@ class SelfTestsDoNotChangeLiveStateTests(unittest.TestCase):
         "Banking/KeyloggerProtection.cpp": [r"OpenClipboard\("],
         "Privacy/PrivacyCleaner.cpp": [r"shadowstrike_test_erase", r"std::ofstream"],
         "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
+        "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
     }
 
     @staticmethod
@@ -28720,6 +28721,32 @@ class CallbackRegistriesAreDispatchedTests(unittest.TestCase):
     def test_outlook_reports_every_mail_that_escaped_scanning(self):
         src = strip_c_comments(read_source(self.HOME / "Email/OutlookScanner.cpp"))
         self.assertGreaterEqual(src.count("InvokeErrorCallbacks(\""), 9)
+
+
+class IpClassificationHasOneDefinitionTests(unittest.TestCase):
+    """Whether an address is private, or IPv6, has one answer: Utils::Ip (task 295).
+
+    The Privacy and IoT IPLeakProtection modules each defined IsPrivateIP and IsIPv6Address and
+    disagreed: text prefixes against inet_pton, and find(':') for IPv6 in both.
+    """
+
+    HOME = ROOT / "src/Products/Community/PhantomHome"
+
+    def test_no_local_ip_predicate_in_the_home_product(self):
+        offenders = []
+        for path in sorted(self.HOME.rglob("*.[ch]pp")):
+            src = strip_c_comments(read_source(path))
+            for name in ("IsPrivateIP", "IsIPv6Address", "IsPrivateIPAddress", "IsIPv6Addr"):
+                if re.search(r"\bbool\s+" + name + r"\s*\(", src):
+                    offenders.append(f"{path.name}:{name}")
+        self.assertEqual([], offenders)
+
+    def test_both_leak_modules_classify_through_the_shared_predicate(self):
+        for rel, floor in (("Privacy/IPLeakProtection.cpp", 3), ("IoT/IPLeakProtection.cpp", 5)):
+            with self.subTest(rel=rel):
+                src = strip_c_comments(read_source(self.HOME / rel))
+                self.assertGreaterEqual(len(re.findall(r"Utils::Ip::Is(PrivateOrLocalAddress|IPv6Literal)\(", src)), floor)
+                self.assertNotRegex(src, r"(isIPv6|IsIPv6)\w*\s*=\s*\w+\.find\(':'\)")
 
 
 if __name__ == "__main__":

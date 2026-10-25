@@ -844,8 +844,6 @@ private:
 [[nodiscard]] std::string_view GetVPNStateName(VPNState state) noexcept;
 [[nodiscard]] std::string_view GetProtectionActionName(ProtectionAction action) noexcept;
 [[nodiscard]] std::string_view GetDNSServerTypeName(DNSServerType type) noexcept;
-[[nodiscard]] bool IsPrivateIP(const std::string& ip) noexcept;
-[[nodiscard]] bool IsIPv6Address(const std::string& ip) noexcept;
 [[nodiscard]] LeakSeverity CalculateLeakSeverity(LeakType type, bool vpnRequired) noexcept;
 
 }  // namespace IoT

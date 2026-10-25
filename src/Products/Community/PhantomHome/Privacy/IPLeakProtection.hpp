@@ -766,11 +766,7 @@ private:
 [[nodiscard]] std::string_view GetIPv6ProtectionModeName(IPv6ProtectionMode mode) noexcept;
 [[nodiscard]] std::string_view GetWebRTCBlockMethodName(WebRTCBlockMethod method) noexcept;
 
-/// @brief Check if IP is private
-[[nodiscard]] bool IsPrivateIP(const std::string& ip);
-
-/// @brief Check if IP is IPv6
-[[nodiscard]] bool IsIPv6Address(const std::string& ip);
+// IsPrivateIP and IsIPv6Address moved to Utils::Ip in IpClassification.hpp (task 295).
 
 /// @brief Get adapter type from description
 [[nodiscard]] AdapterType DetectAdapterType(const std::string& description);
