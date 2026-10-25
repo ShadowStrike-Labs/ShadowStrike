@@ -28879,5 +28879,34 @@ class ThreatIntelFeedsReachTheStoreTests(unittest.TestCase):
         self.assertEqual([], offenders, "IOCEntry has no member initialisers; use {} or BlankFeedEntry()")
 
 
+class BrandImpersonationUsesTheBrandsDomainsTests(unittest.TestCase):
+    """A brand's own domains are the brand (task 344).
+
+    Only brand.com and www.brand.com counted as legitimate, so login.microsoftonline.com and
+    accounts.google.com scored +50 as impersonation, and a substring match made purchase a chase.
+    """
+
+    CPP = ROOT / "src/Products/Community/PhantomHome/Email/PhishingEmailDetector.cpp"
+    HPP = ROOT / "src/Products/Community/PhantomHome/Email/PhishingEmailDetector.hpp"
+
+    def test_every_spoofed_brand_lists_its_domains(self):
+        hpp = strip_c_comments(read_source(self.HPP))
+        block = hpp[hpp.index("COMMONLY_SPOOFED_BRANDS[]"):]
+        brands = re.findall(r'"(\w+)"', block[:block.index("};")])
+        cpp = strip_c_comments(read_source(self.CPP))
+        mapping = cpp[cpp.index("LEGITIMATE_BRAND_DOMAINS = {"):]
+        mapping = mapping[:mapping.index("\n    };")]
+        keys = set(re.findall(r'\{"(\w+)",\s*\{', mapping))
+        self.assertGreater(len(brands), 25)
+        self.assertEqual([], sorted(set(brands) - keys))
+
+    def test_legitimacy_is_decided_by_the_contacted_host(self):
+        cpp = strip_c_comments(read_source(self.CPP))
+        body = cpp[cpp.index("std::optional<std::string> DetectBrandImpersonationInternal("):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("IsOperatedByBrand(host, brand)", body)
+        self.assertNotRegex(body, r'\+\s*"\.com"', "brand.com equality is the defect")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

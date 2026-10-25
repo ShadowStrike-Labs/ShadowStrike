@@ -29,6 +29,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "Products/Community/PhantomHome/Email/EmailProtection.hpp"
 #include "Products/Community/PhantomHome/Email/PhishingEmailDetector.hpp"
@@ -242,6 +243,53 @@ TEST(EmailConfusableSkeleton, ALookalikeOfABrandIsImpersonationAndAnOrdinaryWord
                              "\xD1\x95" /* U+0455 s */ + ".com";
     EXPECT_EQ(std::optional<std::string>("paws.com"), ShadowStrike::Email::ConfusableSkeleton(paws));
     EXPECT_FALSE(detector.DetectBrandImpersonation(paws).has_value());
+}
+
+// Task 344: a brand's own domains are the brand, and ordinary words that contain a short brand
+// name are not; every phishing shape the old substring match caught is still caught.
+TEST(EmailBrandImpersonation, TheBrandsOwnDomainsAreNotImpersonation) {
+    auto& detector = ShadowStrike::Email::PhishingEmailDetector::Instance();
+    if (!detector.IsInitialized()) (void)detector.Initialize();
+    for (const char* host : {"login.microsoftonline.com", "accounts.google.com", "outlook.office.com",
+                             "outlook.office365.com", "www.amazon.co.uk", "aws.amazon.com", "drive.google.com",
+                             "appleid.apple.com", "www.paypal.com", "paypal.com", "secure.chase.com",
+                             "onedrive.live.com", "www.netflix.com.", "Login.Live.com",
+                             // userinfo: the host contacted is PayPal's own apex, so the text
+                             // before it must not be read as part of the domain
+                             "someone@paypal.com"}) {
+        EXPECT_FALSE(detector.DetectBrandImpersonation(host).has_value())
+            << host << " was reported as impersonating " << detector.DetectBrandImpersonation(host).value_or("");
+    }
+}
+
+TEST(EmailBrandImpersonation, AWordThatContainsAShortBrandIsNotTheBrand) {
+    auto& detector = ShadowStrike::Email::PhishingEmailDetector::Instance();
+    if (!detector.IsInitialized()) (void)detector.Initialize();
+    for (const char* host : {"purchase-orders.example", "groups.example.org", "laws.example", "drivers.example",
+                             "pineapple.example", "primeval.example", "stripes.example", "adobes.example",
+                             "upsidedown.example", "applemyth.example"}) {
+        EXPECT_FALSE(detector.DetectBrandImpersonation(host).has_value())
+            << host << " matched " << detector.DetectBrandImpersonation(host).value_or("");
+    }
+}
+
+TEST(EmailBrandImpersonation, EveryPhishingShapeIsStillDetected) {
+    auto& detector = ShadowStrike::Email::PhishingEmailDetector::Instance();
+    if (!detector.IsInitialized()) (void)detector.Initialize();
+    const std::pair<const char*, const char*> cases[] = {
+        {"microsoft-login.xyz", "microsoft"},       {"paypal-secure.example", "paypal"},
+        {"paypalsupport.example", "paypal"},        {"securepaypal.example", "paypal"},
+        {"paypal.com.evil.example", "paypal"},      {"paypal.com@evil.example", "paypal"},
+        {"chasebank-alert.example", "chase"},       {"appleid-verify.example", "apple"},
+        {"chase.example", "chase"},                 {"ups-delivery.example", "ups"},
+        {"microsoft.com.evil.example", "microsoft"}, {"notpaypal.com", "paypal"},
+        {"dhl.example", "dhl"},                     {"amazon-support.example", "amazon"},
+        {"applesupportcenter.example", "apple"},    {"chasebankalert.example", "chase"},
+        {"myupsaccount.example", "ups"},            {"secure-dhlparcel.example", "dhl"},
+    };
+    for (const auto& [host, brand] : cases) {
+        EXPECT_EQ(std::optional<std::string>(brand), detector.DetectBrandImpersonation(host)) << host;
+    }
 }
 
 }  // namespace

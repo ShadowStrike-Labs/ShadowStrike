@@ -126,23 +126,125 @@ namespace {
         {0x051D, 'w'}, {0x03B1, 'a'}, {0x03B9, 'i'}, {0x03BA, 'k'}, {0x03BD, 'v'}
     };
     
-    // Legitimate brand domains for impersonation checks
+    // The registrable domains each commonly spoofed brand actually operates. A host that is one
+    // of these, or a subdomain of one, is the brand itself (task 344). Before this list was used
+    // only brand.com and www.brand.com counted as legitimate, so login.microsoftonline.com,
+    // accounts.google.com, outlook.office.com and amazon.co.uk all scored as impersonation.
+    //
+    // Only domains the brand is known to operate belong here: an entry SUPPRESSES detection for
+    // its whole subtree. A missing entry costs a false positive, never a missed phish.
     const std::unordered_map<std::string, std::vector<std::string>> LEGITIMATE_BRAND_DOMAINS = {
-        {"microsoft", {"microsoft.com", "office.com", "outlook.com", "live.com", "hotmail.com"}},
-        {"google", {"google.com", "gmail.com", "googlemail.com"}},
-        {"apple", {"apple.com", "icloud.com", "me.com"}},
-        {"amazon", {"amazon.com", "amazon.co.uk", "amazon.de", "aws.amazon.com"}},
-        {"paypal", {"paypal.com"}},
-        {"facebook", {"facebook.com", "fb.com"}},
+        {"microsoft", {"microsoft.com", "office.com", "outlook.com", "live.com", "hotmail.com",
+                       "microsoftonline.com", "office365.com", "onedrive.com", "sharepoint.com",
+                       "windows.com", "azure.com", "bing.com", "msn.com", "xbox.com"}},
+        {"office365", {"office365.com", "office.com", "microsoft.com", "microsoftonline.com"}},
+        {"outlook", {"outlook.com", "office.com", "office365.com", "live.com", "microsoft.com"}},
+        {"onedrive", {"onedrive.com", "live.com", "microsoft.com", "sharepoint.com"}},
+        {"google", {"google.com", "gmail.com", "googlemail.com", "youtube.com", "googleusercontent.com",
+                    "googleapis.com", "google.co.uk",
+                    "google.de", "google.fr", "google.it", "google.es", "google.ca", "google.com.au",
+                    "google.co.jp", "google.co.in", "google.com.tr", "google.com.br", "google.nl"}},
+        {"gmail", {"gmail.com", "googlemail.com", "google.com"}},
+        {"drive", {"google.com"}},
+        {"apple", {"apple.com", "icloud.com", "me.com", "mac.com"}},
+        {"icloud", {"icloud.com", "apple.com"}},
+        {"itunes", {"itunes.com", "apple.com"}},
+        {"amazon", {"amazon.com", "amazon.co.uk", "amazon.de", "amazon.fr", "amazon.it", "amazon.es",
+                    "amazon.ca", "amazon.com.au", "amazon.co.jp", "amazon.in", "amazon.com.tr",
+                    "amazon.com.br", "amazon.nl", "amazonaws.com", "primevideo.com"}},
+        {"aws", {"amazon.com", "amazonaws.com", "aws.com"}},
+        {"prime", {"amazon.com", "primevideo.com"}},
+        {"paypal", {"paypal.com", "paypal.me", "paypalobjects.com"}},
+        {"venmo", {"venmo.com"}},
+        {"stripe", {"stripe.com"}},
+        {"facebook", {"facebook.com", "fb.com", "facebook.net", "fbcdn.net", "meta.com"}},
+        {"instagram", {"instagram.com", "cdninstagram.com"}},
+        {"whatsapp", {"whatsapp.com", "whatsapp.net"}},
         {"netflix", {"netflix.com"}},
-        {"chase", {"chase.com", "jpmorganchase.com"}},
-        {"wellsfargo", {"wellsfargo.com"}},
-        {"bankofamerica", {"bankofamerica.com", "bofa.com"}},
-        {"ups", {"ups.com"}},
+        {"spotify", {"spotify.com"}},
+        {"adobe", {"adobe.com"}},
+        {"dropbox", {"dropbox.com", "dropboxusercontent.com"}},
+        {"linkedin", {"linkedin.com", "licdn.com"}},
+        {"twitter", {"twitter.com", "x.com", "twimg.com"}},
+        {"dhl", {"dhl.com", "dhl.de"}},
         {"fedex", {"fedex.com"}},
-        {"dhl", {"dhl.com"}},
-        {"usps", {"usps.com"}}
+        {"ups", {"ups.com"}},
+        {"usps", {"usps.com"}},
+        {"chase", {"chase.com", "jpmorganchase.com", "jpmorgan.com"}},
+        {"wellsfargo", {"wellsfargo.com"}},
+        {"bankofamerica", {"bankofamerica.com", "bofa.com"}}
     };
+
+    // Brand names that are also ordinary words or fragments of them ("purchase" holds chase,
+    // "groups" holds ups, "laws" holds aws). These match only as a whole label part, or joined
+    // to a phishing word; every other brand still matches anywhere inside a label.
+    constexpr std::string_view WORDLIKE_BRANDS[] = {
+        "outlook", "drive", "apple", "aws", "prime", "stripe", "chase", "ups", "dhl", "adobe"};
+
+    // Words phishing domains join to a brand: paypal-secure, securepaypal, chasebank, appleid.
+    constexpr std::string_view PHISHING_AFFIXES[] = {
+        "secure", "security", "verify", "verification", "login", "signin", "account", "accounts",
+        "support", "update", "billing", "service", "services", "online", "help", "auth", "alert",
+        "bank", "banking", "mobile", "mail", "pay", "id", "my", "official", "customer", "team",
+        "parcel", "delivery", "tracking", "package", "shipping"};
+
+    [[nodiscard]] bool IsWordlikeBrand(std::string_view brand) noexcept {
+        return std::find(std::begin(WORDLIKE_BRANDS), std::end(WORDLIKE_BRANDS), brand) != std::end(WORDLIKE_BRANDS);
+    }
+
+    /// True when `rest`, the text joined to a brand, is a phishing word or - for words of four
+    /// letters or more - begins (after the brand) or ends (before it) with one, so
+    /// applesupportcenter and chasebankalert match while upside (ups + "ide") does not.
+    /// Empty text (the brand starts or ends the part) also qualifies.
+    [[nodiscard]] bool IsPhishingAffix(std::string_view rest, bool afterBrand) noexcept {
+        if (rest.empty()) return true;
+        for (const std::string_view affix : PHISHING_AFFIXES) {
+            if (rest == affix) return true;
+            if (affix.size() >= 4 && (afterBrand ? rest.starts_with(affix) : rest.ends_with(affix))) return true;
+        }
+        return false;
+    }
+
+    /// True when the lowercase authority names `brand` in one of its labels or label parts
+    /// (split at '.', '-', '_', '@' and ':'). Word-like brands must be a whole part or joined
+    /// only to phishing words; other brands match anywhere inside a part (paypalsupport).
+    [[nodiscard]] bool NamesBrand(std::string_view authority, std::string_view brand) {
+        const bool wordlike = IsWordlikeBrand(brand);
+        size_t start = 0;
+        while (start <= authority.size()) {
+            const size_t end = authority.find_first_of(".-_@:", start);
+            const std::string_view part = authority.substr(start, (end == std::string_view::npos ? authority.size() : end) - start);
+            if (part == brand) return true;
+            if (part.size() > brand.size()) {
+                if (!wordlike) {
+                    if (part.find(brand) != std::string_view::npos) return true;
+                } else {
+                    // Every occurrence: myupsaccount is "my" + ups + "account".
+                    for (size_t at = part.find(brand); at != std::string_view::npos; at = part.find(brand, at + 1)) {
+                        if (IsPhishingAffix(part.substr(0, at), false) &&
+                            IsPhishingAffix(part.substr(at + brand.size()), true)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if (end == std::string_view::npos) break;
+            start = end + 1;
+        }
+        return false;
+    }
+
+    /// True when `host` is one of the domains `brand` operates, or a subdomain of one.
+    [[nodiscard]] bool IsOperatedByBrand(std::string_view host, const std::string& brand) {
+        const auto it = LEGITIMATE_BRAND_DOMAINS.find(brand);
+        if (it == LEGITIMATE_BRAND_DOMAINS.end()) {
+            return Utils::Domain::IsSameOrSubdomainOf(host, brand + ".com");
+        }
+        for (const auto& official : it->second) {
+            if (Utils::Domain::IsSameOrSubdomainOf(host, official)) return true;
+        }
+        return false;
+    }
     
     /// The brand a skeleton spells, as a whole DNS label or a hyphen-separated part of one. Whole
     /// tokens only: an ordinary Russian word skeletonises to a string that is not a brand name,
@@ -877,34 +979,19 @@ public:
             }
         }
 
-        std::string lowerDomain = AsciiToLower(domain);
+        // The brand may be named anywhere in the authority, including a userinfo part
+        // (https://paypal.com@evil.example/); whether the link is the brand's own is decided
+        // by the host that is actually contacted.
+        std::string authority = AsciiToLower(domain);
+        while (!authority.empty() && authority.back() == '.') authority.pop_back();
+        const size_t at = authority.rfind('@');
+        const std::string host = at == std::string::npos ? authority : authority.substr(at + 1);
 
-        for (const auto& brand : PhishingConstants::COMMONLY_SPOOFED_BRANDS) {
-            std::string brandStr(brand);
-
-            // Exact match (legitimate)
-            if (lowerDomain == brandStr + ".com" ||
-                lowerDomain == "www." + brandStr + ".com") {
-                continue;
-            }
-
-            // Contains brand name but isn't the official domain (suspicious)
-            if (lowerDomain.find(brandStr) != std::string::npos) {
-                return brandStr;
-            }
-
-            // Check for common typosquatting patterns
-            std::string typo1 = brandStr + "secure";
-            std::string typo2 = brandStr + "verify";
-            std::string typo3 = brandStr + "login";
-
-            if (lowerDomain.find(typo1) != std::string::npos ||
-                lowerDomain.find(typo2) != std::string::npos ||
-                lowerDomain.find(typo3) != std::string::npos) {
-                return brandStr;
-            }
+        for (const char* brand : PhishingConstants::COMMONLY_SPOOFED_BRANDS) {
+            if (!NamesBrand(authority, brand)) continue;
+            if (IsOperatedByBrand(host, brand)) continue;
+            return std::string(brand);
         }
-
         return std::nullopt;
     }
 
