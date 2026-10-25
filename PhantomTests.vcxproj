@@ -511,6 +511,7 @@
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelExporter_Tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFeedManager_parsers_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFeedManagerTests.cpp" />
+    <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFeedSync_Tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelFormat_tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelImporter_Tests.cpp" />
     <ClCompile Include="tests\unit\Database_systems_unit\threat_intel\ThreatIntelIndex_tests.cpp" />

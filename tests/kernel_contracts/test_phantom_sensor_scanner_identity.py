@@ -28824,5 +28824,60 @@ class PasswordFieldNeedsAnEditClassTests(unittest.TestCase):
         self.assertIn("IsEditWindow(hwnd)", body)
 
 
+class ThreatIntelFeedsReachTheStoreTests(unittest.TestCase):
+    """A registered feed is synced soon, by the right parser, into the store that owns it (task 259).
+
+    0 indicators after 18 minutes with three feeds "active" had five causes, each invisible to the
+    others' tests: the first sync was a full interval away, the store's feeds had no protocol, the
+    manager had no target store, parsed entries had no reputation (0 is Safe), and nothing was logged.
+    """
+
+    TI = ROOT / "src/PhantomCore/ThreatIntel"
+
+    def _src(self, name):
+        return strip_c_comments(read_source(self.TI / name))
+
+    @staticmethod
+    def _body(src, signature):
+        i = src.index(signature)
+        return src[i:src.index("\n}\n", i)]
+
+    def test_the_store_is_the_feed_managers_target(self):
+        init = self._body(self._src("ThreatIntelStore.cpp"), "bool ThreatIntelStore::Initialize(")
+        self.assertIn("feedManager->SetTargetStore(", init)
+
+    def test_the_feed_manager_stops_before_the_store_lock_is_taken(self):
+        body = self._body(self._src("ThreatIntelStore.cpp"), "void ThreatIntelStore::Shutdown()")
+        stop = body.find("m_impl->feedManager->Shutdown();")
+        lock = body.find("std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);")
+        self.assertGreater(stop, 0)
+        self.assertGreater(lock, stop)
+
+    def test_default_feeds_come_from_the_manager_factories(self):
+        body = self._body(self._src("ThreatIntelStore.cpp"), "uint32_t ThreatIntelStore::RegisterDefaultFeeds()")
+        self.assertRegex(body, r"&ThreatFeedConfig::Create\w+")
+        self.assertNotIn('"https://', body, "an endpoint re-described here loses its parser settings")
+
+    def test_a_running_feed_is_first_scheduled_soon(self):
+        src = self._src("ThreatIntelFeedManager.cpp")
+        start = self._body(src, "bool ThreatIntelFeedManager::Start()")
+        self.assertIn("ScheduleInitialSync(*context);", start)
+        self.assertNotIn("ScheduleNextSync(", start)
+        self.assertIn("cancelRequested.store(false", start)
+
+    def test_stop_never_destroys_a_joinable_thread(self):
+        body = self._body(self._src("ThreatIntelFeedManager.cpp"), "bool ThreatIntelFeedManager::Stop(")
+        clear = body.rfind("m_workerThreads.clear();")
+        self.assertGreater(clear, 0)
+        self.assertIn("thread.join();", body[body.find("joinLate"):clear])
+
+    def test_no_threat_intel_entry_is_default_initialised(self):
+        offenders = []
+        for path in sorted(self.TI.rglob("*.cpp")):
+            for m in re.finditer(r"\bIOCEntry\s+\w+\s*;", strip_c_comments(read_source(path))):
+                offenders.append(f"{path.name}: {m.group(0)}")
+        self.assertEqual([], offenders, "IOCEntry has no member initialisers; use {} or BlankFeedEntry()")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

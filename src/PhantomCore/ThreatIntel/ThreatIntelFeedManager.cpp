@@ -1517,7 +1517,11 @@ bool ThreatIntelFeedManager::Start() {
     {
         std::shared_lock<std::shared_mutex> lock(m_feedsMutex);
         for (const auto& [feedId, context] : m_feeds) {
-            if (context && context->config.enabled) {
+            if (!context) continue;
+            // Stop() cancels every feed; a restart must clear that, or WorkerThread skips
+            // each task of a cancelled feed for the life of the process.
+            context->cancelRequested.store(false, std::memory_order_release);
+            if (context->config.enabled) {
                 ScheduleInitialSync(*context);
             }
         }
@@ -1538,6 +1542,17 @@ bool ThreatIntelFeedManager::Stop(uint32_t timeoutMs) {
     // Wake up all waiting threads to allow them to see shutdown flag
     m_queueCondition.notify_all();
     m_syncLimiterCv.notify_all();
+    
+    // Ask every sync in flight to stop at its next checkpoint (rate-limit wait, each
+    // download chunk, each store batch) so the joins below normally finish in milliseconds.
+    {
+        std::shared_lock<std::shared_mutex> lock(m_feedsMutex);
+        for (const auto& [feedId, context] : m_feeds) {
+            if (context) {
+                context->cancelRequested.store(true, std::memory_order_release);
+            }
+        }
+    }
     
     // Calculate effective timeout with reasonable bounds
     const DWORD effectiveTimeoutMs = (timeoutMs > 0 && timeoutMs <= 300000) 
@@ -1658,19 +1673,25 @@ bool ThreatIntelFeedManager::Stop(uint32_t timeoutMs) {
         }
     }
     
-    // Clear worker thread vector
-    // Note: Only clear threads that were successfully joined
-    m_workerThreads.erase(
-        std::remove_if(m_workerThreads.begin(), m_workerThreads.end(),
-            [](const std::thread& t) { return !t.joinable(); }),
-        m_workerThreads.end()
-    );
-    
-    // If any threads remain joinable, we have a problem but don't leak
-    // They will eventually complete due to shutdown flag
-    if (!m_workerThreads.empty()) {
-        SS_LOG_WARN(L"ThreatIntelFeedManager", L"Some worker threads did not terminate within the timeout period.");
+    // A thread still running past the deadline is joined anyway. Destroying a joinable
+    // std::thread calls std::terminate, which is what clear() did here, and detaching would
+    // leave it running against a destroyed manager. A worker blocked in a download returns
+    // at the next chunk or at the WinINet receive timeout, and then sees the cancel flag.
+    const auto joinLate = [](std::thread& thread, const wchar_t* which) {
+        if (!thread.joinable()) return;
+        SS_LOG_WARN(L"ThreatIntelFeedManager",
+                    L"%s did not stop within the timeout; waiting for its current operation to end",
+                    which);
+        try {
+            thread.join();
+        } catch (const std::system_error&) {
+        }
+    };
+    for (auto& thread : m_workerThreads) {
+        joinLate(thread, L"A sync worker");
     }
+    joinLate(m_schedulerThread, L"The scheduler");
+    joinLate(m_healthThread, L"The health monitor");
     m_workerThreads.clear();
     
     // Clear task queue safely
@@ -3145,8 +3166,9 @@ SyncResult ThreatIntelFeedManager::ExecuteSync(
     EmitEvent(FeedEventType::SyncStarted, context.config.feedId);
     
     try {
-        // Check for cancellation before starting
-        if (context.cancelRequested.load(std::memory_order_acquire)) {
+        // Check for cancellation before starting (Stop() may have begun after this task was taken)
+        if (context.cancelRequested.load(std::memory_order_acquire) ||
+            m_shutdown.load(std::memory_order_acquire)) {
             result.errorMessage = "Sync cancelled before start";
             throw std::runtime_error(result.errorMessage);
         }
@@ -3786,6 +3808,14 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
     while (InternetReadFile(hRequest.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead)) {
         if (bytesRead == 0) {
             break;  // End of data
+        }
+        
+        // Stop() and CancelSync() are honoured per chunk, not only after the whole body.
+        if (m_shutdown.load(std::memory_order_acquire) ||
+            context.cancelRequested.load(std::memory_order_acquire)) {
+            response.error = "Download cancelled";
+            response.body.clear();
+            return response;
         }
         
         // Check size limit before adding
