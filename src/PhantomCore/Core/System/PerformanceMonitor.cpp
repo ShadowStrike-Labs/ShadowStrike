@@ -371,6 +371,9 @@ void PerformanceMonitorStatistics::Reset() noexcept {
 // CALLBACK MANAGER
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different CallbackManager in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 class CallbackManager {
 public:
     uint64_t RegisterResourceUsage(ResourceUsageCallback callback) {
@@ -487,6 +490,8 @@ private:
     std::unordered_map<uint64_t, AnomalyCallback> m_anomalyCallbacks;
     std::unordered_map<uint64_t, ThrottleCallback> m_throttleCallbacks;
 };
+
+}  // namespace
 
 // ============================================================================
 // HISTORY MANAGER

@@ -109,7 +109,6 @@ namespace ThreatIntel {
 // ============================================================================
 
 class ThreatIntelIOCManager;
-class IOCValidator;
 class IOCNormalizer;
 class IOCDeduplicator;
 class IOCRelationshipGraph;

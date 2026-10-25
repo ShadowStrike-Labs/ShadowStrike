@@ -707,6 +707,9 @@ namespace ShadowStrike::AntiEvasion {
     // Ensures handles are always closed, even in exception paths
     // ========================================================================
 
+// Internal linkage: another translation unit defines a different ProcessHandleGuard in this namespace, and the linker kept one inline definition for both.
+namespace {
+
     /**
      * @brief RAII wrapper for process handles from OpenProcess
      */
@@ -752,6 +755,11 @@ namespace ShadowStrike::AntiEvasion {
         HANDLE m_handle;
     };
 
+}  // namespace
+
+// Internal linkage: another translation unit defines a different SnapshotHandleGuard in this namespace, and the linker kept one inline definition for both.
+namespace {
+
     /**
      * @brief RAII wrapper for snapshot handles from CreateToolhelp32Snapshot
      */
@@ -790,6 +798,8 @@ namespace ShadowStrike::AntiEvasion {
     private:
         HANDLE m_handle;
     };
+
+}  // namespace
 
     // ========================================================================
     // RAII: EventLogHandleGuard

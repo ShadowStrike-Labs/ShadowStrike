@@ -833,6 +833,9 @@ void CrashHandlerStatistics::Reset() noexcept {
 // CALLBACK MANAGER (Lock-Free for Crash Path)
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different CallbackManager in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 /**
  * @class CallbackManager
  * @brief Manages crash callbacks with lock-free invocation for crash path safety.
@@ -968,6 +971,8 @@ private:
     std::unordered_map<uint64_t, PostCrashCallback> m_postCrashCallbacks;
     RecoveryCallback m_recoveryCallback;
 };
+
+}  // namespace
 
 // ============================================================================
 // CRASH HISTORY MANAGER

@@ -745,6 +745,9 @@ ReflectiveStatistics& ReflectiveStatistics::operator=(const ReflectiveStatistics
 // CALLBACK MANAGER
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different CallbackManager in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 class CallbackManager {
 public:
     uint64_t RegisterDetection(ReflectiveDetectedCallback callback) {
@@ -818,6 +821,8 @@ private:
     std::unordered_map<uint64_t, ReflectiveScanProgressCallback> m_progressCallbacks;
     std::unordered_map<uint64_t, PECandidateCallback> m_candidateCallbacks;
 };
+
+}  // namespace
 
 // ============================================================================
 // LOADER SIGNATURE DATABASE

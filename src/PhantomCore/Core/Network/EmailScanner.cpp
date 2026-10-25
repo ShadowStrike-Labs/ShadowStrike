@@ -852,6 +852,9 @@ void EmailScannerStatistics::Reset() noexcept {
 // CALLBACK MANAGER
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different CallbackManager in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 class CallbackManager {
 public:
     uint64_t RegisterAnalysis(EmailAnalysisCallback callback) {
@@ -965,6 +968,8 @@ private:
     std::unordered_map<uint64_t, PhishingCallback> m_phishingCallbacks;
     std::unordered_map<uint64_t, MalwareCallback> m_malwareCallbacks;
 };
+
+}  // namespace
 
 // ============================================================================
 // PIMPL IMPLEMENTATION CLASS

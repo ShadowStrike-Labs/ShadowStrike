@@ -659,6 +659,9 @@ double DLLInjectionStatistics::GetDetectionRate() const noexcept {
 // CALLBACK MANAGER
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different CallbackManager in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 class CallbackManager {
 public:
     uint64_t RegisterInjection(DLLInjectionDetectedCallback callback) {
@@ -801,6 +804,8 @@ private:
     std::unordered_map<uint64_t, LoadDecisionCallback> m_decisionCallbacks;
     std::unordered_map<uint64_t, HookInstalledCallback> m_hookCallbacks;
 };
+
+}  // namespace
 
 // ============================================================================
 // MODULE TRACKER

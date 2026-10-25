@@ -29208,5 +29208,125 @@ class CompiledSourcesAreDistinctTests(_CompiledSourcesMixin, unittest.TestCase):
             seen[digest] = path.relative_to(ROOT)
 
 
+class CertificateValidatorStatisticsHaveTheirOwnLayoutTests(unittest.TestCase):
+    """Each InternalAtomicStats has internal linkage (task 216).
+
+    CertificateValidator.cpp and ProcessProtection.cpp each defined a class named
+    ShadowStrike::Security::InternalAtomicStats with a different layout: sixteen counters then
+    startTime, against fourteen counters, startTime and lastEventTimeTicks. Their in-class
+    members are inline, so the linker kept one definition for both. The field run reported
+    kernelRevocationBlocks - the fifteenth counter, offset 112, where the other layout keeps
+    startTime - as the steady-clock time of service start (130.59 s in 1.0.112, 173.18 s in
+    1.0.113) while the counter was never incremented.
+    """
+
+    def test_both_definitions_are_in_an_anonymous_namespace(self):
+        for name in ("CertificateValidator.cpp", "ProcessProtection.cpp"):
+            source = strip_c_comments(read_source(ROOT / "src/PhantomCore/SelfProtection" / name))
+            at = source.index("struct InternalAtomicStats {")
+            opened = [m.start() for m in re.finditer(r"\bnamespace\s*\{", source[:at])]
+            self.assertTrue(opened, "%s: InternalAtomicStats is not in an anonymous namespace" % name)
+            between = source[opened[-1]:at]
+            self.assertLess(between.count("}") - between.count("{"), 0,
+                                 "%s: the anonymous namespace closes before InternalAtomicStats" % name)
+
+
+class _CompiledSourcesMixin:
+    """The .cpp files a project compiles, read from its project file."""
+
+    NS = "{http://schemas.microsoft.com/developer/msbuild/2003}"
+    def _compiled(self, project):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(ROOT / project).getroot()
+        files = []
+        for item in root.iter(self.NS + "ClCompile"):
+            include = item.get("Include") or ""
+            excluded = any(child.tag == self.NS + "ExcludedFromBuild" and
+                           (child.text or "").strip().lower() == "true" for child in item)
+            if include.endswith(".cpp") and not excluded:
+                path = ROOT / include.replace("\\", "/")
+                if path.exists():
+                    files.append(path)
+        return files
+
+
+class CompiledSourcesAreDistinctTests(_CompiledSourcesMixin, unittest.TestCase):
+    """No compiled source is a byte copy of another (task 350)."""
+
+    def test_no_compiled_source_is_a_byte_copy_of_another(self):
+        """RegistryExtAPI.cpp and ServiceExtAPI.cpp were byte copies of RegistryAPI.cpp (task 350)."""
+        import hashlib
+        seen = {}
+        for path in self._compiled("PhantomCoreLib.vcxproj"):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertNotIn(digest, seen, "%s is a byte copy of %s" % (path.relative_to(ROOT), seen.get(digest)))
+            seen[digest] = path.relative_to(ROOT)
+
+
+class TranslationUnitLocalTypesHaveInternalLinkageTests(_CompiledSourcesMixin, unittest.TestCase):
+    """No two compiled translation units define a namespace-scope class of the same name.
+
+    A class defined in a .cpp outside an anonymous namespace has external linkage, and its
+    in-class member functions and implicit constructors are inline: when two .cpp files define
+    one name differently, the linker keeps ONE definition and runs it on objects of both
+    layouts, with no diagnostic. Task 216 measured the result in the field. Eight such pairs
+    existed (InternalAtomicStats, three CallbackManagers, two handle guards, IOCValidator and a
+    test IndexBuffer). This scans what each binary actually compiles, from the project files.
+
+    Scope: PhantomCoreLib together with the service (one binary), and the test project's own
+    sources. Link shims in the test project are guarded by preprocessor switches this scan does
+    not evaluate, so test-versus-library pairs are not checked here.
+    """
+
+    TOKEN = re.compile(
+        r"\bnamespace\s+([A-Za-z_][\w:]*)\s*\{|\bnamespace\s*\{|"
+        r"\b(struct|class|union|enum\s+class|enum\s+struct)\s+(?:alignas\([^)]*\)\s*)?"
+        r"(?:\[\[[^\]]*\]\]\s*)?([A-Za-z_]\w*)\s*(?:final\s*)?(?::[^;{()]*)?\{|[{}]")
+
+    def _external_classes(self, path):
+        source = strip_c_comments(read_source(path))
+        source = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', source)
+        source = re.sub(r"'(?:\\.|[^'\\\n])'", "''", source)
+        stack, found = [], []
+        for match in self.TOKEN.finditer(source):
+            token = match.group(0)
+            if token == "{":
+                stack.append(None)
+            elif token == "}":
+                if stack:
+                    stack.pop()
+            elif token.startswith("namespace"):
+                stack.append(("ns", match.group(1)) if match.group(1) else ("anon", None))
+            else:
+                kind, name = match.group(2), match.group(3)
+                at_namespace_scope = all(entry is not None for entry in stack)
+                anonymous = any(entry and entry[0] == "anon" for entry in stack)
+                if at_namespace_scope and not anonymous and not kind.startswith("enum"):
+                    found.append("::".join(e[1] for e in stack if e) + "::" + name)
+                stack.append(None)
+        return found
+
+    def _duplicates(self, files):
+        owners = {}
+        for path in files:
+            for name in set(self._external_classes(path)):
+                owners.setdefault(name, set()).add(path.relative_to(ROOT).as_posix())
+        return {name: sorted(paths) for name, paths in owners.items() if len(paths) > 1}
+
+    def test_the_library_and_service_define_each_class_once(self):
+        files = self._compiled("PhantomCoreLib.vcxproj") + self._compiled("ShadowStrikePhantomService.vcxproj")
+        self.assertGreater(len(files), 400, "the project files were not read")
+        self.assertEqual({}, self._duplicates(files),
+                         "a class name is defined in more than one translation unit; give the "
+                         "local one internal linkage (an anonymous namespace)")
+
+    def test_the_test_sources_define_each_class_once(self):
+        files = [p for p in self._compiled("PhantomTests.vcxproj")
+                 if p.relative_to(ROOT).as_posix().startswith("tests/")]
+        self.assertGreater(len(files), 200, "the test project file was not read")
+        self.assertEqual({}, self._duplicates(files))
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

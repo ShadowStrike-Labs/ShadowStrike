@@ -312,6 +312,9 @@ namespace ShadowStrike::AntiEvasion {
     // RAII HANDLE WRAPPER (avoids resource leaks in exception paths)
     // ========================================================================
 
+// Internal linkage: another translation unit defines a different ProcessHandleGuard in this namespace, and the linker kept one inline definition for both.
+namespace {
+
     /// @brief RAII wrapper for Windows HANDLE to ensure proper cleanup
     /// @note This is local to avoid depending on ProcessUtils internal detail
     class ProcessHandleGuard {
@@ -361,6 +364,11 @@ namespace ShadowStrike::AntiEvasion {
         HANDLE m_handle;
     };
 
+}  // namespace
+
+// Internal linkage: another translation unit defines a different SnapshotHandleGuard in this namespace, and the linker kept one inline definition for both.
+namespace {
+
     /// @brief RAII wrapper for CreateToolhelp32Snapshot handles
     class SnapshotHandleGuard {
     public:
@@ -381,6 +389,8 @@ namespace ShadowStrike::AntiEvasion {
     private:
         HANDLE m_handle;
     };
+
+}  // namespace
 
 } // End namespace ShadowStrike::AntiEvasion
 

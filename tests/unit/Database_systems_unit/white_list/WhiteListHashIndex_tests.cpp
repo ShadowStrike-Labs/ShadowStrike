@@ -93,6 +93,9 @@ namespace TestConstants {
     constexpr size_t OPERATIONS_PER_THREAD = 1000;
 }
 
+// Internal linkage: another translation unit defines a different IndexBuffer in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 /**
  * @brief RAII helper for temporary index buffer allocation
  */
@@ -143,6 +146,8 @@ private:
     size_t m_size;
     std::unique_ptr<uint8_t[]> m_data;
 };
+
+}  // namespace
 
 /**
  * @brief Helper to create test HashValue objects

@@ -66,6 +66,9 @@ using namespace std::chrono_literals;
 // TEST HELPERS AND UTILITIES
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different IndexBuffer in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 /**
  * @brief RAII helper for managing test buffer memory
  */
@@ -102,6 +105,8 @@ private:
     size_t m_size;
     std::unique_ptr<uint8_t[]> m_buffer;
 };
+
+}  // namespace
 
 /**
  * @brief Test path generator for various test scenarios

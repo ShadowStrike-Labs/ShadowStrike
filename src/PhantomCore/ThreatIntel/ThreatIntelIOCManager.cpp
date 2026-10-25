@@ -336,6 +336,9 @@ constexpr size_t MAX_VERSIONS_PER_ENTRY = 1024;
 // IOC VALIDATOR CLASS
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different IOCValidator in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 /**
  * @brief Internal IOC validator
  */
@@ -452,6 +455,8 @@ public:
         return true;
     }
 };
+
+}  // namespace
 
 // ============================================================================
 // IOC NORMALIZER CLASS

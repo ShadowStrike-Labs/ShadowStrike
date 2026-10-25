@@ -538,6 +538,9 @@ void TrafficAnalyzerStatistics::Reset() noexcept {
 // CALLBACK MANAGER
 // ============================================================================
 
+// Internal linkage: another translation unit defines a different CallbackManager in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 class CallbackManager {
 public:
     uint64_t RegisterPacketCallback(PacketAnalysisCallback callback) {
@@ -651,6 +654,8 @@ private:
     std::unordered_map<uint64_t, ThreatCallback> m_threatCallbacks;
     std::unordered_map<uint64_t, TLSCallback> m_tlsCallbacks;
 };
+
+}  // namespace
 
 // ============================================================================
 // STREAM REASSEMBLY MANAGER

@@ -292,6 +292,9 @@ struct ValidationResult {
     [[nodiscard]] explicit operator bool() const noexcept { return isValid; }
 };
 
+// Internal linkage: another translation unit defines a different IOCValidator in this namespace, and the linker kept one inline definition for both.
+namespace {
+
 /**
  * @brief Enterprise-grade input validator for IOC values
  * 
@@ -882,6 +885,8 @@ public:
         }
     }
 };
+
+}  // namespace
 
 // ThreatIntelLookup.hpp exposes UnifiedLookupOptions as the public options type.
 // The implementation historically used the name LookupOptions; keep that name
