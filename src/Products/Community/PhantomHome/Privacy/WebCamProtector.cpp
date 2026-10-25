@@ -517,7 +517,7 @@ public:
     mutable std::mutex m_cooldownMutex;
 
     /// @brief Callbacks
-    std::vector<AccessEventCallback> m_accessCallbacks;
+    std::vector<CameraAccessCallback> m_accessCallbacks;
     std::vector<CameraDeviceChangeCallback> m_deviceCallbacks;
     std::vector<CameraAccessDecisionCallback> m_decisionCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
@@ -1804,7 +1804,7 @@ CameraRiskLevel WebcamProtector::AnalyzeProcess(uint32_t processId) {
 // CALLBACKS
 // ============================================================================
 
-void WebcamProtector::RegisterAccessCallback(AccessEventCallback callback) {
+void WebcamProtector::RegisterAccessCallback(CameraAccessCallback callback) {
     if (!m_impl) return;
     std::lock_guard lock(m_impl->m_callbacksMutex);
     m_impl->m_accessCallbacks.push_back(std::move(callback));

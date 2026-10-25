@@ -515,7 +515,7 @@ public:
     void ClearEventHistory();
 
     // Callbacks
-    void RegisterAccessCallback(AccessEventCallback callback);
+    void RegisterAccessCallback(LocationAccessCallback callback);
     void RegisterGeofenceCallback(GeofenceCallback callback);
     void RegisterLocationCallback(LocationCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
@@ -580,7 +580,7 @@ private:
     std::atomic<bool> m_stopMonitoring{false};
 
     // Callbacks
-    AccessEventCallback m_accessCallback;
+    LocationAccessCallback m_accessCallback;
     GeofenceCallback m_geofenceCallback;
     LocationCallback m_locationCallback;
     ErrorCallback m_errorCallback;
@@ -1558,7 +1558,7 @@ void LocationPrivacyImpl::ClearEventHistory() {
 // CALLBACKS
 // ============================================================================
 
-void LocationPrivacyImpl::RegisterAccessCallback(AccessEventCallback callback) {
+void LocationPrivacyImpl::RegisterAccessCallback(LocationAccessCallback callback) {
     std::unique_lock lock(m_mutex);
     m_accessCallback = std::move(callback);
 }
@@ -1811,7 +1811,7 @@ void LocationPrivacyImpl::RecordAccessEvent(const LocationAccessEvent& event) {
 }
 
 void LocationPrivacyImpl::NotifyAccessEvent(const LocationAccessEvent& event) {
-    AccessEventCallback callback;
+    LocationAccessCallback callback;
     {
         std::shared_lock lock(m_mutex);
         callback = m_accessCallback;
@@ -2101,7 +2101,7 @@ void LocationPrivacy::ClearEventHistory() {
     m_impl->ClearEventHistory();
 }
 
-void LocationPrivacy::RegisterAccessCallback(AccessEventCallback callback) {
+void LocationPrivacy::RegisterAccessCallback(LocationAccessCallback callback) {
     m_impl->RegisterAccessCallback(std::move(callback));
 }
 

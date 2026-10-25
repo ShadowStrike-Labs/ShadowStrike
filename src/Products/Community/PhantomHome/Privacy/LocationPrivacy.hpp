@@ -521,7 +521,7 @@ struct LocationConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using AccessEventCallback = std::function<void(const LocationAccessEvent&)>;
+using LocationAccessCallback = std::function<void(const LocationAccessEvent&)>;
 using GeofenceCallback = std::function<void(const GeofenceRegion&, bool entered)>;
 using LocationCallback = std::function<GeoLocation(const GeoLocation& real)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
@@ -697,7 +697,7 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterAccessCallback(AccessEventCallback callback);
+    void RegisterAccessCallback(LocationAccessCallback callback);
     void RegisterGeofenceCallback(GeofenceCallback callback);
     void RegisterLocationCallback(LocationCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
