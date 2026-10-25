@@ -362,6 +362,68 @@ TEST_F(StringIndicatorTest, AStringIndicatorCanBeRemovedByItsText) {
 }
 
 // ============================================================================
+// Deduplication index across restarts and Optimize (task 354)
+// ============================================================================
+
+class DedupIndexTest : public ::testing::Test {
+protected:
+    ScratchFolder dir;
+    std::wstring path = (dir.path / "dedup.tidb").wstring();
+
+    static IOCOperationResult Add(ThreatIntelIOCManager& manager, IOCType type, std::string_view value) {
+        IOCEntry entry{};
+        EXPECT_TRUE(manager.ParseAndStoreIOC(type, value, entry)) << std::string(value);
+        entry.reputation = ReputationLevel::Malicious;
+        // The defaults update an existing entry; ask for the duplicate to be reported instead.
+        IOCAddOptions options;
+        options.overwriteIfExists = false;
+        options.updateIfExists = false;
+        return manager.AddIOC(entry, options);
+    }
+};
+
+TEST_F(DedupIndexTest, AnIndicatorAddedAgainAfterARestartIsADuplicate) {
+    {
+        ThreatIntelDatabase db;
+        ASSERT_TRUE(db.Open(path));
+        ThreatIntelIOCManager manager;
+        ASSERT_EQ(manager.Initialize(&db).code, ThreatIntelError::Success);
+        ASSERT_TRUE(Add(manager, IOCType::IPv4, "203.0.113.7").success);
+        ASSERT_TRUE(Add(manager, IOCType::Domain, "evil-one.example").success);
+        manager.Shutdown();
+        db.Close();
+    }
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open(path));
+    ThreatIntelIOCManager manager;
+    ASSERT_EQ(manager.Initialize(&db).code, ThreatIntelError::Success);
+    const auto ip = Add(manager, IOCType::IPv4, "203.0.113.7");
+    const auto domain = Add(manager, IOCType::Domain, "evil-one.example");
+    EXPECT_TRUE(ip.wasDuplicate) << "the dedup index started empty after the restart";
+    EXPECT_TRUE(domain.wasDuplicate);
+    EXPECT_EQ(db.GetEntryCount(), 2u) << "a restart turned a re-add into a second copy";
+    EXPECT_TRUE(manager.ExistsIOC(IOCType::Domain, "evil-one.example"));
+    manager.Shutdown();
+}
+
+TEST_F(DedupIndexTest, OptimizeKeepsEveryLiveIndicatorRecognised) {
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open(path));
+    ThreatIntelIOCManager manager;
+    ASSERT_EQ(manager.Initialize(&db).code, ThreatIntelError::Success);
+    ASSERT_TRUE(Add(manager, IOCType::IPv4, "203.0.113.7").success);
+    ASSERT_TRUE(Add(manager, IOCType::IPv6, "2001:db8::7").success);
+    ASSERT_TRUE(Add(manager, IOCType::Domain, "evil-one.example").success);
+    ASSERT_TRUE(manager.Optimize());
+    EXPECT_TRUE(Add(manager, IOCType::IPv4, "203.0.113.7").wasDuplicate)
+        << "Optimize rebuilt IPv4 keys as a.b.c.d/32, which AddIOC never uses";
+    EXPECT_TRUE(Add(manager, IOCType::IPv6, "2001:db8::7").wasDuplicate) << "Optimize dropped IPv6 keys";
+    EXPECT_TRUE(Add(manager, IOCType::Domain, "evil-one.example").wasDuplicate) << "Optimize dropped string keys";
+    EXPECT_EQ(db.GetEntryCount(), 3u);
+    manager.Shutdown();
+}
+
+// ============================================================================
 // ThreatIntelIndex reads indicator text from the string store (task 353)
 // ============================================================================
 

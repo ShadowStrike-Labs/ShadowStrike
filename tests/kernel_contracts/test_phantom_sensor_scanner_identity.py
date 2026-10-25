@@ -29353,5 +29353,20 @@ class ThreatIntelIndexOwnsItsViewTests(unittest.TestCase):
         self.assertIn("m_impl->index->SetStringSource(&m_impl->database->Strings());", store)
 
 
+class DeduplicationIndexIsRebuiltWithTheAddKeyTests(unittest.TestCase):
+    """The in-memory dedup index is rebuilt at open, and Optimize uses AddIOC's key (task 354)."""
+
+    def test_initialize_and_optimize_share_one_rebuild(self):
+        mgr = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelIOCManager.cpp"))
+        init = extract_c_function(mgr, "ThreatIntelIOCManager::Initialize")
+        self.assertIn("RebuildDeduplicationIndex(*database, *m_impl->deduplicator)", init,
+                      "the dedup index starts empty after a restart again")
+        optimize = extract_c_function(mgr, "ThreatIntelIOCManager::Optimize")
+        self.assertIn("RebuildDeduplicationIndex(*m_impl->database, *m_impl->deduplicator)", optimize)
+        self.assertNotIn('"%u.%u.%u.%u/%u"', optimize, "Optimize builds its own IPv4 key format again")
+        rebuild = extract_c_function(mgr, "RebuildDeduplicationIndex")
+        self.assertIn("BuildDedupKey(*entry)", rebuild)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

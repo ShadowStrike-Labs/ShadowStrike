@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -1113,6 +1113,51 @@ private:
 /**
  * @brief Internal implementation using Pimpl pattern for ABI stability
  */
+namespace {
+
+/// What a dedup rebuild found, for the statistics Optimize recalculates.
+struct DedupRebuildCounts {
+    size_t active = 0;
+    size_t revoked = 0;
+    size_t expired = 0;
+};
+
+/// Rebuilds the deduplication index from the database with the same key AddIOC uses
+/// (BuildDedupKey), so every live entry is found again and none is added twice. Revoked
+/// and expired entries are left out, so they can be added again.
+[[nodiscard]] DedupRebuildCounts RebuildDeduplicationIndex(const ThreatIntelDatabase& database,
+                                                           IOCDeduplicator& deduplicator) noexcept {
+    DedupRebuildCounts counts;
+    deduplicator.Clear();
+    const size_t entryCount = database.GetEntryCount();
+    for (size_t i = 0; i < entryCount; ++i) {
+        const auto* entry = database.GetEntry(i);
+        if (entry == nullptr || entry->entryId == 0) {
+            continue;
+        }
+        if (HasFlag(entry->flags, IOCFlags::Revoked)) {
+            ++counts.revoked;
+            continue;
+        }
+        if (entry->IsExpired()) {
+            ++counts.expired;
+            continue;
+        }
+        ++counts.active;
+        try {
+            const std::string key = BuildDedupKey(*entry);
+            if (!key.empty()) {
+                // A failure leaves this entry reachable by the linear scan only.
+                (void)deduplicator.Add(entry->type, key, entry->entryId);
+            }
+        } catch (...) {
+            // Allocation failure: same fallback as a failed Add.
+        }
+    }
+    return counts;
+}
+
+}  // namespace
 
 class ThreatIntelIOCManager::Impl {
 public:
@@ -1190,6 +1235,11 @@ StoreError ThreatIntelIOCManager::Initialize(
     }
     
     m_impl->database = database;
+
+    // The deduplication index is in memory only. Without a rebuild here it starts empty
+    // after every restart: re-adding a known IOC adds a second copy, and every lookup
+    // falls back to a linear scan of the database.
+    (void)RebuildDeduplicationIndex(*database, *m_impl->deduplicator);
     
     // Initialize entry ID counter from high-water mark of existing entries
     {
@@ -3917,66 +3967,11 @@ bool ThreatIntelIOCManager::Optimize() noexcept {
     // -------------------------------------------------------------------------
     // Phase 1: Rebuild deduplication index
     // -------------------------------------------------------------------------
-    m_impl->deduplicator->Clear();
-    
     const size_t entryCount = m_impl->database->GetEntryCount();
-    size_t activeCount = 0;
-    size_t revokedCount = 0;
-    size_t expiredCount = 0;
-    
-    for (size_t i = 0; i < entryCount; ++i) {
-        const auto* entry = m_impl->database->GetEntry(i);
-        if (entry == nullptr || entry->entryId == 0) continue;
-        
-        // Count statistics
-        if (HasFlag(entry->flags, IOCFlags::Revoked)) {
-            ++revokedCount;
-            continue;  // Don't add revoked entries to dedup index
-        }
-        
-        if (entry->IsExpired()) {
-            ++expiredCount;
-            continue;  // Don't add expired entries to dedup index
-        }
-        
-        ++activeCount;
-        
-        // Rebuild deduplication index based on type
-        std::string valueStr;
-        switch (entry->type) {
-            case IOCType::IPv4: {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%u.%u.%u.%u/%u",
-                    (entry->value.ipv4.address >> 24) & 0xFF,
-                    (entry->value.ipv4.address >> 16) & 0xFF,
-                    (entry->value.ipv4.address >> 8) & 0xFF,
-                    entry->value.ipv4.address & 0xFF,
-                    entry->value.ipv4.prefixLength
-                );
-                valueStr = buf;
-                break;
-            }
-            case IOCType::FileHash: {
-                valueStr.reserve(entry->value.hash.length * 2);
-                for (size_t j = 0; j < entry->value.hash.length; ++j) {
-                    char hex[3];
-                    snprintf(hex, sizeof(hex), "%02x", entry->value.hash.data[j]);
-                    valueStr += hex;
-                }
-                break;
-            }
-            default:
-                // String-based entries - skip for now (would need string pool access)
-                continue;
-        }
-        
-        if (!valueStr.empty()) {
-            // [[nodiscard]] discarded intentionally: failure to index a single
-            // entry during rebuild leaves it discoverable via linear scan only;
-            // the optimize pass continues so partial indexes remain valid.
-            (void)m_impl->deduplicator->Add(entry->type, valueStr, entry->entryId);
-        }
-    }
+    const DedupRebuildCounts counts = RebuildDeduplicationIndex(*m_impl->database, *m_impl->deduplicator);
+    const size_t activeCount = counts.active;
+    const size_t revokedCount = counts.revoked;
+    const size_t expiredCount = counts.expired;
     
     // -------------------------------------------------------------------------
     // Phase 2: Update statistics
