@@ -7,7 +7,10 @@ foreach ($m in $muts) {
     $p = (Resolve-Path $m.file).Path
     $orig = [IO.File]::ReadAllBytes($p)
     $text = [IO.File]::ReadAllText($p)
-    if ($text -notmatch "`r`n") { $m.old = $m.old.Replace("`r`n", "`n"); $m.new = $m.new.Replace("`r`n", "`n") }
+    # Anchors are written with either line ending; match the file's.
+    $old = $m.old.Replace("`r`n", "`n"); $new = $m.new.Replace("`r`n", "`n")
+    if ($text -match "`r`n") { $old = $old.Replace("`n", "`r`n"); $new = $new.Replace("`n", "`r`n") }
+    $m.old = $old; $m.new = $new
     $n = ([regex]::Matches($text, [regex]::Escape($m.old))).Count
     if ($n -ne 1) { "ANCHOR($n) $($m.name)"; continue }
     [IO.File]::WriteAllText($p, $text.Replace($m.old, $m.new), [Text.UTF8Encoding]::new($orig[0] -eq 0xEF))
@@ -15,7 +18,7 @@ foreach ($m in $muts) {
         $out = & .\tools\Invoke-HostGate.ps1 -Filter $m.filter
         # A fatal assertion in SetUpTestSuite SKIPS the suite rather than failing a case, and
         # the run still exits non-zero; both count as the mutation being caught.
-        $failed = @($out | Where-Object { $_ -match '^\[  (FAILED|SKIPPED) \] \w+\.\w+ \(' } | ForEach-Object { $k = $Matches[1]; $n = [regex]::Match($_, '\] (\S+) \(').Groups[1].Value; if ($k -eq 'SKIPPED') { "$n(skipped)" } else { $n } } | Sort-Object -Unique)
+        $failed = @($out | Where-Object { $_ -match '^\[\s+(FAILED|SKIPPED)\s+\] \w+\.\w+ \(' } | ForEach-Object { $k = $Matches[1]; $n = [regex]::Match($_, '\] (\S+) \(').Groups[1].Value; if ($k -eq 'SKIPPED') { "$n(skipped)" } else { $n } } | Sort-Object -Unique)
         $build = ($out | Where-Object { $_ -match '^build:' }) -join ''
         $texit = ($out | Where-Object { $_ -match '^tests: exit=' }) -join ''
         $verdict = if ($failed) { $failed -join ', ' } elseif ($texit -and $texit -ne 'tests: exit=0') { "NO CASE NAMED, but $texit" } else { 'NOTHING FAILED' }
