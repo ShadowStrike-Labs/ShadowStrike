@@ -551,8 +551,20 @@ bool WiFiSecurityAnalyzerImpl::InitializeWLAN() {
         DWORD negotiatedVersion = 0;
         DWORD result = WlanOpenHandle(2, nullptr, &negotiatedVersion, &m_wlanHandle);
 
+        // No WLAN AutoConfig service means no Wi-Fi on this machine - every wired
+        // desktop and most servers. That is the same situation as "no WiFi interface
+        // found" below, which already initialises with nothing to watch, and it is not a
+        // failure (task 342: Initialize failed and the module reported Error instead).
+        // The service is not re-probed; enabling Wi-Fi later takes effect on restart.
+        if (result == ERROR_SERVICE_NOT_ACTIVE || result == ERROR_SERVICE_DOES_NOT_EXIST) {
+            SS_LOG_INFO(LOG_CAT, L"WLAN service not running (error=%u); no Wi-Fi to analyse", result);
+            m_wlanHandle = nullptr;
+            m_hasInterface = false;
+            return true;
+        }
         if (result != ERROR_SUCCESS) {
             SS_LOG_ERROR(LOG_CAT, L"WlanOpenHandle failed: error=%u", result);
+            m_wlanHandle = nullptr;
             return false;
         }
 
@@ -1877,12 +1889,11 @@ bool WiFiSecurityAnalyzerImpl::SelfTest() {
     SS_LOG_INFO(LOG_CAT, L"Running self-test...");
 
     try {
-        // Test 1: WLAN handle
-        {
-            if (!m_wlanHandle) {
-                SS_LOG_ERROR(LOG_CAT, L"Self-test failed: No WLAN handle");
-                return false;
-            }
+        // Test 1: the WLAN state is coherent. No handle is legitimate on a machine
+        // without the WLAN service (task 342); an interface without a handle is not.
+        if (m_hasInterface && !m_wlanHandle) {
+            SS_LOG_ERROR(LOG_CAT, L"Self-test failed: interface recorded without a WLAN handle");
+            return false;
         }
 
         // Test 2: Security level calculation
