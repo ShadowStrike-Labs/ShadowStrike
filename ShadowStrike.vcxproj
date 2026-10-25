@@ -509,19 +509,11 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.cpp">
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
-    </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.cpp">
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
-      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -1299,10 +1291,8 @@
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\CredentialAPI.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\CryptAPI.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\RegistryAPI.hpp" />
-    <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.hpp" />
-    <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\Amsi\AmsiAPI.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\APIDatabase.hpp" />
     <ClInclude Include="PhantomEmulator\WinAPI\APIDispatcher.hpp" />

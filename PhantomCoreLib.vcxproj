@@ -742,16 +742,10 @@
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryAPI.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Amsi\AmsiAPI.cpp">

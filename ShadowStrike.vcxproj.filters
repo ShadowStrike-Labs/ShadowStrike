@@ -1599,16 +1599,10 @@
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryAPI.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="PhantomEmulator\WinAPI\Amsi\AmsiAPI.cpp">
@@ -3314,16 +3308,10 @@
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\RegistryAPI.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PhantomEmulator\WinAPI\Amsi\AmsiAPI.hpp">
