@@ -29250,5 +29250,36 @@ class TranslationUnitLocalTypesHaveInternalLinkageTests(_CompiledSourcesMixin, u
 
 
 
+class EmulatorHandlerSetsAreAllRegisteredTests(unittest.TestCase):
+    """Every handler set the emulator ships is registered by RegisterAll (task 351).
+
+    APIDispatcher::RegisterAll called empty bodies for kernel32, advapi32, ws2_32, wininet, winhttp,
+    user32, shell32 and urlmon, so 37 of the 47 Register* functions in PhantomEmulator/WinAPI had no
+    caller and an emulated sample's calls into those DLLs reached no handler.
+    """
+
+    WINAPI = ROOT / "PhantomEmulator" / "WinAPI"
+
+    def test_every_register_function_has_a_caller(self):
+        sources = {p: strip_c_comments(p.read_text(encoding="utf-8", errors="replace"))
+                   for p in self.WINAPI.rglob("*.cpp")}
+        defined = set()
+        for text in sources.values():
+            defined.update(re.findall(r"^void (Register\w+)\(APIDispatcher&", text, re.M))
+        self.assertGreaterEqual(len(defined), 45, "the handler modules were not found")
+        uncalled = []
+        for name in sorted(defined):
+            calls = sum(len(re.findall(r"\b%s\(\s*(?:\*this|dispatcher)\s*\)" % name, text))
+                        for text in sources.values())
+            if calls == 0:
+                uncalled.append(name)
+        self.assertEqual([], uncalled, "handler sets that RegisterAll never reaches")
+
+    def test_no_dll_registration_body_is_empty(self):
+        text = strip_c_comments((self.WINAPI / "APIDispatcher.cpp").read_text(encoding="utf-8", errors="replace"))
+        empty = re.findall(r"void APIDispatcher::(Register\w+)\(\)\s*noexcept\s*\{\s*\}", text)
+        self.assertEqual([], empty, "a DLL registration body is empty again")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

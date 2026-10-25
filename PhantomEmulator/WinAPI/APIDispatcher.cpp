@@ -34,6 +34,37 @@
 #include "Ole32\COMAPI.hpp"
 #include "Vss\VssAPI.hpp"
 #include "Kernel\KernelAPI.hpp"
+#include "Ntdll\Rtl.hpp"
+#include "Ntdll\Syscall.hpp"
+#include "Kernel32\APCInjectionAPI.hpp"
+#include "Kernel32\ConsoleAPI.hpp"
+#include "Kernel32\EnvAPI.hpp"
+#include "Kernel32\ErrorAPI.hpp"
+#include "Kernel32\FileAPI.hpp"
+#include "Kernel32\FileExtAPI.hpp"
+#include "Kernel32\FileMappingAPI.hpp"
+#include "Kernel32\LibraryAPI.hpp"
+#include "Kernel32\MemoryAPI.hpp"
+#include "Kernel32\ProcessAPI.hpp"
+#include "Kernel32\StringAPI.hpp"
+#include "Kernel32\SyncAPI.hpp"
+#include "Kernel32\ThreadAPI.hpp"
+#include "Kernel32\TimeAPI.hpp"
+#include "Advapi32\CredentialAPI.hpp"
+#include "Advapi32\CryptAPI.hpp"
+#include "Advapi32\RegistryAPI.hpp"
+#include "Advapi32\SecurityAPI.hpp"
+#include "Advapi32\ServiceAPI.hpp"
+#include "Ws2_32\DnsAPI.hpp"
+#include "Ws2_32\SocketAPI.hpp"
+#include "Ws2_32\WSAAsyncAPI.hpp"
+#include "Wininet\InternetAPI.hpp"
+#include "Wininet\HttpStreamAPI.hpp"
+#include "Winhttp\WinHttpAPI.hpp"
+#include "User32\WindowAPI.hpp"
+#include "User32\InputCaptureAPI.hpp"
+#include "Shell32\ShellAPI.hpp"
+#include "Urlmon\UrlmonAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -173,9 +204,8 @@ void APIDispatcher::RegisterBatch(const APIRegistration* regs,
 // ============================================================================
 // RegisterAll — Call all DLL registration stubs
 // ============================================================================
-// Each individual RegisterXxx() is a stub that will be populated when
-// the corresponding DLL handler module is implemented. The DLL modules
-// themselves call Register()/RegisterBatch() to insert their entries.
+// Each RegisterXxx() calls the Register* function of every handler module
+// for that DLL; the modules insert their tables with RegisterBatch().
 
 void APIDispatcher::RegisterAll() noexcept {
     RegisterNtdll();
@@ -194,7 +224,9 @@ void APIDispatcher::RegisterAll() noexcept {
     RegisterKernelNtoskrnl();
 }
 
-// DLL registration stubs — will be filled by DLL handler modules.
+// Every Register* function a handler module defines is called from one of
+// these. One that is not is a handler set the emulator never reaches; task 351
+// found 37 of 47 in that state behind empty DLL bodies.
 void APIDispatcher::RegisterNtdll() noexcept {
     WinAPI::Ntdll::RegisterNtMemory(*this);
     WinAPI::Ntdll::RegisterNtFile(*this);
@@ -206,18 +238,57 @@ void APIDispatcher::RegisterNtdll() noexcept {
     WinAPI::Ntdll::RegisterNtSync(*this);
     WinAPI::Ntdll::RegisterLdrHandlers(*this);
     WinAPI::Ntdll::RegisterEtwAPI(*this);
+    WinAPI::Ntdll::RegisterRtlHandlers(*this);
+    WinAPI::Ntdll::RegisterSyscall(*this);
 }
-void APIDispatcher::RegisterKernel32() noexcept {}
-void APIDispatcher::RegisterAdvapi32() noexcept {}
-void APIDispatcher::RegisterWs2_32()   noexcept {}
-void APIDispatcher::RegisterWininet()  noexcept {}
-void APIDispatcher::RegisterWinhttp()  noexcept {}
-void APIDispatcher::RegisterUser32()   noexcept {}
-void APIDispatcher::RegisterShell32()  noexcept {}
+void APIDispatcher::RegisterKernel32() noexcept {
+    WinAPI::Kernel32::RegisterErrorAPI(*this);
+    WinAPI::Kernel32::RegisterMemoryAPI(*this);
+    WinAPI::Kernel32::RegisterFileAPI(*this);
+    WinAPI::Kernel32::RegisterFileExtAPI(*this);
+    WinAPI::Kernel32::RegisterFileMappingAPI(*this);
+    WinAPI::Kernel32::RegisterProcessAPI(*this);
+    WinAPI::Kernel32::RegisterThreadAPI(*this);
+    WinAPI::Kernel32::RegisterAPCInjectionAPI(*this);
+    WinAPI::Kernel32::RegisterLibraryAPI(*this);
+    WinAPI::Kernel32::RegisterSyncAPI(*this);
+    WinAPI::Kernel32::RegisterTimeAPI(*this);
+    WinAPI::Kernel32::RegisterEnvAPI(*this);
+    WinAPI::Kernel32::RegisterStringAPI(*this);
+    WinAPI::Kernel32::RegisterConsoleAPI(*this);
+}
+void APIDispatcher::RegisterAdvapi32() noexcept {
+    WinAPI::Advapi32::RegisterRegistryAPI(*this);
+    WinAPI::Advapi32::RegisterServiceAPI(*this);
+    WinAPI::Advapi32::RegisterSecurityAPI(*this);
+    WinAPI::Advapi32::RegisterCryptAPI(*this);
+    WinAPI::Advapi32::RegisterCredentialAPI(*this);
+}
+void APIDispatcher::RegisterWs2_32() noexcept {
+    WinAPI::Ws2_32::RegisterSocketAPI(*this);
+    WinAPI::Ws2_32::RegisterDnsAPI(*this);
+    WinAPI::Ws2_32::RegisterWSAAsyncAPI(*this);
+}
+void APIDispatcher::RegisterWininet() noexcept {
+    WinAPI::Wininet::RegisterInternetAPI(*this);
+    WinAPI::Wininet::RegisterHttpStreamAPI(*this);
+}
+void APIDispatcher::RegisterWinhttp() noexcept {
+    WinAPI::Winhttp::RegisterWinHttpAPI(*this);
+}
+void APIDispatcher::RegisterUser32() noexcept {
+    WinAPI::User32::RegisterWindowAPI(*this);
+    WinAPI::User32::RegisterInputCaptureAPI(*this);
+}
+void APIDispatcher::RegisterShell32() noexcept {
+    WinAPI::Shell32::RegisterShellAPI(*this);
+}
 void APIDispatcher::RegisterOle32()    noexcept {
     WinAPI::Ole32::RegisterCOMAPI(*this);
 }
-void APIDispatcher::RegisterUrlmon()   noexcept {}
+void APIDispatcher::RegisterUrlmon() noexcept {
+    WinAPI::Urlmon::RegisterUrlmonAPI(*this);
+}
 void APIDispatcher::RegisterBcrypt() noexcept {
     WinAPI::Bcrypt::RegisterBcrypt(*this);
 }
@@ -808,6 +879,16 @@ bool APIDispatcher::IsRegistered(std::string_view dllName,
 
 uint32_t APIDispatcher::GetRegisteredCount() const noexcept {
     return static_cast<uint32_t>(m_hookMap.size());
+}
+
+std::vector<APIDispatcher::RegisteredAPI> APIDispatcher::GetRegisteredAPIs() const {
+    std::vector<RegisteredAPI> apis;
+    apis.reserve(m_hookMap.size());
+    for (const auto& [address, entry] : m_hookMap) {
+        apis.push_back({entry.dllName ? entry.dllName : "", entry.funcName ? entry.funcName : "",
+                        entry.argCount});
+    }
+    return apis;
 }
 
 // ============================================================================

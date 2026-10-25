@@ -697,6 +697,7 @@
     <ClCompile Include="tests\link_seams.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Reports\HomeReportsStore.cpp" />
     <ClCompile Include="tests\unit\emulator_unit\PhantomEmulator_Tests.cpp" />
+    <ClCompile Include="tests\unit\emulator_unit\APIDispatcher_Tests.cpp" />
     <!-- tests\unit\exploits_unit -->
     <ClCompile Include="tests\unit\exploits_unit\BufferOverflowProtection_Tests.cpp" />
     <ClCompile Include="tests\unit\exploits_unit\HeapSprayDetector_Tests.cpp" />

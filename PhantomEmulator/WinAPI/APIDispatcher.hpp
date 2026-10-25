@@ -119,6 +119,16 @@ public:
     // Get total registered API count.
     [[nodiscard]] uint32_t GetRegisteredCount() const noexcept;
 
+    // One registered API: its DLL, function and argument count.
+    struct RegisteredAPI {
+        std::string dllName;
+        std::string funcName;
+        uint32_t    argCount = 0;
+    };
+
+    // Every registered API, in no particular order.
+    [[nodiscard]] std::vector<RegisteredAPI> GetRegisteredAPIs() const;
+
     // Get the hook address for a specific API (for manual hook setup).
     [[nodiscard]] std::optional<GuestAddress> GetHookAddress(
         std::string_view dllName, std::string_view funcName) const noexcept;
