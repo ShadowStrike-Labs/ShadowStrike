@@ -25108,11 +25108,16 @@ class RegistryDefensiveKeyBaselineContractTests(unittest.TestCase):
             in source,
             "VerifyKeyIntegrity no longer decides tampering by whether the key was ever "
             "observed present, which reinstates the false-positive loop")
-        self.assertTrue(
-            "= RegistryIntegrityStatus::New" not in source,
-            "something now assigns RegistryIntegrityStatus::New. Reporting a defensive "
-            "key's APPEARANCE is a detector behaviour change and belongs in its own "
-            "commit with its own evidence, not folded into a diagnostic fix.")
+        # Task 242 made a defensive key's appearance reportable, deliberately and in one
+        # place: New is produced only by ReportImageHijack, for an IFEO key that carries a
+        # hijack value. An empty key appearing must still not be reported.
+        self.assertEqual(
+            1, source.count("RegistryIntegrityStatus::New;"),
+            "RegistryIntegrityStatus::New is assigned somewhere other than the image "
+            "hijack report, so some other appearance became a violation")
+        report = extract_c_function(source, "ReportImageHijack")
+        self.assertIn("status = RegistryIntegrityStatus::New;", report,
+                      "New is no longer produced by the image hijack report")
 
 
 class TrustPathUnexaminablePathContractTests(unittest.TestCase):
@@ -29061,6 +29066,36 @@ class RegistryKeyPathFoldsTheWholeSubkeyTests(unittest.TestCase):
         self.assertLess(body.index('result.replace(0, rootSegment.size(), L"HKLM")'),
                         body.index("const auto subkeyStart"),
                         "the separator must be located after the root is abbreviated")
+
+
+class RegistryImageHijackIsDetectedTests(unittest.TestCase):
+    """A hijack value on a protected IFEO key is a violation, even when the key is new (task 242)."""
+
+    def test_verification_inspects_the_values_of_an_ifeo_key(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        body = extract_c_function(source, "VerifyKeyIntegrity")
+        inspect = body.find("RegistryProtection::FindImageHijackValues(regKey.Handle())")
+        self.assertNotEqual(-1, inspect, "VerifyKeyIntegrity no longer reads the values of an IFEO key")
+        self.assertIn("RegistryProtection::IsImageExecutionOptionsKey(normalized)", body)
+        self.assertLess(inspect, body.rindex("integrity = RegistryIntegrityStatus::Valid"),
+                        "the key is marked Valid before its values are inspected")
+        self.assertIn("return ReportImageHijack(normalized, hijackValues);", body)
+
+    def test_the_hijack_values_are_the_ones_windows_acts_on(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        body = extract_c_function(source, "RegistryProtection::FindImageHijackValues")
+        for name in ('L"Debugger"', 'L"VerifierDlls"', 'L"UseFilter"'):
+            self.assertIn(name, body, "FindImageHijackValues no longer considers %s" % name)
+
+    def test_a_violation_is_raised_once_per_change_of_state(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        report = extract_c_function(source, "ReportImageHijack")
+        self.assertIn("if (changed) {", report)
+        self.assertIn("FireIntegrityCallback(keyCopy);", report[report.index("if (changed) {"):])
+        poll = extract_c_function(source, "PerformIntegrityCheck")
+        self.assertIn("if (statusChanged &&", poll,
+                      "the poll acts on every interval again, so a persisting violation logs and "
+                      "retries forever")
 
 
 if __name__ == "__main__":

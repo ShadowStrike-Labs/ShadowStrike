@@ -179,6 +179,16 @@ public:
         ::RegCloseKey(key);
         return true;
     }
+    std::vector<std::wstring> HijackValues() const {
+        HKEY key = nullptr;
+        if (::RegOpenKeyExW(HKEY_CURRENT_USER, subKey.c_str(), 0, KEY_READ, &key) != ERROR_SUCCESS) {
+            return {L"<cannot open>"};
+        }
+        auto found = RegistryProtection::FindImageHijackValues(key);
+        ::RegCloseKey(key);
+        return found;
+    }
+
     std::wstring subKey;
 
 private:
@@ -348,6 +358,39 @@ TEST(ProductExecutablesTests, DirectoryContainmentRequiresTheSeparator) {
     EXPECT_FALSE(ProductExecutables::IsInsideDirectory(L"C:\\a.exe", L""));
     EXPECT_TRUE(ProductExecutables::IsProductName(L"shadowstrikephantomui.EXE"));
     EXPECT_FALSE(ProductExecutables::IsProductName(L"ShadowStrikeUI.exe"));
+}
+
+// Task 242: the values that make Windows start something else in the image's place.
+TEST(RegistryImageHijackTests, OnlyValuesThatRedirectTheImageAreReported) {
+    ScratchKey key;
+    key.SetDword(L"MitigationOptions", 0x100);
+    key.SetString(L"Debugger", L"");
+    EXPECT_TRUE(key.HijackValues().empty()) << "an empty Debugger and a mitigation setting start nothing";
+
+    key.SetString(L"Debugger", L"C:\\Users\\Public\\evil.exe");
+    key.SetString(L"VerifierDlls", L"evil.dll");
+    EXPECT_EQ(key.HijackValues(), (std::vector<std::wstring>{L"Debugger", L"VerifierDlls"}));
+}
+
+TEST(RegistryImageHijackTests, AFilterSubkeyDebuggerCountsOnlyWhenUseFilterIsSet) {
+    ScratchKey key;
+    key.SetString(L"Debugger", L"C:\\evil.exe", L"filter1");
+    EXPECT_TRUE(key.HijackValues().empty()) << "without UseFilter Windows does not read the subkeys";
+    key.SetDword(L"UseFilter", 1);
+    EXPECT_EQ(key.HijackValues(), (std::vector<std::wstring>{L"filter1\\Debugger"}));
+}
+
+TEST(RegistryImageHijackTests, OnlyAPerExecutableKeyIsAnImageExecutionOptionsKey) {
+    const std::wstring service = RegistryProtection::ImageExecutionOptionsKeyFor(L"ShadowStrikePhantomService.exe");
+    EXPECT_TRUE(RegistryProtection::IsImageExecutionOptionsKey(service));
+    EXPECT_TRUE(RegistryProtection::IsImageExecutionOptionsKey(
+        L"HKEY_LOCAL_MACHINE\\software\\MICROSOFT\\Windows NT\\CurrentVersion\\Image File Execution "
+        L"Options\\ShadowStrikePhantomUI.exe"));
+    EXPECT_FALSE(RegistryProtection::IsImageExecutionOptionsKey(
+        RegistryProtectionConstants::IMAGE_FILE_EXECUTION_OPTIONS_ROOT));
+    EXPECT_FALSE(RegistryProtection::IsImageExecutionOptionsKey(service + L"\\filter1"));
+    EXPECT_FALSE(RegistryProtection::IsImageExecutionOptionsKey(
+        L"HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\a.exe"));
 }
 
 }  // namespace

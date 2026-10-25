@@ -1005,6 +1005,17 @@ public:
             return RegistryIntegrityStatus::Missing;
         }
 
+        // An Image File Execution Options key opening is not the whole check: the key is
+        // inert until it carries a value that makes Windows start something else in the
+        // image's place, which is the attack these keys are protected against (T1546.012,
+        // task 242). Other protected keys keep the open-means-valid rule.
+        if (RegistryProtection::IsImageExecutionOptionsKey(normalized)) {
+            const auto hijackValues = RegistryProtection::FindImageHijackValues(regKey.Handle());
+            if (!hijackValues.empty()) {
+                return ReportImageHijack(normalized, hijackValues);
+            }
+        }
+
         {
             std::unique_lock lock(m_mutex);
             auto it = m_protectedKeys.find(normalized);
@@ -1014,6 +1025,48 @@ public:
             }
         }
         return RegistryIntegrityStatus::Valid;
+    }
+
+    // New when the protection baseline recorded the key as absent - it was created to
+    // carry the hijack - and Modified when it existed and gained one. The violation is
+    // counted, logged and raised once per change of state, not on every poll.
+    [[nodiscard]] RegistryIntegrityStatus ReportImageHijack(
+        const std::wstring& normalized, const std::vector<std::wstring>& hijackValues) {
+        RegistryIntegrityStatus status = RegistryIntegrityStatus::Modified;
+        ProtectedKey keyCopy;
+        bool changed = false;
+        {
+            std::unique_lock lock(m_mutex);
+            const auto snapshots = m_snapshots.find(normalized);
+            if (snapshots != m_snapshots.end() && !snapshots->second.empty() &&
+                !snapshots->second.front().keyExisted) {
+                status = RegistryIntegrityStatus::New;
+            }
+            auto it = m_protectedKeys.find(normalized);
+            if (it != m_protectedKeys.end()) {
+                changed = (it->second.integrity != status);
+                it->second.integrity = status;
+                it->second.lastVerified = Clock::now();
+                if (changed) {
+                    keyCopy = it->second;
+                }
+            }
+        }
+
+        if (changed) {
+            std::wstring names;
+            for (const auto& name : hijackValues) {
+                if (!names.empty()) {
+                    names += L", ";
+                }
+                names += name;
+            }
+            m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+            SS_LOG_WARN(LOG_CATEGORY, L"Image hijack value on a protected key: %ls (%ls)",
+                normalized.c_str(), names.c_str());
+            FireIntegrityCallback(keyCopy);
+        }
+        return status;
     }
 
     [[nodiscard]] RegistryIntegrityStatus VerifyValueIntegrity(std::wstring_view keyPath,
@@ -2180,8 +2233,18 @@ private:
             if (m_stopMonitoring) return;
 
             const auto status = VerifyKeyIntegrity(keyPath);
-            if (status != RegistryIntegrityStatus::Valid && status != RegistryIntegrityStatus::Unknown) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation detected: %ls", keyPath.c_str());
+
+            // Act on a change of state, not on every poll. A violation that persists - in a
+            // mode without auto-rollback, or one a restore could not clear - would otherwise
+            // log and retry once per polling interval for as long as it lasts.
+            auto& lastStatus = m_lastPolledKeyStatus[keyPath];
+            const bool statusChanged = (lastStatus != status);
+            lastStatus = status;
+
+            if (statusChanged &&
+                status != RegistryIntegrityStatus::Valid && status != RegistryIntegrityStatus::Unknown) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation detected: %ls (status=%hs)", keyPath.c_str(),
+                    std::string(GetIntegrityStatusName(status)).c_str());
 
                 // Auto-rollback if enabled
                 if (m_config.enableAutoRollback && m_mode == RegistryProtectionMode::Rollback) {
@@ -2730,6 +2793,10 @@ private:
     std::atomic<bool> m_monitoringActive{false};
     std::atomic<bool> m_stopMonitoring{false};
 
+    // Last key status PerformIntegrityCheck acted on. Read and written only by the
+    // monitoring thread, so it needs no lock.
+    std::unordered_map<std::wstring, RegistryIntegrityStatus> m_lastPolledKeyStatus;
+
     // Cryptographic session secret for auth token verification
     std::vector<uint8_t> m_sessionSecret;
 
@@ -3023,6 +3090,94 @@ std::wstring RegistryProtection::ImageExecutionOptionsKeyFor(std::wstring_view e
     path += L'\\';
     path += executableName;
     return path;
+}
+
+bool RegistryProtection::IsImageExecutionOptionsKey(std::wstring_view keyPath) {
+    const std::wstring normalized = NormalizeKeyPath(keyPath);
+    const std::wstring root =
+        NormalizeKeyPath(RegistryProtectionConstants::IMAGE_FILE_EXECUTION_OPTIONS_ROOT) + L"\\";
+    if (normalized.size() <= root.size() || !normalized.starts_with(root)) {
+        return false;
+    }
+    // A direct child only: the per-executable key, not a filter subkey below it.
+    return normalized.find(L'\\', root.size()) == std::wstring::npos;
+}
+
+namespace {
+
+// True when the named value exists, has a string type, and holds at least one
+// non-NUL character. Windows reads Debugger and VerifierDlls as strings, so a value
+// of any other type, or an empty string, starts nothing.
+[[nodiscard]] bool HasNonEmptyStringValue(HKEY key, const wchar_t* name) noexcept {
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS) {
+        return false;
+    }
+    if ((type != REG_SZ && type != REG_EXPAND_SZ && type != REG_MULTI_SZ) || size < sizeof(wchar_t)) {
+        return false;
+    }
+    constexpr DWORD kMaxBytes = 64 * 1024;
+    if (size > kMaxBytes) {
+        return true;  // Far longer than any legitimate value; unreadable here, not empty.
+    }
+    std::vector<wchar_t> data(size / sizeof(wchar_t) + 1, L'\0');
+    DWORD read = size;
+    if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(data.data()), &read) !=
+        ERROR_SUCCESS) {
+        return false;
+    }
+    const size_t chars = read / sizeof(wchar_t);
+    return std::any_of(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(chars),
+                       [](wchar_t c) { return c != L'\0'; });
+}
+
+}  // namespace
+
+std::vector<std::wstring> RegistryProtection::FindImageHijackValues(HKEY key) {
+    std::vector<std::wstring> found;
+    if (key == nullptr) {
+        return found;
+    }
+    if (HasNonEmptyStringValue(key, L"Debugger")) {
+        found.emplace_back(L"Debugger");
+    }
+    if (HasNonEmptyStringValue(key, L"VerifierDlls")) {
+        found.emplace_back(L"VerifierDlls");
+    }
+
+    DWORD useFilter = 0;
+    DWORD size = sizeof(useFilter);
+    if (RegGetValueW(key, nullptr, L"UseFilter", RRF_RT_REG_DWORD, nullptr, &useFilter, &size) !=
+            ERROR_SUCCESS ||
+        useFilter == 0) {
+        return found;
+    }
+
+    // UseFilter makes Windows match the image's full path against each subkey's
+    // FilterFullPath and apply that subkey's Debugger. Bounded: a key with more
+    // subkeys than this is not a configuration anyone wrote by hand.
+    constexpr DWORD kMaxSubkeys = 4096;
+    for (DWORD index = 0; index < kMaxSubkeys; ++index) {
+        wchar_t name[256]{};
+        DWORD length = static_cast<DWORD>(std::size(name));
+        const LSTATUS st = RegEnumKeyExW(key, index, name, &length, nullptr, nullptr, nullptr, nullptr);
+        if (st == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (st != ERROR_SUCCESS) {
+            continue;
+        }
+        HKEY subKey = nullptr;
+        if (RegOpenKeyExW(key, name, 0, KEY_QUERY_VALUE, &subKey) != ERROR_SUCCESS) {
+            continue;
+        }
+        if (HasNonEmptyStringValue(subKey, L"Debugger")) {
+            found.push_back(std::wstring(name, length) + L"\\Debugger");
+        }
+        RegCloseKey(subKey);
+    }
+    return found;
 }
 
 std::string RegistryProtection::GetVersionString() noexcept {

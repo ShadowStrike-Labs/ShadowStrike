@@ -1214,6 +1214,24 @@ public:
      * @brief The Image File Execution Options key for one executable name.
      */
     [[nodiscard]] static std::wstring ImageExecutionOptionsKeyFor(std::wstring_view executableName);
+
+    /**
+     * @brief True when keyPath is a per-executable Image File Execution Options key
+     *        (a direct child of IMAGE_FILE_EXECUTION_OPTIONS_ROOT), in any casing.
+     */
+    [[nodiscard]] static bool IsImageExecutionOptionsKey(std::wstring_view keyPath);
+
+    /**
+     * @brief Names of the values in an open Image File Execution Options key that make
+     *        Windows start something other than the executable the key is named after.
+     *
+     * Debugger (the image is launched as the debugger's argument) and VerifierDlls (a DLL
+     * loaded into the image) are reported when non-empty. When UseFilter is non-zero,
+     * Windows consults the key's subkeys instead, so a non-empty Debugger in a subkey is
+     * reported as "<subkey>\\Debugger". Other values (MitigationOptions and the like)
+     * change how the image runs, not what runs, and are not reported.
+     */
+    [[nodiscard]] static std::vector<std::wstring> FindImageHijackValues(HKEY key);
     
     /**
      * @brief Get version string
