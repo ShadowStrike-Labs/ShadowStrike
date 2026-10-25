@@ -29045,5 +29045,23 @@ class ProductExecutablesAreOneListTests(unittest.TestCase):
                       "the public PID query answers by name alone again")
 
 
+class RegistryKeyPathFoldsTheWholeSubkeyTests(unittest.TestCase):
+    """NormalizeKeyPath folds the case of the whole subkey, whatever the root spelling (task 347).
+
+    The subkey was lowercased from the separator position of the ORIGINAL string, after the
+    root had been abbreviated, so HKEY_LOCAL_MACHINE\\SOFTWARE\\... kept its first characters
+    in their original case and no longer matched the protected HKLM\\software\\... entry.
+    """
+
+    def test_folding_starts_at_the_separator_of_the_abbreviated_path(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        body = extract_c_function(source, "NormalizeKeyPath")
+        self.assertIn("const auto subkeyStart = result.find(L'\\\\');", body)
+        self.assertIn("for (size_t i = subkeyStart + 1; i < result.size(); ++i)", body)
+        self.assertLess(body.index('result.replace(0, rootSegment.size(), L"HKLM")'),
+                        body.index("const auto subkeyStart"),
+                        "the separator must be located after the root is abbreviated")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

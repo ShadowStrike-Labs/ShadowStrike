@@ -314,6 +314,28 @@ TEST_F(RegistryProtectionLiveTest, TheSameImageInsideTheInstallDirectoryIsWhitel
     EXPECT_EQ(decision.decision, RegistryOperationDecision::AllowLogged) << decision.reason;
 }
 
+// Task 347: abbreviating the root moved the separator, and the subkey was folded from the
+// old position, so the long root spelling of a protected key normalised differently.
+TEST(RegistryKeyPathTests, EveryRootSpellingAndCasingNormalisesToOnePath) {
+    const std::wstring expected = RegistryProtection::NormalizeKeyPath(L"HKLM\\software\\shadowstrike");
+    EXPECT_EQ(expected, L"HKLM\\software\\shadowstrike");
+    EXPECT_EQ(RegistryProtection::NormalizeKeyPath(L"HKEY_LOCAL_MACHINE\\SOFTWARE\\ShadowStrike"), expected);
+    EXPECT_EQ(RegistryProtection::NormalizeKeyPath(L"hkey_local_machine\\Software\\SHADOWSTRIKE\\"), expected);
+    EXPECT_EQ(RegistryProtection::NormalizeKeyPath(L"HKEY_CURRENT_USER\\SOFTWARE\\ShadowStrike"),
+              L"HKCU\\software\\shadowstrike");
+}
+
+TEST_F(RegistryProtectionLiveTest, AProtectedKeyIsRecognisedUnderTheLongRootName) {
+    ScratchKey key;
+    key.SetString(L"Start", L"2");
+    ASSERT_TRUE(Module().ProtectKey(key.Path(), KeyProtectionType::Full, true));
+    std::wstring upper = L"HKEY_CURRENT_USER\\" + key.subKey;
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::towupper);
+    EXPECT_TRUE(Module().IsKeyProtected(upper));
+    const auto decision = SetValueFrom(::GetCurrentProcessId(), upper);
+    EXPECT_EQ(decision.decision, RegistryOperationDecision::Block) << decision.reason;
+}
+
 TEST(ProductExecutablesTests, DirectoryContainmentRequiresTheSeparator) {
     EXPECT_TRUE(ProductExecutables::IsInsideDirectory(L"C:\\Program Files\\ShadowStrike\\a.exe",
                                                       L"C:\\Program Files\\ShadowStrike\\"));

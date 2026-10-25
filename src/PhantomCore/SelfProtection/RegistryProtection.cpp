@@ -1668,9 +1668,13 @@ public:
         }
 
         // Case-fold the entire subkey path (registry paths are case-insensitive)
-        // Without this, an attacker can bypass protection via alternate casing
-        if (slashPos != std::wstring::npos && slashPos + 1 < result.size()) {
-            for (size_t i = slashPos + 1; i < result.size(); ++i) {
+        // Without this, an attacker can bypass protection via alternate casing.
+        // The separator is found again in the result: abbreviating the root moved it,
+        // and folding from the original position skipped the first characters of the
+        // subkey, so HKEY_LOCAL_MACHINE\SOFTWARE\... and HKLM\software\... differed.
+        const auto subkeyStart = result.find(L'\\');
+        if (subkeyStart != std::wstring::npos) {
+            for (size_t i = subkeyStart + 1; i < result.size(); ++i) {
                 result[i] = static_cast<wchar_t>(towlower(result[i]));
             }
         }
