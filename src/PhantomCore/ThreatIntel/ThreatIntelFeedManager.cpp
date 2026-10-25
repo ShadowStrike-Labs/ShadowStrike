@@ -3184,6 +3184,7 @@ SyncResult ThreatIntelFeedManager::ExecuteSync(
         }
         
         result.totalFetched = entries.size();
+        result.invalidIOCs += ApplyFeedDefaults(context.config, entries);
         
         // Check for cancellation
         if (context.cancelRequested.load(std::memory_order_acquire)) {
@@ -5111,6 +5112,75 @@ void ThreatIntelFeedManager::ScheduleNextSync(FeedContext& context) {
     }
     
     context.stats.nextScheduledSync.store(nextSync, std::memory_order_release);
+}
+
+namespace {
+
+/// Types whose value lives in the database string pool. Feed parsers produce no string-pool
+/// reference for these (task 345), so the feed path cannot store them yet.
+[[nodiscard]] bool IsStringPoolType(IOCType type) noexcept {
+    switch (type) {
+        case IOCType::Domain:
+        case IOCType::URL:
+        case IOCType::Email:
+        case IOCType::JA3:
+        case IOCType::JA3S:
+        case IOCType::RegistryKey:
+        case IOCType::ProcessName:
+        case IOCType::MutexName:
+        case IOCType::NamedPipe:
+        case IOCType::CertFingerprint:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+size_t ThreatIntelFeedManager::ApplyFeedDefaults(const ThreatFeedConfig& config,
+                                                 std::vector<IOCEntry>& entries) const {
+    const uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
+    size_t disallowed = 0;
+    size_t stringValued = 0;
+    
+    std::erase_if(entries, [&](IOCEntry& entry) {
+        if (!config.allowedTypes.empty() &&
+            std::find(config.allowedTypes.begin(), config.allowedTypes.end(), entry.type) ==
+                config.allowedTypes.end()) {
+            ++disallowed;
+            return true;
+        }
+        // The parsers key a string indicator by a hash of its text in the string-offset
+        // field. Stored, that is a reference into the pool to bytes that are not the
+        // indicator: it can never match a lookup and could alias a real pool offset.
+        if (IsStringPoolType(entry.type)) {
+            ++stringValued;
+            return true;
+        }
+        // The parser knows the value; the feed knows what the value means.
+        entry.source = config.source;
+        if (entry.reputation == ReputationLevel::Unknown) {
+            entry.reputation = config.defaultReputation;
+        }
+        if (entry.confidence == ConfidenceLevel::None) {
+            entry.confidence = config.defaultConfidence;
+        }
+        if (entry.expirationTime == 0 && config.defaultTtlSeconds > 0) {
+            entry.expirationTime = now + config.defaultTtlSeconds;
+        }
+        if (entry.valueType == 0) {
+            entry.valueType = static_cast<uint8_t>(entry.type);
+        }
+        return false;
+    });
+    
+    if (stringValued > 0) {
+        SS_LOG_WARN(L"ThreatIntelFeedManager",
+                    L"Feed '%S': %llu domain/URL-type indicators not stored - feed string values are not yet kept",
+                    config.feedId.c_str(), static_cast<unsigned long long>(stringValued));
+    }
+    return disallowed + stringValued;
 }
 
 void ThreatIntelFeedManager::UpdateManagerStats() {

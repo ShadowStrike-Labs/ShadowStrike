@@ -1727,6 +1727,11 @@ private:
     /// @brief Schedule next sync for feed
     void ScheduleNextSync(FeedContext& context);
     
+    /// @brief Give parsed entries the feed's identity: source, default reputation, confidence and
+    ///        TTL where the parser set none, dropping entries outside allowedTypes and string
+    ///        indicators the feed path cannot store. Returns the number dropped.
+    size_t ApplyFeedDefaults(const ThreatFeedConfig& config, std::vector<IOCEntry>& entries) const;
+    
     /// @brief Update manager statistics
     void UpdateManagerStats();
     
