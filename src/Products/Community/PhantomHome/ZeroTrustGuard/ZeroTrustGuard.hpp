@@ -179,8 +179,11 @@ public:
     // ---- Lifecycle ---------------------------------------------------------
 
     /// @brief Initialize the guard. Loads persisted config from ConfigManager.
-    ///        Idempotent; safe to call multiple times.
+    ///        Idempotent and serialised: a concurrent second call waits for the first.
     [[nodiscard]] bool Initialize();
+
+    /// @brief True once Initialize has completed successfully, until Shutdown.
+    [[nodiscard]] bool IsInitialized() const noexcept;
 
     /// @brief Arm the guard. Must be called after Initialize().
     [[nodiscard]] bool Start();

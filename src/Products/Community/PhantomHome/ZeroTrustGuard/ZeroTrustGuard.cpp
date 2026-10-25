@@ -223,6 +223,9 @@ struct ZeroTrustGuard::Impl {
     ZeroTrustConfig              m_config;
     ::ShadowStrike::Products::Home::ProtectionMode m_mode{
         ::ShadowStrike::Products::Home::ProtectionMode::Off};
+    // Serialises Initialize and Shutdown. m_initialized is published only when
+    // Initialize has finished, so IsInitialized never reports a half-loaded guard.
+    std::mutex                   m_lifecycleMutex;
     std::atomic<bool>            m_initialized{false};
     std::atomic<bool>            m_running{false};
 
@@ -262,14 +265,12 @@ ZeroTrustGuard::~ZeroTrustGuard() {
 // ============================================================================
 
 bool ZeroTrustGuard::Initialize() {
-    // CAS so two concurrent Initialize() calls cannot both run the ConfigManager
-    // load / PromptQueue load below. Loser returns true (idempotent contract).
-    bool expected = false;
-    if (!m_impl->m_initialized.compare_exchange_strong(
-            expected, true,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire))
-    {
+    // Idempotent and serialised (task 315). This was a compare-exchange that set
+    // m_initialized BEFORE the loads below, so a concurrent second caller was told
+    // the guard was ready while the first was still loading its configuration. A
+    // second caller now waits for the first and then returns its outcome.
+    std::lock_guard lifecycle(m_impl->m_lifecycleMutex);
+    if (m_impl->m_initialized.load(std::memory_order_acquire)) {
         return true;
     }
 
@@ -281,9 +282,7 @@ bool ZeroTrustGuard::Initialize() {
     {
         SS_LOG_ERROR(kLogCategory,
             L"ZeroTrustGuard.Home: PhantomCore ZeroTrustGuard::Initialize() failed");
-        // Roll back the CAS so a future caller can retry initialization.
-        m_impl->m_initialized.store(false, std::memory_order_release);
-        return false;
+        return false;   // not published, so a later caller can retry
     }
 
     // Load persisted config.
@@ -303,6 +302,8 @@ bool ZeroTrustGuard::Initialize() {
 
     // Load persisted always-allow entries into the prompt queue.
     ZeroTrustPromptQueue::Instance().LoadPersistedAllowList();
+
+    m_impl->m_initialized.store(true, std::memory_order_release);
 
     SS_LOG_INFO(kLogCategory,
         L"ZeroTrustGuard.Home: Initialized (threshold=%.3f, ztMode=%hs, "
@@ -333,7 +334,12 @@ bool ZeroTrustGuard::Start() {
     return true;
 }
 
+bool ZeroTrustGuard::IsInitialized() const noexcept {
+    return m_impl->m_initialized.load(std::memory_order_acquire);
+}
+
 void ZeroTrustGuard::Shutdown() {
+    std::lock_guard lifecycle(m_impl->m_lifecycleMutex);
     if (!m_impl->m_running.exchange(false, std::memory_order_acq_rel)
         && !m_impl->m_initialized.load(std::memory_order_acquire)) {
         return;

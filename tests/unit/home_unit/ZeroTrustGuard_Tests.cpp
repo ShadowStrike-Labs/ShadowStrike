@@ -40,7 +40,11 @@ protected:
     /// suite rather than per test is deliberate: Shutdown() also stops the shared prompt queue,
     /// which a later suite in the same process depends on.
     static void SetUpTestSuite() {
-        ASSERT_TRUE(ZeroTrustGuard::Instance().Initialize())
+        // State, not the return value, so this suite does not depend on being first (task 315).
+        if (!ZeroTrustGuard::Instance().IsInitialized()) {
+            (void)ZeroTrustGuard::Instance().Initialize();
+        }
+        ASSERT_TRUE(ZeroTrustGuard::Instance().IsInitialized())
             << "the guard could not be initialised, so no verdict below would mean anything";
     }
 
@@ -85,6 +89,13 @@ protected:
 // ============================================================================================
 // The score itself
 // ============================================================================================
+
+TEST_F(ZeroTrustGuardTest, TheGuardReportsItsStateAndInitializeIsIdempotent) {
+    // Task 315: there was no state accessor, so a caller could only call Initialize and guess.
+    EXPECT_TRUE(guard.IsInitialized());
+    EXPECT_TRUE(guard.Initialize()) << "a second Initialize on a ready guard is success";
+    EXPECT_TRUE(guard.IsInitialized());
+}
 
 TEST_F(ZeroTrustGuardTest, TheScoreStaysWithinItsDeclaredRange) {
     // Downstream comparisons against threshold and uncertainBand assume a normalised score. A
