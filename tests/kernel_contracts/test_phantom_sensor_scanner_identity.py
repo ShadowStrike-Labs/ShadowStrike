@@ -28908,5 +28908,26 @@ class BrandImpersonationUsesTheBrandsDomainsTests(unittest.TestCase):
         self.assertNotRegex(body, r'\+\s*"\.com"', "brand.com equality is the defect")
 
 
+class KeyboardHookTrustIsBySignatureTests(unittest.TestCase):
+    """A suspicious keyboard hook is excused by its process's signature, not its folder (task 307).
+
+    The System32 exemption excused any binary an administrator-level attacker placed there and
+    refused signed binaries elsewhere; the comment above it claimed a signature check nothing made.
+    """
+
+    CPP = ROOT / "src/Products/Community/PhantomHome/Banking/KeyloggerProtection.cpp"
+
+    def test_the_exemption_asks_the_shared_publisher_trust_policy(self):
+        src = strip_c_comments(read_source(self.CPP))
+        body = src[src.index("bool IsLegitimateHook(const KeyboardHookInfo& hook) const {"):]
+        body = body[:body.index("\n    }\n")]
+        self.assertIn("HasTrustedPublisherSignature(hook.processPath)", body)
+        self.assertNotRegex(body, r"(?i)system32|GetSystemDirectory|IsUnderSystemDirectory")
+        helper = src[src.index("static bool HasTrustedPublisherSignature("):]
+        helper = helper[:helper.index("\n    }\n")]
+        self.assertIn("EvaluatePublisherTrust(processPath).trusted", helper)
+        self.assertIn("HasInstance()", helper, "must fail closed without constructing the engine")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

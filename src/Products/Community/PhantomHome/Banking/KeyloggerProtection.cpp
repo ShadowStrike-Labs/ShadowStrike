@@ -32,6 +32,7 @@
 
 #include "pch.h"
 #include "PhantomCore/Utils/ProcessSnapshotCache.hpp"
+#include "PhantomCore/Core/Engine/ScanEngine.hpp"
 #include "KeyloggerProtection.hpp"
 
 // ============================================================================
@@ -1098,62 +1099,24 @@ public:
         return hooks;
     }
 
-    /// @brief Lowercased real system directories, without a trailing separator.
+    /// @brief The process image carries a verified signature from a publisher this product
+    ///        trusts (Microsoft, or a whitelisted publisher not in the stolen-certificate
+    ///        database), decided by ScanEngine::EvaluatePublisherTrust - the one policy the
+    ///        scan, remediation and disk-monitor paths share, rather than a copy here.
     ///
-    /// Resolved from Win32 rather than hardcoded. A substring test against a literal
-    /// "\\windows\\system32\\" accepts any path that merely CONTAINS it, which exempted a binary
-    /// under a user-created directory of that name from keylogger detection.
-    [[nodiscard]] static const std::vector<std::wstring>& SystemDirectoriesLower() {
-        static const std::vector<std::wstring> directories = []() {
-            std::vector<std::wstring> resolved;
-            const auto append = [&resolved](UINT (WINAPI *query)(LPWSTR, UINT)) {
-                wchar_t buffer[MAX_PATH]{};
-                const UINT length = query(buffer, static_cast<UINT>(std::size(buffer)));
-                if (length == 0 || length >= std::size(buffer)) {
-                    // GetSystemWow64DirectoryW fails on a system without WOW64. Not an error.
-                    return;
-                }
-                std::wstring directory(buffer, length);
-                while (!directory.empty() &&
-                       (directory.back() == L'\\' || directory.back() == L'/')) {
-                    directory.pop_back();
-                }
-                std::transform(directory.begin(), directory.end(), directory.begin(), ::towlower);
-                if (!directory.empty()) {
-                    resolved.push_back(std::move(directory));
-                }
-            };
-            append(&::GetSystemDirectoryW);
-            append(&::GetSystemWow64DirectoryW);
-            return resolved;
-        }();
-        return directories;
-    }
-
-    /// @brief Is this path UNDER a real system directory - anchored, with a separator boundary.
-    [[nodiscard]] static bool IsUnderSystemDirectory(const std::wstring& processPath) {
-        if (processPath.empty()) {
+    /// Fails closed: no path, no engine, or no verified signature means not trusted, so the
+    /// hook stays suspicious. The image is checked at its real path, never by its name.
+    [[nodiscard]] static bool HasTrustedPublisherSignature(const std::wstring& processPath) {
+        if (processPath.empty() || !Core::Engine::ScanEngine::HasInstance()) {
             return false;
         }
-
-        std::error_code ec;
-        const std::filesystem::path canonical =
-            std::filesystem::weakly_canonical(processPath, ec);
-        std::wstring candidate = ec ? processPath : canonical.wstring();
-        std::transform(candidate.begin(), candidate.end(), candidate.begin(), ::towlower);
-        std::replace(candidate.begin(), candidate.end(), L'/', L'\\');
-
-        for (const std::wstring& directory : SystemDirectoriesLower()) {
-            // Anchored at position 0, and a separator must follow, so System32Extra does not match.
-            if (candidate.size() > directory.size() + 1 &&
-                candidate.compare(0, directory.size(), directory) == 0 &&
-                candidate[directory.size()] == L'\\') {
-                return true;
-            }
+        try {
+            return Core::Engine::ScanEngine::Instance().EvaluatePublisherTrust(processPath).trusted;
+        } catch (...) {
+            return false;
         }
-
-        return false;
     }
+
     bool IsLegitimateHook(const KeyboardHookInfo& hook) const {
         // Check our explicit whitelist
         {
@@ -1178,13 +1141,10 @@ public:
         // System processes are considered legitimate
         if (hook.processId <= 4) return true;
 
-        // A binary under a REAL system directory is treated as legitimate. The previous test was a
-        // substring search for the literal "\\windows\\system32\\", which accepted any path that
-        // contained it - C:\\Users\\<user>\\windows\\system32\\keylogger.exe among them - and this
-        // function gates remediation, so that exempted the hook from being blocked. The comment that
-        // stood here claimed signed Microsoft binaries; nothing in this module verifies a signature,
-        // which is filed separately.
-        if (IsUnderSystemDirectory(hook.processPath)) {
+        // A hook is excused by WHO SIGNED its process, not where it lives (task 307). Location
+        // excused any binary an administrator-level attacker placed in System32, and refused a
+        // signed Microsoft binary running from anywhere else.
+        if (HasTrustedPublisherSignature(hook.processPath)) {
             return true;
         }
 

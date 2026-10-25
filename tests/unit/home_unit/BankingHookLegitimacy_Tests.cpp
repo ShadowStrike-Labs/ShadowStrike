@@ -14,10 +14,9 @@
  * @brief Pins which keyboard hooks are excused from detection, and which domains a secure session permits.
  *
  * IsLegitimateHook GATES REMEDIATION. UnhookMaliciousHooks blocks a hook only when it is suspicious AND
- * this predicate says no, so anything it excuses is left in place. Its system-directory test was a
- * substring search for the literal text of a system path, which accepted any path merely containing it -
- * so a hook whose process sat under a user-created directory of the same name was excused. The cases here
- * pin the anchored form: under the REAL system directory yes, anywhere else no.
+ * this predicate says no, so anything it excuses is left in place. It used to excuse by location - first
+ * by a substring of a system path, then by the real system directory. It now excuses by a verified
+ * signature from a trusted publisher (task 307), checked on the image itself.
  *
  * The other three tests in that function are pinned too, because they are correct and a future change
  * should not silently widen them: the PID set is exact, the process name is compared with _wcsicmp rather
@@ -43,6 +42,8 @@
 
 #include "Products/Community/PhantomHome/Banking/KeyloggerProtection.hpp"
 #include "Products/Community/PhantomHome/Banking/SecureBrowser.hpp"
+#include "PhantomCore/Core/Engine/ScanEngine.hpp"
+#include "PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
 
 // DetectionAction is one type for the whole Banking namespace (Common.hpp, task 305).
 // KeyloggerProtection.hpp used to declare Terminate = 3 and Quarantine = 4, the
@@ -72,6 +73,21 @@ std::wstring RealSystemDirectory() {
     return directory;
 }
 
+class ScratchDirectory {
+public:
+    ScratchDirectory()
+        : path(std::filesystem::temp_directory_path() /
+               (L"ss_hooktrust_" + std::to_wstring(::GetCurrentProcessId()) + L"_" +
+                std::to_wstring(::GetTickCount64()))) {
+        std::filesystem::create_directories(path);
+    }
+    ~ScratchDirectory() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    std::filesystem::path path;
+};
+
 KeyboardHookInfo HookFromPath(std::wstring processPath) {
     KeyboardHookInfo hook;
     // Above 4, so the System and Idle exemption does not decide the answer. Windows PIDs are multiples of
@@ -90,61 +106,77 @@ protected:
     static KeyloggerProtection& Guard() { return KeyloggerProtection::Instance(); }
 
     static void SetUpTestSuite() {
-        // Initialize is not idempotent (filed 288), so state is tested rather than assumed. The predicate
-        // under test reads only the whitelists and the path, so it is meaningful either way.
         if (!Guard().IsInitialized()) {
             (void)Guard().Initialize();
         }
+        // The exemption asks the engine's publisher-trust policy, which needs a signature
+        // validator. Production has both; without them the predicate fails closed.
+        (void)ShadowStrike::Core::Engine::ScanEngine::Instance();
+        s_validatorReady = ShadowStrike::Security::DigitalSignatureValidator::Instance().Initialize() ||
+                           ShadowStrike::Security::DigitalSignatureValidator::Instance().IsInitialized();
     }
+
+    void SetUp() override { ASSERT_TRUE(s_validatorReady) << "DigitalSignatureValidator did not initialise"; }
+
+    static inline bool s_validatorReady = false;
 };
 
-TEST_F(HookLegitimacyTest, AHookUnderTheRealSystemDirectoryIsExcused) {
-    const std::wstring system = RealSystemDirectory();
-    ASSERT_FALSE(system.empty()) << "GetSystemDirectoryW failed, so the premise of this suite is untestable";
+// Task 307: the exemption is decided by a verified signature from a trusted publisher, through
+// ScanEngine::EvaluatePublisherTrust. Location used to decide it, which excused anything an
+// administrator-level attacker placed in System32 and refused signed binaries elsewhere.
 
-    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(system + L"\\user32.dll")));
-    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(system + L"\\drivers\\etc\\nested.dll")))
-        << "anything below the system directory, not only its immediate children";
-}
-
-TEST_F(HookLegitimacyTest, TheComparisonIgnoresCaseAndSeparatorStyle) {
+TEST_F(HookLegitimacyTest, AMicrosoftSignedSystemBinaryIsExcused) {
     const std::wstring system = RealSystemDirectory();
     ASSERT_FALSE(system.empty());
-
-    std::wstring upper = system;
+    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(system + L"\\user32.dll")));
+    std::wstring upper = system + L"\\USER32.DLL";
     std::transform(upper.begin(), upper.end(), upper.begin(), ::towupper);
-    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(upper + L"\\USER32.DLL")))
-        << "Windows paths are case-insensitive";
+    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(upper))) << "Windows paths are case-insensitive";
+}
 
-    std::wstring forward = system;
-    std::replace(forward.begin(), forward.end(), L'\\', L'/');
-    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(forward + L"/user32.dll")))
-        << "a forward-slash path names the same file; the previous literal comparison handled neither";
+TEST_F(HookLegitimacyTest, BeingUnderTheSystemDirectoryNoLongerExcusesAHook) {
+    const std::wstring system = RealSystemDirectory();
+    ASSERT_FALSE(system.empty());
+    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(system + L"\\drivers\\etc\\nested.dll")))
+        << "a path under System32 with no signed image behind it was excused by location alone";
+}
+
+TEST_F(HookLegitimacyTest, TheSignatureIsCheckedOnTheImageNotItsNameOrFolder) {
+    const std::wstring system = RealSystemDirectory();
+    ASSERT_FALSE(system.empty());
+    ScratchDirectory scratch;
+    const std::filesystem::path copy = scratch.path / L"user32.dll";
+    // Same file name as the signed one, so trusting by name cannot pass this case.
+    std::filesystem::create_directories(scratch.path / L"tampered");
+    const std::filesystem::path tampered = scratch.path / L"tampered" / L"user32.dll";
+    const std::filesystem::path unsignedImage = scratch.path / L"svchost.exe";
+    std::error_code ec;
+    ASSERT_TRUE(std::filesystem::copy_file(system + L"\\user32.dll", copy, ec)) << ec.message();
+    ASSERT_TRUE(std::filesystem::copy_file(copy, tampered, ec)) << ec.message();
+    {
+        std::fstream f(tampered, std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(f.good());
+        f.seekg(0x400);
+        const char byte = static_cast<char>(f.get());
+        f.seekp(0x400);
+        f.put(static_cast<char>(byte ^ 0x5A));
+    }
+    {
+        std::ofstream f(unsignedImage, std::ios::binary);
+        f << "MZ not a signed image";
+    }
+
+    EXPECT_TRUE(Guard().IsLegitimateHook(HookFromPath(copy.wstring())))
+        << "a Microsoft-signed image is trusted wherever it runs";
+    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(tampered.wstring())))
+        << "one changed byte must break the trust, or the check is not on the image";
+    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(unsignedImage.wstring())))
+        << "a system process NAME confers nothing";
 }
 
 TEST_F(HookLegitimacyTest, AUserCreatedDirectoryOfTheSameNameIsNotExcused) {
-    // The defect. Each of these CONTAINS the text of a system path and is not under one, and each was
-    // reported legitimate - which suppressed remediation, because UnhookMaliciousHooks blocks only what
-    // this predicate rejects.
     EXPECT_FALSE(Guard().IsLegitimateHook(
-        HookFromPath(L"C:\\Users\\victim\\windows\\system32\\keylogger.exe")))
-        << "a directory any user can create must not confer a detection exemption";
-    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(L"C:\\Temp\\windows\\syswow64\\hook.dll")));
-    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(L"D:\\payload\\windows\\system32\\evil.exe")));
-    EXPECT_FALSE(Guard().IsLegitimateHook(
-        HookFromPath(L"\\\\attacker-share\\windows\\system32\\evil.exe")))
-        << "a UNC path is not the local system directory";
-}
-
-TEST_F(HookLegitimacyTest, ASiblingDirectoryWithALongerNameIsNotExcused) {
-    // The boundary. A prefix test without a separator check would accept these.
-    const std::wstring system = RealSystemDirectory();
-    ASSERT_FALSE(system.empty());
-
-    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(system + L"Extra\\evil.exe")));
-    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(system + L"_backup\\evil.exe")));
-    EXPECT_FALSE(Guard().IsLegitimateHook(HookFromPath(system)))
-        << "the directory itself is not an executable under it";
+        HookFromPath(L"C:\\Users\\victim\\windows\\system32\\keylogger.exe")));
 }
 
 TEST_F(HookLegitimacyTest, AnOrdinaryPathIsNotExcusedAndNeitherIsAnEmptyOne) {
