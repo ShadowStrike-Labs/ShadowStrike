@@ -62,7 +62,6 @@
 #include <regex>
 #include <thread>
 #include <queue>
-#include <deque>
 #include <condition_variable>
 
 // ============================================================================
@@ -1161,11 +1160,9 @@ public:
     // Native messaging
     std::unique_ptr<std::jthread> m_nativeHostThread;
 
-    // Worker threads
+    // Worker threads. MonitorWorkerThread scans changed folders directly; there is no
+    // event queue between them (task 301 removed one that was declared and never used).
     std::vector<std::jthread> m_workerThreads;
-
-    // Message queue
-    std::deque<ThunderbirdScanEvent> m_eventQueue;
 
     // ========================================================================
     // CONSTRUCTOR / DESTRUCTOR

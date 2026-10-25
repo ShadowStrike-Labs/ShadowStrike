@@ -513,7 +513,6 @@ public:
         m_activeSyncs.clear();
         m_completedSyncs.clear();
         m_dedupIndex.clear();
-        m_chunkCache.clear();
 
         m_initialized.store(false, std::memory_order_release);
         m_status.store(IncrementalModuleStatus::Stopped, std::memory_order_release);
@@ -1880,8 +1879,9 @@ private:
     std::unordered_map<std::string, std::shared_ptr<SyncContext>> m_activeSyncs;
     std::unordered_map<std::string, SyncResult> m_completedSyncs;
 
+    // Deduplication is this index (task 301: a chunk-content cache declared beside it was
+    // cleared on shutdown and never filled or read).
     std::unordered_map<std::array<uint8_t, 32>, DedupIndexEntry, ArrayHash> m_dedupIndex;
-    std::unordered_map<std::array<uint8_t, 32>, std::vector<uint8_t>, ArrayHash> m_chunkCache;
 
     SyncProgressCallback m_progressCallback;
     SyncCompletionCallback m_completionCallback;

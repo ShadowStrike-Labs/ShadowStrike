@@ -753,10 +753,9 @@ public:
     std::unordered_map<TabKey, std::vector<WebWorkerInfo>, TabKeyHasher> m_workers;
     mutable std::shared_mutex m_workersMutex;
 
-    /// @brief Reserved for dynamically discovered mining indicator domains from external threat intel feeds.
-    /// Currently unpopulated — ThreatIntelManager results route through BlockDomainInternal instead.
-    /// Retained for ABI stability; will be wired when the threat intel push-subscription channel ships.
-    std::unordered_set<std::string> m_dynamicIndicators;
+    // Threat-intel mining domains route through BlockDomainInternal. A never-populated
+    // m_dynamicIndicators set stood here "for ABI stability"; it was a private Impl
+    // member, so it had none (task 301).
 
     std::vector<MinerFoundCallback> m_minerFoundCallbacks;
     std::vector<TabMiningCallback> m_tabMiningCallbacks;
