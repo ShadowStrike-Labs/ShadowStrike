@@ -914,6 +914,7 @@ public:
         // Initialize ThreatIntelStore
         s_tiStore = std::make_shared<TI::ThreatIntelStore>();
         auto tiCfg = TI::StoreConfig::CreateDefault();
+        tiCfg.databasePath = (std::filesystem::temp_directory_path() / L"antievasion_ti.tidb").wstring();
         if (!s_tiStore->Initialize(tiCfg)) {
             ADD_FAILURE() << "ThreatIntelStore::Initialize() failed.";
             return;

@@ -155,52 +155,28 @@ struct StoreConfig {
     std::chrono::seconds statsCollectionInterval = std::chrono::seconds(60);
     
     /**
-     * @brief Create default configuration
-     * 
-     * Creates a configuration with sensible defaults for most use cases.
-     * The database path is set to a temporary directory for convenience.
-     * For production deployments, specify an explicit databasePath.
+     * @brief Create default configuration.
+     *
+     * A preset tunes sizes and features; it does NOT choose where the database lives, and
+     * databasePath is left empty (task 161). Every preset used to invent a uniquely named
+     * file in the world-writable temp directory, so a caller that forgot to override it got
+     * a throwaway store that was always empty - and a miss in an empty store reads as
+     * "not a known threat". The service did exactly that until AntivirusService moved to
+     * Shared(). Initialize() now refuses a configuration without an absolute path.
      */
     static StoreConfig CreateDefault() {
         StoreConfig config;
         config.cacheOptions = CacheOptions{};
-        
-        // Generate a unique temp directory path for the database
-        // TITANIUM: Use a deterministic temp path for default configuration
-        wchar_t tempPath[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, tempPath) > 0) {
-            // Unique per-INSTANCE filename: process id + a monotonic instance
-            // counter. Two ThreatIntelStore instances in the same process (e.g.
-            // a shared store plus an engine-local store) would otherwise derive
-            // the SAME per-PID path; the second Open() then fails with a sharing
-            // violation, because the memory-mapped DB is held by the first
-            // (opened GENERIC_READ|GENERIC_WRITE with FILE_SHARE_READ only).
-            static std::atomic<uint32_t> s_instanceSeq{ 0 };
-            const uint32_t seq = s_instanceSeq.fetch_add(1, std::memory_order_relaxed);
-            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_"
-                + std::to_wstring(GetCurrentProcessId()) + L"_"
-                + std::to_wstring(seq) + L".tidb";
-        } else {
-            // Fallback to current directory if temp path unavailable
-            static std::atomic<uint32_t> s_fallbackSeq{ 0 };
-            config.databasePath = L".\\ShadowStrike_ThreatIntel_"
-                + std::to_wstring(GetCurrentProcessId()) + L"_"
-                + std::to_wstring(s_fallbackSeq.fetch_add(1, std::memory_order_relaxed))
-                + L".tidb";
-        }
-        
         return config;
     }
     
     /**
      * @brief Create high-performance configuration
-     * Optimized for enterprise deployments with maximum throughput
-     * 
-     * @note Uses a temporary database path by default. For production,
-     *       specify an explicit databasePath after calling this method.
+     * Optimized for enterprise deployments with maximum throughput.
+     * Sets no databasePath; the caller supplies one (see CreateDefault).
      */
     static StoreConfig CreateHighPerformance() {
-        StoreConfig config = CreateDefault(); // Start with default (includes temp path)
+        StoreConfig config = CreateDefault();
         config.cacheOptions.shardCount = 256;
         config.cacheOptions.totalCapacity = config.cacheOptions.shardCount * 65536; // 16,777,216 entries
         config.cacheOptions.positiveTTL = CacheConfig::DEFAULT_TTL_SECONDS * 2;
@@ -212,29 +188,16 @@ struct StoreConfig {
         config.maxIOCEntries = 100000000; // 100 million
         config.workerThreadCount = std::thread::hardware_concurrency();
         config.maxConcurrentFeedDownloads = 8;
-        
-        // Update database path to indicate high-perf variant (unique per instance)
-        wchar_t tempPath[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, tempPath) > 0) {
-            static std::atomic<uint32_t> s_hpInstanceSeq{ 0 };
-            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_HighPerf_"
-                + std::to_wstring(GetCurrentProcessId()) + L"_"
-                + std::to_wstring(s_hpInstanceSeq.fetch_add(1, std::memory_order_relaxed))
-                + L".tidb";
-        }
-        
         return config;
     }
     
     /**
      * @brief Create low memory configuration
-     * For embedded or resource-constrained environments
-     * 
-     * @note Uses a temporary database path by default. For production,
-     *       specify an explicit databasePath after calling this method.
+     * For embedded or resource-constrained environments.
+     * Sets no databasePath; the caller supplies one (see CreateDefault).
      */
     static StoreConfig CreateLowMemory() {
-        StoreConfig config = CreateDefault(); // Start with default (includes temp path)
+        StoreConfig config = CreateDefault();
         config.cacheOptions.shardCount = 16;
         config.cacheOptions.totalCapacity = config.cacheOptions.shardCount * 4096; // 65,536 entries
         config.cacheOptions.positiveTTL = 1800;
@@ -245,14 +208,6 @@ struct StoreConfig {
         config.enableCompression = true;
         config.workerThreadCount = 2;
         config.maxConcurrentFeedDownloads = 1;
-        
-        // Update database path to indicate low-memory variant
-        wchar_t tempPath[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, tempPath) > 0) {
-            config.databasePath = std::wstring(tempPath) + L"ShadowStrike_ThreatIntel_LowMem_" 
-                + std::to_wstring(GetCurrentProcessId()) + L".tidb";
-        }
-        
         return config;
     }
 };
@@ -1017,15 +972,11 @@ public:
     /**
      * @brief Initialize the store with configuration
      * @param config Store configuration
-     * @return true if initialization succeeded
+     * @return true if initialization succeeded; false - with an error logged - when
+     *         config.databasePath is empty or not absolute. There is no default location:
+     *         the product's store is Shared(), and anything else names its own file.
      */
     [[nodiscard]] bool Initialize(const StoreConfig& config);
-    
-    /**
-     * @brief Initialize with default configuration
-     * @return true if initialization succeeded
-     */
-    [[nodiscard]] bool Initialize();
     
     /**
      * @brief Shutdown the store and release resources
@@ -1585,12 +1536,12 @@ private:
 /**
  * @brief Create a high-performance threat intelligence store
  */
-[[nodiscard]] std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore();
+[[nodiscard]] std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore(const std::wstring& databasePath);
 
 /**
  * @brief Create a low-memory threat intelligence store
  */
-[[nodiscard]] std::unique_ptr<ThreatIntelStore> CreateLowMemoryThreatIntelStore();
+[[nodiscard]] std::unique_ptr<ThreatIntelStore> CreateLowMemoryThreatIntelStore(const std::wstring& databasePath);
 
 } // namespace ThreatIntel
 } // namespace ShadowStrike

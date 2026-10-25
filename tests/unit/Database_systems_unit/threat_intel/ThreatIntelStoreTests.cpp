@@ -100,6 +100,15 @@ struct TempDir {
 	return cfg;
 }
 
+// A store of its own for one test. There is no default location any more (task 161), so each
+// test names a file; the test binary's process sandbox (test_main.cpp) owns the directory.
+[[nodiscard]] StoreConfig ScratchConfig() {
+	static std::atomic<uint32_t> s_seq{0};
+	StoreConfig cfg = MakeTestConfig(std::filesystem::temp_directory_path() /
+		("ti_scratch_" + std::to_string(s_seq.fetch_add(1)) + ".tidb"));
+	return cfg;
+}
+
 [[nodiscard]] IOCEntry MakeTestIOCEntry(IOCType type, const std::string& value) {
 	IOCEntry entry{};
 	entry.entryId = 0; // Will be assigned by store
@@ -154,15 +163,19 @@ TEST(ThreatIntelStore_Lifecycle, Initialize_WithValidConfig_Succeeds) {
 	EXPECT_FALSE(store->IsInitialized());
 }
 
-TEST(ThreatIntelStore_Lifecycle, Initialize_Default_Succeeds) {
-	auto store = CreateThreatIntelStore();
-	ASSERT_NE(store, nullptr);
-
-	// Default init uses temp directory
-	EXPECT_TRUE(store->Initialize());
-	EXPECT_TRUE(store->IsInitialized());
-
-	store->Shutdown();
+TEST(ThreatIntelStore_Lifecycle, AConfigurationWithoutALocationIsRefused) {
+	// Task 161: every preset used to invent a throwaway file in %TEMP%, so a caller that forgot
+	// to set a path got an empty store whose misses read as "clean".
+	for (StoreConfig cfg : {StoreConfig::CreateDefault(), StoreConfig::CreateHighPerformance(),
+	                        StoreConfig::CreateLowMemory()}) {
+		EXPECT_TRUE(cfg.databasePath.empty()) << "a preset chose a database location";
+		auto store = CreateThreatIntelStore();
+		EXPECT_FALSE(store->Initialize(cfg));
+		EXPECT_FALSE(store->IsInitialized());
+		cfg.databasePath = L"relative\\store.tidb";
+		EXPECT_FALSE(store->Initialize(cfg)) << "a relative path resolves against the working directory";
+		EXPECT_FALSE(store->IsInitialized());
+	}
 }
 
 TEST(ThreatIntelStore_Lifecycle, DoubleInitialize_Fails) {
@@ -180,7 +193,7 @@ TEST(ThreatIntelStore_Lifecycle, DoubleInitialize_Fails) {
 
 TEST(ThreatIntelStore_Lifecycle, Shutdown_Idempotent) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	store->Shutdown();
 	store->Shutdown(); // Should not crash
@@ -244,15 +257,18 @@ TEST(ThreatIntelStore_Lifecycle, FactoryFunctions_CreateValidInstances) {
 	EXPECT_NE(defaultStore, nullptr);
 	EXPECT_FALSE(defaultStore->IsInitialized());
 
-	auto highPerfStore = CreateHighPerformanceThreatIntelStore();
-	EXPECT_NE(highPerfStore, nullptr);
+	TempDir tempDir;
+	auto highPerfStore = CreateHighPerformanceThreatIntelStore(tempDir.FilePath("hp.tidb").wstring());
+	ASSERT_NE(highPerfStore, nullptr);
 	EXPECT_TRUE(highPerfStore->IsInitialized());
 	highPerfStore->Shutdown();
 
-	auto lowMemStore = CreateLowMemoryThreatIntelStore();
-	EXPECT_NE(lowMemStore, nullptr);
+	auto lowMemStore = CreateLowMemoryThreatIntelStore(tempDir.FilePath("lm.tidb").wstring());
+	ASSERT_NE(lowMemStore, nullptr);
 	EXPECT_TRUE(lowMemStore->IsInitialized());
 	lowMemStore->Shutdown();
+
+	EXPECT_EQ(nullptr, CreateLowMemoryThreatIntelStore(L"")) << "a factory without a location must fail";
 }
 
 // ============================================================================
@@ -261,7 +277,7 @@ TEST(ThreatIntelStore_Lifecycle, FactoryFunctions_CreateValidInstances) {
 
 TEST(ThreatIntelStore_Lookups, LookupHash_SHA256_ValidFormat) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto sha256 = MakeValidSHA256();
 	const auto result = store->LookupHash("SHA256", sha256);
@@ -275,7 +291,7 @@ TEST(ThreatIntelStore_Lookups, LookupHash_SHA256_ValidFormat) {
 
 TEST(ThreatIntelStore_Lookups, LookupHash_MD5_ValidFormat) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto md5 = MakeValidMD5();
 	const auto result = store->LookupHash("MD5", md5);
@@ -288,7 +304,7 @@ TEST(ThreatIntelStore_Lookups, LookupHash_MD5_ValidFormat) {
 
 TEST(ThreatIntelStore_Lookups, LookupHash_InvalidFormat_ReturnsNotFound) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupHash("SHA256", "not-a-hex-string");
 	EXPECT_FALSE(result.found);
@@ -298,7 +314,7 @@ TEST(ThreatIntelStore_Lookups, LookupHash_InvalidFormat_ReturnsNotFound) {
 
 TEST(ThreatIntelStore_Lookups, LookupIPv4_String_ValidAddress) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupIPv4("192.168.1.1");
 	// Verify lookup completes without errors
@@ -309,7 +325,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv4_String_ValidAddress) {
 
 TEST(ThreatIntelStore_Lookups, LookupIPv4_Uint32_NetworkByteOrder) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const uint32_t addr = 0x08080808; // 8.8.8.8 in network byte order
 	const auto result = store->LookupIPv4(addr);
@@ -321,7 +337,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv4_Uint32_NetworkByteOrder) {
 
 TEST(ThreatIntelStore_Lookups, LookupIPv4_InvalidFormat_ReturnsNotFound) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupIPv4("999.999.999.999");
 	EXPECT_FALSE(result.found);
@@ -331,7 +347,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv4_InvalidFormat_ReturnsNotFound) {
 
 TEST(ThreatIntelStore_Lookups, LookupIPv6_String_ValidAddress) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupIPv6("2001:4860:4860::8888");
 	// Verify lookup returns valid result
@@ -342,7 +358,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv6_String_ValidAddress) {
 
 TEST(ThreatIntelStore_Lookups, LookupIPv6_Uint64_HighLow) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupIPv6(0x2001486048600000ULL, 0x0000000000008888ULL);
 	// Verify lookup executes without errors
@@ -353,7 +369,7 @@ TEST(ThreatIntelStore_Lookups, LookupIPv6_Uint64_HighLow) {
 
 TEST(ThreatIntelStore_Lookups, LookupDomain_ValidDomain) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupDomain("evil.example.com");
 	// Verify domain lookup returns valid result
@@ -364,7 +380,7 @@ TEST(ThreatIntelStore_Lookups, LookupDomain_ValidDomain) {
 
 TEST(ThreatIntelStore_Lookups, LookupURL_ValidURL) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupURL("http://malicious.site/payload.exe");
 	// URL lookup should complete successfully
@@ -375,7 +391,7 @@ TEST(ThreatIntelStore_Lookups, LookupURL_ValidURL) {
 
 TEST(ThreatIntelStore_Lookups, LookupEmail_ValidEmail) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupEmail("phishing@scam.com");
 	// Email lookup should return valid result
@@ -386,7 +402,7 @@ TEST(ThreatIntelStore_Lookups, LookupEmail_ValidEmail) {
 
 TEST(ThreatIntelStore_Lookups, LookupJA3_ValidFingerprint) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupJA3("abc123def456");
 	// JA3 fingerprint lookup should execute successfully
@@ -397,7 +413,7 @@ TEST(ThreatIntelStore_Lookups, LookupJA3_ValidFingerprint) {
 
 TEST(ThreatIntelStore_Lookups, LookupCVE_ValidCVEID) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupCVE("CVE-2024-1234");
 	// CVE lookup should complete without errors
@@ -408,7 +424,7 @@ TEST(ThreatIntelStore_Lookups, LookupCVE_ValidCVEID) {
 
 TEST(ThreatIntelStore_Lookups, LookupIOC_GenericLookup) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto result = store->LookupIOC(IOCType::Domain, "test.com");
 	// Generic IOC lookup should execute successfully
@@ -436,7 +452,7 @@ TEST(ThreatIntelStore_Lookups, UninitializedStore_ReturnsNotFound) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupHashes_EmptyList) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> hashes;
 	const auto result = store->BatchLookupHashes("SHA256", hashes);
@@ -450,7 +466,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupHashes_EmptyList) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupHashes_SingleHash) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> hashes = {MakeValidSHA256()};
 	const auto result = store->BatchLookupHashes("SHA256", hashes);
@@ -463,7 +479,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupHashes_SingleHash) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupHashes_MultipleHashes) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> hashes = {
 		MakeValidSHA256(),
@@ -482,7 +498,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupHashes_MultipleHashes) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupIPv4_EmptyList) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> addresses;
 	const auto result = store->BatchLookupIPv4(addresses);
@@ -494,7 +510,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupIPv4_EmptyList) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupIPv4_MultipleAddresses) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> addresses = {
 		"8.8.8.8",
@@ -513,7 +529,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupIPv4_MultipleAddresses) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupDomains_MultipleDomains) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> domains = {
 		"google.com",
@@ -531,7 +547,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupDomains_MultipleDomains) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupIOCs_MixedTypes) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::pair<IOCType, std::string>> iocs = {
 		{IOCType::IPv4, "8.8.8.8"},
@@ -550,7 +566,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupIOCs_MixedTypes) {
 
 TEST(ThreatIntelStore_Batch, BatchLookupIOCs_AllInvalid) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::pair<IOCType, std::string>> iocs = {
 		{IOCType::IPv4, "invalid"},
@@ -572,7 +588,7 @@ TEST(ThreatIntelStore_Batch, BatchLookupIOCs_AllInvalid) {
 
 TEST(ThreatIntelStore_IOCMgmt, AddIOC_ValidEntry_Succeeds) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Use IPv4 entry which doesn't require string pool allocation
 	IOCEntry entry{};
@@ -593,7 +609,7 @@ TEST(ThreatIntelStore_IOCMgmt, AddIOC_ValidEntry_Succeeds) {
 
 TEST(ThreatIntelStore_IOCMgmt, AddIOC_Simplified_IPv4) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_TRUE(store->AddIOC(
 		IOCType::IPv4,
@@ -607,7 +623,7 @@ TEST(ThreatIntelStore_IOCMgmt, AddIOC_Simplified_IPv4) {
 
 TEST(ThreatIntelStore_IOCMgmt, AddIOC_Simplified_Hash) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_TRUE(store->AddIOC(
 		IOCType::FileHash,
@@ -621,7 +637,7 @@ TEST(ThreatIntelStore_IOCMgmt, AddIOC_Simplified_Hash) {
 
 TEST(ThreatIntelStore_IOCMgmt, UpdateIOC_ExistingEntry) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Use IPv4 entry which doesn't require string pool allocation
 	IOCEntry entry{};
@@ -648,7 +664,7 @@ TEST(ThreatIntelStore_IOCMgmt, UpdateIOC_ExistingEntry) {
 
 TEST(ThreatIntelStore_IOCMgmt, RemoveIOC_ValidType) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Use IPv4 which works with simplified API
 	ASSERT_TRUE(store->AddIOC(IOCType::IPv4, "10.20.30.40", ReputationLevel::Malicious, ThreatIntelSource::InternalAnalysis));
@@ -659,7 +675,7 @@ TEST(ThreatIntelStore_IOCMgmt, RemoveIOC_ValidType) {
 
 TEST(ThreatIntelStore_IOCMgmt, BulkAddIOCs_EmptyList) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<IOCEntry> entries;
 	const size_t added = store->BulkAddIOCs(entries);
@@ -671,7 +687,7 @@ TEST(ThreatIntelStore_IOCMgmt, BulkAddIOCs_EmptyList) {
 
 TEST(ThreatIntelStore_IOCMgmt, BulkAddIOCs_MultipleEntries) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Use IPv4 entries which don't require string pool allocation
 	std::vector<IOCEntry> entries;
@@ -698,7 +714,7 @@ TEST(ThreatIntelStore_IOCMgmt, BulkAddIOCs_MultipleEntries) {
 
 TEST(ThreatIntelStore_IOCMgmt, HasIOC_AfterAdd_ReturnsTrue) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Use IPv4 which works with simplified API
 	const std::string ip = "172.16.100.50";
@@ -711,7 +727,7 @@ TEST(ThreatIntelStore_IOCMgmt, HasIOC_AfterAdd_ReturnsTrue) {
 
 TEST(ThreatIntelStore_IOCMgmt, HasIOC_NotAdded_ReturnsFalse) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_FALSE(store->HasIOC(IOCType::Domain, "not-exists.com"));
 
@@ -745,7 +761,7 @@ FeedConfiguration MakeValidFeedConfig(const std::string& feedId, const std::stri
 
 TEST(ThreatIntelStore_Feeds, AddFeed_ValidConfig) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto feedCfg = MakeValidFeedConfig("test-feed-001", "Test Feed");
 
@@ -756,7 +772,7 @@ TEST(ThreatIntelStore_Feeds, AddFeed_ValidConfig) {
 
 TEST(ThreatIntelStore_Feeds, RemoveFeed_ExistingFeed) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto feedCfg = MakeValidFeedConfig("remove-feed-001", "Remove Test Feed");
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -768,7 +784,7 @@ TEST(ThreatIntelStore_Feeds, RemoveFeed_ExistingFeed) {
 
 TEST(ThreatIntelStore_Feeds, EnableDisableFeed_TogglesState) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto feedCfg = MakeValidFeedConfig("toggle-feed-001", "Toggle Feed");
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -781,7 +797,7 @@ TEST(ThreatIntelStore_Feeds, EnableDisableFeed_TogglesState) {
 
 TEST(ThreatIntelStore_Feeds, UpdateFeed_TriggersFeedUpdate) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto feedCfg = MakeValidFeedConfig("update-feed-001", "Update Test Feed");
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -796,7 +812,7 @@ TEST(ThreatIntelStore_Feeds, UpdateFeed_TriggersFeedUpdate) {
 
 TEST(ThreatIntelStore_Feeds, UpdateAllFeeds_ReturnsCount) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const size_t updated = store->UpdateAllFeeds();
 	EXPECT_GE(updated, 0u);
@@ -806,7 +822,7 @@ TEST(ThreatIntelStore_Feeds, UpdateAllFeeds_ReturnsCount) {
 
 TEST(ThreatIntelStore_Feeds, GetFeedStatus_ExistingFeed) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto feedCfg = MakeValidFeedConfig("status-feed-001", "Status Test Feed");
 	ASSERT_TRUE(store->AddFeed(feedCfg));
@@ -819,7 +835,7 @@ TEST(ThreatIntelStore_Feeds, GetFeedStatus_ExistingFeed) {
 
 TEST(ThreatIntelStore_Feeds, GetFeedStatus_NonExistent_ReturnsNullopt) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto status = store->GetFeedStatus("non-existent-feed");
 	EXPECT_FALSE(status.has_value());
@@ -829,7 +845,7 @@ TEST(ThreatIntelStore_Feeds, GetFeedStatus_NonExistent_ReturnsNullopt) {
 
 TEST(ThreatIntelStore_Feeds, GetAllFeedStatuses_ReturnsVector) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto statuses = store->GetAllFeedStatuses();
 	EXPECT_GE(statuses.size(), 0u);
@@ -839,7 +855,7 @@ TEST(ThreatIntelStore_Feeds, GetAllFeedStatuses_ReturnsVector) {
 
 TEST(ThreatIntelStore_Feeds, StartStopFeedUpdates_DoesNotCrash) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_NO_THROW({
 		store->StartFeedUpdates();
@@ -863,7 +879,7 @@ TEST(ThreatIntelStore_Import, ImportSTIX_ValidFile) {
 	ofs.close();
 
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	ImportOptions opts;
 	const auto result = store->ImportSTIX(filePath.wstring(), opts);
@@ -884,7 +900,7 @@ TEST(ThreatIntelStore_Import, ImportCSV_ValidFile) {
 	ofs.close();
 
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	ImportOptions opts;
 	const auto result = store->ImportCSV(filePath.wstring(), opts);
@@ -904,7 +920,7 @@ TEST(ThreatIntelStore_Import, ImportJSON_ValidFile) {
 	ofs.close();
 
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	ImportOptions opts;
 	const auto result = store->ImportJSON(filePath.wstring(), opts);
@@ -925,7 +941,7 @@ TEST(ThreatIntelStore_Import, ImportPlainText_ValidFile) {
 	ofs.close();
 
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	ImportOptions opts;
 	const auto result = store->ImportPlainText(filePath.wstring(), IOCType::IPv4, opts);
@@ -938,7 +954,7 @@ TEST(ThreatIntelStore_Import, ImportPlainText_ValidFile) {
 
 TEST(ThreatIntelStore_Import, Import_NonExistentFile_Fails) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	ImportOptions opts;
 	const auto result = store->ImportSTIX(L"C:\\non-existent-file.stix", opts);
@@ -954,7 +970,7 @@ TEST(ThreatIntelStore_Export, Export_ValidPath) {
 	auto exportPath = tempDir.FilePath("export.json");
 
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	ExportOptions opts;
 	opts.format = ExportFormat::JSON;
@@ -971,7 +987,7 @@ TEST(ThreatIntelStore_Export, Export_ValidPath) {
 
 TEST(ThreatIntelStore_Maintenance, Compact_ReducesSize) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const size_t reclaimed = store->Compact();
 	EXPECT_GE(reclaimed, 0u);
@@ -981,7 +997,7 @@ TEST(ThreatIntelStore_Maintenance, Compact_ReducesSize) {
 
 TEST(ThreatIntelStore_Maintenance, VerifyIntegrity_NewDatabase_Succeeds) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_TRUE(store->VerifyIntegrity());
 
@@ -990,7 +1006,7 @@ TEST(ThreatIntelStore_Maintenance, VerifyIntegrity_NewDatabase_Succeeds) {
 
 TEST(ThreatIntelStore_Maintenance, RebuildIndexes_Succeeds) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_TRUE(store->RebuildIndexes());
 
@@ -999,7 +1015,7 @@ TEST(ThreatIntelStore_Maintenance, RebuildIndexes_Succeeds) {
 
 TEST(ThreatIntelStore_Maintenance, Flush_DoesNotCrash) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_NO_THROW({
 		store->Flush();
@@ -1010,7 +1026,7 @@ TEST(ThreatIntelStore_Maintenance, Flush_DoesNotCrash) {
 
 TEST(ThreatIntelStore_Maintenance, EvictExpiredEntries_ReturnsCount) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const size_t evicted = store->EvictExpiredEntries();
 	EXPECT_GE(evicted, 0u);
@@ -1020,7 +1036,7 @@ TEST(ThreatIntelStore_Maintenance, EvictExpiredEntries_ReturnsCount) {
 
 TEST(ThreatIntelStore_Maintenance, PurgeOldEntries_WithMaxAge) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const size_t purged = store->PurgeOldEntries(std::chrono::hours(24 * 30));
 	EXPECT_GE(purged, 0u);
@@ -1044,7 +1060,7 @@ TEST(ThreatIntelStore_Maintenance, UninitializedStore_OperationsFail) {
 
 TEST(ThreatIntelStore_Stats, GetStatistics_InitialState_AllZero) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto stats = store->GetStatistics();
 	EXPECT_EQ(stats.totalLookups, 0u);
@@ -1056,7 +1072,7 @@ TEST(ThreatIntelStore_Stats, GetStatistics_InitialState_AllZero) {
 
 TEST(ThreatIntelStore_Stats, GetStatistics_AfterLookups_Updated) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	(void)store->LookupIPv4("8.8.8.8");
 	(void)store->LookupDomain("example.com");
@@ -1070,7 +1086,7 @@ TEST(ThreatIntelStore_Stats, GetStatistics_AfterLookups_Updated) {
 
 TEST(ThreatIntelStore_Stats, GetCacheStatistics_ValidData) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto cacheStats = store->GetCacheStatistics();
 	EXPECT_GE(cacheStats.totalCapacity, 0u);
@@ -1080,7 +1096,7 @@ TEST(ThreatIntelStore_Stats, GetCacheStatistics_ValidData) {
 
 TEST(ThreatIntelStore_Stats, ResetStatistics_ZeroesCounters) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	(void)store->LookupIPv4("1.1.1.1");
 	ASSERT_GT(store->GetStatistics().totalLookups, 0u);
@@ -1111,7 +1127,7 @@ TEST(ThreatIntelStore_Stats, UninitializedStore_ReturnsEmptyStats) {
 
 TEST(ThreatIntelStore_Events, RegisterEventCallback_ReturnsValidId) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	size_t callbackId = 0;
 	EXPECT_NO_THROW({
@@ -1124,7 +1140,7 @@ TEST(ThreatIntelStore_Events, RegisterEventCallback_ReturnsValidId) {
 
 TEST(ThreatIntelStore_Events, UnregisterEventCallback_DoesNotCrash) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const auto id = store->RegisterEventCallback([](const StoreEvent&) {});
 
@@ -1137,7 +1153,7 @@ TEST(ThreatIntelStore_Events, UnregisterEventCallback_DoesNotCrash) {
 
 TEST(ThreatIntelStore_Events, MultipleCallbacks_AllReceiveEvents) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::atomic<int> count1{0};
 	std::atomic<int> count2{0};
@@ -1168,7 +1184,7 @@ TEST(ThreatIntelStore_Events, MultipleCallbacks_AllReceiveEvents) {
 
 TEST(ThreatIntelStore_EdgeCases, EmptyStrings_HandleGracefully) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	EXPECT_FALSE(store->LookupHash("", "").found);
 	EXPECT_FALSE(store->LookupIPv4("").found);
@@ -1181,7 +1197,7 @@ TEST(ThreatIntelStore_EdgeCases, EmptyStrings_HandleGracefully) {
 
 TEST(ThreatIntelStore_EdgeCases, VeryLongStrings_NoBufferOverflow) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const std::string veryLong(100000, 'a');
 
@@ -1196,7 +1212,7 @@ TEST(ThreatIntelStore_EdgeCases, VeryLongStrings_NoBufferOverflow) {
 
 TEST(ThreatIntelStore_EdgeCases, SpecialCharacters_HandleSafely) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const std::string special = "';DROP TABLE iocs;--";
 
@@ -1210,7 +1226,7 @@ TEST(ThreatIntelStore_EdgeCases, SpecialCharacters_HandleSafely) {
 
 TEST(ThreatIntelStore_EdgeCases, NullBytes_HandleCorrectly) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::string withNull = "test";
 	withNull.push_back('\0');
@@ -1229,7 +1245,7 @@ TEST(ThreatIntelStore_EdgeCases, NullBytes_HandleCorrectly) {
 
 TEST(ThreatIntelStore_Production, HighVolumeLookupsStress_Stable) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	constexpr int kIterations = 1000;
 
@@ -1247,7 +1263,7 @@ TEST(ThreatIntelStore_Production, HighVolumeLookupsStress_Stable) {
 
 TEST(ThreatIntelStore_Production, ConcurrentLookups_ThreadSafe) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	constexpr int kThreads = 16;
 	constexpr int kIters = 250;
@@ -1280,7 +1296,7 @@ TEST(ThreatIntelStore_Production, ConcurrentLookups_ThreadSafe) {
 
 TEST(ThreatIntelStore_Production, ConcurrentIOCManagement_Stable) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	constexpr int kThreads = 8;
 	constexpr int kIters = 100;
@@ -1310,7 +1326,7 @@ TEST(ThreatIntelStore_Production, ConcurrentIOCManagement_Stable) {
 
 TEST(ThreatIntelStore_Production, MixedOperationsStress_AllAPIs) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::atomic<bool> stop{false};
 	std::vector<std::thread> workers;
@@ -1359,7 +1375,7 @@ TEST(ThreatIntelStore_Production, MixedOperationsStress_AllAPIs) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, Loopback_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv4("127.0.0.1");
 	EXPECT_FALSE(result.found); // Loopback should not be in threat DB
@@ -1369,7 +1385,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, Loopback_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, Broadcast_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv4("255.255.255.255");
 	EXPECT_FALSE(result.found);
@@ -1379,7 +1395,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, Broadcast_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, PrivateRanges_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Class A private - use obscure address not in test data
 	auto r1 = store->LookupIPv4("10.255.255.253");
@@ -1398,7 +1414,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, PrivateRanges_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, ZeroAddress_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv4("0.0.0.0");
 	EXPECT_FALSE(result.found);
@@ -1408,7 +1424,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, ZeroAddress_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, MulticastRange_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Multicast address (224.0.0.0 - 239.255.255.255)
 	auto result = store->LookupIPv4("224.0.0.1");
@@ -1419,7 +1435,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, MulticastRange_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, LinkLocal_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Link-local (169.254.0.0/16)
 	auto result = store->LookupIPv4("169.254.0.1");
@@ -1430,7 +1446,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, LinkLocal_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, MalformedWithPort_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// IP with port should be handled gracefully
 	auto result = store->LookupIPv4("192.168.1.1:8080");
@@ -1442,7 +1458,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, MalformedWithPort_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, LeadingZeros_RejectedOrNormalized) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Leading zeros (potential octal interpretation security issue)
 	auto result = store->LookupIPv4("192.168.001.001");
@@ -1454,7 +1470,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, LeadingZeros_RejectedOrNormalized) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, NegativeOctet_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Negative values are invalid
 	auto result = store->LookupIPv4("-1.0.0.1");
@@ -1465,7 +1481,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, NegativeOctet_Handled) {
 
 TEST(ThreatIntelStore_IPv4EdgeCases, HugeOctet_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Octet > 255
 	auto result = store->LookupIPv4("256.0.0.1");
@@ -1480,7 +1496,7 @@ TEST(ThreatIntelStore_IPv4EdgeCases, HugeOctet_Handled) {
 
 TEST(ThreatIntelStore_IPv6EdgeCases, FullFormat_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334");
 	EXPECT_FALSE(result.found);
@@ -1490,7 +1506,7 @@ TEST(ThreatIntelStore_IPv6EdgeCases, FullFormat_Handled) {
 
 TEST(ThreatIntelStore_IPv6EdgeCases, Compressed_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv6("2001:db8::1");
 	EXPECT_FALSE(result.found);
@@ -1500,7 +1516,7 @@ TEST(ThreatIntelStore_IPv6EdgeCases, Compressed_Handled) {
 
 TEST(ThreatIntelStore_IPv6EdgeCases, Loopback_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv6("::1");
 	EXPECT_FALSE(result.found);
@@ -1510,7 +1526,7 @@ TEST(ThreatIntelStore_IPv6EdgeCases, Loopback_Handled) {
 
 TEST(ThreatIntelStore_IPv6EdgeCases, Unspecified_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupIPv6("::");
 	EXPECT_FALSE(result.found);
@@ -1520,7 +1536,7 @@ TEST(ThreatIntelStore_IPv6EdgeCases, Unspecified_Handled) {
 
 TEST(ThreatIntelStore_IPv6EdgeCases, IPv4Mapped_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// IPv4-mapped IPv6 address
 	auto result = store->LookupIPv6("::ffff:192.168.1.1");
@@ -1531,7 +1547,7 @@ TEST(ThreatIntelStore_IPv6EdgeCases, IPv4Mapped_Handled) {
 
 TEST(ThreatIntelStore_IPv6EdgeCases, LinkLocal_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Link-local (fe80::/10)
 	auto result = store->LookupIPv6("fe80::1");
@@ -1546,7 +1562,7 @@ TEST(ThreatIntelStore_IPv6EdgeCases, LinkLocal_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, SHA256_UpperCase_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Uppercase hash that is NOT in the test data - use a unique test value
 	// This is SHA256 of "test_unique_string_not_in_dataset_12345"
@@ -1558,7 +1574,7 @@ TEST(ThreatIntelStore_HashEdgeCases, SHA256_UpperCase_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, SHA256_MixedCase_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupHash("SHA256", "e3B0c44298FC1C149abf4c8996fb92427ae41e4649b934ca495991b7852b855");
 	EXPECT_FALSE(result.found);
@@ -1568,7 +1584,7 @@ TEST(ThreatIntelStore_HashEdgeCases, SHA256_MixedCase_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, SHA1_Valid_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupHash("SHA1", "da39a3ee5e6b4b0d3255bfef95601890afd80709");
 	EXPECT_FALSE(result.found);
@@ -1578,7 +1594,7 @@ TEST(ThreatIntelStore_HashEdgeCases, SHA1_Valid_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, MD5_Valid_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupHash("MD5", "d41d8cd98f00b204e9800998ecf8427e");
 	EXPECT_FALSE(result.found);
@@ -1588,7 +1604,7 @@ TEST(ThreatIntelStore_HashEdgeCases, MD5_Valid_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, SHA512_Valid_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	const std::string sha512 = 
 		"cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
@@ -1601,7 +1617,7 @@ TEST(ThreatIntelStore_HashEdgeCases, SHA512_Valid_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, WrongLength_SHA256_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// SHA256 should be 64 chars, this is 63
 	auto result = store->LookupHash("SHA256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85");
@@ -1612,7 +1628,7 @@ TEST(ThreatIntelStore_HashEdgeCases, WrongLength_SHA256_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, InvalidHexChars_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Contains 'g' which is invalid hex
 	auto result = store->LookupHash("SHA256", "g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
@@ -1623,7 +1639,7 @@ TEST(ThreatIntelStore_HashEdgeCases, InvalidHexChars_Handled) {
 
 TEST(ThreatIntelStore_HashEdgeCases, UnknownAlgorithm_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Unknown algorithm - use unique hash not in test data
 	auto result = store->LookupHash("UNKNOWN_ALGO", "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321");
@@ -1639,7 +1655,7 @@ TEST(ThreatIntelStore_HashEdgeCases, UnknownAlgorithm_Handled) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, SingleLabelDomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Single-label domain (no TLD)
 	auto result = store->LookupDomain("localhost");
@@ -1650,7 +1666,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, SingleLabelDomain_Handled) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, Punycode_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Internationalized domain in Punycode
 	auto result = store->LookupDomain("xn--n3h.com");
@@ -1661,7 +1677,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, Punycode_Handled) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, LongSubdomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Very long subdomain
 	std::string longDomain = std::string(63, 'a') + ".example.com";
@@ -1673,7 +1689,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, LongSubdomain_Handled) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, MaxLengthDomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// DNS max is 253 chars total
 	std::string maxDomain;
@@ -1693,7 +1709,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, MaxLengthDomain_Handled) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, TrailingDot_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// FQDN with trailing dot
 	auto result = store->LookupDomain("example.com.");
@@ -1704,7 +1720,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, TrailingDot_Handled) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, CaseNormalization) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// All uppercase
 	auto r1 = store->LookupDomain("EXAMPLE.COM");
@@ -1719,7 +1735,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, CaseNormalization) {
 
 TEST(ThreatIntelStore_DomainEdgeCases, NumericTLD_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Numeric TLD (not valid per ICANN but handle gracefully)
 	auto result = store->LookupDomain("example.123");
@@ -1734,7 +1750,7 @@ TEST(ThreatIntelStore_DomainEdgeCases, NumericTLD_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, WithQueryParams_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupURL("https://example.com/path?query=value&foo=bar");
 	EXPECT_FALSE(result.found);
@@ -1744,7 +1760,7 @@ TEST(ThreatIntelStore_URLEdgeCases, WithQueryParams_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, WithFragment_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupURL("https://example.com/page#section");
 	EXPECT_FALSE(result.found);
@@ -1754,7 +1770,7 @@ TEST(ThreatIntelStore_URLEdgeCases, WithFragment_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, WithPort_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupURL("https://example.com:8443/secure");
 	EXPECT_FALSE(result.found);
@@ -1764,7 +1780,7 @@ TEST(ThreatIntelStore_URLEdgeCases, WithPort_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, WithAuth_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// URL with user:pass
 	auto result = store->LookupURL("https://user:pass@example.com/");
@@ -1775,7 +1791,7 @@ TEST(ThreatIntelStore_URLEdgeCases, WithAuth_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, EncodedChars_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// URL-encoded characters
 	auto result = store->LookupURL("https://example.com/path%20with%20spaces");
@@ -1786,7 +1802,7 @@ TEST(ThreatIntelStore_URLEdgeCases, EncodedChars_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, DataURL_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Data URL
 	auto result = store->LookupURL("data:text/html,<script>alert(1)</script>");
@@ -1797,7 +1813,7 @@ TEST(ThreatIntelStore_URLEdgeCases, DataURL_Handled) {
 
 TEST(ThreatIntelStore_URLEdgeCases, FileURL_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// File URL
 	auto result = store->LookupURL("file:///etc/passwd");
@@ -1812,7 +1828,7 @@ TEST(ThreatIntelStore_URLEdgeCases, FileURL_Handled) {
 
 TEST(ThreatIntelStore_EmailEdgeCases, WithPlusAddressing_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupEmail("user+tag@example.com");
 	EXPECT_FALSE(result.found);
@@ -1822,7 +1838,7 @@ TEST(ThreatIntelStore_EmailEdgeCases, WithPlusAddressing_Handled) {
 
 TEST(ThreatIntelStore_EmailEdgeCases, WithSubdomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupEmail("user@mail.subdomain.example.com");
 	EXPECT_FALSE(result.found);
@@ -1832,7 +1848,7 @@ TEST(ThreatIntelStore_EmailEdgeCases, WithSubdomain_Handled) {
 
 TEST(ThreatIntelStore_EmailEdgeCases, QuotedLocalPart_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Quoted local part with special chars
 	auto result = store->LookupEmail("\"user.special\"@example.com");
@@ -1843,7 +1859,7 @@ TEST(ThreatIntelStore_EmailEdgeCases, QuotedLocalPart_Handled) {
 
 TEST(ThreatIntelStore_EmailEdgeCases, IPLiteral_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Email with IP literal domain
 	auto result = store->LookupEmail("user@[192.168.1.1]");
@@ -1858,7 +1874,7 @@ TEST(ThreatIntelStore_EmailEdgeCases, IPLiteral_Handled) {
 
 TEST(ThreatIntelStore_BatchEdgeCases, LargeBatch_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Create large batch
 	std::vector<std::string> hashes;
@@ -1882,7 +1898,7 @@ TEST(ThreatIntelStore_BatchEdgeCases, LargeBatch_Handled) {
 
 TEST(ThreatIntelStore_BatchEdgeCases, MixedValidInvalid_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> ips = {
 		"8.8.8.8",          // Valid
@@ -1901,7 +1917,7 @@ TEST(ThreatIntelStore_BatchEdgeCases, MixedValidInvalid_Handled) {
 
 TEST(ThreatIntelStore_BatchEdgeCases, DuplicatesInBatch_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	std::vector<std::string> domains = {
 		"example.com",
@@ -1946,7 +1962,7 @@ TEST(ThreatIntelStore_ResourceEdgeCases, RapidInitShutdown_Stable) {
 
 TEST(ThreatIntelStore_ResourceEdgeCases, OperationsAfterShutdown_Safe) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 	store->Shutdown();
 
 	// All operations should be safe after shutdown
@@ -1970,7 +1986,7 @@ TEST(ThreatIntelStore_ResourceEdgeCases, OperationsAfterShutdown_Safe) {
 
 TEST(ThreatIntelStore_UnicodeEdgeCases, IDNDomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// International domain name (should be converted to Punycode or handled)
 	auto result = store->LookupDomain("münchen.de");
@@ -1981,7 +1997,7 @@ TEST(ThreatIntelStore_UnicodeEdgeCases, IDNDomain_Handled) {
 
 TEST(ThreatIntelStore_UnicodeEdgeCases, ChineseDomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Chinese characters in domain
 	auto result = store->LookupDomain("例え.jp");
@@ -1992,7 +2008,7 @@ TEST(ThreatIntelStore_UnicodeEdgeCases, ChineseDomain_Handled) {
 
 TEST(ThreatIntelStore_UnicodeEdgeCases, RTLDomain_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Right-to-left script
 	auto result = store->LookupDomain("مثال.مصر");
@@ -2007,7 +2023,7 @@ TEST(ThreatIntelStore_UnicodeEdgeCases, RTLDomain_Handled) {
 
 TEST(ThreatIntelStore_BoundaryEdgeCases, ZeroConfidence_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	IOCEntry entry = MakeTestIOCEntry(IOCType::IPv4, "1.2.3.4");
 	entry.confidence = ConfidenceLevel::None;
@@ -2021,7 +2037,7 @@ TEST(ThreatIntelStore_BoundaryEdgeCases, ZeroConfidence_Handled) {
 
 TEST(ThreatIntelStore_BoundaryEdgeCases, MaxTimestamp_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	IOCEntry entry = MakeTestIOCEntry(IOCType::IPv4, "1.2.3.4");
 	entry.firstSeen = UINT64_MAX;
@@ -2037,7 +2053,7 @@ TEST(ThreatIntelStore_BoundaryEdgeCases, MaxTimestamp_Handled) {
 
 TEST(ThreatIntelStore_BoundaryEdgeCases, VeryOldTimestamp_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	IOCEntry entry = MakeTestIOCEntry(IOCType::IPv4, "1.2.3.4");
 	entry.firstSeen = 0; // Unix epoch
@@ -2056,7 +2072,7 @@ TEST(ThreatIntelStore_BoundaryEdgeCases, VeryOldTimestamp_Handled) {
 
 TEST(ThreatIntelStore_ErrorRecovery, ContinuesAfterInvalidInput) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Invalid inputs shouldn't break subsequent operations
 	(void)store->LookupIPv4("invalid");
@@ -2074,7 +2090,7 @@ TEST(ThreatIntelStore_ErrorRecovery, ContinuesAfterInvalidInput) {
 
 TEST(ThreatIntelStore_ErrorRecovery, ContinuesAfterBatchErrors) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Batch with all invalid
 	std::vector<std::string> allInvalid = {"invalid1", "invalid2", "invalid3"};
@@ -2094,7 +2110,7 @@ TEST(ThreatIntelStore_ErrorRecovery, ContinuesAfterBatchErrors) {
 
 TEST(ThreatIntelStore_JA3EdgeCases, ValidJA3_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// JA3 fingerprint (32 char MD5)
 	auto result = store->LookupJA3("d41d8cd98f00b204e9800998ecf8427e");
@@ -2105,7 +2121,7 @@ TEST(ThreatIntelStore_JA3EdgeCases, ValidJA3_Handled) {
 
 TEST(ThreatIntelStore_JA3EdgeCases, EmptyJA3_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupJA3("");
 	EXPECT_FALSE(result.found);
@@ -2119,7 +2135,7 @@ TEST(ThreatIntelStore_JA3EdgeCases, EmptyJA3_Handled) {
 
 TEST(ThreatIntelStore_CVEEdgeCases, ValidFormat_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupCVE("CVE-2021-44228");
 	EXPECT_FALSE(result.found);
@@ -2129,7 +2145,7 @@ TEST(ThreatIntelStore_CVEEdgeCases, ValidFormat_Handled) {
 
 TEST(ThreatIntelStore_CVEEdgeCases, OldFormat_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Old CVE format
 	auto result = store->LookupCVE("CVE-1999-0001");
@@ -2140,7 +2156,7 @@ TEST(ThreatIntelStore_CVEEdgeCases, OldFormat_Handled) {
 
 TEST(ThreatIntelStore_CVEEdgeCases, ExtendedFormat_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Extended CVE ID (post-2014 format)
 	auto result = store->LookupCVE("CVE-2024-123456");
@@ -2151,7 +2167,7 @@ TEST(ThreatIntelStore_CVEEdgeCases, ExtendedFormat_Handled) {
 
 TEST(ThreatIntelStore_CVEEdgeCases, InvalidFormat_Handled) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	auto result = store->LookupCVE("not-a-cve");
 	EXPECT_FALSE(result.found);
@@ -2165,7 +2181,7 @@ TEST(ThreatIntelStore_CVEEdgeCases, InvalidFormat_Handled) {
 
 TEST(ThreatIntelStore_StatsEdgeCases, StatsAfterManyOperations) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Perform many operations
 	for (int i = 0; i < 1000; ++i) {
@@ -2185,7 +2201,7 @@ TEST(ThreatIntelStore_StatsEdgeCases, StatsAfterManyOperations) {
 
 TEST(ThreatIntelStore_StatsEdgeCases, CacheStatsAccurate) {
 	auto store = CreateThreatIntelStore();
-	ASSERT_TRUE(store->Initialize());
+	ASSERT_TRUE(store->Initialize(ScratchConfig()));
 
 	// Same lookup multiple times should hit cache
 	for (int i = 0; i < 100; ++i) {

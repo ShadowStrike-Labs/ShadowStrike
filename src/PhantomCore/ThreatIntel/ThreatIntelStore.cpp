@@ -640,6 +640,23 @@ ThreatIntelStore::~ThreatIntelStore() {
 // ============================================================================
 
 bool ThreatIntelStore::Initialize(const StoreConfig& config) {
+    // No default location (task 161): an empty path used to be filled by the presets with a
+    // throwaway file in %TEMP%, and a relative one resolves against the working directory
+    // (a service's is System32). Refused before any state changes.
+    if (config.databasePath.empty() || !std::filesystem::path(config.databasePath).is_absolute()) {
+        Utils::Logger::Instance().LogEx(
+            Utils::LogLevel::Error,
+            L"ThreatIntelStore",
+            __FILEW__,
+            __LINE__,
+            __FUNCTIONW__,
+            L"Initialize refused: databasePath must be an absolute path (got '%s'); use "
+            L"ThreatIntelStore::Shared() for the product store",
+            config.databasePath.c_str()
+        );
+        return false;
+    }
+
     // Use compare_exchange to atomically check and set initialization flag
     // This ensures only one thread can proceed with initialization
     bool expected = false;
@@ -889,10 +906,6 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
         );
         return false;
     }
-}
-
-bool ThreatIntelStore::Initialize() {
-    return Initialize(StoreConfig::CreateDefault());
 }
 
 std::shared_ptr<ThreatIntelStore> ThreatIntelStore::Shared() {
@@ -4690,10 +4703,12 @@ std::unique_ptr<ThreatIntelStore> CreateThreatIntelStore(const StoreConfig& conf
  * 
  * @return Unique pointer to initialized high-performance store, or nullptr on failure
  */
-std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore() {
+std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore(const std::wstring& databasePath) {
     try {
         auto store = std::make_unique<ThreatIntelStore>();
-        if (!store->Initialize(StoreConfig::CreateHighPerformance())) {
+        StoreConfig config = StoreConfig::CreateHighPerformance();
+        config.databasePath = databasePath;
+        if (!store->Initialize(config)) {
             Utils::Logger::Instance().LogEx(
                 Utils::LogLevel::Error,
                 L"ThreatIntelStore",
@@ -4740,10 +4755,12 @@ std::unique_ptr<ThreatIntelStore> CreateHighPerformanceThreatIntelStore() {
  * 
  * @return Unique pointer to initialized low-memory store, or nullptr on failure
  */
-std::unique_ptr<ThreatIntelStore> CreateLowMemoryThreatIntelStore() {
+std::unique_ptr<ThreatIntelStore> CreateLowMemoryThreatIntelStore(const std::wstring& databasePath) {
     try {
         auto store = std::make_unique<ThreatIntelStore>();
-        if (!store->Initialize(StoreConfig::CreateLowMemory())) {
+        StoreConfig config = StoreConfig::CreateLowMemory();
+        config.databasePath = databasePath;
+        if (!store->Initialize(config)) {
             Utils::Logger::Instance().LogEx(
                 Utils::LogLevel::Error,
                 L"ThreatIntelStore",

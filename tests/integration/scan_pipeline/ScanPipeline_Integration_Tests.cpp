@@ -541,6 +541,7 @@ public:
         // 10. Initialize ThreatIntelStore.
         {
             TI::StoreConfig cfg = TI::StoreConfig::CreateLowMemory();
+            cfg.databasePath = (std::filesystem::temp_directory_path() / L"scanpipeline_ti.tidb").wstring();
             auto ti = std::make_unique<TI::ThreatIntelStore>();
             if (!ti->Initialize(cfg)) {
                 ADD_FAILURE() << "ThreatIntelStore::Initialize() failed.";

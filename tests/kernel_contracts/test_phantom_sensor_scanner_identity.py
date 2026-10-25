@@ -28929,27 +28929,6 @@ class KeyboardHookTrustIsBySignatureTests(unittest.TestCase):
         self.assertIn("HasInstance()", helper, "must fail closed without constructing the engine")
 
 
-class KeyboardHookTrustIsBySignatureTests(unittest.TestCase):
-    """A suspicious keyboard hook is excused by its process's signature, not its folder (task 307).
-
-    The System32 exemption excused any binary an administrator-level attacker placed there and
-    refused signed binaries elsewhere; the comment above it claimed a signature check nothing made.
-    """
-
-    CPP = ROOT / "src/Products/Community/PhantomHome/Banking/KeyloggerProtection.cpp"
-
-    def test_the_exemption_asks_the_shared_publisher_trust_policy(self):
-        src = strip_c_comments(read_source(self.CPP))
-        body = src[src.index("bool IsLegitimateHook(const KeyboardHookInfo& hook) const {"):]
-        body = body[:body.index("\n    }\n")]
-        self.assertIn("HasTrustedPublisherSignature(hook.processPath)", body)
-        self.assertNotRegex(body, r"(?i)system32|GetSystemDirectory|IsUnderSystemDirectory")
-        helper = src[src.index("static bool HasTrustedPublisherSignature("):]
-        helper = helper[:helper.index("\n    }\n")]
-        self.assertIn("EvaluatePublisherTrust(processPath).trusted", helper)
-        self.assertIn("HasInstance()", helper, "must fail closed without constructing the engine")
-
-
 class ZeroTrustDecisionsArePersistedAndRevocableTests(unittest.TestCase):
     """AlwaysBlock survives restart, and every standing decision can be withdrawn (task 269)."""
 
@@ -28977,6 +28956,30 @@ class ZeroTrustDecisionsArePersistedAndRevocableTests(unittest.TestCase):
         self.assertIn("RegisterV2Handler(CommandType::RevokeZeroTrustDecision", ipc)
         self.assertIn("ZeroTrustPromptQueue::Instance().Revoke(", ipc)
         self.assertIn('{"decisions",', ipc)
+
+
+class ThreatIntelStoreHasNoDefaultLocationTests(unittest.TestCase):
+    """A store configuration never chooses where the database lives (task 161).
+
+    Every preset invented a throwaway file under %TEMP%; a caller that did not override it got an
+    always-empty store whose misses read as clean. The no-argument Initialize() was that trap.
+    """
+
+    TI = ROOT / "src/PhantomCore/ThreatIntel"
+
+    def test_no_preset_or_initializer_invents_a_path(self):
+        hpp = strip_c_comments(read_source(self.TI / "ThreatIntelStore.hpp"))
+        start = hpp.index("struct StoreConfig")
+        presets = hpp[start:hpp.index("\n};", start)]
+        self.assertNotRegex(presets, r"GetTempPath|temp_directory_path|databasePath\s*=")
+        self.assertNotRegex(hpp, r"\bbool\s+Initialize\s*\(\s*\)\s*;")
+
+    def test_initialize_refuses_a_missing_or_relative_path(self):
+        cpp = strip_c_comments(read_source(self.TI / "ThreatIntelStore.cpp"))
+        body = cpp[cpp.index("bool ThreatIntelStore::Initialize(const StoreConfig& config) {"):]
+        head = body[:body.index("compare_exchange_strong")]
+        self.assertIn("config.databasePath.empty()", head)
+        self.assertIn(".is_absolute()", head)
 
 
 if __name__ == "__main__":
