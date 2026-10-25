@@ -1029,9 +1029,16 @@ private:
 [[nodiscard]] InputFieldType DetectInputFieldType(uint64_t windowHandle);
 
 /**
- * @brief Check if window is password field
+ * @brief True for a Win32 edit-family control (Edit, RichEdit*, or a superclass of one) that
+ *        carries ES_PASSWORD. The style bit means something else on every other class.
  */
 [[nodiscard]] bool IsPasswordField(uint64_t windowHandle);
+
+/**
+ * @brief True when `className` names a control on which ES_PASSWORD means a masked field:
+ *        exactly "Edit", or a RichEdit class (RichEdit20W, RICHEDIT50W, ...). Case-insensitive.
+ */
+[[nodiscard]] bool IsPasswordCapableEditClass(std::wstring_view className) noexcept;
 
 }  // namespace Banking
 }  // namespace ShadowStrike

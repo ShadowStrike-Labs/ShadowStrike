@@ -17,6 +17,7 @@
  */
 #include "pch.h"
 #include "ScreenshotBlocker.hpp"
+#include "KeyloggerProtection.hpp"
 
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
@@ -1082,22 +1083,17 @@ namespace ShadowStrike::Banking {
 
             // Enumerate child controls looking for password edit fields
             ::EnumChildWindows(hwnd, [](HWND child, LPARAM innerParam) -> BOOL {
-                wchar_t className[64] = {};
-                ::GetClassNameW(child, className, 64);
-
-                // Standard Edit control with ES_PASSWORD style
-                if (_wcsicmp(className, L"Edit") == 0) {
-                    LONG_PTR style = ::GetWindowLongPtrW(child, GWL_STYLE);
-                    if (style & ES_PASSWORD) {
-                        auto* ctx2 = reinterpret_cast<EnumCtx*>(innerParam);
-                        // Protect the top-level parent, not the edit control itself
-                        HWND topLevel = ::GetAncestor(child, GA_ROOT);
-                        if (topLevel && !ctx2->self->IsWindowProtected(
+                // One definition of a password field (KeyloggerProtection, task 308): it also
+                // sees RichEdit and superclassed edits, which an exact "Edit" match missed.
+                if (IsPasswordField(reinterpret_cast<uint64_t>(child))) {
+                    auto* ctx2 = reinterpret_cast<EnumCtx*>(innerParam);
+                    // Protect the top-level parent, not the edit control itself
+                    HWND topLevel = ::GetAncestor(child, GA_ROOT);
+                    if (topLevel && !ctx2->self->IsWindowProtected(
+                            reinterpret_cast<WindowHandle>(topLevel))) {
+                        if (ctx2->self->ProtectWindow(
                                 reinterpret_cast<WindowHandle>(topLevel))) {
-                            if (ctx2->self->ProtectWindow(
-                                    reinterpret_cast<WindowHandle>(topLevel))) {
-                                ctx2->protectedCount++;
-                            }
+                            ctx2->protectedCount++;
                         }
                     }
                 }

@@ -405,6 +405,7 @@
     <ClCompile Include="tests\unit\home_unit\CleanerBrowserPaths_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\ModuleSelfTest_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\ModuleSelfTestRemaining_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\PasswordFieldIdentity_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\ModuleInitializeIdempotence_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\CallbackDispatch_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\AttachmentFileTyping_Tests.cpp" />

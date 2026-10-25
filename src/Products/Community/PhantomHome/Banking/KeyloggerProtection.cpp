@@ -616,8 +616,7 @@ public:
         }
 
         // Detect the field type
-        LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
-        if (style & ES_PASSWORD) {
+        if (IsPasswordField(windowHandle)) {
             info.fieldType = InputFieldType::Password;
         }
 
@@ -667,8 +666,7 @@ public:
             auto* c = reinterpret_cast<EnumCtx*>(lParam);
             if (!::IsWindowVisible(hwnd)) return TRUE;
 
-            LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
-            if (style & ES_PASSWORD) {
+            if (IsPasswordField(reinterpret_cast<uint64_t>(hwnd))) {
                 uint64_t handle = reinterpret_cast<uint64_t>(hwnd);
                 c->self->EnableSecureInputMode(handle);
                 c->count++;
@@ -677,8 +675,7 @@ public:
             // Also check child windows for password fields
             ::EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
                 auto* ctx2 = reinterpret_cast<EnumCtx*>(lp);
-                LONG_PTR childStyle = ::GetWindowLongPtrW(child, GWL_STYLE);
-                if (childStyle & ES_PASSWORD) {
+                if (IsPasswordField(reinterpret_cast<uint64_t>(child))) {
                     uint64_t handle = reinterpret_cast<uint64_t>(child);
                     ctx2->self->EnableSecureInputMode(handle);
                     ctx2->count++;
@@ -2036,32 +2033,47 @@ std::string_view GetInputFieldTypeName(InputFieldType type) noexcept {
     return "Unknown";
 }
 
+namespace {
+
+/// The window's class, or the system class it superclasses (a WinForms TextBox registers its
+/// own class name over Edit; RealGetWindowClassW reports the Edit underneath).
+[[nodiscard]] bool IsEditWindow(HWND hwnd) noexcept {
+    wchar_t name[256]{};
+    if (::GetClassNameW(hwnd, name, static_cast<int>(std::size(name))) > 0 &&
+        IsPasswordCapableEditClass(name)) {
+        return true;
+    }
+    wchar_t real[256]{};
+    const UINT n = ::RealGetWindowClassW(hwnd, real, static_cast<UINT>(std::size(real)));
+    return n > 0 && IsPasswordCapableEditClass(std::wstring_view(real, n));
+}
+
+}  // namespace
+
 InputFieldType DetectInputFieldType(uint64_t windowHandle) {
     HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(windowHandle));
     if (!::IsWindow(hwnd)) return InputFieldType::Unknown;
 
-    LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if (style & ES_PASSWORD) return InputFieldType::Password;
+    if (IsPasswordField(windowHandle)) return InputFieldType::Password;
+    return IsEditWindow(hwnd) ? InputFieldType::Generic : InputFieldType::Unknown;
+}
 
-    // Heuristic: check the control's associated label text or name
-    wchar_t className[64]{};
-    ::GetClassNameW(hwnd, className, static_cast<int>(std::size(className)));
-    std::wstring cls(className);
-
-    // Standard Edit control check
-    if (_wcsicmp(cls.c_str(), L"Edit") == 0 || _wcsicmp(cls.c_str(), L"RichEdit20W") == 0) {
-        // Check parent label heuristics (search sibling controls)
-        return InputFieldType::Generic;
-    }
-
-    return InputFieldType::Unknown;
+bool IsPasswordCapableEditClass(std::wstring_view className) noexcept {
+    constexpr std::wstring_view kRichEdit = L"RichEdit";
+    return (className.size() == 4 && ::_wcsnicmp(className.data(), L"Edit", 4) == 0) ||
+           (className.size() > kRichEdit.size() &&
+            ::_wcsnicmp(className.data(), kRichEdit.data(), kRichEdit.size()) == 0);
 }
 
 bool IsPasswordField(uint64_t windowHandle) {
+    // ES_PASSWORD (0x20) is a class-specific style bit: on a Button it is BS_LEFTTEXT, so a
+    // checkbox with its text on the left read as a password field, and AutoProtectPasswordFields
+    // spent MAX_PROTECTED_WINDOWS slots on such controls (task 308). The bit counts only on the
+    // edit family. A browser or UWP password box is not a Win32 edit and cannot be seen here.
     HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(windowHandle));
     if (!::IsWindow(hwnd)) return false;
-    LONG_PTR style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
-    return (style & ES_PASSWORD) != 0;
+    if ((::GetWindowLongPtrW(hwnd, GWL_STYLE) & ES_PASSWORD) == 0) return false;
+    return IsEditWindow(hwnd);
 }
 
 } // namespace Banking

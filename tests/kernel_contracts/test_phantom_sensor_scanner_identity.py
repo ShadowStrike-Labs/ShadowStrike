@@ -28626,6 +28626,7 @@ class SelfTestsDoNotChangeLiveStateTests(unittest.TestCase):
         "Privacy/PrivacyCleaner.cpp": [r"shadowstrike_test_erase", r"std::ofstream"],
         "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
         "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
+        "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
     }
 
     @staticmethod
@@ -28747,6 +28748,58 @@ class IpClassificationHasOneDefinitionTests(unittest.TestCase):
                 src = strip_c_comments(read_source(self.HOME / rel))
                 self.assertGreaterEqual(len(re.findall(r"Utils::Ip::Is(PrivateOrLocalAddress|IPv6Literal)\(", src)), floor)
                 self.assertNotRegex(src, r"(isIPv6|IsIPv6)\w*\s*=\s*\w+\.find\(':'\)")
+
+
+class IpClassificationHasOneDefinitionTests(unittest.TestCase):
+    """Whether an address is private, or IPv6, has one answer: Utils::Ip (task 295).
+
+    The Privacy and IoT IPLeakProtection modules each defined IsPrivateIP and IsIPv6Address and
+    disagreed: text prefixes against inet_pton, and find(':') for IPv6 in both.
+    """
+
+    HOME = ROOT / "src/Products/Community/PhantomHome"
+
+    def test_no_local_ip_predicate_in_the_home_product(self):
+        offenders = []
+        for path in sorted(self.HOME.rglob("*.[ch]pp")):
+            src = strip_c_comments(read_source(path))
+            for name in ("IsPrivateIP", "IsIPv6Address", "IsPrivateIPAddress", "IsIPv6Addr"):
+                if re.search(r"\bbool\s+" + name + r"\s*\(", src):
+                    offenders.append(f"{path.name}:{name}")
+        self.assertEqual([], offenders)
+
+    def test_both_leak_modules_classify_through_the_shared_predicate(self):
+        for rel, floor in (("Privacy/IPLeakProtection.cpp", 3), ("IoT/IPLeakProtection.cpp", 5)):
+            with self.subTest(rel=rel):
+                src = strip_c_comments(read_source(self.HOME / rel))
+                self.assertGreaterEqual(len(re.findall(r"Utils::Ip::Is(PrivateOrLocalAddress|IPv6Literal)\(", src)), floor)
+                self.assertNotRegex(src, r"(isIPv6|IsIPv6)\w*\s*=\s*\w+\.find\(':'\)")
+
+
+class PasswordFieldNeedsAnEditClassTests(unittest.TestCase):
+    """ES_PASSWORD is read only together with the window class (task 308).
+
+    0x20 is BS_LEFTTEXT on a Button, so a bare style test made left-text checkboxes password
+    fields and spent protected-window slots on them. IsPasswordField is the one place the bit is
+    read; every password-field decision goes through it.
+    """
+
+    BANKING = ROOT / "src/Products/Community/PhantomHome/Banking"
+
+    def test_the_style_bit_is_read_only_by_the_predicate(self):
+        for rel, expected in (("KeyloggerProtection.cpp", 1), ("ScreenshotBlocker.cpp", 0)):
+            with self.subTest(rel=rel):
+                src = strip_c_comments(read_source(self.BANKING / rel))
+                self.assertEqual(expected, len(re.findall(r"&\s*ES_PASSWORD", src)))
+
+    def test_every_password_decision_uses_the_predicate(self):
+        kp = strip_c_comments(read_source(self.BANKING / "KeyloggerProtection.cpp"))
+        sb = strip_c_comments(read_source(self.BANKING / "ScreenshotBlocker.cpp"))
+        self.assertGreaterEqual(kp.count("IsPasswordField("), 5)   # definition + 4 uses
+        self.assertGreaterEqual(sb.count("IsPasswordField("), 1)
+        body = kp[kp.index("bool IsPasswordField(uint64_t windowHandle) {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("IsEditWindow(hwnd)", body)
 
 
 if __name__ == "__main__":
