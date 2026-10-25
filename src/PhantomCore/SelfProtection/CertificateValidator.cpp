@@ -719,6 +719,9 @@ void CertificateValidatorStatistics::Reset() noexcept {
 // INTERNAL ATOMIC STATISTICS (PIMPL-private; snapshots to public non-atomic struct)
 // ============================================================================
 
+// Internal linkage: ProcessProtection.cpp also defined a different InternalAtomicStats in this namespace (task 216).
+namespace {
+
 struct InternalAtomicStats {
     std::atomic<uint64_t> totalValidations{0};
     std::atomic<uint64_t> validCertificates{0};
@@ -792,6 +795,8 @@ struct InternalAtomicStats {
         avgValidationTimeUs.store(newAvg, std::memory_order_relaxed);
     }
 };
+
+}  // namespace
 
 // ============================================================================
 // BOUNDED ASYNC VALIDATION WORKER POOL

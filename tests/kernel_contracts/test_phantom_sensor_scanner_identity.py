@@ -29130,5 +29130,28 @@ class RegistryRestoreIsSubtractiveTests(unittest.TestCase):
         self.assertNotIn("RegDeleteKey", body)
 
 
+class CertificateValidatorStatisticsHaveTheirOwnLayoutTests(unittest.TestCase):
+    """Each InternalAtomicStats has internal linkage (task 216).
+
+    CertificateValidator.cpp and ProcessProtection.cpp each defined a class named
+    ShadowStrike::Security::InternalAtomicStats with a different layout: sixteen counters then
+    startTime, against fourteen counters, startTime and lastEventTimeTicks. Their in-class
+    members are inline, so the linker kept one definition for both. The field run reported
+    kernelRevocationBlocks - the fifteenth counter, offset 112, where the other layout keeps
+    startTime - as the steady-clock time of service start (130.59 s in 1.0.112, 173.18 s in
+    1.0.113) while the counter was never incremented.
+    """
+
+    def test_both_definitions_are_in_an_anonymous_namespace(self):
+        for name in ("CertificateValidator.cpp", "ProcessProtection.cpp"):
+            source = strip_c_comments(read_source(ROOT / "src/PhantomCore/SelfProtection" / name))
+            at = source.index("struct InternalAtomicStats {")
+            opened = [m.start() for m in re.finditer(r"\bnamespace\s*\{", source[:at])]
+            self.assertTrue(opened, "%s: InternalAtomicStats is not in an anonymous namespace" % name)
+            between = source[opened[-1]:at]
+            self.assertLess(between.count("}") - between.count("{"), 0,
+                                 "%s: the anonymous namespace closes before InternalAtomicStats" % name)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

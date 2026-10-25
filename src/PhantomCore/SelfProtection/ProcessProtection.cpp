@@ -404,6 +404,9 @@ namespace {
 // INTERNAL ATOMIC STATISTICS — thread-safe counters inside PIMPL
 // ============================================================================
 
+// Internal linkage: CertificateValidator.cpp also defined a different InternalAtomicStats in this namespace (task 216).
+namespace {
+
 /**
  * @brief Internal atomic statistics. Used exclusively inside ProcessProtectionImpl.
  *        Public API returns a plain ProcessProtectionStatistics snapshot via Snapshot().
@@ -481,6 +484,8 @@ struct InternalAtomicStats {
         lastEventTimeTicks.store(0, std::memory_order_relaxed);
     }
 };
+
+}  // namespace
 
 // ============================================================================
 // PROCESS PROTECTION IMPLEMENTATION CLASS
