@@ -345,24 +345,26 @@ public:
     // PIN LOGIC
     // ========================================================================
 
-    void AddPin(const CertificatePin& pin) {
+    /// @return true when the pin was stored. Callers notify pin-update callbacks after
+    ///         this returns, with m_mutex released.
+    [[nodiscard]] bool AddPin(const CertificatePin& pin) {
         std::unique_lock lock(m_mutex);
 
         const std::string normDomain = NormalizeDomain(pin.domain);
         if (!IsValidDomainPattern(normDomain)) {
             SS_LOG_WARN(LOG_CAT, L"Rejected certificate pin with invalid domain pattern.");
-            return;
+            return false;
         }
         if (pin.hashAlgorithm != PinHashAlgorithm::SHA256 ||
             pin.pinType != PinType::SPKI) {
             SS_LOG_WARN(LOG_CAT, L"Rejected unsupported certificate pin type/algorithm.");
-            return;
+            return false;
         }
         std::vector<uint8_t> decoded;
         if (!Utils::CryptoUtils::Base64::Decode(pin.pinHash, decoded) ||
             decoded.size() != CertPinningConstants::PIN_HASH_LENGTH) {
             SS_LOG_WARN(LOG_CAT, L"Rejected certificate pin with invalid SHA-256 pin hash.");
-            return;
+            return false;
         }
 
         auto existing = m_pinStore.find(normDomain);
@@ -370,19 +372,60 @@ public:
             m_pinStore.size() >= CertPinningConstants::MAX_PINNED_DOMAINS) {
             SS_LOG_WARN(LOG_CAT, L"Global pinned domain limit reached (max %zu). Rejecting.",
                         CertPinningConstants::MAX_PINNED_DOMAINS);
-            return;
+            return false;
         }
 
         auto& domainPins = m_pinStore[normDomain];
         if (domainPins.size() >= CertPinningConstants::MAX_PINS_PER_DOMAIN) {
             SS_LOG_WARN(LOG_CAT, L"Pin limit reached for domain (max %zu). Rejecting new pin.",
                         CertPinningConstants::MAX_PINS_PER_DOMAIN);
-            return;
+            return false;
         }
 
         CertificatePin normalizedPin = pin;
         normalizedPin.domain = normDomain;
         domainPins.push_back(std::move(normalizedPin));
+        return true;
+    }
+
+    /// Pin count per domain. Caller holds m_mutex.
+    [[nodiscard]] std::unordered_map<std::string, size_t> PinCountsLocked() const {
+        std::unordered_map<std::string, size_t> counts;
+        counts.reserve(m_pinStore.size());
+        for (const auto& [domain, pins] : m_pinStore) counts.emplace(domain, pins.size());
+        return counts;
+    }
+
+    /// A pin change is security-relevant in a banking module (task 300): a consumer must
+    /// learn that the set of keys a bank is allowed to present changed. Fired after a
+    /// public mutation, never under m_mutex; one callback per changed domain. Pins loaded
+    /// by Initialize/UpdateConfiguration are configuration, not updates, and do not fire.
+    void NotifyPinUpdate(const std::string& domain, bool added) {
+        std::vector<PinUpdateCallback> callbacks;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbacks = m_pinUpdateCallbacks;
+        }
+        for (const auto& cb : callbacks) {
+            if (!cb) continue;
+            try {
+                cb(domain, added);
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CAT, L"Exception in pin update callback.");
+            }
+        }
+    }
+
+    /// Notifies every domain whose pin count grew (added) or which disappeared (removed).
+    void NotifyPinChanges(const std::unordered_map<std::string, size_t>& before,
+                          const std::unordered_map<std::string, size_t>& after) {
+        for (const auto& [domain, n] : after) {
+            const auto it = before.find(domain);
+            if (it == before.end() || it->second < n) NotifyPinUpdate(domain, true);
+        }
+        for (const auto& [domain, n] : before) {
+            if (!after.contains(domain)) NotifyPinUpdate(domain, false);
+        }
     }
 
     std::vector<CertificatePin> GetPins(const std::string& domain) const {
@@ -1357,15 +1400,33 @@ PinningMode CertificatePinning::GetMode() const noexcept {
 // ============================================================================
 
 bool CertificatePinning::LoadDefaultBankPins() {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->LoadBuiltInPins();
-    SS_LOG_INFO(LOG_CAT, L"Default bank pins loaded. Domains: %zu",
-                m_impl->m_pinStore.size());
+    std::unordered_map<std::string, size_t> before, after;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        before = m_impl->PinCountsLocked();
+        m_impl->LoadBuiltInPins();
+        after = m_impl->PinCountsLocked();
+        SS_LOG_INFO(LOG_CAT, L"Default bank pins loaded. Domains: %zu",
+                    m_impl->m_pinStore.size());
+    }
+    m_impl->NotifyPinChanges(before, after);
     return true;
 }
 
 bool CertificatePinning::LoadPinsFromFile(const std::filesystem::path& path) {
-    return m_impl->LoadPinsFromFileImpl(path);
+    std::unordered_map<std::string, size_t> before;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        before = m_impl->PinCountsLocked();
+    }
+    const bool ok = m_impl->LoadPinsFromFileImpl(path);
+    std::unordered_map<std::string, size_t> after;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        after = m_impl->PinCountsLocked();
+    }
+    m_impl->NotifyPinChanges(before, after);
+    return ok;
 }
 
 bool CertificatePinning::SavePinsToFile(const std::filesystem::path& path) const {
@@ -1373,7 +1434,9 @@ bool CertificatePinning::SavePinsToFile(const std::filesystem::path& path) const
 }
 
 void CertificatePinning::AddPin(const CertificatePin& pin) {
-    m_impl->AddPin(pin);
+    if (m_impl->AddPin(pin)) {
+        m_impl->NotifyPinUpdate(NormalizeDomain(pin.domain), true);
+    }
 }
 
 void CertificatePinning::AddSPKIPin(const std::string& domain,
@@ -1405,12 +1468,21 @@ void CertificatePinning::AddSPKIPin(const std::string& domain,
     pin.isBackup = isBackup;
     pin.source = "api";
     pin.createdAt = std::chrono::system_clock::now();
-    m_impl->AddPin(pin);
+    if (m_impl->AddPin(pin)) {
+        m_impl->NotifyPinUpdate(normalizedDomain, true);
+    }
 }
 
 void CertificatePinning::RemovePin(const std::string& domain) {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_pinStore.erase(NormalizeDomain(domain));
+    const std::string normalized = NormalizeDomain(domain);
+    size_t erased = 0;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        erased = m_impl->m_pinStore.erase(normalized);
+    }
+    if (erased != 0) {
+        m_impl->NotifyPinUpdate(normalized, false);
+    }
 }
 
 void CertificatePinning::RemoveAllPins(const std::string& domain) {
@@ -1440,9 +1512,14 @@ size_t CertificatePinning::GetPinnedDomainCount() const noexcept {
 }
 
 void CertificatePinning::ClearAllPins() {
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_pinStore.clear();
-    SS_LOG_INFO(LOG_CAT, L"All pins cleared.");
+    std::unordered_map<std::string, size_t> before;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        before = m_impl->PinCountsLocked();
+        m_impl->m_pinStore.clear();
+        SS_LOG_INFO(LOG_CAT, L"All pins cleared.");
+    }
+    m_impl->NotifyPinChanges(before, {});
 }
 
 // ============================================================================

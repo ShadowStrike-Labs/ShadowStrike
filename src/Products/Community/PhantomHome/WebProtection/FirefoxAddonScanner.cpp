@@ -466,6 +466,13 @@ public:
             try {
                 std::ifstream f(extensionsJson);
                 json data = json::parse(f, nullptr, false);
+                if (data.is_discarded()) {
+                    // A non-throwing parse: a corrupt registry was skipped without a word.
+                    Logger::Error("FirefoxAddonScanner: extensions.json in {} is not valid JSON",
+                        profilePath.string());
+                    NotifyError("a Firefox profile's add-on registry could not be read; its add-ons were not scanned",
+                                ERROR_INVALID_DATA);
+                }
 
                 if (!data.is_discarded() && data.contains("addons") &&
                     data["addons"].is_array()) {
@@ -518,6 +525,8 @@ public:
             } catch (const std::exception& e) {
                 Logger::Error("FirefoxAddonScanner: failed to parse extensions.json in {}: {}",
                     profilePath.string(), e.what());
+                NotifyError("a Firefox profile's add-on registry could not be read; its add-ons were not scanned",
+                            ERROR_INVALID_DATA);
             }
         }
 
@@ -1010,6 +1019,8 @@ public:
         } catch (const std::exception& e) {
             Logger::Error("FirefoxAddonScanner: XPI extraction failed for {}: {}",
                 xpiPath.string(), e.what());
+            NotifyError("a Firefox add-on package could not be unpacked, so its code was not analysed",
+                        ERROR_INVALID_DATA);
             return std::nullopt;
         }
     }
@@ -1120,6 +1131,7 @@ public:
         } catch (const std::exception& e) {
             Logger::Error("FirefoxAddonScanner: code analysis error in {}: {}",
                 addonPath.string(), e.what());
+            NotifyError("a Firefox add-on's code analysis did not complete", ERROR_UNHANDLED_EXCEPTION);
         }
 
         return analysis;
@@ -1378,6 +1390,23 @@ public:
     void RegisterErrorCallback(ErrorCallback cb) {
         std::unique_lock lock(m_cbMutex);
         m_errorCallbacks.push_back(std::move(cb));
+    }
+
+    // ERROR CALLBACK CONTRACT (task 300, one rule for every module): an error callback
+    // fires when protection work the module is expected to do silently did not happen
+    // - an item that could not be examined, a scan that could not start. Not for a
+    // failure the caller already receives as a return value, not for invalid
+    // arguments, not for a throwing callback. Copied under the lock, invoked after it
+    // is released, one try/catch per callback, so one consumer cannot stop the rest.
+    void NotifyError(const std::string& message, int code) {
+        std::vector<ErrorCallback> snapshot;
+        {
+            std::unique_lock lock(m_cbMutex);
+            snapshot = m_errorCallbacks;
+        }
+        for (const auto& cb : snapshot) {
+            try { if (cb) cb(message, code); } catch (...) {}
+        }
     }
 
     void UnregisterCallbacks() {

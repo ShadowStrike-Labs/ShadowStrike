@@ -264,6 +264,8 @@ public:
     void RegisterDisconnectedCallback(DeviceDisconnectedCallback callback);
     void RegisterPolicyCallback(PolicyDecisionCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
+    void NotifyError(const std::string& message, int code);
+    void NotifyPolicyDecision(const USBDeviceInfo& device, AccessLevel access);
     void UnregisterCallbacks();
 
     USBMonitorStatisticsSnapshot GetStatistics() const;
@@ -593,7 +595,9 @@ void USBDeviceMonitorImpl::HandleDeviceChange(UINT nEventType, DWORD_PTR dwData)
 void USBDeviceMonitorImpl::EnumerateDevices() {
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_USB_DEVICE, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (hDevInfo == INVALID_HANDLE_VALUE) {
+        const DWORD err = ::GetLastError();
         SS_LOG_ERROR(L"USBMonitor", L"SetupDiGetClassDevs failed");
+        NotifyError("connected USB devices could not be enumerated, so none were evaluated", static_cast<int>(err));
         return;
     }
 
@@ -822,6 +826,8 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
                 SS_LOG_ERROR(L"USBMonitor",
                     L"Auto-scan was NOT started for drive %hs - the volume is mounted and will not be examined",
                     device.driveLetter.c_str());
+                NotifyError("a mounted USB volume will not be scanned: the scan could not be started",
+                            ERROR_NOT_READY);
             }
         }
     }
@@ -856,6 +862,7 @@ void USBDeviceMonitorImpl::ProcessNewDevice(const USBDeviceInfo& device) {
     evt.timestamp = std::chrono::system_clock::now();
     evt.accessGranted = access;
     NotifyCallbacks(evt);
+    NotifyPolicyDecision(mutableDevice, access);
 
     SS_LOG_INFO(L"USBMonitor", L"Device connected: %hs (VID_%04X&PID_%04X) Access: %hs",
         RedactDeviceIdentifier(device.deviceId).c_str(), device.vid, device.pid, GetAccessLevelName(access).data());
@@ -940,6 +947,44 @@ void USBDeviceMonitorImpl::LogEvent(DeviceEventType type, const USBDeviceInfo& d
     m_eventHistory.push_back(evt);
     if (m_eventHistory.size() > m_config.deviceHistorySize) {
         m_eventHistory.pop_front();
+    }
+}
+
+// ERROR CALLBACK CONTRACT (task 300, one rule for every module): an error callback
+// fires when protection work the module is expected to do silently did not happen
+// - an item that could not be examined, a scan that could not start. Not for a
+// failure the caller already receives as a return value, not for invalid
+// arguments, not for a throwing callback. Copied under the lock, invoked after it
+// is released, one try/catch per callback, so one consumer cannot stop the rest.
+void USBDeviceMonitorImpl::NotifyError(const std::string& message, int code) {
+    std::vector<ErrorCallback> cbs;
+    {
+        std::unique_lock lock(m_cbMutex);
+        cbs = m_errorCallbacks;
+    }
+    for (const auto& cb : cbs) {
+        try {
+            if (cb) cb(message, code);
+        } catch (...) {
+            SS_LOG_ERROR(L"USBMonitor", L"Error callback threw");
+        }
+    }
+}
+
+// Every final access decision for a connected device, allowed or not: the callback type
+// carries the AccessLevel so a consumer can filter, and an audit consumer needs both.
+void USBDeviceMonitorImpl::NotifyPolicyDecision(const USBDeviceInfo& device, AccessLevel access) {
+    std::vector<PolicyDecisionCallback> cbs;
+    {
+        std::unique_lock lock(m_cbMutex);
+        cbs = m_policyCallbacks;
+    }
+    for (const auto& cb : cbs) {
+        try {
+            if (cb) cb(device, access);
+        } catch (...) {
+            SS_LOG_ERROR(L"USBMonitor", L"Policy callback threw");
+        }
     }
 }
 

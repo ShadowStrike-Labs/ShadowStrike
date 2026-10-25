@@ -28687,5 +28687,39 @@ class BrowserIdentityComesFromTheLocatorTests(unittest.TestCase):
         self.assertGreaterEqual(src.count("ProcessIsBrowser("), 3)   # definition + 2 uses
 
 
+class CallbackRegistriesAreDispatchedTests(unittest.TestCase):
+    """Every registry a Register*Callback fills is also dispatched (task 300).
+
+    Six registries had a declaration, a push_back and a clear, and no dispatch. The
+    signature of a live one is a copy taken under the lock before invoking; the unit
+    tests cannot reach USB policy decisions or Outlook errors without hardware or COM.
+    """
+
+    HOME = ROOT / "src/Products/Community/PhantomHome"
+    SITES = [
+        ("Email/OutlookScanner.cpp", r"callbacksCopy = m_errorCallbacks;"),
+        ("USB_Protection/USBDeviceMonitor.cpp", r"cbs = m_policyCallbacks;"),
+        ("USB_Protection/USBDeviceMonitor.cpp", r"cbs = m_errorCallbacks;"),
+        ("Banking/CertificatePinning.cpp", r"callbacks = m_pinUpdateCallbacks;"),
+        ("WebProtection/FirefoxAddonScanner.cpp", r"snapshot = m_errorCallbacks;"),
+        ("WebProtection/TrackerBlocker.cpp", r"for \(const auto& \[id, cb\] : m_updateCallbacks\)"),
+    ]
+
+    def test_each_registry_has_a_dispatch_copy(self):
+        for rel, pattern in self.SITES:
+            with self.subTest(rel=rel, pattern=pattern):
+                self.assertRegex(strip_c_comments(read_source(self.HOME / rel)), pattern)
+
+    def test_a_usb_access_decision_reaches_policy_callbacks(self):
+        src = strip_c_comments(read_source(self.HOME / "USB_Protection/USBDeviceMonitor.cpp"))
+        body = src[src.index("void USBDeviceMonitorImpl::ProcessNewDevice("):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("NotifyPolicyDecision(mutableDevice, access);", body)
+
+    def test_outlook_reports_every_mail_that_escaped_scanning(self):
+        src = strip_c_comments(read_source(self.HOME / "Email/OutlookScanner.cpp"))
+        self.assertGreaterEqual(src.count("InvokeErrorCallbacks(\""), 9)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

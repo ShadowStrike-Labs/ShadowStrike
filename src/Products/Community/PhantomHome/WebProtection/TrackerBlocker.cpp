@@ -894,7 +894,26 @@ public:
         m_stats.activeRuleCount = m_rules.size();
 
         TB_LOG_INFO("Loaded {} rules from URL-based blocklist '{}'", ruleCount, blocklistId);
+        lock.unlock();
+        NotifyBlocklistUpdated(info);   // UpdateBlocklist reloads through here
         return true;
+    }
+
+    /// A blocklist was loaded or refreshed (task 300). Never called under m_mutex.
+    void NotifyBlocklistUpdated(const BlocklistInfo& info) {
+        std::vector<BlocklistUpdateCallback> callbacks;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbacks.reserve(m_updateCallbacks.size());
+            for (const auto& [id, cb] : m_updateCallbacks) callbacks.push_back(cb);
+        }
+        for (const auto& cb : callbacks) {
+            try {
+                if (cb) cb(info);
+            } catch (...) {
+                TB_LOG_ERROR("Blocklist update callback threw");
+            }
+        }
     }
 
     [[nodiscard]] bool UnloadBlocklist(std::string_view id) {
@@ -1827,14 +1846,24 @@ private:
     [[nodiscard]] bool LoadBlocklistFromFile(const std::filesystem::path& path,
                                               BlocklistSource source,
                                               const std::string& name) {
-        std::unique_lock lock(m_mutex);
-        return LoadBlocklistFromFileLocked(path, source, name);
+        BlocklistInfo loaded;
+        bool ok = false;
+        {
+            std::unique_lock lock(m_mutex);
+            ok = LoadBlocklistFromFileLocked(path, source, name, &loaded);
+        }
+        if (ok) {
+            NotifyBlocklistUpdated(loaded);
+        }
+        return ok;
     }
 
-    // Precondition: m_mutex held exclusively by caller.
+    // Precondition: m_mutex held exclusively by caller. The caller notifies update
+    // callbacks after releasing it, from *loaded.
     [[nodiscard]] bool LoadBlocklistFromFileLocked(const std::filesystem::path& path,
                                                     BlocklistSource source,
-                                                    const std::string& name) {
+                                                    const std::string& name,
+                                                    BlocklistInfo* loaded = nullptr) {
         try {
             std::error_code fileSizeError;
             const auto fileSize = fs::file_size(path, fileSizeError);
@@ -1889,6 +1918,9 @@ private:
             info.enabled = true;
             info.lastUpdated = Clock::now();
             m_blocklists[blocklistId] = info;
+            if (loaded != nullptr) {
+                *loaded = info;
+            }
 
             TB_LOG_INFO("Loaded blocklist '{}' with {} rules", name, ruleCount);
             return true;

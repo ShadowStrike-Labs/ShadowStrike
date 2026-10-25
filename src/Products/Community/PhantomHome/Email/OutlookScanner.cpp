@@ -1349,6 +1349,7 @@ public:
             if (!mailInfo.has_value()) {
                 Logger::Error("OnNewMail: Failed to extract mail item info");
                 m_stats.scanErrors++;
+                InvokeErrorCallbacks("an incoming mail item could not be read and was not scanned", ERROR_INVALID_DATA);
                 return;
             }
 
@@ -1357,6 +1358,7 @@ public:
         } catch (const std::exception& e) {
             Logger::Error("OnNewMail - Exception: {}", e.what());
             m_stats.scanErrors++;
+            InvokeErrorCallbacks("an incoming mail item was not scanned: exception", ERROR_UNHANDLED_EXCEPTION);
         }
     }
 
@@ -1382,6 +1384,7 @@ public:
                 if (!pNamespace) {
                     Logger::Error("OnNewMailEx: MAPI Namespace unavailable for EntryID: {}", entryId);
                     m_stats.scanErrors++;
+                    InvokeErrorCallbacks("an incoming mail item could not be opened and was not scanned", ERROR_NOT_READY);
                     continue;
                 }
 
@@ -1396,6 +1399,7 @@ public:
                 if (!mailInfo.has_value()) {
                     Logger::Error("OnNewMailEx: Failed to extract mail info for EntryID: {}", entryId);
                     m_stats.scanErrors++;
+                    InvokeErrorCallbacks("an incoming mail item could not be read and was not scanned", ERROR_INVALID_DATA);
                     continue;
                 }
 
@@ -1408,6 +1412,7 @@ public:
         } catch (const std::exception& e) {
             Logger::Error("OnNewMailEx - Exception: {}", e.what());
             m_stats.scanErrors++;
+            InvokeErrorCallbacks("incoming mail items were not scanned: exception", ERROR_UNHANDLED_EXCEPTION);
         }
     }
 
@@ -1426,6 +1431,7 @@ public:
             if (!mailInfo.has_value()) {
                 Logger::Error("OnItemSend: Failed to extract mail item info");
                 m_stats.scanErrors++;
+                InvokeErrorCallbacks("an outgoing mail item could not be read and was sent without being scanned", ERROR_INVALID_DATA);
                 return true;
             }
 
@@ -1478,6 +1484,7 @@ public:
         } catch (const std::exception& e) {
             Logger::Error("OnItemSend - Exception: {}", e.what());
             m_stats.scanErrors++;
+            InvokeErrorCallbacks("an outgoing mail item was sent without being scanned: exception", ERROR_UNHANDLED_EXCEPTION);
             return true;
         }
     }
@@ -1647,6 +1654,7 @@ public:
 
         } catch (const std::exception& e) {
             Logger::Error("OnAttachmentAdd - Exception: {}", e.what());
+            InvokeErrorCallbacks("an added attachment was not scanned: exception", ERROR_UNHANDLED_EXCEPTION);
         }
     }
 
@@ -2743,6 +2751,7 @@ private:
 
         } catch (const std::exception& e) {
             Logger::Error("ProcessMailEvent - Exception: {}", e.what());
+            InvokeErrorCallbacks("a mail item was not fully scanned: exception", ERROR_UNHANDLED_EXCEPTION);
         }
     }
 
@@ -2865,6 +2874,29 @@ private:
                 }
             } catch (const std::exception& e) {
                 Logger::Error("InvokeScanCallbacks: Callback threw: {}", e.what());
+            }
+        }
+    }
+
+    // ERROR CALLBACK CONTRACT (task 300, one rule for every module): an error callback
+    // fires when protection work the module is expected to do silently did not happen
+    // - an item that could not be examined, a scan that could not start. Not for a
+    // failure the caller already receives as a return value, not for invalid
+    // arguments, not for a throwing callback. Copied under the lock, invoked after it
+    // is released, one try/catch per callback, so one consumer cannot stop the rest.
+    void InvokeErrorCallbacks(const std::string& message, int code) {
+        std::vector<ErrorCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy = m_errorCallbacks;
+        }
+        for (const auto& callback : callbacksCopy) {
+            try {
+                if (callback) {
+                    callback(message, code);
+                }
+            } catch (...) {
+                Logger::Error("InvokeErrorCallbacks: Callback threw");
             }
         }
     }
