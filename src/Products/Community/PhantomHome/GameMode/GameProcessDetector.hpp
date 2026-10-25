@@ -653,6 +653,9 @@ private:
 [[nodiscard]] std::string_view GetDetectionMethodName(DetectionMethod method) noexcept;
 [[nodiscard]] std::string_view GetVRPlatformName(VRPlatform platform) noexcept;
 
+/// Whether a window class name is one a known game engine registers. Exact match.
+[[nodiscard]] bool IsGameEngineWindowClass(std::string_view className) noexcept;
+
 /// @brief Get launcher install path from registry
 [[nodiscard]] std::wstring GetLauncherInstallPath(LauncherType type);
 

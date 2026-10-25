@@ -1611,6 +1611,8 @@ bool WiFiSecurityAnalyzerImpl::IsWeakSSID(const std::string& ssid) const {
         }
     }
 
+    // Substring BY DESIGN (task 292): default SSIDs carry suffixes (linksys-5G,
+    // NETGEAR-Guest), and a false match only advises that the name looks default.
     for (const auto& weak : WEAK_SSIDS) {
         if (lower.find(weak) != std::string::npos) {
             return true;

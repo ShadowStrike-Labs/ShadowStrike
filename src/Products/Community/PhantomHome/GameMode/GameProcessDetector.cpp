@@ -342,9 +342,14 @@ const std::vector<GameEntry> KNOWN_GAMES_DATABASE = {
 /**
  * @brief Common game window classes
  */
-const std::vector<std::string> GAME_WINDOW_CLASSES = {
+// Window classes registered by game engines, matched EXACTLY (task 292). A window class
+// is an identity, and a false match activates game mode, which suppresses protection;
+// a substring test let any window whose class merely contained one of these qualify.
+// The Unity entry was "Unity WndClass" with a space, which Unity does not register, so
+// Unity games never matched this signal at all.
+constexpr std::array<std::string_view, 7> GAME_WINDOW_CLASSES = {
     "UnrealWindow",
-    "Unity WndClass",
+    "UnityWndClass",
     "SDL_app",
     "GLFW30",
     "CryENGINE",
@@ -1450,12 +1455,9 @@ bool GameProcessDetectorImpl::MatchWindowClass(HWND hwnd) {
 
 #ifdef _WIN32
     char className[256] = {};
-    GetClassNameA(hwnd, className, sizeof(className));
-
-    for (const auto& gameClass : GAME_WINDOW_CLASSES) {
-        if (std::string_view(className).find(gameClass) != std::string_view::npos) {
-            return true;
-        }
+    const int length = GetClassNameA(hwnd, className, sizeof(className));
+    if (length > 0 && IsGameEngineWindowClass(std::string_view(className, static_cast<size_t>(length)))) {
+        return true;
     }
 #endif
 
@@ -2126,6 +2128,11 @@ std::string_view GetDetectionMethodName(DetectionMethod method) noexcept {
         case DetectionMethod::Heuristic:         return "Heuristic";
         default:                                 return "Unknown";
     }
+}
+
+bool IsGameEngineWindowClass(std::string_view className) noexcept {
+    return std::find(GAME_WINDOW_CLASSES.begin(), GAME_WINDOW_CLASSES.end(), className) !=
+           GAME_WINDOW_CLASSES.end();
 }
 
 std::string_view GetVRPlatformName(VRPlatform platform) noexcept {

@@ -182,4 +182,17 @@ TEST(EmailMimePolicy, TheExecutableMimeTypesAreBlockedCaseInsensitively) {
     EXPECT_FALSE(IsBlockedMimeType(";"));
 }
 
+// Task 292: a shortened link is one whose HOST is the shortener, not one that contains its name.
+TEST(EmailShortenedLinks, TheHostMustBeTheShortener) {
+    auto& detector = ShadowStrike::Email::PhishingEmailDetector::Instance();
+    if (!detector.IsInitialized()) (void)detector.Initialize();
+    for (const char* url : {"https://bit.ly/abc", "https://t.co/xyz", "http://BIT.LY./q", "https://www.tinyurl.com/z"}) {
+        EXPECT_TRUE(detector.AnalyzeURL(url).isShortened) << url;
+    }
+    for (const char* url : {"https://www.microsoft.com/download", "https://shirt.co/sale",
+                            "https://example.com/?next=bit.ly", "https://notbit.ly.example/x"}) {
+        EXPECT_FALSE(detector.AnalyzeURL(url).isShortened) << url;
+    }
+}
+
 }  // namespace

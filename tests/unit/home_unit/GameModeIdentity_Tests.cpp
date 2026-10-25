@@ -223,4 +223,16 @@ TEST_F(PerformanceProfileTest, AnUnknownProfileFallsBackToSomethingUsable) {
     EXPECT_GT(bogus.throttle.scanRateLimit, 0u);
 }
 
+TEST(GameWindowClass, OnlyAnEngineClassItselfMatches) {
+    // Task 292: a substring test let any class containing an engine name qualify, and a match
+    // activates game mode, which suppresses protection. Exact now; "Unity WndClass" never matched Unity.
+    using ShadowStrike::GameMode::IsGameEngineWindowClass;
+    for (const char* c : {"UnityWndClass", "UnrealWindow", "SDL_app", "GLFW30"}) {
+        EXPECT_TRUE(IsGameEngineWindowClass(c)) << c;
+    }
+    for (const char* c : {"Chrome_WidgetWin_1", "MyUnityWndClassHelper", "unrealwindow", "", "SDL_app2"}) {
+        EXPECT_FALSE(IsGameEngineWindowClass(c)) << c;
+    }
+}
+
 }  // namespace ShadowStrike::GameMode::Test

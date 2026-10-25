@@ -60,6 +60,7 @@
 #include "PhantomCore/Utils/Logger.hpp"
 #include "PhantomCore/Utils/StringUtils.hpp"
 #include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/DomainUtils.hpp"
 #include "PhantomCore/PatternStore/PatternStore.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 #include "PhantomCore/Whitelist/WhiteListStore.hpp"
@@ -763,11 +764,21 @@ public:
             // Check if HTTPS
             result.usesHTTPS = (url.find("https://") == 0);
 
-            // Check if shortened URL
-            for (const auto& service : SHORTENED_URL_SERVICES) {
-                if (result.domain.find(service) != std::string::npos) {
-                    result.isShortened = true;
-                    break;
+            // Check if shortened URL: the HOST is the service or a subdomain of it
+            // (task 292). A substring test called every microsoft.com link shortened,
+            // because "microsof[t.co]m" contains t.co.
+            {
+                std::string host = result.domain;
+                if (const auto at = host.rfind('@'); at != std::string::npos) host.erase(0, at + 1);
+                if (const auto colon = host.find(':'); colon != std::string::npos) host.erase(colon);
+                while (!host.empty() && host.back() == '.') host.pop_back();
+                std::transform(host.begin(), host.end(), host.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                for (const auto& service : SHORTENED_URL_SERVICES) {
+                    if (Utils::Domain::IsSameOrSubdomainOf(host, service)) {
+                        result.isShortened = true;
+                        break;
+                    }
                 }
             }
 
