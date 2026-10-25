@@ -54,6 +54,7 @@
 #include "../Communication/AlertSystem.hpp"
 #include "../Communication/TelemetryCollector.hpp"
 #include "DigitalSignatureValidator.hpp"
+#include "ProductExecutables.hpp"
 
 #include <algorithm>
 #include <deque>
@@ -294,16 +295,25 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to add default protected key: %ls", keyPath.c_str());
             }
         }
+        for (const auto executable : ProductExecutables::kNames) {
+            const std::wstring keyPath = RegistryProtection::ImageExecutionOptionsKeyFor(executable);
+            if (!IsKeyProtectedInternal(keyPath) &&
+                !AddProtectedKeyInternal(keyPath, KeyProtectionType::Full, true)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to add default protected key: %ls", keyPath.c_str());
+            }
+        }
 
         // Initialize whitelisted processes
         for (const auto& process : config.whitelistedProcesses) {
             m_whitelistedProcesses.insert(process);
         }
 
-        // Add ShadowStrike processes to whitelist
-        m_whitelistedProcesses.insert(L"ShadowStrikePhantomService.exe");
-        m_whitelistedProcesses.insert(L"ShadowStrikeUI.exe");
-        m_whitelistedProcesses.insert(L"ShadowStrikeUpdater.exe");
+        // Add the product's own executables to the whitelist. A name only nominates a
+        // process; IsProcessWhitelisted also requires the image to live in our install
+        // directory and carry a valid signature.
+        for (const auto executable : ProductExecutables::kNames) {
+            m_whitelistedProcesses.insert(std::wstring(executable));
+        }
 
         // Start monitoring if enabled
         if (config.enableUserModePolling &&
@@ -602,19 +612,9 @@ public:
         bool success = true;
 
         // IFEO debugger keys for ShadowStrike executables - critical EDR evasion vector
-        static constexpr std::array<std::wstring_view, 3> kExecutables = {
-            L"ShadowStrikePhantomService.exe",
-            L"ShadowStrikeUI.exe",
-            L"ShadowStrikeUpdater.exe"
-        };
-
-        constexpr std::wstring_view kIFEOBase =
-            L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
-            L"\\Image File Execution Options\\";
-
-        for (const auto& exe : kExecutables) {
-            const std::wstring ifeoPath = std::wstring(kIFEOBase) + std::wstring(exe);
-            success &= ProtectKey(ifeoPath, KeyProtectionType::Full, true);
+        for (const auto executable : ProductExecutables::kNames) {
+            success &= ProtectKey(RegistryProtection::ImageExecutionOptionsKeyFor(executable),
+                KeyProtectionType::Full, true);
         }
 
         if (success) {
@@ -1448,12 +1448,9 @@ public:
     }
 
     [[nodiscard]] bool IsWhitelisted(uint32_t processId) const {
-        // Get process name from PID
-        const auto processName = GetProcessNameFromPid(processId);
-        if (processName.empty()) {
-            return false;
-        }
-        return IsWhitelisted(processName);
+        // The same identity test FilterOperation applies. Answering by name alone told a
+        // caller that any process renamed to a whitelisted name was trusted.
+        return IsProcessWhitelisted(processId);
     }
 
     [[nodiscard]] std::vector<std::wstring> GetWhitelistedProcesses() const {
@@ -1986,6 +1983,18 @@ private:
         // Lock released here by RAII — safe for I/O below
 
         if (!nameMatched) {
+            return false;
+        }
+
+        // A product name is only ours when the image runs from our install directory.
+        // A valid signature alone proves nothing about who the process is: a renamed
+        // copy of any signed binary - reg.exe included - carries one, and until this
+        // check it bypassed every protected key.
+        if (ProductExecutables::IsProductName(processInfo.first) &&
+            !ProductExecutables::IsInsideInstallDirectory(processInfo.second)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Whitelist bypass attempt: process '%ls' (PID %u) uses a product name outside the install directory",
+                processInfo.second.c_str(), processId);
             return false;
         }
 
@@ -3003,6 +3012,13 @@ HKEY RegistryProtection::ParseRootKey(std::wstring_view keyPath) {
 
 std::wstring RegistryProtection::GetSubkeyPath(std::wstring_view fullPath) {
     return RegistryProtectionImpl::GetSubkeyPath(fullPath);
+}
+
+std::wstring RegistryProtection::ImageExecutionOptionsKeyFor(std::wstring_view executableName) {
+    std::wstring path(RegistryProtectionConstants::IMAGE_FILE_EXECUTION_OPTIONS_ROOT);
+    path += L'\\';
+    path += executableName;
+    return path;
 }
 
 std::string RegistryProtection::GetVersionString() noexcept {

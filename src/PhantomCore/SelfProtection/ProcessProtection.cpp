@@ -57,6 +57,7 @@
 #include "../Communication/TelemetryCollector.hpp"
 #include "../Communication/IPCManager.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "ProductExecutables.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -714,23 +715,8 @@ private:
     // Internal auth token
     std::string m_internalAuthToken;
 
-    // ShadowStrike component executables, as the installer actually ships them.
-    //
-    // This list previously read ShadowStrike.exe, ShadowStrikeSvc.exe,
-    // PhantomSensor.sys, SSAgent.exe and SSUpdater.exe. Four of those five names are
-    // not installed by this product and never have been, so a list meant to recognise
-    // our own components matched almost nothing - and the one entry that was correct,
-    // PhantomSensor.sys, is a kernel driver rather than a process, so it can never
-    // appear as a process image name here either.
-    //
-    // Verified against the MSI File table: the processes this product runs are the
-    // service, the tray, the UI and the driver-resume helper.
-    static constexpr std::array<std::wstring_view, 4> SHADOWSTRIKE_COMPONENTS = {
-        L"ShadowStrikePhantomService.exe",
-        L"ShadowStrikePhantomTray.exe",
-        L"ShadowStrikePhantomUI.exe",
-        L"ShadowStrikeDriverResume.exe"
-    };
+    // The component executables are ProductExecutables::kNames, the one list every
+    // self-protection module reads (ProductExecutables.hpp).
 };
 
 // ============================================================================
@@ -2536,21 +2522,8 @@ bool ProcessProtectionImpl::IsShadowStrikeComponent(uint32_t processId) const {
         return false;
     }
 
-    std::wstring lowerName = processName;
-    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
-
-    bool nameMatches = false;
-    for (const auto& component : SHADOWSTRIKE_COMPONENTS) {
-        std::wstring lowerComponent(component);
-        std::transform(lowerComponent.begin(), lowerComponent.end(), lowerComponent.begin(), ::towlower);
-
-        if (lowerName == lowerComponent) {
-            nameMatches = true;
-            break;
-        }
-    }
-
-    if (!nameMatches) {
+    // The name is a precondition only; the image location below is the identity.
+    if (!::ShadowStrike::Security::ProductExecutables::IsProductName(processName)) {
         return false;
     }
 
@@ -2563,27 +2536,8 @@ bool ProcessProtectionImpl::IsShadowStrikeComponent(uint32_t processId) const {
         return false;
     }
 
-    // Verify the image resides in the same directory as our own executable
-    std::wstring ownPath = GetProcessImagePath(GetCurrentProcessIdSafe());
-    if (ownPath.empty()) {
-        return false;
-    }
-
-    // Extract directory from own path
-    size_t ownDirPos = ownPath.find_last_of(L'\\');
-    if (ownDirPos == std::wstring::npos) {
-        return false;
-    }
-    std::wstring ownDir = ownPath.substr(0, ownDirPos + 1);
-
-    // Convert both to lowercase for comparison
-    std::wstring lowerOwnDir = ownDir;
-    std::transform(lowerOwnDir.begin(), lowerOwnDir.end(), lowerOwnDir.begin(), ::towlower);
-
-    std::wstring lowerImagePath = imagePath;
-    std::transform(lowerImagePath.begin(), lowerImagePath.end(), lowerImagePath.begin(), ::towlower);
-
-    if (lowerImagePath.find(lowerOwnDir) != 0) {
+    // Verify the image resides below the directory our own executable was started from
+    if (!::ShadowStrike::Security::ProductExecutables::IsInsideInstallDirectory(imagePath)) {
         Utils::Logger::Warn("[ProcessProtection] Component name match for PID {} but image path '{}' is outside installation directory - rejecting",
                            processId, WideToNarrow(imagePath));
         return false;

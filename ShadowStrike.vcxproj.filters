@@ -2783,6 +2783,9 @@
     <ClInclude Include="src\PhantomCore\SelfProtection\ProcessProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\PhantomCore\SelfProtection\ProductExecutables.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\PhantomCore\SelfProtection\RegistryProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>

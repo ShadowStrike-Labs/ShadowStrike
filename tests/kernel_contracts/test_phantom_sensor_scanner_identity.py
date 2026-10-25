@@ -28982,5 +28982,68 @@ class ThreatIntelStoreHasNoDefaultLocationTests(unittest.TestCase):
         self.assertIn(".is_absolute()", head)
 
 
+class ProductExecutablesAreOneListTests(unittest.TestCase):
+    """Self-protection names the product's own executables from one list (task 346).
+
+    RegistryProtection guarded the IFEO keys of ShadowStrikeUI.exe and ShadowStrikeUpdater.exe,
+    names the installer has never shipped, so the UI, the tray and the driver-resume helper had no
+    guard. Its whitelist also nominated by name and then accepted ANY valid signature, so a
+    renamed copy of a signed binary such as reg.exe bypassed every protected key.
+    """
+
+    HEADER = ROOT / "src/PhantomCore/SelfProtection/ProductExecutables.hpp"
+    PROCESS_PROTECTION = ROOT / "src/PhantomCore/SelfProtection/ProcessProtection.cpp"
+
+    def _names(self):
+        header = strip_c_comments(read_source(self.HEADER))
+        start = header.index("kNames = {")
+        return re.findall(r'L"([^"]+\.exe)"', header[start:header.index("};", start)])
+
+    def test_the_list_is_the_installed_executables(self):
+        names = self._names()
+        defense = strip_c_comments(read_source(SELF_DEFENSE_HPP_PATH))
+        start = defense.index("CRITICAL_INSTALLED_FILES = {")
+        installed = re.findall(r'L"([^"\\]+\.exe)"', defense[start:defense.index("};", start)])
+        self.assertEqual(sorted(installed), sorted(names),
+                         "ProductExecutables::kNames no longer matches the executables SelfDefense "
+                         "lists from the MSI File table")
+
+    def test_no_self_protection_source_names_an_executable_that_is_not_installed(self):
+        for path in (REGISTRY_PROTECTION_CPP_PATH, REGISTRY_PROTECTION_HPP_PATH, self.PROCESS_PROTECTION):
+            source = strip_c_comments(read_source(path))
+            for ghost in ("ShadowStrikeUI.exe", "ShadowStrikeUpdater.exe"):
+                self.assertNotIn(ghost, source, "%s names %s, which is not installed" % (path.name, ghost))
+
+    def test_registry_protection_guards_and_whitelists_from_the_list(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        init = source[source.index("bool Initialize(const RegistryProtectionConfiguration& config)"):]
+        init = init[:init.index("void Shutdown(")]
+        self.assertGreaterEqual(init.count("ProductExecutables::kNames"), 2,
+                                "Initialize no longer protects the IFEO key and whitelists the name of "
+                                "every product executable from the shared list")
+        self.assertIn("ImageExecutionOptionsKeyFor(executable)", init)
+        self.assertIn("ProductExecutables::kNames", extract_c_function(source, "ProtectIFEOKeys"))
+        process = strip_c_comments(read_source(self.PROCESS_PROTECTION))
+        self.assertNotIn("SHADOWSTRIKE_COMPONENTS", process,
+                         "ProcessProtection keeps its own list of executables again")
+        component = extract_c_function(process, "ProcessProtectionImpl::IsShadowStrikeComponent")
+        self.assertIn("ProductExecutables::IsProductName(processName)", component)
+        self.assertIn("ProductExecutables::IsInsideInstallDirectory(imagePath)", component)
+
+    def test_a_product_name_is_trusted_only_from_the_install_directory(self):
+        source = strip_c_comments(read_source(REGISTRY_PROTECTION_CPP_PATH))
+        body = extract_c_function(source, "IsProcessWhitelisted")
+        location = body.find("ProductExecutables::IsInsideInstallDirectory(processInfo.second)")
+        self.assertNotEqual(-1, location,
+                            "the whitelist no longer requires a product name to run from the install "
+                            "directory, so any renamed signed binary is trusted again")
+        self.assertLess(location, body.index("VerifyFile("),
+                        "the location check must decide before the signature check can accept")
+        match = re.search(r"bool IsWhitelisted\(uint32_t processId\) const \{(.*?)\n    \}", source, re.S)
+        self.assertIsNotNone(match, "IsWhitelisted(uint32_t) is gone")
+        self.assertIn("return IsProcessWhitelisted(processId);", match.group(1),
+                      "the public PID query answers by name alone again")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

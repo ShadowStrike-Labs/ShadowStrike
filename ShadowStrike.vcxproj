@@ -1657,6 +1657,7 @@
     <ClInclude Include="src\PhantomCore\SelfProtection\FileProtection.hpp" />
     <ClInclude Include="src\PhantomCore\SelfProtection\MemoryProtection.hpp" />
     <ClInclude Include="src\PhantomCore\SelfProtection\ProcessProtection.hpp" />
+    <ClInclude Include="src\PhantomCore\SelfProtection\ProductExecutables.hpp" />
     <ClInclude Include="src\PhantomCore\SelfProtection\RegistryProtection.hpp" />
     <ClInclude Include="src\PhantomCore\SelfProtection\SecurityEnums.hpp" />
     <ClInclude Include="src\PhantomCore\SelfProtection\SelfDefense.hpp" />

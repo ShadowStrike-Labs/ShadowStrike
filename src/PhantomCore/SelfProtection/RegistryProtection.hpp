@@ -231,7 +231,11 @@ namespace RegistryProtectionConstants {
     // DEFAULT PROTECTED KEYS
     // ========================================================================
     
-    inline constexpr std::array<std::wstring_view, 13> DEFAULT_PROTECTED_KEYS = {
+    // The Image File Execution Options keys of the product's own executables are not listed
+    // here: Initialize protects one per ProductExecutables::kNames entry, so the guard cannot
+    // drift from the installer again (it named ShadowStrikeUI.exe and ShadowStrikeUpdater.exe,
+    // which were never installed, and left the shipped UI, tray and resume helper unguarded).
+    inline constexpr std::array<std::wstring_view, 10> DEFAULT_PROTECTED_KEYS = {
         L"HKLM\\SOFTWARE\\ShadowStrike",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrikePhantomService",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Services\\PhantomSensor",   // the INF registers this name
@@ -241,11 +245,12 @@ namespace RegistryProtectionConstants {
         L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\ShadowStrikePhantomService",
         L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\ShadowStrikePhantomService",
         L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-        L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikePhantomService.exe",
-        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeUI.exe",
-        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\ShadowStrikeUpdater.exe"
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System"
     };
+
+    /// Parent of every per-executable Image File Execution Options key (MITRE T1546.012).
+    inline constexpr std::wstring_view IMAGE_FILE_EXECUTION_OPTIONS_ROOT =
+        L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
 
 }  // namespace RegistryProtectionConstants
 
@@ -1204,6 +1209,11 @@ public:
      * @brief Get subkey path (without root)
      */
     [[nodiscard]] static std::wstring GetSubkeyPath(std::wstring_view fullPath);
+
+    /**
+     * @brief The Image File Execution Options key for one executable name.
+     */
+    [[nodiscard]] static std::wstring ImageExecutionOptionsKeyFor(std::wstring_view executableName);
     
     /**
      * @brief Get version string
