@@ -28625,8 +28625,6 @@ class SelfTestsDoNotChangeLiveStateTests(unittest.TestCase):
         "Banking/KeyloggerProtection.cpp": [r"OpenClipboard\("],
         "Privacy/PrivacyCleaner.cpp": [r"shadowstrike_test_erase", r"std::ofstream"],
         "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
-        "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
-        "WebProtection/BrowserProtection.cpp": [r"AddTo(Block|Allow)list\(", r"RemoveFrom(Block|Allow)list\("],
     }
 
     @staticmethod
@@ -28724,30 +28722,54 @@ class CallbackRegistriesAreDispatchedTests(unittest.TestCase):
         self.assertGreaterEqual(src.count("InvokeErrorCallbacks(\""), 9)
 
 
-class IpClassificationHasOneDefinitionTests(unittest.TestCase):
-    """Whether an address is private, or IPv6, has one answer: Utils::Ip (task 295).
+class PrecompiledHeaderIsIncludedWhereUsedTests(unittest.TestCase):
+    """A source compiled with /Yu must include the precompiled header first (task 245).
 
-    The Privacy and IoT IPLeakProtection modules each defined IsPrivateIP and IsIPv6Address and
-    disagreed: text prefixes against inet_pton, and find(':') for IPv6 in both.
+    ShadowStrike.vcxproj set PrecompiledHeader=Use project-wide and listed 170 sources that never
+    include pch.h - every PhantomDisassembler and PhantomEmulator file among them - so each failed
+    with C1010. PhantomCoreLib gives the same files NotUsing, which is why only one project broke.
     """
 
-    HOME = ROOT / "src/Products/Community/PhantomHome"
+    PROJECTS = ("ShadowStrike.vcxproj", "PhantomCoreLib.vcxproj", "PhantomTests.vcxproj",
+                "PhantomHomeModules.vcxproj", "ShadowStrikePhantomService.vcxproj")
 
-    def test_no_local_ip_predicate_in_the_home_product(self):
-        offenders = []
-        for path in sorted(self.HOME.rglob("*.[ch]pp")):
-            src = strip_c_comments(read_source(path))
-            for name in ("IsPrivateIP", "IsIPv6Address", "IsPrivateIPAddress", "IsIPv6Addr"):
-                if re.search(r"\bbool\s+" + name + r"\s*\(", src):
-                    offenders.append(f"{path.name}:{name}")
-        self.assertEqual([], offenders)
+    @staticmethod
+    def _first_include(path):
+        src = strip_c_comments(read_source(path))
+        m = re.search(r'#\s*include\s*["<]([^">]+)[">]', src)
+        return m.group(1).replace("\\", "/").rsplit("/", 1)[-1] if m else ""
 
-    def test_both_leak_modules_classify_through_the_shared_predicate(self):
-        for rel, floor in (("Privacy/IPLeakProtection.cpp", 3), ("IoT/IPLeakProtection.cpp", 5)):
-            with self.subTest(rel=rel):
-                src = strip_c_comments(read_source(self.HOME / rel))
-                self.assertGreaterEqual(len(re.findall(r"Utils::Ip::Is(PrivateOrLocalAddress|IPv6Literal)\(", src)), floor)
-                self.assertNotRegex(src, r"(isIPv6|IsIPv6)\w*\s*=\s*\w+\.find\(':'\)")
+    def test_every_pch_user_includes_the_header(self):
+        checked = 0
+        for name in self.PROJECTS:
+            text = (ROOT / name).read_text(encoding="utf-8-sig")
+            uses = re.findall(r"<PrecompiledHeader>Use</PrecompiledHeader>", text)
+            if not uses:
+                continue
+            header = re.search(r"<PrecompiledHeaderFile>([^<]+)</PrecompiledHeaderFile>", text)
+            header = header.group(1) if header else "pch.h"
+            offenders = []
+            for inc, _, body in re.findall(r'<ClCompile Include="([^"]+)"\s*(/>|>(.*?)</ClCompile>)', text, re.S):
+                if re.search(r"NotUsing|>Create<|ExcludedFromBuild>true", body or ""):
+                    continue
+                path = ROOT / inc.replace("\\", "/")
+                if not path.is_file():
+                    continue
+                checked += 1
+                if self._first_include(path) != header:
+                    offenders.append(inc)
+            with self.subTest(project=name):
+                self.assertEqual([], offenders[:10], f"{len(offenders)} sources use {header} without including it")
+        self.assertGreater(checked, 900, "the walk proved nothing")   # 935 measured
+
+    def test_the_disassembler_and_emulator_resolve_their_includes(self):
+        text = (ROOT / "ShadowStrike.vcxproj").read_text(encoding="utf-8-sig")
+        dirs = re.findall(r"<AdditionalIncludeDirectories>([^<]+)</AdditionalIncludeDirectories>", text)
+        self.assertTrue(dirs)
+        for d in dirs:
+            entries = d.split(";")
+            self.assertIn("$(ProjectDir)", entries, "PhantomDisassembler/... resolves from the root")
+            self.assertIn("$(ProjectDir)PhantomEmulator", entries)
 
 
 class IpClassificationHasOneDefinitionTests(unittest.TestCase):

@@ -103,7 +103,7 @@
       <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;$(ProjectDir)PhantomEmulator;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
     </ClCompile>
@@ -139,7 +139,7 @@
       <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
       <LanguageStandard>stdcpp23</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)include;$(ProjectDir)include\YARA;$(ProjectDir)src;$(ProjectDir)PhantomEmulator;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <ObjectFileName>$(IntDir)%(RelativeDir)</ObjectFileName>
     </ClCompile>
@@ -157,142 +157,550 @@
     <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
   </ImportGroup>
   <ItemGroup>
-    <ClCompile Include="PhantomDisassembler\Decoder.cpp" />
-    <ClCompile Include="PhantomDisassembler\Formatter.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\APISequenceAnalyzer.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\BehaviorMonitor.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\CryptoDetector.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\DKOMDetector.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\DotNetAnalyzer.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\EvasionDetector.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\IOCExtractor.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\MemoryForensics.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\MITREMapper.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\MLClassifier.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\NetworkBehaviorAnalyzer.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\PerformanceProfiler.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\StringExtractor.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\ThreatScorer.cpp" />
-    <ClCompile Include="PhantomEmulator\Analysis\UnpackingEngine.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Accel\CryptoAccelerator.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Accel\MemoryScanAccel.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Accel\SIMDEngine.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CLR\MetadataParser.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CLR\MSILDisassembler.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CLR\MSILInterpreter.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\CPU.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\ExceptionDispatcher.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AESNIOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AMXOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\ArithmeticOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AVX2Ops.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AVX512Ops.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\BitManip.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\CETOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\ControlFlow.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\DataTransfer.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\Decoder\InstructionDecoder.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\FlagOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\FMAOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\FPUOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\LogicOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SHAOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\ShiftRotate.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SSE2Ops.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SSE4Ops.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\StackOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\StringOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SystemOps.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\HardwareBreakpoints.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\CPU\State\CPUState.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\JIT\JITCompiler.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\JIT\JITOptimizer.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Kernel\DriverLoader.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Kernel\KernelAddressSpace.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Kernel\KernelStructures.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Kernel\MSREmulation.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Kernel\RingTransition.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\ExportResolver.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\HashResolver.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\ImportResolver.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\PELoader.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\PEParser.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\RelocApplier.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\ResourceParser.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\ShellcodeLoader.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Loader\TLSHandler.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Memory\MemoryTracker.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Memory\TaintTracker.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Memory\VirtualMemory.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Threading\SyncPrimitives.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\Threading\ThreadScheduler.cpp" />
-    <ClCompile Include="PhantomEmulator\Core\WoW64\WoW64Layer.cpp" />
-    <ClCompile Include="PhantomEmulator\Integration\EmulationSession.cpp" />
-    <ClCompile Include="PhantomEmulator\Integration\KernelIPCBridge.cpp" />
-    <ClCompile Include="PhantomEmulator\Integration\ProcessManager.cpp" />
-    <ClCompile Include="PhantomEmulator\Integration\ResultConverter.cpp" />
-    <ClCompile Include="PhantomEmulator\Integration\YaraScanner.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\DebuggerAntiEvasion.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\EnvironmentAntiEvasion.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\TimingAntiEvasion.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\VMAntiEvasion.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\EnvironmentBuilder.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\SystemDLLContent.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualFileSystem.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualNetwork.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualProcess.cpp" />
-    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualRegistry.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\CredentialAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\CryptAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Amsi\AmsiAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\APIDispatcher.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Bcrypt\BcryptAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\HandleTable.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\APCInjectionAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ConsoleAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\EnvAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ErrorAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\FileAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\FileExtAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\FileMappingAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\LibraryAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\MemoryAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ProcessAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\StringAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\SyncAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ThreadAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\TimeAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Kernel\KernelAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\EtwAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\Ldr.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtFile.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtMemory.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtProcess.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtRegistry.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtSync.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtSystem.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtThread.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtToken.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\Rtl.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\Syscall.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ole32\COMAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ole32\WmiEmulation.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Shell32\ShellAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Urlmon\UrlmonAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\User32\InputCaptureAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\User32\WindowAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Vss\VssAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Winhttp\WinHttpAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Wininet\HttpStreamAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Wininet\InternetAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ws2_32\DnsAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ws2_32\SocketAPI.cpp" />
-    <ClCompile Include="PhantomEmulator\WinAPI\Ws2_32\WSAAsyncAPI.cpp" />
+    <ClCompile Include="PhantomDisassembler\Decoder.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomDisassembler\Formatter.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\APISequenceAnalyzer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\BehaviorMonitor.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\CryptoDetector.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\DKOMDetector.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\DotNetAnalyzer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\EvasionDetector.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\IOCExtractor.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\MemoryForensics.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\MITREMapper.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\MLClassifier.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\NetworkBehaviorAnalyzer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\PerformanceProfiler.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\StringExtractor.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\ThreatScorer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Analysis\UnpackingEngine.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Accel\CryptoAccelerator.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Accel\MemoryScanAccel.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Accel\SIMDEngine.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CLR\MetadataParser.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CLR\MSILDisassembler.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CLR\MSILInterpreter.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\CPU.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\ExceptionDispatcher.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AESNIOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AMXOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\ArithmeticOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AVX2Ops.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\AVX512Ops.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\BitManip.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\CETOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\ControlFlow.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\DataTransfer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\Decoder\InstructionDecoder.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\FlagOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\FMAOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\FPUOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\LogicOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SHAOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\ShiftRotate.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SSE2Ops.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SSE4Ops.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\StackOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\StringOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\Executor\SystemOps.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\HardwareBreakpoints.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\CPU\State\CPUState.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\JIT\JITCompiler.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\JIT\JITOptimizer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Kernel\DriverLoader.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Kernel\KernelAddressSpace.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Kernel\KernelStructures.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Kernel\MSREmulation.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Kernel\RingTransition.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\ExportResolver.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\HashResolver.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\ImportResolver.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\PELoader.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\PEParser.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\RelocApplier.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\ResourceParser.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\ShellcodeLoader.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Loader\TLSHandler.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Memory\MemoryTracker.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Memory\TaintTracker.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Memory\VirtualMemory.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Threading\SyncPrimitives.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\Threading\ThreadScheduler.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Core\WoW64\WoW64Layer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Integration\EmulationSession.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Integration\KernelIPCBridge.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Integration\ProcessManager.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Integration\ResultConverter.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\Integration\YaraScanner.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\DebuggerAntiEvasion.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\EnvironmentAntiEvasion.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\TimingAntiEvasion.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\AntiEvasion\VMAntiEvasion.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\EnvironmentBuilder.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\SystemDLLContent.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualFileSystem.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualNetwork.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualProcess.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\VirtualOS\VirtualRegistry.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\CredentialAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\CryptAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\RegistryExtAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\SecurityAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Advapi32\ServiceExtAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Amsi\AmsiAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\APIDispatcher.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Bcrypt\BcryptAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\HandleTable.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\APCInjectionAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ConsoleAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\EnvAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ErrorAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\FileAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\FileExtAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\FileMappingAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\LibraryAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\MemoryAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ProcessAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\StringAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\SyncAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\ThreadAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel32\TimeAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Kernel\KernelAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\EtwAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\Ldr.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtFile.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtMemory.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtProcess.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtRegistry.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtSync.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtSystem.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtThread.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\NtToken.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\Rtl.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ntdll\Syscall.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ole32\COMAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ole32\WmiEmulation.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Shell32\ShellAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Urlmon\UrlmonAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\User32\InputCaptureAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\User32\WindowAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Vss\VssAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Winhttp\WinHttpAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Wininet\HttpStreamAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Wininet\InternetAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ws2_32\DnsAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ws2_32\SocketAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PhantomEmulator\WinAPI\Ws2_32\WSAAsyncAPI.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\AI\CortexConfig.cpp" />
     <ClCompile Include="src\PhantomCore\AI\FeatureExtractor.cpp" />
     <ClCompile Include="src\PhantomCore\AI\ModelCache.cpp" />
@@ -318,7 +726,10 @@
     <ClCompile Include="src\Products\Community\PhantomEDR\DeviceControl\DeviceAuditLog.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\DeviceControl\DeviceExceptions.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\DeviceControl\DevicePolicyEngine.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\EDRProductOrchestrator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\EDRProductOrchestrator.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomEDR\IncidentResponse\AlertCorrelator.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\IncidentResponse\ContainmentEngine.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\IncidentResponse\IncidentManager.cpp" />
@@ -330,12 +741,30 @@
     <ClCompile Include="src\Products\Community\PhantomEDR\Playbooks\PlaybookEngine.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\Playbooks\PlaybookLibrary.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\Playbooks\PlaybookScheduler.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\PolicyEngine\PolicyAuditLog.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\PolicyEngine\PolicyEnforcer.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\PolicyEngine\PolicyManager.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\Reporting\ExecutiveSummary.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\Reporting\IncidentReport.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomEDR\Reporting\ReportGenerator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\PolicyEngine\PolicyAuditLog.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomEDR\PolicyEngine\PolicyEnforcer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomEDR\PolicyEngine\PolicyManager.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomEDR\Reporting\ExecutiveSummary.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomEDR\Reporting\IncidentReport.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomEDR\Reporting\ReportGenerator.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomEDR\Sandboxing\LocalSandbox.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\Sandboxing\SandboxAnalyzer.cpp" />
     <ClCompile Include="src\Products\Community\PhantomEDR\Sandboxing\SandboxPolicy.cpp" />
@@ -698,6 +1127,7 @@
     <ClCompile Include="src\PhantomCore\Utils\Logger.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkSecurity_SSL_TLS.cpp" />
+    <ClCompile Include="src\PhantomCore\Utils\BrowserLocator.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\IpClassification.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkUtils.cpp" />
     <ClCompile Include="src\PhantomCore\Utils\NetworkUtilsMacAdress.cpp" />
@@ -1312,9 +1742,18 @@
     </MASM>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\Products\Community\PhantomXDR\AIAssistant\IncidentSummarizer.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\AIAssistant\QueryTranslator.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\AIAssistant\SOCAssistant.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomXDR\AIAssistant\IncidentSummarizer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\AIAssistant\QueryTranslator.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\AIAssistant\SOCAssistant.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="src\Products\Community\PhantomXDR\Config\XDRConfigRegistration.cpp" />
     <ClCompile Include="src\Products\Community\PhantomXDR\EmailThreat\EmailAnalyzer.cpp" />
     <ClCompile Include="src\Products\Community\PhantomXDR\EmailThreat\PhishingCorrelator.cpp" />
@@ -1326,24 +1765,75 @@
     <ClCompile Include="src\Products\Community\PhantomXDR\NetworkDetection\LateralMovementDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomXDR\NetworkDetection\NetworkSensor.cpp" />
     <ClCompile Include="src\Products\Community\PhantomXDR\NetworkDetection\TLSInspector.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\SOARLocal\SOAREngine.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\SOARLocal\SOARPlaybooks.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\CorrelationEngine.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\CorrelationRules.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\IncidentScorer.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\StorylineBuilder.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\XDRProductEntry.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomXDR\XDRProductOrchestrator.cpp" />
-    <ClCompile Include="tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\anti_evasion\AntiEvasion_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\communication_pipeline\CommunicationPipeline_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\config_propagation\ConfigPropagation_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\exploit_protection\Exploits_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\ransomware_protection\RansomwareDetector_Integration_Tests.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomXDR\SOARLocal\SOAREngine.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\SOARLocal\SOARPlaybooks.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\CorrelationEngine.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\CorrelationRules.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\IncidentScorer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\XDRCorrelation\StorylineBuilder.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\XDRProductEntry.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\Products\Community\PhantomXDR\XDRProductOrchestrator.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\anti_evasion\AntiEvasion_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\communication_pipeline\CommunicationPipeline_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\config_propagation\ConfigPropagation_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\exploit_protection\Exploits_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\ransomware_protection\RansomwareDetector_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="tests\integration\scan_pipeline\ScanPipeline_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\self_protection\SelfProtectionStack_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\update_lifecycle\UpdateLifecycle_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\product_orchestrator\HomeProductOrchestrator_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\self_protection\SelfProtectionStack_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\update_lifecycle\UpdateLifecycle_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\product_orchestrator\HomeProductOrchestrator_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="tests\unit\ai_unit\CortexConfig_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\FeatureExtractor_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\ModelCache_Tests.cpp" />
@@ -1353,11 +1843,26 @@
     <ClCompile Include="tests\unit\config_unit\PolicyManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\ProfileManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp" />
-    <ClCompile Include="tests\integration\core_process\ProcessChain_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\core_registry\RegistryChain_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\core_registry\StartupAnalyzer_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\core_registry\SystemSettingsMonitor_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\core_filesystem\FileSystemChain_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_process\ProcessChain_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_registry\RegistryChain_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_registry\StartupAnalyzer_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_registry\SystemSettingsMonitor_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_filesystem\FileSystemChain_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\DLLInjectionDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\MemoryScanner_Tests.cpp" />
@@ -1373,8 +1878,14 @@
     <ClCompile Include="tests\unit\core_network_unit\NetworkMonitor_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\TrafficAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp" />
-    <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp" />
-    <ClCompile Include="tests\integration\realtime_protection_pipeline\RTPPipeline_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="tests\integration\realtime_protection_pipeline\RTPPipeline_Integration_Tests.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="tests\unit\exploits_unit\BufferOverflowProtection_Tests.cpp" />
     <ClCompile Include="tests\unit\exploits_unit\HeapSprayDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\exploits_unit\JITSprayDetector_Tests.cpp" />
