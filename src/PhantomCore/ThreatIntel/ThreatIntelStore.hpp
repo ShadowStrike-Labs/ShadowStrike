@@ -651,6 +651,16 @@ struct FeedConfiguration {
 };
 
 /**
+ * @brief The feed manager's configuration for a FeedConfiguration, or nullopt when its
+ *        FeedType has no parser (YARA, Sigma, OpenIOC, Custom, Unknown).
+ *
+ * The protocol decides which parser reads the body. ThreatIntelStore::AddFeed once mapped
+ * every field except this one, so every feed defaulted to REST_API and a CSV or plain-text
+ * body was handed to the JSON parser (task 259). PlainText is one indicator per line.
+ */
+[[nodiscard]] std::optional<ThreatFeedConfig> ToFeedManagerConfig(const FeedConfiguration& config);
+
+/**
  * @brief Status of a feed
  */
 struct FeedStatus {

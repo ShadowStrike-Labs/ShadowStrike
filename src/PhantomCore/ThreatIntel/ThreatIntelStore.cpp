@@ -76,6 +76,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <limits>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
@@ -928,59 +929,50 @@ uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
         return 0;
     }
 
-    // Public, key-free blocklists. URLs mirror the built-in feed factories in
-    // ThreatIntelFeedManager so there is a single source of truth for endpoints.
+    if (!m_impl->feedManager) {
+        Utils::Logger::Error("[ThreatIntel] RegisterDefaultFeeds: no feed manager; no feeds registered");
+        return 0;
+    }
+
+    // Public, key-free blocklists, built by the feed manager's own factories so the
+    // endpoint, protocol and parser settings have one source of truth. These were once
+    // re-described here as FeedConfiguration values, which carried no protocol: every
+    // feed defaulted to REST_API and its plain-text body went to the JSON parser, so
+    // no sync could ever succeed (task 259).
     //
-    // Intervals are chosen to match how often each source actually changes.
-    // Polling faster than the publisher updates costs bandwidth and CPU without
-    // improving detection, and abuse.ch explicitly asks clients not to hammer
-    // their endpoints.
+    // Intervals are chosen to match how often each source actually changes. Polling
+    // faster than the publisher updates costs bandwidth and CPU without improving
+    // detection, and abuse.ch explicitly asks clients not to hammer their endpoints.
+    //
+    // URLhaus is deliberately absent: its indicators are URLs, and the feed path cannot
+    // yet store a string indicator (task 345). Downloading it hourly would cost
+    // bandwidth and store nothing.
     struct DefaultFeed {
-        const char*         id;
-        const char*         name;
-        const char*         description;
-        const char*         url;
-        FeedType            type;
-        std::chrono::hours  interval;
+        ThreatFeedConfig (*make)();
+        std::chrono::hours interval;
     };
-
-    static const DefaultFeed kFeeds[] = {
-        { "urlhaus", "URLhaus",
-          "abuse.ch URLhaus - active malware distribution URLs",
-          "https://urlhaus.abuse.ch/downloads/csv_online/",
-          FeedType::CSV, std::chrono::hours(1) },
-
-        { "feodotracker", "Feodo Tracker",
-          "abuse.ch Feodo Tracker - recommended botnet C2 IP blocklist",
-          "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt",
-          FeedType::PlainText, std::chrono::hours(2) },
-
-        { "etopen-compromised-ips", "ET Open Compromised IPs",
-          "Emerging Threats Open - known compromised hosts",
-          "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
-          FeedType::PlainText, std::chrono::hours(6) },
+    static constexpr DefaultFeed kFeeds[] = {
+        { &ThreatFeedConfig::CreateFeodoTracker, std::chrono::hours(2) },
+        { &ThreatFeedConfig::CreateETOpen,       std::chrono::hours(6) },
     };
 
     uint32_t registered = 0;
     for (const auto& feed : kFeeds) {
-        FeedConfiguration config{};
-        config.feedId         = feed.id;
-        config.name           = feed.name;
-        config.description    = feed.description;
-        config.url            = feed.url;
-        config.type           = feed.type;
-        config.authType       = FeedAuthType::None;   // public, no credentials
-        config.updateInterval = feed.interval;
-        config.enabled        = true;
+        ThreatFeedConfig config = feed.make();
+        config.syncIntervalSeconds = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(feed.interval).count());
+        config.enabled = true;
 
-        if (AddFeed(config)) {
+        if (m_impl->feedManager->AddFeed(config)) {
             ++registered;
             Utils::Logger::Info("[ThreatIntel] Registered feed '{}' ({}h interval)",
-                                feed.id, static_cast<long long>(feed.interval.count()));
+                                config.feedId, static_cast<long long>(feed.interval.count()));
         } else {
-            Utils::Logger::Warn("[ThreatIntel] Could not register feed '{}'", feed.id);
+            Utils::Logger::Warn("[ThreatIntel] Could not register feed '{}'", config.feedId);
         }
     }
+    Utils::Logger::Info(
+        "[ThreatIntel] URLhaus not registered: URL indicators from feeds cannot be stored yet");
 
     if (registered == 0) {
         Utils::Logger::Error(
@@ -2000,6 +1992,66 @@ bool ThreatIntelStore::AddFeed(const FeedConfig& config) noexcept {
  * @brief Converts high-level FeedConfiguration into the internal structure expected by FeedManager.
  * Type-safe mapping for FeedManager
  */
+std::optional<ThreatFeedConfig> ToFeedManagerConfig(const FeedConfiguration& config) {
+    ThreatFeedConfig out;
+    switch (config.type) {
+        case FeedType::CSV:
+            out.protocol = FeedProtocol::CSV_HTTP;
+            break;
+        case FeedType::PlainText:
+            out.protocol = FeedProtocol::CSV_HTTP;
+            out.parser.csvDelimiter = '\0';   // whole line is the value, as in CreateFeodoTracker
+            out.parser.csvHasHeader = false;
+            out.parser.csvValueColumn = 0;
+            break;
+        case FeedType::JSON:
+            out.protocol = FeedProtocol::JSON_HTTP;
+            break;
+        case FeedType::STIX_TAXII:
+        case FeedType::STIX_File:
+            out.protocol = FeedProtocol::STIX_TAXII;
+            break;
+        case FeedType::MISP:
+            out.protocol = FeedProtocol::MISP_API;
+            break;
+        default:
+            return std::nullopt;
+    }
+
+    out.feedId = config.feedId;
+    out.name = config.name;
+    out.description = config.description;
+    out.enabled = config.enabled;
+    out.endpoint.baseUrl = config.url;
+    out.syncIntervalSeconds = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(config.updateInterval).count());
+    for (const auto& [name, value] : config.customHeaders) {
+        out.endpoint.headers[name] = value;
+    }
+    out.allowedTypes = config.allowedIOCTypes;
+    out.defaultTags = config.tags;
+    if (config.maxEntries > 0) {
+        out.maxIOCsPerSync = static_cast<uint32_t>(
+            std::min<size_t>(config.maxEntries, std::numeric_limits<uint32_t>::max()));
+    }
+
+    // The two enums share values up to Certificate and then diverge (Custom is 6 here and
+    // HMAC is 6 there), so the mapping is by name, not by cast.
+    switch (config.authType) {
+        case FeedAuthType::None:        out.auth.method = AuthMethod::None; break;
+        case FeedAuthType::APIKey:      out.auth.method = AuthMethod::ApiKey; break;
+        case FeedAuthType::BasicAuth:   out.auth.method = AuthMethod::BasicAuth; break;
+        case FeedAuthType::BearerToken: out.auth.method = AuthMethod::BearerToken; break;
+        case FeedAuthType::OAuth2:      out.auth.method = AuthMethod::OAuth2; break;
+        case FeedAuthType::Certificate: out.auth.method = AuthMethod::Certificate; break;
+        case FeedAuthType::Custom:      out.auth.method = AuthMethod::Custom; break;
+    }
+    out.auth.apiKey = config.apiKey;
+    out.auth.username = config.username;
+    out.auth.password = config.password;
+    return out;
+}
+
 bool ThreatIntelStore::AddFeed(const FeedConfiguration& config) noexcept
 {
     if (!IsInitialized() || !m_impl->feedManager) {
@@ -2007,27 +2059,14 @@ bool ThreatIntelStore::AddFeed(const FeedConfiguration& config) noexcept
     }
 
     try {
+        const auto managerCfg = ToFeedManagerConfig(config);
+        if (!managerCfg) {
+            Utils::Logger::Error("[ThreatIntel] Feed '{}' not added: its feed type has no parser",
+                                 config.feedId);
+            return false;
+        }
         std::unique_lock lock(m_impl->rwLock);
-
-        // 1. Facade DTO -> Manager Config conversion (Enterprise Mapping)
-        ThreatFeedConfig managerCfg;
-        managerCfg.feedId = config.feedId;
-        managerCfg.name = config.name;
-        managerCfg.description = config.description;
-        managerCfg.enabled = config.enabled;
-        managerCfg.endpoint.baseUrl = config.url; // URL mapping
-        managerCfg.syncIntervalSeconds = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(config.updateInterval).count());
-
-        // 2. Authentication mapping
-        managerCfg.auth.method = static_cast<AuthMethod>(config.authType);
-        managerCfg.auth.apiKey = config.apiKey;
-        managerCfg.auth.username = config.username;
-        managerCfg.auth.password = config.password;
-
-        // 3. Pass to FeedManager (It now expects ThreatFeedConfig)
-        return m_impl->feedManager->AddFeed(managerCfg);
-
+        return m_impl->feedManager->AddFeed(*managerCfg);
     }
     catch (const std::exception& ex) {
         Utils::Logger::Instance().LogEx(

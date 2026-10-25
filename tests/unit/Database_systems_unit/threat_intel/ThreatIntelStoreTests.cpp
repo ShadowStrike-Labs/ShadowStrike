@@ -738,6 +738,7 @@ FeedConfiguration MakeValidFeedConfig(const std::string& feedId, const std::stri
 	config.feedId = feedId;
 	config.name = name;
 	config.url = "https://test.example.com/feeds/" + feedId;  // Required by validation
+	config.type = FeedType::PlainText;  // a feed type with no parser is refused (task 259)
 	config.enabled = true;
 	return config;
 }
