@@ -1115,6 +1115,20 @@ private:
  */
 namespace {
 
+/// Bumps the data generation when the mutating scope ends. Declared after the write lock,
+/// it is destroyed first: after every write of the scope and before the lock is released, so
+/// a lookup that read the generation before the data can never tag pre-change data with the
+/// post-change generation.
+class GenerationBump {
+public:
+    explicit GenerationBump(std::atomic<uint64_t>& generation) noexcept : m_generation(generation) {}
+    ~GenerationBump() { m_generation.fetch_add(1, std::memory_order_release); }
+    GenerationBump(const GenerationBump&) = delete;
+    GenerationBump& operator=(const GenerationBump&) = delete;
+private:
+    std::atomic<uint64_t>& m_generation;
+};
+
 /// The entry a dedup ID names, if it is still a live indicator. Hard deletes zero the slot
 /// and soft deletes revoke it without removing the dedup key, so the key can outlive it; a
 /// stale key must not stop the indicator being added again.
@@ -1205,6 +1219,9 @@ public:
     
     /// Next entry ID (atomic counter)
     std::atomic<uint64_t> nextEntryId{1};
+
+    /// See GetDataGeneration. Bumped by GenerationBump when a mutation finishes.
+    std::atomic<uint64_t> dataGeneration{1};
 };
 
 // ============================================================================
@@ -1411,6 +1428,7 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     
     // Write to database
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     // IOC-5 fix: re-check dedup under the exclusive lock to close the TOCTOU
     // window between the optimistic check above and this write lock acquisition.
@@ -1538,6 +1556,7 @@ IOCOperationResult ThreatIntelIOCManager::UpdateIOC(
     
     // Find existing entry
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     auto* existingEntry = m_impl->database->GetMutableEntry(
         static_cast<size_t>(entry.entryId - 1)
@@ -1608,6 +1627,7 @@ IOCOperationResult ThreatIntelIOCManager::DeleteIOC(
     }
     
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     auto* entry = m_impl->database->GetMutableEntry(
         static_cast<size_t>(entryId - 1)
@@ -1678,6 +1698,7 @@ IOCOperationResult ThreatIntelIOCManager::RestoreIOC(uint64_t entryId) noexcept 
     }
     
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     auto* entry = m_impl->database->GetMutableEntry(
         static_cast<size_t>(entryId - 1)
@@ -2568,6 +2589,7 @@ bool ThreatIntelIOCManager::SetIOCTTL(uint64_t entryId, uint32_t ttlSeconds) noe
     }
     
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     auto* entry = m_impl->database->GetMutableEntry(
         static_cast<size_t>(entryId - 1)
@@ -2627,6 +2649,7 @@ bool ThreatIntelIOCManager::RenewIOCTTL(uint64_t entryId, uint32_t additionalSec
     }
     
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     auto* entry = m_impl->database->GetMutableEntry(
         static_cast<size_t>(entryId - 1)
@@ -2706,6 +2729,7 @@ size_t ThreatIntelIOCManager::PurgeExpiredIOCs() noexcept {
     // Phase 2: Purge identified entries (write lock per entry for better concurrency)
     for (const uint64_t entryId : entriesToPurge) {
         std::lock_guard<std::shared_mutex> writeLock(m_rwLock);
+        const GenerationBump generationBump(m_impl->dataGeneration);
         
         auto* entry = m_impl->database->GetMutableEntry(
             static_cast<size_t>(entryId - 1)
@@ -2839,6 +2863,10 @@ bool ThreatIntelIOCManager::ParseIOC(
     IOCEntry& entry
 ) const noexcept {
     return ParseIOC(type, value, entry, nullptr);
+}
+
+uint64_t ThreatIntelIOCManager::GetDataGeneration() const noexcept {
+    return m_impl->dataGeneration.load(std::memory_order_acquire);
 }
 
 bool ThreatIntelIOCManager::ParseAndStoreIOC(
@@ -3278,6 +3306,7 @@ bool ThreatIntelIOCManager::MergeDuplicates(
     }
     
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     auto* keepEntry = m_impl->database->GetMutableEntry(
         static_cast<size_t>(keepEntryId - 1)
@@ -3991,6 +4020,7 @@ bool ThreatIntelIOCManager::Optimize() noexcept {
     const auto startTime = GetNanoseconds();
     
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
+    const GenerationBump generationBump(m_impl->dataGeneration);
     
     // -------------------------------------------------------------------------
     // Phase 1: Rebuild deduplication index

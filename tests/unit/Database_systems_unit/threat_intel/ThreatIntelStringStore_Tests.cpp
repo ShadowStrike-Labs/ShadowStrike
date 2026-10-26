@@ -349,6 +349,31 @@ TEST_F(StringIndicatorTest, AStringEntryWithoutStoredTextIsRefused) {
     store->Shutdown();
 }
 
+// Task 357: the per-thread lookup cache answered from before a change. Each case looks the
+// indicator up once, changes it, and looks again on the same thread.
+TEST_F(StringIndicatorTest, ALookupAfterRemovalDoesNotFindTheIndicator) {
+    auto store = Open();
+    ASSERT_TRUE(store->AddIOC(IOCType::IPv4, "203.0.113.9", ReputationLevel::Malicious,
+                              ThreatIntelSource::InternalAnalysis));
+    ASSERT_TRUE(store->LookupIPv4("203.0.113.9").found);
+    ASSERT_TRUE(store->RemoveIOC(IOCType::IPv4, "203.0.113.9"));
+    EXPECT_FALSE(store->LookupIPv4("203.0.113.9").found) << "a removed indicator is still answered";
+    store->Shutdown();
+}
+
+TEST_F(StringIndicatorTest, ALookupAfterAnUpdateSeesTheNewReputation) {
+    auto store = Open();
+    ASSERT_TRUE(store->AddIOC(IOCType::Domain, "evil-one.example", ReputationLevel::Suspicious,
+                              ThreatIntelSource::InternalAnalysis));
+    ASSERT_EQ(store->LookupDomain("evil-one.example").reputation, ReputationLevel::Suspicious);
+    // Adding it again with the default options updates the entry (task 356).
+    ASSERT_TRUE(store->AddIOC(IOCType::Domain, "evil-one.example", ReputationLevel::Malicious,
+                              ThreatIntelSource::InternalAnalysis));
+    EXPECT_EQ(store->LookupDomain("evil-one.example").reputation, ReputationLevel::Malicious)
+        << "the lookup answered with the reputation from before the update";
+    store->Shutdown();
+}
+
 TEST_F(StringIndicatorTest, AStringIndicatorCanBeRemovedByItsText) {
     auto store = Open();
     ASSERT_TRUE(store->AddIOC(IOCType::Domain, "evil-one.example", ReputationLevel::Malicious,

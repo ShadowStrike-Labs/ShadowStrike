@@ -961,13 +961,16 @@ public:
      */
     [[nodiscard]] std::optional<ThreatLookupResult> Lookup(
         IOCType type,
-        std::string_view value
+        std::string_view value,
+        uint64_t generation
     ) noexcept {
         const uint32_t hash = ComputeHash(type, value);
         
-        // Linear probe in thread-local cache
+        // Linear probe in thread-local cache. An answer cached under another data
+        // generation may describe an indicator that has since changed or gone: it is a miss.
         for (auto* entry = m_head; entry != nullptr; entry = entry->next) {
-            if (entry->hash == hash && entry->type == type && entry->value == value) {
+            if (entry->hash == hash && entry->type == type && entry->value == value &&
+                entry->generation == generation) {
                 // Move to front (MRU)
                 if (entry != m_head) {
                     MoveToFront(entry);
@@ -1001,7 +1004,8 @@ public:
     void Insert(
         IOCType type,
         std::string_view value,
-        const ThreatLookupResult& result
+        const ThreatLookupResult& result,
+        uint64_t generation
     ) noexcept {
         const uint32_t hash = ComputeHash(type, value);
         
@@ -1009,6 +1013,7 @@ public:
         for (auto* entry = m_head; entry != nullptr; entry = entry->next) {
             if (entry->hash == hash && entry->type == type && entry->value == value) {
                 entry->result = result;
+                entry->generation = generation;
                 MoveToFront(entry);
                 return;
             }
@@ -1030,6 +1035,7 @@ public:
         entry->type = type;
         entry->value = std::string(value);
         entry->result = result;
+        entry->generation = generation;
         
         // Insert at head
         InsertAtHead(entry);
@@ -1088,6 +1094,7 @@ private:
         IOCType type{IOCType::Reserved};
         std::string value;
         ThreatLookupResult result;
+        uint64_t generation{0};  ///< Data generation the result was read under
         CacheEntry* prev{nullptr};
         CacheEntry* next{nullptr};
     };
@@ -2147,7 +2154,11 @@ public:
         
         ThreatLookupResult result;
         result.type = type;
-        
+
+        // Read before any tier reads data, so an answer cached by this lookup is tagged
+        // with a generation no newer than the data it came from (task 357).
+        const uint64_t generation = m_iocManager != nullptr ? m_iocManager->GetDataGeneration() : 0;
+
         // =====================================================================
         // ENTERPRISE INPUT VALIDATION
         // =====================================================================
@@ -2176,7 +2187,7 @@ public:
         if (LIKELY(tlCache != nullptr && options.maxLookupTiers >= 1)) {
             const auto tierStart = std::chrono::high_resolution_clock::now();
             
-            const auto cachedResult = tlCache->Lookup(type, value);
+            const auto cachedResult = tlCache->Lookup(type, value, generation);
             
             const auto tierEnd = std::chrono::high_resolution_clock::now();
             const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2212,7 +2223,7 @@ public:
         if (LIKELY(m_cache != nullptr && options.maxLookupTiers >= 2)) {
             const auto tierStart = std::chrono::high_resolution_clock::now();
             
-            result = LookupInCache(type, value);
+            result = LookupInCache(type, value, generation);
             
             const auto tierEnd = std::chrono::high_resolution_clock::now();
             const uint64_t tierLatency = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2229,7 +2240,7 @@ public:
                 
                 // Cache in thread-local cache for faster subsequent lookups
                 if (tlCache != nullptr && options.cacheResult) {
-                    tlCache->Insert(type, value, result);
+                    tlCache->Insert(type, value, result, generation);
                 }
                 
                 const auto endTime = std::chrono::high_resolution_clock::now();
@@ -2270,10 +2281,10 @@ public:
                 // Update caches
                 if (options.cacheResult) {
                     if (tlCache != nullptr) {
-                        tlCache->Insert(type, value, result);
+                        tlCache->Insert(type, value, result, generation);
                     }
                     if (m_cache != nullptr) {
-                        CacheResult(type, value, result);
+                        CacheResult(type, value, result, generation);
                     }
                 }
                 
@@ -2315,10 +2326,10 @@ public:
                 // Update caches
                 if (options.cacheResult) {
                     if (tlCache != nullptr) {
-                        tlCache->Insert(type, value, result);
+                        tlCache->Insert(type, value, result, generation);
                     }
                     if (m_cache != nullptr) {
-                        CacheResult(type, value, result);
+                        CacheResult(type, value, result, generation);
                     }
                 }
                 
@@ -2360,10 +2371,10 @@ public:
                 // Cache external results
                 if (options.cacheResult) {
                     if (tlCache != nullptr) {
-                        tlCache->Insert(type, value, result);
+                        tlCache->Insert(type, value, result, generation);
                     }
                     if (m_cache != nullptr) {
-                        CacheResult(type, value, result);
+                        CacheResult(type, value, result, generation);
                     }
                 }
             } else {
@@ -2397,7 +2408,8 @@ private:
      */
     [[nodiscard]] ThreatLookupResult LookupInCache(
         IOCType type,
-        std::string_view value
+        std::string_view value,
+        uint64_t generation
     ) noexcept {
         ThreatLookupResult result;
         result.type = type;
@@ -2425,6 +2437,10 @@ private:
         CacheValue cacheValue;
         if (!m_cache->Lookup(key, cacheValue)) {
             // Cache miss - entry not found
+            return result;
+        }
+        // Cached under another data generation: the indicator may have changed since.
+        if (cacheValue.generation != generation) {
             return result;
         }
         
@@ -3027,7 +3043,8 @@ private:
     void CacheResult(
         IOCType type,
         std::string_view value,
-        const ThreatLookupResult& result
+        const ThreatLookupResult& result,
+        uint64_t generation
     ) noexcept {
         if (UNLIKELY(m_cache == nullptr || !result.found)) {
             return;
@@ -3122,6 +3139,7 @@ private:
         
         cacheValue.insertionTime = now;
         cacheValue.expirationTime = now + ttlSeconds;
+        cacheValue.generation = generation;
         
         // =====================================================================
         // Insert into Cache

@@ -29423,5 +29423,37 @@ class ADuplicateAddUpdatesTheExistingEntryTests(unittest.TestCase):
         self.assertNotIn("FormatIOCValueForIndex(entry)", bulk)
 
 
+class LookupCachesAreTaggedWithTheDataGenerationTests(unittest.TestCase):
+    """A cached lookup answer is served only under the data generation it was read in (task 357).
+
+    Neither the per-thread cache nor the shared reputation cache was invalidated when an
+    indicator changed: a removed indicator was still found, and an updated one kept its old
+    reputation, on the same thread, until the entry aged out (up to hours).
+    """
+
+    def test_every_mutation_bumps_the_generation_under_its_write_lock(self):
+        mgr = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelIOCManager.cpp"))
+        for name in ("AddIOC", "UpdateIOC", "RestoreIOC", "SetIOCTTL", "RenewIOCTTL",
+                     "PurgeExpiredIOCs", "MergeDuplicates", "Optimize"):
+            body = extract_c_function(mgr, "ThreatIntelIOCManager::" + name)
+            lock = body.find("(m_rwLock);")
+            bump = body.find("const GenerationBump generationBump(m_impl->dataGeneration);")
+            self.assertNotEqual(-1, bump, "%s changes indicators without bumping the generation" % name)
+            self.assertLess(lock, bump, "%s: the bump must be declared after the lock so it runs first" % name)
+        self.assertGreaterEqual(mgr.count("const GenerationBump generationBump(m_impl->dataGeneration);"), 9)
+
+    def test_both_cache_tiers_compare_the_generation(self):
+        look = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelLookup.cpp"))
+        self.assertIn("entry->generation == generation", look)
+        self.assertIn("if (cacheValue.generation != generation) {", look)
+        self.assertIn("cacheValue.generation = generation;", look)
+        self.assertNotIn("tlCache->Insert(type, value, result);", look)
+        self.assertNotIn("CacheResult(type, value, result);", look)
+        execute = look[look.index("ThreatLookupResult ExecuteLookup(\n        IOCType type,\n        std::string_view value,\n        const LookupOptions& options,\n        ThreadLocalCache* tlCache"):]
+        read = execute.index("m_iocManager->GetDataGeneration()")
+        self.assertLess(read, execute.index("tlCache->Lookup("),
+                        "the generation must be read before any tier reads data")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

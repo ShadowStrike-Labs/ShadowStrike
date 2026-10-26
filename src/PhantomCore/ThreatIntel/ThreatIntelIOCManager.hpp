@@ -1045,6 +1045,14 @@ public:
      * added. Fails for a string-valued type the parser does not canonicalize, and when the
      * text cannot be stored.
      */
+    /**
+     * @brief A number that changes after every change to the stored indicators
+     *
+     * Read before a lookup reads the data; an answer cached under an older value may
+     * describe an indicator that has since been updated, removed or expired.
+     */
+    [[nodiscard]] uint64_t GetDataGeneration() const noexcept;
+
     [[nodiscard]] bool ParseAndStoreIOC(
         IOCType type,
         std::string_view value,

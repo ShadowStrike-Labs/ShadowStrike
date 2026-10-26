@@ -362,6 +362,13 @@ struct alignas(8) CacheValue {
     
     /// @brief Insertion timestamp
     uint32_t insertionTime{0};
+
+    /// @brief Data generation of the store when the cached answer was read
+    ///
+    /// A cache user that knows the store's current generation (ThreatIntelLookup) treats an
+    /// entry from another generation as a miss, so an answer from before an update, removal
+    /// or expiry is never served (task 357). Zero for entries inserted without one.
+    uint64_t generation{0};
     
     /// @brief Default constructor
     CacheValue() noexcept = default;
@@ -431,7 +438,7 @@ struct alignas(8) CacheValue {
     }
 };
 
-static_assert(sizeof(CacheValue) == 32, "CacheValue must be 32 bytes");
+static_assert(sizeof(CacheValue) == 40, "CacheValue must be 40 bytes");
 
 // ============================================================================
 // SEQLOCK-PROTECTED CACHE ENTRY
