@@ -403,9 +403,21 @@ TEST(ThreatIntelIOCManager_Add, AddIOC_Duplicate) {
 	IOCOperationResult result1 = manager.AddIOC(entry, options);
 	EXPECT_TRUE(result1.success);
 	
-	// Add duplicate
+	// Add duplicate. The default options update an existing entry rather than store a
+	// second copy; this used to fail with "Invalid entry ID" because the duplicate was
+	// passed to UpdateIOC with the caller's ID 0 (task 356).
 	IOCOperationResult result2 = manager.AddIOC(entry, options);
-	EXPECT_FALSE(result2.success); // Should reject duplicate
+	EXPECT_TRUE(result2.success) << result2.errorMessage;
+	EXPECT_TRUE(result2.wasUpdated);
+	EXPECT_EQ(result2.entryId, result1.entryId);
+	EXPECT_EQ(database.GetEntryCount(), 1u) << "a duplicate was stored as a second entry";
+
+	// Asked not to update, the add reports the duplicate and stores nothing.
+	options.updateIfExists = false;
+	options.overwriteIfExists = false;
+	IOCOperationResult result3 = manager.AddIOC(entry, options);
+	EXPECT_TRUE(result3.wasDuplicate);
+	EXPECT_EQ(database.GetEntryCount(), 1u);
 	
 	manager.Shutdown();
 	database.Close();

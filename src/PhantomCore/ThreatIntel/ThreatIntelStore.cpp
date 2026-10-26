@@ -1898,37 +1898,19 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
                 continue;
             }
             
-            // Check if entry already exists using lookup interface
-            StoreLookupOptions storeLookupOpts = StoreLookupOptions::FastLookup();
-            storeLookupOpts.updateCache = false;
-            storeLookupOpts.includeMetadata = false;
-            
-            // Convert to UnifiedLookupOptions for internal lookup
-            const auto lookupOpts = Impl::ConvertToUnifiedOptions(storeLookupOpts);
-            
-            auto lookupResult = m_impl->lookup->Lookup(entry.type,
-                ThreatIntelDatabase::FormatIOCValueForIndex(entry)
-                , lookupOpts);
-            
-            if (lookupResult.found) {
-                // Entry exists - try to update if newer
-                // For now, count as updated (actual update logic depends on IOCManager)
-                auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
-                if (opResult.success) {
-                    ++result.updatedEntries;
-                    mutatedIndices.push_back(i);
-                } else {
-                    ++result.errorCount;
-                }
+            // The add itself says whether the entry was new or an existing one it updated.
+            // A lookup first, by FormatIOCValueForIndex text, cannot answer that: for a
+            // string-valued entry that text is "strref:offset:length", which no lookup
+            // accepts, so every re-synced URL was counted as new.
+            const auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+            if (!opResult.success) {
+                ++result.errorCount;
+            } else if (opResult.wasDuplicate || opResult.wasUpdated) {
+                ++result.updatedEntries;
+                mutatedIndices.push_back(i);
             } else {
-                // New entry - add it
-                auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
-                if (opResult.success) {
-                    ++result.newEntries;
-                    mutatedIndices.push_back(i);
-                } else {
-                    ++result.errorCount;
-                }
+                ++result.newEntries;
+                mutatedIndices.push_back(i);
             }
         }
         

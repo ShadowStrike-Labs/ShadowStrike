@@ -74,6 +74,27 @@ constexpr const char* kUrlhausBody =
 
 uint64_t Now() { return static_cast<uint64_t>(std::time(nullptr)); }
 
+// Serves each feed its own body, chosen by the requested host.
+class RoutedHttpClient final : public IHttpClient {
+public:
+    HttpResponse Execute(const HttpRequest& request) override {
+        HttpResponse r;
+        r.statusCode = 200;
+        r.statusMessage = "OK";
+        const std::string body = request.url.find("urlhaus") != std::string::npos ? kUrlhausBody : kFeodoBody;
+        r.body.assign(body.begin(), body.end());
+        return r;
+    }
+    std::future<HttpResponse> ExecuteAsync(const HttpRequest& request) override {
+        std::promise<HttpResponse> p;
+        p.set_value(Execute(request));
+        return p.get_future();
+    }
+    void SetDefaultHeaders(const std::unordered_map<std::string, std::string>&) override {}
+    void SetProxy(const std::string&) override {}
+    std::string GetLastError() const override { return {}; }
+};
+
 class ScratchDir {
 public:
     ScratchDir()
@@ -237,6 +258,39 @@ TEST(FeedSyncStore, UrlIndicatorsAreDroppedRatherThanStoredAsFakeStringReference
     EXPECT_EQ(2u, result.totalFetched);
     EXPECT_EQ(0u, result.newIOCs) << "a URL keyed by a hash in the string-offset field was stored";
     EXPECT_EQ(2u, result.invalidIOCs);
+
+    mgr.reset();
+    store->Shutdown();
+}
+
+// A feed that is synced again reports its indicators as updated, not new and not failed. The
+// update path used to hand the ID-less feed entry to UpdateIOC, which rejected ID 0.
+TEST(FeedSyncStore, ASecondSyncUpdatesWhatTheFirstStored) {
+    ScratchDir dir;
+    auto store = OpenStore(dir);
+    ASSERT_TRUE(store);
+    auto mgr = StartedManager(std::make_shared<RoutedHttpClient>());
+    ASSERT_TRUE(mgr);
+    mgr->SetTargetStore(store);
+    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus()));
+    ASSERT_TRUE(mgr->AddFeed(Feodo()));
+
+    ASSERT_EQ(2u, mgr->SyncFeed("urlhaus").newIOCs);
+    ASSERT_EQ(2u, mgr->SyncFeed("feodotracker").newIOCs);
+    const auto firstSeen = store->LookupIPv4("203.0.113.7").firstSeen;
+    ASSERT_NE(0u, firstSeen);
+    // Timestamps are in seconds: the re-sync must happen in a later second for a reset of
+    // first-seen to be visible.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    for (const char* feed : {"urlhaus", "feodotracker"}) {
+        const auto again = mgr->SyncFeed(feed);
+        ASSERT_TRUE(again.success) << feed << ": " << again.errorMessage;
+        EXPECT_EQ(0u, again.newIOCs) << feed << ": a re-synced indicator was counted as new";
+        EXPECT_EQ(2u, again.updatedIOCs) << feed << ": a re-synced indicator was not updated";
+    }
+    EXPECT_TRUE(store->LookupURL("http://malware.example/a.exe").found);
+    EXPECT_EQ(firstSeen, store->LookupIPv4("203.0.113.7").firstSeen) << "a re-sighting reset first-seen";
 
     mgr.reset();
     store->Shutdown();

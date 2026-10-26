@@ -29368,5 +29368,23 @@ class DeduplicationIndexIsRebuiltWithTheAddKeyTests(unittest.TestCase):
         self.assertIn("BuildDedupKey(*entry)", rebuild)
 
 
+class ADuplicateAddUpdatesTheExistingEntryTests(unittest.TestCase):
+    """AddIOC updates a live duplicate by its own ID (task 356)."""
+
+    def test_the_update_addresses_the_existing_slot(self):
+        mgr = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelIOCManager.cpp"))
+        body = extract_c_function(mgr, "ThreatIntelIOCManager::AddIOC")
+        self.assertIn("update.entryId = duplicateId.value();", body,
+                      "a duplicate is passed to UpdateIOC with the caller's ID, 0 for every feed entry")
+        self.assertNotIn("return UpdateIOC(entry, options);", body)
+        self.assertIn("LiveEntry(*m_impl->database, duplicateId.value())", body)
+        self.assertIn("LiveEntry(*m_impl->database, dup.value())", body,
+                      "the under-lock recheck trusts a stale dedup key again")
+        bulk = extract_c_function(strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelStore.cpp")),
+                                  "ThreatIntelStore::BulkAddIOCsWithStats")
+        self.assertIn("opResult.wasDuplicate || opResult.wasUpdated", bulk)
+        self.assertNotIn("FormatIOCValueForIndex(entry)", bulk)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

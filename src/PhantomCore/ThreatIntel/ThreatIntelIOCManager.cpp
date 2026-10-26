@@ -1115,6 +1115,20 @@ private:
  */
 namespace {
 
+/// The entry a dedup ID names, if it is still a live indicator. Hard deletes zero the slot
+/// and soft deletes revoke it without removing the dedup key, so the key can outlive it; a
+/// stale key must not stop the indicator being added again.
+[[nodiscard]] const IOCEntry* LiveEntry(const ThreatIntelDatabase& database, uint64_t entryId) noexcept {
+    if (entryId == 0) {
+        return nullptr;
+    }
+    const IOCEntry* entry = database.GetEntry(static_cast<size_t>(entryId - 1));
+    if (entry == nullptr || entry->entryId != entryId || HasFlag(entry->flags, IOCFlags::Revoked)) {
+        return nullptr;
+    }
+    return entry;
+}
+
 /// What a dedup rebuild found, for the statistics Optimize recalculates.
 struct DedupRebuildCounts {
     size_t active = 0;
@@ -1329,8 +1343,10 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
             const auto duplicateId = m_impl->deduplicator->CheckDuplicate(
                 entry.type, valueStr
             );
+            const auto* existing = duplicateId.has_value()
+                ? LiveEntry(*m_impl->database, duplicateId.value()) : nullptr;
             
-            if (duplicateId.has_value()) {
+            if (existing != nullptr) {
                 m_impl->stats.duplicatesDetected.fetch_add(1, std::memory_order_relaxed);
                 
                 if (!options.overwriteIfExists && !options.updateIfExists) {
@@ -1340,10 +1356,22 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
                     return result;
                 }
                 
-                // Handle conflict resolution
-                if (options.updateIfExists) {
-                    return UpdateIOC(entry, options);
+                // Update the entry that exists. The incoming entry is new to the caller and
+                // carries no ID (a feed's never does), and UpdateIOC addresses the slot by ID,
+                // so passing it through unchanged failed every re-sync with "Invalid entry ID".
+                // With only overwriteIfExists set, the code used to fall through and store a
+                // second copy.
+                IOCEntry update = entry;
+                update.entryId = duplicateId.value();
+                // A re-sighting does not change when the indicator was first seen.
+                update.createdTime = existing->createdTime;
+                if (existing->firstSeen != 0 && (update.firstSeen == 0 || existing->firstSeen < update.firstSeen)) {
+                    update.firstSeen = existing->firstSeen;
                 }
+                if (!HasFlag(update.flags, IOCFlags::Revoked)) {
+                    update.flags |= IOCFlags::Enabled;
+                }
+                return UpdateIOC(update, options);
             }
         }
     }
@@ -1390,7 +1418,7 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
         const std::string recheckStr = BuildDedupKey(entry);
         if (!recheckStr.empty()) {
             const auto dup = m_impl->deduplicator->CheckDuplicate(entry.type, recheckStr);
-            if (dup.has_value()) {
+            if (dup.has_value() && LiveEntry(*m_impl->database, dup.value()) != nullptr) {
                 m_impl->stats.duplicatesDetected.fetch_add(1, std::memory_order_relaxed);
                 return IOCOperationResult::Duplicate(dup.value());
             }
