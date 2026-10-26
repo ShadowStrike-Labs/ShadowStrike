@@ -1232,6 +1232,15 @@ public:
         std::string_view value,
         ReputationLevel reputation,
         ThreatIntelSource source = ThreatIntelSource::InternalAnalysis) noexcept;
+
+    /**
+     * @brief Store the canonical text of a Domain, URL or Email value and point entry at it
+     *
+     * Only the entry's string reference is written; every other field is the caller's. Used by
+     * feed parsers, which build entries before adding them. Fails for any other type and for a
+     * value that is not a valid indicator of its type.
+     */
+    [[nodiscard]] bool StoreIndicatorText(IOCType type, std::string_view value, IOCEntry& entry) noexcept;
     
     /**
      * @brief Update an existing IOC entry

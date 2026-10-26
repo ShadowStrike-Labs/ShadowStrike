@@ -243,7 +243,8 @@ TEST(FeedSyncStore, AnIpBlocklistLandsInTheStoreAsMalicious) {
     store->Shutdown();
 }
 
-TEST(FeedSyncStore, UrlIndicatorsAreDroppedRatherThanStoredAsFakeStringReferences) {
+// Task 345: URL indicators from a feed are stored as text and found by a lookup of the URL.
+TEST(FeedSyncStore, UrlIndicatorsFromAFeedAreStoredAndFound) {
     ScratchDir dir;
     auto store = OpenStore(dir);
     ASSERT_TRUE(store);
@@ -256,8 +257,15 @@ TEST(FeedSyncStore, UrlIndicatorsAreDroppedRatherThanStoredAsFakeStringReference
     const auto result = mgr->SyncFeed("urlhaus");
     ASSERT_TRUE(result.success) << result.errorMessage;
     EXPECT_EQ(2u, result.totalFetched);
-    EXPECT_EQ(0u, result.newIOCs) << "a URL keyed by a hash in the string-offset field was stored";
-    EXPECT_EQ(2u, result.invalidIOCs);
+    EXPECT_EQ(2u, result.newIOCs);
+    EXPECT_EQ(0u, result.invalidIOCs);
+
+    const auto hit = store->LookupURL("http://malware.example/a.exe");
+    ASSERT_TRUE(hit.found) << "a URL from the feed is not in the store";
+    EXPECT_EQ(ReputationLevel::Malicious, hit.reputation);
+    EXPECT_TRUE(store->LookupURL("http://MALWARE.example/b.exe").found) << "the host is case-insensitive";
+    EXPECT_FALSE(store->LookupURL("http://malware.example/c.exe").found)
+        << "a URL of the same length that the feed never listed was found";
 
     mgr.reset();
     store->Shutdown();
@@ -296,6 +304,41 @@ TEST(FeedSyncStore, ASecondSyncUpdatesWhatTheFirstStored) {
     store->Shutdown();
 }
 
+// A row whose value is not a URL is rejected by the text store, not stored without text.
+TEST(FeedSyncStore, AFeedValueThatIsNotAValidUrlIsNotStored) {
+    ScratchDir dir;
+    auto store = OpenStore(dir);
+    ASSERT_TRUE(store);
+    const std::string body = std::string(kUrlhausBody) +
+        "\"3\",\"2026-10-25 10:02:00\",\"not a url at all\",\"online\",\"\",\"malware_download\",\"\",\"\",\"x\"\n";
+    auto mgr = StartedManager(std::make_shared<ScriptedHttpClient>(200, body));
+    ASSERT_TRUE(mgr);
+    mgr->SetTargetStore(store);
+    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus()));
+    const auto result = mgr->SyncFeed("urlhaus");
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    EXPECT_EQ(2u, result.newIOCs);
+
+    mgr.reset();
+    store->Shutdown();
+}
+
+// Used on its own, a parser has no text store: it leaves the reference empty instead of putting
+// a hash of the text where the offset of the text belongs.
+TEST(FeedParsers, WithoutATextStoreAStringIndicatorHasNoReference) {
+    CsvFeedParser parser;
+    const auto config = ThreatFeedConfig::CreateURLhaus().parser;
+    std::vector<IOCEntry> entries;
+    const std::string body = kUrlhausBody;
+    ASSERT_TRUE(parser.Parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()),
+                             entries, config));
+    ASSERT_EQ(2u, entries.size());
+    for (const auto& entry : entries) {
+        EXPECT_EQ(IOCType::URL, entry.type);
+        EXPECT_EQ(0u, entry.value.stringRef.stringOffset) << "a parser put something other than a text offset here";
+    }
+}
+
 TEST(FeedSyncStore, TheStoreRegistersItsDefaultFeedsAndSchedulesThemSoon) {
     ScratchDir dir;
     auto store = OpenStore(dir);
@@ -303,8 +346,8 @@ TEST(FeedSyncStore, TheStoreRegistersItsDefaultFeedsAndSchedulesThemSoon) {
     EXPECT_GE(store->RegisterDefaultFeeds(), 2u);
     EXPECT_TRUE(store->GetFeedStatus("feodotracker").has_value());
     EXPECT_TRUE(store->GetFeedStatus("etopen-compromised-ips").has_value());
-    EXPECT_FALSE(store->GetFeedStatus("urlhaus").has_value())
-        << "URLhaus indicators cannot be stored yet, so downloading it costs bandwidth for nothing";
+    EXPECT_TRUE(store->GetFeedStatus("urlhaus").has_value())
+        << "URLhaus is the default feed of malware-distribution URLs (task 345)";
 
     store->StartFeedUpdates();
     const auto status = store->GetFeedStatus("feodotracker");

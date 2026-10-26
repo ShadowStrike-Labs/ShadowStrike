@@ -969,9 +969,9 @@ uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
     // faster than the publisher updates costs bandwidth and CPU without improving
     // detection, and abuse.ch explicitly asks clients not to hammer their endpoints.
     //
-    // URLhaus is deliberately absent: its indicators are URLs, and the feed path cannot
-    // yet store a string indicator (task 345). Downloading it hourly would cost
-    // bandwidth and store nothing.
+    // URLhaus publishes the malware-distribution URLs currently online; its CSV is
+    // regenerated every few minutes and abuse.ch asks for no more than one fetch per five.
+    // Hourly keeps it current without load on them.
     struct DefaultFeed {
         ThreatFeedConfig (*make)();
         std::chrono::hours interval;
@@ -979,6 +979,7 @@ uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
     static constexpr DefaultFeed kFeeds[] = {
         { &ThreatFeedConfig::CreateFeodoTracker, std::chrono::hours(2) },
         { &ThreatFeedConfig::CreateETOpen,       std::chrono::hours(6) },
+        { &ThreatFeedConfig::CreateURLhaus,      std::chrono::hours(1) },
     };
 
     uint32_t registered = 0;
@@ -996,8 +997,6 @@ uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
             Utils::Logger::Warn("[ThreatIntel] Could not register feed '{}'", config.feedId);
         }
     }
-    Utils::Logger::Info(
-        "[ThreatIntel] URLhaus not registered: URL indicators from feeds cannot be stored yet");
 
     if (registered == 0) {
         Utils::Logger::Error(
@@ -1716,6 +1715,19 @@ bool ThreatIntelStore::AddIOC(
     entry.flags |= IOCFlags::HasExpiration;
 
     return AddIOC(entry);
+}
+
+bool ThreatIntelStore::StoreIndicatorText(IOCType type, std::string_view value, IOCEntry& entry) noexcept {
+    if (!IsInitialized() || !m_impl->iocManager || !ThreatIntelDatabase::IsStringValuedType(type)) {
+        return false;
+    }
+    IOCEntry parsed{};
+    if (!m_impl->iocManager->ParseAndStoreIOC(type, value, parsed)) {
+        return false;
+    }
+    entry.value.stringRef.stringOffset = parsed.value.stringRef.stringOffset;
+    entry.value.stringRef.stringLength = parsed.value.stringRef.stringLength;
+    return true;
 }
 
 bool ThreatIntelStore::UpdateIOC(const IOCEntry& entry) noexcept {

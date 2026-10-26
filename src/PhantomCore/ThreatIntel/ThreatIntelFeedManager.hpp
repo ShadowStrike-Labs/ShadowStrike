@@ -434,6 +434,13 @@ struct ParserConfig {
     bool csvHasHeader = true;
     int csvValueColumn = 0;
     int csvTypeColumn = -1;
+
+    /// Stores the text of a string-valued indicator (Domain, URL, Email) and sets the entry's
+    /// string reference to it; false rejects the value. Set by the feed manager for one sync,
+    /// never part of a persisted feed configuration. Without it a parser leaves the reference
+    /// empty and the feed manager drops the entry, because a reference that names no text
+    /// matches the wrong indicators (task 345).
+    std::function<bool(IOCType type, std::string_view value, IOCEntry& entry)> storeIndicatorText;
 };
 
 /**
@@ -1154,7 +1161,8 @@ private:
     /// @brief Parse STIX indicator pattern
     [[nodiscard]] bool ParseSTIXPattern(
         const std::string& pattern,
-        IOCEntry& entry
+        IOCEntry& entry,
+        const ParserConfig& config
     );
     
     /// @brief Map STIX type to IOCType

@@ -3982,10 +3982,30 @@ bool ThreatIntelFeedManager::ParseFeedResponse(
     // Parse with size limit enforcement
     constexpr size_t MAX_ENTRIES = 10000000;  // 10M max entries
     
+    // String-valued indicators are stored as text through the target store, which also
+    // canonicalises them so a lookup of any spelling finds them. Types the feed does not
+    // supply are left without text and dropped by ApplyFeedDefaults as disallowed.
+    ParserConfig parserConfig = context.config.parser;
+    std::shared_ptr<ThreatIntelStore> store;
+    {
+        std::shared_lock<std::shared_mutex> lk(m_depsMutex);
+        store = m_store;
+    }
+    if (store) {
+        const std::vector<IOCType> allowed = context.config.allowedTypes;
+        parserConfig.storeIndicatorText =
+            [store, allowed](IOCType type, std::string_view value, IOCEntry& entry) {
+                if (!allowed.empty() && std::find(allowed.begin(), allowed.end(), type) == allowed.end()) {
+                    return true;
+                }
+                return store->StoreIndicatorText(type, value, entry);
+            };
+    }
+
     const bool success = parser->Parse(
         std::span<const uint8_t>(response.body),
         outEntries,
-        context.config.parser
+        parserConfig
     );
     
     // Enforce entry limit
@@ -5236,30 +5256,6 @@ void ThreatIntelFeedManager::ScheduleRetryAfterFailure(FeedContext& context) {
     context.stats.nextScheduledSync.store(now + delay, std::memory_order_release);
 }
 
-namespace {
-
-/// Types whose value lives in the database string pool. Feed parsers produce no string-pool
-/// reference for these (task 345), so the feed path cannot store them yet.
-[[nodiscard]] bool IsStringPoolType(IOCType type) noexcept {
-    switch (type) {
-        case IOCType::Domain:
-        case IOCType::URL:
-        case IOCType::Email:
-        case IOCType::JA3:
-        case IOCType::JA3S:
-        case IOCType::RegistryKey:
-        case IOCType::ProcessName:
-        case IOCType::MutexName:
-        case IOCType::NamedPipe:
-        case IOCType::CertFingerprint:
-            return true;
-        default:
-            return false;
-    }
-}
-
-}  // namespace
-
 size_t ThreatIntelFeedManager::ApplyFeedDefaults(const ThreatFeedConfig& config,
                                                  std::vector<IOCEntry>& entries) const {
     const uint64_t now = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
@@ -5273,10 +5269,11 @@ size_t ThreatIntelFeedManager::ApplyFeedDefaults(const ThreatFeedConfig& config,
             ++disallowed;
             return true;
         }
-        // The parsers key a string indicator by a hash of its text in the string-offset
-        // field. Stored, that is a reference into the pool to bytes that are not the
-        // indicator: it can never match a lookup and could alias a real pool offset.
-        if (IsStringPoolType(entry.type)) {
+        // A string indicator is kept only when its text was stored during the parse
+        // (ParserConfig::storeIndicatorText). Without that the reference is empty, and
+        // an empty reference would match every indicator of its length.
+        if (ThreatIntelDatabase::IsStringValuedType(entry.type) &&
+            entry.value.stringRef.stringOffset == 0) {
             ++stringValued;
             return true;
         }
@@ -5299,7 +5296,7 @@ size_t ThreatIntelFeedManager::ApplyFeedDefaults(const ThreatFeedConfig& config,
     
     if (stringValued > 0) {
         SS_LOG_WARN(L"ThreatIntelFeedManager",
-                    L"Feed '%S': %llu domain/URL-type indicators not stored - feed string values are not yet kept",
+                    L"Feed '%S': %llu domain/URL-type indicators not stored - no text store for this sync",
                     config.feedId.c_str(), static_cast<unsigned long long>(stringValued));
     }
     return disallowed + stringValued;

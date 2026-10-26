@@ -42,6 +42,20 @@ namespace ShadowStrike {
             return entry;
         }
 
+        // The text of a string-valued indicator, stored through the sync's text sink. A hash of
+        // the text used to go into the string-offset field here: a reference to bytes that are
+        // not the indicator, which matched nothing on lookup and could alias a real reference.
+        // Without a sink the reference stays empty, and the feed manager drops the entry.
+        [[nodiscard]] bool AttachIndicatorText(const ParserConfig& config, IOCType type,
+                                               std::string_view value, IOCEntry& entry) {
+            entry.value.stringRef.stringOffset = 0;
+            entry.value.stringRef.stringLength = 0;
+            if (!config.storeIndicatorText) {
+                return true;
+            }
+            return config.storeIndicatorText(type, value, entry);
+        }
+
         // Maximum nesting depth accepted by JSON / STIX / TAXII parsers.
         // nlohmann::json::parse is recursive descent; an attacker-supplied
         // payload of "[[[[[[..." can otherwise blow the worker thread's
@@ -587,14 +601,9 @@ namespace ShadowStrike {
                     break;
                 }
                 default: {
-                    // String-based IOCs use string pool reference
-                    // For now, we store a hash of the value for deduplication
-                    uint32_t valueHash = 0;
-                    for (char c : value) {
-                        valueHash = valueHash * 31 + static_cast<uint8_t>(c);
+                    if (!AttachIndicatorText(config, iocType, value, entry)) {
+                        return false;  // The value is not a valid indicator of its type
                     }
-                    entry.value.stringRef.stringOffset = valueHash;
-                    entry.value.stringRef.stringLength = static_cast<uint16_t>(std::min(value.size(), size_t(65535)));
                     break;
                 }
                 }
@@ -921,15 +930,9 @@ namespace ShadowStrike {
                         break;
                     }
                     default: {
-                        // String-based IOCs - compute hash for deduplication
-                        uint32_t valueHash = 0;
-                        for (const char c : value) {
-                            valueHash = valueHash * 31 + static_cast<uint8_t>(c);
+                        if (!AttachIndicatorText(config, iocType, value, entry)) {
+                            continue;  // The value is not a valid indicator of its type
                         }
-                        entry.value.stringRef.stringOffset = valueHash;
-                        entry.value.stringRef.stringLength = static_cast<uint16_t>(
-                            std::min(value.size(), static_cast<size_t>(65535))
-                            );
                         break;
                     }
                     }
@@ -1098,7 +1101,7 @@ namespace ShadowStrike {
         bool StixFeedParser::Parse(
             std::span<const uint8_t> data,
             std::vector<IOCEntry>& outEntries,
-            const ParserConfig& /*config*/
+            const ParserConfig& config
         ) {
             // Security limits to prevent DoS
             constexpr size_t MAX_STIX_SIZE = 100 * 1024 * 1024;  // 100MB
@@ -1183,7 +1186,7 @@ namespace ShadowStrike {
 
                         IOCEntry entry = BlankFeedEntry();
 
-                        if (ParseSTIXPattern(pattern, entry)) {
+                        if (ParseSTIXPattern(pattern, entry, config)) {
                             // Extract metadata safely
                             if (obj.contains("created") && obj["created"].is_string()) {
                                 entry.createdTime = ShadowStrike::ThreatIntel_Util::ParseISO8601(obj["created"].get<std::string>());
@@ -1343,7 +1346,8 @@ namespace ShadowStrike {
 
         bool StixFeedParser::ParseSTIXPattern(
             const std::string& pattern,
-            IOCEntry& entry
+            IOCEntry& entry,
+            const ParserConfig& config
         ) {
             // STIX pattern format: [type:property = 'value']
             // Examples:
@@ -1490,16 +1494,9 @@ namespace ShadowStrike {
                 break;
             }
             default: {
-                // String-based IOCs - compute hash for deduplication
-                uint32_t valueHash = 0;
-                for (const char c : value) {
-                    // Overflow is intentional for hash mixing
-                    valueHash = valueHash * 31 + static_cast<uint8_t>(c);
+                if (!AttachIndicatorText(config, entry.type, value, entry)) {
+                    return false;  // The value is not a valid indicator of its type
                 }
-                entry.value.stringRef.stringOffset = valueHash;
-                entry.value.stringRef.stringLength = static_cast<uint16_t>(
-                    std::min(value.size(), size_t{ 65535 })
-                    );
                 break;
             }
             }

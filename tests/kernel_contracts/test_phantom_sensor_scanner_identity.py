@@ -29368,6 +29368,43 @@ class DeduplicationIndexIsRebuiltWithTheAddKeyTests(unittest.TestCase):
         self.assertIn("BuildDedupKey(*entry)", rebuild)
 
 
+class FeedIndicatorTextIsStoredTests(unittest.TestCase):
+    """String indicators from feeds carry stored text, and URLhaus is a default feed (task 345).
+
+    The feed parsers put a 31-multiplier hash of the text in the string-offset field, so a
+    synced URL could never be found; ApplyFeedDefaults then had to drop every string indicator
+    and URLhaus was left unregistered.
+    """
+
+    TI = ROOT / "src/PhantomCore/ThreatIntel"
+
+    def test_parsers_store_text_through_the_sync_sink_and_never_hash_it(self):
+        parsers = strip_c_comments(read_source(self.TI / "ThreatIntelFeedManager_parsers.cpp"))
+        self.assertNotIn("valueHash", parsers, "a parser keys a string indicator by a hash again")
+        self.assertNotIn("stringRef.stringOffset = valueHash", parsers)
+        self.assertEqual(3, parsers.count("AttachIndicatorText(config, "),
+                         "every parser's string branch must store its text through the sink")
+        helper = extract_c_function(parsers, "AttachIndicatorText")
+        self.assertIn("entry.value.stringRef.stringOffset = 0;", helper)
+        self.assertIn("return config.storeIndicatorText(type, value, entry);", helper)
+
+    def test_the_manager_wires_the_sink_and_drops_only_textless_entries(self):
+        mgr = strip_c_comments(read_source(self.TI / "ThreatIntelFeedManager.cpp"))
+        parse = extract_c_function(mgr, "ThreatIntelFeedManager::ParseFeedResponse")
+        self.assertIn("parserConfig.storeIndicatorText =", parse)
+        self.assertIn("store->StoreIndicatorText(type, value, entry)", parse)
+        self.assertIn("parserConfig\n    );", parse, "the parser is not given the config that carries the sink")
+        defaults = extract_c_function(mgr, "ThreatIntelFeedManager::ApplyFeedDefaults")
+        self.assertIn("entry.value.stringRef.stringOffset == 0", defaults,
+                      "ApplyFeedDefaults no longer drops a string entry that has no text")
+        self.assertNotIn("IsStringPoolType", mgr, "every string indicator is dropped again")
+
+    def test_urlhaus_is_registered_by_default(self):
+        store = strip_c_comments(read_source(self.TI / "ThreatIntelStore.cpp"))
+        feeds = extract_c_function(store, "ThreatIntelStore::RegisterDefaultFeeds")
+        self.assertIn("&ThreatFeedConfig::CreateURLhaus", feeds)
+
+
 class ADuplicateAddUpdatesTheExistingEntryTests(unittest.TestCase):
     """AddIOC updates a live duplicate by its own ID (task 356)."""
 
