@@ -1030,13 +1030,16 @@ public:
      * @brief Parse an IOC value and, for a string-valued type, also return its canonical text
      * @param canonicalText Receives the normalized text a Domain, URL or Email is stored and
      *        matched by; left empty for types whose value is held inline
+     *
+     * Static: it reads no manager state, so code that stores indicators without a manager
+     * (ThreatIntelImporter) canonicalises them by the same rules.
      */
-    [[nodiscard]] bool ParseIOC(
+    [[nodiscard]] static bool ParseIOC(
         IOCType type,
         std::string_view value,
         IOCEntry& entry,
         std::string* canonicalText
-    ) const noexcept;
+    ) noexcept;
 
     /**
      * @brief Parse an IOC value and store the text of a string-valued one

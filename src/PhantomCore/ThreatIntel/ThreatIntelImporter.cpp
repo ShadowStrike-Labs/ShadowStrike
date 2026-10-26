@@ -25,6 +25,7 @@
 
 #include "ThreatIntelImporter.hpp"
 #include "ThreatIntelDatabase.hpp"
+#include "ThreatIntelIOCManager.hpp"
 #include "ThreatIntelFormat.hpp"  // For Format:: utilities
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/HashUtils.hpp"
@@ -4544,30 +4545,50 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
         const size_t snapshotCount = database.GetEntryCount();
         bool fatalDbError = false;
 
-        // String-pool-backed IOC types cannot be persisted by this importer
-        // because the working DBStringPoolAdapter buffer above is in-process
-        // only and the underlying memory-mapped database currently exposes
-        // no append-string API. Writing such an entry would persist a
-        // stringRef whose offset points outside the mapped region, corrupting
-        // every future read. We refuse to persist them rather than silently
-        // poison the database. ARCH-BLOCKER: extend ThreatIntelDatabase with
-        // a mmap-backed string pool, then route DBStringPoolAdapter through it.
-        auto requiresStringPool = [](IOCType t) noexcept {
-            switch (t) {
-                case IOCType::Domain:
-                case IOCType::URL:
-                case IOCType::Email:
-                case IOCType::JA3:
-                case IOCType::JA3S:
-                case IOCType::RegistryKey:
-                case IOCType::ProcessName:
-                case IOCType::MutexName:
-                case IOCType::NamedPipe:
-                case IOCType::CertFingerprint:
-                    return true;
-                default:
+        // The readers stage every text (an indicator's value, a description, a STIX id) in
+        // stringPool, an in-memory buffer whose offsets mean nothing to the database. Before
+        // an entry is written, each of its texts is stored in the database's string store and
+        // the entry repointed (task 358). An indicator value is canonicalised first, by the
+        // rules the IOC manager stores and looks up by, so an import of "WWW.Evil.Example" is
+        // found by a lookup of "evil.example". A value that is not a valid indicator of its
+        // type, or a string type the canonicaliser does not handle, is refused.
+        auto commitTexts = [&](IOCEntry& e) -> bool {
+            if (ThreatIntelDatabase::IsStringValuedType(e.type)) {
+                const std::string_view staged =
+                    stringPool.GetString(e.value.stringRef.stringOffset, e.value.stringRef.stringLength);
+                IOCEntry probe{};
+                std::string canonical;
+                if (staged.empty() || !ThreatIntelIOCManager::ParseIOC(e.type, staged, probe, &canonical) ||
+                    canonical.empty()) {
                     return false;
+                }
+                const auto stored = database.InternString(canonical);
+                if (!stored.has_value()) {
+                    return false;
+                }
+                e.value.stringRef.stringOffset = stored->offset;
+                e.value.stringRef.stringLength = stored->length;
             }
+            // Metadata texts: stored when possible, cleared otherwise. Left as they were, they
+            // would point at an unrelated text of the database, or at nothing.
+            const auto moveText = [&](uint32_t& offset, uint16_t& length) {
+                if (length == 0) {
+                    offset = 0;
+                    return;
+                }
+                const std::string_view text = stringPool.GetString(offset, length);
+                const auto stored = text.empty() ? std::nullopt : database.InternString(text);
+                if (stored.has_value() && stored->offset <= UINT32_MAX && stored->length <= UINT16_MAX) {
+                    offset = static_cast<uint32_t>(stored->offset);
+                    length = static_cast<uint16_t>(stored->length);
+                } else {
+                    offset = 0;
+                    length = 0;
+                }
+            };
+            moveText(e.descriptionOffset, e.descriptionLength);
+            moveText(e.stixIdOffset, e.stixIdLength);
+            return true;
         };
 
         // Atomic batch writer: applies a vector of normalized entries to the
@@ -4580,9 +4601,7 @@ ImportResult ThreatIntelImporter::DoImportToDatabase(
             }
             const size_t batchSnapshot = database.GetEntryCount();
             for (IOCEntry& src : currentBatch) {
-                // Refuse entries whose stringRef offsets reference the
-                // in-process pool. See ARCH-BLOCKER comment above.
-                if (requiresStringPool(src.type)) {
+                if (!commitTexts(src)) {
                     ++result.totalSkipped;
                     continue;
                 }

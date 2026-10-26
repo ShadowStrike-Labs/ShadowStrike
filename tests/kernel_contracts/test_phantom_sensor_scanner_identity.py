@@ -29467,5 +29467,45 @@ class LookupAcceptsEquivalentSpellingsTests(unittest.TestCase):
                         "canonicalisation must run before validation refuses the spelling")
 
 
+class ImportsKeepStringIndicatorsTests(unittest.TestCase):
+    """Imports store the text of Domain, URL and Email indicators (task 358).
+
+    ThreatIntelStore's STIX, CSV, JSON and plain-text imports counted every string indicator as
+    skipped, and ThreatIntelImporter refused them under an ARCH-BLOCKER comment because its
+    texts lived only in an in-memory staging buffer.
+    """
+
+    TI = ROOT / "src/PhantomCore/ThreatIntel"
+
+    def test_every_store_import_stores_string_values(self):
+        # Sliced by definition rather than brace-matched: these bodies contain the string
+        # "://", which strip_c_comments would read as the start of a comment.
+        store = read_source(self.TI / "ThreatIntelStore.cpp")
+        starts = {m.group(1): m.start() for m in
+                  re.finditer(r"^ImportResult ThreatIntelStore::(Import\w+)\(", store, re.M)}
+        ordered = sorted(starts.values())
+        for name, call in (("ImportCSV", "StoreIndicatorText(detectedType, iocValue, entry)"),
+                           ("ImportJSON", "StoreIndicatorText(iocType, iocValue, entry)"),
+                           ("ImportPlainText", "StoreIndicatorText(detectedType, line, entry)"),
+                           ("ImportSTIX", "StoreIndicatorText(stringType,")):
+            self.assertIn(name, starts, "ThreatIntelStore::%s is gone" % name)
+            begin = starts[name]
+            later = [s for s in ordered if s > begin]
+            body = store[begin:later[0] if later else len(store)]
+            self.assertIn(call, body, "%s skips string indicators again" % name)
+
+    def test_the_importer_commits_texts_before_writing_an_entry(self):
+        imp = strip_c_comments(read_source(self.TI / "ThreatIntelImporter.cpp"))
+        body = extract_c_function(imp, "ThreatIntelImporter::DoImportToDatabase")
+        self.assertNotIn("requiresStringPool", body)
+        commit = body.find("if (!commitTexts(src)) {")
+        self.assertNotEqual(-1, commit)
+        self.assertLess(commit, body.index("database.FindEntry(indexKey, src.type)"),
+                        "the entry is matched before its reference names stored text")
+        self.assertIn("ThreatIntelIOCManager::ParseIOC(e.type, staged, probe, &canonical)", body)
+        self.assertIn("database.InternString(canonical)", body)
+        self.assertIn("moveText(e.descriptionOffset, e.descriptionLength);", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

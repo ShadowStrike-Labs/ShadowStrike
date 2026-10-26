@@ -2898,7 +2898,7 @@ bool ThreatIntelIOCManager::ParseIOC(
     std::string_view value,
     IOCEntry& entry,
     std::string* canonicalText
-) const noexcept {
+) noexcept {
     if (canonicalText != nullptr) {
         canonicalText->clear();
     }

@@ -2694,13 +2694,32 @@ ImportResult ThreatIntelStore::ImportSTIX(
                                 }
                             }
                         }
-                    } else if (pattern.find("domain-name:value") != std::string::npos) {
-                        entry.type = IOCType::Domain;
-                        // Domain stored via IOCManager (needs string pool)
-                        ++result.totalSkipped;
-                    } else if (pattern.find("url:value") != std::string::npos) {
-                        entry.type = IOCType::URL;
-                        ++result.totalSkipped;
+                    } else if (const IOCType stringType =
+                                   pattern.find("domain-name:value") != std::string::npos ? IOCType::Domain
+                                   : pattern.find("url:value") != std::string::npos        ? IOCType::URL
+                                   : pattern.find("email-addr:value") != std::string::npos ? IOCType::Email
+                                                                                           : IOCType::Unknown;
+                               stringType != IOCType::Unknown) {
+                        // The text is canonicalised and stored, and the entry points at it
+                        // (task 358). These patterns used to be counted as skipped.
+                        entry.type = stringType;
+                        bool stored = false;
+                        const size_t eqPos = pattern.find("= '");
+                        if (eqPos != std::string::npos) {
+                            const size_t startPos = eqPos + 3;
+                            const size_t endPos = pattern.find("'", startPos);
+                            if (endPos != std::string::npos) {
+                                stored = StoreIndicatorText(stringType,
+                                    std::string_view(pattern).substr(startPos, endPos - startPos), entry);
+                            }
+                        }
+                        if (stored) {
+                            entries.push_back(entry);
+                            ++result.totalImported;
+                            result.countByType[stringType]++;
+                        } else {
+                            ++result.totalParseErrors;
+                        }
                     }
                 }
                 
@@ -3072,9 +3091,17 @@ ImportResult ThreatIntelStore::ImportCSV(
                     }
                     break;
                 }
+                case IOCType::Domain:
+                case IOCType::URL:
+                case IOCType::Email:
+                    // The text is canonicalised and stored, and the entry points at it, so the
+                    // imported indicator is found by a lookup of any spelling (task 358).
+                    if (StoreIndicatorText(detectedType, iocValue, entry)) {
+                        parseSuccess = true;
+                        result.countByType[detectedType]++;
+                    }
+                    break;
                 default:
-                    // String-based types (Domain, URL, Email) need string pool handling
-                    // Skip for now - these would be handled by IOCManager directly
                     ++result.totalSkipped;
                     continue;
             }
@@ -3455,8 +3482,17 @@ ImportResult ThreatIntelStore::ImportJSON(
                     }
                     break;
                 }
+                case IOCType::Domain:
+                case IOCType::URL:
+                case IOCType::Email:
+                    // The text is canonicalised and stored, and the entry points at it, so the
+                    // imported indicator is found by a lookup of any spelling (task 358).
+                    if (StoreIndicatorText(iocType, iocValue, entry)) {
+                        parseSuccess = true;
+                        result.countByType[iocType]++;
+                    }
+                    break;
                 default:
-                    // String-based types handled by IOCManager
                     ++result.totalSkipped;
                     continue;
             }
@@ -3694,9 +3730,17 @@ ImportResult ThreatIntelStore::ImportPlainText(
                     }
                     break;
                 }
+                case IOCType::Domain:
+                case IOCType::URL:
+                case IOCType::Email:
+                    // The text is canonicalised and stored, and the entry points at it, so the
+                    // imported indicator is found by a lookup of any spelling (task 358).
+                    if (StoreIndicatorText(detectedType, line, entry)) {
+                        parseSuccess = true;
+                        result.countByType[detectedType]++;
+                    }
+                    break;
                 default:
-                    // String-based types (Domain, URL, Email) - skip for now
-                    // These would need string pool handling via IOCManager
                     ++result.totalSkipped;
                     continue;
             }

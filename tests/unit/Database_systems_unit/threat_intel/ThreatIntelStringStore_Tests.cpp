@@ -26,12 +26,14 @@
 #include "PhantomCore/ThreatIntel/ThreatIntelDatabase.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelIOCManager.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelIndex.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelImporter.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelStore.hpp"
 #include "PhantomCore/ThreatIntel/ThreatIntelStringStore.hpp"
 
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -494,6 +496,123 @@ TEST(ThreatIntelIndexStrings, ADomainIsIndexedFromTheStringStoreAfterTheCallersV
     EXPECT_FALSE(index.LookupDomain("good-two.example").found);
     index.SetStringSource(nullptr);
     index.Shutdown();
+}
+
+// ============================================================================
+// Imports keep Domain, URL and Email indicators (task 358)
+// ============================================================================
+
+class ImportStringIndicatorTest : public StringIndicatorTest {
+protected:
+    std::wstring WriteFile(const char* name, const std::string& body) {
+        const auto file = dir.path / name;
+        std::ofstream out(file, std::ios::binary);
+        out << body;
+        return file.wstring();
+    }
+};
+
+TEST_F(ImportStringIndicatorTest, APlainTextImportKeepsDomainsUrlsAndEmails) {
+    auto store = Open();
+    const auto file = WriteFile("list.txt",
+        "WWW.Evil-One.example\nhttp://malware.example/a.exe\nboss@evil-one.example\n203.0.113.7\n");
+    const auto result = store->ImportPlainText(file, IOCType::Unknown);
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    EXPECT_TRUE(store->LookupDomain("evil-one.example").found) << "an imported domain was skipped";
+    EXPECT_TRUE(store->LookupURL("http://malware.example/a.exe").found);
+    EXPECT_TRUE(store->LookupEmail("boss@evil-one.example").found);
+    EXPECT_TRUE(store->LookupIPv4("203.0.113.7").found);
+    EXPECT_FALSE(store->LookupDomain("safe-one.example").found);
+    store->Shutdown();
+}
+
+TEST_F(ImportStringIndicatorTest, ACsvImportKeepsDomainsAndUrls) {
+    auto store = Open();
+    const auto file = WriteFile("list.csv", "indicator,type\nevil-two.example,domain\nhttp://malware.example/c.exe,url\n");
+    const auto result = store->ImportCSV(file);
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    EXPECT_TRUE(store->LookupDomain("evil-two.example").found);
+    EXPECT_TRUE(store->LookupURL("http://malware.example/c.exe").found);
+    store->Shutdown();
+}
+
+TEST_F(ImportStringIndicatorTest, AJsonImportKeepsDomainsAndUrls) {
+    auto store = Open();
+    const auto file = WriteFile("list.json",
+        R"({"indicators":[{"value":"evil-three.example","type":"domain"},)"
+        R"({"value":"http://malware.example/j.exe","type":"url"}]})");
+    const auto result = store->ImportJSON(file);
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    EXPECT_TRUE(store->LookupDomain("evil-three.example").found);
+    EXPECT_TRUE(store->LookupURL("http://malware.example/j.exe").found);
+    store->Shutdown();
+}
+
+TEST_F(ImportStringIndicatorTest, AStixImportKeepsDomainUrlAndEmailPatterns) {
+    auto store = Open();
+    const auto file = WriteFile("bundle.json",
+        R"({"type":"bundle","id":"bundle--1","objects":[)"
+        R"({"type":"indicator","id":"indicator--1","pattern":"[domain-name:value = 'Evil-Four.example']","pattern_type":"stix"},)"
+        R"({"type":"indicator","id":"indicator--2","pattern":"[url:value = 'http://malware.example/s.exe']","pattern_type":"stix"},)"
+        R"({"type":"indicator","id":"indicator--3","pattern":"[email-addr:value = 'boss@evil-four.example']","pattern_type":"stix"}]})");
+    const auto result = store->ImportSTIX(file);
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    EXPECT_TRUE(store->LookupDomain("evil-four.example").found) << "a domain-name pattern was skipped";
+    EXPECT_TRUE(store->LookupURL("http://malware.example/s.exe").found);
+    EXPECT_TRUE(store->LookupEmail("boss@evil-four.example").found);
+    store->Shutdown();
+}
+
+// An imported description used to keep its offset into the importer's in-memory staging buffer,
+// which then named an unrelated text of the database, or nothing.
+TEST(ThreatIntelImporterStrings, AnImportedDescriptionIsStoredWithTheEntry) {
+    ScratchFolder dir;
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open((dir.path / "desc.tidb").wstring()));
+    ThreatIntelImporter importer;
+    ImportOptions options;
+    options.format = ImportFormat::STIX21;
+    std::istringstream input(
+        R"({"type":"bundle","id":"bundle--2","objects":[{"type":"indicator","id":"indicator--9",)"
+        R"("spec_version":"2.1","created":"2026-10-26T10:00:00Z","modified":"2026-10-26T10:00:00Z",)"
+        R"("valid_from":"2026-10-26T10:00:00Z","pattern_type":"stix",)"
+        R"("pattern":"[domain-name:value = 'evil-six.example']","description":"Phishing kit host"}]})");
+    const auto result = importer.ImportFromStream(db, input, options, nullptr);
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    ASSERT_EQ(db.GetEntryCount(), 1u);
+    const IOCEntry* entry = db.GetEntry(0);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(db.GetString(entry->value.stringRef.stringOffset, entry->value.stringRef.stringLength), "evil-six.example");
+    EXPECT_EQ(db.GetString(entry->descriptionOffset, entry->descriptionLength), "Phishing kit host")
+        << "the description points somewhere other than its text";
+}
+
+// The importer library writes entries itself. Its texts must land in the database's string
+// store, canonicalised, so the IOC manager finds them after a reopen.
+TEST(ThreatIntelImporterStrings, AnImportedDomainIsFoundByTheManagerAfterAReopen) {
+    ScratchFolder dir;
+    const auto path = (dir.path / "import.tidb").wstring();
+    {
+        ThreatIntelDatabase db;
+        ASSERT_TRUE(db.Open(path));
+        ThreatIntelImporter importer;
+        ImportOptions options;
+        options.format = ImportFormat::PlainText;
+        std::istringstream input("WWW.Evil-Five.example\n198.51.100.9\n");
+        const auto result = importer.ImportFromStream(db, input, options, nullptr);
+        ASSERT_TRUE(result.success) << result.errorMessage;
+        EXPECT_EQ(result.totalImported, 2u) << "the domain was skipped";
+        EXPECT_TRUE(db.FindString("evil-five.example").has_value()) << "the canonical text was not stored";
+        db.Close();
+    }
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open(path));
+    EXPECT_EQ(db.GetRevokedUnresolvableStringEntries(), 0u) << "the imported domain had no stored text";
+    ThreatIntelIOCManager manager;
+    ASSERT_EQ(manager.Initialize(&db).code, ThreatIntelError::Success);
+    EXPECT_TRUE(manager.FindIOC(IOCType::Domain, "evil-five.example").has_value());
+    EXPECT_FALSE(manager.FindIOC(IOCType::Domain, "safe-five.example").has_value());
+    manager.Shutdown();
 }
 
 }  // namespace
