@@ -2159,6 +2159,31 @@ public:
         // with a generation no newer than the data it came from (task 357).
         const uint64_t generation = m_iocManager != nullptr ? m_iocManager->GetDataGeneration() : 0;
 
+        // Spellings that name the same indicator are reduced to one before any tier sees
+        // them (task 352). Validation used to refuse both of these outright, so a caller
+        // passing a DNS name with its root dot got "not found" for a known-bad domain:
+        //   - an absolute domain name ends in the root label's dot (RFC 1034 3.1)
+        //   - a URL scheme is case-insensitive (RFC 3986 3.1)
+        // One trailing dot only: "evil.example.." is still refused.
+        std::string canonicalValue;
+        if (type == IOCType::Domain && value.size() > 1 && value.back() == '.' &&
+            value[value.size() - 2] != '.') {
+            canonicalValue.assign(value.substr(0, value.size() - 1));
+            value = canonicalValue;
+        } else if (type == IOCType::URL) {
+            const size_t schemeEnd = value.find("://");
+            if (schemeEnd != std::string_view::npos && schemeEnd <= 16 &&
+                std::any_of(value.begin(), value.begin() + static_cast<std::ptrdiff_t>(schemeEnd),
+                            [](char c) { return c >= 'A' && c <= 'Z'; })) {
+                canonicalValue.assign(value);
+                for (size_t i = 0; i < schemeEnd; ++i) {
+                    canonicalValue[i] = static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(canonicalValue[i])));
+                }
+                value = canonicalValue;
+            }
+        }
+        
         // =====================================================================
         // ENTERPRISE INPUT VALIDATION
         // =====================================================================

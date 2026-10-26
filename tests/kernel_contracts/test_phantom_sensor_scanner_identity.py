@@ -29455,5 +29455,17 @@ class LookupCachesAreTaggedWithTheDataGenerationTests(unittest.TestCase):
                         "the generation must be read before any tier reads data")
 
 
+class LookupAcceptsEquivalentSpellingsTests(unittest.TestCase):
+    """A lookup reduces equivalent spellings before validating (task 352)."""
+
+    def test_root_dot_and_scheme_case_are_canonicalised_before_validation(self):
+        look = strip_c_comments(read_source(ROOT / "src/PhantomCore/ThreatIntel/ThreatIntelLookup.cpp"))
+        execute = look[look.index("ThreatLookupResult ExecuteLookup(\n        IOCType type,\n        std::string_view value,\n        const LookupOptions& options,\n        ThreadLocalCache* tlCache"):]
+        canon = execute.find("value = canonicalValue;")
+        self.assertNotEqual(-1, canon)
+        self.assertLess(canon, execute.index("IOCValidator::Validate(type, value)"),
+                        "canonicalisation must run before validation refuses the spelling")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

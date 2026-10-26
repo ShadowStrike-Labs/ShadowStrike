@@ -306,6 +306,21 @@ TEST_F(StringIndicatorTest, ADomainMatchesInEveryCanonicalSpelling) {
     store->Shutdown();
 }
 
+// Task 352: valid spellings of a stored indicator are found, not refused by validation.
+TEST_F(StringIndicatorTest, AnAbsoluteDomainNameAndAnUpperCaseSchemeAreFound) {
+    auto store = Open();
+    ASSERT_TRUE(store->AddIOC(IOCType::Domain, "evil-one.example", ReputationLevel::Malicious,
+                              ThreatIntelSource::InternalAnalysis));
+    ASSERT_TRUE(store->AddIOC(IOCType::URL, "http://evil-one.example/a.exe", ReputationLevel::Malicious,
+                              ThreatIntelSource::InternalAnalysis));
+    EXPECT_TRUE(store->LookupDomain("evil-one.example.").found) << "the root dot of an absolute name was refused";
+    EXPECT_FALSE(store->LookupDomain("evil-one.example..").found);
+    EXPECT_TRUE(store->LookupURL("HTTP://evil-one.example/a.exe").found) << "an upper-case scheme was refused";
+    EXPECT_TRUE(store->LookupURL("Http://EVIL-ONE.example/a.exe").found);
+    EXPECT_FALSE(store->LookupURL("HTTP://evil-one.example/A.exe").found) << "the path is case-sensitive";
+    store->Shutdown();
+}
+
 TEST_F(StringIndicatorTest, AUrlHostIsCaseInsensitiveAndItsPathIsNot) {
     auto store = Open();
     ASSERT_TRUE(store->AddIOC(IOCType::URL, "http://EVIL.example/Payload.exe", ReputationLevel::Malicious,
