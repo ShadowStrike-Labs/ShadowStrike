@@ -730,6 +730,15 @@ struct SignatureValidatorStatistics {
     /// read failure can never be mistaken for a trust decision, and separately
     /// from invalid signatures so it cannot be read as evidence against a file.
     uint64_t subjectUnreadable = 0;
+
+    /// @brief Catalog lookups that failed rather than answered (task 373).
+    ///
+    /// Only ERROR_NOT_FOUND from the catalog database means a file is not a catalog
+    /// member. Any other failure answers nothing, so the result is Error: never
+    /// cached, never Unsigned, and the next request asks again.
+    uint64_t catalogLookupFailed = 0;
+    /// @brief Win32 error of the most recent failed catalog lookup (0 if none).
+    uint64_t catalogLookupLastError = 0;
     uint64_t blockedSigners      = 0;
     uint64_t avgValidationTimeUs = 0;
     uint64_t stolenCertDetections = 0;
@@ -1312,6 +1321,20 @@ private:
  * @brief Get signature result name
  */
 [[nodiscard]] std::string_view GetSignatureResultName(SignatureValidationResult result) noexcept;
+
+/// @brief What a catalog-database lookup established (task 373).
+enum class CatalogLookup : uint8_t {
+    Member    = 0,   ///< A catalog vouches for the file
+    NotMember = 1,   ///< The database answered: no catalog lists this hash
+    Failed    = 2    ///< No answer; the file is neither trusted nor refuted
+};
+
+/// @brief Classifies the last error of a CryptCATAdminEnumCatalogFromHash call that
+///        returned no catalog. Only ERROR_NOT_FOUND is an answer.
+[[nodiscard]] constexpr CatalogLookup ClassifyCatalogEnumMiss(unsigned long lastError) noexcept {
+    return lastError == 1168UL /* ERROR_NOT_FOUND */ ? CatalogLookup::NotMember
+                                                     : CatalogLookup::Failed;
+}
 
 /**
  * @brief Get signature type name

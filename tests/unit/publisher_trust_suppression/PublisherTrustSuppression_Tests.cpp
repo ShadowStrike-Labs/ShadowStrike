@@ -161,6 +161,48 @@ private:
     bool m_copied = false;
 };
 
+// ---------------------------------------------------------------------------
+// Catalog lookups (task 373). The 1.0.125 VM run reported ten catalog-signed
+// System32 DLLs as Unsigned; on the host all ten resolve. Only ERROR_NOT_FOUND
+// from the catalog database may become Unsigned - any other miss is no answer.
+// ---------------------------------------------------------------------------
+TEST(CatalogLookupTest, OnlyNotFoundIsAnAnswer) {
+    using ShadowStrike::Security::CatalogLookup;
+    using ShadowStrike::Security::ClassifyCatalogEnumMiss;
+    EXPECT_EQ(ClassifyCatalogEnumMiss(ERROR_NOT_FOUND), CatalogLookup::NotMember);
+    EXPECT_EQ(ClassifyCatalogEnumMiss(ERROR_SHARING_VIOLATION), CatalogLookup::Failed);
+    EXPECT_EQ(ClassifyCatalogEnumMiss(RPC_S_SERVER_UNAVAILABLE), CatalogLookup::Failed);
+    EXPECT_EQ(ClassifyCatalogEnumMiss(ERROR_SUCCESS), CatalogLookup::Failed);
+}
+
+TEST(PublisherTrustSuppressionTest, FieldReportedCatalogDllsVerifyAsMicrosoftSigned) {
+    ASSERT_NO_FATAL_FAILURE(EnsureValidatorReady());
+    auto& validator = DigitalSignatureValidator::Instance();
+    for (const wchar_t* name : {L"rpcss.dll", L"gpsvc.dll", L"w32time.dll"}) {
+        const auto file = SystemDirectory() / name;
+        ASSERT_TRUE(std::filesystem::exists(file)) << file.string();
+        const auto info = validator.VerifyFile(file.wstring(), ScanPathOptions());
+        EXPECT_TRUE(info.isValid && info.isMicrosoftSigned)
+            << file.filename().string() << ": result=" << static_cast<int>(info.result)
+            << " error='" << info.errorMessage << "'";
+        EXPECT_EQ(info.type, ShadowStrike::Security::SignatureType::Catalog) << file.filename().string();
+    }
+}
+
+TEST(PublisherTrustSuppressionTest, ANonMemberIsStillUnsigned) {
+    ASSERT_NO_FATAL_FAILURE(EnsureValidatorReady());
+    const auto dir = std::filesystem::temp_directory_path() / "phantom-trust-suppression";
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "not-a-catalog-member.bin";
+    { std::ofstream(file, std::ios::binary) << "plain bytes with no signature and no catalog entry"; }
+    const auto info = DigitalSignatureValidator::Instance().VerifyFile(file.wstring(), ScanPathOptions());
+    EXPECT_FALSE(info.isValid);
+    EXPECT_EQ(info.result, ShadowStrike::Security::SignatureValidationResult::Unsigned)
+        << "error='" << info.errorMessage << "'";
+    std::error_code ec;
+    std::filesystem::remove(file, ec);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------

@@ -29749,5 +29749,47 @@ class DownloadBlockerFollowsSignInTests(unittest.TestCase):
         self.assertIn("MergeMonitoredDirectories(m_monitoredDirs, resolved, MAX_MONITORED_DIRS)", body)
 
 
+class CatalogLookupFailureIsNotUnsignedTests(unittest.TestCase):
+    """A catalog lookup that did not answer is Error, never Unsigned (task 373).
+
+    The 1.0.125 VM run reported ten catalog-signed System32 DLLs as Unsigned; on the host
+    every one resolves through the same API calls.
+    """
+
+    SRC = ROOT / "src/PhantomCore/SelfProtection/DigitalSignatureValidator.cpp"
+    HDR = ROOT / "src/PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
+
+    def setUp(self):
+        self.src = strip_c_comments(read_source(self.SRC))
+
+    def test_only_not_found_is_an_answer(self):
+        body = extract_c_function(strip_c_comments(read_source(self.HDR)), "ClassifyCatalogEnumMiss")
+        self.assertIn("lastError == 1168UL", body)
+        self.assertIn("CatalogLookup::NotMember", body)
+        self.assertIn(": CatalogLookup::Failed", body)
+
+    def test_resolution_reports_three_outcomes(self):
+        body = extract_c_function(self.src, "resolveCatalogForFile")
+        self.assertIn("outcome = ClassifyCatalogEnumMiss(outError);", body)
+        self.assertIn("CatalogLookup outcome = CatalogLookup::Failed;", body)
+        self.assertEqual(2, body.count("return CatalogLookup::Failed;"))
+
+    def test_a_failed_lookup_is_error_and_counted(self):
+        body = extract_c_function(self.src, "verifyCatalogSignature")
+        failed = body[body.index("if (lookup == CatalogLookup::Failed) {"):body.index("if (lookup == CatalogLookup::NotMember) {")]
+        self.assertIn("result.result = SignatureValidationResult::Error;", failed)
+        self.assertIn("m_stats.catalogLookupFailed++;", failed)
+        self.assertNotIn("Unsigned", failed)
+        raw = read_source(self.SRC).replace("\r\n", "\n")
+        cache = raw[raw.index("            // Cache result\n"):]
+        self.assertTrue(cache.split("\n")[1].strip().startswith(
+            "if (useCache && result.result != SignatureValidationResult::Error) {"),
+            "an Error result is cached and answers later requests")
+
+    def test_hashing_shares_write(self):
+        body = extract_c_function(self.src, "computeCatalogMembershipHash")
+        self.assertIn("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

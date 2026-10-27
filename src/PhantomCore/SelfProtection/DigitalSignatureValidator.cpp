@@ -329,6 +329,8 @@ std::string SignatureValidatorStatistics::ToJson() const {
     oss << "\"unrecognisedTrustStatus\":" << unrecognisedTrustStatus << ",";
     oss << "\"unsignableTargetsRefused\":" << unsignableTargetsRefused << ",";
     oss << "\"subjectUnreadable\":" << subjectUnreadable << ",";
+    oss << "\"catalogLookupFailed\":" << catalogLookupFailed << ",";
+    oss << "\"catalogLookupLastError\":" << catalogLookupLastError << ",";
     oss << "\"blockedSigners\":" << blockedSigners << ",";
     oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"stolenCertDetections\":" << stolenCertDetections << ",";
@@ -835,7 +837,8 @@ public:
             // matches the member digests stored inside the catalog. Using the
             // wrong hash here is why catalog-signed files failed to validate.
             std::vector<BYTE> memberHash;
-            if (!computeCatalogMembershipHash(filePathStr, memberHash) ||
+            DWORD memberHashError = ERROR_SUCCESS;
+            if (!computeCatalogMembershipHash(filePathStr, memberHash, memberHashError) ||
                 memberHash.size() != sizeof(FileHash)) {
                 result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Failed to compute catalog membership hash";
@@ -1342,7 +1345,9 @@ public:
         // to find the catalog for catalog-signed OS binaries.
         std::wstring catalogPath;
         std::vector<BYTE> catHash;
-        if (resolveCatalogForFile(std::wstring(filePath), catalogPath, catHash) &&
+        DWORD lookupError = ERROR_SUCCESS;
+        if (resolveCatalogForFile(std::wstring(filePath), catalogPath, catHash, lookupError) ==
+                CatalogLookup::Member &&
             !catalogPath.empty()) {
             return catalogPath;
         }
@@ -2069,14 +2074,20 @@ private:
     // subsequent same-algorithm enumeration.
     [[nodiscard]] bool computeCatalogMembershipHash(
         const std::wstring& filePath,
-        std::vector<BYTE>& outHash
+        std::vector<BYTE>& outHash,
+        DWORD& outError
     ) noexcept {
         outHash.clear();
+        outError = ERROR_SUCCESS;
 
+        // FILE_SHARE_WRITE as well: without it the open fails with a sharing
+        // violation whenever another process holds the file for writing, and that
+        // failure is an absence of an answer, not evidence the file is unsigned.
         HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
             FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) {
+            outError = GetLastError();
             return false;
         }
 
@@ -2087,6 +2098,7 @@ private:
                                           BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
             useV2 = false;
             if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
+                outError = GetLastError();
                 CloseHandle(hFile);
                 return false;
             }
@@ -2098,10 +2110,12 @@ private:
             ? CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile, &hashLen, hashBytes, 0)
             : CryptCATAdminCalcHashFromFileHandle(hFile, &hashLen, hashBytes, 0);
 
+        const DWORD calcError = calcOk ? ERROR_SUCCESS : GetLastError();
         CryptCATAdminReleaseContext(hCatAdmin, 0);
         CloseHandle(hFile);
 
         if (!calcOk || hashLen == 0) {
+            outError = calcOk ? ERROR_INVALID_DATA : calcError;
             return false;
         }
         outHash.assign(hashBytes, hashBytes + hashLen);
@@ -2115,15 +2129,18 @@ private:
     // catalog-signed OS binaries (most of System32 -- msxml3, imageres,
     // wscinterop, ntdll, ...) were previously mis-classified as unsigned and
     // pushed through the full detection pipeline on every access.
-    [[nodiscard]] bool resolveCatalogForFile(
+    [[nodiscard]] CatalogLookup resolveCatalogForFile(
         const std::wstring& filePath,
         std::wstring& outCatalogPath,
-        std::vector<BYTE>& outHash
+        std::vector<BYTE>& outHash,
+        DWORD& outError
     ) noexcept {
         outCatalogPath.clear();
+        outError = ERROR_SUCCESS;
 
-        if (!computeCatalogMembershipHash(filePath, outHash) || outHash.empty()) {
-            return false;
+        if (!computeCatalogMembershipHash(filePath, outHash, outError) || outHash.empty()) {
+            if (outError == ERROR_SUCCESS) outError = ERROR_INVALID_DATA;
+            return CatalogLookup::Failed;
         }
 
         // Enumerate with the same algorithm preference used to hash. The hash is
@@ -2133,11 +2150,12 @@ private:
         if (!CryptCATAdminAcquireContext2(&hCatAdmin, &driverActionGuid,
                                           BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
             if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
-                return false;
+                outError = GetLastError();
+                return CatalogLookup::Failed;
             }
         }
 
-        bool found = false;
+        CatalogLookup outcome = CatalogLookup::Failed;
         HCATINFO hCatInfo = CryptCATAdminEnumCatalogFromHash(
             hCatAdmin, outHash.data(), static_cast<DWORD>(outHash.size()), 0, nullptr);
         if (hCatInfo) {
@@ -2145,13 +2163,18 @@ private:
             catInfo.cbStruct = sizeof(catInfo);
             if (CryptCATCatalogInfoFromContext(hCatInfo, &catInfo, 0)) {
                 outCatalogPath = catInfo.wszCatalogFile;
-                found = true;
+                outcome = CatalogLookup::Member;
+            } else {
+                outError = GetLastError();
             }
             CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+        } else {
+            outError = GetLastError();
+            outcome = ClassifyCatalogEnumMiss(outError);
         }
 
         CryptCATAdminReleaseContext(hCatAdmin, 0);
-        return found;
+        return outcome;
     }
 
     [[nodiscard]] SignatureInfo verifyCatalogSignature(
@@ -2163,7 +2186,20 @@ private:
         // Resolve the catalog via the correct catalog-membership hash.
         std::wstring catalogPath;
         std::vector<BYTE> catHash;
-        if (!resolveCatalogForFile(filePath, catalogPath, catHash)) {
+        DWORD lookupError = ERROR_SUCCESS;
+        const CatalogLookup lookup = resolveCatalogForFile(filePath, catalogPath, catHash, lookupError);
+        if (lookup == CatalogLookup::Failed) {
+            // No answer is not a verdict: Error is neither cached nor read as Unsigned,
+            // and trust consumers fail closed on it (task 373).
+            m_stats.catalogLookupFailed++;
+            m_stats.catalogLookupLastError.store(lookupError, std::memory_order_relaxed);
+            SS_LOG_INFO(LOG_CATEGORY, L"Catalog lookup failed (Win32 %lu), no verdict: %ls",
+                        static_cast<unsigned long>(lookupError), filePath.c_str());
+            result.result = SignatureValidationResult::Error;
+            result.errorMessage = "Catalog lookup failed";
+            return result;
+        }
+        if (lookup == CatalogLookup::NotMember) {
             // Not a member of any installed catalog => genuinely not
             // catalog-signed. Unsigned/non-MS/tampered files land here and
             // continue to receive the full detection pipeline upstream.
@@ -2383,6 +2419,8 @@ private:
         // measurement that produced this counter.
         std::atomic<uint64_t> unsignableTargetsRefused{0};
         std::atomic<uint64_t> subjectUnreadable{0};
+        std::atomic<uint64_t> catalogLookupFailed{0};
+        std::atomic<uint64_t> catalogLookupLastError{0};
         std::atomic<uint64_t> blockedSigners{0};
         std::atomic<uint64_t> avgValidationTimeUs{0};
         std::atomic<uint64_t> stolenCertDetections{0};
@@ -2395,6 +2433,7 @@ private:
             revocationChecks = 0; revokedCertificates = 0; expiredCertificates = 0;
             revocationUndetermined = 0; unrecognisedTrustStatus = 0;
             unsignableTargetsRefused = 0; subjectUnreadable = 0;
+            catalogLookupFailed = 0; catalogLookupLastError = 0;
             blockedSigners = 0; avgValidationTimeUs = 0;
             stolenCertDetections = 0; anomalyDetections = 0;
             startTime = Clock::now();
@@ -2415,6 +2454,8 @@ private:
             s.unrecognisedTrustStatus = unrecognisedTrustStatus.load(std::memory_order_relaxed);
             s.unsignableTargetsRefused = unsignableTargetsRefused.load(std::memory_order_relaxed);
             s.subjectUnreadable = subjectUnreadable.load(std::memory_order_relaxed);
+            s.catalogLookupFailed = catalogLookupFailed.load(std::memory_order_relaxed);
+            s.catalogLookupLastError = catalogLookupLastError.load(std::memory_order_relaxed);
             s.blockedSigners      = blockedSigners.load(std::memory_order_relaxed);
             s.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
             s.stolenCertDetections = stolenCertDetections.load(std::memory_order_relaxed);
