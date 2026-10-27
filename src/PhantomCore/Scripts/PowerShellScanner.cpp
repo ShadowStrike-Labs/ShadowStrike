@@ -100,6 +100,14 @@ static constexpr TaggedPattern AMSI_BYPASS_PATTERNS[] = {
     {"etweventwrite",                                 "ETW bypass (blinding)"},
 };
 
+// Memory and reflection primitives from the table above. SecureString marshalling, P/Invoke
+// and private-member reflection are routine (BitLocker.psm1 marshals SecureStrings), so
+// these describe AMSI tampering only beside an AMSI referent or an obfuscated reference.
+static constexpr const char* AMSI_PRIMITIVES_NEEDING_REFERENT[] = {
+    "[ref].assembly.gettype", "nonpublic,static", "runtime.interopservices.marshal",
+    "virtualprotect", "ntwritevirtualmemory",
+};
+
 // Obfuscated AMSI references (string-split evasion)
 static constexpr const char* AMSI_OBFUSCATED_REFS[] = {
     "('ams'+'i')",  "('am'+'si')",  "('a'+'msi')",
@@ -173,6 +181,44 @@ static constexpr ScoredPattern SUSPICIOUS_CMDLETS[] = {
     {"-windowstyle hidden",                   45},
     {"-w hidden",                             45},
 };
+
+// ── Identification vs capability ─────────────────────────────────────────────
+// The SUSPICIOUS_CMDLETS entries named here are offensive tooling or its command grammar:
+// one is an identification and may convict alone. Every other entry is a capability that
+// ordinary administration uses daily (Add-Type, P/Invoke, web requests, base64, remoting).
+// Summed without a cap, capabilities made 24 of the 303 PowerShell modules Windows ships
+// score as blocking (task 364), so their sum is capped below the suspicious threshold and a
+// capability counts as evidence only inside one of the behaviour combinations below.
+static constexpr const char* STRONG_INDICATOR_NAMES[] = {
+    "invoke-mimikatz", "invoke-reflectivepeinjection", "invoke-shellcode",
+    "invoke-tokenmanipulation", "invoke-credentialinjection", "invoke-dllinjection",
+    "invoke-obfuscation", "out-encodedcommand", "invoke-cradlecrafter", "powersploit",
+    "mimikatz", "sekurlsa::", "lsadump::", "kerberos::golden", "privilege::debug",
+    "sekurlsa::logonpasswords", "rubeus", "sharphound",
+};
+
+static constexpr int WEAK_SCORE_CAP = 45;
+static constexpr int SCORE_BEHAVIOUR_COMBINATION = 90;
+
+// Behaviour combinations: a capability paired with what turns it into an attack.
+static constexpr const char* DOWNLOAD_PRIMITIVES[] = {
+    "downloadstring", "downloadfile", "downloaddata", "net.webclient",
+    "invoke-webrequest", "invoke-restmethod", "start-bitstransfer",
+    "msxml2.xmlhttp", "winhttp.winhttprequest",
+};
+static constexpr const char* DOWNLOAD_ALIAS_TOKENS[] = { "iwr", "irm" };
+static constexpr const char* EXEC_SINKS[] = {
+    "invoke-expression", "scriptblock]::create", ".invokescript(",
+};
+static constexpr const char* EXEC_SINK_TOKENS[] = { "iex" };
+static constexpr const char* DECODE_PRIMITIVES[] = {
+    "frombase64string", "gzipstream", "deflatestream",
+};
+static constexpr const char* REFLECTIVE_LOADS[] = {
+    "assembly]::load(", "currentdomain.load(",
+};
+static constexpr const char* HIDDEN_WINDOW_FLAGS[] = { "-w hidden", "-windowstyle hidden" };
+static constexpr const char* ENCODED_COMMAND_FLAGS[] = { "-enc ", "-encodedcommand" };
 
 // ── Download cradle patterns ─────────────────────────────────────────────────
 static constexpr ScoredPattern DOWNLOAD_CRADLES[] = {
@@ -760,9 +806,15 @@ private:
         std::string normalized = normalize(content);
         std::string normLower  = toLower(normalized);
 
+        // A module manifest (.psd1) is data that PowerShell evaluates in restricted language
+        // mode: it cannot call a cmdlet, so only identifications apply to it. Scanned as code,
+        // Microsoft.PowerShell.Utility.psd1 convicted on the cmdlet NAMES it exports.
+        const bool manifest = depth == 0 && isManifestName(contextName);
+        int weakScore = 0;
+
         // ── Phase 1: AMSI bypass detection ──────────────────────────────
         std::vector<std::string> amsiTechniques;
-        if (detectAmsiBypass(normLower, amsiTechniques)) {
+        if (!manifest && detectAmsiBypass(normLower, amsiTechniques)) {
             totalScore += Constants::Heuristics::SCORE_AMSI_BYPASS;
             result.category = ThreatCategory::AMSI_TAMPERING;
             m_stats.amsiBypassesBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -775,9 +827,16 @@ private:
         }
 
         // ── Phase 2: Suspicious cmdlet/API matching ─────────────────────
+        // Identifications score in full; capabilities go to weakScore, which is capped.
         for (const auto& [pat, score] : Patterns::SUSPICIOUS_CMDLETS) {
             if (normLower.find(pat) != std::string::npos) {
-                totalScore += score;
+                if (isStrongIndicator(pat)) {
+                    totalScore += score;
+                } else if (!manifest) {
+                    weakScore += score;
+                } else {
+                    continue;
+                }
                 rules.push_back(std::string("Suspicious: ") + pat);
                 addFlaggedLine(content, normLower, pat, flagged);
             }
@@ -793,7 +852,7 @@ private:
         }
 
         // ── Phase 4: Shellcode injection combo ──────────────────────────
-        {
+        if (!manifest) {
             int shellcodeHits = 0;
             for (const char* m : Patterns::SHELLCODE_MARKERS) {
                 if (normLower.find(m) != std::string::npos) ++shellcodeHits;
@@ -806,7 +865,7 @@ private:
         }
 
         // ── Phase 5: WMI persistence ────────────────────────────────────
-        {
+        if (!manifest) {
             int wmiHits = 0;
             for (const char* w : Patterns::WMI_PERSISTENCE) {
                 if (normLower.find(w) != std::string::npos) ++wmiHits;
@@ -818,46 +877,80 @@ private:
             }
         }
 
+        // Behaviour predicates shared by phases 6 to 8.
+        const bool hasExecSink = containsAny(normLower, Patterns::EXEC_SINKS) ||
+                                 containsAnyToken(normLower, Patterns::EXEC_SINK_TOKENS);
+        const bool hasDownload = containsAny(normLower, Patterns::DOWNLOAD_PRIMITIVES) ||
+                                 containsAnyToken(normLower, Patterns::DOWNLOAD_ALIAS_TOKENS);
+        const bool hasDecode = containsAny(normLower, Patterns::DECODE_PRIMITIVES);
+
         // ── Phase 6: Constrained language mode bypass ───────────────────
-        for (const char* c : Patterns::CLM_BYPASS) {
-            if (normLower.find(c) != std::string::npos) {
-                totalScore += Constants::Heuristics::SCORE_LANGUAGE_MODE_BYPASS;
-                rules.push_back(std::string("CLM bypass: ") + c);
-                break;
+        // Runspace creation and the words FullLanguage/ConstrainedLanguage are routine
+        // (DSC resources create runspaces). Reading or setting the session's language mode
+        // to FullLanguage is the bypass; the other markers are capabilities.
+        if (!manifest) {
+            const bool languageModeTamper =
+                normLower.find("$executioncontext.sessionstate.languagemode") != std::string::npos &&
+                normLower.find("fulllanguage") != std::string::npos;
+            for (const char* c : Patterns::CLM_BYPASS) {
+                if (normLower.find(c) != std::string::npos) {
+                    if (languageModeTamper) {
+                        totalScore += Constants::Heuristics::SCORE_LANGUAGE_MODE_BYPASS;
+                    } else {
+                        weakScore += 20;
+                    }
+                    rules.push_back(std::string("CLM bypass: ") + c);
+                    break;
+                }
             }
         }
 
         // ── Phase 7: Reverse shell ──────────────────────────────────────
-        {
+        // A socket and its stream are what Test-NetConnection uses. A reverse shell also
+        // executes what it receives, or is a named tool.
+        if (!manifest) {
             int revHits = 0;
             for (const char* r : Patterns::REVERSE_SHELL) {
                 if (normLower.find(r) != std::string::npos) ++revHits;
             }
-            if (revHits >= 2) {
+            const bool namedTool = normLower.find("invoke-powershelltcp") != std::string::npos;
+            if (revHits >= 2 && (hasExecSink || namedTool)) {
                 totalScore += Constants::Heuristics::SCORE_REVERSE_SHELL;
                 rules.push_back("Reverse shell pattern");
                 result.category = ThreatCategory::REVERSE_SHELL;
             }
         }
 
-        // ── Phase 8: Download cradles ───────────────────────────────────
-        for (const auto& [pat, score] : Patterns::DOWNLOAD_CRADLES) {
-            if (normLower.find(pat) != std::string::npos) {
-                totalScore += score;
-                rules.push_back(std::string("Download cradle: ") + pat);
-                if (result.category == ThreatCategory::NONE)
-                    result.category = ThreatCategory::DOWNLOADER;
-            }
+        // ── Phase 8: Behaviour combinations ─────────────────────────────
+        // Download, decode, reflective load and hidden launch are capabilities (scored in
+        // phase 2 as weak); paired with what executes their result they are the attack.
+        if (!manifest) {
+            const auto combination = [&](bool present, const char* rule, ThreatCategory category) {
+                if (!present) return;
+                totalScore += Patterns::SCORE_BEHAVIOUR_COMBINATION;
+                rules.push_back(rule);
+                if (result.category == ThreatCategory::NONE) result.category = category;
+            };
+            combination(hasDownload && hasExecSink, "Download and execute", ThreatCategory::DOWNLOADER);
+            combination(hasDecode && hasExecSink, "Decode and execute in memory", ThreatCategory::NONE);
+            combination(hasDecode && containsAny(normLower, Patterns::REFLECTIVE_LOADS),
+                        "Reflective load of a decoded assembly", ThreatCategory::PROCESS_INJECTION);
+            combination(containsAny(normLower, Patterns::HIDDEN_WINDOW_FLAGS) &&
+                            containsAny(normLower, Patterns::ENCODED_COMMAND_FLAGS),
+                        "Hidden launch of an encoded command", ThreatCategory::NONE);
         }
 
         // ── Phase 9: Obfuscation analysis ───────────────────────────────
+        // A capability: line-continuation backticks alone made eight Windows modules score.
         ObfuscationDetails obf = analyzeObfuscation(content);
         result.obfuscation = obf;
-        if (obf.primaryType != ObfuscationType::NONE) {
+        if (!manifest && obf.primaryType != ObfuscationType::NONE) {
             m_stats.obfuscatedDetected.fetch_add(1, std::memory_order_relaxed);
-            totalScore += Constants::Heuristics::SCORE_SUSPICIOUS_OBFUSCATION;
+            weakScore += Constants::Heuristics::SCORE_SUSPICIOUS_OBFUSCATION;
             rules.push_back("Obfuscation: " + obfuscationName(obf.primaryType));
         }
+
+        totalScore += std::min(weakScore, Patterns::WEAK_SCORE_CAP);
 
         // ── Phase 10: Multi-layer deobfuscation ─────────────────────────
         const uint32_t maxDepth = getConfigValue<uint32_t>(
@@ -865,7 +958,7 @@ private:
         const bool deobfEnabled = getConfigValue<bool>(
             [](const PowerShellScanConfig& c){ return c.enableDeobfuscation; });
 
-        if (deobfEnabled && depth < maxDepth) {
+        if (!manifest && deobfEnabled && depth < maxDepth) {
             std::string deobfuscated = deobfuscate(content);
             if (!deobfuscated.empty() && deobfuscated != content) {
                 auto inner = analyzeContent(deobfuscated, contextName + "_deobf", depth + 1);
@@ -928,9 +1021,20 @@ private:
     ) const noexcept {
         bool detected = false;
 
-        // Direct pattern matches (patterns are already lowercase constexpr)
+        // Direct pattern matches (patterns are already lowercase constexpr). The memory and
+        // reflection primitives are collected separately and count only beside a referent.
+        std::vector<std::string> primitives;
         for (const auto& [pat, desc] : Patterns::AMSI_BYPASS_PATTERNS) {
-            if (contentLower.find(pat) != std::string::npos) {
+            if (contentLower.find(pat) == std::string::npos) {
+                continue;
+            }
+            const bool needsReferent = std::any_of(
+                std::begin(Patterns::AMSI_PRIMITIVES_NEEDING_REFERENT),
+                std::end(Patterns::AMSI_PRIMITIVES_NEEDING_REFERENT),
+                [&](const char* p) { return std::string_view(p) == pat; });
+            if (needsReferent) {
+                primitives.emplace_back(desc);
+            } else {
                 techniques.push_back(desc);
                 detected = true;
             }
@@ -955,15 +1059,61 @@ private:
             detected = true;
         }
 
-        // Marshal::WriteInt32 AMSI context null
+        // Marshal::WriteInt32 AMSI context null. The AMSI half is required: WriteInt32
+        // through Marshal alone is ordinary interop.
         if (contentLower.find("writeint32") != std::string::npos &&
-            (contentLower.find("amsi") != std::string::npos ||
-             contentLower.find("marshal") != std::string::npos)) {
+            contentLower.find("amsi") != std::string::npos) {
             techniques.push_back("Marshal::WriteInt32 AMSI context null");
             detected = true;
         }
 
+        if (detected) {
+            techniques.insert(techniques.end(), primitives.begin(), primitives.end());
+        }
         return detected;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PRECISION HELPERS (task 364)
+    // ════════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] static bool isManifestName(std::string_view name) noexcept {
+        constexpr std::string_view ext = ".psd1";
+        if (name.size() < ext.size()) return false;
+        const auto tail = name.substr(name.size() - ext.size());
+        return std::equal(tail.begin(), tail.end(), ext.begin(), [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) == b;
+        });
+    }
+
+    [[nodiscard]] static bool isStrongIndicator(std::string_view pattern) noexcept {
+        return std::any_of(std::begin(Patterns::STRONG_INDICATOR_NAMES),
+                           std::end(Patterns::STRONG_INDICATOR_NAMES),
+                           [&](const char* n) { return pattern == n; });
+    }
+
+    template <size_t N>
+    [[nodiscard]] static bool containsAny(const std::string& text, const char* const (&patterns)[N]) noexcept {
+        return std::any_of(std::begin(patterns), std::end(patterns),
+                           [&](const char* p) { return text.find(p) != std::string::npos; });
+    }
+
+    // Whole-word match for short aliases ("iex" must not match inside another word).
+    template <size_t N>
+    [[nodiscard]] static bool containsAnyToken(const std::string& text, const char* const (&tokens)[N]) noexcept {
+        const auto isWordChar = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '$';
+        };
+        for (const char* token : tokens) {
+            const std::string_view tok(token);
+            for (size_t pos = text.find(tok); pos != std::string::npos; pos = text.find(tok, pos + 1)) {
+                const bool left = pos == 0 || !isWordChar(text[pos - 1]);
+                const size_t end = pos + tok.size();
+                const bool right = end >= text.size() || !isWordChar(text[end]);
+                if (left && right) return true;
+            }
+        }
+        return false;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1013,16 +1163,9 @@ private:
             }
         }
 
-        // Try removing backticks (already done in normalize, but for raw input)
-        std::string noBt;
-        noBt.reserve(content.size());
-        for (char c : content) {
-            if (c != '`') noBt += c;
-        }
-        if (noBt.size() != content.size() && !noBt.empty()) {
-            return noBt;
-        }
-
+        // Backtick removal is not a layer: normalize() already strips backticks before
+        // every phase, so re-analysing the stripped text counted the same matches again
+        // at half weight.
         return {};
     }
 

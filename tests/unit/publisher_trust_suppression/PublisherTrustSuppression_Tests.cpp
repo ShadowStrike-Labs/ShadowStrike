@@ -281,3 +281,22 @@ TEST(PublisherTrustSuppressionTest, TheSuppressionCounterIsReadable) {
     // at all, which is what was missing for archivesScanned before 0771f440.
     EXPECT_GE(stats.heuristicVerdictsSuppressedByTrust, 0ull);
 }
+
+// ---------------------------------------------------------------------------
+// Catalog-signed PowerShell modules (task 364). The 1.0.124 VM run convicted
+// Microsoft.PowerShell.Utility.psd1 and BitLocker.psm1 and blocked reads of them,
+// which broke every PowerShell session on the machine. Neither file carries an
+// embedded signature block; both are members of a Windows catalog.
+// ---------------------------------------------------------------------------
+TEST(PublisherTrustSuppressionTest, CatalogSignedPowerShellModulesVerifyAsMicrosoftSigned) {
+    ASSERT_NO_FATAL_FAILURE(EnsureValidatorReady());
+    const auto modules = SystemDirectory() / L"WindowsPowerShell" / L"v1.0" / L"Modules";
+    for (const auto& file : {modules / L"Microsoft.PowerShell.Utility" / L"Microsoft.PowerShell.Utility.psd1",
+                             modules / L"BitLocker" / L"BitLocker.psm1"}) {
+        ASSERT_TRUE(std::filesystem::exists(file)) << file.string();
+        const auto info = DigitalSignatureValidator::Instance().VerifyFile(file.wstring(), ScanPathOptions());
+        EXPECT_TRUE(info.isValid && info.isMicrosoftSigned)
+            << file.filename().string() << ": result=" << static_cast<int>(info.result)
+            << " error='" << info.errorMessage << "'";
+    }
+}

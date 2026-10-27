@@ -29536,5 +29536,39 @@ class ThreatIntelImporterDeclarationsAreDefinedTests(unittest.TestCase):
         self.assertIn("return ImportFromStream(database, stream, opts, nullptr);", body)
 
 
+class PowerShellScannerPrecisionTests(unittest.TestCase):
+    """PowerShellScanner convicts on identifications and behaviour combinations (task 364).
+
+    Summing capability scores made 24 of the 303 PowerShell modules Windows ships score as
+    blocking; the 1.0.124 VM run blocked reads of two of them and PowerShell stopped working.
+    """
+
+    SRC = ROOT / "src/PhantomCore/Scripts/PowerShellScanner.cpp"
+
+    def setUp(self):
+        self.src = strip_c_comments(read_source(self.SRC))
+        self.analyze = extract_c_function(self.src, "analyzeContent")
+
+    def test_capabilities_are_capped(self):
+        self.assertIn("weakScore += score;", self.analyze)
+        self.assertIn("totalScore += std::min(weakScore, Patterns::WEAK_SCORE_CAP);", self.analyze)
+        cap = re.search(r"WEAK_SCORE_CAP = (\d+);", self.src)
+        thr = re.search(r"THRESHOLD_SUSPICIOUS\s*=\s*(\d+);", read_source(ROOT / "src/PhantomCore/Scripts/PowerShellScanner.hpp"))
+        self.assertLess(int(cap.group(1)), int(thr.group(1)), "capabilities alone reach suspicious")
+
+    def test_manifests_get_identifications_only(self):
+        self.assertIn("const bool manifest = depth == 0 && isManifestName(contextName);", self.analyze)
+        self.assertIn("if (!manifest && detectAmsiBypass(normLower, amsiTechniques)) {", self.analyze)
+
+    def test_amsi_primitives_need_a_referent(self):
+        body = extract_c_function(self.src, "detectAmsiBypass")
+        self.assertIn("primitives.emplace_back(desc);", body)
+        self.assertNotIn('contentLower.find("marshal")', body)
+
+    def test_backtick_stripping_is_not_reanalysed(self):
+        body = extract_c_function(self.src, "deobfuscate")
+        self.assertNotIn("noBt", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
