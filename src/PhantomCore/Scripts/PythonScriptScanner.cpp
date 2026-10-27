@@ -50,6 +50,7 @@
 
 #include "pch.h"
 #include "PythonScriptScanner.hpp"
+#include "KernelBlockTarget.hpp"
 
 // Cross-module wiring
 #include "../Communication/AlertSystem.hpp"
@@ -2917,6 +2918,10 @@ void PythonScriptScanner::OnKernelImageLoad(
 [[nodiscard]] bool PythonScriptScanner::RequestKernelProcessBlock(
     uint32_t pid, std::wstring_view reason)
 {
+    if (!IsKernelBlockTarget(pid)) {
+        SS_LOG_WARN(L"PythonScanner", L"Refusing kernel process block for PID %u", pid);
+        return false;
+    }
     if (!Communication::IPCManager::HasInstance()) {
         SS_LOG_WARN(L"PythonScanner",
             L"Cannot block PID=%u: IPCManager not available", pid);

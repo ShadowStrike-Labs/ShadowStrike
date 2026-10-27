@@ -33,6 +33,7 @@
 
 #include "pch.h"
 #include "PowerShellScanner.hpp"
+#include "KernelBlockTarget.hpp"
 
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -1365,7 +1366,10 @@ private:
     // ════════════════════════════════════════════════════════════════════════
 
     void notifyKernelBlock(uint32_t pid, const char* reason) const noexcept {
-        if (pid == 0) return;
+        if (!IsKernelBlockTarget(pid)) {
+            SS_LOG_WARN(LOG_CAT, L"Refusing kernel block for PID %u (%hs)", pid, reason);
+            return;
+        }
         try {
             // Build behavioral alert for kernel
             // The IPC path sends FilterMessageType_BehavioralAlert which the
@@ -1616,10 +1620,8 @@ private:
                 L"MALICIOUS: %hs score=%d PID=%u",
                 result.threatName.c_str(), result.riskScore, result.processId);
 
-            // Kernel enforcement
-            if (result.processId != 0) {
-                notifyKernelBlock(result.processId, result.threatName.c_str());
-            }
+            // Kernel enforcement; notifyKernelBlock refuses pseudo and own PIDs.
+            notifyKernelBlock(result.processId, result.threatName.c_str());
 
             // AlertSystem wiring
             reportThreatToAlertSystem(result);
@@ -1906,6 +1908,10 @@ public:
         uint32_t processId,
         const std::wstring& reason
     ) noexcept {
+        if (!IsKernelBlockTarget(processId)) {
+            SS_LOG_WARN(LOG_CAT, L"Refusing kernel process block for PID %u", processId);
+            return false;
+        }
         try {
             if (!Communication::IPCManager::HasInstance()) return false;
             auto& ipc = Communication::IPCManager::Instance();

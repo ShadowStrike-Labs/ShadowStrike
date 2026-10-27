@@ -50,6 +50,7 @@
 
 #include "pch.h"
 #include "MacroDetector.hpp"
+#include "KernelBlockTarget.hpp"
 
 // Standard library includes
 #include <algorithm>
@@ -2754,6 +2755,11 @@ void MacroDetectorImpl::OnKernelImageLoad(
 [[nodiscard]] bool MacroDetectorImpl::RequestKernelProcessBlock(
     uint32_t processId,
     const std::wstring& reason) {
+
+    if (!IsKernelBlockTarget(processId)) {
+        SS_LOG_WARN(L"MacroDetector", L"Refusing kernel process block for PID %u", processId);
+        return false;
+    }
 
     try {
         if (!Communication::IPCManager::HasInstance()) {

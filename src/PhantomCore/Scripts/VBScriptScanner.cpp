@@ -42,6 +42,7 @@
 
 #include "pch.h"
 #include "VBScriptScanner.hpp"
+#include "KernelBlockTarget.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
@@ -2689,6 +2690,10 @@ void VBScriptScanner::OnKernelImageLoad(
 [[nodiscard]] bool VBScriptScanner::RequestKernelProcessBlock(
     uint32_t pid, std::wstring_view reason)
 {
+    if (!IsKernelBlockTarget(pid)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"Refusing kernel process block for PID %u", pid);
+        return false;
+    }
     if (!Communication::IPCManager::HasInstance()) {
         SS_LOG_WARN(LOG_CATEGORY,
             L"Cannot block PID=%u: IPCManager not available", pid);

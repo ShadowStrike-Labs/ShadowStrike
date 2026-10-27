@@ -2756,6 +2756,9 @@
     <ClInclude Include="src\PhantomCore\Scripts\PowerShellScanner.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\PhantomCore\Scripts\KernelBlockTarget.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\PhantomCore\Scripts\PythonScriptScanner.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>

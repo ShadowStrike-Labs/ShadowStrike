@@ -42,6 +42,7 @@
 
 #include "pch.h"
 #include "JavaScriptScanner.hpp"
+#include "KernelBlockTarget.hpp"
 
 #include <regex>
 #include <cmath>
@@ -2649,9 +2650,9 @@ bool JavaScriptScannerImpl::RequestKernelProcessBlock(
     uint32_t processId,
     const std::wstring& reason) {
 
-    if (!IsAcceptableUserModePid(processId)) {
+    if (!IsKernelBlockTarget(processId)) {
         SS_LOG_WARN(LOG_CATEGORY,
-            L"Refusing kernel process block for pseudo-PID %u", processId);
+            L"Refusing kernel process block for PID %u", processId);
         return false;
     }
 

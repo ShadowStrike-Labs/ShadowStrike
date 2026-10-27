@@ -38,6 +38,7 @@
 
 #include "pch.h"
 #include "AMSIIntegration.hpp"
+#include "KernelBlockTarget.hpp"
 
 // ============================================================================
 // WINDOWS AMSI SDK
@@ -960,7 +961,8 @@ public:
         request.content = buffer;
         request.contentName = std::wstring(contentName);
         request.sessionId = sessionId;
-        request.processId = GetCurrentProcessId();
+        // The service scans content it read itself: no process originated it.
+        request.processId = 0;
 
         auto response = ScanBuffer(request);
         return response.result;
@@ -992,7 +994,7 @@ public:
             utf8Content.size());
         request.contentName = std::wstring(contentName);
         request.contentType = type;
-        request.processId = GetCurrentProcessId();
+        request.processId = 0;   // service-side content, see ScanBuffer
 
         auto response = ScanBuffer(request);
         return response.result;
@@ -2338,6 +2340,10 @@ public:
 
     [[nodiscard]] bool RequestKernelProcessBlockImpl(uint32_t processId,
                                                       const std::wstring& reason) {
+        if (!IsKernelBlockTarget(processId)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Refusing kernel process block for PID %u", processId);
+            return false;
+        }
         try {
             if (!Communication::IPCManager::HasInstance()) {
                 SS_LOG_WARN(LOG_CATEGORY,

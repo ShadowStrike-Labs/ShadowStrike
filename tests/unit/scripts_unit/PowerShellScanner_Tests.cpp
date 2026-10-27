@@ -25,8 +25,21 @@
 #include <nlohmann/json.hpp>
 
 #include "../../../src/PhantomCore/Scripts/PowerShellScanner.hpp"
+#include "../../../src/PhantomCore/Scripts/KernelBlockTarget.hpp"
 
 namespace ShadowStrike::Scripts::Test {
+
+// Task 368: AMSI scans of files the service read itself reported the service's own PID,
+// and the scanner asked the kernel to block it.
+TEST(KernelBlockTarget, RefusesNoOriginSystemAndOwnProcess) {
+    EXPECT_FALSE(IsKernelBlockTarget(0));
+    EXPECT_FALSE(IsKernelBlockTarget(4));
+    EXPECT_FALSE(IsKernelBlockTarget(GetCurrentProcessId()));
+    // Any other process id is a target; the guard does not check that it exists.
+    EXPECT_TRUE(IsKernelBlockTarget(GetCurrentProcessId() + 4));
+    EXPECT_TRUE(IsKernelBlockTarget(8));
+}
+
 namespace {
 
 using nlohmann::json;

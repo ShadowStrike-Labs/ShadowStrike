@@ -29570,5 +29570,41 @@ class PowerShellScannerPrecisionTests(unittest.TestCase):
         self.assertNotIn("noBt", body)
 
 
+class ScriptKernelBlocksRefuseOwnProcessTests(unittest.TestCase):
+    """Script scanners never ask the kernel to block PID 0, System or the service (task 368).
+
+    AMSI scans of files the service read itself carried GetCurrentProcessId(), and
+    PowerShellScanner asked the kernel to block the service ('block PID=6472').
+    """
+
+    S = ROOT / "src/PhantomCore/Scripts"
+    SENDERS = [
+        ("PowerShellScanner.cpp", "notifyKernelBlock"),
+        ("PowerShellScanner.cpp", "requestKernelProcessBlockImpl"),
+        ("AMSIIntegration.cpp", "RequestKernelProcessBlockImpl"),
+        ("JavaScriptScanner.cpp", "JavaScriptScannerImpl::RequestKernelProcessBlock"),
+        ("MacroDetector.cpp", "MacroDetectorImpl::RequestKernelProcessBlock"),
+        ("PythonScriptScanner.cpp", "PythonScriptScanner::RequestKernelProcessBlock"),
+        ("VBScriptScanner.cpp", "VBScriptScanner::RequestKernelProcessBlock"),
+    ]
+
+    def test_guard_refuses_pseudo_and_own_pids(self):
+        body = extract_c_function(strip_c_comments(read_source(self.S / "KernelBlockTarget.hpp")),
+                                  "IsKernelBlockTarget")
+        for term in ("pid != 0", "pid != 4", "::GetCurrentProcessId()"):
+            self.assertIn(term, body)
+
+    def test_every_sender_checks_the_target_before_ipc(self):
+        for name, func in self.SENDERS:
+            body = extract_c_function(strip_c_comments(read_source(self.S / name)), func)
+            self.assertIn("IsKernelBlockTarget(", body, f"{name} {func}")
+            self.assertLess(body.index("IsKernelBlockTarget("), body.index("IPCManager"), f"{name} {func}")
+
+    def test_service_side_amsi_scans_have_no_origin_process(self):
+        src = strip_c_comments(read_source(self.S / "AMSIIntegration.cpp"))
+        self.assertNotIn("request.processId = GetCurrentProcessId();", src)
+        self.assertEqual(2, src.count("request.processId = 0;"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

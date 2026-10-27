@@ -1639,6 +1639,7 @@
     <ClInclude Include="src\PhantomCore\Scripts\JavaScriptScanner.hpp" />
     <ClInclude Include="src\PhantomCore\Scripts\MacroDetector.hpp" />
     <ClInclude Include="src\PhantomCore\Scripts\PowerShellScanner.hpp" />
+    <ClInclude Include="src\PhantomCore\Scripts\KernelBlockTarget.hpp" />
     <ClInclude Include="src\PhantomCore\Scripts\PythonScriptScanner.hpp" />
     <ClInclude Include="src\PhantomCore\Scripts\VBScriptScanner.hpp" />
     <ClInclude Include="src\PhantomCore\SelfProtection\AntiDebug.hpp" />
