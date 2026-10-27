@@ -29680,5 +29680,39 @@ class YaraIndicatorRulesPassPublisherTrustTests(unittest.TestCase):
         self.assertIn("stats.signatureVerdictsSuppressedByTrust =", src)
 
 
+class PolymorphicGenericPassesPublisherTrustTests(unittest.TestCase):
+    """Stage 6 Polymorphic.Generic is withheld on a verified signature (task 366).
+
+    The 1.0.124 VM run convicted the Microsoft-signed System.Management.Automation.dll at
+    stage 6, which never consulted publisher trust.
+    """
+
+    ENGINE = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+
+    def setUp(self):
+        self.src = strip_c_comments(read_source(self.ENGINE))
+
+    def test_only_unnamed_verdicts_consult_trust_and_the_scan_continues(self):
+        gate = self.src.index("bool polyWithheldByTrust = false;")
+        block = self.src[gate:self.src.index("if (!polyWithheldByTrust && polyResult.isPolymorphic &&", gate)]
+        self.assertIn("polyResult.isPolymorphic && polyResult.threatFamily.empty() &&", block)
+        self.assertIn("m_impl->EvaluatePublisherTrust(filePath)", block)
+        self.assertIn("polymorphicVerdictsSuppressedByTrust", block)
+        self.assertNotIn("goto finalize_scan", block)
+
+    def test_non_suppression_names_the_reason(self):
+        body = extract_c_function(self.src, "LogTrustNotEstablished")
+        self.assertIn("trust.why", body)
+        trust = extract_c_function(self.src, "EvaluatePublisherTrust")
+        self.assertIn("decision.why = Security::GetSignatureResultName(info.result);", trust)
+        for stage in ("Stage 4.6 script", "Stage 5 heuristic", "Stage 5.5 executable",
+                      "Stage 6 Polymorphic.Generic"):
+            self.assertIn(f'Impl::LogTrustNotEstablished("{stage}"', self.src, stage)
+
+    def test_counter_is_reported(self):
+        self.assertIn('"\\"polymorphicVerdictsSuppressedByTrust\\":"', self.src)
+        self.assertIn("stats.polymorphicVerdictsSuppressedByTrust =", self.src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

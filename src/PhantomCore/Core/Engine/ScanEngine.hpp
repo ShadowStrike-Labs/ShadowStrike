@@ -1169,6 +1169,9 @@ public:
     /// withheld on a verified publisher signature (task 367).
     uint64_t signatureVerdictsSuppressedByTrust = 0;
 
+    /// Stage 6 generic polymorphic verdicts withheld on a verified signature (task 366).
+    uint64_t polymorphicVerdictsSuppressedByTrust = 0;
+
     /// @brief Heuristic analyses skipped because trust was ALREADY established.
     ///
     /// Distinct from heuristicVerdictsSuppressedByTrust, which counts analyses that

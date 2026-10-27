@@ -278,6 +278,7 @@ public:
         // did not.
         std::atomic<uint64_t> scriptVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> signatureVerdictsSuppressedByTrust{0};
+        std::atomic<uint64_t> polymorphicVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> scansTruncatedByBudget{0};
 
         // Process stats
@@ -999,6 +1000,7 @@ public:
         m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
         m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.signatureVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+        m_stats.polymorphicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
@@ -1392,6 +1394,9 @@ public:
         bool suppress = false;
         std::wstring signerName;
         const char* basis = "";
+        /// Why trust was or was not established; logged on every non-suppression so
+        /// a field log tells an unsigned file from a validator failure (task 366).
+        std::string_view why = "validator unavailable";
     };
 
     [[nodiscard]] TrustSuppression EvaluatePublisherTrust(
@@ -1419,6 +1424,7 @@ public:
                 static_cast<uint32_t>(Flags::CacheResult));
 
         const auto info = validator.VerifyFile(filePath, options);
+        decision.why = Security::GetSignatureResultName(info.result);
 
         if (!info.isValid) {
             return decision;
@@ -1432,9 +1438,13 @@ public:
                 L"Heuristic conviction NOT suppressed: signer '%ls' is in the "
                 L"stolen-certificate database: %ls",
                 info.signer.signerName.c_str(), filePath.c_str());
+            decision.why = "stolen certificate";
             return decision;
         }
 
+        if (!info.isMicrosoftSigned) {
+            decision.why = "publisher not whitelisted";
+        }
         if (info.isMicrosoftSigned) {
             decision.suppress = true;
             decision.basis = "Microsoft-signed";
@@ -1450,7 +1460,17 @@ public:
         }
 
         decision.signerName = info.signer.signerName;
+        if (decision.suppress) decision.why = decision.basis;
         return decision;
+    }
+
+    /// One INFO line when trust did not withhold a verdict, naming the reason.
+    static void LogTrustNotEstablished(const char* stage, const TrustSuppression& trust,
+                                       const std::wstring& filePath) {
+        SS_LOG_INFO(L"ScanEngine",
+            L"%hs conviction stands, trust not established (%.*hs, signer '%ls'): %ls",
+            stage, static_cast<int>(trust.why.size()), trust.why.data(),
+            trust.signerName.c_str(), filePath.c_str());
     }
 
     // ========================================================================
@@ -2760,6 +2780,7 @@ EngineResult ScanEngine::ScanFile(
                             // still owed, and any of them may convict this file on
                             // evidence rather than on a score.
                         } else {
+                            Impl::LogTrustNotEstablished("Stage 4.6 script", scriptTrust, filePath);
                             result.verdict = ScanVerdict::Infected;
                             result.threatName = std::move(scriptThreatName);
                             result.detectionSource = std::move(scriptDetectionMethod);
@@ -3105,6 +3126,7 @@ EngineResult ScanEngine::ScanFile(
                     // through 10, any of which may convict it on evidence
                     // rather than on a score.
                 } else {
+                Impl::LogTrustNotEstablished("Stage 5 heuristic", trust, filePath);
 
                 m_impl->m_stats.heuristicHits.fetch_add(1, std::memory_order_relaxed);
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
@@ -3210,6 +3232,7 @@ EngineResult ScanEngine::ScanFile(
                             " withheld on a verified signature (" +
                             std::string(trust.basis) + ")");
                     } else {
+                    Impl::LogTrustNotEstablished("Stage 5.5 executable", trust, filePath);
                     m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
                     result.verdict = ScanVerdict::Suspicious;
@@ -3332,7 +3355,31 @@ EngineResult ScanEngine::ScanFile(
             }
 
             // --- 6a: Polymorphic/metamorphic engine detection ---
-            if (polyResult.isPolymorphic &&
+            // A generic polymorphic verdict names no family: an inference, governed by
+            // publisher trust exactly as stage 5's score is. The 1.0.124 VM run convicted
+            // the Microsoft-signed System.Management.Automation.dll here. A named family
+            // keeps convicting, and a withheld verdict continues to stages 7 to 10.
+            bool polyWithheldByTrust = false;
+            if (polyResult.isPolymorphic && polyResult.threatFamily.empty() &&
+                static_cast<uint8_t>(polyResult.confidence) >= static_cast<uint8_t>(PolymorphicDetectionConfidence::Medium)) {
+                const auto polyTrust = m_impl->EvaluatePublisherTrust(filePath);
+                if (polyTrust.suppress) {
+                    polyWithheldByTrust = true;
+                    m_impl->m_stats.polymorphicVerdictsSuppressedByTrust
+                        .fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"Stage 6 Polymorphic.Generic NOT reported: %hs, signer '%ls' - "
+                        L"deeper stages still run: %ls",
+                        polyTrust.basis, polyTrust.signerName.c_str(), filePath.c_str());
+                    result.indicators.push_back(
+                        "Polymorphic.Generic withheld on a verified signature (" +
+                        std::string(polyTrust.basis) + ")");
+                } else {
+                    Impl::LogTrustNotEstablished("Stage 6 Polymorphic.Generic", polyTrust, filePath);
+                }
+            }
+
+            if (!polyWithheldByTrust && polyResult.isPolymorphic &&
                 static_cast<uint8_t>(polyResult.confidence) >= static_cast<uint8_t>(PolymorphicDetectionConfidence::Medium)) {
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
@@ -5645,6 +5692,8 @@ std::string ScanEngine::Stats::ToJson() const {
         << scriptVerdictsSuppressedByTrust << ",";
     oss << "\"signatureVerdictsSuppressedByTrust\":"
         << signatureVerdictsSuppressedByTrust << ",";
+    oss << "\"polymorphicVerdictsSuppressedByTrust\":"
+        << polymorphicVerdictsSuppressedByTrust << ",";
     oss << "\"scansTruncatedByBudget\":" << scansTruncatedByBudget;
     oss << "}";
     return oss.str();
@@ -5694,6 +5743,8 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.scriptVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.signatureVerdictsSuppressedByTrust =
         m_impl->m_stats.signatureVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
+    stats.polymorphicVerdictsSuppressedByTrust =
+        m_impl->m_stats.polymorphicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.heuristicSkippedOnKnownTrust =
         m_impl->m_stats.heuristicSkippedOnKnownTrust.load(std::memory_order_relaxed);
     stats.scansTruncatedByBudget =
@@ -5744,6 +5795,7 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.signatureVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.polymorphicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);

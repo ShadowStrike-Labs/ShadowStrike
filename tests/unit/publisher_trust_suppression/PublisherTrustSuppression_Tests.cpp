@@ -281,6 +281,7 @@ TEST(PublisherTrustSuppressionTest, TheSuppressionCounterIsReadable) {
     // at all, which is what was missing for archivesScanned before 0771f440.
     EXPECT_GE(stats.heuristicVerdictsSuppressedByTrust, 0ull);
     EXPECT_GE(stats.signatureVerdictsSuppressedByTrust, 0ull);     // task 367
+    EXPECT_GE(stats.polymorphicVerdictsSuppressedByTrust, 0ull);   // task 366
 }
 
 // ---------------------------------------------------------------------------
