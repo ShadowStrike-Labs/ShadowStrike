@@ -29507,5 +29507,34 @@ class ImportsKeepStringIndicatorsTests(unittest.TestCase):
         self.assertIn("moveText(e.descriptionOffset, e.descriptionLength);", body)
 
 
+class ThreatIntelImporterDeclarationsAreDefinedTests(unittest.TestCase):
+    """Every member ThreatIntelImporter declares has a definition (task 359).
+
+    Six import entry points and five helpers were declared without a definition, so a caller
+    compiled and failed only at link time.
+    """
+
+    TI = ROOT / "src/PhantomCore/ThreatIntel"
+
+    def test_every_declared_member_is_defined(self):
+        header = strip_c_comments(read_source(self.TI / "ThreatIntelImporter.hpp"))
+        source = strip_c_comments(read_source(self.TI / "ThreatIntelImporter.cpp"))
+        start = header.index("\nclass ThreatIntelImporter")
+        body = header[header.index("{", start) + 1:header.index("\n};", start)]
+        names = set(re.findall(r"\b([A-Z]\w*)\s*\(", body))
+        names -= {"ThreatIntelImporter", "ImportResult", "ImportOptions", "IOCType",
+                  "ImportFormat", "ImportCompression", "IOCEntry"}
+        self.assertGreater(len(names), 20, "the declaration scan found too little to be meaningful")
+        missing = sorted(n for n in names if not re.search(r"ThreatIntelImporter::" + n + r"\s*\(", source))
+        self.assertEqual([], missing, "declared but never defined")
+
+    def test_memory_imports_reuse_the_stream_path(self):
+        source = strip_c_comments(read_source(self.TI / "ThreatIntelImporter.cpp"))
+        body = extract_c_function(source, "ThreatIntelImporter::ImportFromBytes")
+        self.assertIn("DetectCompression(input)", body)
+        self.assertIn("std::ispanstream stream(", body)
+        self.assertIn("return ImportFromStream(database, stream, opts, nullptr);", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

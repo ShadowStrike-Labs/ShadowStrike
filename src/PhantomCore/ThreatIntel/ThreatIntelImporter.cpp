@@ -38,6 +38,7 @@
 
 #include <filesystem>
 #include <sstream>
+#include <spanstream>
 #include <algorithm>
 #include <regex>
 #include <iostream>
@@ -4300,6 +4301,61 @@ ImportResult ThreatIntelImporter::ImportFromStream(
     } catch (const std::exception& e) {
         result.success = false;
         result.errorMessage = std::string("Import stream error: ") + e.what();
+        return result;
+    }
+}
+
+ImportResult ThreatIntelImporter::ImportFromString(
+    ThreatIntelDatabase& database,
+    std::string_view input,
+    const ImportOptions& options
+) {
+    return ImportFromBytes(
+        database,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(input.data()), input.size()),
+        options);
+}
+
+ImportResult ThreatIntelImporter::ImportFromBytes(
+    ThreatIntelDatabase& database,
+    std::span<const uint8_t> input,
+    const ImportOptions& options
+) {
+    ImportResult result;
+
+    try {
+        if (input.empty()) {
+            result.success = false;
+            result.errorMessage = "Empty input";
+            return result;
+        }
+
+        // No reader decompresses, from a file or from memory. Compressed bytes would be
+        // parsed as text and reported as thousands of parse errors, so they are refused.
+        if (const auto compression = DetectCompression(input);
+            compression != ImportCompression::None && compression != ImportCompression::Auto) {
+            result.success = false;
+            result.errorMessage = "Compressed input is not supported; decompress it before importing";
+            return result;
+        }
+
+        // A view over the caller's bytes: a feed can be hundreds of megabytes, and
+        // ispanstream reads it in place where an istringstream would copy it.
+        // Read-only by construction: the span-of-const constructor opens for input only.
+        std::ispanstream stream(
+            std::span<const char>(reinterpret_cast<const char*>(input.data()), input.size()));
+
+        ImportOptions opts = options;
+        if (opts.format == ImportFormat::Auto) {
+            opts.format = DetectFormatFromContent(stream);
+            stream.clear();
+            stream.seekg(0);
+        }
+
+        return ImportFromStream(database, stream, opts, nullptr);
+    } catch (const std::exception& e) {
+        result.success = false;
+        result.errorMessage = std::string("Import memory error: ") + e.what();
         return result;
     }
 }

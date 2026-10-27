@@ -1139,23 +1139,6 @@ public:
         ImportProgressCallback progressCallback = nullptr
     );
     
-    /**
-     * @brief Import IOC entries from file to vector
-     * @param inputPath Input file path
-     * @param stringPool String pool writer for metadata
-     * @param entries Output vector for entries
-     * @param options Import options
-     * @param progressCallback Optional progress callback
-     * @return Import result
-     */
-    [[nodiscard]] ImportResult ImportFromFile(
-        const std::wstring& inputPath,
-        IStringPoolWriter* stringPool,
-        std::vector<IOCEntry>& entries,
-        const ImportOptions& options,
-        ImportProgressCallback progressCallback = nullptr
-    );
-    
     // =========================================================================
     // Stream Import
     // =========================================================================
@@ -1171,23 +1154,6 @@ public:
     [[nodiscard]] ImportResult ImportFromStream(
         ThreatIntelDatabase& database,
         std::istream& input,
-        const ImportOptions& options,
-        ImportProgressCallback progressCallback = nullptr
-    );
-    
-    /**
-     * @brief Import IOC entries from stream to vector
-     * @param input Input stream
-     * @param stringPool String pool writer for metadata
-     * @param entries Output vector for entries
-     * @param options Import options
-     * @param progressCallback Optional progress callback
-     * @return Import result
-     */
-    [[nodiscard]] ImportResult ImportFromStream(
-        std::istream& input,
-        IStringPoolWriter* stringPool,
-        std::vector<IOCEntry>& entries,
         const ImportOptions& options,
         ImportProgressCallback progressCallback = nullptr
     );
@@ -1210,21 +1176,6 @@ public:
     );
     
     /**
-     * @brief Import IOC entries from string to vector
-     * @param input Input string
-     * @param stringPool String pool writer for metadata
-     * @param entries Output vector for entries
-     * @param options Import options
-     * @return Import result
-     */
-    [[nodiscard]] ImportResult ImportFromString(
-        std::string_view input,
-        IStringPoolWriter* stringPool,
-        std::vector<IOCEntry>& entries,
-        const ImportOptions& options
-    );
-    
-    /**
      * @brief Import IOC entries from byte vector
      * @param database Database to import into
      * @param input Input bytes
@@ -1242,47 +1193,11 @@ public:
     // =========================================================================
     
     /**
-     * @brief Parse a single IOC string to entry
-     * @param iocValue IOC value string
-     * @param entry Output entry
-     * @param stringPool String pool writer for metadata
-     * @param options Import options
-     * @return true if parsing successful
-     */
-    [[nodiscard]] bool ParseSingleIOC(
-        std::string_view iocValue,
-        IOCEntry& entry,
-        IStringPoolWriter* stringPool,
-        const ImportOptions& options = ImportOptions()
-    );
-    
-    /**
      * @brief Detect IOC type from value
      * @param value IOC value string
      * @return Detected IOC type
      */
     [[nodiscard]] static IOCType DetectIOCType(std::string_view value);
-    
-    /**
-     * @brief Validate IOC value format
-     * @param value IOC value string
-     * @param type Expected IOC type
-     * @return true if valid
-     */
-    [[nodiscard]] static bool ValidateIOCFormat(std::string_view value, IOCType type);
-    
-    /**
-     * @brief Normalize IOC value
-     * @param value IOC value string
-     * @param type IOC type
-     * @param flags Normalization flags
-     * @return Normalized value
-     */
-    [[nodiscard]] static std::string NormalizeIOCValue(
-        std::string_view value,
-        IOCType type,
-        NormalizationFlags flags
-    );
     
     // =========================================================================
     // Format Detection
@@ -1312,61 +1227,6 @@ public:
      * @return Detected compression or None if unknown
      */
     [[nodiscard]] static ImportCompression DetectCompression(std::span<const uint8_t> data);
-    
-    // =========================================================================
-    // Batch Import
-    // =========================================================================
-    
-    /**
-     * @brief Import multiple files
-     * @param database Database to import into
-     * @param inputPaths List of input file paths
-     * @param options Import options
-     * @param progressCallback Optional progress callback
-     * @return Map of file path to import result
-     */
-    [[nodiscard]] std::unordered_map<std::wstring, ImportResult> ImportMultipleFiles(
-        ThreatIntelDatabase& database,
-        const std::vector<std::wstring>& inputPaths,
-        const ImportOptions& options,
-        ImportProgressCallback progressCallback = nullptr
-    );
-    
-    /**
-     * @brief Import from directory (recursive)
-     * @param database Database to import into
-     * @param directoryPath Directory path
-     * @param filePattern File pattern (e.g., "*.csv")
-     * @param options Import options
-     * @param progressCallback Optional progress callback
-     * @return Import result
-     */
-    [[nodiscard]] ImportResult ImportFromDirectory(
-        ThreatIntelDatabase& database,
-        const std::wstring& directoryPath,
-        const std::wstring& filePattern,
-        const ImportOptions& options,
-        ImportProgressCallback progressCallback = nullptr
-    );
-    
-    // =========================================================================
-    // URL Import
-    // =========================================================================
-    
-    /**
-     * @brief Import from URL (HTTP/HTTPS)
-     * @param database Database to import into
-     * @param url URL to fetch
-     * @param options Import options
-     * @param progressCallback Optional progress callback
-     * @return Import result
-     */
-    [[nodiscard]] ImportResult ImportFromURL(
-        ThreatIntelDatabase& database,
-        const std::string& url,
-        const ImportOptions& options,
-        ImportProgressCallback progressCallback = nullptr
-    );
     
     // =========================================================================
     // Validation Callbacks
@@ -1440,14 +1300,6 @@ private:
         ImportFormat format
     );
     
-    [[nodiscard]] ImportResult DoImport(
-        IImportReader& reader,
-        IStringPoolWriter* stringPool,
-        std::vector<IOCEntry>& entries,
-        const ImportOptions& options,
-        ImportProgressCallback progressCallback
-    );
-    
     [[nodiscard]] ImportResult DoImportToDatabase(
         IImportReader& reader,
         ThreatIntelDatabase& database,
@@ -1457,12 +1309,6 @@ private:
     
     bool ValidateEntry(IOCEntry& entry, const ImportOptions& options);
     void NormalizeEntry(IOCEntry& entry, const ImportOptions& options, IStringPoolWriter* stringPool);
-    [[nodiscard]] IOCEntry ResolveConflict(
-        const IOCEntry& existing,
-        const IOCEntry& newEntry,
-        ConflictResolution strategy
-    );
-    
     void UpdateProgress(
         ImportProgress& progress,
         size_t currentEntry,

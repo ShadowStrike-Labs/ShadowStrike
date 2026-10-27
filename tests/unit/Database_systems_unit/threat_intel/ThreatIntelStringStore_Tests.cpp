@@ -587,6 +587,32 @@ TEST(ThreatIntelImporterStrings, AnImportedDescriptionIsStoredWithTheEntry) {
         << "the description points somewhere other than its text";
 }
 
+// ImportFromString and ImportFromBytes were declared and never defined: a caller compiled and
+// then failed to link (task 359).
+TEST(ThreatIntelImporterStrings, AStringImportDetectsTheFormatAndStoresTheEntries) {
+    ScratchFolder dir;
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open((dir.path / "memory.tidb").wstring()));
+    ThreatIntelImporter importer;
+    const auto result = importer.ImportFromString(db, "evil-seven.example\n192.0.2.44\n", ImportOptions{});
+    ASSERT_TRUE(result.success) << result.errorMessage;
+    EXPECT_EQ(result.totalImported, 2u);
+    EXPECT_TRUE(db.FindString("evil-seven.example").has_value());
+    EXPECT_EQ(db.GetEntryCount(), 2u);
+}
+
+TEST(ThreatIntelImporterStrings, AByteImportRefusesCompressedAndEmptyInput) {
+    ScratchFolder dir;
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open((dir.path / "bytes.tidb").wstring()));
+    ThreatIntelImporter importer;
+    const uint8_t gzip[] = {0x1F, 0x8B, 0x08, 0x00, 'e', 'v', 'i', 'l', '.', 'x', '\n'};
+    const auto compressed = importer.ImportFromBytes(db, gzip, ImportOptions{});
+    EXPECT_FALSE(compressed.success) << "compressed bytes were parsed as text";
+    EXPECT_EQ(db.GetEntryCount(), 0u);
+    EXPECT_FALSE(importer.ImportFromBytes(db, std::span<const uint8_t>{}, ImportOptions{}).success);
+}
+
 // The importer library writes entries itself. Its texts must land in the database's string
 // store, canonicalised, so the IOC manager finds them after a reopen.
 TEST(ThreatIntelImporterStrings, AnImportedDomainIsFoundByTheManagerAfterAReopen) {
