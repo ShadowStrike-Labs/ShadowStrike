@@ -702,6 +702,7 @@ namespace ShadowStrike {
                         detection.signatureId = match.ruleId;
                         detection.signatureName = match.ruleName;
                         detection.threatLevel = match.threatLevel;
+                        detection.inferenceTier = IsYaraInferenceTier(match.threatLevel);
                         detection.description = "YARA rule match in process memory";
 
                         // TITANIUM: Safe timestamp handling

@@ -1165,6 +1165,10 @@ public:
     /// exist and VMware Tools' signed script was deleted on a generic score.
     uint64_t scriptVerdictsSuppressedByTrust = 0;
 
+    /// Stage 4 YARA detections, all generic indicator rules (scored below High),
+    /// withheld on a verified publisher signature (task 367).
+    uint64_t signatureVerdictsSuppressedByTrust = 0;
+
     /// @brief Heuristic analyses skipped because trust was ALREADY established.
     ///
     /// Distinct from heuristicVerdictsSuppressedByTrust, which counts analyses that

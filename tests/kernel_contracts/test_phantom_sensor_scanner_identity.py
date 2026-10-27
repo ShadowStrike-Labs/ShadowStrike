@@ -29640,5 +29640,45 @@ class ZeroDayShellcodeNeedsCodeEvidenceTests(unittest.TestCase):
         self.assertNotIn("0xE0", body)
 
 
+class YaraIndicatorRulesPassPublisherTrustTests(unittest.TestCase):
+    """Generic YARA indicator rules are withheld on a verified signature (task 367).
+
+    A score-40 indicator rule asked to quarantine Defender's MpCmdRun.exe in the 1.0.124
+    VM run; stage 4 never consulted publisher trust.
+    """
+
+    SS = ROOT / "src/PhantomCore/SignatureStore"
+    ENGINE = ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+
+    def test_tier_boundary_is_high(self):
+        src = strip_c_comments(read_source(self.SS / "SignatureFormat.hpp"))
+        body = extract_c_function(src, "IsYaraInferenceTier")
+        self.assertIn("< static_cast<uint8_t>(ThreatLevel::High)", body)
+
+    def test_every_yara_conversion_sets_the_tier(self):
+        line = "detection.inferenceTier = IsYaraInferenceTier(match.threatLevel);"
+        self.assertEqual(2, strip_c_comments(read_source(self.SS / "SignatureStore.cpp")).count(line))
+        self.assertEqual(1, strip_c_comments(read_source(self.SS / "SignatureStore_scan.cpp")).count(line))
+        for name in ("SignatureStore.cpp", "SignatureStore_scan.cpp"):
+            src = strip_c_comments(read_source(self.SS / name))
+            self.assertEqual(src.count("detection.signatureName = match.ruleName;"), src.count(line), name)
+
+    def test_only_all_inference_results_consult_trust(self):
+        src = strip_c_comments(read_source(self.ENGINE))
+        gate = src.index("bool sigWithheldByTrust = false;")
+        block = src[gate:src.index("if (sigResult.HasDetections() && !sigWithheldByTrust) {", gate)]
+        self.assertIn("std::all_of(sigResult.detections.begin(), sigResult.detections.end(),", block)
+        self.assertIn("return d.inferenceTier;", block)
+        self.assertIn("m_impl->EvaluatePublisherTrust(filePath)", block)
+        self.assertIn("if (sigTrust.suppress) {", block)
+        self.assertNotIn("goto finalize_scan", block)
+        self.assertIn("signatureVerdictsSuppressedByTrust", block)
+
+    def test_counter_is_reported(self):
+        src = strip_c_comments(read_source(self.ENGINE))
+        self.assertIn('"\\"signatureVerdictsSuppressedByTrust\\":"', src)
+        self.assertIn("stats.signatureVerdictsSuppressedByTrust =", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

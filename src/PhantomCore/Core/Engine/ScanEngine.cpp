@@ -277,6 +277,7 @@ public:
         // ran, zero while signed vendors are being quarantined again means it
         // did not.
         std::atomic<uint64_t> scriptVerdictsSuppressedByTrust{0};
+        std::atomic<uint64_t> signatureVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> scansTruncatedByBudget{0};
 
         // Process stats
@@ -997,6 +998,7 @@ public:
             m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
         m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+        m_stats.signatureVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
@@ -2218,7 +2220,36 @@ EngineResult ScanEngine::ScanFile(
 
                 auto sigResult = m_impl->m_signatureStore->ScanBuffer(fileBuffer, sigScanOpts);
 
-                if (sigResult.HasDetections()) {
+                // GENERIC INDICATOR RULES PASS THROUGH PUBLISHER TRUST (task 367).
+                // A YARA rule scored below High is an inference with no named family -
+                // the class stages 4.6 and 5 already submit to EvaluatePublisherTrust.
+                // The 1.0.124 VM run asked to quarantine Defender's own MpCmdRun.exe on
+                // one of them. Only an all-inference result is eligible: one hash,
+                // pattern or High+ rule match keeps the conviction. A stolen-certificate
+                // signer never suppresses, and stages 4.5 to 10 still run.
+                bool sigWithheldByTrust = false;
+                if (sigResult.HasDetections() &&
+                    std::all_of(sigResult.detections.begin(), sigResult.detections.end(),
+                                [](const auto& d) { return d.inferenceTier; })) {
+                    const auto sigTrust = m_impl->EvaluatePublisherTrust(filePath);
+                    if (sigTrust.suppress) {
+                        sigWithheldByTrust = true;
+                        m_impl->m_stats.signatureVerdictsSuppressedByTrust
+                            .fetch_add(1, std::memory_order_relaxed);
+                        const auto& first = sigResult.detections.front();
+                        SS_LOG_INFO(L"ScanEngine",
+                            L"Stage 4 indicator rule '%hs' (%zu match(es)) NOT reported: "
+                            L"%hs, signer '%ls' - deeper stages still run: %ls",
+                            first.signatureName.c_str(), sigResult.detections.size(),
+                            sigTrust.basis, sigTrust.signerName.c_str(), filePath.c_str());
+                        result.indicators.push_back(
+                            "Indicator rule " + first.signatureName +
+                            " withheld on a verified signature (" +
+                            std::string(sigTrust.basis) + ")");
+                    }
+                }
+
+                if (sigResult.HasDetections() && !sigWithheldByTrust) {
                     m_impl->m_stats.signatureHits.fetch_add(1, std::memory_order_relaxed);
 
                     // THE MOST SEVERE DETECTION, not the first one.
@@ -5612,6 +5643,8 @@ std::string ScanEngine::Stats::ToJson() const {
     oss << "\"heuristicSkippedOnKnownTrust\":" << heuristicSkippedOnKnownTrust << ",";
     oss << "\"scriptVerdictsSuppressedByTrust\":"
         << scriptVerdictsSuppressedByTrust << ",";
+    oss << "\"signatureVerdictsSuppressedByTrust\":"
+        << signatureVerdictsSuppressedByTrust << ",";
     oss << "\"scansTruncatedByBudget\":" << scansTruncatedByBudget;
     oss << "}";
     return oss.str();
@@ -5659,6 +5692,8 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.heuristicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.scriptVerdictsSuppressedByTrust =
         m_impl->m_stats.scriptVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
+    stats.signatureVerdictsSuppressedByTrust =
+        m_impl->m_stats.signatureVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.heuristicSkippedOnKnownTrust =
         m_impl->m_stats.heuristicSkippedOnKnownTrust.load(std::memory_order_relaxed);
     stats.scansTruncatedByBudget =
@@ -5708,6 +5743,7 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.signatureVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);

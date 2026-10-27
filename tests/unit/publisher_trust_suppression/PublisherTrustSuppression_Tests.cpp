@@ -280,6 +280,7 @@ TEST(PublisherTrustSuppressionTest, TheSuppressionCounterIsReadable) {
     // scanned, so no magnitude is asserted - only that the snapshot carries it
     // at all, which is what was missing for archivesScanned before 0771f440.
     EXPECT_GE(stats.heuristicVerdictsSuppressedByTrust, 0ull);
+    EXPECT_GE(stats.signatureVerdictsSuppressedByTrust, 0ull);     // task 367
 }
 
 // ---------------------------------------------------------------------------

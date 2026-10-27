@@ -2053,6 +2053,7 @@ ScanResult SignatureStore::ExecuteParallelScan(
                             detection.signatureId = match.ruleId;
                             detection.signatureName = match.ruleName;
                             detection.threatLevel = match.threatLevel;
+                            detection.inferenceTier = IsYaraInferenceTier(match.threatLevel);
                             detection.description = "YARA rule match";
                             detections.push_back(std::move(detection));
                         }
@@ -2240,6 +2241,7 @@ ScanResult SignatureStore::ExecuteSequentialScan(
                 detection.signatureId = match.ruleId;
                 detection.signatureName = match.ruleName;
                 detection.threatLevel = match.threatLevel;
+                detection.inferenceTier = IsYaraInferenceTier(match.threatLevel);
                 detection.description = "YARA rule match";
                 detection.matchTimestamp = match.matchTimeMicroseconds;
                 

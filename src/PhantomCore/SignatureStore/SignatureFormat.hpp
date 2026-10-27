@@ -477,6 +477,14 @@ enum class ThreatLevel : uint8_t {
     Critical = 100      // Critical threat
 };
 
+/// Whether a YARA rule at @p level is a generic indicator rather than an identification.
+/// YARA Forge scores below 75 (High) mark rules its curators rate as suspicious rather
+/// than malicious, e.g. "executable embeds registry values that disable Defender",
+/// which Defender's own MpCmdRun.exe matches (task 367).
+[[nodiscard]] constexpr bool IsYaraInferenceTier(ThreatLevel level) noexcept {
+    return static_cast<uint8_t>(level) < static_cast<uint8_t>(ThreatLevel::High);
+}
+
 // Detection result (move-optimized for performance)
 struct DetectionResult {
     uint64_t signatureId{0};                              // Matched signature ID
@@ -488,6 +496,10 @@ struct DetectionResult {
     uint64_t matchTimestamp{0};                           // Detection time (us precision)
     uint64_t matchTimeNanoseconds{0};                     // Time to match (profiling)
     float similarity{0.0f};                               // Fuzzy match similarity [0.0, 1.0]
+    /// A generic indicator (a YARA rule scored below High), not a named identification.
+    /// The scan engine lets a verified publisher signature withhold it, as it does for
+    /// heuristic scores; hash and pattern matches are identifications and never set it.
+    bool inferenceTier{false};
 
     // Default constructor
     DetectionResult() = default;

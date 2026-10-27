@@ -1776,3 +1776,28 @@ TEST_F(YaraRuleStoreTest, LoadCompiledRules_FromFile) {
     EXPECT_TRUE(error.IsSuccess());
     loadStore.Close();
 }
+
+// Task 367: generic indicator rules (YARA Forge score below 75) are inference tier and
+// pass through publisher trust; rules scored High or Critical stay identifications.
+TEST(YaraInferenceTier, BoundaryIsHigh) {
+    EXPECT_TRUE(IsYaraInferenceTier(ThreatLevel::Info));
+    EXPECT_TRUE(IsYaraInferenceTier(ThreatLevel::Low));
+    EXPECT_TRUE(IsYaraInferenceTier(ThreatLevel::Medium));
+    EXPECT_FALSE(IsYaraInferenceTier(ThreatLevel::High));
+    EXPECT_FALSE(IsYaraInferenceTier(ThreatLevel::Critical));
+}
+
+TEST_F(YaraRuleStoreTest, ForgeScoreDecidesInferenceTier) {
+    const std::string rules =
+        "rule TierProbeIndicator { meta: score = 40 strings: $a = \"tier-probe-a\" condition: $a }\n"
+        "rule TierProbeFamily { meta: score = 80 strings: $a = \"tier-probe-b\" condition: $a }\n";
+    ASSERT_TRUE(yara_store_->AddRulesFromSource(rules, "default").IsSuccess());
+    const auto indicator = yara_store_->GetRuleMetadata("TierProbeIndicator", "default");
+    const auto family = yara_store_->GetRuleMetadata("TierProbeFamily", "default");
+    ASSERT_TRUE(indicator.has_value());
+    ASSERT_TRUE(family.has_value());
+    EXPECT_EQ(indicator->threatLevel, ThreatLevel::Low);
+    EXPECT_TRUE(IsYaraInferenceTier(indicator->threatLevel));
+    EXPECT_EQ(family->threatLevel, ThreatLevel::High);
+    EXPECT_FALSE(IsYaraInferenceTier(family->threatLevel));
+}
