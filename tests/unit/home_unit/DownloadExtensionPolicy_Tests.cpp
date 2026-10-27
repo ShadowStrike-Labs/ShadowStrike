@@ -157,4 +157,30 @@ TEST_F(DownloadBlockerPolicyTest, AnUnlistedExtensionIsNotBlocked) {
     EXPECT_FALSE(Blocker().IsExtensionBlocked(""));
 }
 
+// Task 369: the service starts before anyone signs in, so the Downloads set grows at
+// sign-in. Merging must add new folders once, ignore case and trailing separators, and
+// respect the cap.
+TEST(DownloadMonitoredDirectoriesTest, MergeAddsEachNewFolderOnceWithinTheCap) {
+    std::vector<fs::path> monitored;
+    const std::vector<fs::path> firstSignIn = {L"C:\\Users\\alice\\Downloads"};
+    EXPECT_EQ(1u, Downloads::MergeMonitoredDirectories(monitored, firstSignIn, 64));
+    ASSERT_EQ(1u, monitored.size());
+
+    // Re-resolution returns the same folder spelled differently: nothing is added.
+    const std::vector<fs::path> again = {L"c:\\users\\ALICE\\downloads\\", L""};
+    EXPECT_EQ(0u, Downloads::MergeMonitoredDirectories(monitored, again, 64));
+    EXPECT_EQ(1u, monitored.size());
+
+    // A second user signs in.
+    const std::vector<fs::path> two = {L"C:\\Users\\alice\\Downloads", L"D:\\Profiles\\bob\\Downloads"};
+    EXPECT_EQ(1u, Downloads::MergeMonitoredDirectories(monitored, two, 64));
+    ASSERT_EQ(2u, monitored.size());
+    EXPECT_EQ(monitored[1], fs::path(L"D:\\Profiles\\bob\\Downloads"));
+
+    // The cap holds.
+    const std::vector<fs::path> third = {L"E:\\carol\\Downloads"};
+    EXPECT_EQ(0u, Downloads::MergeMonitoredDirectories(monitored, third, 2));
+    EXPECT_EQ(2u, monitored.size());
+}
+
 }  // namespace ShadowStrike::WebBrowser::Test

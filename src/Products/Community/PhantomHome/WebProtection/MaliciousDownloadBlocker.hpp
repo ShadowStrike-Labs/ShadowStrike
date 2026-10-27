@@ -737,6 +737,14 @@ using ErrorCallback = std::function<void(const std::string& message, int code)>;
 /// @brief Pre-download callback (return false to block)
 using PreDownloadCallback = std::function<bool(const DownloadInfo&)>;
 
+/// @brief Appends each directory of @p resolved not yet in @p monitored, up to @p maxDirs.
+/// Paths compare case-insensitively after normalisation. Returns how many were added.
+/// The service resolves user Downloads folders per signed-in session, so the set grows
+/// as users sign in after the service started (task 369).
+[[nodiscard]] size_t MergeMonitoredDirectories(std::vector<fs::path>& monitored,
+                                               const std::vector<fs::path>& resolved,
+                                               size_t maxDirs);
+
 }  // namespace Downloads
 
 // ============================================================================

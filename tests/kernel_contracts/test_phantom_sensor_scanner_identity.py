@@ -29714,5 +29714,40 @@ class PolymorphicGenericPassesPublisherTrustTests(unittest.TestCase):
         self.assertIn("stats.polymorphicVerdictsSuppressedByTrust =", self.src)
 
 
+class DownloadBlockerFollowsSignInTests(unittest.TestCase):
+    """DownloadBlocker starts with no session and adds Downloads at sign-in (task 369).
+
+    The 1.0.124 VM run (nobody signed in) logged 'monitoring 0 directories' and
+    'MaliciousDownloadBlocker Start() failed'; nothing re-resolved later.
+    """
+
+    SRC = ROOT / "src/Products/Community/PhantomHome/WebProtection/MaliciousDownloadBlocker.cpp"
+
+    def setUp(self):
+        self.src = strip_c_comments(read_source(self.SRC))
+
+    def test_empty_default_set_does_not_fail_start(self):
+        body = extract_c_function(self.src, "MaliciousDownloadBlockerImpl::StartMonitoring")
+        self.assertIn("if (!m_usingDefaultDirs) {", body)
+        empty = body[body.index("if (m_monitoredDirs.empty()) {"):body.index("m_stopThread.store(false")]
+        self.assertEqual(1, empty.count("return false;"))
+        self.assertIn("m_usingDefaultDirs = m_monitoredDirs.empty();",
+                      extract_c_function(self.src, "MaliciousDownloadBlockerImpl::Initialize"))
+
+    def test_watches_rebuild_when_a_sign_in_adds_a_folder(self):
+        loop = extract_c_function(self.src, "MaliciousDownloadBlockerImpl::MonitoringLoop")
+        self.assertIn("if (!RunWatches()) break;", loop)
+        run = extract_c_function(self.src, "MaliciousDownloadBlockerImpl::RunWatches")
+        self.assertEqual(2, run.count("if (RefreshDefaultDirectories()) return true;"))
+        timeout = run[run.index("if (waitResult == WAIT_TIMEOUT) {"):]
+        self.assertLess(timeout.index("RefreshDefaultDirectories()"), timeout.index("continue;"))
+
+    def test_refresh_merges_resolved_sessions(self):
+        body = extract_c_function(self.src, "MaliciousDownloadBlockerImpl::RefreshDefaultDirectories")
+        self.assertIn("if (!m_usingDefaultDirs) return false;", body)
+        self.assertIn("ResolveDefaultDownloadDirectories()", body)
+        self.assertIn("MergeMonitoredDirectories(m_monitoredDirs, resolved, MAX_MONITORED_DIRS)", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

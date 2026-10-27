@@ -683,6 +683,10 @@ public:
 
 private:
     void MonitoringLoop();
+    /// One watch set over the current directories. True: rebuild with a grown set.
+    bool RunWatches();
+    /// Re-resolves the default Downloads folders; true if any was added.
+    bool RefreshDefaultDirectories();
     DownloadVerdict AnalyzeFile(const fs::path& path, const std::string& hash, FileAnalysisResult& analysis);
     void NotifyCallbacks(const DownloadScanResult& result, const fs::path& filePath, const std::string& sourceUrl);
     void RememberProcessedFile(const std::string& path);
@@ -699,6 +703,9 @@ private:
     std::atomic<bool> m_stopThread{false};
     HANDLE m_stopEvent = nullptr;
     std::vector<fs::path> m_monitoredDirs;
+    /// The directory set comes from signed-in sessions, not configuration, and is
+    /// re-resolved while monitoring (task 369).
+    bool m_usingDefaultDirs = false;
     mutable std::mutex m_processedMutex;
     std::unordered_set<std::string> m_processedFiles;
     std::deque<std::string> m_processedFileOrder;
@@ -774,7 +781,8 @@ bool MaliciousDownloadBlockerImpl::Initialize(const DownloadBlockerConfiguration
 
     // Load monitored directories
     m_monitoredDirs = config.monitoredDirectories;
-    if (m_monitoredDirs.empty()) {
+    m_usingDefaultDirs = m_monitoredDirs.empty();
+    if (m_usingDefaultDirs) {
         m_monitoredDirs = ResolveDefaultDownloadDirectories();
     }
     if (m_monitoredDirs.size() > MAX_MONITORED_DIRS) {
@@ -1208,8 +1216,14 @@ bool MaliciousDownloadBlockerImpl::StartMonitoring() {
     if (m_isMonitoring.load(std::memory_order_acquire)) return true;
 
     if (m_monitoredDirs.empty()) {
-        Logger::Warn("DownloadBlocker: no directories to monitor");
-        return false;
+        if (!m_usingDefaultDirs) {
+            Logger::Warn("DownloadBlocker: no directories to monitor");
+            return false;
+        }
+        // Nobody is signed in yet (service start at boot). Each sign-in adds that
+        // user's Downloads folder, so monitoring starts now and waits for one.
+        Logger::Info("DownloadBlocker: no user session yet, monitoring starts and adds "
+                     "each user's Downloads folder at sign-in");
     }
 
     m_stopThread.store(false, std::memory_order_release);
@@ -1256,7 +1270,29 @@ void MaliciousDownloadBlockerImpl::StopMonitoring() {
     Logger::Info("DownloadBlocker: directory monitoring stopped");
 }
 
+bool MaliciousDownloadBlockerImpl::RefreshDefaultDirectories() {
+    if (!m_usingDefaultDirs) return false;
+    const auto resolved = ResolveDefaultDownloadDirectories();
+    std::unique_lock lock(m_mutex);
+    const size_t before = m_monitoredDirs.size();
+    const size_t added = MergeMonitoredDirectories(m_monitoredDirs, resolved, MAX_MONITORED_DIRS);
+    for (size_t i = before; i < m_monitoredDirs.size(); ++i) {
+        Logger::Info("DownloadBlocker: user session detected, now monitoring {}",
+                     Utils::StringUtils::ToNarrow(m_monitoredDirs[i].wstring()));
+    }
+    return added > 0;
+}
+
 void MaliciousDownloadBlockerImpl::MonitoringLoop() {
+    // Watches are rebuilt whenever a sign-in adds a Downloads folder.
+    while (!m_stopThread.load(std::memory_order_acquire)) {
+        if (!RunWatches()) break;
+    }
+}
+
+bool MaliciousDownloadBlockerImpl::RunWatches() {
+    constexpr auto kRefreshInterval = std::chrono::seconds(10);
+    auto nextRefresh = Clock::now() + kRefreshInterval;
     // Collect directory handles for ReadDirectoryChangesW
     struct WatchEntry {
         HANDLE hDir = INVALID_HANDLE_VALUE;
@@ -1346,7 +1382,9 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
     }
 
     if (watches.empty()) {
-        Logger::Warn("DownloadBlocker: no directories could be monitored, falling back to polling");
+        if (!m_monitoredDirs.empty()) {
+            Logger::Warn("DownloadBlocker: no directories could be monitored, falling back to polling");
+        }
         // Fallback: simple polling loop
         while (!m_stopThread.load(std::memory_order_acquire)) {
             std::vector<fs::path> dirs;
@@ -1376,8 +1414,12 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
                 }
             }
             std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (Clock::now() >= nextRefresh) {
+                nextRefresh = Clock::now() + kRefreshInterval;
+                if (RefreshDefaultDirectories()) return true;
+            }
         }
-        return;
+        return false;
     }
 
     // Event-driven monitoring loop
@@ -1394,7 +1436,14 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
         DWORD waitResult = WaitForMultipleObjects(
             static_cast<DWORD>(events.size()), events.data(), FALSE, 1000);
 
-        if (waitResult == WAIT_TIMEOUT) continue;
+        if (waitResult == WAIT_TIMEOUT) {
+            // Only when idle: a rebuild drops nothing that has already been delivered.
+            if (Clock::now() >= nextRefresh) {
+                nextRefresh = Clock::now() + kRefreshInterval;
+                if (RefreshDefaultDirectories()) return true;
+            }
+            continue;
+        }
         if (waitResult == WAIT_FAILED) {
             Logger::Error("DownloadBlocker: WaitForMultipleObjects failed: {}", GetLastError());
             break;
@@ -1459,6 +1508,30 @@ void MaliciousDownloadBlockerImpl::MonitoringLoop() {
     }
 
     // Cleanup events handled by ~WatchEntry RAII below as `watches` unwinds.
+    return false;
+}
+
+size_t Downloads::MergeMonitoredDirectories(std::vector<fs::path>& monitored,
+                                            const std::vector<fs::path>& resolved,
+                                            size_t maxDirs) {
+    const auto key = [](const fs::path& p) {
+        std::wstring s = p.lexically_normal().wstring();
+        while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+        if (!s.empty()) ::CharLowerBuffW(s.data(), static_cast<DWORD>(s.size()));
+        return s;
+    };
+    size_t added = 0;
+    for (const auto& dir : resolved) {
+        if (monitored.size() >= maxDirs) break;
+        if (dir.empty()) continue;
+        const auto k = key(dir);
+        const bool known = std::any_of(monitored.begin(), monitored.end(),
+                                       [&](const fs::path& m) { return key(m) == k; });
+        if (known) continue;
+        monitored.push_back(dir);
+        ++added;
+    }
+    return added;
 }
 
 bool MaliciousDownloadBlockerImpl::HasProcessedFile(const std::string& path) const {
