@@ -29791,5 +29791,26 @@ class CatalogLookupFailureIsNotUnsignedTests(unittest.TestCase):
         self.assertIn("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE", body)
 
 
+class ZeroDayInferencePassesPublisherTrustTests(unittest.TestCase):
+    """Stage 9 verdicts with only the corruption heuristic pass through trust (task 372)."""
+
+    def setUp(self):
+        self.src = strip_c_comments(read_source(ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"))
+
+    def test_only_corruption_only_verdicts_consult_trust(self):
+        start = self.src.index("const bool zdInferenceOnly =")
+        block = self.src[start:self.src.index("if (!zdWithheldByTrust && zdResult.detected &&", start)]
+        for need in ("zdResult.cveMatches.empty()", "!zdResult.shellcodeInfo.has_value()",
+                     "!zdResult.ropChainInfo.has_value()", "!zdResult.heapSprayInfo.has_value()",
+                     "m_impl->EvaluatePublisherTrust(filePath)", "zeroDayVerdictsSuppressedByTrust",
+                     'Impl::LogTrustNotEstablished("Stage 9 zero-day"'):
+            self.assertIn(need, block, need)
+        self.assertNotIn("goto finalize_scan", block)
+
+    def test_counter_is_reported(self):
+        self.assertIn('"\\"zeroDayVerdictsSuppressedByTrust\\":"', self.src)
+        self.assertIn("stats.zeroDayVerdictsSuppressedByTrust =", self.src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

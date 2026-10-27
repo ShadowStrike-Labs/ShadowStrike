@@ -1172,6 +1172,10 @@ public:
     /// Stage 6 generic polymorphic verdicts withheld on a verified signature (task 366).
     uint64_t polymorphicVerdictsSuppressedByTrust = 0;
 
+    /// Stage 9 verdicts resting only on the memory-corruption heuristic, withheld on
+    /// a verified signature (task 372).
+    uint64_t zeroDayVerdictsSuppressedByTrust = 0;
+
     /// @brief Heuristic analyses skipped because trust was ALREADY established.
     ///
     /// Distinct from heuristicVerdictsSuppressedByTrust, which counts analyses that

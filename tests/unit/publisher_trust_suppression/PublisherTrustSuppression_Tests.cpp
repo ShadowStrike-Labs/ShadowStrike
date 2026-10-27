@@ -324,6 +324,7 @@ TEST(PublisherTrustSuppressionTest, TheSuppressionCounterIsReadable) {
     EXPECT_GE(stats.heuristicVerdictsSuppressedByTrust, 0ull);
     EXPECT_GE(stats.signatureVerdictsSuppressedByTrust, 0ull);     // task 367
     EXPECT_GE(stats.polymorphicVerdictsSuppressedByTrust, 0ull);   // task 366
+    EXPECT_GE(stats.zeroDayVerdictsSuppressedByTrust, 0ull);       // task 372
 }
 
 // ---------------------------------------------------------------------------
