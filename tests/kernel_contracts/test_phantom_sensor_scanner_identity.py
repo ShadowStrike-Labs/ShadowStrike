@@ -29399,10 +29399,21 @@ class FeedIndicatorTextIsStoredTests(unittest.TestCase):
                       "ApplyFeedDefaults no longer drops a string entry that has no text")
         self.assertNotIn("IsStringPoolType", mgr, "every string indicator is dropped again")
 
-    def test_urlhaus_is_registered_by_default(self):
+    def test_urlhaus_is_registered_with_the_abuse_ch_key(self):
+        # Task 18: abuse.ch answers the key-free download path with 410 Gone, so URLhaus
+        # moved from the public list to the credentialed one.
         store = strip_c_comments(read_source(self.TI / "ThreatIntelStore.cpp"))
-        feeds = extract_c_function(store, "ThreatIntelStore::RegisterDefaultFeeds")
-        self.assertIn("&ThreatFeedConfig::CreateURLhaus", feeds)
+        self.assertNotIn("&ThreatFeedConfig::CreateURLhaus",
+                         extract_c_function(store, "ThreatIntelStore::RegisterDefaultFeeds"))
+        creds = extract_c_function(store, "ThreatIntelStore::RegisterCredentialedFeeds")
+        self.assertIn("ThreatFeedConfig::CreateURLhaus(*abuseKey)", creds)
+        self.assertIn('add("urlhaus", urlhaus);', creds)
+        mgr = strip_c_comments(read_source(self.TI / "ThreatIntelFeedManager.cpp"))
+        body = extract_c_function(mgr, "ThreatFeedConfig::CreateURLhaus")
+        self.assertNotIn("/downloads/csv_online/", body)
+        self.assertIn('"/v2/files/exports/" + authKey + "/recent.csv"', body)
+        self.assertIn("config.endpoint.pathContainsCredentials = true;", body)
+        self.assertIn("if (IsUrlPathSafeKey(authKey)) {", body)
 
 
 class ADuplicateAddUpdatesTheExistingEntryTests(unittest.TestCase):

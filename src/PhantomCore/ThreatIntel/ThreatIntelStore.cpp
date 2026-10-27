@@ -979,7 +979,6 @@ uint32_t ThreatIntelStore::RegisterDefaultFeeds() noexcept {
     static constexpr DefaultFeed kFeeds[] = {
         { &ThreatFeedConfig::CreateFeodoTracker, std::chrono::hours(2) },
         { &ThreatFeedConfig::CreateETOpen,       std::chrono::hours(6) },
-        { &ThreatFeedConfig::CreateURLhaus,      std::chrono::hours(1) },
     };
 
     uint32_t registered = 0;
@@ -1040,14 +1039,26 @@ uint32_t ThreatIntelStore::RegisterCredentialedFeeds() noexcept {
     };
 
     // abuse.ch issues ONE Auth-Key that covers MalwareBazaar and ThreatFox.
+    // The same key now also unlocks URLhaus: abuse.ch retired its key-free download
+    // (410 Gone), so without a key the product has no malicious-URL feed (task 18).
     if (const auto abuseKey = creds.Get(ThreatIntel::FeedCredentialKeys::AbuseChAuthKey)) {
         add("malwarebazaar", ThreatFeedConfig::CreateMalwareBazaar(*abuseKey));
         add("threatfox", ThreatFeedConfig::CreateThreatFox(*abuseKey));
+        if (ThreatFeedConfig::IsUrlPathSafeKey(*abuseKey)) {
+            auto urlhaus = ThreatFeedConfig::CreateURLhaus(*abuseKey);
+            urlhaus.syncIntervalSeconds = 3600;  // abuse.ch asks for at most one fetch per 5 min
+            add("urlhaus", urlhaus);
+        } else {
+            Utils::Logger::Warn(
+                "[ThreatIntel] {} is not plain letters and digits ({} chars) - URLhaus "
+                "is not registered because the key goes into the download URL",
+                ThreatIntel::FeedCredentialKeys::AbuseChAuthKey, abuseKey->size());
+        }
     } else {
         Utils::Logger::Warn(
-            "[ThreatIntel] No {} configured - MalwareBazaar and ThreatFox stay "
-            "disabled, so FILE HASH indicators have no feed source. Public URL and "
-            "IP feeds are unaffected. A free key is available from "
+            "[ThreatIntel] No {} configured - MalwareBazaar, ThreatFox and URLhaus stay "
+            "disabled, so FILE HASH and malicious-URL indicators have no feed source. "
+            "Public IP feeds are unaffected. A free key is available from "
             "https://auth.abuse.ch/ for non-commercial use.",
             ThreatIntel::FeedCredentialKeys::AbuseChAuthKey);
     }

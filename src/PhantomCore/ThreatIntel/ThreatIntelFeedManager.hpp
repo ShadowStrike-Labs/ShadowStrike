@@ -543,8 +543,14 @@ struct ThreatFeedConfig {
     /// @brief Create AbuseIPDB feed config
     [[nodiscard]] static ThreatFeedConfig CreateAbuseIPDB(const std::string& apiKey);
     
-    /// @brief Create URLhaus feed config (no auth required)
-    [[nodiscard]] static ThreatFeedConfig CreateURLhaus();
+    /// @brief Create URLhaus feed config.
+    /// @param authKey abuse.ch Auth-Key. abuse.ch retired the key-free download path
+    ///        (it answers 410 Gone); the export URL now carries the key. A key that is
+    ///        not plain letters and digits yields a disabled config with no path.
+    [[nodiscard]] static ThreatFeedConfig CreateURLhaus(const std::string& authKey);
+
+    /// @brief True when @p key is 1-128 ASCII letters or digits, safe to place in a URL path.
+    [[nodiscard]] static bool IsUrlPathSafeKey(std::string_view key) noexcept;
     
     /// @brief Create MalwareBazaar feed config
     [[nodiscard]] static ThreatFeedConfig CreateMalwareBazaar(const std::string& authKey = "");
@@ -1270,7 +1276,7 @@ public:
  * 
  * // Add feeds
  * manager.AddFeed(ThreatFeedConfig::CreateAlienVaultOTX("your-otx-key"));
- * manager.AddFeed(ThreatFeedConfig::CreateURLhaus());
+ * manager.AddFeed(ThreatFeedConfig::CreateURLhaus(abuseChAuthKey));
  * 
  * // Set event callback
  * manager.SetEventCallback([](const FeedEvent& event) {

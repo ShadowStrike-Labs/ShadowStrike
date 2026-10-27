@@ -626,7 +626,14 @@ ThreatFeedConfig ThreatFeedConfig::CreateAbuseIPDB(const std::string& apiKey) {
     return config;
 }
 
-ThreatFeedConfig ThreatFeedConfig::CreateURLhaus() {
+bool ThreatFeedConfig::IsUrlPathSafeKey(std::string_view key) noexcept {
+    if (key.empty() || key.size() > 128) return false;
+    return std::all_of(key.begin(), key.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    });
+}
+
+ThreatFeedConfig ThreatFeedConfig::CreateURLhaus(const std::string& authKey) {
     ThreatFeedConfig config = CreateDefault(ThreatIntelSource::URLhaus);
     
     config.feedId = "urlhaus";
@@ -635,11 +642,21 @@ ThreatFeedConfig ThreatFeedConfig::CreateURLhaus() {
     config.protocol = FeedProtocol::CSV_HTTP;
     config.priority = FeedPriority::High;
     
-    config.endpoint.baseUrl = "https://urlhaus.abuse.ch";
-    config.endpoint.path = "/downloads/csv_online/";
+    // abuse.ch answers the key-free /downloads/csv_online/ path with 410 Gone (1.0.125
+    // VM run, every sync). Its documented export is
+    // https://urlhaus-api.abuse.ch/v2/files/exports/<Auth-Key>/recent.csv. The key is
+    // in the path, so it is restricted to letters and digits (no path or query
+    // injection) and the URL is redacted from logs.
+    config.endpoint.baseUrl = "https://urlhaus-api.abuse.ch";
+    if (IsUrlPathSafeKey(authKey)) {
+        config.endpoint.path = "/v2/files/exports/" + authKey + "/recent.csv";
+        config.endpoint.pathContainsCredentials = true;
+    } else {
+        config.enabled = false;
+    }
     config.endpoint.method = "GET";
     
-    config.auth.method = AuthMethod::None;
+    config.auth.method = AuthMethod::None;  // Key embedded in URL path
     
     config.rateLimit.requestsPerMinute = 10;
     

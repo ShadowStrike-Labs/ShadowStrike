@@ -66,6 +66,8 @@ private:
     std::string m_body;
 };
 
+/// Placeholder abuse.ch key: letters and digits, so the URLhaus export path accepts it.
+constexpr const char* kTestAbuseChKey = "0123456789abcdefTEST";
 constexpr const char* kFeodoBody = "# Feodo Tracker recommended blocklist\n203.0.113.7\n198.51.100.23\n";
 constexpr const char* kUrlhausBody =
     "id,dateadded,url,url_status,last_online,threat,tags,urlhaus_link,reporter\n"
@@ -252,7 +254,7 @@ TEST(FeedSyncStore, UrlIndicatorsFromAFeedAreStoredAndFound) {
     auto mgr = StartedManager(http);
     ASSERT_TRUE(mgr);
     mgr->SetTargetStore(store);
-    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus()));
+    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus(kTestAbuseChKey)));
 
     const auto result = mgr->SyncFeed("urlhaus");
     ASSERT_TRUE(result.success) << result.errorMessage;
@@ -280,7 +282,7 @@ TEST(FeedSyncStore, ASecondSyncUpdatesWhatTheFirstStored) {
     auto mgr = StartedManager(std::make_shared<RoutedHttpClient>());
     ASSERT_TRUE(mgr);
     mgr->SetTargetStore(store);
-    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus()));
+    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus(kTestAbuseChKey)));
     ASSERT_TRUE(mgr->AddFeed(Feodo()));
 
     ASSERT_EQ(2u, mgr->SyncFeed("urlhaus").newIOCs);
@@ -314,7 +316,7 @@ TEST(FeedSyncStore, AFeedValueThatIsNotAValidUrlIsNotStored) {
     auto mgr = StartedManager(std::make_shared<ScriptedHttpClient>(200, body));
     ASSERT_TRUE(mgr);
     mgr->SetTargetStore(store);
-    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus()));
+    ASSERT_TRUE(mgr->AddFeed(ThreatFeedConfig::CreateURLhaus(kTestAbuseChKey)));
     const auto result = mgr->SyncFeed("urlhaus");
     ASSERT_TRUE(result.success) << result.errorMessage;
     EXPECT_EQ(2u, result.newIOCs);
@@ -327,7 +329,7 @@ TEST(FeedSyncStore, AFeedValueThatIsNotAValidUrlIsNotStored) {
 // a hash of the text where the offset of the text belongs.
 TEST(FeedParsers, WithoutATextStoreAStringIndicatorHasNoReference) {
     CsvFeedParser parser;
-    const auto config = ThreatFeedConfig::CreateURLhaus().parser;
+    const auto config = ThreatFeedConfig::CreateURLhaus(kTestAbuseChKey).parser;
     std::vector<IOCEntry> entries;
     const std::string body = kUrlhausBody;
     ASSERT_TRUE(parser.Parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()),
@@ -346,8 +348,9 @@ TEST(FeedSyncStore, TheStoreRegistersItsDefaultFeedsAndSchedulesThemSoon) {
     EXPECT_GE(store->RegisterDefaultFeeds(), 2u);
     EXPECT_TRUE(store->GetFeedStatus("feodotracker").has_value());
     EXPECT_TRUE(store->GetFeedStatus("etopen-compromised-ips").has_value());
-    EXPECT_TRUE(store->GetFeedStatus("urlhaus").has_value())
-        << "URLhaus is the default feed of malware-distribution URLs (task 345)";
+    // URLhaus is not asserted here: abuse.ch retired its key-free download (410 Gone,
+    // task 18), so it registers only when this machine has an abuse.ch key. The
+    // registration rule is pinned by the contract suite.
 
     store->StartFeedUpdates();
     const auto status = store->GetFeedStatus("feodotracker");
@@ -412,4 +415,28 @@ TEST(FeedParsers, AParsedEntryStartsUnknownNotSafeOrIndeterminate) {
     EXPECT_EQ(ConfidenceLevel::None, out[0].confidence);
     EXPECT_EQ(0u, out[0].expirationTime);
     EXPECT_EQ(0u, out[0].entryId);
+}
+
+// ============================================================================
+// URLhaus export URL (task 18): abuse.ch answers the key-free path with 410 Gone.
+// ============================================================================
+
+TEST(FeedUrlhausEndpoint, TheKeyedExportIsRequestedAndRedactedFromLogs) {
+    const auto cfg = ThreatFeedConfig::CreateURLhaus(kTestAbuseChKey);
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_EQ(cfg.endpoint.GetFullUrl(),
+              std::string("https://urlhaus-api.abuse.ch/v2/files/exports/") + kTestAbuseChKey + "/recent.csv");
+    EXPECT_TRUE(cfg.endpoint.pathContainsCredentials);
+    EXPECT_EQ(cfg.endpoint.GetSafeLogUrl().find(kTestAbuseChKey), std::string::npos)
+        << "the key would be written to the log";
+}
+
+TEST(FeedUrlhausEndpoint, AKeyThatCouldAlterTheUrlDisablesTheFeed) {
+    const std::vector<std::string> badKeys = {"", "abc/../x", "abc?x=1", "abc def", "abc%2F", std::string(129, 'a')};
+    for (const auto& bad : badKeys) {
+        const auto cfg = ThreatFeedConfig::CreateURLhaus(bad);
+        EXPECT_FALSE(cfg.enabled) << "key '" << bad << "'";
+        EXPECT_EQ(cfg.endpoint.path.find("exports"), std::string::npos) << "key '" << bad << "'";
+    }
+    EXPECT_TRUE(ThreatFeedConfig::IsUrlPathSafeKey(std::string(128, 'Z')));
 }
