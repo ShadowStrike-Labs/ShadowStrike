@@ -82,7 +82,9 @@ if ($free -lt $MinFreeGB) { "REFUSED: $free GB memory headroom (available and fr
 function Invoke-Guarded([string]$file, [string[]]$argList, [string]$stdout, [string]$stderr,
                         [int]$sec, [int]$capGB, [string]$what) {
     $job = [HostGate.Job]::Create([long]$capGB * 1GB)
-    $sp = @{ FilePath = $file; ArgumentList = $argList; NoNewWindow = $true; PassThru = $true }
+    $sp = @{ FilePath = $file; NoNewWindow = $true; PassThru = $true }
+    # Start-Process rejects an empty -ArgumentList; the whole suite runs with no arguments.
+    if ($argList.Count -gt 0) { $sp.ArgumentList = $argList }
     if ($stdout) { $sp.RedirectStandardOutput = $stdout }
     if ($stderr) { $sp.RedirectStandardError = $stderr }
     $p = Start-Process @sp
