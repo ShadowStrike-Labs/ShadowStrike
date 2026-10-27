@@ -29606,5 +29606,39 @@ class ScriptKernelBlocksRefuseOwnProcessTests(unittest.TestCase):
         self.assertEqual(2, src.count("request.processId = 0;"))
 
 
+class ZeroDayShellcodeNeedsCodeEvidenceTests(unittest.TestCase):
+    """Text and byte statistics cannot make a buffer shellcode on their own (task 365).
+
+    API names, DLL names, the opcode-valued byte count and entropy convicted NTUSER.DAT and
+    prefetch files in the 1.0.124 VM run.
+    """
+
+    SRC = ROOT / "src/PhantomCore/Core/Engine/ZeroDayDetector.cpp"
+
+    def setUp(self):
+        self.src = strip_c_comments(read_source(self.SRC))
+        self.body = extract_c_function(self.src, "ZeroDayDetector::Impl::DetectShellcodeInternal")
+
+    def test_no_code_evidence_returns_before_text_signals(self):
+        gate = self.body.index("if (!info.hasNopSled && !codeEvidence) {")
+        self.assertIn("const bool codeEvidence = info.hasGetPC || known != nullptr;", self.body)
+        self.assertLess(gate, self.body.index("ClassifyByApiNames(buffer)"))
+        self.assertLess(gate, self.body.index("kNetSigs"))
+
+    def test_corroborating_signals_require_code_evidence(self):
+        self.assertIn("if (codeEvidence && DetectDecoderStub(buffer)) {", self.body)
+        self.assertIn("} else if (info.hasGetPC) {\n            info.type = ClassifyByApiNames(buffer);", self.body)
+        self.assertIn("if (!codeEvidence) break;", self.body)
+
+    def test_only_high_confidence_patterns_stand_alone(self):
+        self.assertIn("known->confidence >= kStandalonePatternConfidence) score += 20;", self.body)
+        self.assertIn("kStandalonePatternConfidence = 0.88f;", self.src)
+
+    def test_indirect_transfer_is_not_getpc(self):
+        body = extract_c_function(self.src, "ZeroDayDetector::Impl::DetectGetPCTrick")
+        self.assertNotIn("0xD0", body)
+        self.assertNotIn("0xE0", body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

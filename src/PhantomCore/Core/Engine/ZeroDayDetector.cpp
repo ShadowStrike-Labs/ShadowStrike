@@ -79,6 +79,8 @@ constexpr size_t kMaxFindGadgetsBytes       = 16u * 1024u * 1024u;
 constexpr size_t kMaxGadgetsReturned        = 4096;
 constexpr size_t kMaxCveDatabaseEntries     = 1024;
 constexpr size_t kMaxShellcodePatterns      = 256;
+/// Known-pattern confidence at which a match alone reaches the shellcode threshold.
+constexpr float  kStandalonePatternConfidence = 0.88f;
 
 [[nodiscard]] std::wstring ToWide(std::string_view v) noexcept {
     try { return Utils::StringUtils::ToWide(v); }
@@ -144,7 +146,8 @@ public:
     [[nodiscard]] bool DetectGetPCTrick(std::span<const uint8_t> buffer) noexcept;
     [[nodiscard]] bool DetectDecoderStub(std::span<const uint8_t> buffer) noexcept;
     [[nodiscard]] double ComputeEntropy(std::span<const uint8_t> buffer) noexcept;
-    [[nodiscard]] ShellcodeType ClassifyShellcode(std::span<const uint8_t> buffer) noexcept;
+    [[nodiscard]] const ShellcodePattern* MatchKnownPattern(std::span<const uint8_t> buffer) noexcept;
+    [[nodiscard]] ShellcodeType ClassifyByApiNames(std::span<const uint8_t> buffer) noexcept;
     [[nodiscard]] bool ScanForPattern(std::span<const uint8_t> haystack, std::span<const uint8_t> needle) noexcept;
 
     [[nodiscard]] std::optional<ROPChainInfo> DetectROPChainInternal(
@@ -308,13 +311,30 @@ std::optional<ShellcodeInfo> ZeroDayDetector::Impl::DetectShellcodeInternal(
         }
 
         if (DetectGetPCTrick(buffer))  info.hasGetPC = true;
-        if (DetectDecoderStub(buffer)) {
+        const ShellcodePattern* known = MatchKnownPattern(buffer);
+
+        // Only code structure can make a buffer shellcode. Text (API and DLL names),
+        // byte-value counts and entropy occur in any registry hive, prefetch file or
+        // string table; the 1.0.124 VM run convicted NTUSER.DAT 18 times on them alone.
+        // They still count beside a self-locating instruction or a known code pattern.
+        const bool codeEvidence = info.hasGetPC || known != nullptr;
+        if (!info.hasNopSled && !codeEvidence) {
+            return std::nullopt;
+        }
+
+        // The decoder heuristic counts opcode-valued bytes, so ordinary digits and
+        // capitals satisfy it; it corroborates code evidence and cannot stand in for it.
+        if (codeEvidence && DetectDecoderStub(buffer)) {
             info.hasDecoderStub = true;
             info.isEncoded      = true;
             info.encodingType   = "XOR/ADD loop encoder";
         }
 
-        info.type = ClassifyShellcode(buffer);
+        if (known != nullptr) {
+            info.type = known->type;
+        } else if (info.hasGetPC) {
+            info.type = ClassifyByApiNames(buffer);
+        }
 
         // Network indicator scan
         static const char* kNetSigs[][2] = {
@@ -325,6 +345,7 @@ std::optional<ShellcodeInfo> ZeroDayDetector::Impl::DetectShellcodeInternal(
             {"HttpSendReq",  "HTTP request API"},
         };
         for (const auto& ns : kNetSigs) {
+            if (!codeEvidence) break;
             const auto len = std::strlen(ns[0]);
             std::span<const uint8_t> sig(reinterpret_cast<const uint8_t*>(ns[0]), len);
             if (ScanForPattern(buffer, sig))
@@ -339,6 +360,8 @@ std::optional<ShellcodeInfo> ZeroDayDetector::Impl::DetectShellcodeInternal(
         if (info.entropy >= 5.5f && info.entropy <= 7.5f) score += 15;
         if (!info.networkIndicators.empty())              score += 20;
         if (info.type != ShellcodeType::Unknown)          score += 30;
+        // A high-confidence known prologue is specific enough to stand alone.
+        if (known != nullptr && known->confidence >= kStandalonePatternConfidence) score += 20;
 
         if (score >= 50) {
             m_stats.shellcodeDetected.fetch_add(1, std::memory_order_relaxed);
@@ -401,12 +424,8 @@ bool ZeroDayDetector::Impl::DetectGetPCTrick(
                 buffer[i+2] == 0x24 && buffer[i+3] == 0xF4)
                 return true;
 
-            // JMP/CALL reg then POP
-            if (i+2 < buffer.size() && buffer[i] == 0xFF &&
-                ((buffer[i+1] >= 0xD0 && buffer[i+1] <= 0xD7) ||
-                 (buffer[i+1] >= 0xE0 && buffer[i+1] <= 0xE7)) &&
-                buffer[i+2] >= 0x58 && buffer[i+2] <= 0x5F)
-                return true;
+            // An indirect CALL/JMP followed by POP is not listed: the POP runs only
+            // after a return, or never, so it does not read the program counter.
         }
         return false;
     } catch (...) { return false; }
@@ -453,15 +472,22 @@ double ZeroDayDetector::Impl::ComputeEntropy(
     } catch (...) { return 0.0; }
 }
 
-ShellcodeType ZeroDayDetector::Impl::ClassifyShellcode(
+const ZeroDayDetector::Impl::ShellcodePattern* ZeroDayDetector::Impl::MatchKnownPattern(
     std::span<const uint8_t> buffer) noexcept
 {
     try {
         for (const auto& pat : m_shellcodePatterns) {
             if (ScanForPattern(buffer, std::span<const uint8_t>(pat.signature)))
-                return pat.type;
+                return &pat;
         }
+    } catch (...) {}
+    return nullptr;
+}
 
+ShellcodeType ZeroDayDetector::Impl::ClassifyByApiNames(
+    std::span<const uint8_t> buffer) noexcept
+{
+    try {
         struct APIHint { const char* api; ShellcodeType type; };
         static const APIHint hints[] = {
             {"URLDownloadToFile", ShellcodeType::Downloader},

@@ -20,11 +20,30 @@
 #include <vector>
 
 #include "../../../src/PhantomCore/Core/Engine/ZeroDayDetector.hpp"
+#include "../../../src/PhantomCore/Utils/Base64Utils.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 
 namespace ShadowStrike::Core::Engine::Test {
 namespace {
+
+// Test inputs are stored base64-encoded and decoded in memory only.
+std::vector<uint8_t> FromBase64(std::string_view b64) {
+    std::vector<uint8_t> out;
+    Utils::Base64DecodeError err{};
+    EXPECT_TRUE(Utils::Base64Decode(b64, out, err)) << b64;
+    return out;
+}
+
+// A data-file fragment: a hive signature, API and DLL names, digits and capitals.
+// It carries no code structure.
+std::vector<uint8_t> MakeDataFileBuffer() {
+    const auto block = FromBase64(
+        "cmVnZgAAAAAgY29ubmVjdCBiaW5kIGxpc3RlbiB3czJfMzIgd2luaW5ldCBXaW5FeGVjIDEzMTMxMzEzMTMxMyBBQkNERUZHSElKS0xNTk8gQEBAQCAwMTIzNDU2Nzg5IA==");
+    std::vector<uint8_t> buffer;
+    for (int i = 0; i < 16; ++i) buffer.insert(buffer.end(), block.begin(), block.end());
+    return buffer;
+}
 
 bool Contains(std::string_view haystack, std::string_view needle) {
     return haystack.find(needle) != std::string_view::npos;
@@ -244,6 +263,47 @@ TEST_F(ZeroDayDetectorTest, InitializedHeuristicsDetectShellcodeHeapAndRopSignal
     const Engine::ZeroDayResult stackAnalysis = detector.AnalyzeStack(stackDump, moduleRanges);
     EXPECT_TRUE(stackAnalysis.detected);
     EXPECT_EQ(stackAnalysis.type, Engine::ExploitType::ROPChain);
+}
+
+// Task 365: text, byte-value counts and entropy alone convicted registry hives and
+// prefetch files. Code structure is now required; the same text beside it still counts.
+TEST_F(ZeroDayDetectorTest, DataFileTextAloneIsNotShellcode) {
+    auto& detector = Engine::ZeroDayDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    const auto data = MakeDataFileBuffer();
+    // The byte-value heuristic still fires on it: that is why it cannot stand alone.
+    ASSERT_TRUE(detector.HasDecoderStub(data));
+    EXPECT_FALSE(detector.DetectShellcode(data).has_value());
+    EXPECT_FALSE(detector.AnalyzeBuffer(data).detected);
+}
+
+TEST_F(ZeroDayDetectorTest, CodeStructureStillDetectsBesideText) {
+    auto& detector = Engine::ZeroDayDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    // The same data with a self-locating instruction pair: text now classifies it.
+    auto withGetPc = MakeDataFileBuffer();
+    const std::array<uint8_t, 6> getPc = {0xE8, 0x00, 0x00, 0x00, 0x00, 0x58};
+    withGetPc.insert(withGetPc.begin() + 64, getPc.begin(), getPc.end());
+    const auto located = detector.DetectShellcode(withGetPc);
+    ASSERT_TRUE(located.has_value());
+    EXPECT_TRUE(located->hasGetPC);
+    EXPECT_TRUE(located->hasDecoderStub);
+    EXPECT_NE(located->type, Engine::ShellcodeType::Unknown);
+    EXPECT_FALSE(located->networkIndicators.empty());
+
+    // A high-confidence known prologue stands alone, inside data or on its own.
+    const auto prologue = FromBase64("/OiCAAAA");
+    auto withPrologue = std::vector<uint8_t>(256, 0x00);
+    withPrologue.insert(withPrologue.begin() + 100, prologue.begin(), prologue.end());
+    const auto known = detector.DetectShellcode(withPrologue);
+    ASSERT_TRUE(known.has_value());
+    EXPECT_EQ(known->type, Engine::ShellcodeType::Meterpreter);
+    EXPECT_TRUE(detector.AnalyzeBuffer(withPrologue).detected);
+
+    // The NOP-run-plus-GetPC shape keeps detecting.
+    EXPECT_TRUE(detector.DetectShellcode(MakeShellcodeLikeBuffer()).has_value());
 }
 
 }  // namespace ShadowStrike::Core::Engine::Test
