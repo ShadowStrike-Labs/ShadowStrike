@@ -30113,5 +30113,39 @@ class LostScanChannelIsRebuiltTests(unittest.TestCase):
                       self.establish[published:scope_end])
 
 
+class StartStatesTheReconnectGraceTests(unittest.TestCase):
+    """IPCManager::Start reports the reconnect grace it primes, not a deferred connect (task 106, item 5).
+
+    Start logged "Filter port first-connect deferred 3000 ms", and RealTimeProtection's
+    synchronous ConnectFilterPort followed within a millisecond on the same thread in the
+    1.0.94 and 1.0.126-1.0.128 field logs: the announced deferral never happened on the
+    shipped start path.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        ipc = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        rtp = strip_c_comments(read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"))
+        cls.start = extract_c_function(ipc, "IPCManager::Start")
+        cls.init = extract_c_function(rtp, "InitializeIPCManager")
+
+    def test_no_deferred_first_connect_is_announced(self):
+        for claim in ("first-connect deferred", "ConnectFilterPort-deferred"):
+            self.assertNotIn(claim, self.start)
+
+    def test_the_log_names_the_grace_it_primes(self):
+        primed = re.search(r"constexpr uint32_t (\w+) = 3000;", self.start)
+        self.assertIsNotNone(primed, "the primed grace constant is gone")
+        name = primed.group(1)
+        self.assertIn(f"m_reconnectBackoffMs.store({name},", self.start)
+        log = self.start.index('"[IPCManager] Worker reconnect attempts start after a {} ms boot grace"')
+        self.assertIn(name, self.start[log:self.start.index(";", log)])
+
+    def test_the_shipped_start_path_connects_synchronously(self):
+        # The wording above holds because this caller connects as soon as Start returns.
+        self.assertLess(self.init.index("if (!ipc.Start()) {"),
+                        self.init.index("if (!ipc.ConnectFilterPort()) {"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

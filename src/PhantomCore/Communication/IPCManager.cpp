@@ -408,29 +408,25 @@ bool IPCManager::Start(uint32_t workerThreadCount) {
         ResetEvent(m_impl->shutdownEvent);
     }
 
-    // BOOT-GRACE: defer first filter-port connect by 3 seconds.
-    //
-    // Previously Start() invoked ConnectFilterPort() synchronously here.
-    // On a clean install + first reboot the kernel minifilter is still
-    // warming up while ShadowStrikePhantomService is autoloading; a
-    // synchronous FilterConnectCommunicationPort against an unready port
-    // returns ERROR_FILE_NOT_FOUND and, if the port is being torn down
-    // mid-init, can wedge the service in FltMgr internals during the
-    // exact window that winlogon expects the SCM critical-service set to
-    // settle. Instead, prime the reconnect back-off so the worker
-    // routine's coordinated reconnect path (single claim, exponential
-    // back-off, ACCESS_DENIED ceiling already in place) drives the very
-    // first attempt 3 s into the future. Honors the 5-strike
-    // ACCESS_DENIED ceiling already implemented in ConnectFilterPort.
+    // Start() does not connect the filter port. The shipped start path,
+    // RealTimeProtection::InitializeIPCManager, connects synchronously as soon
+    // as this returns, once its kernel handlers are registered; the receive
+    // workers only reconnect. Priming their back-off places the first worker
+    // attempt 3 s after start rather than at the 1 s base interval, so a
+    // connect that failed during boot, with the minifilter still warming up,
+    // is not retried straight back into it. Only where no caller connects (the
+    // Fuzzer's focused build) is that attempt the first connect. The log line
+    // here used to announce a deferred first connect, and the synchronous
+    // connect followed it within a millisecond on the same thread (field logs
+    // 1.0.94 and 1.0.126-1.0.128, task 106).
     if (m_impl->config.enableFilterPort) {
-        constexpr uint32_t kFilterPortFirstConnectGraceMs = 3000;
-        m_reconnectBackoffMs.store(kFilterPortFirstConnectGraceMs,
+        constexpr uint32_t kWorkerReconnectGraceMs = 3000;
+        m_reconnectBackoffMs.store(kWorkerReconnectGraceMs,
                                    std::memory_order_release);
-        ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-deferred-3s");
+        ::ShadowStrikeAppendBootTrace(L"ipc-Start-worker-reconnect-grace-3s");
         Utils::Logger::Info(
-            "[IPCManager] Filter port first-connect deferred {} ms "
-            "(boot-grace; reconnect path handles the attempt)",
-            kFilterPortFirstConnectGraceMs);
+            "[IPCManager] Worker reconnect attempts start after a {} ms boot grace",
+            kWorkerReconnectGraceMs);
     } else {
         ::ShadowStrikeAppendBootTrace(L"ipc-Start-ConnectFilterPort-disabled");
     }
