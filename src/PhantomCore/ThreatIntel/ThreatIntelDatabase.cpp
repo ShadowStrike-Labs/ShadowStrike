@@ -961,6 +961,7 @@ size_t ThreatIntelDatabase::AllocateEntry() noexcept {
     
     m_header->totalActiveEntries++;
     m_stats.entryCount = static_cast<size_t>(m_header->totalActiveEntries);
+    UpdateHeaderChecksum();
     
     return index;
 }
@@ -1023,6 +1024,7 @@ size_t ThreatIntelDatabase::AllocateEntries(size_t count) noexcept {
     const size_t startIndex = static_cast<size_t>(m_header->totalActiveEntries);
     m_header->totalActiveEntries += static_cast<uint64_t>(count);
     m_stats.entryCount = static_cast<size_t>(m_header->totalActiveEntries);
+    UpdateHeaderChecksum();
     
     return startIndex;
 }
@@ -1041,6 +1043,7 @@ bool ThreatIntelDatabase::SetEntryCount(size_t count) noexcept {
     
     m_header->totalActiveEntries = static_cast<uint64_t>(count);
     m_stats.entryCount = count;
+    UpdateHeaderChecksum();
     
     return true;
 }
@@ -1059,6 +1062,7 @@ size_t ThreatIntelDatabase::IncrementEntryCount() noexcept {
     
     m_header->totalActiveEntries++;
     m_stats.entryCount = m_header->totalActiveEntries;
+    UpdateHeaderChecksum();
     
     return m_header->totalActiveEntries;
 }
@@ -1213,6 +1217,7 @@ size_t ThreatIntelDatabase::Compact() noexcept {
     size_t removedCount = originalCount - writeIndex;
     m_header->totalActiveEntries = static_cast<uint64_t>(writeIndex);
     m_stats.entryCount = writeIndex;
+    UpdateHeaderChecksum();
     
     // Calculate bytes reclaimed (entries removed * entry size)
     size_t bytesReclaimed = removedCount * sizeof(IOCEntry);
@@ -1396,7 +1401,12 @@ bool ThreatIntelDatabase::UpdateHeaderChecksum() noexcept {
         return false;
     }
     
-    // Note: Caller should hold lock
+    // Caller holds m_mutex. Every header mutation calls this before releasing the
+    // lock: the checksum covers mutable fields (entry count, timestamps, sizes), the
+    // view is file-backed, and the memory manager writes a dirty header page out on
+    // its own schedule. A mutation left unsealed until the next Flush/Close reaches
+    // disk with a stale checksum if the process ends first, and OpenExisting then
+    // rejects the file on every later boot (1.0.126 VM run, task 380).
     if (!m_header) {
         return false;
     }
@@ -1419,6 +1429,7 @@ void ThreatIntelDatabase::UpdateTimestamp() noexcept {
             std::chrono::system_clock::now().time_since_epoch()
         ).count()
     );
+    UpdateHeaderChecksum();
     
     m_stats.lastModifiedTimestamp = m_header->lastUpdateTime;
 }
@@ -1968,6 +1979,7 @@ bool ThreatIntelDatabase::Remap(size_t newSize) noexcept {
     // Update entry data size and file size in header
     m_header->entryDataSize = newSize - m_header->entryDataOffset;
     m_header->totalFileSize = newSize;
+    UpdateHeaderChecksum();
     
     // Update stats
     m_stats.extensionCount++;

@@ -2010,3 +2010,101 @@ TEST_F(ThreatIntelDatabaseTest, Titanium_PathHandlingEdgeCases) {
 }
 
 // ============================================================================
+// HEADER CHECKSUM STAYS SEALED (task 380)
+//
+// The header checksum covers the entry count, timestamps and sizes, and the view is
+// file-backed. The 1.0.126 VM run lost its database on the next boot: a mutation after
+// the last Flush left a stale checksum, the process ended without Close, and
+// OpenExisting rejected the file from then on.
+// ============================================================================
+
+namespace {
+
+// Bytes of a file another handle holds open for write, read through the cache, the
+// way the file looks on disk if its writer ends without Close.
+bool CopyOpenDatabase(const std::wstring& from, const std::wstring& to) {
+    HANDLE in = CreateFileW(from.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (in == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    std::ofstream out(to, std::ios::binary | std::ios::trunc);
+    std::vector<char> buffer(1 << 16);
+    bool ok = out.is_open();
+    DWORD got = 0;
+    while (ok && ReadFile(in, buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr) && got > 0) {
+        out.write(buffer.data(), got);
+        ok = static_cast<bool>(out);
+    }
+    CloseHandle(in);
+    return ok;
+}
+
+}  // namespace
+
+TEST_F(ThreatIntelDatabaseTest, HeaderChecksumHoldsAfterEveryMutation) {
+    createdDatabases.push_back(testDbPath + L".strings");
+    ThreatIntelDatabase db;
+    ASSERT_TRUE(db.Open(testDbPath));
+
+    ASSERT_NE(db.AllocateEntry(), SIZE_MAX);
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "AllocateEntry";
+
+    ASSERT_NE(db.AllocateEntries(16), SIZE_MAX);
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "AllocateEntries";
+
+    ASSERT_TRUE(db.SetEntryCount(12));
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "SetEntryCount";
+
+    ASSERT_EQ(db.IncrementEntryCount(), 13u);
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "IncrementEntryCount";
+
+    IOCEntry* doomed = db.GetMutableEntry(0);
+    ASSERT_NE(doomed, nullptr);
+    doomed->flags |= IOCFlags::Revoked;
+    (void)db.Compact();
+    ASSERT_EQ(db.GetEntryCount(), 12u) << "Compact must remove the revoked entry";
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "Compact";
+
+    const size_t before = db.GetStats().mappedSize;
+    ASSERT_TRUE(db.ExtendBy(DATABASE_PAGE_SIZE * 4));
+    ASSERT_GT(db.GetStats().mappedSize, before);
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "Extend";
+
+    // The timestamp has one-second resolution, so wait for it to move or the check
+    // below could not tell a resealed header from an unchanged one.
+    const uint64_t stamp = db.GetHeader()->lastUpdateTime;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (db.GetHeader()->lastUpdateTime == stamp && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        db.UpdateTimestamp();
+    }
+    ASSERT_NE(db.GetHeader()->lastUpdateTime, stamp);
+    EXPECT_TRUE(db.VerifyHeaderChecksum()) << "UpdateTimestamp";
+
+    db.Close();
+}
+
+TEST_F(ThreatIntelDatabaseTest, ADatabaseWhoseWriterNeverClosedReopens) {
+    const std::wstring copy = testDbPath + L".unclosed";
+    createdDatabases.push_back(testDbPath + L".strings");
+    createdDatabases.push_back(copy);
+    createdDatabases.push_back(copy + L".strings");
+
+    ThreatIntelDatabase writer;
+    ASSERT_TRUE(writer.Open(testDbPath));
+    ASSERT_TRUE(writer.Flush());
+    // What the feed sync does: entries, then a timestamp, with no Flush after it.
+    ASSERT_NE(writer.AllocateEntries(3), SIZE_MAX);
+    writer.UpdateTimestamp();
+    ASSERT_TRUE(CopyOpenDatabase(testDbPath, copy));
+
+    ThreatIntelDatabase reopened;
+    EXPECT_TRUE(reopened.Open(copy))
+        << "a database whose writer ended without Close must open on the next start";
+    if (reopened.IsOpen()) {
+        EXPECT_EQ(reopened.GetEntryCount(), 3u);
+        reopened.Close();
+    }
+    writer.Close();
+}
