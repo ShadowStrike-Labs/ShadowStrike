@@ -921,6 +921,19 @@ bool IPCManager::IsFilterPortConnected() const noexcept {
         && m_connected.load(std::memory_order_acquire);
 }
 
+bool IPCManager::IsScanChannelEstablished() const noexcept {
+    // FilterConnection::Connect returns true only after key exchange and driver
+    // attestation, and a later disconnect clears IsConnected, so this is the live
+    // state of the channel scan requests travel on. The pointer is copied under
+    // the lock and queried outside it, as the receive workers do.
+    std::shared_ptr<FilterConnection> conn;
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        conn = m_primaryConnection;
+    }
+    return conn && conn->IsConnected();
+}
+
 ThreatIntelPusher* IPCManager::GetPusher() noexcept {
     std::lock_guard lock(m_pusherMutex);
     return m_pusher.get();

@@ -952,6 +952,17 @@ public:
     
     /// @brief Check filter port connection
     [[nodiscard]] bool IsFilterPortConnected() const noexcept;
+
+    /**
+     * @brief True only while the encrypted, attested primary scan channel is up.
+     *
+     * IsConnected and IsFilterPortConnected report the raw control handle, which
+     * opens even when key exchange or driver attestation fails - and then no scan
+     * request can be served. This is the state that decides whether the kernel can
+     * reach the scanner; report it, not the handle, wherever "driver connected"
+     * means "files are being scanned" (task 82).
+     */
+    [[nodiscard]] bool IsScanChannelEstablished() const noexcept;
     
     /// @brief Send message to kernel
     [[nodiscard]] bool SendToKernel(

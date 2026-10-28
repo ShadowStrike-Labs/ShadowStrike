@@ -29977,5 +29977,41 @@ class NetworkBlocklistLoadsFromTheDataDirectoryTests(unittest.TestCase):
                         "the absolute-path check must run before the file is opened")
 
 
+class DriverConnectedReportsTheLiveScanChannelTests(unittest.TestCase):
+    """driverConnected reports the encrypted, attested scan channel, live (task 82).
+
+    It was set true once on the raw control-handle connect, so the 1.0.92 run reported the
+    driver connected while attestation had failed and no file was scanned, and a later
+    disconnect never cleared it.
+    """
+
+    def setUp(self):
+        self.rtp = strip_c_comments(read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"))
+        self.ipc = strip_c_comments(read_source(ROOT / "src/PhantomCore/Communication/IPCManager.cpp"))
+
+    def test_never_hardcoded_true(self):
+        self.assertNotIn("driverConnected = true", self.rtp)
+
+    def test_every_reader_asks_the_channel(self):
+        status = extract_c_function(self.rtp, "RealTimeProtection::GetStatus")
+        self.assertIn("status.driverConnected = RealTimeProtectionImpl::ScanChannelUp();", status)
+        self.assertIn('j["driverConnected"] = ScanChannelUp();', self.rtp)
+        self.assertIn('(ScanChannelUp() ? L"Yes" : L"No")', self.rtp)
+        self.assertIn("if (!ScanChannelUp()) {", self.rtp)
+
+    def test_channel_query_is_the_attested_connection(self):
+        body = extract_c_function(self.ipc, "IPCManager::IsScanChannelEstablished")
+        self.assertIn("m_primaryConnection", body)
+        self.assertIn("->IsConnected()", body)
+        for raw in ("m_hPort", "m_connected"):
+            self.assertNotIn(raw, body, f"{raw} is the raw control handle, not the scan channel")
+
+    def test_protected_claim_requires_the_channel(self):
+        status = extract_c_function(self.rtp, "RealTimeProtection::GetStatus")
+        self.assertIn("status.isProtected = m_impl->ProtectedNow();", status)
+        self.assertIn("return m_protectionStatus.isProtected && ScanChannelUp();", self.rtp)
+        self.assertIn('j["protected"] = ProtectedNow();', self.rtp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -887,7 +887,7 @@ public:
                 m_protectionStatus.driverConnected = false;
             } else {
                 SetComponentState(ComponentType::IPC_MANAGER, ProtectionComponentState::RUNNING);
-                m_protectionStatus.driverConnected = true;
+                m_protectionStatus.driverConnected = ScanChannelUp();
 
                 // Push threat intelligence to kernel after driver connection
                 SyncThreatIntelToKernel();
@@ -1437,6 +1437,21 @@ public:
         }
     }
 
+    // THE LIVE SCAN CHANNEL, NOT A SNAPSHOT (task 82). driverConnected used to be set
+    // true once, on the raw control-handle connect: it read true while key exchange or
+    // attestation had failed and no file was being scanned (the 1.0.92 run), and it never
+    // changed after a later disconnect. Every reader asks the channel instead.
+    [[nodiscard]] static bool ScanChannelUp() noexcept {
+        return Communication::IPCManager::HasInstance() &&
+               Communication::IPCManager::Instance().IsScanChannelEstablished();
+    }
+
+    // "Protected" requires the scan channel as well as active protection: with the
+    // channel down the kernel cannot reach the scanner, so no file open is scanned.
+    [[nodiscard]] bool ProtectedNow() const noexcept {
+        return m_protectionStatus.isProtected && ScanChannelUp();
+    }
+
     bool InitializeIPCManager() {
         try {
             auto& ipc = Communication::IPCManager::Instance();
@@ -1483,7 +1498,7 @@ public:
             }
 
             m_protectionStatus.driverLoaded = true;
-            m_protectionStatus.driverConnected = true;
+            m_protectionStatus.driverConnected = ScanChannelUp();
             m_protectionStatus.driverVersion = L"3.0.0"; // Would query from driver
 
             return true;
@@ -8624,8 +8639,8 @@ public:
         }
 
         // Check driver connection
-        if (!m_protectionStatus.driverConnected) {
-            Utils::Logger::Warn("RealTimeProtection: Kernel driver not connected");
+        if (!ScanChannelUp()) {
+            Utils::Logger::Warn("RealTimeProtection: Kernel scan channel not established");
         }
 
         Utils::Logger::Info("RealTimeProtection: Diagnostics {}",
@@ -8637,8 +8652,8 @@ public:
         std::wostringstream oss;
         oss << L"=== RealTimeProtection Diagnostic Summary ===\n";
         oss << L"State: " << Utils::StringUtils::ToWide(ProtectionStateToString(m_state.load())) << L"\n";
-        oss << L"Protected: " << (m_protectionStatus.isProtected ? L"Yes" : L"No") << L"\n";
-        oss << L"Driver Connected: " << (m_protectionStatus.driverConnected ? L"Yes" : L"No") << L"\n";
+        oss << L"Protected: " << (ProtectedNow() ? L"Yes" : L"No") << L"\n";
+        oss << L"Driver Connected: " << (ScanChannelUp() ? L"Yes" : L"No") << L"\n";
         oss << L"\n=== Components ===\n";
 
         for (const auto& status : m_componentStatus) {
@@ -8659,8 +8674,8 @@ public:
         try {
             json j;
             j["state"] = ProtectionStateToString(m_state.load());
-            j["protected"] = m_protectionStatus.isProtected;
-            j["driverConnected"] = m_protectionStatus.driverConnected;
+            j["protected"] = ProtectedNow();
+            j["driverConnected"] = ScanChannelUp();
 
             json components = json::array();
             for (const auto& status : m_componentStatus) {
@@ -8981,7 +8996,10 @@ std::unordered_map<std::wstring, std::vector<std::wstring>> RealTimeProtection::
 // ============================================================================
 
 ProtectionStatus RealTimeProtection::GetStatus() const {
-    return m_impl->m_protectionStatus;
+    ProtectionStatus status = m_impl->m_protectionStatus;
+    status.driverConnected = RealTimeProtectionImpl::ScanChannelUp();   // live, not the init snapshot (task 82)
+    status.isProtected = m_impl->ProtectedNow();
+    return status;
 }
 
 ComponentStatus RealTimeProtection::GetComponentStatus(ComponentType component) const {
