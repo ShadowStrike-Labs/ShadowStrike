@@ -839,15 +839,25 @@ std::vector<CVEMatch> ZeroDayDetector::Impl::CorrelateCVEs(
     try {
         // SECURITY: do not produce CVE matches purely on cosmetic byte
         // patterns ("MSHTML", "ms-msdt", ...) — those would fire on benign
-        // documents and inflate the alert pipeline.  A pattern-only match is
-        // accepted ONLY when at least one corroborating exploit indicator
-        // (shellcode / ROP / heap-spray / corruption / non-Unknown type)
-        // exists.  Pure type matches without a pattern hit are reported only
-        // when the result already has corroborating evidence.
+        // documents and inflate the alert pipeline.  A pattern match is
+        // accepted ONLY beside exploit evidence: shellcode, a ROP chain or a
+        // heap spray.  Pure type matches without a pattern hit are never
+        // reported.
+        //
+        // The memory-corruption arm does NOT corroborate. It counts memory-write
+        // instruction clusters, which any compiled code contains, and every
+        // result that reaches this function already has shellcode or corruption
+        // - so accepting corruption (or the non-Unknown type it sets) made this
+        // guard always true. A 4-byte pattern then attributed a CVE, and its +30
+        // in CalculateConfidence lifted a corruption-only result from Low (20)
+        // to High. The Microsoft-signed msxml3.dll was convicted that way in the
+        // 1.0.125 and 1.0.126 VM runs; on the build host it carries CVE-2020-0796's
+        // 00 00 03 11 once and no other pattern, and 309 of 3,768 System32 DLLs
+        // there carry at least one of the five. Corruption still adds its own
+        // confidence beside real evidence.
         const bool hasCorroborating =
             result.shellcodeInfo.has_value() || result.ropChainInfo.has_value() ||
-            result.heapSprayInfo.has_value() || result.corruptionInfo.has_value() ||
-            result.type != ExploitType::Unknown;
+            result.heapSprayInfo.has_value();
 
         for (const auto& cve : m_cveDatabase) {
             const bool typeMatch    = (result.type == cve.exploitType);

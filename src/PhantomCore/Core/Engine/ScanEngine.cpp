@@ -279,7 +279,6 @@ public:
         std::atomic<uint64_t> scriptVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> signatureVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> polymorphicVerdictsSuppressedByTrust{0};
-        std::atomic<uint64_t> zeroDayVerdictsSuppressedByTrust{0};
         std::atomic<uint64_t> scansTruncatedByBudget{0};
 
         // Process stats
@@ -1002,7 +1001,6 @@ public:
         m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.signatureVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.polymorphicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
-        m_stats.zeroDayVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
         m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
             m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
@@ -3703,37 +3701,10 @@ EngineResult ScanEngine::ScanFile(
             ZeroDayAnalysisOptions zdOptions{};
             auto zdResult = m_impl->m_zeroDayDetector->AnalyzeFile(filePath, zdOptions);
 
-            // The memory-corruption arm counts memory-write instruction clusters over
-            // the whole file, which any compiled code section contains: the 1.0.125
-            // VM run marked the Microsoft-signed msxml3.dll Suspicious on it alone. A
-            // verdict with no CVE match and no shellcode, ROP or heap-spray evidence is
-            // an inference and passes through publisher trust like stages 5 and 6.
-            // Any other evidence keeps the verdict, and stage 10 still runs.
-            const bool zdInferenceOnly = zdResult.detected && zdResult.cveMatches.empty() &&
-                !zdResult.shellcodeInfo.has_value() && !zdResult.ropChainInfo.has_value() &&
-                !zdResult.heapSprayInfo.has_value();
-            bool zdWithheldByTrust = false;
-            if (zdInferenceOnly &&
-                static_cast<uint8_t>(zdResult.confidence) >= static_cast<uint8_t>(DetectionConfidence::Medium)) {
-                const auto zdTrust = m_impl->EvaluatePublisherTrust(filePath);
-                if (zdTrust.suppress) {
-                    zdWithheldByTrust = true;
-                    m_impl->m_stats.zeroDayVerdictsSuppressedByTrust
-                        .fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_INFO(L"ScanEngine",
-                        L"Stage 9 '%hs' NOT reported: %hs, signer '%ls' - deeper stages "
-                        L"still run: %ls",
-                        zdResult.description.c_str(), zdTrust.basis,
-                        zdTrust.signerName.c_str(), filePath.c_str());
-                    result.indicators.push_back(
-                        "ZeroDay." + zdResult.description +
-                        " withheld on a verified signature (" + std::string(zdTrust.basis) + ")");
-                } else {
-                    Impl::LogTrustNotEstablished("Stage 9 zero-day", zdTrust, filePath);
-                }
-            }
-
-            if (!zdWithheldByTrust && zdResult.detected &&
+            // No publisher-trust gate here, unlike stages 5 and 6: a Medium verdict
+            // needs exploit evidence. The corruption arm alone scores Low, and a CVE
+            // is attributed only beside shellcode, ROP or heap spray (CorrelateCVEs).
+            if (zdResult.detected &&
                 static_cast<uint8_t>(zdResult.confidence) >= static_cast<uint8_t>(DetectionConfidence::Medium)) {
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
@@ -5726,8 +5697,6 @@ std::string ScanEngine::Stats::ToJson() const {
         << signatureVerdictsSuppressedByTrust << ",";
     oss << "\"polymorphicVerdictsSuppressedByTrust\":"
         << polymorphicVerdictsSuppressedByTrust << ",";
-    oss << "\"zeroDayVerdictsSuppressedByTrust\":"
-        << zeroDayVerdictsSuppressedByTrust << ",";
     oss << "\"scansTruncatedByBudget\":" << scansTruncatedByBudget;
     oss << "}";
     return oss.str();
@@ -5779,8 +5748,6 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
         m_impl->m_stats.signatureVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.polymorphicVerdictsSuppressedByTrust =
         m_impl->m_stats.polymorphicVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
-    stats.zeroDayVerdictsSuppressedByTrust =
-        m_impl->m_stats.zeroDayVerdictsSuppressedByTrust.load(std::memory_order_relaxed);
     stats.heuristicSkippedOnKnownTrust =
         m_impl->m_stats.heuristicSkippedOnKnownTrust.load(std::memory_order_relaxed);
     stats.scansTruncatedByBudget =
@@ -5832,7 +5799,6 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.scriptVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.signatureVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.polymorphicVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
-    m_impl->m_stats.zeroDayVerdictsSuppressedByTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicSkippedOnKnownTrust.store(0, std::memory_order_relaxed);
     m_impl->m_stats.scansTruncatedByBudget.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);

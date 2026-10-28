@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <filesystem>
 #include <map>
 #include <string_view>
 #include <vector>
@@ -304,6 +305,88 @@ TEST_F(ZeroDayDetectorTest, CodeStructureStillDetectsBesideText) {
 
     // The NOP-run-plus-GetPC shape keeps detecting.
     EXPECT_TRUE(detector.DetectShellcode(MakeShellcodeLikeBuffer()).has_value());
+}
+
+// A CVE is attributed only beside exploit evidence. The write-cluster corruption arm
+// fires on any compiled code, so it cannot corroborate a byte-pattern CVE match: with
+// it counted, a 4-byte pattern lifted a corruption-only result from Low to High and
+// stage 9 convicted the Microsoft-signed msxml3.dll in the 1.0.125 and 1.0.126 runs.
+namespace {
+
+// Four memory-write MOVs six bytes apart: one write cluster, no code structure.
+std::vector<uint8_t> MakeWriteClusterBuffer() {
+    std::vector<uint8_t> buffer(32, 0x00);
+    for (int i = 0; i < 4; ++i) {
+        const std::array<uint8_t, 6> movImm = {0xC7, 0x00, 0x01, 0x00, 0x00, 0x00};
+        buffer.insert(buffer.end(), movImm.begin(), movImm.end());
+    }
+    buffer.insert(buffer.end(), 32, 0x00);
+    return buffer;
+}
+
+// The 4-byte pattern the built-in table files under CVE-2020-0796.
+void AppendCvePattern(std::vector<uint8_t>& buffer) {
+    const std::array<uint8_t, 4> pattern = {0x00, 0x00, 0x03, 0x11};
+    buffer.insert(buffer.end(), {0x7F, 0x7F});
+    buffer.insert(buffer.end(), pattern.begin(), pattern.end());
+    buffer.insert(buffer.end(), {0x7F, 0x7F});
+}
+
+}  // namespace
+
+TEST_F(ZeroDayDetectorTest, CorruptionAloneDoesNotAttributeACve) {
+    auto& detector = Engine::ZeroDayDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    auto buffer = MakeWriteClusterBuffer();
+    AppendCvePattern(buffer);
+    const auto result = detector.AnalyzeBuffer(buffer);
+
+    // The corruption arm still fires and is still reported ...
+    ASSERT_TRUE(result.detected);
+    ASSERT_TRUE(result.corruptionInfo.has_value());
+    EXPECT_FALSE(result.shellcodeInfo.has_value());
+    // ... but it attributes no CVE and stays below the stage 9 verdict threshold.
+    EXPECT_TRUE(result.cveMatches.empty()) << result.cveMatches.front().cveId;
+    EXPECT_LT(static_cast<uint8_t>(result.confidence),
+              static_cast<uint8_t>(Engine::DetectionConfidence::Medium));
+}
+
+TEST_F(ZeroDayDetectorTest, ExploitEvidenceStillAttributesACve) {
+    auto& detector = Engine::ZeroDayDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    auto buffer = MakeShellcodeLikeBuffer();
+    AppendCvePattern(buffer);
+    const auto result = detector.AnalyzeBuffer(buffer);
+
+    ASSERT_TRUE(result.detected);
+    ASSERT_TRUE(result.shellcodeInfo.has_value());
+    ASSERT_FALSE(result.cveMatches.empty());
+    EXPECT_EQ(result.cveMatches.front().cveId, "CVE-2020-0796");
+    EXPECT_GE(static_cast<uint8_t>(result.confidence),
+              static_cast<uint8_t>(Engine::DetectionConfidence::Medium));
+}
+
+// The field file itself, present on every Windows build. On the build host it carries
+// the CVE-2020-0796 pattern once and the write-cluster arm fires on its code.
+TEST_F(ZeroDayDetectorTest, Msxml3IsNotReportedAsAnExploit) {
+    auto& detector = Engine::ZeroDayDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    wchar_t sys[MAX_PATH] = {};
+    const UINT n = ::GetSystemDirectoryW(sys, MAX_PATH);
+    ASSERT_GT(n, 0u);
+    ASSERT_LT(n, static_cast<UINT>(MAX_PATH));
+    const std::filesystem::path file = std::filesystem::path(sys) / L"msxml3.dll";
+    ASSERT_TRUE(std::filesystem::exists(file)) << file.string();
+
+    const auto result = detector.AnalyzeFile(file);
+    EXPECT_TRUE(result.cveMatches.empty()) << result.cveMatches.front().cveId;
+    EXPECT_FALSE(result.detected &&
+                 static_cast<uint8_t>(result.confidence) >=
+                     static_cast<uint8_t>(Engine::DetectionConfidence::Medium))
+        << "confidence " << static_cast<int>(result.confidence) << ": " << result.description;
 }
 
 }  // namespace ShadowStrike::Core::Engine::Test

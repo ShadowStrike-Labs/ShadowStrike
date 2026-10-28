@@ -29802,25 +29802,47 @@ class CatalogLookupFailureIsNotUnsignedTests(unittest.TestCase):
         self.assertIn("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE", body)
 
 
-class ZeroDayInferencePassesPublisherTrustTests(unittest.TestCase):
-    """Stage 9 verdicts with only the corruption heuristic pass through trust (task 372)."""
+class ZeroDayCveAttributionNeedsExploitEvidenceTests(unittest.TestCase):
+    """A CVE is attributed only beside shellcode, ROP or heap-spray evidence.
+
+    The write-cluster corruption arm fires on any compiled code, and every result that
+    reaches CorrelateCVEs already has shellcode or corruption, so counting corruption as
+    corroboration made the guard always true. A 4-byte pattern then lifted msxml3.dll
+    from Low to High and stage 9 convicted it in the 1.0.125 and 1.0.126 VM runs.
+    """
+
+    ZD = ROOT / "src/PhantomCore/Core/Engine/ZeroDayDetector.cpp"
 
     def setUp(self):
-        self.src = strip_c_comments(read_source(ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"))
+        self.zd = strip_c_comments(read_source(self.ZD))
+        self.engine = strip_c_comments(read_source(ROOT / "src/PhantomCore/Core/Engine/ScanEngine.cpp"))
 
-    def test_only_corruption_only_verdicts_consult_trust(self):
-        start = self.src.index("const bool zdInferenceOnly =")
-        block = self.src[start:self.src.index("if (!zdWithheldByTrust && zdResult.detected &&", start)]
-        for need in ("zdResult.cveMatches.empty()", "!zdResult.shellcodeInfo.has_value()",
-                     "!zdResult.ropChainInfo.has_value()", "!zdResult.heapSprayInfo.has_value()",
-                     "m_impl->EvaluatePublisherTrust(filePath)", "zeroDayVerdictsSuppressedByTrust",
-                     'Impl::LogTrustNotEstablished("Stage 9 zero-day"'):
-            self.assertIn(need, block, need)
-        self.assertNotIn("goto finalize_scan", block)
+    def _corroboration(self):
+        body = extract_c_function(self.zd, "CorrelateCVEs")
+        start = body.index("const bool hasCorroborating =")
+        return body[start:body.index(";", start)]
 
-    def test_counter_is_reported(self):
-        self.assertIn('"\\"zeroDayVerdictsSuppressedByTrust\\":"', self.src)
-        self.assertIn("stats.zeroDayVerdictsSuppressedByTrust =", self.src)
+    def test_only_exploit_evidence_corroborates(self):
+        expr = self._corroboration()
+        for need in ("result.shellcodeInfo.has_value()", "result.ropChainInfo.has_value()",
+                     "result.heapSprayInfo.has_value()"):
+            self.assertIn(need, expr, need)
+        self.assertNotIn("corruptionInfo", expr)
+        self.assertNotIn("ExploitType::Unknown", expr)
+
+    def test_a_pattern_match_is_still_required(self):
+        body = extract_c_function(self.zd, "CorrelateCVEs")
+        self.assertIn("if (!hasCorroborating)            continue;", body)
+        self.assertIn("if (!patternMatch)                 continue;", body)
+
+    def test_stage_nine_consults_no_trust_gate(self):
+        # Stage 9 verdicts rest on exploit evidence, so a publisher-trust gate there
+        # would only withhold evidence; the misdirected one from task 372 is gone.
+        start = self.engine.index('SS_DIAG_SCOPE("ScanEngine", "stage09-zeroday");')
+        block = self.engine[start:self.engine.index('SS_DIAG_SCOPE("ScanEngine", "stage10-cortex-ml");', start)]
+        self.assertIn("m_impl->m_zeroDayDetector->AnalyzeFile(filePath, zdOptions)", block)
+        self.assertNotIn("EvaluatePublisherTrust", block)
+        self.assertNotIn("zeroDayVerdictsSuppressedByTrust", self.engine)
 
 
 class CircuitBreakerHalfOpenAdmitsOneProbeTests(unittest.TestCase):
