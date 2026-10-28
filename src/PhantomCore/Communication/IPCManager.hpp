@@ -944,7 +944,13 @@ public:
     // FILTER PORT OPERATIONS
     // ========================================================================
     
-    /// @brief Connect to kernel filter port
+    /// @brief Connect to the kernel filter port, or repair its scan channel.
+    ///
+    /// Opens the control handle, the push connection and the primary scanner
+    /// connection. When the control handle is already open but the primary
+    /// scanner connection is down, rebuilds that connection instead. Returns true
+    /// when the control handle is open on return; whether scan requests can be
+    /// served is IsScanChannelEstablished().
     [[nodiscard]] bool ConnectFilterPort();
     
     /// @brief Disconnect from filter port
@@ -1349,13 +1355,13 @@ private:
     // we never hammer the kernel ConnectNotify path with N concurrent attempts
     // (which has been observed to wedge VMware guests during first-boot
     // service start while the minifilter is still warming up). Other workers
-    // back off and wait until m_hPort becomes non-null again.
+    // back off and wait until the scan channel is established again.
     std::atomic<bool> m_reconnectClaim{false};
 
     // Current reconnect back-off (ms). Starts at config.reconnectDelayMs on
-    // first failure and doubles up to kReconnectBackoffCapMs. Reset to 0 on
-    // successful connect. Read/written only by the worker that owns the
-    // reconnect claim.
+    // first failure and doubles up to kReconnectBackoffCapMs. Primed by Start(),
+    // reset to 0 when the scan channel is established, and otherwise
+    // read/written only by the worker that owns the reconnect claim.
     std::atomic<uint32_t> m_reconnectBackoffMs{0};
 
     // Permanent-failure tracking for the filter port.
@@ -1443,9 +1449,18 @@ private:
         std::make_shared<const std::vector<KernelConfigPublication>>() };
 
     /// @brief Invoke every registered configuration publisher. Called from
-    ///        ConnectFilterPort once the encrypted channel is established, with
-    ///        no IPCManager lock held.
+    ///        EstablishScanChannel once the encrypted channel is established -
+    ///        on the first connect and on every rebuild - with
+    ///        m_primaryConnMutex not held.
     void PublishKernelConfiguration();
+
+    /// @brief Bring up the primary scanner connection, retiring a dead one.
+    ///
+    /// The one implementation behind the first connect and the rebuild in
+    /// ConnectFilterPort, so both re-publish kernel configuration and reset the
+    /// reconnect back-off the same way. Caller holds m_connectMutex. Returns
+    /// whether the scan channel is established.
+    [[nodiscard]] bool EstablishScanChannel(const std::wstring& portName);
 
     // Generic (non-verdict) subscribers, held as an immutable snapshot behind a
     // shared_ptr so the DISPATCH path copies one refcount instead of N

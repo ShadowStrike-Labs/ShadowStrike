@@ -13444,29 +13444,42 @@ class KernelConfigPublisherContractTests(unittest.TestCase):
 
     # -- the wiring that makes it work ---------------------------------------
     def test_configuration_is_republished_when_the_channel_comes_up(self):
-        body = self._definition_body(self.ipc_cpp, "bool IPCManager::ConnectFilterPort(")
-        self.assertTrue(
-            "PublishKernelConfiguration();" in body,
-            "ConnectFilterPort does not republish kernel configuration, so the "
+        # Both the first connect and the rebuild of a lost scan channel (task 381)
+        # bring the channel up through EstablishScanChannel, so that is the one place
+        # configuration is republished; a second copy in ConnectFilterPort could
+        # drift from it.
+        connect = self._definition_body(self.ipc_cpp, "bool IPCManager::ConnectFilterPort(")
+        self.assertEqual(
+            connect.count("EstablishScanChannel(portName)"), 2,
+            "the first connect and the rebuild must both go through "
+            "EstablishScanChannel, or one of them stops republishing the kernel "
+            "configuration")
+        self.assertNotIn(
+            "PublishKernelConfiguration();", connect,
+            "ConnectFilterPort republishes outside EstablishScanChannel; keep the "
+            "one implementation")
+
+        body = self._definition_body(self.ipc_cpp, "bool IPCManager::EstablishScanChannel(")
+        self.assertEqual(
+            body.count("PublishKernelConfiguration();"), 1,
+            "EstablishScanChannel does not republish kernel configuration, so the "
             "configuration refused during Initialize is never restored - and a "
             "reconnect leaves the kernel unconfigured too")
 
-        # It must sit in the branch that ran because the channel IS up. Calling
-        # it when the channel is down would send every publisher into the same
-        # refusal that caused the defect.
-        gate = body.find("if (encryptedChannelUp)")
-        call = body.find("PublishKernelConfiguration();")
-        self.assertNotEqual(gate, -1, "the encryptedChannelUp gate is gone")
+        # It must run only once the channel IS up. Calling it when the channel is
+        # down would send every publisher into the same refusal that caused the
+        # defect.
+        call = body.index("PublishKernelConfiguration();")
+        failed = body.find("if (!fresh) {")
+        self.assertNotEqual(failed, -1, "the failed-connect branch is gone")
         self.assertGreater(
-            call, gate,
-            "PublishKernelConfiguration must be inside the encryptedChannelUp "
-            "branch; publishing while the channel is down reproduces the defect")
-        opened = body.count("{", gate, call)
-        closed = body.count("}", gate, call)
+            call, body.index("return false;", failed),
+            "PublishKernelConfiguration must come after the failed-connect return; "
+            "publishing while the channel is down reproduces the defect")
         self.assertGreater(
-            opened, closed,
-            "PublishKernelConfiguration is not nested inside the "
-            "encryptedChannelUp branch (brace depth did not increase)")
+            call, body.index("m_primaryConnection = std::move(fresh);"),
+            "PublishKernelConfiguration must follow publication of the established "
+            "connection, which is the one SendToKernel sends on")
 
     def test_the_self_defeating_startup_wait_is_not_reintroduced(self):
         # The wait could never help the senders it was written for: they run on
@@ -30011,6 +30024,93 @@ class DriverConnectedReportsTheLiveScanChannelTests(unittest.TestCase):
         self.assertIn("status.isProtected = m_impl->ProtectedNow();", status)
         self.assertIn("return m_protectionStatus.isProtected && ScanChannelUp();", self.rtp)
         self.assertIn('j["protected"] = ProtectedNow();', self.rtp)
+
+
+class LostScanChannelIsRebuiltTests(unittest.TestCase):
+    """A reconnect rebuilds a lost scan channel while the control handle is open (task 381).
+
+    ConnectFilterPort answered "already connected" whenever the control handle was open, so
+    a primary scanner connection that failed to establish, or that the kernel tore down after
+    an undelivered key exchange (CommPort.c relies on this path to build a new one), was
+    never rebuilt: every reconnect attempt was a no-op until the service restarted.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        ipc = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+        cls.connect = extract_c_function(ipc, "IPCManager::ConnectFilterPort")
+        cls.establish = extract_c_function(ipc, "IPCManager::EstablishScanChannel")
+        cls.worker = extract_c_function(ipc, "IPCManager::WorkerRoutine")
+
+    @staticmethod
+    def _block(code, opener):
+        start = code.index(opener)
+        brace = code.index("{", start)
+        return code[start:_matching_delimiter(code, brace, "{", "}") + 1]
+
+    def _open_handle_branch(self):
+        return self._block(self.connect, "if (m_hPort.load(std::memory_order_acquire) != nullptr) {")
+
+    def test_an_open_control_handle_alone_is_not_connected(self):
+        branch = self._open_handle_branch()
+        established = self._block(branch, "if (IsScanChannelEstablished()) {")
+        self.assertIn('"[IPCManager] Filter port already connected"', established)
+        self.assertIn("return true;", established)
+        self.assertEqual(1, self.connect.count("Filter port already connected"),
+                         "an already-connected answer outside the channel check is back")
+
+    def test_the_open_handle_branch_rebuilds_the_scan_channel(self):
+        branch = self._open_handle_branch()
+        rebuild = branch.find("EstablishScanChannel(portName)")
+        self.assertNotEqual(-1, rebuild, "an open handle with the channel down is not rebuilt")
+        self.assertGreater(rebuild, branch.index("if (IsScanChannelEstablished()) {"))
+
+    def test_no_rebuild_while_stopping(self):
+        branch = self._open_handle_branch()
+        guard = branch.find("if (!m_running.load(std::memory_order_acquire)) {")
+        self.assertNotEqual(-1, guard, "a rebuild can race Stop() and reopen the channel")
+        self.assertLess(guard, branch.index("EstablishScanChannel(portName)"))
+
+    def test_a_dead_predecessor_is_retired_before_reconnecting(self):
+        body = self.establish
+        take = body.index("retired = std::move(m_primaryConnection);")
+        close = body.find("retired->Disconnect();")
+        self.assertNotEqual(-1, close, "the dead connection keeps its handle and kernel slot")
+        self.assertLess(take, close)
+        self.assertLess(close, body.index("fresh->Connect("))
+
+    def test_the_connection_is_published_only_once_established(self):
+        body = self.establish
+        self.assertNotIn("m_primaryConnection->Connect(", body,
+                         "connecting the published member exposes a half-built channel")
+        retired = body.index("retired->Disconnect();")
+        failed = body.index("if (!fresh) {")
+        self.assertLess(retired, body.index("fresh = std::make_shared<FilterConnection>(portName);"))
+        self.assertNotIn("m_primaryConnMutex", body[retired:failed],
+                         "the key exchange must not run under m_primaryConnMutex")
+        published = body.index("m_primaryConnection = std::move(fresh);")
+        self.assertLess(body.index("return false;", failed), published)
+
+    def test_back_off_resets_only_on_an_established_channel(self):
+        self.assertNotIn("m_reconnectBackoffMs.store(0", self.connect)
+        body = self.establish
+        reset = body.find("m_reconnectBackoffMs.store(0")
+        self.assertNotEqual(-1, reset)
+        self.assertGreater(reset, body.index("return false;", body.index("if (!fresh) {")))
+
+    def test_the_worker_backs_off_on_the_scan_channel(self):
+        self.assertIn("const bool ok = ConnectFilterPort() && IsScanChannelEstablished();",
+                      self.worker)
+
+    def test_a_late_teardown_cannot_clear_the_rebuilt_channel(self):
+        self.assertEqual(1, self.worker.count("m_connected.store(false"))
+        guard = self._block(self.worker, "if (m_primaryConnection == conn) {")
+        self.assertIn("m_connected.store(false", guard)
+        # Restored inside the same m_primaryConnMutex scope that publishes the connection.
+        published = self.establish.index("m_primaryConnection = std::move(fresh);")
+        scope_end = self.establish.index("}", published)
+        self.assertIn("m_connected.store(true, std::memory_order_release);",
+                      self.establish[published:scope_end])
 
 
 if __name__ == "__main__":

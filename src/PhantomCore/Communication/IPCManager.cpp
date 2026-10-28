@@ -623,15 +623,31 @@ bool IPCManager::ConnectFilterPort() {
     // primary/push FilterConnection instances.
     std::lock_guard<std::mutex> connectLock(m_connectMutex);
 
-    if (m_hPort.load(std::memory_order_acquire) != nullptr) {
-        Utils::Logger::Debug("[IPCManager] Filter port already connected");
-        return true;
-    }
-
     std::wstring portName;
     {
         std::shared_lock lock(m_impl->configMutex);
         portName = m_impl->config.filterPortName;
+    }
+
+    // An open control handle is not a connection. Scan requests travel on the
+    // primary scanner connection, which can fail to establish (key exchange,
+    // driver attestation) after this handle opened, and which the kernel tears
+    // down by itself when a key exchange goes undelivered - CommPort.c then
+    // relies on this path to build a new one. Returning on the handle alone left
+    // a lost scan channel lost until the service restarted (task 381).
+    if (m_hPort.load(std::memory_order_acquire) != nullptr) {
+        if (IsScanChannelEstablished()) {
+            Utils::Logger::Debug("[IPCManager] Filter port already connected");
+            return true;
+        }
+        if (!m_running.load(std::memory_order_acquire)) {
+            // Stop() is tearing the channel down on purpose.
+            return true;
+        }
+        Utils::Logger::Info("[IPCManager] Control handle open but the scan channel is down - "
+                            "rebuilding the primary scanner connection");
+        (void)EstablishScanChannel(portName);
+        return true;
     }
 
     Utils::Logger::Info("[IPCManager] Connecting to filter port: {}",
@@ -831,55 +847,79 @@ bool IPCManager::ConnectFilterPort() {
         }
     }
 
-    // Create primary encrypted connection for kernel scan I/O.
+    // The primary scanner connection, shared with the reconnect path above.
+    if (EstablishScanChannel(portName)) {
+        Utils::Logger::Info("[IPCManager] Filter port connected; encrypted primary scanner channel established");
+    } else {
+        // Report the AUTHORITATIVE channel state: a blanket "connected" here
+        // would mask a degraded kernel link.
+        Utils::Logger::Warn("[IPCManager] Filter port connected (control handle only) - encrypted primary "
+                            "scanner channel NOT established; kernel scan I/O degraded until reconnect");
+    }
+    return true;
+}
+
+bool IPCManager::EstablishScanChannel(const std::wstring& portName) {
     // This connection registers as the kernel's PRIMARY SCANNER port
     // (ConnectionContext type == 1): the minifilter routes all scan requests
     // and notifications here and gates them on this connection's established
     // session key. The receive workers pump this connection (see WorkerRoutine)
     // and ReplyToKernel replies on it, so the WDK MessageId scope and the
     // session key are always consistent between receive and reply.
+
+    // Retire a dead predecessor first: its handle holds a kernel client slot
+    // until closed. It is taken out under the lock, so no SendToKernel or reply
+    // is mid-call on it, and disconnected outside the lock, because Disconnect
+    // waits for in-flight receives to drain.
+    std::shared_ptr<FilterConnection> retired;
     {
         std::lock_guard lock(m_primaryConnMutex);
-        try {
-            m_primaryConnection = std::make_shared<FilterConnection>(portName);
-            if (m_primaryConnection->Connect(/*registerAsPrimaryScanner=*/true)) {
-                Utils::Logger::Info("[IPCManager] Primary encrypted scanner connection established");
-            } else {
-                Utils::Logger::Error("[IPCManager] Primary encrypted scanner connection FAILED — "
-                                      "kernel scan requests cannot be served until reconnect");
-                m_primaryConnection.reset();
-            }
-        } catch (const std::exception& e) {
-            Utils::Logger::Error("[IPCManager] Failed to create primary FilterConnection: {}",
-                                  e.what());
-            m_primaryConnection.reset();
-        }
+        retired = std::move(m_primaryConnection);   // leaves the member empty
+    }
+    if (retired) {
+        retired->Disconnect();
     }
 
-    // Connect succeeded — reset reconnect back-off so the next disconnect
-    // starts retrying at the configured base interval, not at the cap.
+    // Connected before it is published, and outside m_primaryConnMutex: the key
+    // exchange can take seconds under load, while status readers and
+    // SendToKernel take that mutex. Nothing observes the connection until it is
+    // established.
+    std::shared_ptr<FilterConnection> fresh;
+    try {
+        fresh = std::make_shared<FilterConnection>(portName);
+        if (!fresh->Connect(/*registerAsPrimaryScanner=*/true)) {
+            fresh.reset();
+        }
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("[IPCManager] Failed to create primary FilterConnection: {}",
+                              e.what());
+        fresh.reset();
+    }
+    if (!fresh) {
+        Utils::Logger::Error("[IPCManager] Primary encrypted scanner connection FAILED - "
+                              "kernel scan requests cannot be served until reconnect");
+        return false;
+    }
+
+    {
+        std::lock_guard lock(m_primaryConnMutex);
+        m_primaryConnection = std::move(fresh);
+        // The receive path clears m_connected when it sees the current channel
+        // torn down; the channel is back, so restore it. Both writes happen
+        // under this mutex, so a worker still holding the retired connection
+        // cannot clear the flag for this one.
+        m_connected.store(true, std::memory_order_release);
+    }
+    Utils::Logger::Info("[IPCManager] Primary encrypted scanner connection established");
+
+    // The next loss retries at the configured base interval, not at the cap.
     m_reconnectBackoffMs.store(0, std::memory_order_relaxed);
 
-    // Report the AUTHORITATIVE channel state. The control handle above can
-    // open even when the encrypted primary-scanner channel did not establish,
-    // so a blanket "Successfully connected" would mask a degraded kernel link.
-    bool encryptedChannelUp;
-    {
-        std::lock_guard lock(m_primaryConnMutex);
-        encryptedChannelUp = (m_primaryConnection != nullptr);
-    }
-    if (encryptedChannelUp) {
-        Utils::Logger::Info("[IPCManager] Filter port connected; encrypted primary scanner channel established");
-        // The channel is up, either for the first time or again after a
-        // reconnect. Either way every module owning kernel-side configuration
-        // must re-publish it now: its own Initialize ran before this point and
-        // was refused. Invoked with no IPCManager lock held - see
-        // PublishKernelConfiguration.
-        PublishKernelConfiguration();
-    } else {
-        Utils::Logger::Warn("[IPCManager] Filter port connected (control handle only) — encrypted primary "
-                            "scanner channel NOT established; kernel scan I/O degraded until reconnect");
-    }
+    // The channel is up, either for the first time or again after a reconnect.
+    // Either way every module owning kernel-side configuration must re-publish
+    // it now: its own Initialize ran before this point and was refused.
+    // Invoked with m_primaryConnMutex not held - see PublishKernelConfiguration.
+    PublishKernelConfiguration();
     return true;
 }
 
@@ -2224,7 +2264,11 @@ void IPCManager::WorkerRoutine() {
                 continue;
             }
 
-            const bool ok = ConnectFilterPort();
+            // ConnectFilterPort reports the control handle; the back-off follows
+            // the scan channel, so a channel that keeps failing to establish (key
+            // exchange, attestation) is retried at a growing interval instead of
+            // at the base delay forever.
+            const bool ok = ConnectFilterPort() && IsScanChannelEstablished();
             if (!ok) {
                 Utils::Logger::Debug("[IPCManager] Filter port reconnect attempt failed");
                 m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
@@ -2233,7 +2277,7 @@ void IPCManager::WorkerRoutine() {
                 if (next > kReconnectBackoffCapMs) next = kReconnectBackoffCapMs;
                 m_reconnectBackoffMs.store(next, std::memory_order_relaxed);
             }
-            // Success path resets m_reconnectBackoffMs inside ConnectFilterPort.
+            // Success path resets m_reconnectBackoffMs inside EstablishScanChannel.
 
             m_reconnectClaim.store(false, std::memory_order_release);
             continue;
@@ -2315,7 +2359,14 @@ void IPCManager::WorkerRoutine() {
             if (!conn->IsConnected()) {
                 // Channel torn down -> the reconnect path at the top of the loop
                 // (with its own coordinated back-off) handles re-establishment.
-                m_connected.store(false, std::memory_order_release);
+                // Cleared only while this is still the current connection: a
+                // rebuild may already have replaced it and restored the flag.
+                {
+                    std::lock_guard<std::mutex> connLock(m_primaryConnMutex);
+                    if (m_primaryConnection == conn) {
+                        m_connected.store(false, std::memory_order_release);
+                    }
+                }
                 badReceiveStreak = 0;
                 continue;
             }
