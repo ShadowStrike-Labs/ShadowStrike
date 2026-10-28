@@ -55,6 +55,18 @@
         <ServiceDependency Id="RpcSs"/>
         <ServiceDependency Id="Winmgmt"/>
         <ServiceDependency Id="FltMgr"/>
+        <!--
+          Failure actions also on a stop WITH AN ERROR, not only on a crash.
+          util:ServiceConfig below defines the actions; SCM applies them to a
+          process crash only unless this flag is set. A failed background start
+          reports STOPPED with ERROR_SERVICE_SPECIFIC_ERROR (task 380), and
+          without the flag recovery was left to the boot-time watchdog alone.
+          A normal stop reports NO_ERROR and is not restarted. MsiServiceConfig,
+          Windows Installer 5.0, which Package InstallerVersion="500" requires.
+        -->
+        <ServiceConfig FailureActionsWhen="failedToStopOrReturnedError"
+                       OnInstall="yes"
+                       OnReinstall="yes"/>
       </ServiceInstall>
 
       <!--

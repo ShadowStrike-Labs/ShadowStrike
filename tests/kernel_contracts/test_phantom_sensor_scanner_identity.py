@@ -29927,5 +29927,33 @@ class BootInitFailureReportsStoppedTests(unittest.TestCase):
         self.assertLess(tail.index("SetServiceStatus(SERVICE_STOP_PENDING"), tail.index(stopped))
 
 
+class ServiceFailureActionsOnErrorStopTests(unittest.TestCase):
+    """SCM failure actions also fire when the service stops with an error (task 380).
+
+    A failed background start reports STOPPED with ERROR_SERVICE_SPECIFIC_ERROR. SCM
+    applies util:ServiceConfig's restart actions to a crash only, unless the service's
+    non-crash failure flag is set; the MSI never set it.
+    """
+
+    WIX = "{http://wixtoolset.org/schemas/v4/wxs}"
+
+    @classmethod
+    def setUpClass(cls):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(str(INSTALLER_COMPONENTS_WXS_PATH)).getroot()
+        cls.install = None
+        for si in root.iter(cls.WIX + "ServiceInstall"):
+            if si.get("Name") == "ShadowStrikePhantomService":
+                cls.install = si
+
+    def test_flag_set_on_the_service_install(self):
+        self.assertIsNotNone(self.install, "ServiceInstall for ShadowStrikePhantomService is gone")
+        configs = list(self.install.iter(self.WIX + "ServiceConfig"))
+        self.assertEqual(1, len(configs))
+        self.assertEqual("failedToStopOrReturnedError", configs[0].get("FailureActionsWhen"))
+        self.assertEqual("yes", configs[0].get("OnInstall"))
+        self.assertEqual("yes", configs[0].get("OnReinstall"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
