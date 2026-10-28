@@ -139,6 +139,7 @@ typedef struct _SB_CIRCUIT_BREAKER {
     LARGE_INTEGER LastStateTransition;
     LARGE_INTEGER OpenedTime;
     LARGE_INTEGER TimeoutWindowStart; ///< start of the current reply-timeout window (100ns)
+    LARGE_INTEGER LastHalfOpenProbe;  ///< 100ns time the last half-open probe was admitted (task 91)
     volatile LONG64 TotalTrips;
     volatile LONG64 TotalRecoveries;
     EX_PUSH_LOCK Lock;
@@ -2608,9 +2609,52 @@ SbpCheckCircuitBreaker(
                 LARGE_INTEGER now;
                 KeQuerySystemTime(&now);
                 CircuitBreaker->LastStateTransition = now;
+                CircuitBreaker->LastHalfOpenProbe.QuadPart = 0;
                 DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                            "[ShadowStrike/SB] Circuit breaker: Open -> HalfOpen\n");
             }
+            //
+            // Moved to half-open (or lost the CAS to the thread that did); fall
+            // through to the single-probe gate below instead of admitting every
+            // caller.
+            //
+        } else {
+            return FALSE;
+        }
+    }
+
+    //
+    // HALF-OPEN: admit exactly ONE probe per SB_CIRCUIT_HALF_OPEN_TEST_MS and
+    // fail open (allow, unscanned) every other request until that probe resolves.
+    //
+    // The previous code returned TRUE for every caller in half-open, so the
+    // instant the 30 s recovery window opened the whole create backlog was
+    // admitted at once. Against a still-saturated scanner one timeout in that
+    // flood re-tripped the breaker, and the flood added load while doing it, so
+    // the breaker stayed latched open for almost a whole field run (1.0.125:
+    // 41,942 creates allowed with the circuit open against 811 scanned). One
+    // probe lets a recovered scanner close on the next request, while a
+    // still-slow one is asked exactly once per interval rather than flooded.
+    //
+    // The claim is a CAS on the probe timestamp, so it needs no lock. Time always
+    // advances, so no outcome can latch half-open: a probe whose result is never
+    // recorded is reclaimed after the interval. SbpRecordSuccess and
+    // SbpRecordFailure still end the episode (close, or re-open for 30 s).
+    //
+    if ((SB_CIRCUIT_STATE)CircuitBreaker->State == SbCircuitHalfOpen) {
+        LARGE_INTEGER lastProbe;
+        LONG64 sinceProbeMs;
+
+        KeQuerySystemTime(&currentTime);
+        lastProbe.QuadPart = InterlockedCompareExchange64(
+            &CircuitBreaker->LastHalfOpenProbe.QuadPart, 0, 0);
+        sinceProbeMs = (currentTime.QuadPart - lastProbe.QuadPart) / 10000;
+
+        if (sinceProbeMs >= SB_CIRCUIT_HALF_OPEN_TEST_MS &&
+            InterlockedCompareExchange64(
+                &CircuitBreaker->LastHalfOpenProbe.QuadPart,
+                currentTime.QuadPart,
+                lastProbe.QuadPart) == lastProbe.QuadPart) {
             return TRUE;
         }
 
@@ -2618,7 +2662,7 @@ SbpCheckCircuitBreaker(
     }
 
     //
-    // Half-open - allow one request to test
+    // Closed, or a concurrent close won the race: admit.
     //
     return TRUE;
 }

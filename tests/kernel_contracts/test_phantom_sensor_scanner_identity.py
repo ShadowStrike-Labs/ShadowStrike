@@ -29823,5 +29823,40 @@ class ZeroDayInferencePassesPublisherTrustTests(unittest.TestCase):
         self.assertIn("stats.zeroDayVerdictsSuppressedByTrust =", self.src)
 
 
+class CircuitBreakerHalfOpenAdmitsOneProbeTests(unittest.TestCase):
+    """The scan-bridge breaker admits one half-open probe, not every caller (task 91).
+
+    The 1.0.125 VM run let 41,942 creates through with the circuit open against 811
+    scanned. SbpCheckCircuitBreaker returned TRUE for every caller in half-open, so the
+    whole backlog flooded a still-saturated scanner the instant the recovery window
+    opened and one timeout in the flood re-tripped the breaker, latching it open.
+    """
+
+    SB = ROOT / "PhantomSensor/PhantomSensor/Communication/ScanBridge.c"
+
+    def setUp(self):
+        self.raw = read_source(self.SB)
+        self.src = strip_c_comments(self.raw)
+        self.check = extract_c_function(self.src, "SbpCheckCircuitBreaker")
+
+    def test_a_struct_field_records_the_last_probe(self):
+        self.assertIn("LARGE_INTEGER LastHalfOpenProbe;", self.src)
+
+    def test_half_open_no_longer_admits_every_caller(self):
+        # The old tail returned TRUE unconditionally for every half-open caller.
+        self.assertNotIn("Half-open - allow one request to test", self.raw)
+
+    def test_half_open_gates_one_probe_per_interval(self):
+        self.assertIn("CircuitBreaker->State == SbCircuitHalfOpen", self.check)
+        self.assertIn("SB_CIRCUIT_HALF_OPEN_TEST_MS", self.check)
+        self.assertIn("InterlockedCompareExchange64", self.check)
+        self.assertIn("LastHalfOpenProbe.QuadPart", self.check)
+        # the caller that does not win the probe claim fails open
+        self.assertIn("return FALSE;", self.check)
+
+    def test_entering_half_open_resets_the_probe_clock(self):
+        self.assertIn("CircuitBreaker->LastHalfOpenProbe.QuadPart = 0;", self.check)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
