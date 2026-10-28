@@ -215,6 +215,7 @@ std::wstring WhitelistDatabase()      { return GetDataDirectory() + L"\\whitelis
 std::wstring ThreatIntelDatabase()    { return GetDataDirectory() + L"\\threatintel.tidb"; }
 std::wstring ThreatIntelStringStore() { return ThreatIntelDatabase() + L".strings"; }
 std::wstring HashReputationDatabase() { return GetDataDirectory() + L"\\hashes.hdb"; }
+std::wstring NetworkBlocklist()       { return GetDataDirectory() + L"\\ip_blocklist.txt"; }
 
 std::vector<std::wstring> GetOwnedDataFiles() {
     std::vector<std::wstring> files;

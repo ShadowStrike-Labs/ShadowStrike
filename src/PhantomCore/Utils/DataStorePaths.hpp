@@ -98,6 +98,11 @@ namespace ShadowStrike::Utils::DataStorePaths {
 /// @brief Hash-reputation store database (bloom-filtered known-bad hashes).
 [[nodiscard]] std::wstring HashReputationDatabase();
 
+/// @brief Operator-supplied network blocklist (one IP or domain per line, '#' comments).
+/// Optional input, never shipped: absent means no operator entries. Lives here, not in a
+/// relative "data/" path, because a service's working directory is System32 (task 78).
+[[nodiscard]] std::wstring NetworkBlocklist();
+
 /// @brief Absolute paths of the files this product owns as DATA, not as content.
 ///
 /// These are the detection databases: the working stores in the data directory

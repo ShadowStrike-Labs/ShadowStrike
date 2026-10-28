@@ -2029,7 +2029,7 @@ public:
                     SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::ERROR);
                 } else {
                     ntf.Start();
-                    ntf.LoadBlockListFromFile(L"data/ip_blocklist.txt");
+                    ntf.LoadBlockListFromFile(Utils::DataStorePaths::NetworkBlocklist());
                     SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::RUNNING);
                     Utils::Logger::Info("RealTimeProtection: NetworkTrafficFilter initialized and started");
                 }

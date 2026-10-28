@@ -1217,6 +1217,25 @@ std::vector<std::string> NetworkTrafficFilter::GetBlockedDomains() const {
 }
 
 bool NetworkTrafficFilter::LoadBlockListFromFile(const std::wstring& filePath) {
+    // A RELATIVE PATH IS REFUSED, NOT RESOLVED (task 78). In a service it resolves
+    // against System32, so "data/ip_blocklist.txt" never named the intended file and
+    // the blocklist never loaded. Callers pass DataStorePaths::NetworkBlocklist().
+    if (filePath.empty() || !std::filesystem::path(filePath).is_absolute()) {
+        Utils::Logger::Error("NetworkTrafficFilter: blocklist path refused, not absolute: '{}'",
+            Utils::StringUtils::ToNarrow(filePath));
+        return false;
+    }
+
+    // ABSENT IS A NORMAL STATE. The list is operator-supplied and is not shipped, so a
+    // missing file means no operator entries, reported at INFO. Present but unreadable
+    // is a fault and stays an ERROR.
+    std::error_code ec;
+    if (!std::filesystem::exists(filePath, ec) && !ec) {
+        Utils::Logger::Info("NetworkTrafficFilter: no operator blocklist at {}; none loaded.",
+            Utils::StringUtils::ToNarrow(filePath));
+        return false;
+    }
+
     std::ifstream file(filePath);
     if (!file.is_open()) {
         Utils::Logger::Error("NetworkTrafficFilter: Cannot open blocklist file: {}",

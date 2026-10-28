@@ -29955,5 +29955,27 @@ class ServiceFailureActionsOnErrorStopTests(unittest.TestCase):
         self.assertEqual("yes", configs[0].get("OnReinstall"))
 
 
+class NetworkBlocklistLoadsFromTheDataDirectoryTests(unittest.TestCase):
+    """The operator network blocklist loads from DataStorePaths, never a relative path (task 78).
+
+    "data/ip_blocklist.txt" resolved against the service's System32 working directory, so
+    the list never loaded.
+    """
+
+    def setUp(self):
+        self.rtp = strip_c_comments(read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"))
+        self.ntf = strip_c_comments(read_source(ROOT / "src/PhantomCore/RealTime/NetworkTrafficFilter.cpp"))
+
+    def test_service_passes_the_data_directory_path(self):
+        self.assertIn("ntf.LoadBlockListFromFile(Utils::DataStorePaths::NetworkBlocklist());", self.rtp)
+        self.assertNotIn('LoadBlockListFromFile(L"data/', self.rtp)
+
+    def test_loader_refuses_a_relative_path(self):
+        body = extract_c_function(self.ntf, "NetworkTrafficFilter::LoadBlockListFromFile")
+        refuse = body.index("is_absolute()")
+        self.assertLess(refuse, body.index("std::ifstream file(filePath);"),
+                        "the absolute-path check must run before the file is opened")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
