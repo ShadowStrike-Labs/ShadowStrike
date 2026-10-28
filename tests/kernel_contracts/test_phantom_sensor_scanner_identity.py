@@ -29903,5 +29903,29 @@ class ThreatIntelStoreFailureDegradesStartupTests(unittest.TestCase):
         self.assertGreater(bind, self.block.index("} else {"))
 
 
+class BootInitFailureReportsStoppedTests(unittest.TestCase):
+    """A failed background init leaves SCM showing STOPPED with an error (task 380).
+
+    OnStart reports RUNNING before Phase 2; ServiceMain used to only join the init
+    thread and return, so SCM kept RUNNING and the start watchdog took it as healthy.
+    """
+
+    SVC = ROOT / "src/PhantomCore/Service/AntivirusService.cpp"
+
+    def setUp(self):
+        self.body = extract_c_function(strip_c_comments(read_source(self.SVC)), "AntivirusService::OnStart")
+
+    def test_init_thread_records_the_failure(self):
+        fail = self.body[self.body.index("if (!initOk || !startOk) {"):]
+        self.assertIn("m_bootInitFailed.store(true", fail[:fail.index("SetEvent")])
+
+    def test_service_main_reports_stopped_with_the_error(self):
+        tail = self.body[self.body.index("OnStart-bootInitThread-join-leave"):]
+        self.assertIn("m_bootInitFailed.load(", tail)
+        stopped = "SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);"
+        self.assertIn(stopped, tail)
+        self.assertLess(tail.index("SetServiceStatus(SERVICE_STOP_PENDING"), tail.index(stopped))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

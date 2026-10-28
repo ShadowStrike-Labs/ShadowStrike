@@ -1572,6 +1572,7 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
             ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-signal-stop-on-failure");
             self->m_serviceStatus.dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
             self->m_serviceStatus.dwServiceSpecificExitCode = 1;
+            self->m_bootInitFailed.store(true, std::memory_order_release);
             if (self->m_stopEvent != nullptr) {
                 ::SetEvent(self->m_stopEvent);
             }
@@ -1626,6 +1627,18 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
         ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-join-leave");
     }
 
+    // Phase 2 failed: report the failed start. The init thread recorded the
+    // service-specific code but cannot leave RUNNING itself, and returning from
+    // ServiceMain does not change what SCM shows - the 1.0.126 VM run sat RUNNING
+    // with nothing initialized while the start watchdog read that as healthy
+    // (task 380). A STOP control that arrived first already reported STOPPED.
+    if (m_bootInitFailed.load(std::memory_order_acquire) &&
+        m_serviceStatus.dwCurrentState != SERVICE_STOPPED) {
+        ::ShadowStrikeAppendBootTrace(L"OnStart-report-STOPPED-after-init-failure");
+        SetServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 30000);
+        try { m_impl->Stop(); } catch (...) {}
+        SetServiceStatus(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR);
+    }
 }
 
 void AntivirusService::OnStop() {

@@ -212,6 +212,9 @@ private:
     // STOPPED; success leaves the service in SERVICE_RUNNING.
     HANDLE m_bootInitThread{ nullptr };
     std::atomic<bool> m_bootInitComplete{ false };
+    // Set by the boot-init thread when Initialize or Start failed; ServiceMain
+    // reads it after the stop event to report STOPPED with an error (task 380).
+    std::atomic<bool> m_bootInitFailed{ false };
 
     static std::atomic<bool> s_instanceCreated;
 };
