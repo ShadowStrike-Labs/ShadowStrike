@@ -303,30 +303,33 @@ ThreatIntelDatabase::~ThreatIntelDatabase() {
 // ============================================================================
 
 bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
+    m_lastOpenFailure = OpenFailure::None;
+    m_lastOpenError = 0;
+
     // Check if already open
     if (m_isOpen.load(std::memory_order_acquire)) {
-        return false;
+        return FailOpen(OpenFailure::InvalidRequest, 0);
     }
     
     // TITANIUM: Validate file path
     if (config.filePath.empty()) {
-        return false;
+        return FailOpen(OpenFailure::InvalidRequest, 0);
     }
     
     // TITANIUM: Check path length limit (MAX_PATH for Windows)
     constexpr size_t kMaxPathLength = 32767;  // Windows extended path limit
     if (config.filePath.length() >= kMaxPathLength) {
-        return false;
+        return FailOpen(OpenFailure::InvalidRequest, 0);
     }
     
     // TITANIUM: Validate initial size limits
     if (config.initialSize > 0 && config.initialSize > DATABASE_MAX_SIZE) {
-        return false;
+        return FailOpen(OpenFailure::InvalidRequest, 0);
     }
     
     // TITANIUM: Validate max size configuration
     if (config.maxSize > DATABASE_MAX_SIZE) {
-        return false;
+        return FailOpen(OpenFailure::InvalidRequest, 0);
     }
     
     std::unique_lock lock(m_mutex);
@@ -340,9 +343,9 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         fileExists = std::filesystem::exists(config.filePath);
     } catch (const std::filesystem::filesystem_error&) {
         // TITANIUM: Handle filesystem errors gracefully
-        return false;
+        return FailOpen(OpenFailure::AccessFailed, 0);
     } catch (const std::exception&) {
-        return false;
+        return FailOpen(OpenFailure::AccessFailed, 0);
     }
     
     if (fileExists) {
@@ -357,7 +360,7 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         }
     } else {
         // File doesn't exist and we shouldn't create it
-        return false;
+        return FailOpen(OpenFailure::NotFound, 0);
     }
     
     // TITANIUM: Always validate integrity on open regardless of readOnly.
@@ -377,7 +380,7 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         m_hashIndexBuilt = false;
         m_isOpen.store(false, std::memory_order_release);
         m_stats.isOpen = false;
-        return false;
+        return FailOpen(OpenFailure::UnusableContent, 0);
     }
     
     // Update statistics
@@ -400,7 +403,7 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
         m_header = nullptr;
         m_entries = nullptr;
         m_stats.isOpen = false;
-        return false;
+        return FailOpen(OpenFailure::AccessFailed, 0);
     }
     m_revokedUnresolvableStrings = 0;
     if (!config.readOnly) {
@@ -414,6 +417,23 @@ bool ThreatIntelDatabase::Open(const DatabaseConfig& config) noexcept {
     m_isOpen.store(true, std::memory_order_release);
     
     return true;
+}
+
+bool ThreatIntelDatabase::FailOpen(OpenFailure failure, uint32_t error) noexcept {
+    m_lastOpenFailure = failure;
+    m_lastOpenError = error;
+    return false;
+}
+
+const wchar_t* ThreatIntelDatabase::OpenFailureName(OpenFailure failure) noexcept {
+    switch (failure) {
+        case OpenFailure::None:            return L"none";
+        case OpenFailure::InvalidRequest:  return L"invalid request";
+        case OpenFailure::NotFound:        return L"not found";
+        case OpenFailure::AccessFailed:    return L"access failed";
+        case OpenFailure::UnusableContent: return L"unusable content";
+    }
+    return L"unknown";
 }
 
 void ThreatIntelDatabase::RevokeUnresolvableStringEntries() noexcept {
@@ -1485,7 +1505,7 @@ bool ThreatIntelDatabase::CreateDatabase(const DatabaseConfig& config) noexcept 
         );
         
         if (fileHandle == INVALID_HANDLE_VALUE) {
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, ::GetLastError());
         }
         
         // Set file size
@@ -1493,13 +1513,15 @@ bool ThreatIntelDatabase::CreateDatabase(const DatabaseConfig& config) noexcept 
         size.QuadPart = static_cast<LONGLONG>(initialSize);
         
         if (!SetFilePointerEx(fileHandle, size, nullptr, FILE_BEGIN)) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         if (!SetEndOfFile(fileHandle)) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         // Create file mapping
@@ -1513,8 +1535,9 @@ bool ThreatIntelDatabase::CreateDatabase(const DatabaseConfig& config) noexcept 
         );
         
         if (mappingHandle == nullptr) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         // Map view
@@ -1527,9 +1550,10 @@ bool ThreatIntelDatabase::CreateDatabase(const DatabaseConfig& config) noexcept 
         );
         
         if (baseAddress == nullptr) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(mappingHandle);
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         // Set up region
@@ -1564,7 +1588,7 @@ bool ThreatIntelDatabase::CreateDatabase(const DatabaseConfig& config) noexcept 
         return true;
         
     } catch (...) {
-        return false;
+        return FailOpen(OpenFailure::AccessFailed, 0);
     }
 }
 
@@ -1585,20 +1609,21 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         );
         
         if (fileHandle == INVALID_HANDLE_VALUE) {
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, ::GetLastError());
         }
         
         // Get file size
         LARGE_INTEGER fileSize;
         if (!GetFileSizeEx(fileHandle, &fileSize)) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         // Validate minimum size
         if (fileSize.QuadPart < static_cast<LONGLONG>(sizeof(ThreatIntelDatabaseHeader))) {
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         
         // TITANIUM: Reject files that exceed configured / hard limits so a
@@ -1607,12 +1632,12 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         if (fileSize.QuadPart < 0 ||
             static_cast<uint64_t>(fileSize.QuadPart) > DATABASE_MAX_SIZE) {
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         if (config.maxSize > 0 &&
             static_cast<uint64_t>(fileSize.QuadPart) > config.maxSize) {
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::InvalidRequest, 0);
         }
         
         // Create file mapping
@@ -1628,8 +1653,9 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         );
         
         if (mappingHandle == nullptr) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         // Map view
@@ -1644,9 +1670,10 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         );
         
         if (baseAddress == nullptr) {
+            const DWORD openError = ::GetLastError();
             CloseHandle(mappingHandle);
             CloseHandle(fileHandle);
-            return false;
+            return FailOpen(OpenFailure::AccessFailed, openError);
         }
         
         // Set up region
@@ -1663,7 +1690,7 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         if (m_header->magic != THREATINTEL_DB_MAGIC) {
             m_region.Close();
             m_header = nullptr;
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         
         // TITANIUM: Strict version check at open time. A mismatched major
@@ -1672,7 +1699,7 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         if (m_header->versionMajor != THREATINTEL_DB_VERSION_MAJOR) {
             m_region.Close();
             m_header = nullptr;
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         
         // TITANIUM: Validate entryDataOffset before deriving m_entries.
@@ -1684,7 +1711,7 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
             entryDataOffset >= regionSize) {
             m_region.Close();
             m_header = nullptr;
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         
         // TITANIUM: Cross-check declared active-entry count against the actual
@@ -1694,7 +1721,7 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         if (m_header->totalActiveEntries > maxPossibleEntries) {
             m_region.Close();
             m_header = nullptr;
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         
         // TITANIUM: Validate header CRC unconditionally for existing files.
@@ -1702,7 +1729,7 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         if (!VerifyHeaderChecksumInternal()) {
             m_region.Close();
             m_header = nullptr;
-            return false;
+            return FailOpen(OpenFailure::UnusableContent, 0);
         }
         
         // Set entries pointer using entryDataOffset
@@ -1715,7 +1742,7 @@ bool ThreatIntelDatabase::OpenExisting(const DatabaseConfig& config) noexcept {
         return true;
         
     } catch (...) {
-        return false;
+        return FailOpen(OpenFailure::AccessFailed, 0);
     }
 }
 

@@ -2108,3 +2108,51 @@ TEST_F(ThreatIntelDatabaseTest, ADatabaseWhoseWriterNeverClosedReopens) {
     }
     writer.Close();
 }
+
+// OPEN NAMES WHY IT FAILED (task 380)
+//
+// The store replaces a database only on UnusableContent, so the class must be right:
+// a sharing or ACL failure misread as bad content would destroy a healthy file.
+// ============================================================================
+
+TEST_F(ThreatIntelDatabaseTest, OpenNamesWhyItFailed) {
+    using Failure = ThreatIntelDatabase::OpenFailure;
+    createdDatabases.push_back(testDbPath + L".strings");
+
+    {   // bytes that are not a database
+        std::ofstream(testDbPath, std::ios::binary).write(std::string(64 * 1024, '\0').data(), 64 * 1024);
+        ThreatIntelDatabase db;
+        EXPECT_FALSE(db.Open(testDbPath));
+        EXPECT_EQ(db.GetLastOpenFailure(), Failure::UnusableContent);
+        CleanupDatabase(testDbPath);
+    }
+    {   // a healthy database another handle holds without sharing
+        ThreatIntelDatabase writer;
+        ASSERT_TRUE(writer.Open(testDbPath));
+        writer.Close();
+        HANDLE held = CreateFileW(testDbPath.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        ASSERT_NE(held, INVALID_HANDLE_VALUE);
+        ThreatIntelDatabase db;
+        EXPECT_FALSE(db.Open(testDbPath));
+        EXPECT_EQ(db.GetLastOpenFailure(), Failure::AccessFailed);
+        EXPECT_EQ(db.GetLastOpenError(), static_cast<uint32_t>(ERROR_SHARING_VIOLATION));
+        CloseHandle(held);
+        CleanupDatabase(testDbPath);
+    }
+    {   // no file, and creation not allowed
+        DatabaseConfig config = DatabaseConfig::CreateDefault(testDbPath);
+        config.createIfNotExists = false;
+        ThreatIntelDatabase db;
+        EXPECT_FALSE(db.Open(config));
+        EXPECT_EQ(db.GetLastOpenFailure(), Failure::NotFound);
+    }
+    {   // a second Open of an open database; success clears the class
+        ThreatIntelDatabase db;
+        ASSERT_TRUE(db.Open(testDbPath));
+        EXPECT_EQ(db.GetLastOpenFailure(), Failure::None);
+        EXPECT_FALSE(db.Open(testDbPath));
+        EXPECT_EQ(db.GetLastOpenFailure(), Failure::InvalidRequest);
+        db.Close();
+    }
+}

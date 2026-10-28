@@ -314,9 +314,31 @@ public:
     /**
      * @brief Open or create a database
      * @param config Database configuration
-     * @return true if successful
+     * @return true if successful; on false, GetLastOpenFailure says why
      */
     [[nodiscard]] bool Open(const DatabaseConfig& config) noexcept;
+
+    /**
+     * @brief Why the last Open() failed.
+     *
+     * The caller decides on this whether a file may be replaced. Only UnusableContent
+     * proves the bytes are not a database this build can read; every other class says
+     * nothing about the file and must leave it alone (task 380).
+     */
+    enum class OpenFailure : uint8_t {
+        None = 0,
+        InvalidRequest,   ///< Already open, or a path or size argument the database refuses
+        NotFound,         ///< No file, and createIfNotExists is false
+        AccessFailed,     ///< The OS refused or failed: sharing, ACL, mapping, I/O (see GetLastOpenError)
+        UnusableContent,  ///< Opened, but not a readable database: size, magic, version, layout or checksum
+    };
+
+    [[nodiscard]] OpenFailure GetLastOpenFailure() const noexcept { return m_lastOpenFailure; }
+
+    /// Win32 error behind an AccessFailed, 0 when the failure carried none.
+    [[nodiscard]] uint32_t GetLastOpenError() const noexcept { return m_lastOpenError; }
+
+    [[nodiscard]] static const wchar_t* OpenFailureName(OpenFailure failure) noexcept;
     
     /**
      * @brief Open database with path only (default config)
@@ -718,6 +740,13 @@ private:
     
     /// Is database open
     std::atomic<bool> m_isOpen{false};
+
+    /// See GetLastOpenFailure / GetLastOpenError. Written by Open, which has one caller at a time.
+    OpenFailure m_lastOpenFailure = OpenFailure::None;
+    uint32_t    m_lastOpenError = 0;
+
+    /// Records why Open failed and returns false, so every failure exit is one statement.
+    bool FailOpen(OpenFailure failure, uint32_t error) noexcept;
     
     /// Read-write lock for thread safety
     mutable std::shared_mutex m_mutex;

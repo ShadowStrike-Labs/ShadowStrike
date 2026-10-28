@@ -59,6 +59,17 @@
 #include <thread>
 #include <vector>
 
+// Guarded like the sibling database test: the Win32 handle APIs used by the
+// store-repair tests need Windows.h, and pch.h defines these macros but does
+// not include it.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
 namespace ShadowStrike::ThreatIntel::Tests {
 
 using namespace ShadowStrike::ThreatIntel;
@@ -2213,6 +2224,56 @@ TEST(ThreatIntelStore_StatsEdgeCases, CacheStatsAccurate) {
 	// At minimum verify we get valid stats
 	EXPECT_GE(cacheStats.totalCapacity, 0u);
 
+	store->Shutdown();
+}
+
+// AN UNREADABLE DATABASE IS SET ASIDE; ONE THE OS REFUSED IS NOT (task 380)
+//
+// The 1.0.126 VM run rebooted with a database it could not read and kept no IOC store for
+// the rest of the session. Bytes that are not a database are replaced with an empty one;
+// a sharing failure says nothing about the bytes and must leave a healthy file alone.
+TEST(ThreatIntelStore_Lifecycle, AnUnreadableDatabaseIsSetAsideAndReplaced) {
+	TempDir tempDir;
+	const auto dbPath = tempDir.FilePath("unreadable.tidb");
+	{
+		std::ofstream out(dbPath, std::ios::binary);
+		const std::string zeros(64 * 1024, '\0');
+		out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+	}
+	auto store = CreateThreatIntelStore();
+	ASSERT_NE(store, nullptr);
+	EXPECT_TRUE(store->Initialize(MakeTestConfig(dbPath)))
+		<< "a file that is not a database must not keep the store closed";
+	EXPECT_TRUE(store->IsInitialized());
+	std::error_code ec;
+	const std::filesystem::path aside(dbPath.wstring() + L".unreadable");
+	EXPECT_TRUE(std::filesystem::exists(aside)) << "the unreadable bytes were not kept for diagnosis";
+	EXPECT_EQ(std::filesystem::file_size(aside, ec), 64u * 1024u);
+	store->Shutdown();
+}
+
+TEST(ThreatIntelStore_Lifecycle, ADatabaseHeldElsewhereIsNotReplaced) {
+	TempDir tempDir;
+	const auto dbPath = tempDir.FilePath("held.tidb");
+	{
+		auto first = CreateThreatIntelStore();
+		ASSERT_TRUE(first->Initialize(MakeTestConfig(dbPath)));
+		first->Shutdown();
+	}
+	std::error_code ec;
+	const auto sizeBefore = std::filesystem::file_size(dbPath, ec);
+	HANDLE held = ::CreateFileW(dbPath.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+	                            FILE_ATTRIBUTE_NORMAL, nullptr);
+	ASSERT_NE(held, INVALID_HANDLE_VALUE);
+
+	auto store = CreateThreatIntelStore();
+	EXPECT_FALSE(store->Initialize(MakeTestConfig(dbPath)));
+	::CloseHandle(held);
+
+	EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(dbPath.wstring() + L".unreadable")))
+		<< "a sharing failure moved a healthy database aside";
+	EXPECT_EQ(std::filesystem::file_size(dbPath, ec), sizeBefore);
+	EXPECT_TRUE(store->Initialize(MakeTestConfig(dbPath))) << "the untouched file must open once released";
 	store->Shutdown();
 }
 

@@ -703,15 +703,62 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
         dbConfig.verifyOnOpen = config.verifyIntegrityOnLoad;
         dbConfig.prefaultPages = true; // Always prefault for performance
 
-        if (!m_impl->database->Open(dbConfig)) {
+        bool opened = m_impl->database->Open(dbConfig);
+
+        // REPAIR ONLY WHAT IS PROVEN UNREADABLE (task 380). A file that opened but is
+        // not a database this build can read - wrong size, magic, version, layout or
+        // checksum - cannot become readable by waiting, and leaving it in place meant
+        // no IOC lookups on any later start, while the feeds that fill the store are
+        // re-fetched anyway. So it is set aside, one copy kept for diagnosis, and an
+        // empty database takes its place. Any other failure - sharing, ACL, I/O - says
+        // nothing about the bytes, and replacing a healthy file another process holds
+        // would destroy it, so those leave the file alone.
+        if (!opened && !dbConfig.readOnly &&
+            m_impl->database->GetLastOpenFailure() == ThreatIntelDatabase::OpenFailure::UnusableContent) {
+            const std::wstring aside = config.databasePath + L".unreadable";
+            if (::MoveFileExW(config.databasePath.c_str(), aside.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                // The text store belongs to the entries just set aside. A missing one
+                // is fine; one that cannot move stays and is only appended to.
+                const std::wstring strings = ThreatIntelDatabase::StringStorePathFor(config.databasePath);
+                (void)::MoveFileExW(strings.c_str(), (strings + L".unreadable").c_str(), MOVEFILE_REPLACE_EXISTING);
+                Utils::Logger::Instance().LogEx(
+                    Utils::LogLevel::Warn,
+                    L"ThreatIntelStore",
+                    __FILEW__,
+                    __LINE__,
+                    __FUNCTIONW__,
+                    L"Database %s was unreadable (unusable content) and was moved to %s; "
+                    L"starting an empty database - indicators return with the next feed sync",
+                    config.databasePath.c_str(),
+                    aside.c_str()
+                );
+                m_impl->database = std::make_unique<ThreatIntelDatabase>();
+                opened = m_impl->database->Open(dbConfig);
+            } else {
+                Utils::Logger::Instance().LogEx(
+                    Utils::LogLevel::Error,
+                    L"ThreatIntelStore",
+                    __FILEW__,
+                    __LINE__,
+                    __FUNCTIONW__,
+                    L"Unreadable database %s could not be moved aside (Win32 %lu); left in place",
+                    config.databasePath.c_str(),
+                    static_cast<unsigned long>(::GetLastError())
+                );
+            }
+        }
+
+        if (!opened) {
             Utils::Logger::Instance().LogEx(
                 Utils::LogLevel::Error,
                 L"ThreatIntelStore",
                 __FILEW__,
                 __LINE__,
                 __FUNCTIONW__,
-                L"Failed to open database: %s",
-                config.databasePath.c_str()
+                L"Failed to open database: %s (%s, Win32 %lu)",
+                config.databasePath.c_str(),
+                ThreatIntelDatabase::OpenFailureName(m_impl->database->GetLastOpenFailure()),
+                static_cast<unsigned long>(m_impl->database->GetLastOpenError())
             );
             m_isInitialized.store(false, std::memory_order_release);
             return false;
