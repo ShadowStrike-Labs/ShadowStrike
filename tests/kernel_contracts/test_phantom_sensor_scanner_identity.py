@@ -29880,5 +29880,28 @@ class CircuitBreakerHalfOpenAdmitsOneProbeTests(unittest.TestCase):
         self.assertIn("CircuitBreaker->LastHalfOpenProbe.QuadPart = 0;", self.check)
 
 
+class ThreatIntelStoreFailureDegradesStartupTests(unittest.TestCase):
+    """An unreadable threat-intel store degrades startup, it does not abort it (task 380).
+
+    The 1.0.126 VM run rebooted with a rejected threatintel.tidb; Initialize returned
+    false and the machine ran with no driver and no scanning.
+    """
+
+    SVC = ROOT / "src/PhantomCore/Service/AntivirusService.cpp"
+
+    def setUp(self):
+        src = strip_c_comments(read_source(self.SVC))
+        start = src.index('impl-Initialize-ThreatIntelStore-enter')
+        self.block = src[start:src.index('impl-Initialize-CryptoManager-enter', start)]
+
+    def test_store_failure_does_not_return(self):
+        self.assertNotIn("return false;", self.block)
+        self.assertIn("impl-Initialize-ThreatIntelStore-DEGRADED", self.block)
+
+    def test_facade_bound_only_to_an_open_store(self):
+        bind = self.block.index("ThreatIntelManager::Instance().Bind(m_threatIntelStore.get());")
+        self.assertGreater(bind, self.block.index("} else {"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -361,13 +361,22 @@ public:
             }
 
             if (!m_threatIntelStore || !m_threatIntelStore->IsInitialized()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize ThreatIntelStore");
-                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-FAIL");
-                return false;
+                // DEGRADED, NOT FATAL. Without the store the product loses IOC and
+                // reputation lookups; signatures, heuristics and the kernel channel do
+                // not depend on it, and every other consumer of Shared() already
+                // continues without it. Returning false here turned one unreadable
+                // cache file into no protection at all: the 1.0.126 VM run rebooted
+                // with a rejected threatintel.tidb and ran with no driver and no
+                // scanning (task 380). The facade stays unbound, so the status report
+                // carries threatIntel=false.
+                SS_LOG_ERROR(LOG_CATEGORY,
+                             L"ThreatIntelStore unavailable - continuing without IOC and "
+                             L"reputation lookups; all other protection starts normally");
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-DEGRADED");
+            } else {
+                ThreatIntel::ThreatIntelManager::Instance().Bind(m_threatIntelStore.get());
+                ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-leave");
             }
-
-            ThreatIntel::ThreatIntelManager::Instance().Bind(m_threatIntelStore.get());
-            ::ShadowStrikeAppendBootTrace(L"impl-Initialize-ThreatIntelStore-leave");
 
             // CryptoManager (foundation — used by ConfigManager, CertificateValidator,
             // and secure IPC; must be available before other security modules)
@@ -1616,6 +1625,7 @@ void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
         m_bootInitThread = nullptr;
         ::ShadowStrikeAppendBootTrace(L"OnStart-bootInitThread-join-leave");
     }
+
 }
 
 void AntivirusService::OnStop() {
@@ -1778,7 +1788,9 @@ bool AntivirusService::IsHealthy() const noexcept {
         // Check ServiceMonitor resource health (CPU, memory, heartbeat)
         if (!ServiceMonitor::Instance().IsHealthy()) return false;
 
-        // Check fatal-dependency modules (service cannot function without these)
+        // Check modules without which protection is incomplete. The threat-intel
+        // store is degraded rather than fatal at startup (task 380), so its absence
+        // reports unhealthy here instead of stopping the service.
         if (!ThreatIntel::ThreatIntelManager::Instance().IsInitialized()) return false;
 
         if (Security::CryptoManager::HasInstance() &&
