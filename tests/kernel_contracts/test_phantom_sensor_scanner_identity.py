@@ -3207,20 +3207,26 @@ class SourceContractTests(unittest.TestCase):
 
         # Offsets only, never the haystack: an assertIn against a 5,000-line file
         # prints the entire file on failure and buries the finding.
-        gate = "if (scope == SecurityInfoScope::Full)"
-        gate_count = src.count(gate)
-        self.assertEqual(
-            gate_count, 1,
-            "expected exactly one Full-scope gate around the account-name lookup, "
-            "found %d" % gate_count,
-        )
-        call_at = src.index("LookupAccountSidW")
+        #
+        # The lookup must sit INSIDE a Full-scope block. This used to assert that the
+        # gate text occurred once in the file and that one preceded the call, which
+        # stopped holding when the privilege-name loop got its own Full gate (task 138)
+        # and never proved enclosure: a gate whose block closed before the call passed.
+        gate = "if (scope == SecurityInfoScope::Full) {"
+        call_at = src.index("LookupAccountSidW(")
         gate_at = src.rfind(gate, 0, call_at)
         self.assertNotEqual(
             gate_at, -1,
             "the account-name lookup at offset %d is not preceded by the Full-scope "
             "gate, so it would run for every caller including those that owe the "
             "kernel an answer" % call_at,
+        )
+        block_end = _matching_delimiter(src, gate_at + len(gate) - 1, "{", "}")
+        self.assertLess(
+            call_at, block_end,
+            "the account-name lookup at offset %d is outside the Full-scope block "
+            "before it (which closes at offset %d), so it runs for every scope"
+            % (call_at, block_end),
         )
         # Nothing may reopen the guard between the gate and the call.
         between = src[gate_at:call_at]
