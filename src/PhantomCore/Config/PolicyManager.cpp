@@ -546,9 +546,7 @@ std::string ComplianceReport::ToJson() const {
 
         Utils::JSON::Json violations = Utils::JSON::Json::array();
         for (const auto& v : pendingViolations) {
-            Utils::JSON::Json vj;
-            (void)Utils::JSON::Parse(v.ToJson(), vj);
-            violations.push_back(std::move(vj));
+            violations.push_back(Utils::JSON::ParseObjectOrError(v.ToJson(), "ComplianceReport.pendingViolation"));
         }
         j["pendingViolations"] = std::move(violations);
 

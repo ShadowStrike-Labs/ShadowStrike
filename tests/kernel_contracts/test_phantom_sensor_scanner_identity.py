@@ -30235,38 +30235,43 @@ class ScriptBlocksNameTheWritingProcessTests(unittest.TestCase):
         self.assertIn("req.ProcessId", statement)
 
 
-class UsbSerializersEmbedSubObjectsWithoutDiscardingParseTests(unittest.TestCase):
-    """USB serializers embed sub-objects through a checked helper, not a discarded Parse (task 155).
+class JsonSubObjectEmbedsUseCheckedParseTests(unittest.TestCase):
+    """ToJson() embeds a sub-object through a checked helper, never a discarded Parse (task 155).
 
-    Three USB serializers built an enclosing JSON document by calling Utils::JSON::Parse on a
-    sub-object's ToJson() string and ignoring the returned bool. On a parse failure nlohmann
-    leaves the output discarded/null, which then vanishes from the enclosing document, so a
-    malformed sub-object was dropped silently instead of recorded. The fix routes every such
-    site through Utils::JSON::ParseObjectOrError, which returns a visible
-    {"__jsonError": <context>} object on failure. This pins the migration: no discard may
-    return, and the checked helper must stay in use.
+    Several serializers built an enclosing JSON document by calling Utils::JSON::Parse on a
+    sub-object's ToJson() string and ignoring the returned bool; one site hid the discard
+    behind a (void) cast. On a parse failure nlohmann leaves the output discarded/null, which
+    then vanishes from the document, so a malformed sub-object was dropped silently instead of
+    recorded. The eleven USB sites and the PolicyManager compliance report were routed through
+    Utils::JSON::ParseObjectOrError, which returns a visible {"__jsonError": <context>} object
+    on failure. These pin the migration: no Utils::JSON::Parse of a ToJson() result may remain
+    anywhere under src, and the known embed sites must keep calling the checked helper.
     """
 
-    SOURCES = (
+    # Sites fixed for task 155; each must keep embedding sub-objects through the checked helper.
+    EMBED_SITES = (
         "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.cpp",
         "src/Products/Community/PhantomHome/USB_Protection/DeviceControlManager.cpp",
         "src/Products/Community/PhantomHome/USB_Protection/USBScanner.cpp",
+        "src/PhantomCore/Config/PolicyManager.cpp",
     )
 
-    # Utils::JSON::Parse(<expr>.ToJson(), ...) with the bool result ignored. ParseObjectOrError
-    # does not match: after "Parse" comes "ObjectOrError(", never "(".
+    # Utils::JSON::Parse(<expr>.ToJson(), ...) with the bool result ignored, with or without a
+    # (void) cast. ParseObjectOrError does not match: after "Parse" comes "ObjectOrError(".
     DISCARD = re.compile(r"Utils::JSON::Parse\([^;]*\.ToJson\(\)")
 
-    def test_no_serializer_discards_a_parse_of_a_tojson_result(self):
-        for rel in self.SOURCES:
-            source = strip_c_comments(read_source(ROOT / rel))
-            found = self.DISCARD.findall(source)
-            self.assertEqual(
-                [], found,
-                "%s parses a ToJson() result and discards the status: %r" % (rel, found))
+    def test_no_source_discards_a_parse_of_a_tojson_result(self):
+        offenders = []
+        for path in sorted((ROOT / "src").rglob("*.cpp")):
+            source = strip_c_comments(read_source(path))
+            for hit in self.DISCARD.findall(source):
+                offenders.append("%s: %s" % (path.relative_to(ROOT).as_posix(), hit))
+        self.assertEqual(
+            [], offenders,
+            "Utils::JSON::Parse of a ToJson() result discards the status: %r" % offenders)
 
-    def test_each_serializer_uses_the_checked_helper(self):
-        for rel in self.SOURCES:
+    def test_known_embed_sites_use_the_checked_helper(self):
+        for rel in self.EMBED_SITES:
             source = strip_c_comments(read_source(ROOT / rel))
             self.assertIn(
                 "Utils::JSON::ParseObjectOrError(", source,
