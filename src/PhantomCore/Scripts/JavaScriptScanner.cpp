@@ -1030,7 +1030,13 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
             if (cached.has_value()) {
                 m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
                 SS_LOG_DEBUG(LOG_CATEGORY, L"Cache hit for hash: %hs", result.sha256.c_str());
-                return cached.value();
+                // The verdict is shared by content; the process is not. A cached result
+                // keeps the process of the scan that filled the cache, so it is stamped
+                // with this scan's, or a second writer of the same script would be
+                // reported as the first.
+                JSScanResult hit = std::move(*cached);
+                hit.processId = processId;
+                return hit;
             }
             m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2715,6 +2721,12 @@ void JavaScriptScannerImpl::ReportThreatToAlertSystem(const JSScanResult& result
             " | Risk: " + std::to_string(result.riskScore) +
             " | Category: " + std::string(GetJSThreatCategoryName(result.category)) +
             " | SHA256: " + result.sha256;
+
+        // 0 means no process is known (a memory scan, for one); naming PID 0, the
+        // System Idle Process, would attribute the script to the wrong process.
+        if (result.processId != 0) {
+            details += " | PID: " + std::to_string(result.processId);
+        }
 
         if (!result.extractedIOCs.empty()) {
             details += " | IOCs: ";

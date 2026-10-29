@@ -32,7 +32,8 @@ void PythonScriptScanner_Shutdown() noexcept;
 bool VBScriptScanner_Init() noexcept;
 void VBScriptScanner_Shutdown() noexcept;
 
-bool JavaScriptScanner_ScanFile(const std::wstring& filePath) noexcept;
+bool JavaScriptScanner_ScanFile(const std::wstring& filePath,
+                                std::uint32_t pid) noexcept;
 bool VBScriptScanner_ScanFile(const std::wstring& filePath,
                               const std::wstring& lowerExt) noexcept;
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
@@ -122,7 +123,7 @@ constexpr std::size_t kMaxDispatchPathChars = 32767;
 
 }  // namespace
 
-bool DispatchFileScan(std::uint32_t /*pid*/,
+bool DispatchFileScan(std::uint32_t pid,
                       const std::wstring& filePath) noexcept {
     if (!IsValidDispatchPath(filePath)) {
         return false;
@@ -133,9 +134,12 @@ bool DispatchFileScan(std::uint32_t /*pid*/,
 
     using namespace Internal;
 
-    // JavaScript family.
+    // JavaScript family. The originating process is forwarded: the scanner stamps it on
+    // the result, the alert and the telemetry. The VBScript, Python and macro scanners
+    // below have no process-aware scan entry yet, so their reports carry no process
+    // (task 180); RealTimeProtection still names it on the block it logs.
     if (ext == L".js" || ext == L".jse" || ext == L".mjs" || ext == L".cjs") {
-        return JavaScriptScanner_ScanFile(filePath);
+        return JavaScriptScanner_ScanFile(filePath, pid);
     }
 
     // VBScript / Windows Script Host / HTA.

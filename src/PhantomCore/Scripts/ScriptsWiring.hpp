@@ -53,7 +53,9 @@ void ShutdownScriptsSubsystem() noexcept;
 
 /**
  * @brief Scan a file that was just written/closed by @p pid.
- * @param pid Originating process identifier from kernel/service dispatch.
+ * @param pid Originating process identifier from kernel/service dispatch. Forwarded to
+ *        the JavaScript scanner, whose result, alert and telemetry carry it. The VBScript,
+ *        Python and macro scanners have no process-aware scan entry yet (task 180).
  * @param filePath Absolute or normalized path. Empty paths, embedded NULs,
  *        control characters, and paths longer than 32767 UTF-16 code units
  *        are rejected before scanner dispatch.

@@ -30197,5 +30197,37 @@ class IPCManagerHasNoNamedPipeTransportTests(unittest.TestCase):
             ["FilterPort", "SharedMemory"])
 
 
+class ScriptBlocksNameTheWritingProcessTests(unittest.TestCase):
+    """An on-access script detection names the process that wrote the file (task 180).
+
+    DispatchFileScan took the originating PID from the kernel request and discarded it, so
+    every script blocked on the on-access path was reported without its writer and could
+    not be correlated with a process-creation event. The JavaScript path is unit-tested end
+    to end (OnAccessDispatchForwardsTheWritingProcess); these pin the two reports a unit
+    test cannot reach without a malicious sample: the JavaScript alert, and the block line
+    RealTimeProtection logs for all four script scanners.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        js = strip_c_comments(read_source(ROOT / "src/PhantomCore/Scripts/JavaScriptScanner.cpp"))
+        cls.alert = extract_c_function(js, "JavaScriptScannerImpl::ReportThreatToAlertSystem")
+        cls.rtp = strip_c_comments(read_source(ROOT / "src/PhantomCore/RealTime/RealTimeProtection.cpp"))
+
+    def test_the_javascript_alert_names_a_known_process(self):
+        guard = self.alert.find("if (result.processId != 0) {")
+        self.assertNotEqual(-1, guard, "the alert no longer separates an unknown process (0)")
+        named = self.alert.find('" | PID: " + std::to_string(result.processId)')
+        self.assertGreater(named, guard, "the alert does not name the process inside the guard")
+        self.assertLess(named, self.alert.index("alerts.RaiseAlert("),
+                        "the PID is added after the alert is raised")
+
+    def test_the_block_line_names_the_writing_process(self):
+        start = self.rtp.index('"RealTimeProtection: Script scanner blocked malicious file: {} "')
+        statement = self.rtp[start:self.rtp.index(";", start)]
+        self.assertIn('"(written by PID {})"', statement)
+        self.assertIn("req.ProcessId", statement)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

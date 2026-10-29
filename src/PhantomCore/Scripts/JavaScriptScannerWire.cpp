@@ -39,10 +39,11 @@ void JavaScriptScanner_Shutdown() noexcept {
     }
 }
 
-bool JavaScriptScanner_ScanFile(const std::wstring& filePath) noexcept {
+bool JavaScriptScanner_ScanFile(const std::wstring& filePath,
+                                std::uint32_t pid) noexcept {
     try {
         const auto result = JavaScriptScanner::Instance().ScanFile(
-            std::filesystem::path{filePath});
+            std::filesystem::path{filePath}, pid);
         return result.isMalicious;
     } catch (const std::exception& e) {
         Utils::Logger::Warn("ScriptsWiring: JS ScanFile exception: {}", e.what());

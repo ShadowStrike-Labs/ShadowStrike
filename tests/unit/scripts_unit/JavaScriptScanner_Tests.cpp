@@ -22,6 +22,12 @@
 #include <nlohmann/json.hpp>
 
 #include "../../../src/PhantomCore/Scripts/JavaScriptScanner.hpp"
+#include "../../../src/PhantomCore/Scripts/ScriptsWiring.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 namespace ShadowStrike::Scripts::Test {
 namespace {
@@ -249,6 +255,82 @@ TEST_F(JavaScriptScannerTest, RepeatedInitializePreservesExistingConfiguration) 
     EXPECT_TRUE(effectiveConfig.blockObfuscatedScripts);
     ASSERT_EQ(effectiveConfig.allowedActiveX.size(), 1u);
     EXPECT_EQ(effectiveConfig.allowedActiveX.front(), "Safe.Control");
+}
+
+// ============================================================================
+// Task 180: the process that wrote a script reaches the JavaScript scanner's report.
+//
+// DispatchFileScan took the originating PID from the kernel request and discarded it, so
+// every script detected on the on-access path was reported without its writer. These
+// cases use benign scripts: the PID is stamped on every result, clean or not, so no
+// malicious sample is needed to prove the path.
+// ============================================================================
+namespace {
+
+// Content unique to each call, so a verdict can never come from another case's cache entry.
+std::filesystem::path WriteUniqueBenignScript(std::string_view tag) {
+    static std::atomic<unsigned> sequence{0};
+    const std::string stamp =
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
+        std::to_string(sequence.fetch_add(1)) + "-" + std::string(tag);
+    const auto path = std::filesystem::temp_directory_path() / ("ss-js-pid-" + stamp + ".js");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << "var greeting = 'hello from " << stamp << "';\n"
+        << "function shout(text) { return text.toUpperCase(); }\n"
+        << "var shouted = shout(greeting);\n";
+    return path;
+}
+
+}  // namespace
+
+TEST_F(JavaScriptScannerTest, AFileScanCarriesTheWritingProcess) {
+    auto& scanner = JavaScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+    const auto path = WriteUniqueBenignScript("file");
+
+    const auto result = scanner.ScanFile(path, 4242u);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    ASSERT_NE(result.status, JSScanStatus::ErrorFileAccess) << result.description;
+    EXPECT_EQ(result.processId, 4242u);
+}
+
+TEST_F(JavaScriptScannerTest, ACachedVerdictIsStampedWithTheCurrentScansProcess) {
+    // The verdict is shared by content and the process is not: a second writer of the same
+    // script must not be reported as the first.
+    auto& scanner = JavaScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+    const auto path = WriteUniqueBenignScript("cache");
+
+    const auto first = scanner.ScanFile(path, 1111u);
+    const auto hitsBefore = scanner.GetStatistics().cacheHits;
+    const auto second = scanner.ScanFile(path, 2222u);
+    const auto hitsAfter = scanner.GetStatistics().cacheHits;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    ASSERT_EQ(first.processId, 1111u);
+    ASSERT_EQ(hitsAfter, hitsBefore + 1) << "the second scan was not served from the cache, "
+                                            "so this case would prove nothing";
+    EXPECT_EQ(second.processId, 2222u)
+        << "a cached verdict named the process of the scan that filled the cache";
+}
+
+TEST_F(JavaScriptScannerTest, OnAccessDispatchForwardsTheWritingProcess) {
+    auto& scanner = JavaScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+    std::vector<uint32_t> seen;  // callbacks run synchronously, on the scanning thread
+    scanner.RegisterCallback([&seen](const JSScanResult& r) { seen.push_back(r.processId); });
+    const auto path = WriteUniqueBenignScript("dispatch");
+
+    (void)Wiring::DispatchFileScan(4242u, path.wstring());
+    scanner.UnregisterCallbacks();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+
+    ASSERT_EQ(seen.size(), 1u) << "the dispatcher did not reach the JavaScript scanner";
+    EXPECT_EQ(seen.front(), 4242u) << "the dispatcher dropped the originating process";
 }
 
 }  // namespace ShadowStrike::Scripts::Test

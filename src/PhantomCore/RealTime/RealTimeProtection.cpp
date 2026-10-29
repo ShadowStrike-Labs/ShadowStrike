@@ -3774,8 +3774,10 @@ public:
                     SS_DIAG("OnAccess", "step.DispatchFileScan(scripts)");
                     if (Scripts::Wiring::DispatchFileScan(req.ProcessId, filePath)) {
                         Utils::Logger::Warn(
-                            "RealTimeProtection: Script scanner blocked malicious file: {}",
-                            Utils::StringUtils::ToNarrow(filePath));
+                            "RealTimeProtection: Script scanner blocked malicious file: {} "
+                            "(written by PID {})",
+                            Utils::StringUtils::ToNarrow(filePath),
+                            static_cast<uint32_t>(req.ProcessId));
                         m_stats.threatsDetected++;
                         return Communication::KernelVerdict::Block;
                     }
