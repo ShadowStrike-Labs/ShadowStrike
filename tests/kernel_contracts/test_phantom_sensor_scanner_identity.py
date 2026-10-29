@@ -25840,8 +25840,8 @@ class BrowserProtectionCapabilityHonestyContractTests(unittest.TestCase):
     Nothing outside WebProtectionWiring's four lifecycle hooks calls into BrowserProtection
     at all: OnNavigate, IsURLBlocked, OnDownload and the rest of roughly forty-five public
     capability methods have no caller, so the blocklist is populated at Initialize and never
-    consulted. EnforceSafeSearchInternal sets a bool, logs "enforcement enabled" and writes
-    no policy. The module therefore inspects nothing without the host, and a start would
+    consulted. The safe-search path writes no policy and, since task 247, says so and refuses
+    the request. The module therefore inspects nothing without the host, and a start would
     report a healthy module with no function.
     """
 

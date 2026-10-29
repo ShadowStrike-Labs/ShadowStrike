@@ -393,7 +393,6 @@ void BrowserProtectionStatistics::Reset() noexcept {
     downloadsBlocked = 0;
     adsBlocked = 0;
     trackersBlocked = 0;
-    safeSearchEnforced = 0;
     cacheHits = 0;
     cacheMisses = 0;
 
@@ -419,7 +418,6 @@ std::string BrowserProtectionStatistics::ToJson() const {
         << "\"downloadsBlocked\":" << downloadsBlocked.load() << ","
         << "\"adsBlocked\":" << adsBlocked.load() << ","
         << "\"trackersBlocked\":" << trackersBlocked.load() << ","
-        << "\"safeSearchEnforced\":" << safeSearchEnforced.load() << ","
         << "\"uptimeSeconds\":" << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - statsStartTime).count()
         << "}";
     return oss.str();
@@ -475,10 +473,11 @@ public:
             }
         }
 
-        // Store safe search and parental control settings
-        m_safeSearchSettings = m_config.safeSearch;
+        // Store parental control settings; the safe-search request stays in m_config.
         m_parentalSettings = m_config.parentalControls;
-        m_safeSearchEnforced = m_config.enableSafeSearch;
+        if (m_config.enableSafeSearch) {
+            WarnSafeSearchNotEnforced(L"configuration");
+        }
 
         // Native messaging is started by the orchestrator's start step, not here. This
         // used to call StartNativeMessagingInternal and DISCARD the result, which
@@ -530,9 +529,10 @@ public:
         }
         std::unique_lock lock(m_mutex);
         m_config = config;
-        m_safeSearchSettings = config.safeSearch;
         m_parentalSettings = config.parentalControls;
-        m_safeSearchEnforced = config.enableSafeSearch;
+        if (config.enableSafeSearch) {
+            WarnSafeSearchNotEnforced(L"configuration");
+        }
         SS_LOG_INFO(LOG_CATEGORY, L"Configuration updated");
         return true;
     }
@@ -567,7 +567,6 @@ public:
         bool                       cfgEnableAds = false;
         bool                       cfgEnableTrackers = false;
         std::set<URLCategory> cfgBlockedCategories;
-        bool                       safeSearchSnap = false;
         ParentalControlSettings    parentalSnap;
         PreNavigationCallback      preNavCb;
         NavigationCallback         navCb;
@@ -581,7 +580,6 @@ public:
             cfgEnableAds            = m_config.enableAdBlocking;
             cfgEnableTrackers       = m_config.enableTrackerBlocking;
             cfgBlockedCategories    = m_config.blockedCategories;
-            safeSearchSnap          = m_safeSearchEnforced;
             parentalSnap            = m_parentalSettings;
             preNavCb                = m_preNavCallback;
             navCb                   = m_navCallback;
@@ -693,10 +691,9 @@ public:
             }
         }
 
-        // 5. Safe search enforcement
-        if (safeSearchSnap) {
-            EnforceSafeSearchOnUrl(request.url, domain);
-        }
+        // 5. Safe search: nothing is done or counted here, because this build has no
+        //    enforcement mechanism (no search-URL rewrite, no browser policy). Counting a
+        //    search-engine visit as an enforcement reported work that was not done.
 
         // 6. Phishing / malware check via SafeBrowsingAPI
         if (cfgEnablePhishing || cfgBlockMalware) {
@@ -1367,23 +1364,50 @@ public:
     // ========================================================================
     // SAFE SEARCH
     // ========================================================================
+    //
+    // THIS BUILD HAS NO SAFE-SEARCH ENFORCEMENT MECHANISM. On Windows safe search is
+    // applied by per-browser policy (ForceGoogleSafeSearch, ForceBingSafeSearch,
+    // ForceYouTubeRestrict) or by rewriting search URLs, and this module does neither.
+    // These functions used to record the request, log "enabled" and return true, and
+    // IsSafeSearchEnforced then echoed the request, so a caller was told the protection
+    // was on while nothing enforced it. A request to enforce is now refused, and the
+    // query answers with what is in effect. Writing machine-wide browser policy is an
+    // owner decision, and the installer has no uninstall step to remove it (task 322).
+
+    // Called with m_mutex held, or before the module is shared.
+    void WarnSafeSearchNotEnforced(const wchar_t* origin) const {
+        SS_LOG_WARN(LOG_CATEGORY,
+                    L"Safe search requested by %ls, but this build has no enforcement "
+                    L"mechanism: no browser policy is written and no search URL is rewritten. "
+                    L"Safe search is NOT enforced.",
+                    origin);
+    }
 
     bool EnforceSafeSearchInternal(bool enable) {
         std::unique_lock lock(m_mutex);
-        m_safeSearchEnforced = enable;
-        SS_LOG_INFO(LOG_CATEGORY, L"Safe search enforcement %ls", enable ? L"enabled" : L"disabled");
+        // The request is kept in the configuration, as parental controls keep theirs, so
+        // GetConfiguration reports what was asked and IsSafeSearchEnforced what is in effect.
+        m_config.enableSafeSearch = enable;
+        if (enable) {
+            WarnSafeSearchNotEnforced(L"EnforceSafeSearch");
+            return false;
+        }
+        SS_LOG_INFO(LOG_CATEGORY, L"Safe search request cleared; it was not enforced");
         return true;
     }
 
     bool IsSafeSearchEnforcedInternal() const noexcept {
-        std::shared_lock lock(m_mutex);
-        return m_safeSearchEnforced;
+        return false;
     }
 
     bool UpdateSafeSearchSettingsInternal(const SafeSearchSettings& settings) {
         std::unique_lock lock(m_mutex);
-        m_safeSearchSettings = settings;
-        m_safeSearchEnforced = settings.enabled;
+        m_config.safeSearch = settings;
+        m_config.enableSafeSearch = settings.enabled;
+        if (settings.enabled) {
+            WarnSafeSearchNotEnforced(L"UpdateSafeSearchSettings");
+            return false;
+        }
         return true;
     }
 
@@ -1533,7 +1557,6 @@ public:
         stats.downloadsBlocked = m_stats.downloadsBlocked.load();
         stats.adsBlocked = m_stats.adsBlocked.load();
         stats.trackersBlocked = m_stats.trackersBlocked.load();
-        stats.safeSearchEnforced = m_stats.safeSearchEnforced.load();
         stats.cacheHits = m_stats.cacheHits.load();
         stats.cacheMisses = m_stats.cacheMisses.load();
         AtomicValueStoreRelaxed(stats.startTime, AtomicValueLoadRelaxed(m_stats.startTime));
@@ -1583,20 +1606,6 @@ public:
         return snap.blockedCategories.count(cat) > 0;
     }
 
-    void EnforceSafeSearchOnUrl(const std::string& url, const std::string& domain) {
-        // Track safe search enforcement in stats
-        bool isSearchEngine = false;
-        for (const char* searchDomain : BrowserConstants::SAFE_SEARCH_DOMAINS) {
-            if (DomainEndsWith(domain, searchDomain)) {
-                isSearchEngine = true;
-                break;
-            }
-        }
-        if (isSearchEngine) {
-            m_stats.safeSearchEnforced++;
-        }
-    }
-
 private:
     mutable std::shared_mutex m_mutex;
     std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
@@ -1608,10 +1617,8 @@ private:
     std::atomic<bool> m_nativeMessagingRunning{false};
     HANDLE m_nativePipeHandle = INVALID_HANDLE_VALUE;
 
-    // Safe search and parental control state
-    SafeSearchSettings m_safeSearchSettings;
+    // Parental control state. The safe-search request lives in m_config.
     ParentalControlSettings m_parentalSettings;
-    bool m_safeSearchEnforced = false;
 
     // Callbacks
     NavigationCallback m_navCallback;

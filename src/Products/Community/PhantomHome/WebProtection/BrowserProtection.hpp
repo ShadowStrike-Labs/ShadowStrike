@@ -192,12 +192,6 @@ namespace BrowserConstants {
         "brave.exe", "opera.exe", "vivaldi.exe"
     };
 
-    /// @brief Safe search domains
-    inline constexpr const char* SAFE_SEARCH_DOMAINS[] = {
-        "google.com", "bing.com", "yahoo.com",
-        "duckduckgo.com", "yandex.com"
-    };
-
 }  // namespace BrowserConstants
 
 // ============================================================================
@@ -593,7 +587,6 @@ struct BrowserProtectionStatistics {
     std::atomic<uint64_t> downloadsBlocked{0};
     std::atomic<uint64_t> adsBlocked{0};
     std::atomic<uint64_t> trackersBlocked{0};
-    std::atomic<uint64_t> safeSearchEnforced{0};
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
     std::array<std::atomic<uint64_t>, 32> byBlockReason{};
@@ -615,7 +608,6 @@ struct BrowserProtectionStatistics {
           downloadsBlocked(o.downloadsBlocked.load(std::memory_order_relaxed)),
           adsBlocked(o.adsBlocked.load(std::memory_order_relaxed)),
           trackersBlocked(o.trackersBlocked.load(std::memory_order_relaxed)),
-          safeSearchEnforced(o.safeSearchEnforced.load(std::memory_order_relaxed)),
           cacheHits(o.cacheHits.load(std::memory_order_relaxed)),
           cacheMisses(o.cacheMisses.load(std::memory_order_relaxed)),
           startTime(std::atomic_ref<TimePoint>(const_cast<TimePoint&>(o.startTime)).load(std::memory_order_relaxed)) {
@@ -646,7 +638,6 @@ struct BrowserProtectionStatistics {
         downloadsBlocked.store(o.downloadsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
         adsBlocked.store(o.adsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
         trackersBlocked.store(o.trackersBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        safeSearchEnforced.store(o.safeSearchEnforced.load(std::memory_order_relaxed), std::memory_order_relaxed);
         cacheHits.store(o.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
         cacheMisses.store(o.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
         for (size_t i = 0; i < byBlockReason.size(); ++i) {
@@ -858,14 +849,22 @@ public:
     // ========================================================================
     // SAFE SEARCH
     // ========================================================================
+    //
+    // This build has no safe-search enforcement mechanism: it writes no browser
+    // policy and rewrites no search URL (task 247).
     
-    /// @brief Enforce safe search
+    /// @brief Request safe search enforcement.
+    /// @return false when @p enable is true, because nothing can enforce it; the
+    ///         request is kept in the configuration and logged at WARN. true when
+    ///         clearing the request, since safe search is then reported as off.
     [[nodiscard]] bool EnforceSafeSearch(bool enable);
     
-    /// @brief Is safe search enforced
+    /// @brief Whether safe search is in effect. Always false in this build.
     [[nodiscard]] bool IsSafeSearchEnforced() const noexcept;
     
-    /// @brief Update safe search settings
+    /// @brief Store safe search settings.
+    /// @return false when @p settings.enabled is set, for the same reason as
+    ///         EnforceSafeSearch; the settings are stored either way.
     [[nodiscard]] bool UpdateSafeSearchSettings(const SafeSearchSettings& settings);
 
     // ========================================================================

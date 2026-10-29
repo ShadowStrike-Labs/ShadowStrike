@@ -453,6 +453,7 @@
     <ClCompile Include="tests\unit\home_unit\DlpPiiValidation_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Privacy\DataLeakProtection.cpp" />
     <ClCompile Include="tests\unit\home_unit\BrowserHttpsPredicate_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\BrowserSafeSearchHonesty_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\BrowserProtection.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\MaliciousDownloadBlocker.cpp" />
     <ClCompile Include="tests\unit\home_unit\MiningPortAndWallet_Tests.cpp" />
