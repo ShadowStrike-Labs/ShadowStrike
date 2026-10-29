@@ -2181,9 +2181,7 @@ std::string BadUSBAttackEvent::ToJson() const {
     Utils::JSON::Json json;
     json["eventId"] = eventId;
 
-    Utils::JSON::Json deviceJson;
-    Utils::JSON::Parse(device.ToJson(), deviceJson);
-    json["device"] = deviceJson;
+    json["device"] = Utils::JSON::ParseObjectOrError(device.ToJson(), "BadUSBAttackEvent.device");
 
     json["analysisResult"] = static_cast<uint8_t>(analysisResult);
     json["analysisResultName"] = std::string(GetDeviceAnalysisResultName(analysisResult));
@@ -2191,15 +2189,11 @@ std::string BadUSBAttackEvent::ToJson() const {
     json["attackTypeName"] = std::string(GetAttackDeviceTypeName(attackType));
     json["confidence"] = static_cast<uint8_t>(confidence);
 
-    Utils::JSON::Json statsJson;
-    Utils::JSON::Parse(inputStats.ToJson(), statsJson);
-    json["inputStats"] = statsJson;
+    json["inputStats"] = Utils::JSON::ParseObjectOrError(inputStats.ToJson(), "BadUSBAttackEvent.inputStats");
 
     json["detectedPatterns"] = Utils::JSON::Json::array();
     for (const auto& pattern : detectedPatterns) {
-        Utils::JSON::Json patternJson;
-        Utils::JSON::Parse(pattern.ToJson(), patternJson);
-        json["detectedPatterns"].push_back(patternJson);
+        json["detectedPatterns"].push_back(Utils::JSON::ParseObjectOrError(pattern.ToJson(), "BadUSBAttackEvent.detectedPattern"));
     }
 
     json["responseRequested"] = static_cast<uint8_t>(responseRequested);

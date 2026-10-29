@@ -30235,5 +30235,43 @@ class ScriptBlocksNameTheWritingProcessTests(unittest.TestCase):
         self.assertIn("req.ProcessId", statement)
 
 
+class UsbSerializersEmbedSubObjectsWithoutDiscardingParseTests(unittest.TestCase):
+    """USB serializers embed sub-objects through a checked helper, not a discarded Parse (task 155).
+
+    Three USB serializers built an enclosing JSON document by calling Utils::JSON::Parse on a
+    sub-object's ToJson() string and ignoring the returned bool. On a parse failure nlohmann
+    leaves the output discarded/null, which then vanishes from the enclosing document, so a
+    malformed sub-object was dropped silently instead of recorded. The fix routes every such
+    site through Utils::JSON::ParseObjectOrError, which returns a visible
+    {"__jsonError": <context>} object on failure. This pins the migration: no discard may
+    return, and the checked helper must stay in use.
+    """
+
+    SOURCES = (
+        "src/Products/Community/PhantomHome/USB_Protection/BadUSBDetector.cpp",
+        "src/Products/Community/PhantomHome/USB_Protection/DeviceControlManager.cpp",
+        "src/Products/Community/PhantomHome/USB_Protection/USBScanner.cpp",
+    )
+
+    # Utils::JSON::Parse(<expr>.ToJson(), ...) with the bool result ignored. ParseObjectOrError
+    # does not match: after "Parse" comes "ObjectOrError(", never "(".
+    DISCARD = re.compile(r"Utils::JSON::Parse\([^;]*\.ToJson\(\)")
+
+    def test_no_serializer_discards_a_parse_of_a_tojson_result(self):
+        for rel in self.SOURCES:
+            source = strip_c_comments(read_source(ROOT / rel))
+            found = self.DISCARD.findall(source)
+            self.assertEqual(
+                [], found,
+                "%s parses a ToJson() result and discards the status: %r" % (rel, found))
+
+    def test_each_serializer_uses_the_checked_helper(self):
+        for rel in self.SOURCES:
+            source = strip_c_comments(read_source(ROOT / rel))
+            self.assertIn(
+                "Utils::JSON::ParseObjectOrError(", source,
+                "%s no longer embeds sub-objects through the checked helper" % rel)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

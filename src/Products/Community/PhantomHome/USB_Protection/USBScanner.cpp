@@ -1804,9 +1804,7 @@ std::string FileScanResultInfo::ToJson() const {
 
     json["threats"] = Utils::JSON::Json::array();
     for (const auto& threat : threats) {
-        Utils::JSON::Json tj;
-        Utils::JSON::Parse(threat.ToJson(), tj);
-        json["threats"].push_back(tj);
+        json["threats"].push_back(Utils::JSON::ParseObjectOrError(threat.ToJson(), "FileScanResultInfo.threat"));
     }
 
     return json.dump();
@@ -1849,16 +1847,12 @@ std::string USBScanResultSummary::ToJson() const {
 
     json["infectedFiles"] = Utils::JSON::Json::array();
     for (const auto& f : infectedFiles) {
-        Utils::JSON::Json fj;
-        Utils::JSON::Parse(f.ToJson(), fj);
-        json["infectedFiles"].push_back(fj);
+        json["infectedFiles"].push_back(Utils::JSON::ParseObjectOrError(f.ToJson(), "USBScanResultSummary.infectedFile"));
     }
 
     json["suspiciousFiles"] = Utils::JSON::Json::array();
     for (const auto& f : suspiciousFiles) {
-        Utils::JSON::Json fj;
-        Utils::JSON::Parse(f.ToJson(), fj);
-        json["suspiciousFiles"].push_back(fj);
+        json["suspiciousFiles"].push_back(Utils::JSON::ParseObjectOrError(f.ToJson(), "USBScanResultSummary.suspiciousFile"));
     }
 
     return json.dump();

@@ -372,6 +372,22 @@ namespace ShadowStrike {
 				}
 			}
 
+			Json ParseObjectOrError(std::string_view serialized, std::string_view context) noexcept {
+				Json parsed;
+				if (Parse(serialized, parsed)) {
+					return parsed;
+				}
+				// Parse failed: surface a visible marker instead of discarding the sub-object.
+				Json marker;
+				try {
+					marker["__jsonError"] = std::string(context);
+				}
+				catch (...) {
+					// If even the marker cannot be built, return an empty object (still non-null).
+				}
+				return marker;
+			}
+
 			// ============================================================================
 			// Stringify Functions
 			// ============================================================================

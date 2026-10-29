@@ -144,6 +144,21 @@ namespace ShadowStrike {
 			                         const ParseOptions& opt = {}) noexcept;
 
 			/**
+			 * @brief Parse a serialized JSON object, returning an error marker instead of null.
+			 *
+			 * Serializers that embed a sub-object produced by ToJson() must not silently discard a
+			 * parse failure. On failure nlohmann yields a discarded/null value that then vanishes
+			 * from the enclosing document. This helper parses @p serialized and, on failure, returns
+			 * a visible object { "__jsonError": <context> } so the failure is recorded, not dropped.
+			 *
+			 * @param serialized Serialized JSON text (typically a sub-object's ToJson() result)
+			 * @param context Caller-supplied identifier embedded in the error marker on failure
+			 * @return Parsed Json object on success; { "__jsonError": context } on failure
+			 */
+			[[nodiscard]] Json ParseObjectOrError(std::string_view serialized,
+			                                      std::string_view context) noexcept;
+
+			/**
 			 * @brief Serialize Json object to string.
 			 *
 			 * @param j Input Json object

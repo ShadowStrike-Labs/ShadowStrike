@@ -640,9 +640,7 @@ public:
             json["rules"] = Utils::JSON::Json::array();
 
             for (const auto& rule : m_rules) {
-                Utils::JSON::Json ruleJson;
-                Utils::JSON::Parse(rule.ToJson(), ruleJson);
-                json["rules"].push_back(ruleJson);
+                json["rules"].push_back(Utils::JSON::ParseObjectOrError(rule.ToJson(), "SaveRulesToFile.rule"));
             }
 
             std::wstring widePath = Utils::StringUtils::ToWide(path);
@@ -702,9 +700,7 @@ public:
             json["entries"] = Utils::JSON::Json::array();
 
             for (const auto& entry : m_auditLog) {
-                Utils::JSON::Json entryJson;
-                Utils::JSON::Parse(entry.ToJson(), entryJson);
-                json["entries"].push_back(entryJson);
+                json["entries"].push_back(Utils::JSON::ParseObjectOrError(entry.ToJson(), "ExportAuditLog.entry"));
             }
 
             std::wstring widePath = Utils::StringUtils::ToWide(path);
@@ -1663,9 +1659,7 @@ std::string DeviceRule::ToJson() const {
     json["name"] = name;
     json["description"] = description;
 
-    Utils::JSON::Json criteriaJson;
-    Utils::JSON::Parse(criteria.ToJson(), criteriaJson);
-    json["criteria"] = criteriaJson;
+    json["criteria"] = Utils::JSON::ParseObjectOrError(criteria.ToJson(), "DeviceRule.criteria");
 
     json["action"] = static_cast<uint8_t>(action);
     json["accessLevel"] = static_cast<uint8_t>(accessLevel);
@@ -1674,13 +1668,9 @@ std::string DeviceRule::ToJson() const {
     json["logAudit"] = logAudit;
     json["notifyUser"] = notifyUser;
 
-    Utils::JSON::Json timeJson;
-    Utils::JSON::Parse(timeCondition.ToJson(), timeJson);
-    json["timeCondition"] = timeJson;
+    json["timeCondition"] = Utils::JSON::ParseObjectOrError(timeCondition.ToJson(), "DeviceRule.timeCondition");
 
-    Utils::JSON::Json userJson;
-    Utils::JSON::Parse(userCondition.ToJson(), userJson);
-    json["userCondition"] = userJson;
+    json["userCondition"] = Utils::JSON::ParseObjectOrError(userCondition.ToJson(), "DeviceRule.userCondition");
 
     json["customMessage"] = customMessage;
     json["createdTime"] = createdTime.time_since_epoch().count();

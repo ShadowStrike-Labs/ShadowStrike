@@ -791,3 +791,47 @@ TEST_F(JSONUtilsTest, Stress_LargeArray) {
     ASSERT_TRUE(Stringify(j, out));
     EXPECT_GT(out.size(), 10000u);
 }
+
+// ============================================================================
+// ParseObjectOrError TESTS (embedded sub-object serialization, task 155)
+// ============================================================================
+TEST_F(JSONUtilsTest, ParseObjectOrError_ValidObject_RoundTrips) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ParseObjectOrError_ValidObject_RoundTrips] Testing...");
+    Json original;
+    original["id"] = 7;
+    original["name"] = "device";
+    original["enabled"] = true;
+
+    std::string serialized;
+    ASSERT_TRUE(Stringify(original, serialized));
+
+    Json result = ParseObjectOrError(serialized, "Test.subObject");
+    EXPECT_TRUE(result.is_object());
+    EXPECT_FALSE(result.contains("__jsonError"));
+    EXPECT_EQ(result, original);
+}
+
+TEST_F(JSONUtilsTest, ParseObjectOrError_InvalidJson_ReturnsErrorMarker) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ParseObjectOrError_InvalidJson_ReturnsErrorMarker] Testing...");
+    // Malformed object: value missing after the colon.
+    Json result = ParseObjectOrError(R"({"invalid": })", "Test.badObject");
+
+    // The failure must stay visible as an object, never a discarded/null value
+    // that would silently vanish from the enclosing document.
+    EXPECT_TRUE(result.is_object());
+    EXPECT_FALSE(result.is_null());
+    EXPECT_FALSE(result.is_discarded());
+    ASSERT_TRUE(result.contains("__jsonError"));
+    EXPECT_EQ(result["__jsonError"], "Test.badObject");
+}
+
+TEST_F(JSONUtilsTest, ParseObjectOrError_EmptyString_ReturnsMarkerNotNull) {
+    SS_LOG_INFO(L"JSONUtils_Tests", L"[ParseObjectOrError_EmptyString_ReturnsMarkerNotNull] Testing...");
+    Json result = ParseObjectOrError("", "Test.empty");
+
+    EXPECT_TRUE(result.is_object());
+    EXPECT_FALSE(result.is_null());
+    EXPECT_FALSE(result.is_discarded());
+    ASSERT_TRUE(result.contains("__jsonError"));
+    EXPECT_EQ(result["__jsonError"], "Test.empty");
+}
