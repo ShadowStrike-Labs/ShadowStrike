@@ -46,6 +46,13 @@
 
 using namespace ShadowStrike::Utils::ProcessUtils;
 
+// Declared here (external linkage, defined in ProcessUtils.cpp) so the
+// privilege-by-LUID logic that backs hasSeDebugPrivilege can be unit-tested
+// directly, without routing through a token this runner may not hold. Task 138.
+namespace ShadowStrike::Utils::ProcessUtils {
+    bool TokenHasEnabledPrivilege(const TOKEN_PRIVILEGES* privileges, LUID target) noexcept;
+}
+
 // ============================================================================
 // TEST FIXTURE
 // ============================================================================
@@ -718,6 +725,79 @@ TEST_F(ProcessUtilsTest, ElevationAndSidProjectionsStillAnswerUnderLocalOnly) {
     ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, nullptr,
                                        SecurityInfoScope::LocalOnly));
     EXPECT_EQ(IsProcessElevated(m_currentPid), sec.isElevated);
+}
+
+// ============================================================================
+// Task 138: SeDebugPrivilege is derived by LUID, not by resolving 256 display
+// names, and privilege names are resolved only for a Full query.
+// ============================================================================
+TEST_F(ProcessUtilsTest, TokenHasEnabledPrivilegeChecksLuidAndEnabledBit) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[TokenHasEnabledPrivilegeChecksLuidAndEnabledBit] Testing...");
+    // A synthetic privilege set with three entries - enabled, present-but-disabled,
+    // and present-but-only-enabled-by-default - pins BOTH the LUID match and the
+    // SE_PRIVILEGE_ENABLED check independently of whatever privileges the test
+    // runner holds. This is the environment-independent mutation guard for the
+    // logic that backs hasSeDebugPrivilege.
+    std::vector<BYTE> buf(sizeof(DWORD) + 3 * sizeof(LUID_AND_ATTRIBUTES), 0);
+    auto* tp = reinterpret_cast<TOKEN_PRIVILEGES*>(buf.data());
+    tp->PrivilegeCount = 3;
+    const LUID enabledLuid{ 0x1111, 0 };
+    const LUID disabledLuid{ 0x2222, 0 };
+    const LUID defaultOnlyLuid{ 0x3333, 0 };
+    tp->Privileges[0] = LUID_AND_ATTRIBUTES{ enabledLuid, SE_PRIVILEGE_ENABLED };
+    tp->Privileges[1] = LUID_AND_ATTRIBUTES{ disabledLuid, 0 };
+    tp->Privileges[2] = LUID_AND_ATTRIBUTES{ defaultOnlyLuid, SE_PRIVILEGE_ENABLED_BY_DEFAULT };
+
+    EXPECT_TRUE(TokenHasEnabledPrivilege(tp, enabledLuid));       // present + enabled
+    EXPECT_FALSE(TokenHasEnabledPrivilege(tp, disabledLuid));     // present, disabled
+    EXPECT_FALSE(TokenHasEnabledPrivilege(tp, defaultOnlyLuid));  // present, not ENABLED
+    const LUID absentLuid{ 0x9999, 0 };
+    EXPECT_FALSE(TokenHasEnabledPrivilege(tp, absentLuid));       // absent
+    const LUID sameLowDiffHigh{ 0x1111, 0x55 };
+    EXPECT_FALSE(TokenHasEnabledPrivilege(tp, sameLowDiffHigh));  // LowPart matches, HighPart differs
+    EXPECT_FALSE(TokenHasEnabledPrivilege(nullptr, enabledLuid)); // null-safe
+}
+
+TEST_F(ProcessUtilsTest, HasSeDebugPrivilegeReflectsTheTokenByLuid) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[HasSeDebugPrivilegeReflectsTheTokenByLuid] Testing...");
+    // GetProcessSecurityInfo must report hasSeDebugPrivilege exactly as the LUID
+    // matcher reads this process's own token - whether or not the runner holds the
+    // privilege - which guards the wiring from token to LUID to boolean.
+    HANDLE token = nullptr;
+    ASSERT_TRUE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token));
+    DWORD len = 0;
+    GetTokenInformation(token, TokenPrivileges, nullptr, 0, &len);
+    ASSERT_GT(len, 0u);
+    std::vector<BYTE> buf(len, 0);
+    ASSERT_TRUE(GetTokenInformation(token, TokenPrivileges, buf.data(), len, &len));
+    CloseHandle(token);
+
+    LUID seDebug{};
+    ASSERT_TRUE(LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &seDebug));
+    const bool expected = TokenHasEnabledPrivilege(
+        reinterpret_cast<const TOKEN_PRIVILEGES*>(buf.data()), seDebug);
+
+    ProcessSecurityInfo sec;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, nullptr,
+                                       SecurityInfoScope::LocalOnly));
+    EXPECT_EQ(expected, sec.hasSeDebugPrivilege);
+}
+
+TEST_F(ProcessUtilsTest, PrivilegeNamesAreResolvedOnlyForFullScope) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[PrivilegeNamesAreResolvedOnlyForFullScope] Testing...");
+    // Resolving each privilege's display name is a per-privilege LSASS lookup, so it
+    // is done only for a Full query. LocalOnly must leave enabledPrivileges empty
+    // while still producing the security booleans. If the Full gate around the name
+    // loop is removed, LocalOnly populates the list and this fails.
+    ProcessSecurityInfo full;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, full, nullptr, SecurityInfoScope::Full));
+    EXPECT_FALSE(full.enabledPrivileges.empty())
+        << "Full scope must resolve privilege display names";
+
+    ProcessSecurityInfo local;
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, local, nullptr, SecurityInfoScope::LocalOnly));
+    EXPECT_TRUE(local.enabledPrivileges.empty())
+        << "LocalOnly must not spend a per-privilege LSASS lookup building display names";
 }
 
 TEST_F(ProcessUtilsTest, SessionIdNeedsNoProcessHandle) {

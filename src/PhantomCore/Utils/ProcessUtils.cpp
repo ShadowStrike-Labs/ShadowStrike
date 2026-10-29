@@ -1099,6 +1099,24 @@ namespace ShadowStrike {
 // Process Security Information
 // ==========================================================
 
+// Returns true iff `privileges` contains `target` with SE_PRIVILEGE_ENABLED set.
+// Kept at external linkage (not in an anonymous namespace) and out of the public
+// header - so <windows.h> types stay out of it - so the privilege-by-LUID logic
+// that backs hasSeDebugPrivilege can be unit-tested directly; a matching
+// declaration lives in ProcessUtils_Tests.cpp. See task 138.
+bool TokenHasEnabledPrivilege(const TOKEN_PRIVILEGES* privileges, LUID target) noexcept {
+    if (privileges == nullptr) {
+        return false;
+    }
+    for (DWORD i = 0; i < privileges->PrivilegeCount; ++i) {
+        const LUID_AND_ATTRIBUTES& p = privileges->Privileges[i];
+        if (p.Luid.LowPart == target.LowPart && p.Luid.HighPart == target.HighPart) {
+            return (p.Attributes & SE_PRIVILEGE_ENABLED) != 0;
+        }
+    }
+    return false;
+}
+
 bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err,
                             SecurityInfoScope scope) noexcept {
     sec = {};
@@ -1277,28 +1295,49 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err,
                                                pv.data(), static_cast<DWORD>(pv.size()), &len)) {
             auto tp = reinterpret_cast<TOKEN_PRIVILEGES*>(pv.data());
             if (tp) {
-                try {
-                    sec.enabledPrivileges.reserve(std::min(static_cast<DWORD>(64), tp->PrivilegeCount));
-                } catch (...) {
-                    // Continue without reservation
+                // The security-relevant booleans are derived from SeDebugPrivilege's
+                // LUID, resolved once, rather than by resolving and string-comparing
+                // every privilege's display name. That removes up to 256
+                // LookupPrivilegeNameW round trips into LSASS from a function five
+                // projections call, and fixes a correctness hazard: a failed name
+                // lookup for that one privilege previously left hasSeDebugPrivilege
+                // false even when it was present and enabled, under-reporting a
+                // process's ability to open and inject into other processes. A
+                // well-known privilege's LUID is constant for the life of the system.
+                static const std::optional<LUID> seDebugLuid = []() -> std::optional<LUID> {
+                    LUID luid{};
+                    if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+                        return luid;
+                    }
+                    return std::nullopt;
+                }();
+                if (seDebugLuid && TokenHasEnabledPrivilege(tp, *seDebugLuid)) {
+                    sec.hasSeDebugPrivilege = true;
+                    sec.hasDebugPrivilege = true;
                 }
-                
-                for (DWORD i = 0; i < tp->PrivilegeCount && i < 256; i++) {
-                    WCHAR privName[256] = {};
-                    DWORD cch = static_cast<DWORD>(std::size(privName));
-                    
-                    if (LookupPrivilegeNameW(nullptr, &tp->Privileges[i].Luid, privName, &cch)) {
-                        try {
-                            sec.enabledPrivileges.emplace_back(privName);
-                        } catch (...) {
-                            // Ignore allocation failure for individual privilege
-                        }
-                        
-                        if (_wcsicmp(privName, L"SeDebugPrivilege") == 0) {
-                            const bool enabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
-                            sec.hasSeDebugPrivilege = enabled;
-                            if (enabled) {
-                                sec.hasDebugPrivilege = true;
+
+                // enabledPrivileges holds DISPLAY NAMES, one LSASS lookup each. They
+                // are read only by HasProcessPrivilege and GetProcessPrivileges, both
+                // of which query at Full scope, so resolving them under LocalOnly would
+                // spend up to 256 lookups on a thread that asked for local token facts
+                // only. The names are therefore built for a Full query only; the
+                // booleans above are produced under either scope.
+                if (scope == SecurityInfoScope::Full) {
+                    try {
+                        sec.enabledPrivileges.reserve(std::min(static_cast<DWORD>(64), tp->PrivilegeCount));
+                    } catch (...) {
+                        // Continue without reservation
+                    }
+
+                    for (DWORD i = 0; i < tp->PrivilegeCount && i < 256; i++) {
+                        WCHAR privName[256] = {};
+                        DWORD cch = static_cast<DWORD>(std::size(privName));
+
+                        if (LookupPrivilegeNameW(nullptr, &tp->Privileges[i].Luid, privName, &cch)) {
+                            try {
+                                sec.enabledPrivileges.emplace_back(privName);
+                            } catch (...) {
+                                // Ignore allocation failure for individual privilege
                             }
                         }
                     }
