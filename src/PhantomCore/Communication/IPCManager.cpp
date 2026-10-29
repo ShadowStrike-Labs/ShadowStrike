@@ -532,7 +532,6 @@ void IPCManager::Stop() {
 
     // Disconnect channels
     DisconnectFilterPort();
-    DisconnectPipe();
 
     m_status.store(IPCStatus::Stopped);
     Utils::Logger::Info("[IPCManager] Stopped");
@@ -1262,177 +1261,6 @@ bool IPCManager::QueryDriverStatus(SHADOWSTRIKE_DRIVER_STATUS& outStatus) noexce
 }
 
 // ============================================================================
-// NAMED PIPE OPERATIONS
-// ============================================================================
-
-bool IPCManager::CreatePipeServer(const std::wstring& pipeName) {
-    if (m_hPipe != nullptr) {
-        Utils::Logger::Warn("[IPCManager] Pipe server already exists");
-        return false;
-    }
-
-    // Create secure DACL for pipe
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE };
-    if (!CreateSecurePipeDacl(sa)) {
-        Utils::Logger::Warn("[IPCManager] Failed to create secure DACL, using default");
-    }
-
-    m_hPipe = CreateNamedPipeW(
-        pipeName.c_str(),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-        1,  // FIX [BUG #16]: Single instance prevents named pipe squatting attacks
-        static_cast<DWORD>(IPCConstants::MAX_MESSAGE_SIZE),
-        static_cast<DWORD>(IPCConstants::MAX_MESSAGE_SIZE),
-        0,
-        &sa
-    );
-
-    // Free security descriptor if allocated
-    if (sa.lpSecurityDescriptor != nullptr) {
-        LocalFree(sa.lpSecurityDescriptor);
-    }
-
-    if (m_hPipe == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        Utils::Logger::Error("[IPCManager] CreateNamedPipe failed: {}", error);
-        m_hPipe = nullptr;
-        return false;
-    }
-
-    Utils::Logger::Info("[IPCManager] Created pipe server: {}",
-                        Utils::StringUtils::ToNarrow(pipeName));
-    return true;
-}
-
-bool IPCManager::ConnectToPipe(const std::wstring& pipeName) {
-    // Wait for pipe to be available
-    if (!WaitNamedPipeW(pipeName.c_str(), 5000)) {
-        Utils::Logger::Error("[IPCManager] Pipe not available: {}", GetLastError());
-        return false;
-    }
-
-    m_hPipe = CreateFileW(
-        pipeName.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED,
-        nullptr
-    );
-
-    if (m_hPipe == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        Utils::Logger::Error("[IPCManager] Failed to connect to pipe: {}", error);
-        m_hPipe = nullptr;
-        return false;
-    }
-
-    // Set message mode
-    DWORD mode = PIPE_READMODE_MESSAGE;
-    if (!SetNamedPipeHandleState(m_hPipe, &mode, nullptr, nullptr)) {
-        Utils::Logger::Warn("[IPCManager] Failed to set pipe message mode: {}",
-                            GetLastError());
-    }
-
-    Utils::Logger::Info("[IPCManager] Connected to pipe: {}",
-                        Utils::StringUtils::ToNarrow(pipeName));
-    return true;
-}
-
-void IPCManager::DisconnectPipe() {
-    // FIX [BUG #18]: Atomic exchange prevents racing Send/Disconnect from
-    // double-closing the pipe handle when Stop() runs concurrently with
-    // an in-flight SendCommand path.
-    HANDLE hOld = m_hPipe.exchange(nullptr, std::memory_order_acq_rel);
-    if (hOld != nullptr) {
-        FlushFileBuffers(hOld);
-        DisconnectNamedPipe(hOld);
-        CloseHandle(hOld);
-        Utils::Logger::Info("[IPCManager] Pipe disconnected");
-    }
-}
-
-bool IPCManager::SendPipeMessage(const void* data, size_t size) {
-    if (data == nullptr || size == 0) {
-        return false;
-    }
-
-    // FIX [BUG #19]: Cap outbound pipe writes at MAX_MESSAGE_SIZE. Without
-    // this, a malformed caller could pass a multi-gigabyte buffer that the
-    // peer's receive ring buffer is not sized for, dead-locking the pipe.
-    if (size > IPCConstants::MAX_MESSAGE_SIZE) {
-        Utils::Logger::Error("[IPCManager] SendPipeMessage rejected: {} > MAX_MESSAGE_SIZE ({})",
-                             size, IPCConstants::MAX_MESSAGE_SIZE);
-        m_impl->stats.errors.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-
-    // FIX [BUG #18]: Snapshot pipe handle once so a concurrent DisconnectPipe
-    // cannot close it between the null-check and the WriteFile call.
-    HANDLE hPipe = m_hPipe.load(std::memory_order_acquire);
-    if (hPipe == nullptr) {
-        Utils::Logger::Error("[IPCManager] Cannot send - pipe not connected");
-        return false;
-    }
-
-    DWORD bytesWritten = 0;
-    OVERLAPPED overlapped = {};
-    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-
-    if (overlapped.hEvent == nullptr) {
-        return false;
-    }
-
-    BOOL result = WriteFile(
-        hPipe,
-        data,
-        static_cast<DWORD>(size),
-        &bytesWritten,
-        &overlapped
-    );
-
-    if (!result) {
-        DWORD error = GetLastError();
-        if (error == ERROR_IO_PENDING) {
-            // Wait for completion
-            DWORD waitResult = WaitForSingleObject(overlapped.hEvent, 5000);
-            if (waitResult == WAIT_OBJECT_0) {
-                GetOverlappedResult(hPipe, &overlapped, &bytesWritten, FALSE);
-            } else {
-                // FIX [BUG #8]: After CancelIoEx, MUST drain with
-                // GetOverlappedResult(bWait=TRUE) before OVERLAPPED goes out
-                // of scope. Without this, the kernel may write to freed stack.
-                CancelIoEx(hPipe, &overlapped);
-                GetOverlappedResult(hPipe, &overlapped, &bytesWritten, TRUE);
-                CloseHandle(overlapped.hEvent);
-                return false;
-            }
-        } else {
-            CloseHandle(overlapped.hEvent);
-            return false;
-        }
-    }
-
-    CloseHandle(overlapped.hEvent);
-
-    m_impl->stats.messagesSent++;
-    m_impl->stats.bytesSent += bytesWritten;
-
-    return bytesWritten == static_cast<DWORD>(size);
-}
-
-void IPCManager::SendCommand(const std::string& cmd) {
-    if (!cmd.empty()) {
-        if (!SendPipeMessage(cmd.data(), cmd.size())) {
-            Utils::Logger::Warn("[IPCManager] Failed to send command over named pipe");
-            m_impl->stats.errors++;
-        }
-    }
-}
-
-// ============================================================================
 // SHARED MEMORY OPERATIONS
 // ============================================================================
 
@@ -1981,11 +1809,6 @@ size_t IPCManager::GenericSubscriberCount() const noexcept {
     }
 }
 
-void IPCManager::SetMessageCallback(std::function<void(const std::string&)> cb) {
-    std::lock_guard lock(m_handlerMutex);
-    m_messageCallback = std::move(cb);
-}
-
 void IPCManager::UnregisterHandlers() {
     std::lock_guard lock(m_handlerMutex);
     m_fileScanHandler = nullptr;
@@ -1996,7 +1819,6 @@ void IPCManager::UnregisterHandlers() {
     m_imageLoadSubscribers = std::make_shared<const std::vector<ImageLoadSubscription>>();
     m_registrySubscribers = std::make_shared<const std::vector<RegistrySubscription>>();
     m_genericSubscribers = std::make_shared<const std::vector<GenericSubscription>>();
-    m_messageCallback = nullptr;
     Utils::Logger::Info("[IPCManager] Unregistered all handlers");
 }
 
@@ -2020,23 +1842,6 @@ ConnectionInfo IPCManager::GetConnectionInfo(ChannelType channel) const {
             }
             break;
 
-        case ChannelType::NamedPipe:
-            info.status = m_hPipe != nullptr
-                          ? ConnectionStatus::Connected
-                          : ConnectionStatus::Disconnected;
-            // Left empty deliberately. This channel has no configured endpoint:
-            // the name it used to report came from config.servicePipeName, which
-            // was a duplicate of ServiceCommConstants::SERVICE_PIPE_NAME and has
-            // been removed, and nothing in this build can open this transport
-            // anyway (CreatePipeServer has no callers). Reporting a plausible
-            // pipe name for a channel that is never opened is how a status
-            // display comes to describe a connection that does not exist - the
-            // same class of defect as the UI reporting the driver ONLINE while
-            // the kernel channel was refused. An empty endpoint alongside
-            // Disconnected is the accurate answer.
-            info.endpoint.clear();
-            break;
-
         default:
             info.status = ConnectionStatus::Disconnected;
             break;
@@ -2053,50 +1858,12 @@ ConnectionInfo IPCManager::GetConnectionInfo(ChannelType channel) const {
 
 std::vector<ConnectionInfo> IPCManager::GetAllConnections() const {
     std::vector<ConnectionInfo> connections;
-    connections.reserve(3);
+    connections.reserve(2);
 
     connections.push_back(GetConnectionInfo(ChannelType::FilterPort));
-    connections.push_back(GetConnectionInfo(ChannelType::NamedPipe));
     connections.push_back(GetConnectionInfo(ChannelType::SharedMemory));
 
     return connections;
-}
-
-void IPCManager::Reconnect(ChannelType channel) {
-    Utils::Logger::Info("[IPCManager] Reconnecting channel: {}",
-                        std::string(GetChannelTypeName(channel)));
-
-    switch (channel) {
-        case ChannelType::FilterPort:
-            DisconnectFilterPort();
-            if (ConnectFilterPort()) {
-                m_impl->stats.reconnects++;
-            }
-            break;
-
-        case ChannelType::NamedPipe:
-            // Deliberately does nothing beyond dropping any handle.
-            //
-            // This branch used to call ConnectToPipe(config.servicePipeName),
-            // which was a "reconnect" of a channel nothing ever connects in the
-            // first place: CreatePipeServer has no callers and the only caller of
-            // ConnectToPipe was this line. It also counted a reconnect in the
-            // statistics, so the numbers reported channel recoveries that never
-            // happened - a counter that reads healthy for work not done is worse
-            // than an absent one.
-            //
-            // The name it read has been removed as a duplicate of
-            // ServiceCommConstants::SERVICE_PIPE_NAME. When this transport is
-            // either wired up or removed as its own change, this branch is where
-            // a real reconnect belongs, and it must name its channel explicitly.
-            DisconnectPipe();
-            Utils::Logger::Warn("[IPCManager] Reconnect(NamedPipe): this transport has no "
-                                "connect path in this build; nothing to re-establish");
-            break;
-
-        default:
-            break;
-    }
 }
 
 // ============================================================================
@@ -3806,7 +3573,6 @@ std::string_view GetVerdictName(SHADOWSTRIKE_SCAN_VERDICT verdict) noexcept {
 std::string_view GetChannelTypeName(ChannelType type) noexcept {
     switch (type) {
         case ChannelType::FilterPort:   return "FilterPort";
-        case ChannelType::NamedPipe:    return "NamedPipe";
         case ChannelType::SharedMemory: return "SharedMemory";
         case ChannelType::LocalSocket:  return "LocalSocket";
         default:                        return "Unknown";
@@ -3824,33 +3590,6 @@ std::string_view GetConnectionStatusName(ConnectionStatus status) noexcept {
         case ConnectionStatus::Error:           return "Error";
         default:                                return "Unknown";
     }
-}
-
-bool CreateSecurePipeDacl(SECURITY_ATTRIBUTES& sa) {
-    // FIX [BUG #10 CRITICAL]: NULL DACL = Everyone full access.
-    // Build proper DACL: SYSTEM + Administrators only.
-    //
-    // SDDL string breakdown:
-    //   D:P         — DACL present, protected (no inheritance)
-    //   (A;;GA;;;SY) — Allow GENERIC_ALL to SYSTEM
-    //   (A;;GA;;;BA) — Allow GENERIC_ALL to Built-in Administrators
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)",
-            SDDL_REVISION_1,
-            &pSD,
-            nullptr)) {
-        Utils::Logger::Error("[IPCManager] ConvertStringSecurityDescriptor failed: {}",
-                             GetLastError());
-        return false;
-    }
-
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.lpSecurityDescriptor = pSD;
-    sa.bInheritHandle = FALSE;
-
-    return true;
 }
 
 bool VerifyDriverSignature(const std::wstring& driverPath) {

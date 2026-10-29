@@ -57,29 +57,27 @@
  *    - Large buffer support
  *    - Connection management
  *
- * 2. NAMED PIPES
- *    - Service-GUI communication
- *    - Secure pipe creation
- *    - Access control
- *    - Message framing
- *
- * 3. SHARED MEMORY
+ * 2. SHARED MEMORY
  *    - Zero-copy transfers
  *    - Ring buffers
  *    - Event signaling
  *    - Memory mapping
  *
- * 4. WORKER POOL
+ * 3. WORKER POOL
  *    - IOCP-based dispatch
  *    - Thread affinity
  *    - Priority management
  *    - Load balancing
  *
- * 5. MESSAGE HANDLING
+ * 4. MESSAGE HANDLING
  *    - Command dispatching
  *    - Reply management
  *    - Timeout handling
  *    - Error recovery
+ *
+ * No named pipe is served or opened here. The UI and tray pipe is served by
+ * ServiceCommunicator and the control pipe by ServiceCommunication; see the note
+ * on pipe names in IPCConstants.
  *
  * PERFORMANCE REQUIREMENTS:
  * =========================
@@ -290,7 +288,7 @@ using SystemTimePoint = std::chrono::system_clock::time_point;
  */
 enum class ChannelType : uint8_t {
     FilterPort      = 0,        ///< Kernel filter port
-    NamedPipe       = 1,        ///< Named pipe
+    // 1 is retired: it was NamedPipe, a transport this class never opened (task 95).
     SharedMemory    = 2,        ///< Shared memory
     LocalSocket     = 3         ///< Local socket
 };
@@ -649,9 +647,6 @@ struct IPCConfiguration {
     /// @brief Enable filter port
     bool enableFilterPort = true;
     
-    /// @brief Enable named pipes
-    bool enableNamedPipes = true;
-    
     /// @brief Enable shared memory
     bool enableSharedMemory = true;
     
@@ -1002,40 +997,6 @@ public:
         const SHADOWSTRIKE_PROCESS_VERDICT_REPLY& verdictReply);
 
     // ========================================================================
-    // NAMED PIPE OPERATIONS
-    // ========================================================================
-    //
-    // NOT REACHED BY ANY PRODUCTION CODE TODAY, established by measurement
-    // rather than assumed: CreatePipeServer has no callers anywhere in src,
-    // tests or Fuzzer; ConnectToPipe is called only from IPCManager::Reconnect,
-    // which itself has no callers. So this transport can neither be served nor
-    // connected, and the send/receive machinery behind m_hPipe is unreachable
-    // with it. It is left in place rather than deleted here because removing a
-    // whole transport from the class that also owns the kernel filter port
-    // deserves its own change, with its own verification, rather than riding
-    // along with a naming fix.
-    //
-    // The pipe name is now a REQUIRED argument. It previously defaulted to a
-    // duplicate of ServiceCommConstants::SERVICE_PIPE_NAME declared in this
-    // header - see the note where that literal used to be. A caller must state
-    // which channel it means.
-
-    /// @brief Create named pipe server
-    [[nodiscard]] bool CreatePipeServer(const std::wstring& pipeName);
-    
-    /// @brief Connect to pipe server
-    [[nodiscard]] bool ConnectToPipe(const std::wstring& pipeName);
-    
-    /// @brief Disconnect pipe
-    void DisconnectPipe();
-    
-    /// @brief Send through pipe
-    [[nodiscard]] bool SendPipeMessage(const void* data, size_t size);
-    
-    /// @brief Send command string
-    void SendCommand(const std::string& cmd);
-
-    // ========================================================================
     // SHARED MEMORY OPERATIONS
     // ========================================================================
     
@@ -1269,9 +1230,6 @@ public:
     /// @brief Number of live generic subscribers. Zero means no module observes kernel alerts.
     [[nodiscard]] size_t GenericSubscriberCount() const noexcept;
     
-    /// @brief Set message callback (for pipe messages)
-    void SetMessageCallback(std::function<void(const std::string&)> cb);
-    
     /// @brief Unregister all handlers
     void UnregisterHandlers();
 
@@ -1284,9 +1242,6 @@ public:
     
     /// @brief Get all connections
     [[nodiscard]] std::vector<ConnectionInfo> GetAllConnections() const;
-    
-    /// @brief Force reconnect
-    void Reconnect(ChannelType channel);
 
     // ========================================================================
     // CALLBACKS
@@ -1339,10 +1294,9 @@ private:
     
     std::unique_ptr<IPCManagerImpl> m_impl;
     
-    // Core handles (m_hPort/m_hPipe are atomic — accessed by multiple worker threads
+    // Core handles (m_hPort is atomic — accessed by multiple worker threads
     // and by Stop()/Disconnect*() concurrently)
     std::atomic<HANDLE> m_hPort{nullptr};
-    std::atomic<HANDLE> m_hPipe{nullptr};
     HANDLE m_hIOCP = nullptr;
 
     // Serializes ConnectFilterPort against itself: worker threads on a stale port
@@ -1469,7 +1423,6 @@ private:
     // Never null once constructed.
     std::shared_ptr<const std::vector<GenericSubscription>> m_genericSubscribers{
         std::make_shared<const std::vector<GenericSubscription>>() };
-    std::function<void(const std::string&)> m_messageCallback;
     mutable std::mutex m_handlerMutex;
     
     // Shared memory regions
@@ -1508,9 +1461,6 @@ private:
 [[nodiscard]] std::string_view GetVerdictName(SHADOWSTRIKE_SCAN_VERDICT verdict) noexcept;
 [[nodiscard]] std::string_view GetChannelTypeName(ChannelType type) noexcept;
 [[nodiscard]] std::string_view GetConnectionStatusName(ConnectionStatus status) noexcept;
-
-/// @brief Create secure DACL for named pipe
-[[nodiscard]] bool CreateSecurePipeDacl(SECURITY_ATTRIBUTES& sa);
 
 /// @brief Verify driver signature
 [[nodiscard]] bool VerifyDriverSignature(const std::wstring& driverPath);

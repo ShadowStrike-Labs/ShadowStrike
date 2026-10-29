@@ -30147,5 +30147,55 @@ class StartStatesTheReconnectGraceTests(unittest.TestCase):
                         self.init.index("if (!ipc.ConnectFilterPort()) {"))
 
 
+class IPCManagerHasNoNamedPipeTransportTests(unittest.TestCase):
+    """The class that owns the kernel filter port carries no named-pipe transport (task 95).
+
+    MEASURED before removal: CreatePipeServer had no caller in src, tests or Fuzzer;
+    ConnectToPipe's only caller was Reconnect, which had none; SendCommand,
+    SetMessageCallback and the enableNamedPipes switch had no caller or reader; and the
+    callback SetMessageCallback stored was never invoked. The transport could be neither
+    served nor connected, yet GetAllConnections listed it as a channel and the module
+    header advertised it as the Service-GUI channel - which is ServiceCommunicator's.
+
+    A pipe added back to this class would be a second, unreviewed endpoint in the
+    component that answers the kernel's scan requests, and would reopen the question of
+    which pipe the UI talks to that the IPCConstants note settles.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hpp = strip_c_comments(read_source(IPC_MANAGER_HPP_PATH))
+        cls.cpp = strip_c_comments(read_source(IPC_MANAGER_CPP_PATH))
+
+    def test_the_header_declares_no_pipe_api(self):
+        for name in ("CreatePipeServer", "ConnectToPipe", "DisconnectPipe",
+                     "SendPipeMessage", "CreateSecurePipeDacl", "m_hPipe",
+                     "enableNamedPipes", "SetMessageCallback", "m_messageCallback"):
+            self.assertNotIn(name, self.hpp, f"{name} is back in IPCManager.hpp")
+        self.assertIsNone(re.search(r"\bvoid\s+Reconnect\s*\(\s*ChannelType", self.hpp),
+                          "Reconnect(ChannelType) is back; it had no caller")
+
+    def test_no_pipe_is_created_or_opened(self):
+        for call in ("CreateNamedPipeW(", "ConnectNamedPipe(", "WaitNamedPipeW(",
+                     "SetNamedPipeHandleState(", "DisconnectNamedPipe("):
+            self.assertNotIn(call, self.cpp, f"IPCManager.cpp calls {call}")
+
+    def test_channel_value_one_stays_retired(self):
+        enum = re.search(r"enum class ChannelType\s*:\s*uint8_t\s*\{(.*?)\};", self.hpp, re.S)
+        self.assertIsNotNone(enum, "ChannelType is gone")
+        body = enum.group(1)
+        self.assertNotIn("NamedPipe", body)
+        self.assertIsNone(re.search(r"=\s*1\s*,", body),
+                          "value 1 was NamedPipe; reusing it would give old logs a new meaning")
+        self.assertIn("SharedMemory    = 2", body)
+        self.assertIn("LocalSocket     = 3", body)
+
+    def test_the_connection_report_lists_only_channels_this_class_owns(self):
+        body = extract_c_function(self.cpp, "IPCManager::GetAllConnections")
+        self.assertEqual(
+            re.findall(r"GetConnectionInfo\(ChannelType::(\w+)\)", body),
+            ["FilterPort", "SharedMemory"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
