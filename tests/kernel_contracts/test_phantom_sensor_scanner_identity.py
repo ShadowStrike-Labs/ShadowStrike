@@ -30315,5 +30315,30 @@ class DriverAttestationIsEnforcedUnconditionallyTests(unittest.TestCase):
             "refusal; enforcement must be unconditional (task 81)")
 
 
+class SignaturePinningHasNoUnwiredOptionsTests(unittest.TestCase):
+    """Signature-signer pinning is not carried as unread options (task 81).
+
+    SignatureValidationOptions once declared expectedSigner and expectedThumbprint 'for
+    pinning'; both were read nowhere in the tree - a declared-but-unwired control - while
+    the only real pin is the compiled-in signer key checked by
+    CryptoManager::ValidateKernelDriverAttestation. The unread options were removed. This
+    fails if either returns, so a future edit cannot reintroduce an unwired third pinning
+    mechanism beside the working one.
+    """
+
+    OPTIONS_HEADER = "src/PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
+
+    def test_validation_options_declare_no_unwired_pinning_fields(self):
+        source = strip_c_comments(read_source(ROOT / self.OPTIONS_HEADER))
+        start = source.index("struct SignatureValidationOptions")
+        body = source[start:source.index("};", start)]
+        for field in ("expectedSigner", "expectedThumbprint"):
+            self.assertNotIn(
+                field, body,
+                "%s re-declares the unwired pinning field %r; wire it to "
+                "ValidateKernelDriverAttestation or remove it (task 81)"
+                % (self.OPTIONS_HEADER, field))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -676,12 +676,6 @@ struct SignatureValidationOptions {
     /// @brief Validation flags
     SignatureValidationFlags flags = SignatureValidationFlags::Standard;
     
-    /// @brief Expected signer name (for pinning)
-    std::wstring expectedSigner;
-    
-    /// @brief Expected thumbprint (for pinning)
-    std::optional<std::array<uint8_t, 20>> expectedThumbprint;
-    
     /// @brief Minimum timestamp date
     std::optional<SystemTimePoint> minimumTimestamp;
     
