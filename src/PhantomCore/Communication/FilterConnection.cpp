@@ -1122,11 +1122,6 @@ private:
     std::atomic<bool> m_encryptionEstablished{false};
     std::atomic<uint64_t> m_nonceCounter{0};
 
-    // Driver attestation enforcement policy.
-    // true = hard-fail if driver signature/hash cannot be verified (production).
-    // false = warn-only mode for development/testing environments.
-    bool m_enforceDriverAttestation{true};
-
     //=========================================================================
     // Key Exchange
     //=========================================================================
@@ -1305,25 +1300,22 @@ private:
                 std::wstring(systemDir) + L"\\drivers\\PhantomSensor.sys";
 
             if (!crypto.ValidateKernelDriverAttestation(driverPath)) {
+                // Enforced unconditionally. A driver whose signature is invalid, or
+                // signed by a signer this build does not trust, is never trusted with
+                // the channel. There is deliberately no warn-only toggle: the pinned
+                // signer key already lets a dev-signed driver pass on a machine that
+                // does not trust the dev root, so the only thing a bypass could do is
+                // weaken attestation, which must not be possible.
                 Utils::Logger::Error("[FilterConnection] KEX: Driver attestation FAILED for {} "
                                      "- signature invalid, or signed by a signer this build "
-                                     "does not trust",
+                                     "does not trust; refusing the channel",
                                      WideToUtf8String(driverPath));
-
-                if (m_enforceDriverAttestation) {
-                    crypto.SecureZero(m_sessionKey.data(), m_sessionKey.size());
-                    m_encryptionEstablished.store(false, std::memory_order_release);
-                    Utils::Logger::Error("[FilterConnection] KEX: Connection refused - "
-                                         "driver attestation enforcement active");
-                    return false;
-                }
-                Utils::Logger::Warn("[FilterConnection] KEX: Driver attestation failed but "
-                                    "enforcement is DISABLED - SOC alert recommended");
+                crypto.SecureZero(m_sessionKey.data(), m_sessionKey.size());
+                m_encryptionEstablished.store(false, std::memory_order_release);
+                return false;
             }
-            else {
-                Utils::Logger::Info("[FilterConnection] KEX: Driver attestation passed - "
-                                    "signature verified against the pinned signer key");
-            }
+            Utils::Logger::Info("[FilterConnection] KEX: Driver attestation passed - "
+                                "signature verified against the pinned signer key");
         }
 
         // Scrub the key exchange buffer — contains salt, wrapped key, nonce,

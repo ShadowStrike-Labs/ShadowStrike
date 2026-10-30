@@ -30278,5 +30278,42 @@ class JsonSubObjectEmbedsUseCheckedParseTests(unittest.TestCase):
                 "%s no longer embeds sub-objects through the checked helper" % rel)
 
 
+class DriverAttestationIsEnforcedUnconditionallyTests(unittest.TestCase):
+    """A failed driver attestation always refuses the channel - no bypass toggle (task 81).
+
+    FilterConnection carried m_enforceDriverAttestation, hardcoded true, with a warn-only
+    else branch no configuration could reach. A toggle whose only off-state would bypass
+    driver attestation is a latent security hole: the pinned signer key already lets a
+    dev-signed driver pass on a machine that does not trust the dev root, so the only
+    effect a bypass could have is to weaken attestation. The toggle and its dead branch
+    were removed and the refusal made unconditional. These pin that: no enforcement toggle
+    remains, and the attestation-failure branch scrubs the session key and returns false
+    with no intervening condition.
+    """
+
+    SOURCE = "src/PhantomCore/Communication/FilterConnection.cpp"
+
+    def test_no_attestation_enforcement_toggle_remains(self):
+        source = strip_c_comments(read_source(ROOT / self.SOURCE))
+        self.assertNotIn(
+            "m_enforceDriverAttestation", source,
+            "the attestation-enforcement toggle is back; a failed attestation must "
+            "refuse unconditionally (task 81)")
+
+    def test_failed_attestation_scrubs_key_and_refuses_unconditionally(self):
+        source = strip_c_comments(read_source(ROOT / self.SOURCE))
+        at = source.index("if (!crypto.ValidateKernelDriverAttestation(driverPath))")
+        brace = source.index("{", at)
+        refuse = source.index("return false;", brace)
+        body = source[brace + 1:refuse]
+        self.assertIn(
+            "SecureZero(m_sessionKey", body,
+            "a failed attestation no longer scrubs the session key before refusing")
+        self.assertNotIn(
+            "if (", body,
+            "a condition was reintroduced between the failed attestation and the "
+            "refusal; enforcement must be unconditional (task 81)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
