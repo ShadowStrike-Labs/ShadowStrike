@@ -28067,6 +28067,22 @@ class DataDestructionServicingExemptionTests(unittest.TestCase):
         self.assertIn("NameInfo->Volume.Length", self.fn)
         self.assertIn("KeGetCurrentIrql() != PASSIVE_LEVEL", self.fn)
 
+    def test_windows_update_servicing_roots_are_present(self):
+        # TiWorker (Windows-signed) clears CBS state under these while servicing;
+        # without them Windows Update was denied as data destruction. Task 384
+        # logged pid 5960 TiWorker reason 0x2 deleting \Windows\servicing\Sessions
+        # and \Windows\CbsTemp. The signer gate still blocks a spoofed same-name dir.
+        m = re.search(r"kServicingRoots\[\]\s*=\s*\{(.*?)\};", self.fn, re.S)
+        self.assertIsNotNone(m, "kServicingRoots table not found")
+        roots = re.findall(r'L"([^"]+)"', m.group(1))
+        for expected in (r"\\Program Files\\WindowsApps\\",
+                         r"\\ProgramData\\USOPrivate\\",
+                         r"\\Windows\\SoftwareDistribution\\",
+                         r"\\Windows\\WinSxS\\",
+                         r"\\Windows\\servicing\\",
+                         r"\\Windows\\CbsTemp\\"):
+            self.assertIn(expected, roots)
+
     def test_exemption_applies_only_where_destruction_would_block(self):
         i = self.psi.find("PsipDetectDataDestruction(processContext)")
         self.assertNotEqual(i, -1)

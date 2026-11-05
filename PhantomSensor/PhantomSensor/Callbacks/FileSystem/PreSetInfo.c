@@ -2054,6 +2054,9 @@ PsipIsOwnArtifactDeletion(
  *     \ProgramData\USOPrivate\        Update Orchestrator state
  *     \Windows\SoftwareDistribution\  Windows Update downloads
  *     \Windows\WinSxS\                component store cleanup (TiWorker)
+ *     \Windows\servicing\             CBS servicing state; TiWorker clears
+ *                                     Sessions\*.xml during store maintenance
+ *     \Windows\CbsTemp\               CBS scratch files written by TiWorker
  *   Matched volume-relative, at the start of the path, so a directory of the
  *   same name elsewhere does not qualify.
  *
@@ -2077,6 +2080,8 @@ PsipIsWindowsServicingDeletion(
         L"\\ProgramData\\USOPrivate\\",
         L"\\Windows\\SoftwareDistribution\\",
         L"\\Windows\\WinSxS\\",
+        L"\\Windows\\servicing\\",
+        L"\\Windows\\CbsTemp\\",
     };
     UNICODE_STRING relative;
     BOOLEAN inStore = FALSE;
