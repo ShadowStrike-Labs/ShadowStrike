@@ -423,6 +423,7 @@ typedef struct _PSI_GLOBAL_STATE {
         volatile LONG64 DestructionBlocks;
         volatile LONG64 OwnArtifactDeletes;       // Deletes of files the deleter created
         volatile LONG64 ServicingDeletesAllowed;  // Over-threshold OS servicing deletes allowed
+        volatile LONG64 InstallerTransactionAllowed; // Over-threshold Windows Installer Config.Msi ops allowed
         volatile LONG64 CredentialAccessBlocks;
         volatile LONG64 SystemFileBlocks;
         volatile LONG64 ExclusionSkips;
@@ -491,6 +492,17 @@ PsipIsOwnArtifactDeletion(
 static BOOLEAN
 PsipIsWindowsServicingDeletion(
     _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    );
+
+static BOOLEAN
+PsipPathHasVolumeRootConfigMsi(
+    _In_ PCUNICODE_STRING Path
+    );
+
+static BOOLEAN
+PsipIsInstallerTransactionOperation(
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo,
+    _In_opt_ PCUNICODE_STRING NewFileName
     );
 
 static BOOLEAN
@@ -1357,16 +1369,36 @@ ShadowStrikePreSetInformation(
                         infoClass == FileRenameInformation ||
                         infoClass == FileRenameInformationEx) {
 
-                        shouldBlock = TRUE;
-                        blockReason = PSI_BEHAVIOR_MASS_RENAME | PSI_BEHAVIOR_MASS_DELETE;
-                        InterlockedIncrement64(&g_PsiState.Stats.RansomwareBlocks);
+                        //
+                        // The Windows Installer engine removes a file by moving it
+                        // into <volume>\Config.Msi\NNNNN.rbf (an extension-changing
+                        // rename) and deletes those backups on commit. At the volume
+                        // of a product uninstall that rename burst scores as
+                        // ransomware, and the engine is then denied on the .rbf, so
+                        // the product cannot be uninstalled (task 384, measured
+                        // reason 0x3). A Windows-signed caller operating on
+                        // \Config.Msi\ is the engine doing transaction bookkeeping,
+                        // not ransomware: Config.Msi holds only transient rollback
+                        // files, and a move there is not an in-place encryption
+                        // rename of user data. The process stays flagged; only this
+                        // operation is allowed. An unsigned process gets nothing.
+                        //
+                        if (PsipIsInstallerTransactionOperation(
+                                nameInfo,
+                                newFileNameAllocated ? &newFileName : NULL)) {
+                            InterlockedIncrement64(&g_PsiState.Stats.InstallerTransactionAllowed);
+                        } else {
+                            shouldBlock = TRUE;
+                            blockReason = PSI_BEHAVIOR_MASS_RENAME | PSI_BEHAVIOR_MASS_DELETE;
+                            InterlockedIncrement64(&g_PsiState.Stats.RansomwareBlocks);
 
-                        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                                   "[ShadowStrike/PreSetInfo] BLOCKED: Ransomware behavior "
-                                   "PID=%lu, File=%wZ, Score=%ld\n",
-                                   HandleToULong(requestorPid),
-                                   &nameInfo->Name,
-                                   processContext->SuspicionScore);
+                            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                                       "[ShadowStrike/PreSetInfo] BLOCKED: Ransomware behavior "
+                                       "PID=%lu, File=%wZ, Score=%ld\n",
+                                       HandleToULong(requestorPid),
+                                       &nameInfo->Name,
+                                       processContext->SuspicionScore);
+                        }
                     }
                 }
 
@@ -1395,6 +1427,17 @@ ShadowStrikePreSetInformation(
                         // so nothing else about it is trusted.
                         //
                         InterlockedIncrement64(&g_PsiState.Stats.ServicingDeletesAllowed);
+                    } else if ((infoClass == FileDispositionInformation ||
+                                infoClass == FileDispositionInformationEx) &&
+                               PsipIsInstallerTransactionOperation(nameInfo, NULL)) {
+                        //
+                        // The Windows Installer engine deleting its own rollback
+                        // backups under \Config.Msi\ on transaction commit. Same
+                        // Config.Msi + Windows-signer gate as the rename allow
+                        // above; counted, allowed, and the process stays a suspect
+                        // so its operations elsewhere are still judged (task 384).
+                        //
+                        InterlockedIncrement64(&g_PsiState.Stats.InstallerTransactionAllowed);
                     } else if (infoClass == FileDispositionInformation ||
                                infoClass == FileDispositionInformationEx) {
 
@@ -2117,6 +2160,110 @@ PsipIsWindowsServicingDeletion(
     }
 
     if (!inStore) {
+        return FALSE;
+    }
+
+    if (!NT_SUCCESS(ShadowStrikeValidateProcessSignature(PsGetCurrentProcessId(),
+                                                        &isSigned,
+                                                        &signer)) ||
+        !isSigned) {
+        return FALSE;
+    }
+
+    return (signer == ShadowSignerWindows ||
+            signer == ShadowSignerWinTcb ||
+            signer == ShadowSignerWinSystem);
+}
+
+/**
+ * @brief TRUE if Path names a Config.Msi directory at a volume root.
+ *
+ * The Windows Installer engine's transaction/rollback directory is always
+ * <volume>\Config.Msi\. Two forms reach this check: the normalized device form
+ * of a source handle (\Device\HarddiskVolumeN\Config.Msi\...) and the Win32 form
+ * a rename destination carries (\??\C:\Config.Msi\...). In both, the directory is
+ * at the volume root exactly when the character before "\Config.Msi\" ends a
+ * volume specifier - a drive colon, or the trailing digit of HarddiskVolumeN. A
+ * nested ...\x\Config.Msi\ is deliberately not matched. Case-insensitive.
+ */
+static BOOLEAN
+PsipPathHasVolumeRootConfigMsi(
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    UNICODE_STRING tag = RTL_CONSTANT_STRING(L"\\Config.Msi\\");
+    USHORT tagChars, pathChars, i;
+
+    if (Path == NULL || Path->Buffer == NULL) {
+        return FALSE;
+    }
+
+    tagChars  = (USHORT)(tag.Length / sizeof(WCHAR));
+    pathChars = (USHORT)(Path->Length / sizeof(WCHAR));
+
+    //
+    // At least one character must precede the tag (the volume specifier).
+    //
+    if (pathChars <= tagChars) {
+        return FALSE;
+    }
+
+    for (i = 1; (USHORT)(i + tagChars) <= pathChars; i++) {
+        UNICODE_STRING window;
+        window.Buffer        = &Path->Buffer[i];
+        window.Length        = tag.Length;
+        window.MaximumLength = tag.Length;
+        if (RtlEqualUnicodeString(&window, &tag, TRUE)) {
+            WCHAR prev = Path->Buffer[i - 1];
+            if (prev == L':' || (prev >= L'0' && prev <= L'9')) {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
+/**
+ * @brief TRUE for a rename/delete that is the Windows Installer engine operating
+ *        on its own transaction directory, which must not score as ransomware.
+ *
+ * Gate, both required:
+ *   Location - the source (delete target) or the rename destination is a volume
+ *              root Config.Msi path. Config.Msi holds only transient .rbf/.rbs
+ *              rollback files the engine writes during a transaction; no user data
+ *              lives there, so it is never where ransomware or a wiper operates.
+ *   Identity - the requesting process carries a Windows Code Integrity signing
+ *              level (ShadowStrikeValidateProcessSignature), i.e. msiexec/msiserver.
+ *
+ * Only an allow: the process stays counted as a suspect, and any operation it
+ * makes outside Config.Msi is judged exactly as before. An unsigned process, or a
+ * signed one that created its own Config.Msi folder elsewhere, gets nothing. Not
+ * PASSIVE_LEVEL means FALSE, as the signature query cannot run.
+ */
+static BOOLEAN
+PsipIsInstallerTransactionOperation(
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo,
+    _In_opt_ PCUNICODE_STRING NewFileName
+    )
+{
+    BOOLEAN inConfigMsi = FALSE;
+    BOOLEAN isSigned = FALSE;
+    SHADOW_SIGNER_TYPE signer = ShadowSignerNone;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;
+    }
+
+    if (NameInfo != NULL && PsipPathHasVolumeRootConfigMsi(&NameInfo->Name)) {
+        inConfigMsi = TRUE;
+    }
+    if (!inConfigMsi && NewFileName != NULL && NewFileName->Length > 0 &&
+        PsipPathHasVolumeRootConfigMsi(NewFileName)) {
+        inConfigMsi = TRUE;
+    }
+
+    if (!inConfigMsi) {
         return FALSE;
     }
 

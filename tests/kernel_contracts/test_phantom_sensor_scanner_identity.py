@@ -28095,6 +28095,79 @@ class DataDestructionServicingExemptionTests(unittest.TestCase):
             "the ransomware rule must not inherit the servicing exemption")
 
 
+class InstallerTransactionExemptionTests(unittest.TestCase):
+    """The product's own MSI uninstall is allowed past the behavioral blocks (task 384).
+
+    The Windows Installer engine removes each file by moving it to
+    <volume>\\Config.Msi\\NNNNN.rbf (an extension-changing rename) and deletes those
+    backups on commit. At uninstall volume that rename burst scores as ransomware
+    (VM-measured reason 0x3), and the engine is then denied on the .rbf, so the
+    product cannot be uninstalled. A Windows-signed caller operating on \\Config.Msi\\
+    is exempted from the ransomware AND data-destruction blocks - only there, only
+    when signed, and only as an allow (the process stays a counted suspect).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psi = read_source(ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreSetInfo.c")
+        cls.match = _psi_function(cls.psi, "PsipPathHasVolumeRootConfigMsi")
+        cls.gate = _psi_function(cls.psi, "PsipIsInstallerTransactionOperation")
+
+    def test_location_matcher_anchors_config_msi_at_a_volume_root(self):
+        self.assertTrue(self.match, "PsipPathHasVolumeRootConfigMsi body not found")
+        self.assertIn(r'L"\\Config.Msi\\"', self.match)
+        self.assertIn("RtlEqualUnicodeString", self.match)
+        # Volume-root anchored: the char before the tag must end a volume specifier
+        # (a drive colon, or the trailing digit of HarddiskVolumeN), so a nested
+        # ...\\x\\Config.Msi\\ a non-engine process could create cannot earn it.
+        self.assertIn("prev == L':'", self.match)
+        self.assertIn("prev >= L'0'", self.match)
+
+    def test_exemption_requires_a_windows_signer_checked_after_location(self):
+        self.assertTrue(self.gate, "PsipIsInstallerTransactionOperation body not found")
+        self.assertIn("KeGetCurrentIrql() != PASSIVE_LEVEL", self.gate)
+        loc = self.gate.find("if (!inConfigMsi)")
+        sig = self.gate.find("ShadowStrikeValidateProcessSignature(")
+        self.assertNotEqual(loc, -1, "the location gate is gone")
+        self.assertNotEqual(sig, -1, "a location alone must never exempt an operation")
+        self.assertLess(loc, sig, "no signature lookup unless the op is in Config.Msi")
+        tail = self.gate[sig:]
+        self.assertIn("signer == ShadowSignerWindows", tail)
+        self.assertNotIn("ShadowSignerAuthenticode", tail,
+            "any Authenticode signer would let any signed program mass-rename")
+        self.assertIn("!isSigned", tail)
+
+    def test_ransomware_block_allows_the_installer_transaction_via_the_destination(self):
+        i = self.psi.find("PsipDetectRansomwareBehavior(processContext)")
+        self.assertNotEqual(i, -1)
+        block = self.psi[i:self.psi.find("goto CompleteOperation", i)]
+        self.assertIn("PsipIsInstallerTransactionOperation(", block,
+            "the ransomware branch must exempt the installer transaction")
+        self.assertIn("newFileNameAllocated ? &newFileName : NULL", block,
+            "a rename lands in Config.Msi, so the destination must be passed through")
+        allow = block.find("InstallerTransactionAllowed")
+        blk = block.find("shouldBlock = TRUE")
+        self.assertNotEqual(allow, -1)
+        self.assertNotEqual(blk, -1)
+        self.assertLess(allow, blk, "the allow must gate the block, not trail it")
+
+    def test_data_destruction_block_allows_the_installer_transaction_after_servicing(self):
+        i = self.psi.find("PsipDetectDataDestruction(processContext)")
+        self.assertNotEqual(i, -1)
+        block = self.psi[i:self.psi.find("goto CompleteOperation", i)]
+        self.assertIn("PsipIsInstallerTransactionOperation(nameInfo, NULL)", block)
+        s = block.find("PsipIsWindowsServicingDeletion")
+        g = block.find("PsipIsInstallerTransactionOperation")
+        self.assertNotEqual(s, -1, "the servicing exemption must remain")
+        self.assertLess(s, g, "servicing stays first; the installer allow is the next else-if")
+
+    def test_the_allow_is_not_a_blanket_signer_pass(self):
+        # Dropping the Config.Msi location check would turn this into "any Windows
+        # -signed process may mass-rename anything" - exactly what must not happen.
+        self.assertIn("inConfigMsi", self.gate)
+        self.assertIn("PsipPathHasVolumeRootConfigMsi", self.gate)
+
+
 class SetInfoBlockReasonIsNamedTests(unittest.TestCase):
     """A rename/delete refusal is logged with its rule, not 'unspecified'."""
 
