@@ -439,6 +439,7 @@ public:
 
     // Kernel bridge
     [[nodiscard]] bool SyncProtectedProcessesToKernel();
+    [[nodiscard]] bool SyncProductInstallTreeToKernel();
     void OnKernelSelfProtectEventInternal(const void* data, uint32_t size);
 
 private:
@@ -644,6 +645,7 @@ std::string SelfDefense::GetVersionString() noexcept {
 }
 
 bool SelfDefense::SyncProtectedProcessesToKernel() { return m_impl->SyncProtectedProcessesToKernel(); }
+bool SelfDefense::SyncProductInstallTreeToKernel() { return m_impl->SyncProductInstallTreeToKernel(); }
 void SelfDefense::OnKernelSelfProtectEvent(const void* data, uint32_t size) { m_impl->OnKernelSelfProtectEventInternal(data, size); }
 
 // ============================================================================
@@ -958,6 +960,16 @@ bool SelfDefenseImpl::Initialize(const SelfDefenseConfiguration& config) {
                         L"Initial protected-process sync to the kernel did not confirm; the "
                         L"kernel treats our processes as unregistered until the IPC channel is "
                         L"established and the registered publisher re-pushes this list");
+        }
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: SyncProductInstallTreeToKernel...");
+        if (!SyncProductInstallTreeToKernel()) {
+            // Same cold-start ordering as above: the registered publisher
+            // re-pushes this once the filter port is up, well before any
+            // user-initiated uninstall runs.
+            SS_LOG_WARN(LOG_CATEGORY,
+                        L"Initial product install-tree registration did not confirm; the kernel "
+                        L"exempts the product's own signed uninstall only after this registration "
+                        L"is re-pushed once the IPC channel is established");
         }
         SS_LOG_INFO(LOG_CATEGORY, L"SelfDefense: RegisterKernelHandler...");
         RegisterKernelHandler();
@@ -3118,6 +3130,79 @@ bool SelfDefenseImpl::SyncProtectedProcessesToKernel() {
         return true;
     }
     SS_LOG_WARN(LOG_CATEGORY, L"Failed to sync protected processes to kernel");
+    return false;
+}
+
+bool SelfDefenseImpl::SyncProductInstallTreeToKernel() {
+    if (!Communication::IPCManager::HasInstance()) return false;
+
+    // Resolve the product's own install directory the same way FileProtection
+    // does - the directory of this service image. Two prefixes are registered,
+    // matching the two forms a kernel SetInformation rename/delete carries:
+    //   DOS form     \??\C:\...\ShadowStrike\Phantom\      (a rename destination)
+    //   device form  \Device\HarddiskVolumeN\...\Phantom\  (a normalized source name)
+    // Both end in a backslash so the driver treats them as directory prefixes.
+    wchar_t modulePath[MAX_PATH] = {};
+    DWORD n = ::GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+
+    std::wstring full(modulePath, n);
+    size_t slash = full.find_last_of(L'\\');
+    if (slash == std::wstring::npos || slash < 2) return false;
+    std::wstring installDir = full.substr(0, slash);        // e.g. C:\Program Files\ShadowStrike\Phantom
+    if (installDir.size() < 3 || installDir[1] != L':') return false;
+    if (installDir.back() != L'\\') installDir.push_back(L'\\');
+
+    std::wstring dosForm = L"\\??\\" + installDir;          // \??\C:\...\Phantom\
+
+    std::wstring deviceForm;
+    {
+        wchar_t drive[3] = { installDir[0], L':', L'\0' };
+        wchar_t devName[MAX_PATH] = {};
+        if (::QueryDosDeviceW(drive, devName, MAX_PATH) != 0) {
+            deviceForm.assign(devName);                     // \Device\HarddiskVolumeN
+            deviceForm += installDir.substr(2);             // append "\...\Phantom\", dropping "C:"
+        }
+    }
+
+    SHADOWSTRIKE_REGISTER_PROTECTED_PATH body{};
+    auto fill = [](wchar_t* dst, uint32_t& outChars, const std::wstring& s) {
+        size_t cap = SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS - 1;   // leave room for the terminator
+        size_t len = (s.size() > cap) ? 0 : s.size();          // too long -> omit this form
+        if (len > 0) { std::memcpy(dst, s.c_str(), len * sizeof(wchar_t)); }
+        dst[len] = L'\0';
+        outChars = static_cast<uint32_t>(len);
+    };
+    fill(body.DeviceForm, body.DeviceFormChars, deviceForm);
+    fill(body.DosForm, body.DosFormChars, dosForm);
+    if (body.DeviceFormChars == 0 && body.DosFormChars == 0) {
+        SS_LOG_WARN(LOG_CATEGORY, L"Could not resolve the product install tree to register with the kernel");
+        return false;
+    }
+
+    size_t totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + sizeof(body);
+    std::vector<uint8_t> message(totalSize, 0);
+    auto* header = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(message.data());
+    header->Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+    header->Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+    header->MessageType = static_cast<UINT16>(FilterMessageType_RegisterProtectedPath);
+    header->MessageId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+    header->TotalSize = static_cast<UINT32>(totalSize);
+    header->DataSize = static_cast<UINT32>(sizeof(body));
+    LARGE_INTEGER ts;
+    ::QueryPerformanceCounter(&ts);
+    header->Timestamp = static_cast<UINT64>(ts.QuadPart);
+    header->Flags = 0;
+    std::memcpy(message.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER), &body, sizeof(body));
+
+    bool sent = Communication::IPCManager::Instance().SendToKernel(message.data(), message.size());
+    if (sent) {
+        SS_LOG_INFO(LOG_CATEGORY,
+                    L"Registered product install tree with the kernel (device=%u, dos=%u chars)",
+                    body.DeviceFormChars, body.DosFormChars);
+        return true;
+    }
+    SS_LOG_WARN(LOG_CATEGORY, L"Failed to register the product install tree with the kernel");
     return false;
 }
 

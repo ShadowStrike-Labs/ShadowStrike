@@ -13530,8 +13530,8 @@ class KernelConfigPublisherContractTests(unittest.TestCase):
     def test_all_three_configuration_owners_register_a_publisher(self):
         calls = self._call_args(self.svc_cpp, "ipc.RegisterKernelConfigPublisher")
         self.assertEqual(
-            len(calls), 3,
-            "expected exactly 3 kernel configuration publishers in "
+            len(calls), 4,
+            "expected exactly 4 kernel configuration publishers in "
             "AntivirusService.cpp, found %d - a module was added or dropped"
             % len(calls))
 
@@ -13539,6 +13539,7 @@ class KernelConfigPublisherContractTests(unittest.TestCase):
             "RegistryProtection": "SyncProtectedKeysToKernel",
             "FileProtection": "SyncProtectedPathsToKernel",
             "SelfDefense": "SyncProtectedProcessesToKernel",
+            "SelfDefenseInstallTree": "SyncProductInstallTreeToKernel",
         }
         seen = {}
         for call in calls:
@@ -28126,11 +28127,11 @@ class InstallerTransactionExemptionTests(unittest.TestCase):
     def test_exemption_requires_a_windows_signer_checked_after_location(self):
         self.assertTrue(self.gate, "PsipIsInstallerTransactionOperation body not found")
         self.assertIn("KeGetCurrentIrql() != PASSIVE_LEVEL", self.gate)
-        loc = self.gate.find("if (!inConfigMsi)")
+        loc = self.gate.find("if (!inInstallerLocation)")
         sig = self.gate.find("ShadowStrikeValidateProcessSignature(")
-        self.assertNotEqual(loc, -1, "the location gate is gone")
+        self.assertNotEqual(loc, -1, "the combined location gate is gone")
         self.assertNotEqual(sig, -1, "a location alone must never exempt an operation")
-        self.assertLess(loc, sig, "no signature lookup unless the op is in Config.Msi")
+        self.assertLess(loc, sig, "no signature lookup unless the op is in an installer location")
         tail = self.gate[sig:]
         self.assertIn("signer == ShadowSignerWindows", tail)
         self.assertNotIn("ShadowSignerAuthenticode", tail,
@@ -28162,10 +28163,161 @@ class InstallerTransactionExemptionTests(unittest.TestCase):
         self.assertLess(s, g, "servicing stays first; the installer allow is the next else-if")
 
     def test_the_allow_is_not_a_blanket_signer_pass(self):
-        # Dropping the Config.Msi location check would turn this into "any Windows
-        # -signed process may mass-rename anything" - exactly what must not happen.
+        # Dropping the location check would turn this into "any Windows-signed
+        # process may mass-rename anything" - exactly what must not happen. Both
+        # locations are structural/registered gates, not a bare signed-process pass.
         self.assertIn("inConfigMsi", self.gate)
         self.assertIn("PsipPathHasVolumeRootConfigMsi", self.gate)
+        self.assertIn("inInstallTree", self.gate)
+        self.assertIn("PsipPathIsUnderProductInstallTree", self.gate)
+        self.assertIn("inInstallerLocation = (inConfigMsi || inInstallTree)", self.gate,
+            "the signer gate must sit behind the OR of the two location checks")
+
+
+class ProductInstallTreeExemptionTests(unittest.TestCase):
+    """The product's own install tree is exempted only when registered AND signed (task 384).
+
+    Fix B let the signed engine move each file to <volume>\\Config.Msi\\. But the
+    engine first renames each file IN PLACE within the install tree to a TBD*.tmp
+    (an extension-changing rename), and that burst was still scored as ransomware:
+    the VM uninstall returned 1603 on
+    ...\\ShadowStrike\\Phantom\\qml\\QtQml\\Models\\TBD3207.tmp (System Error 5).
+    The driver learns the product's own install directory from the LocalSystem
+    service at startup and exempts a Windows-signed caller operating there - only
+    there, only signed, only as an allow. Nothing else in the tree is trusted, and
+    nothing outside it is affected (a non-install-tree signed rename burst, which
+    the VM run showed still blocks 750/800, is untouched).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.psi = read_source(ROOT / "PhantomSensor/PhantomSensor/Callbacks/FileSystem/PreSetInfo.c")
+        cls.match = _psi_function(cls.psi, "PsipPathIsUnderProductInstallTree")
+        cls.setter = _psi_function(cls.psi, "ShadowStrikeRegisterProductInstallTree")
+        cls.gate = _psi_function(cls.psi, "PsipIsInstallerTransactionOperation")
+
+    def test_matcher_declines_until_the_tree_is_published(self):
+        # A lock-free reader takes the publication flag as its gate: no match
+        # against a never-written or mid-rewrite tree (fail-safe toward detection).
+        self.assertTrue(self.match, "PsipPathIsUnderProductInstallTree body not found")
+        v = self.match.find("g_ProductInstallTree.Valid == 0")
+        first_read = self.match.find("DeviceFormLength")
+        self.assertNotEqual(v, -1, "the Valid flag must gate the read")
+        self.assertNotEqual(first_read, -1)
+        self.assertLess(v, first_read, "the Valid check must precede any buffer read")
+        self.assertIn("return FALSE;", self.match[v:first_read])
+
+    def test_matcher_checks_both_registered_forms_as_case_insensitive_prefixes(self):
+        self.assertIn("g_ProductInstallTree.DeviceForm", self.match)
+        self.assertIn("g_ProductInstallTree.DosForm", self.match)
+        self.assertEqual(self.match.count("RtlPrefixUnicodeString"), 2,
+            "both the device and the DOS prefix must be prefix-tested")
+        self.assertEqual(self.match.count(", TRUE)"), 2, "both compares are case-insensitive")
+
+    def test_setter_requires_a_real_directory_prefix(self):
+        # Leading AND trailing backslash plus a length floor: a namespace root such
+        # as L"\\??\\" or L"\\Device\\" (ends in a backslash, would prefix every
+        # path) must not be accepted as an install tree.
+        self.assertTrue(self.setter, "ShadowStrikeRegisterProductInstallTree body not found")
+        self.assertIn("PSI_INSTALL_TREE_MIN_CHARS", self.setter)
+        self.assertIn("[0] == L'\\\\'", self.setter)
+        self.assertIn("- 1] == L'\\\\'", self.setter)
+        self.assertIn("return STATUS_INVALID_PARAMETER;", self.setter,
+            "with neither form valid the setter must record nothing and fail")
+
+    def test_setter_publishes_behind_a_fence(self):
+        # Drop Valid, rewrite, raise Valid - so a reader sees the whole previous
+        # value or the whole new one, never a torn prefix.
+        zero = self.setter.find("InterlockedExchange(&g_ProductInstallTree.Valid, 0)")
+        one = self.setter.find("InterlockedExchange(&g_ProductInstallTree.Valid, 1)")
+        cpy = self.setter.find("RtlCopyMemory")
+        self.assertNotEqual(zero, -1, "the flag must be dropped before the rewrite")
+        self.assertNotEqual(one, -1, "the flag must be raised after the rewrite")
+        self.assertNotEqual(cpy, -1)
+        self.assertLess(zero, cpy, "Valid must drop to 0 before the buffers are written")
+        self.assertLess(cpy, one, "Valid must rise to 1 only after the buffers are written")
+
+    def test_min_chars_floor_is_defined_and_not_tiny(self):
+        m = re.search(r"#define\s+PSI_INSTALL_TREE_MIN_CHARS\s+(\d+)", self.psi)
+        self.assertIsNotNone(m, "PSI_INSTALL_TREE_MIN_CHARS must be defined")
+        self.assertGreaterEqual(int(m.group(1)), 8,
+            "a floor this low or lower would admit a namespace-root prefix like \\??\\")
+
+    def test_gate_adds_the_install_tree_as_a_second_location(self):
+        self.assertIn("inInstallTree", self.gate)
+        self.assertEqual(self.gate.count("PsipPathIsUnderProductInstallTree("), 2,
+            "both the source handle name and the rename destination must be checked")
+        # The install-tree allow lives inside the same signer-gated function, so it
+        # inherits the Windows-signer requirement the Config.Msi allow already had.
+        loc = self.gate.find("if (!inInstallerLocation)")
+        sig = self.gate.find("ShadowStrikeValidateProcessSignature(")
+        self.assertNotEqual(loc, -1)
+        self.assertLess(loc, sig)
+
+
+class RegisterProtectedPathWiringTests(unittest.TestCase):
+    """The install-tree registration message is defined, privileged, and reachable (task 384)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.types = read_source(ROOT / "PhantomSensor/Shared/MessageTypes.h")
+        cls.shared = read_source(ROOT / "PhantomSensor/Shared/SharedDefs.h")
+        cls.mh = read_source(ROOT / "PhantomSensor/PhantomSensor/Communication/MessageHandler.c")
+        cls.comm = read_source(ROOT / "PhantomSensor/PhantomSensor/Communication/CommPort.c")
+
+    def test_type_is_appended_immediately_before_max(self):
+        # Append-only: the wire number of every existing type must not move, so the
+        # new type is the last real enumerator, right before _Max.
+        stripped = strip_c_comments(self.types)
+        enum = stripped[stripped.find("FilterMessageType_None"):stripped.find("} SHADOWSTRIKE_MESSAGE_TYPE;")]
+        names = [m.group(1) for m in re.finditer(r"FilterMessageType_(\w+)", enum)]
+        self.assertIn("RegisterProtectedPath", names)
+        self.assertEqual(names[-1], "Max", "Max must stay last")
+        self.assertEqual(names[-2], "RegisterProtectedPath",
+            "the new type must be the last real type, immediately before Max")
+
+    def test_payload_struct_is_shared_and_bounded(self):
+        self.assertIn("SHADOWSTRIKE_REGISTER_PROTECTED_PATH", self.shared)
+        self.assertIn("#define SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS", self.shared)
+        self.assertIn("DeviceForm[SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS]", self.shared)
+        self.assertIn("DosForm[SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS]", self.shared)
+
+    def test_handler_is_registered(self):
+        self.assertIn(
+            "MhRegisterHandler(FilterMessageType_RegisterProtectedPath, MhpHandleRegisterProtectedPath, NULL)",
+            self.mh, "the handler must be bound to the new type")
+
+    def test_registration_is_privileged_localsystem_only(self):
+        priv = _psi_function(self.mh, "MhpIsPrivilegedOperation")
+        self.assertIn("FilterMessageType_RegisterProtectedPath", priv,
+            "registering the install tree must require authorization (LocalSystem)")
+
+    def test_handler_clamps_caller_declared_lengths(self):
+        h = extract_c_function(self.mh, "MhpHandleRegisterProtectedPath")
+        self.assertIn("PayloadSize < sizeof(SHADOWSTRIKE_REGISTER_PROTECTED_PATH)", h)
+        self.assertEqual(h.count(">= SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS"), 2,
+            "both declared char counts must be clamped to the buffer before use")
+        self.assertIn("ShadowStrikeRegisterProductInstallTree(", h)
+
+    def test_commport_does_not_shadow_the_new_type(self):
+        # A type CommPort switches on itself never reaches the MessageHandler table
+        # (that is exactly why MhpHandleProtectedProcessRegister is dead code). The
+        # new type must fall through CommPort's default arm to our handler, so it
+        # must NOT appear as a case in ShadowStrikeMessageNotify.
+        notify = extract_c_function(self.comm, "ShadowStrikeMessageNotify")
+        self.assertNotIn("RegisterProtectedPath", notify,
+            "the new type must fall through to the MessageHandler dispatch, not be cased in CommPort")
+
+    def test_service_registers_the_install_tree_at_startup_and_republishes(self):
+        sd = read_source(ROOT / "src/PhantomCore/SelfProtection/SelfDefense.cpp")
+        self.assertIn("FilterMessageType_RegisterProtectedPath", sd)
+        self.assertIn("QueryDosDeviceW", sd,
+            "the device form (the kernel source-name match) must be resolved")
+        self.assertIn("deviceForm", sd)
+        self.assertIn("dosForm", sd)
+        av = read_source(ROOT / "src/PhantomCore/Service/AntivirusService.cpp")
+        self.assertIn("SyncProductInstallTreeToKernel", av,
+            "a kernel config publisher must re-push the registration once the filter port is up")
 
 
 class SetInfoBlockReasonIsNamedTests(unittest.TestCase):

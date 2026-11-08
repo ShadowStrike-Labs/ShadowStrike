@@ -453,6 +453,38 @@ typedef struct _PSI_GLOBAL_STATE {
 
 static PSI_GLOBAL_STATE g_PsiState = { 0 };
 
+//
+// Minimum length (WCHARs) for a registered install-tree prefix. A real device
+// or DOS install prefix is far longer than this; the floor rejects a dangerously
+// broad stub such as L"\\??\\" or L"\\Device\\" that, because it ends in a
+// backslash, would otherwise prefix-match every path on the volume. Together
+// with the leading- and trailing-backslash requirements in the setter it keeps
+// the installer-transaction exemption anchored to a real product directory and
+// never to a namespace root (task 384, detection integrity).
+//
+#define PSI_INSTALL_TREE_MIN_CHARS 16
+
+//
+// Product install-tree prefixes (task 384). Set once per boot session by the
+// product's LocalSystem service through FilterMessageType_RegisterProtectedPath,
+// read lock-free on the SetInformation path by PsipPathIsUnderProductInstallTree.
+// Valid moves 0 -> 1 only after both buffers and their lengths are fully written
+// (InterlockedExchange is a full fence), and is dropped to 0 for the brief
+// rewrite window of a re-registration, so a concurrent reader observes either the
+// complete previous value or the complete new one - never a torn prefix. A reader
+// that catches Valid == 0 declines the exemption, and the operation is then
+// judged by the ordinary behavioral rules (fail-safe toward detection).
+//
+typedef struct _PSI_PRODUCT_INSTALL_TREE {
+    volatile LONG Valid;
+    USHORT        DeviceFormLength;   // bytes, excluding the terminator
+    USHORT        DosFormLength;      // bytes, excluding the terminator
+    WCHAR         DeviceForm[SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS];
+    WCHAR         DosForm[SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS];
+} PSI_PRODUCT_INSTALL_TREE;
+
+static PSI_PRODUCT_INSTALL_TREE g_ProductInstallTree = { 0 };
+
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -497,6 +529,11 @@ PsipIsWindowsServicingDeletion(
 static BOOLEAN
 PsipPathHasVolumeRootConfigMsi(
     _In_ PCUNICODE_STRING Path
+    );
+
+static BOOLEAN
+PsipPathIsUnderProductInstallTree(
+    _In_opt_ PCUNICODE_STRING Path
     );
 
 static BOOLEAN
@@ -2176,6 +2213,63 @@ PsipIsWindowsServicingDeletion(
 }
 
 /**
+ * @brief TRUE if Path lies under the product's own registered install tree.
+ *
+ * The product's LocalSystem service registers the tree once per boot
+ * (ShadowStrikeRegisterProductInstallTree) in the two forms a SetInformation
+ * operation carries: the device form of a source handle name
+ * (\Device\HarddiskVolumeN\...\) and the Win32 form of a rename destination
+ * (\??\C:\...\), each a directory prefix ending in a backslash. A match means
+ * the operation is inside the product's own folder; combined with the
+ * Windows-signer gate in PsipIsInstallerTransactionOperation that is the
+ * product's own msiexec servicing its own files (it renames each in place to a
+ * TBD*.tmp during uninstall), not ransomware touching user data. Lock-free: a
+ * tree mid-re-registration (Valid == 0) declines here and the operation is
+ * judged by the ordinary rules. Case-insensitive, like every path compare here.
+ */
+static BOOLEAN
+PsipPathIsUnderProductInstallTree(
+    _In_opt_ PCUNICODE_STRING Path
+    )
+{
+    UNICODE_STRING prefix;
+
+    if (Path == NULL || Path->Buffer == NULL || Path->Length == 0) {
+        return FALSE;
+    }
+
+    //
+    // Read the publication flag first. The 0 -> 1 transition in the setter is an
+    // InterlockedExchange (full fence) performed only after both buffers and
+    // lengths are written, so observing Valid != 0 guarantees the fields read
+    // below are the complete, matching set.
+    //
+    if (g_ProductInstallTree.Valid == 0) {
+        return FALSE;
+    }
+
+    if (g_ProductInstallTree.DeviceFormLength > 0) {
+        prefix.Buffer        = (PWCH)g_ProductInstallTree.DeviceForm;
+        prefix.Length        = g_ProductInstallTree.DeviceFormLength;
+        prefix.MaximumLength = g_ProductInstallTree.DeviceFormLength;
+        if (RtlPrefixUnicodeString(&prefix, Path, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    if (g_ProductInstallTree.DosFormLength > 0) {
+        prefix.Buffer        = (PWCH)g_ProductInstallTree.DosForm;
+        prefix.Length        = g_ProductInstallTree.DosFormLength;
+        prefix.MaximumLength = g_ProductInstallTree.DosFormLength;
+        if (RtlPrefixUnicodeString(&prefix, Path, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
  * @brief TRUE if Path names a Config.Msi directory at a volume root.
  *
  * The Windows Installer engine's transaction/rollback directory is always
@@ -2226,20 +2320,23 @@ PsipPathHasVolumeRootConfigMsi(
 
 /**
  * @brief TRUE for a rename/delete that is the Windows Installer engine operating
- *        on its own transaction directory, which must not score as ransomware.
+ *        on its own transaction files, which must not score as ransomware.
  *
  * Gate, both required:
- *   Location - the source (delete target) or the rename destination is a volume
- *              root Config.Msi path. Config.Msi holds only transient .rbf/.rbs
- *              rollback files the engine writes during a transaction; no user data
- *              lives there, so it is never where ransomware or a wiper operates.
+ *   Location - the source (delete target) or the rename destination is either a
+ *              volume-root Config.Msi path OR inside the product's own registered
+ *              install tree. Config.Msi holds only transient .rbf/.rbs rollback
+ *              files the engine writes during a transaction; the install tree is
+ *              the product's own folder, serviced in place during uninstall
+ *              (each file renamed to a TBD*.tmp before removal). Neither is where
+ *              ransomware or a wiper operates - that is user data elsewhere.
  *   Identity - the requesting process carries a Windows Code Integrity signing
  *              level (ShadowStrikeValidateProcessSignature), i.e. msiexec/msiserver.
  *
  * Only an allow: the process stays counted as a suspect, and any operation it
- * makes outside Config.Msi is judged exactly as before. An unsigned process, or a
- * signed one that created its own Config.Msi folder elsewhere, gets nothing. Not
- * PASSIVE_LEVEL means FALSE, as the signature query cannot run.
+ * makes outside these locations is judged exactly as before. An unsigned process,
+ * or a signed one operating on user data, gets nothing. Not PASSIVE_LEVEL means
+ * FALSE, as the signature query cannot run.
  */
 static BOOLEAN
 PsipIsInstallerTransactionOperation(
@@ -2248,6 +2345,8 @@ PsipIsInstallerTransactionOperation(
     )
 {
     BOOLEAN inConfigMsi = FALSE;
+    BOOLEAN inInstallTree = FALSE;
+    BOOLEAN inInstallerLocation;
     BOOLEAN isSigned = FALSE;
     SHADOW_SIGNER_TYPE signer = ShadowSignerNone;
 
@@ -2255,6 +2354,12 @@ PsipIsInstallerTransactionOperation(
         return FALSE;
     }
 
+    //
+    // Location (1): the volume-root Config.Msi transaction directory, matched
+    // structurally and present on every machine. The source handle name carries
+    // the device form; a rename destination carries the Win32 form; the matcher
+    // recognizes Config.Msi in either.
+    //
     if (NameInfo != NULL && PsipPathHasVolumeRootConfigMsi(&NameInfo->Name)) {
         inConfigMsi = TRUE;
     }
@@ -2263,7 +2368,23 @@ PsipIsInstallerTransactionOperation(
         inConfigMsi = TRUE;
     }
 
-    if (!inConfigMsi) {
+    //
+    // Location (2): the product's own install tree, registered by the LocalSystem
+    // service at startup. During uninstall msiexec renames each file in place to
+    // a TBD*.tmp here before moving it into Config.Msi; without this that in-tree
+    // rename burst is still scored as ransomware (task 384, VM-measured 0x3).
+    // Checked in both forms against both registered prefixes.
+    //
+    if (NameInfo != NULL && PsipPathIsUnderProductInstallTree(&NameInfo->Name)) {
+        inInstallTree = TRUE;
+    }
+    if (!inInstallTree && NewFileName != NULL && NewFileName->Length > 0 &&
+        PsipPathIsUnderProductInstallTree(NewFileName)) {
+        inInstallTree = TRUE;
+    }
+
+    inInstallerLocation = (inConfigMsi || inInstallTree);
+    if (!inInstallerLocation) {
         return FALSE;
     }
 
@@ -2277,6 +2398,90 @@ PsipIsInstallerTransactionOperation(
     return (signer == ShadowSignerWindows ||
             signer == ShadowSignerWinTcb ||
             signer == ShadowSignerWinSystem);
+}
+
+//
+// Record the product's own install-tree prefix(es). Declared in PreSetInfo.h and
+// called by the MessageHandler dispatch for FilterMessageType_RegisterProtectedPath
+// (task 384). See the header for the full contract.
+//
+_Use_decl_annotations_
+NTSTATUS
+ShadowStrikeRegisterProductInstallTree(
+    PCWSTR DeviceForm,
+    USHORT DeviceFormChars,
+    PCWSTR DosForm,
+    USHORT DosFormChars
+    )
+{
+    BOOLEAN haveDevice = FALSE;
+    BOOLEAN haveDos = FALSE;
+
+    PAGED_CODE();
+
+    //
+    // A form is accepted only if it is a plausible absolute directory prefix:
+    // long enough (PSI_INSTALL_TREE_MIN_CHARS), within the fixed buffer, and
+    // bounded by a backslash at both ends. The trailing backslash makes it a
+    // directory boundary (so \Device\HarddiskVolume1\ cannot match
+    // HarddiskVolume11); the length floor rejects a namespace-root stub. A form
+    // that fails is treated as absent; if NEITHER survives, nothing is recorded
+    // and the caller is told, rather than publishing a partial or broad tree.
+    //
+    if (DeviceForm != NULL &&
+        DeviceFormChars >= PSI_INSTALL_TREE_MIN_CHARS &&
+        DeviceFormChars < SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS &&
+        DeviceForm[0] == L'\\' &&
+        DeviceForm[DeviceFormChars - 1] == L'\\') {
+        haveDevice = TRUE;
+    }
+
+    if (DosForm != NULL &&
+        DosFormChars >= PSI_INSTALL_TREE_MIN_CHARS &&
+        DosFormChars < SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS &&
+        DosForm[0] == L'\\' &&
+        DosForm[DosFormChars - 1] == L'\\') {
+        haveDos = TRUE;
+    }
+
+    if (!haveDevice && !haveDos) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Drop the publication flag, rewrite, then republish. A concurrent lock-free
+    // reader sees Valid == 0 during this window and declines the exemption
+    // (fail-safe), and otherwise a fully written, self-consistent prefix set.
+    //
+    InterlockedExchange(&g_ProductInstallTree.Valid, 0);
+
+    if (haveDevice) {
+        RtlCopyMemory(g_ProductInstallTree.DeviceForm, DeviceForm,
+                      (SIZE_T)DeviceFormChars * sizeof(WCHAR));
+        g_ProductInstallTree.DeviceForm[DeviceFormChars] = L'\0';
+        g_ProductInstallTree.DeviceFormLength = (USHORT)(DeviceFormChars * sizeof(WCHAR));
+    } else {
+        g_ProductInstallTree.DeviceFormLength = 0;
+    }
+
+    if (haveDos) {
+        RtlCopyMemory(g_ProductInstallTree.DosForm, DosForm,
+                      (SIZE_T)DosFormChars * sizeof(WCHAR));
+        g_ProductInstallTree.DosForm[DosFormChars] = L'\0';
+        g_ProductInstallTree.DosFormLength = (USHORT)(DosFormChars * sizeof(WCHAR));
+    } else {
+        g_ProductInstallTree.DosFormLength = 0;
+    }
+
+    InterlockedExchange(&g_ProductInstallTree.Valid, 1);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+               "[ShadowStrike/PreSetInfo] Product install tree registered "
+               "(device=%u chars, dos=%u chars)\n",
+               haveDevice ? DeviceFormChars : 0,
+               haveDos ? DosFormChars : 0);
+
+    return STATUS_SUCCESS;
 }
 
 static BOOLEAN

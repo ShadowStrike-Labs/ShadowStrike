@@ -88,6 +88,7 @@
 #include "TelemetryBuffer.h"
 #include "../Context/InstanceContext.h"
 #include "../Callbacks/FileSystem/PreCreate.h"
+#include "../Callbacks/FileSystem/PreSetInfo.h"
 #include "../ETW/ETWProvider.h"
 #include "../ETW/EventSchema.h"
 #include "../ETW/ManifestGenerator.h"
@@ -435,6 +436,17 @@ MhpHandleExclusionUpdate(
     _Out_ PULONG ReturnOutputBufferLength
     );
 
+static NTSTATUS
+MhpHandleRegisterProtectedPath(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    );
+
 // ============================================================================
 // PAGE ALLOCATION
 // ============================================================================
@@ -464,6 +476,7 @@ MhpHandleExclusionUpdate(
 #pragma alloc_text(PAGE, MhpHandleUpdateBehavioralRules)
 #pragma alloc_text(PAGE, MhpHandlePushNetworkIoC)
 #pragma alloc_text(PAGE, MhpHandleExclusionUpdate)
+#pragma alloc_text(PAGE, MhpHandleRegisterProtectedPath)
 #endif
 
 // ============================================================================
@@ -639,6 +652,11 @@ MhInitialize(
     }
 
     status = MhRegisterHandler(FilterMessageType_ExclusionUpdate, MhpHandleExclusionUpdate, NULL);
+    if (!NT_SUCCESS(status)) {
+        goto CleanupOnError;
+    }
+
+    status = MhRegisterHandler(FilterMessageType_RegisterProtectedPath, MhpHandleRegisterProtectedPath, NULL);
     if (!NT_SUCCESS(status)) {
         goto CleanupOnError;
     }
@@ -1035,6 +1053,7 @@ MhpIsPrivilegedOperation(
         case FilterMessageType_UpdateBehavioralRules:
         case FilterMessageType_PushNetworkIoC:
         case FilterMessageType_ExclusionUpdate:
+        case FilterMessageType_RegisterProtectedPath:
             return TRUE;
         default:
             return FALSE;
@@ -2240,6 +2259,84 @@ MhpHandleProtectedProcessRegister(
     //
     // Send reply
     //
+    if (OutputBuffer != NULL && OutputBufferSize >= sizeof(SHADOWSTRIKE_GENERIC_REPLY)) {
+        reply = (PSHADOWSTRIKE_GENERIC_REPLY)OutputBuffer;
+        reply->MessageId = Header->MessageId;
+        reply->Status = (UINT32)status;
+        reply->Reserved = 0;
+        *ReturnOutputBufferLength = sizeof(SHADOWSTRIKE_GENERIC_REPLY);
+    }
+
+    return status;
+}
+
+/**
+ * @brief Register the product's own install tree (FilterMessageType_RegisterProtectedPath).
+ *
+ * Reached through CommPort's default dispatch arm (this type is intentionally
+ * not cased there), after ShadowStrikeProcessUserMessage has decrypted the
+ * frame, copied it into kernel memory, and confirmed the caller is LocalSystem
+ * via MhpIsPrivilegedOperation + MhIsCallerAuthorized. The payload carries the
+ * two forms of the install-tree prefix; this hands them to the behavioral engine,
+ * which exempts a Windows-signed caller operating there from the mass-operation
+ * blocks so the product's own msiexec uninstall is not scored as ransomware
+ * (task 384).
+ *
+ * The caller-declared char counts are clamped to the fixed buffer before use, so
+ * a payload that lies about its lengths can only shrink - never over-read the
+ * payload or overrun the driver buffer. The engine's setter does the
+ * directory-prefix validation and either records a valid tree or fails.
+ */
+static NTSTATUS
+MhpHandleRegisterProtectedPath(
+    _In_ PSHADOWSTRIKE_CLIENT_PORT ClientContext,
+    _In_ PSS_MESSAGE_HEADER Header,
+    _In_reads_bytes_opt_(PayloadSize) PVOID PayloadBuffer,
+    _In_ ULONG PayloadSize,
+    _Out_writes_bytes_opt_(OutputBufferSize) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+    )
+{
+    PSHADOWSTRIKE_REGISTER_PROTECTED_PATH request;
+    PSHADOWSTRIKE_GENERIC_REPLY reply;
+    ULONG deviceChars;
+    ULONG dosChars;
+    NTSTATUS status;
+
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(ClientContext);
+
+    *ReturnOutputBufferLength = 0;
+
+    if (PayloadBuffer == NULL || PayloadSize < sizeof(SHADOWSTRIKE_REGISTER_PROTECTED_PATH)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    request = (PSHADOWSTRIKE_REGISTER_PROTECTED_PATH)PayloadBuffer;
+
+    //
+    // Clamp the caller-declared counts to the fixed buffer capacity, leaving room
+    // for the terminator the setter writes. A lying count can therefore only
+    // shrink - it can neither over-read this payload nor overrun the driver's
+    // install-tree buffer.
+    //
+    deviceChars = request->DeviceFormChars;
+    dosChars    = request->DosFormChars;
+    if (deviceChars >= SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS) {
+        deviceChars = SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS - 1;
+    }
+    if (dosChars >= SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS) {
+        dosChars = SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS - 1;
+    }
+
+    status = ShadowStrikeRegisterProductInstallTree(
+        (deviceChars > 0) ? request->DeviceForm : NULL,
+        (USHORT)deviceChars,
+        (dosChars > 0) ? request->DosForm : NULL,
+        (USHORT)dosChars
+        );
+
     if (OutputBuffer != NULL && OutputBufferSize >= sizeof(SHADOWSTRIKE_GENERIC_REPLY)) {
         reply = (PSHADOWSTRIKE_GENERIC_REPLY)OutputBuffer;
         reply->MessageId = Header->MessageId;

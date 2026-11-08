@@ -206,6 +206,14 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     //
     FilterMessageType_RegistryBehavioralAlert, // Registry behaviour score (persistence spray, defense evasion)
 
+    //
+    // Appended here deliberately (see the append-only note above): the product's
+    // LocalSystem service registering its own install tree so the driver can
+    // exempt the product's signed msiexec uninstall from the mass-operation
+    // blocks (task 384). User-to-kernel, privileged (LocalSystem only).
+    //
+    FilterMessageType_RegisterProtectedPath,   // Register the product install-tree prefix(es)
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 
@@ -346,13 +354,14 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
      (type) == FilterMessageType_EnableFiltering || \
      (type) == FilterMessageType_DisableFiltering || \
      (type) == FilterMessageType_RegisterProtectedProcess || \
+     (type) == FilterMessageType_RegisterProtectedPath || \
      (type) == FilterMessageType_ExclusionQuery)
 
 /**
  * @brief Kernel -> user, unsolicited.
  *
  * Says NOTHING about replies - see the note above. Complete as of
- * FilterMessageType_Max == 46.
+ * FilterMessageType_Max == 47.
  */
 #define SHADOWSTRIKE_IS_NOTIFICATION_MESSAGE(type) \
     ((type) == FilterMessageType_ProcessNotify || \

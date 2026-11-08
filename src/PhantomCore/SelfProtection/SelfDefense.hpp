@@ -1640,6 +1640,17 @@ public:
      *         could not be attempted.
      */
     [[nodiscard]] bool SyncProtectedProcessesToKernel();
+
+    /**
+     * @brief Register the product's own install tree with the kernel driver.
+     * @note Lets the driver exempt the product's Windows-signed msiexec uninstall
+     *       from the mass-rename/mass-delete behavioral blocks (task 384). Sent at
+     *       startup and re-pushed by the kernel config publisher once the filter
+     *       port is up, so the registration is present well before any uninstall.
+     * @return true if the kernel accepted the registration; false if it was
+     *         refused or the install directory could not be resolved.
+     */
+    [[nodiscard]] bool SyncProductInstallTreeToKernel();
     
     /**
      * @brief Handle incoming kernel self-protection alert

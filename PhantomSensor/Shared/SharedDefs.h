@@ -673,6 +673,31 @@ typedef struct _SHADOWSTRIKE_GENERIC_REPLY {
 } SHADOWSTRIKE_GENERIC_REPLY, *PSHADOWSTRIKE_GENERIC_REPLY;
 
 // ============================================================================
+// PRODUCT INSTALL-TREE REGISTRATION (FilterMessageType_RegisterProtectedPath)
+// ============================================================================
+//
+// The LocalSystem service tells the driver, once per boot session, where the
+// product itself is installed - in the two path forms a SetInformation rename
+// or delete carries: the normalized DEVICE form the filter manager puts in
+// FltGetFileNameInformation (\Device\HarddiskVolumeN\...\ShadowStrike\Phantom\),
+// and the Win32 DOS form a rename destination carries
+// (\??\C:\...\ShadowStrike\Phantom\). The driver stores both and exempts ONLY a
+// Windows-signed caller operating inside that tree from the mass-rename /
+// mass-delete blocks, so the product's own msiexec uninstall is not scored as
+// ransomware (task 384). Each form is a directory prefix: it begins and ends
+// with a backslash. A char count of 0 means that form is absent; at least one
+// must be present. The counts exclude the NUL terminator.
+//
+#define SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS 320
+
+typedef struct _SHADOWSTRIKE_REGISTER_PROTECTED_PATH {
+    UINT32 DeviceFormChars;
+    UINT32 DosFormChars;
+    WCHAR  DeviceForm[SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS];
+    WCHAR  DosForm[SHADOWSTRIKE_INSTALL_TREE_MAX_CHARS];
+} SHADOWSTRIKE_REGISTER_PROTECTED_PATH, *PSHADOWSTRIKE_REGISTER_PROTECTED_PATH;
+
+// ============================================================================
 // PROCESS VERDICT REPLY
 // ============================================================================
 

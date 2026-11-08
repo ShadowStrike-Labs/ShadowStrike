@@ -132,6 +132,7 @@ enum class MessageType : uint16_t {
     ThreatScoreNotify        = FilterMessageType_ThreatScoreNotify,
     FileOperationEvent       = FilterMessageType_FileOperationEvent,
     RegistryBehavioralAlert  = FilterMessageType_RegistryBehavioralAlert,
+    RegisterProtectedPath    = FilterMessageType_RegisterProtectedPath,
 
     Max                      = FilterMessageType_Max
 };
@@ -140,7 +141,7 @@ enum class MessageType : uint16_t {
 // an enumerator missing from this mirror still can - that is exactly how
 // KeyExchange and FileOperationEvent went absent. This fails the build when the
 // kernel enum grows, so whoever appends a type is forced to visit this list.
-static_assert(static_cast<uint16_t>(MessageType::Max) == 46,
+static_assert(static_cast<uint16_t>(MessageType::Max) == 47,
               "Kernel message enum grew: add the new type to Communication::MessageType, "
               "then bump this count in the same change.");
 static_assert(sizeof(MessageType) == sizeof(uint16_t),

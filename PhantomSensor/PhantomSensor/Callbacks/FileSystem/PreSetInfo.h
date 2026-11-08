@@ -298,6 +298,50 @@ ShadowStrikeRemovePreSetInfoProcessContext(
     _In_ HANDLE ProcessId
     );
 
+// ============================================================================
+// PRODUCT INSTALL-TREE REGISTRATION (task 384)
+// ============================================================================
+
+/**
+ * @brief Record the product's own install-tree prefix(es) for the Windows
+ *        Installer transaction exemption.
+ *
+ * The product's LocalSystem service calls this once per boot session (via
+ * FilterMessageType_RegisterProtectedPath). A Windows-signed caller renaming or
+ * deleting INSIDE this tree is then exempted from the mass-rename / mass-delete
+ * behavioral blocks, so the product's own msiexec uninstall - which renames each
+ * file in place to a TBD*.tmp and moves it to \Config.Msi\ - is not scored as
+ * ransomware (task 384, VM-measured reason 0x3). The value is held in the driver
+ * so it survives the service being stopped during RemoveFiles. Everything
+ * outside the tree, and every non-Windows-signed caller inside it, is judged
+ * exactly as before: this is only an allow, never a suppression of counting.
+ *
+ * Each prefix must be an absolute directory prefix: it begins and ends with a
+ * backslash. Pass 0 chars for a form that is absent; at least one must be
+ * present and valid or the call records nothing and fails.
+ *
+ * @param DeviceForm       Device-form prefix (\Device\HarddiskVolumeN\...\), or NULL.
+ * @param DeviceFormChars  WCHARs in DeviceForm excluding the terminator (0 if absent).
+ * @param DosForm          Win32-form prefix (\??\C:\...\), or NULL.
+ * @param DosFormChars     WCHARs in DosForm excluding the terminator (0 if absent).
+ *
+ * @return STATUS_SUCCESS when at least one valid prefix was recorded.
+ * @return STATUS_INVALID_PARAMETER if neither form is a valid directory prefix.
+ *
+ * @irql PASSIVE_LEVEL
+ * @threadsafety Thread-safe. A lock-free reader on the file path observes either
+ *               the previous value or the new one, never a torn buffer.
+ */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+ShadowStrikeRegisterProductInstallTree(
+    _In_reads_opt_(DeviceFormChars) PCWSTR DeviceForm,
+    _In_ USHORT DeviceFormChars,
+    _In_reads_opt_(DosFormChars) PCWSTR DosForm,
+    _In_ USHORT DosFormChars
+    );
+
 #ifdef __cplusplus
 }
 #endif

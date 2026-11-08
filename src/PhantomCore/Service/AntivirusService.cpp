@@ -672,6 +672,14 @@ public:
                     }
                     return false;
                 });
+
+                ipc.RegisterKernelConfigPublisher("SelfDefenseInstallTree", [] {
+                    if (Security::SelfDefense::HasInstance() &&
+                        Security::SelfDefense::Instance().IsInitialized()) {
+                        return Security::SelfDefense::Instance().SyncProductInstallTreeToKernel();
+                    }
+                    return false;
+                });
             }
             ::ShadowStrikeAppendBootTrace(L"impl-Initialize-IPCManager-leave");
 
