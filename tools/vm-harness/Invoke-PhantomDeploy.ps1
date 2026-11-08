@@ -870,12 +870,31 @@ driver build fails inf2cat with an error that names nothing useful:
         # one day earlier passes either way. Exactly one combination fails and it
         # is the one an overnight deploy occupies.
         & $inf2cat /driver:"$driverOutDir" /os:10_X64 /uselocaltime 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) {
-            Die ("Inf2Cat failed (exit {0}) for {1}. The catalog no longer covers the signed driver, so this package must not ship. Read the signability errors printed above: 22.9.7 (postdated DriverVer) means the stamp and Inf2Cat disagree about the time basis, which is NOT an incremental-build problem." -f `
-                $LASTEXITCODE, $driverOutDir)
+        #
+        # One hazard beyond the time basis above: the host's real-time AV races
+        # Inf2Cat on the freshly written catalog. A scanner (Defender, Kaspersky)
+        # that opens the new .cat mid-generation makes Inf2Cat report a CLEAN INF
+        # (Errors: None, Warnings: None) yet fail with "Unable to retrieve the
+        # subject GUID" and leave a 0-byte catalog. Measured 2026-11-08: a 1.0.129
+        # deploy failed this way while the identical staged inputs passed on an
+        # immediate manual retry. A bounded retry that clears the stub between
+        # attempts turns that race into a non-event; a genuine INF/DriverVer fault
+        # (e.g. the postdated-DriverVer case above) fails every attempt and still
+        # Dies below.
+        $inf2catExit = $LASTEXITCODE
+        $catOk = ($inf2catExit -eq 0 -and (Test-Path $catSrc) -and (Get-Item $catSrc).Length -gt 0)
+        for ($attempt = 2; $attempt -le 4 -and -not $catOk; $attempt++) {
+            $sz = if (Test-Path $catSrc) { (Get-Item $catSrc).Length } else { 'absent' }
+            Log ("Inf2Cat attempt {0} produced no catalog (exit {1}, size {2}); clearing the stub and retrying after an AV-scan pause..." -f ($attempt - 1), $inf2catExit, $sz)
+            Remove-Item $catSrc -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            & $inf2cat /driver:"$driverOutDir" /os:10_X64 /uselocaltime 2>&1 | Out-Host
+            $inf2catExit = $LASTEXITCODE
+            $catOk = ($inf2catExit -eq 0 -and (Test-Path $catSrc) -and (Get-Item $catSrc).Length -gt 0)
         }
-        if (-not (Test-Path $catSrc)) {
-            Die ("Inf2Cat reported success but {0} is absent. Check the CatalogFile directive in PhantomSensor.inf matches this filename." -f $catSrc)
+        if (-not $catOk) {
+            Die ("Inf2Cat failed to produce a non-empty catalog (exit {0}) for {1} after 4 attempts. The catalog no longer covers the signed driver, so this package must not ship. Read the signability errors printed above: an empty Errors list with a 0-byte .cat is the real-time-AV race on the output catalog; '22.9.7 (postdated DriverVer)' instead means the StampInf local date and Inf2Cat's UTC check disagree, which no retry fixes." -f `
+                $inf2catExit, $driverOutDir)
         }
 
         # 3. Sign the regenerated catalog.
