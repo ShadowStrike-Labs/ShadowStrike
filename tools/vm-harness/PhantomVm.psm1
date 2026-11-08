@@ -194,7 +194,9 @@ function Invoke-PhantomGuestScript {
 `$ErrorActionPreference = 'Continue'
 `$ProgressPreference = 'SilentlyContinue'
 `$global:LASTEXITCODE = 0
-try { & { $Script } } catch { `$_ | Out-String | Write-Output; exit 1 }
+try { & {
+$Script
+} } catch { `$_ | Out-String | Write-Output; exit 1 }
 exit [int]`$global:LASTEXITCODE
 "@
     # The script travels as a FILE. An -EncodedCommand line is UTF-16 Base64,
