@@ -25,6 +25,7 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
+#include "../Utils/DataStorePaths.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -1316,26 +1317,33 @@ bool ProgramUpdater::Initialize(const ProgramUpdaterConfiguration& config)
     }
     m_impl->m_installDirectory = fs::path(exePath).parent_path();
 
-    // Resolve staging directory.
+    // Resolve staging directory. The fallback lives under %ProgramData%\ShadowStrike,
+    // NOT the install tree: a directory created in Program Files at runtime
+    // survives uninstall and blocks the install folder from being pruned (task 322).
     if (config.stagingDirectory.empty()) {
         m_impl->m_stagingDir =
-            m_impl->m_installDirectory / ProgUpdateConstants::STAGING_DIR;
+            fs::path(ShadowStrike::Utils::DataStorePaths::GetBaseDirectory()) /
+            ProgUpdateConstants::STAGING_DIR;
     } else {
         m_impl->m_stagingDir = config.stagingDirectory;
     }
 
-    // Resolve backup directory.
+    // Resolve backup directory (same rule as staging).
     if (config.backupDirectory.empty()) {
         m_impl->m_backupDir =
-            m_impl->m_installDirectory / ProgUpdateConstants::BACKUP_DIR;
+            fs::path(ShadowStrike::Utils::DataStorePaths::GetBaseDirectory()) /
+            ProgUpdateConstants::BACKUP_DIR;
     } else {
         m_impl->m_backupDir = config.backupDirectory;
     }
 
-    // Create directories.
-    if (!FU::CreateDirectories(m_impl->m_stagingDir.wstring())) {
+    // Create and harden the directories. Both hold update binaries; under
+    // %ProgramData% the default ACL would let a non-administrator plant a staged
+    // package or a backup image, so each is locked to SYSTEM/Administrators-write.
+    if (!ShadowStrike::Utils::DataStorePaths::EnsureHardenedDirectory(
+            m_impl->m_stagingDir.wstring())) {
         SS_LOG_ERROR(kLogCategory,
-            L"Failed to create staging directory: %ls",
+            L"Failed to create or harden staging directory: %ls",
             m_impl->m_stagingDir.wstring().c_str());
         m_impl->m_status = ProgUpdaterStatus::Error;
         m_impl->NotifyError("Failed to create staging directory",
@@ -1343,9 +1351,10 @@ bool ProgramUpdater::Initialize(const ProgramUpdaterConfiguration& config)
         return false;
     }
 
-    if (!FU::CreateDirectories(m_impl->m_backupDir.wstring())) {
+    if (!ShadowStrike::Utils::DataStorePaths::EnsureHardenedDirectory(
+            m_impl->m_backupDir.wstring())) {
         SS_LOG_ERROR(kLogCategory,
-            L"Failed to create backup directory: %ls",
+            L"Failed to create or harden backup directory: %ls",
             m_impl->m_backupDir.wstring().c_str());
         m_impl->m_status = ProgUpdaterStatus::Error;
         m_impl->NotifyError("Failed to create backup directory",

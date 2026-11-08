@@ -169,10 +169,50 @@ bool                  g_hardened = false;
     return false;
 }
 
+/// @brief Create every directory level of an absolute path, tolerating existing
+///        ones. Skips the drive root (e.g. "C:\"). Returns false on first real
+///        failure.
+[[nodiscard]] bool CreateDirectoryChain(const std::wstring& path) noexcept {
+    for (size_t i = 0; i < path.size(); ++i) {
+        // Create each ancestor as its separator is reached. i > 2 skips the
+        // "C:\" root separator, which always exists and cannot be created.
+        if (path[i] == L'\\' && i > 2) {
+            if (!CreateLevel(path.substr(0, i))) {
+                return false;
+            }
+        }
+    }
+    return CreateLevel(path);
+}
+
 }  // namespace
 
+std::wstring GetBaseDirectory() {
+    return ProgramDataRoot() + L"\\ShadowStrike";
+}
+
 std::wstring GetDataDirectory() {
-    return ProgramDataRoot() + L"\\ShadowStrike\\Data";
+    return GetBaseDirectory() + L"\\Data";
+}
+
+bool EnsureHardenedDirectory(const std::wstring& directory) noexcept {
+    if (directory.empty()) {
+        return false;
+    }
+    if (!CreateDirectoryChain(directory)) {
+        SS_LOG_ERROR(kLogCat,
+            L"Could not create the runtime directory '%ls'", directory.c_str());
+        return false;
+    }
+    if (!ApplyRestrictiveAcl(directory)) {
+        // Created but not hardened: report failure so the caller does not treat a
+        // user-writable backup/snapshot/staging directory as trustworthy.
+        SS_LOG_WARN(kLogCat,
+            L"Runtime directory '%ls' exists but could NOT be hardened; a non-"
+            L"administrator may be able to tamper with its contents", directory.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool EnsureDataDirectory() noexcept {

@@ -20,6 +20,7 @@
 #include "RollbackManager.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#include "../Utils/DataStorePaths.hpp"
 #include "../Utils/Logger.hpp"
 
 #include <WinSock2.h>
@@ -1150,25 +1151,25 @@ bool RollbackManager::Initialize(const RollbackManagerConfiguration& config) {
 
     // Resolve snapshot base directory.
     if (config.snapshotDirectory.empty()) {
-        // Default: relative to the executable.
-        std::error_code ec;
-        auto exePath = fs::path(ShadowStrike::Utils::SystemUtils::GetExecutablePath());
-        if (exePath.empty()) {
-            wchar_t buf[MAX_PATH]{};
-            ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
-            exePath = fs::path(buf);
-        }
-        m_impl->m_snapshotBaseDir = exePath.parent_path() /
-                                     RollbackConstants::SNAPSHOT_DIR;
+        // Default: under %ProgramData%\ShadowStrike, NOT the install tree. Update
+        // rollback snapshots are mutable runtime data; a snapshot directory
+        // created in Program Files survives uninstall and blocks the install
+        // folder from being pruned (task 322).
+        m_impl->m_snapshotBaseDir =
+            fs::path(ShadowStrike::Utils::DataStorePaths::GetBaseDirectory()) /
+            RollbackConstants::SNAPSHOT_DIR;
     }
     else {
         m_impl->m_snapshotBaseDir = config.snapshotDirectory;
     }
 
-    // Create base snapshot directory.
-    if (!FU::CreateDirectories(m_impl->m_snapshotBaseDir.wstring())) {
+    // Create and harden the base snapshot directory. Hardening matters under
+    // %ProgramData%, whose default ACL would otherwise let a non-administrator
+    // plant a rollback image into the snapshot store.
+    if (!ShadowStrike::Utils::DataStorePaths::EnsureHardenedDirectory(
+            m_impl->m_snapshotBaseDir.wstring())) {
         SS_LOG_ERROR(kLogCategory,
-            L"Failed to create snapshot directory: %s",
+            L"Failed to create or harden snapshot directory: %s",
             m_impl->m_snapshotBaseDir.wstring().c_str());
         m_impl->m_status = RollbackManagerStatus::Error;
         m_impl->NotifyError("Failed to create snapshot directory", ERROR_PATH_NOT_FOUND);

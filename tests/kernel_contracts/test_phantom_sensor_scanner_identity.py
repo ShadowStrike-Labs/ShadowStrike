@@ -28320,6 +28320,67 @@ class RegisterProtectedPathWiringTests(unittest.TestCase):
             "a kernel config publisher must re-push the registration once the filter port is up")
 
 
+class RuntimeDirsLiveUnderProgramDataTests(unittest.TestCase):
+    """Runtime working dirs resolve under %ProgramData%, never the install tree (task 322).
+
+    The service created its backup, update-snapshot and update-backup directories
+    inside its own Program Files install tree. Program Files is read-only program
+    files the MSI owns and removes; a directory created there at runtime survives
+    uninstall and keeps the install folder from being pruned - which is exactly
+    what left six empty dirs after an otherwise clean uninstall. These now root in
+    DataStorePaths::GetBaseDirectory() (%ProgramData%\\ShadowStrike) and are
+    hardened on create, because the default ProgramData ACL would otherwise let a
+    non-administrator tamper with a rollback, snapshot or staged-update store.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dsp = read_source(ROOT / "src/PhantomCore/Utils/DataStorePaths.cpp")
+        cls.fp  = read_source(ROOT / "src/PhantomCore/SelfProtection/FileProtection.cpp")
+        cls.rb  = read_source(ROOT / "src/PhantomCore/Update/RollbackManager.cpp")
+        cls.pu  = read_source(ROOT / "src/PhantomCore/Update/ProgramUpdater.cpp")
+
+    def test_base_dir_is_programdata_shadowstrike_and_data_derives_from_it(self):
+        self.assertIn("std::wstring GetBaseDirectory() {", self.dsp)
+        self.assertIn('return ProgramDataRoot() + L"\\\\ShadowStrike";', self.dsp)
+        self.assertIn('return GetBaseDirectory() + L"\\\\Data";', self.dsp,
+            "the data directory must derive from the base, not re-spell the root")
+
+    def test_hardened_create_applies_the_restrictive_acl_and_fails_closed(self):
+        fn = extract_c_function(self.dsp, "EnsureHardenedDirectory")
+        self.assertIn("CreateDirectoryChain", fn)
+        self.assertIn("ApplyRestrictiveAcl", fn)
+        # Created-but-not-hardened must be reported as failure, not trusted.
+        self.assertIn("return false;", fn[fn.find("ApplyRestrictiveAcl"):],
+            "a directory that could not be hardened must not be treated as ready")
+
+    def test_file_protection_backup_is_under_programdata_and_hardened(self):
+        self.assertIn("m_backupStoragePath = Utils::DataStorePaths::GetBaseDirectory()", self.fp)
+        self.assertNotIn("m_backupStoragePath = m_installationPath", self.fp,
+            "the ransomware-rollback backup dir must not be rooted in the install tree")
+        self.assertIn("EnsureHardenedDirectory(m_backupStoragePath)", self.fp)
+
+    def test_rollback_snapshot_base_is_under_programdata_and_hardened(self):
+        i = self.rb.find("config.snapshotDirectory.empty()")
+        self.assertNotEqual(i, -1)
+        block = self.rb[i:self.rb.find("else", i)]
+        self.assertIn("DataStorePaths::GetBaseDirectory()", block,
+            "the default snapshot base must be ProgramData, not the executable's parent")
+        self.assertNotIn("exePath.parent_path()", self.rb,
+            "the install tree must no longer be the snapshot base")
+        self.assertIn("EnsureHardenedDirectory(", self.rb)
+
+    def test_program_updater_staging_and_backup_under_programdata_and_hardened(self):
+        self.assertNotIn("m_installDirectory / ProgUpdateConstants::STAGING_DIR", self.pu)
+        self.assertNotIn("m_installDirectory / ProgUpdateConstants::BACKUP_DIR", self.pu)
+        self.assertEqual(self.pu.count("DataStorePaths::GetBaseDirectory()"), 2,
+            "both the staging and backup fallbacks must root in ProgramData")
+        self.assertEqual(self.pu.count("EnsureHardenedDirectory("), 2,
+            "both the staging and backup dirs must be created hardened")
+        self.assertIn("m_installDirectory / def", self.pu,
+            "m_installDirectory must still address the actual install targets")
+
+
 class SetInfoBlockReasonIsNamedTests(unittest.TestCase):
     """A rename/delete refusal is logged with its rule, not 'unspecified'."""
 

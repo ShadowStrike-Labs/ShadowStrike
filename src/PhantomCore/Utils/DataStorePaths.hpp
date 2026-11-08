@@ -48,6 +48,32 @@ namespace ShadowStrike::Utils::DataStorePaths {
 /// @note Callers use this to refuse to honour a whitelist that anyone can edit.
 [[nodiscard]] bool IsDataDirectoryHardened() noexcept;
 
+/// @brief The per-machine ShadowStrike root under %ProgramData%.
+/// @return Absolute path, e.g. C:\ProgramData\ShadowStrike (never empty).
+///
+/// This is the base for the product's mutable, per-machine runtime data. Working
+/// directories (ransomware-rollback backups, update snapshots and staging) belong
+/// here, NOT under the install tree in Program Files: Program Files is read-only
+/// program files that the installer owns and removes, so a runtime directory
+/// created there survives uninstall and keeps the install folder from being
+/// pruned. GetDataDirectory() is this plus "\Data".
+[[nodiscard]] std::wstring GetBaseDirectory();
+
+/// @brief Create @p directory (and any missing parents) and harden its DACL to
+///        the same posture as the data directory: SYSTEM and Administrators may
+///        write, everyone else may only read, inheritance blocked.
+///
+/// For the runtime working directories that moved out of the install tree this is
+/// not optional. In Program Files they were admin-only by inheritance; the default
+/// %ProgramData% ACL grants ordinary users create-file rights, so a plain create
+/// in ProgramData would let a non-administrator plant or tamper with a
+/// rollback snapshot or a staged update package - a tamper vector the move must
+/// not introduce. The ACL is re-applied on every call, so a directory loosened by
+/// an earlier version or an attacker is brought back to posture.
+///
+/// @return true only if the directory exists AND is hardened when this returns.
+[[nodiscard]] bool EnsureHardenedDirectory(const std::wstring& directory) noexcept;
+
 /// @brief Signature store database (B-tree index, YARA rules, patterns, hashes).
 [[nodiscard]] std::wstring SignatureDatabase();
 

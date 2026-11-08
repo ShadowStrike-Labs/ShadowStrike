@@ -50,6 +50,7 @@
 #include "FileProtection.hpp"
 #include "SelfDefense.hpp"   // SelfDefenseConstants::CRITICAL_INSTALLED_FILES
 #include "../Utils/PE_sig_verf.hpp"
+#include "../Utils/DataStorePaths.hpp"
 #include "../Communication/IPCManager.hpp"
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
@@ -612,8 +613,11 @@ FileProtectionImpl::FileProtectionImpl() {
         m_installationPath = exePath.parent_path().wstring();
     }
 
-    // Default backup path
-    m_backupStoragePath = m_installationPath + L"\\Backups";
+    // Runtime backup directory. Lives under %ProgramData%\ShadowStrike, NOT under
+    // the install tree: a directory created in Program Files at runtime survives
+    // uninstall and blocks the install folder from being pruned (task 322). The
+    // install path is still resolved above for ProtectInstallationDirectory.
+    m_backupStoragePath = Utils::DataStorePaths::GetBaseDirectory() + L"\\Backups";
 }
 
 FileProtectionImpl::~FileProtectionImpl() {
@@ -670,10 +674,13 @@ FileProtectionImpl::~FileProtectionImpl() {
 
     // Create backup directory if needed
     if (config.enableAutoBackup) {
-        try {
-            std::filesystem::create_directories(m_backupStoragePath);
-        } catch (const std::exception& e) {
-            SS_LOG_WARN(L"FileProtection", L"Failed to create backup directory: %hs", e.what());
+        // Created and hardened in one step: under %ProgramData% the default ACL
+        // would let a non-administrator write into the ransomware-rollback store,
+        // so the directory is locked to SYSTEM/Administrators-write here.
+        if (!Utils::DataStorePaths::EnsureHardenedDirectory(m_backupStoragePath)) {
+            SS_LOG_WARN(L"FileProtection",
+                        L"Failed to create or harden the backup directory: %ls",
+                        m_backupStoragePath.c_str());
         }
 
         // HIGH-03 FIX: Auto-protect the backup directory
