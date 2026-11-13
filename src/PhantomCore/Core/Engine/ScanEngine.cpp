@@ -1399,6 +1399,40 @@ public:
         std::string_view why = "validator unavailable";
     };
 
+    // TRUE when a VERIFIED signer is the product's own code-signing identity.
+    //
+    // This is the product recognising ITSELF, and it is deliberately distinct
+    // from the third-party vendor whitelist (SeedTrustedPublishers): security
+    // vendors stay excluded there by design, but our own installer, uninstaller,
+    // bootstrapper and the Burn clean-room copy must not be convicted on a score.
+    // Field defect it fixes: the bundle /uninstall was refused 0x80070005 because
+    // Stage 5 convicted ShadowStrikePhantom-Home-Setup.exe on a heuristic score,
+    // the engine returned Suspicious, the driver cached Verdict_Malicious and
+    // PreAcquireSection enforced it on execute-map.
+    //
+    // Keyed on the signer common name, matched case-insensitively - the same
+    // value and comparison the vendor whitelist uses - and ONLY ever consulted by
+    // EvaluatePublisherTrust AFTER the signature and chain have verified, so a
+    // third party cannot forge the identity. Hard-coded rather than a whitelist
+    // entry so policy cannot remove it. The dev CN is the identity current builds
+    // are signed with; add the production signing CN here (and ideally pin its
+    // SHA-256 thumbprint via info.signer.thumbprint) when the release cert exists.
+    [[nodiscard]] static bool IsFirstPartySigner(const Security::SignerInfo& signer) {
+        if (signer.signerName.empty()) {
+            return false;
+        }
+        static constexpr const wchar_t* kFirstPartyPublisherCNs[] = {
+            L"ShadowStrike-Labs Dev Code Signing",
+        };
+        const std::wstring name = StringUtils::ToLowerCopy(signer.signerName);
+        for (const wchar_t* cn : kFirstPartyPublisherCNs) {
+            if (name == StringUtils::ToLowerCopy(std::wstring(cn))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     [[nodiscard]] TrustSuppression EvaluatePublisherTrust(
         const std::wstring& filePath) const {
         TrustSuppression decision{};
@@ -1439,6 +1473,22 @@ public:
                 L"stolen-certificate database: %ls",
                 info.signer.signerName.c_str(), filePath.c_str());
             decision.why = "stolen certificate";
+            return decision;
+        }
+
+        // FIRST-PARTY: the product trusting its own verified signature. Reached
+        // only after info.isValid (signature + chain verified) and the stolen-cert
+        // gate, so it cannot be forged. Suppresses only the SCORE, like every
+        // branch here - the evidence stages (hash/YARA/IOC) already ran and
+        // finalized before Stage 5, and deeper stages still run - so this makes
+        // the engine stop convicting its OWN installer without blinding it to
+        // anything else. See IsFirstPartySigner for why this is not the vendor
+        // whitelist and cannot be removed by policy.
+        if (IsFirstPartySigner(info.signer)) {
+            decision.suppress = true;
+            decision.basis = "first-party (own publisher)";
+            decision.signerName = info.signer.signerName;
+            decision.why = decision.basis;
             return decision;
         }
 
