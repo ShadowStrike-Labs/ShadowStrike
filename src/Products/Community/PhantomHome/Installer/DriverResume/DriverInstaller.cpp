@@ -456,65 +456,33 @@ DWORD StopAndDeleteExistingService(SC_HANDLE hScm)
     if (QueryServiceStatus(svc.get(), &ss) &&
         ss.dwCurrentState != SERVICE_STOPPED)
     {
-        // PhantomSensor is a file-system minifilter. It is brought up with
-        // FilterLoad (see LoadDriver), so it must be taken down with the matching
-        // FltMgr call FilterUnload, which invokes the driver's FilterUnload
-        // callback, drains in-flight callbacks, and detaches every instance.
-        //
-        // The prior SERVICE_CONTROL_STOP was the defect behind uninstall failing
-        // 0x80070005: a minifilter does not honour an SCM stop, so the filter
-        // stayed loaded. A loaded driver image cannot be deleted, and the still-live
-        // driver's self-protection then denied the MSI RemoveFiles deletions, so the
-        // whole uninstall failed. FilterUnload is the same operation 'fltmc unload'
-        // performs, which was verified to let the uninstall complete.
-        LOG_INFO(L"Unloading minifilter '%ls' via FilterUnload (current state: %lu)...",
+        LOG_INFO(L"Stopping service '%ls' (current state: %lu)...",
                  kServiceName, ss.dwCurrentState);
 
-        const HRESULT hr = FilterUnload(kServiceName);
-        if (SUCCEEDED(hr)) {
-            LOG_INFO(L"FilterUnload succeeded (HRESULT=0x%08X).", hr);
-        } else {
-            // Mirror the FilterLoad -> StartServiceW fallback on the load side.
-            // ERROR_INVALID_FUNCTION means the image is not a minifilter (WDM path);
-            // any other failure - including a detach the driver refused on a drain
-            // timeout - also lands here. The legacy SCM stop is the honest fallback;
-            // if it too leaves the driver loaded, deletion completes on the reboot
-            // the uninstall already schedules.
-            if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION)) {
-                LOG_WARN(L"FilterUnload returned ERROR_INVALID_FUNCTION; "
-                         L"falling back to SCM stop...");
-            } else {
-                LOG_WARN(L"FilterUnload returned 0x%08X; trying SCM stop as fallback.", hr);
-            }
+        SERVICE_STATUS ctrlStatus{};
+        ControlService(svc.get(), SERVICE_CONTROL_STOP, &ctrlStatus);
 
-            SERVICE_STATUS ctrlStatus{};
-            if (ControlService(svc.get(), SERVICE_CONTROL_STOP, &ctrlStatus)) {
-                constexpr int kTimeoutMs = 10'000;
-                constexpr int kPollMs    = 250;
-                int waited = 0;
-                while (waited < kTimeoutMs) {
-                    Sleep(static_cast<DWORD>(kPollMs));
-                    waited += kPollMs;
-                    SERVICE_STATUS ss2{};
-                    if (QueryServiceStatus(svc.get(), &ss2) &&
-                        ss2.dwCurrentState == SERVICE_STOPPED)
-                    {
-                        LOG_INFO(L"Service stopped after %d ms (SCM fallback).", waited);
-                        break;
-                    }
-                }
-            } else {
-                LOG_WARN(L"SCM stop not accepted (0x%08X); "
-                         L"driver removal will complete on reboot.", GetLastError());
-            }
+        constexpr int kTimeoutMs = 10'000;
+        constexpr int kPollMs    = 250;
+        int waited = 0;
 
-            SERVICE_STATUS ss3{};
-            if (QueryServiceStatus(svc.get(), &ss3) &&
-                ss3.dwCurrentState != SERVICE_STOPPED)
+        while (waited < kTimeoutMs) {
+            Sleep(static_cast<DWORD>(kPollMs));
+            waited += kPollMs;
+            SERVICE_STATUS ss2{};
+            if (QueryServiceStatus(svc.get(), &ss2) &&
+                ss2.dwCurrentState == SERVICE_STOPPED)
             {
-                LOG_WARN(L"Driver still loaded after unload attempts; forcing "
-                         L"deletion (completes on reboot).");
+                LOG_INFO(L"Service stopped after %d ms.", waited);
+                break;
             }
+        }
+
+        SERVICE_STATUS ss3{};
+        if (QueryServiceStatus(svc.get(), &ss3) &&
+            ss3.dwCurrentState != SERVICE_STOPPED)
+        {
+            LOG_WARN(L"Service did not stop within %d ms; forcing deletion.", kTimeoutMs);
         }
     }
 
