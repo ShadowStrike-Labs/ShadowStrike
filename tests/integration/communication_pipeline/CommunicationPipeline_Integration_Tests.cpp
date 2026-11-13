@@ -2528,6 +2528,8 @@ TEST_F(TypeContracts, MessageType_KernelWireOrdinals) {
               static_cast<uint16_t>(FilterMessageType_FileOperationEvent));
     EXPECT_EQ(static_cast<uint16_t>(MessageType::RegistryBehavioralAlert),
               static_cast<uint16_t>(FilterMessageType_RegistryBehavioralAlert));
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::RegisterProtectedPath),
+              static_cast<uint16_t>(FilterMessageType_RegisterProtectedPath));
     EXPECT_EQ(static_cast<uint16_t>(MessageType::Max),
               static_cast<uint16_t>(FilterMessageType_Max));
 
@@ -2538,7 +2540,7 @@ TEST_F(TypeContracts, MessageType_KernelWireOrdinals) {
     EXPECT_EQ(static_cast<uint16_t>(MessageType::ProcessNotify), 8u)
         << "ProcessNotify is 8 on the wire. It read 7 while the mirror omitted "
            "KeyExchange, and 7 is ScanVerdict.";
-    EXPECT_EQ(static_cast<uint16_t>(MessageType::Max), 46u)
+    EXPECT_EQ(static_cast<uint16_t>(MessageType::Max), 47u)
         << "The kernel message enum grew. Confirm every new type was added to "
            "Communication::MessageType, then update this count.";
 }
