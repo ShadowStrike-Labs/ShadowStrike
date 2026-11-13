@@ -253,6 +253,50 @@
                      Value="[ProductCode]"/>
     </Component>
 
+    <!--
+         REMOVE THE INSTALL TREE ON UNINSTALL (task 322)
+
+         MSI's RemoveFiles deletes the files this package ships, but the service
+         creates runtime subdirectories under the install folder (Backup, Backups,
+         Update\...) that are not in the MSI directory table. MSI cannot prune a
+         directory it does not own, and a single non-MSI subfolder keeps the empty
+         Phantom and ShadowStrike folders behind after an otherwise clean uninstall
+         (VM-confirmed, task 322). util:RemoveFolderEx removes the whole install-root
+         tree on uninstall, reading the path from the InstallRoot value this
+         component writes at install. On="uninstall" only, so a repair or a major
+         upgrade never triggers it, and removal is scoped to the product's own
+         [ShadowStrikeFolder] = C:\Program Files\ShadowStrike.
+    -->
+    <Component Id="CmpRemoveInstallRoot"
+               Directory="ShadowStrikeFolder"
+               Guid="{DC23BC56-1951-4098-AC4F-76D2EE33DF56}"
+               Bitness="always64">
+      <RegistryValue Root="HKLM"
+                     Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                     Name="InstallRoot"
+                     Type="string"
+                     Value="[ShadowStrikeFolder]"
+                     KeyPath="yes"/>
+      <util:RemoveFolderEx Id="RemoveSsInstallRootTree"
+                           On="uninstall"
+                           Property="REMOVESSINSTALLROOT"/>
+      <!--
+        RemoveFolderEx clears any runtime subtree (and upgrade residue from a
+        build that predated the ProgramData relocation). These two remove the
+        empty declared folders themselves - Phantom (INSTALLFOLDER) and its
+        parent ShadowStrike - which MSI's own directory removal leaves behind
+        and RemoveFolderEx does not reach (it runs during RemoveFiles, before
+        the files above it are gone). The RemoveFolders standard action runs
+        after RemoveFiles, so both are empty and removable by then.
+      -->
+      <RemoveFolder Id="RemoveInstallFolderPhantom"
+                    Directory="INSTALLFOLDER"
+                    On="uninstall"/>
+      <RemoveFolder Id="RemoveInstallFolderRoot"
+                    Directory="ShadowStrikeFolder"
+                    On="uninstall"/>
+    </Component>
+
     <!-- ═══════════════════════════════════════════════════════════════════
          START MENU SHORTCUT  (all-users, per-machine install)
     ═══════════════════════════════════════════════════════════════════ -->

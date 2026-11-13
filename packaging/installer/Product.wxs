@@ -183,6 +183,21 @@
     <Launch Condition="Installed OR VCREDIST2022X64INSTALLED"
             Message="ShadowStrike Phantom Home requires the Microsoft Visual C++ 2015-2022 x64 runtime. Run ShadowStrikePhantom-Home-Setup.exe so the bundled prerequisite is installed first."/>
 
+    <!--
+      Install-root path for util:RemoveFolderEx (task 322). CmpRemoveInstallRoot
+      writes HKLM\...\Install\InstallRoot = [ShadowStrikeFolder] at install; this
+      search reads it back during uninstall so the removal action knows which tree
+      to delete. Bitness matches the 64-bit hive the value is written to.
+    -->
+    <Property Id="REMOVESSINSTALLROOT">
+      <RegistrySearch Id="SsInstallRootSearch"
+                      Root="HKLM"
+                      Key="SOFTWARE\ShadowStrike\PhantomHome\Install"
+                      Name="InstallRoot"
+                      Type="raw"
+                      Bitness="always64"/>
+    </Property>
+
     <!-- ──────────────── Directory tree ──────────────── -->
     <!--
       Qt subdirectories (platforms, qml, styles, …) are declared inside
@@ -239,6 +254,10 @@
 
       <!-- Install anchor read by the tray InstallProbe to detect orphan state. -->
       <ComponentRef Id="CmpInstallAnchor"/>
+
+      <!-- Removes the whole install-root tree (incl. runtime-created empty
+           subdirs) on uninstall, so nothing is left under Program Files. -->
+      <ComponentRef Id="CmpRemoveInstallRoot"/>
 
       <!-- Start Menu shortcut for the UI. -->
       <ComponentRef Id="CmpStartMenuShortcut"/>
