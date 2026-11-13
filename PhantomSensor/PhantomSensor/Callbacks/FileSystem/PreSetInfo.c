@@ -2401,6 +2401,61 @@ PsipIsInstallerTransactionOperation(
 }
 
 //
+// Public counterpart for the self-protection file-deny path (SelfProtect.c,
+// ShadowStrikeShouldBlockFileAccess). task 322.
+//
+// That path blocks writes/deletes of protected product files by any process
+// that is not a registered protected process. It correctly stops tampering, but
+// it also blocked the product's OWN uninstall: msiexec's RemoveFiles deletes the
+// installed files and every delete was denied, so the MSI failed 0x80070005 and
+// the product could not be removed. This is the same gate
+// PsipIsInstallerTransactionOperation applies on the mass-operation path (task
+// 384), reduced to the install-tree location only - Config.Msi sits at a volume
+// root and is never a protected product path, so it cannot reach the self-protect
+// block and does not belong here. Both conditions are required: a Windows Code
+// Integrity signer (msiexec / the OS servicing stack) AND a path inside the
+// product's own registered install tree. It is only ever an ALLOW, and only for
+// the product's own folder; a third-party-signed or unsigned caller, or any path
+// outside the tree, still blocks. PASSIVE_LEVEL only (the signature query cannot
+// run higher); a higher IRQL, an unregistered tree, or an unsigned caller all
+// decline and leave the block in force, so the narrowing fails safe toward
+// self-protection.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowStrikeIsInstallerServicingOwnTree(
+    _In_opt_ PCUNICODE_STRING Path,
+    _In_ HANDLE RequestorPid
+    )
+{
+    BOOLEAN isSigned = FALSE;
+    SHADOW_SIGNER_TYPE signer = ShadowSignerNone;
+
+    //
+    // The signature query runs only at PASSIVE_LEVEL. Declining above it leaves
+    // the self-protect block in force, which is the safe direction.
+    //
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;
+    }
+
+    if (!PsipPathIsUnderProductInstallTree(Path)) {
+        return FALSE;
+    }
+
+    if (!NT_SUCCESS(ShadowStrikeValidateProcessSignature(RequestorPid,
+                                                         &isSigned,
+                                                         &signer)) ||
+        !isSigned) {
+        return FALSE;
+    }
+
+    return (signer == ShadowSignerWindows ||
+            signer == ShadowSignerWinTcb ||
+            signer == ShadowSignerWinSystem);
+}
+
+//
 // Record the product's own install-tree prefix(es). Declared in PreSetInfo.h and
 // called by the MessageHandler dispatch for FilterMessageType_RegisterProtectedPath
 // (task 384). See the header for the full contract.

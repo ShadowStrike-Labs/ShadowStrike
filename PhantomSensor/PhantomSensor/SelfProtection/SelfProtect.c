@@ -56,6 +56,7 @@
 #include "../Utilities/MemoryUtils.h"
 #include "../Behavioral/BehaviorEngine.h"
 #include "../ETW/TelemetryEvents.h"
+#include "../Callbacks/FileSystem/PreSetInfo.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeSelfProtection)
@@ -1283,6 +1284,21 @@ ShadowStrikeShouldBlockFileAccess(
     }
 
     if (!ShadowStrikeIsPathProtected(FilePath)) {
+        SspLeaveOperation();
+        return FALSE;
+    }
+
+    //
+    // Allow the product's own uninstall/servicing. A Windows Code Integrity
+    // signed caller (msiexec / the OS servicing stack) operating inside the
+    // product's own registered install tree is the legitimate removal of the
+    // product, not tampering. Without this the self-protect block denied every
+    // RemoveFiles delete and the product's own MSI uninstall failed 0x80070005
+    // (task 322). The check declines above PASSIVE_LEVEL, for an unregistered
+    // tree, and for any unsigned or third-party caller, so self-protection stays
+    // in force in every other case; see ShadowStrikeIsInstallerServicingOwnTree.
+    //
+    if (ShadowStrikeIsInstallerServicingOwnTree(FilePath, RequestorPid)) {
         SspLeaveOperation();
         return FALSE;
     }

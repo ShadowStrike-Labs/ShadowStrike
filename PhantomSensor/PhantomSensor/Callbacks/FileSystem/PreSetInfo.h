@@ -342,6 +342,26 @@ ShadowStrikeRegisterProductInstallTree(
     _In_ USHORT DosFormChars
     );
 
+/**
+ * @brief TRUE if a Windows-signed caller is operating inside the product's own
+ *        registered install tree - the legitimate servicing/uninstall of the
+ *        product, which the self-protection file-deny path must permit.
+ *
+ * Exposed for SelfProtect.c (ShadowStrikeShouldBlockFileAccess). Both conditions
+ * are required: Path lies under the registered install tree AND RequestorPid
+ * carries a Windows Code Integrity signing level. Only ever an allow; declines
+ * above PASSIVE_LEVEL, for an unregistered tree, or for an unsigned / third-party
+ * caller, so self-protection stays in force in every other case (task 322).
+ *
+ * @irql <= DISPATCH_LEVEL (the signature query is attempted only at PASSIVE).
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowStrikeIsInstallerServicingOwnTree(
+    _In_opt_ PCUNICODE_STRING Path,
+    _In_ HANDLE RequestorPid
+    );
+
 #ifdef __cplusplus
 }
 #endif
