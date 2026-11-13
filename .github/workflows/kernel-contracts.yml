@@ -8,6 +8,8 @@ on:
       - "PhantomSensor/PhantomSensor/Communication/CommPort.h"
       - "PhantomSensor/PhantomSensor/Communication/ScanBridge.c"
       - "PhantomSensor/PhantomSensor/Communication/ScanBridge.h"
+      - "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+      - "src/Products/Community/PhantomHome/Installer/DriverResume/DriverInstaller.cpp"
       - "tests/kernel_contracts/**"
       - ".github/workflows/kernel-contracts.yml"
   push:
@@ -17,6 +19,8 @@ on:
       - "PhantomSensor/PhantomSensor/Communication/CommPort.h"
       - "PhantomSensor/PhantomSensor/Communication/ScanBridge.c"
       - "PhantomSensor/PhantomSensor/Communication/ScanBridge.h"
+      - "src/PhantomCore/Core/Engine/ScanEngine.cpp"
+      - "src/Products/Community/PhantomHome/Installer/DriverResume/DriverInstaller.cpp"
       - "tests/kernel_contracts/**"
       - ".github/workflows/kernel-contracts.yml"
   workflow_dispatch:
@@ -34,4 +38,4 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Run host-safe contracts
-        run: python3 tests/kernel_contracts/test_phantom_sensor_scanner_identity.py
+        run: python3 -m unittest discover -s tests/kernel_contracts -p "test_*.py" -v
