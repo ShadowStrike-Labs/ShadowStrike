@@ -3136,12 +3136,22 @@ bool SelfDefenseImpl::SyncProtectedProcessesToKernel() {
 bool SelfDefenseImpl::SyncProductInstallTreeToKernel() {
     if (!Communication::IPCManager::HasInstance()) return false;
 
-    // Resolve the product's own install directory the same way FileProtection
-    // does - the directory of this service image. Two prefixes are registered,
-    // matching the two forms a kernel SetInformation rename/delete carries:
-    //   DOS form     \??\C:\...\ShadowStrike\Phantom\      (a rename destination)
-    //   device form  \Device\HarddiskVolumeN\...\Phantom\  (a normalized source name)
-    // Both end in a backslash so the driver treats them as directory prefixes.
+    // Resolve the product's install ROOT - the vendor folder the MSI creates and
+    // removes (ShadowStrikeFolder, e.g. C:\Program Files\ShadowStrike), NOT the
+    // Phantom subfolder this service image sits in. The install-tree exemption
+    // must span the whole footprint a signed uninstaller removes: the files under
+    // ...\ShadowStrike\Phantom\, the Phantom directory, AND the vendor directory
+    // above it. Registering only ...\Phantom left the vendor folder outside the
+    // exemption, so the data-destruction gate denied msiexec's RemoveFolder on
+    // ...\ShadowStrike and orphaned the empty folder after uninstall (task 322;
+    // VM-measured error 5 on C:\Program Files\ShadowStrike\ once the Phantom
+    // directory itself became removable). Two prefixes are registered, matching
+    // the two forms a kernel SetInformation rename/delete carries:
+    //   DOS form     \??\C:\...\ShadowStrike\               (a rename destination)
+    //   device form  \Device\HarddiskVolumeN\...\ShadowStrike\ (a normalized source)
+    // Both end in a backslash so the driver treats them as directory prefixes;
+    // the kernel root-node match (task 322) then also covers the vendor folder
+    // itself, not only paths beneath it.
     wchar_t modulePath[MAX_PATH] = {};
     DWORD n = ::GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return false;
@@ -3149,11 +3159,19 @@ bool SelfDefenseImpl::SyncProductInstallTreeToKernel() {
     std::wstring full(modulePath, n);
     size_t slash = full.find_last_of(L'\\');
     if (slash == std::wstring::npos || slash < 2) return false;
-    std::wstring installDir = full.substr(0, slash);        // e.g. C:\Program Files\ShadowStrike\Phantom
+    std::wstring exeDir = full.substr(0, slash);            // C:\Program Files\ShadowStrike\Phantom
+    size_t slash2 = exeDir.find_last_of(L'\\');             // separator before "Phantom"
+    if (slash2 == std::wstring::npos || slash2 < 2) return false;
+    std::wstring installDir = exeDir.substr(0, slash2);     // C:\Program Files\ShadowStrike
+    // The registered prefix ends in a backslash and prefix-matches everything
+    // beneath it, so it must never degenerate to a drive or a single top-level
+    // folder (C:\ or C:\Program Files). Require a drive specifier and at least one
+    // more separator below it (X:\dir\vendor) - a real vendor subfolder.
     if (installDir.size() < 3 || installDir[1] != L':') return false;
+    if (installDir.find(L'\\', 3) == std::wstring::npos) return false;
     if (installDir.back() != L'\\') installDir.push_back(L'\\');
 
-    std::wstring dosForm = L"\\??\\" + installDir;          // \??\C:\...\Phantom\
+    std::wstring dosForm = L"\\??\\" + installDir;          // \??\C:\...\ShadowStrike\
 
     std::wstring deviceForm;
     {
@@ -3161,7 +3179,7 @@ bool SelfDefenseImpl::SyncProductInstallTreeToKernel() {
         wchar_t devName[MAX_PATH] = {};
         if (::QueryDosDeviceW(drive, devName, MAX_PATH) != 0) {
             deviceForm.assign(devName);                     // \Device\HarddiskVolumeN
-            deviceForm += installDir.substr(2);             // append "\...\Phantom\", dropping "C:"
+            deviceForm += installDir.substr(2);             // append "\...\ShadowStrike\", dropping "C:"
         }
     }
 
