@@ -52,6 +52,8 @@ using namespace ShadowStrike::Utils::ProcessUtils;
 // directly, without routing through a token this runner may not hold. Task 138.
 namespace ShadowStrike::Utils::ProcessUtils {
     bool TokenHasEnabledPrivilege(const TOKEN_PRIVILEGES* privileges, LUID target) noexcept;
+    // Same arrangement, task 387: LocalSystem is decided by the token user SID.
+    bool TokenIdentityIsLocalSystem(PSID userSid, const TOKEN_GROUPS* groups) noexcept;
 }
 
 // ============================================================================
@@ -757,6 +759,46 @@ TEST_F(ProcessUtilsTest, TokenHasEnabledPrivilegeChecksLuidAndEnabledBit) {
     const LUID sameLowDiffHigh{ 0x1111, 0x55 };
     EXPECT_FALSE(TokenHasEnabledPrivilege(tp, sameLowDiffHigh));  // LowPart matches, HighPart differs
     EXPECT_FALSE(TokenHasEnabledPrivilege(nullptr, enabledLuid)); // null-safe
+}
+
+TEST_F(ProcessUtilsTest, LocalSystemIsDecidedByTheTokenUserNotOnlyByGroups) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[LocalSystemIsDecidedByTheTokenUserNotOnlyByGroups] Testing...");
+    // Task 387. A LocalSystem token carries S-1-5-18 as its USER, and its groups
+    // do not list it. Synthetic SIDs keep this independent of the runner, which
+    // cannot open a real SYSTEM token unelevated.
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    PSID systemSid = nullptr;
+    PSID usersSid = nullptr;
+    ASSERT_TRUE(AllocateAndInitializeSid(&nt, 1, SECURITY_LOCAL_SYSTEM_RID,
+                                         0, 0, 0, 0, 0, 0, 0, &systemSid));
+    ASSERT_TRUE(AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                         DOMAIN_ALIAS_RID_USERS, 0, 0, 0, 0, 0, 0, &usersSid));
+    std::vector<BYTE> buf(sizeof(TOKEN_GROUPS), 0);
+    auto* groups = reinterpret_cast<TOKEN_GROUPS*>(buf.data());
+    groups->GroupCount = 1;
+    groups->Groups[0].Sid = usersSid;
+    groups->Groups[0].Attributes = SE_GROUP_ENABLED;
+
+    EXPECT_TRUE(TokenIdentityIsLocalSystem(systemSid, groups));   // SYSTEM user, groups without it
+    EXPECT_TRUE(TokenIdentityIsLocalSystem(systemSid, nullptr));  // the call GetProcessSecurityInfo makes
+    EXPECT_FALSE(TokenIdentityIsLocalSystem(usersSid, groups));   // neither user nor group
+    groups->Groups[0].Sid = systemSid;
+    EXPECT_TRUE(TokenIdentityIsLocalSystem(usersSid, groups));    // group membership still counts
+    EXPECT_FALSE(TokenIdentityIsLocalSystem(nullptr, nullptr));   // null-safe
+
+    FreeSid(usersSid);
+    FreeSid(systemSid);
+}
+
+TEST_F(ProcessUtilsTest, ThisTestProcessIsNotReportedAsLocalSystem) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[ThisTestProcessIsNotReportedAsLocalSystem] Testing...");
+    // The other direction of task 387: reading the user SID must not make an
+    // ordinary token look like SYSTEM. The runner is never LocalSystem.
+    ProcessSecurityInfo sec;
+    ASSERT_TRUE(GetProcessSecurityInfo(::GetCurrentProcessId(), sec, nullptr,
+                                       SecurityInfoScope::LocalOnly));
+    EXPECT_NE(sec.userSid, L"S-1-5-18");
+    EXPECT_FALSE(sec.isRunningAsSystem);
 }
 
 TEST_F(ProcessUtilsTest, HasSeDebugPrivilegeReflectsTheTokenByLuid) {

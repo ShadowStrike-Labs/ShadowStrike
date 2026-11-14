@@ -1117,6 +1117,36 @@ bool TokenHasEnabledPrivilege(const TOKEN_PRIVILEGES* privileges, LUID target) n
     return false;
 }
 
+// Returns true iff a token with this user SID and these groups is LocalSystem.
+// Same linkage arrangement as TokenHasEnabledPrivilege above, for the same reason;
+// the matching declaration lives in ProcessUtils_Tests.cpp.
+//
+// LocalSystem is the token USER (S-1-5-18), not a group: a SYSTEM token's
+// TokenGroups lists Administrators, Everyone, SERVICE and the System label, but not
+// NT AUTHORITY\SYSTEM. Checking groups alone reported every SYSTEM process as
+// not-SYSTEM, and QuarantineManager::CanTerminateProcess then treated SYSTEM
+// processes as terminable (task 387). Group membership still counts, so no token
+// that was classified SYSTEM before stops being so. Either argument may be null.
+bool TokenIdentityIsLocalSystem(PSID userSid, const TOKEN_GROUPS* groups) noexcept {
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    PSID systemSid = nullptr;
+    if (!AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+                                  0, 0, 0, 0, 0, 0, 0, &systemSid)) {
+        return false;
+    }
+    bool isSystem = (userSid != nullptr && EqualSid(userSid, systemSid));
+    if (!isSystem && groups != nullptr) {
+        for (DWORD i = 0; i < groups->GroupCount; ++i) {
+            if (groups->Groups[i].Sid != nullptr && EqualSid(groups->Groups[i].Sid, systemSid)) {
+                isSystem = true;
+                break;
+            }
+        }
+    }
+    FreeSid(systemSid);
+    return isSystem;
+}
+
 bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err,
                             SecurityInfoScope scope) noexcept {
     sec = {};
@@ -1158,6 +1188,9 @@ bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& sec, Error* err,
     
     auto tu = reinterpret_cast<TOKEN_USER*>(buf.data());
     if (tu && tu->User.Sid) {
+        // The user SID decides LocalSystem; the group loop below can only add to it.
+        sec.isRunningAsSystem = TokenIdentityIsLocalSystem(tu->User.Sid, nullptr);
+
         LPWSTR sidStr = nullptr;
         if (ConvertSidToStringSidW(tu->User.Sid, &sidStr) && sidStr) {
             try {
