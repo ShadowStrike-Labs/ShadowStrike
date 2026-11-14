@@ -223,6 +223,23 @@ TEST_F(PerformanceProfileTest, AnUnknownProfileFallsBackToSomethingUsable) {
     EXPECT_GT(bogus.throttle.scanRateLimit, 0u);
 }
 
+TEST_F(PerformanceProfileTest, AZeroScanRateLimitMeansUnlimitedNotThrottleEverything) {
+    // The defensive half of EveryProfileAllowsAtLeastOneScanPerSecond: no profile sets
+    // zero, but scanRateLimit is a uint32_t taken from configuration. ShouldThrottleScan
+    // throttles when the count REACHES the limit, so a limit of zero would defer the very
+    // first scan and stop scanning entirely while throttling is active. Zero must read as
+    // unlimited (task 287).
+    auto& opt = PerformanceOptimizer::Instance();
+    ThrottleSettings settings;
+    settings.scanRateLimit = 0;
+    opt.EnableThrottling(settings);
+    EXPECT_FALSE(opt.ShouldThrottleScan())
+        << "a zero scan-rate limit throttled scanning instead of meaning unlimited";
+    EXPECT_FALSE(opt.ShouldThrottleScan())
+        << "the second call throttled too, so zero is still treated as a hard limit";
+    opt.DisableThrottling();  // restore state for sibling tests on the shared singleton
+}
+
 TEST(GameWindowClass, OnlyAnEngineClassItselfMatches) {
     // Task 292: a substring test let any class containing an engine name qualify, and a match
     // activates game mode, which suppresses protection. Exact now; "Unity WndClass" never matched Unity.

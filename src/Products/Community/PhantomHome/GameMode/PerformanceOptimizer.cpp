@@ -2236,6 +2236,15 @@ void PerformanceOptimizer::DisableThrottling() {
 
     std::lock_guard lock(m_impl->m_scanRateMutex);
 
+    // A rate limit of zero reads as "no limit" to anyone configuring it, but the
+    // comparison below treats it as "throttle everything": with the limit at 0 the
+    // very first scan satisfies current >= 0 and every scan is deferred, so scanning
+    // stops entirely while throttling is active. Treat zero as unlimited (task 287).
+    // No profile sets zero today, but the value is a uint32_t taken from configuration.
+    if (m_impl->m_scanRateLimit == 0) {
+        return false;
+    }
+
     auto now = Clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         now - m_impl->m_scanWindowStart).count();
