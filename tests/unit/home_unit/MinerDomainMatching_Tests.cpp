@@ -139,4 +139,20 @@ TEST(MinerExtractDomain, NonsenseYieldsNothingRatherThanSomethingWrong) {
     EXPECT_TRUE(ExtractDomain(std::string("\x80\x80")).empty());
 }
 
+TEST(MinerDomainMatching, SitesThatMerelyEmbeddedAMinerAreNoLongerDomainBlocked) {
+    // task 311: these are still-live ordinary sites that embedded a Coinhive-era miner. A
+    // domain block is a false positive on every visit; an embedded miner is caught by this
+    // module's script/WASM analysis instead, which detects the miner rather than the host.
+    // bitcoincore.io is the legitimate Bitcoin Core project and cookiescript.info is a
+    // consent CDN - neither is mining infrastructure.
+    EXPECT_FALSE(IsKnownMiningDomain("kiwifarms.net"));
+    EXPECT_FALSE(IsKnownMiningDomain("vidoza.net"));
+    EXPECT_FALSE(IsKnownMiningDomain("joyreactor.cc"));
+    EXPECT_FALSE(IsKnownMiningDomain("bitcoincore.io"));
+    EXPECT_FALSE(IsKnownMiningDomain("cookiescript.info"));
+    // Operator infrastructure stays blocked outright.
+    EXPECT_TRUE(IsKnownMiningDomain("coinhive.com"));
+    EXPECT_TRUE(IsKnownMiningDomain("authedmine.com"));
+}
+
 }  // namespace

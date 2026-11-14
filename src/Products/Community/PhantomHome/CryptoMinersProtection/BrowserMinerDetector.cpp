@@ -601,20 +601,34 @@ constexpr auto POOL_ENDPOINTS = std::to_array<std::string_view>({
 
 constexpr std::array<uint8_t, 4> WASM_MAGIC = {0x00, 0x61, 0x73, 0x6D};
 
+// Operator infrastructure for in-browser mining - the services that host the mining
+// script/pool. Blocking these outright is correct: the domain exists only to mine.
+//
+// PROVENANCE: derived from a public Coinhive-era blocklist (~2019). Coinhive shut down
+// in March 2019, so the historical infrastructure entries are largely harmless (a dead
+// domain blocks nothing). Task 311 removed the entries that were SITES WHICH ONCE
+// EMBEDDED a miner (kiwifarms.net, joyreactor.cc, kickass.cd, vidoza.net,
+// miner.pr0gramm.com, okestream.com, streamfe.com, dmdamedia.hu, pazanchik.com,
+// hallaert.online) because those are still-live ordinary sites and a domain block is a
+// false positive on every visit - an embedded miner is caught by this module's script
+// and WASM analysis instead, which detects the miner rather than remembering the host.
+// Also removed bitcoincore.io (the legitimate Bitcoin Core project) and
+// cookiescript.info (a cookie-consent CDN, an injection victim not an operator).
+// Still pending verification before beta: rocks.io, ppoi.org, gus.host, papoto.com
+// (short generic names whose subdomain reach is wide).
 constexpr auto KNOWN_MINING_DOMAINS = std::to_array<std::string_view>({
     "coinhive.com", "coin-hive.com", "authedmine.com", "cryptoloot.pro",
     "crypto-loot.com", "webminepool.com", "webminepool.tk", "jsecoin.com",
-    "coinblind.com", "coin-have.com", "kisshentai.net", "kiwifarms.net",
+    "coinblind.com", "coin-have.com", "kisshentai.net",
     "monerominer.rocks", "ppoi.org", "minero.cc", "freecontent.stream",
-    "hemnes.win", "kickass.cd", "cloudcoins.co", "2giga.link", "ad-miner.com",
+    "hemnes.win", "cloudcoins.co", "2giga.link", "ad-miner.com",
     "afminer.com", "beatingheart.pro", "bmst.pw", "cnt.statistic.date",
-    "cookiescript.info", "coinerra.com", "rocks.io", "vidoza.net", "ajplugins.com",
+    "coinerra.com", "rocks.io", "ajplugins.com",
     "static-cnt.bid", "gus.host", "cdn.staticfile.tk", "crypto.csgostash.com",
-    "noblock.pro", "miner.pr0gramm.com", "cpu2cash.link", "papoto.com",
-    "party-nngvitbizn.now.sh", "hallaert.online", "hashing.win", "pazanchik.com",
-    "bitcoincore.io", "moneone.ga", "jscdndel.com", "digxmr.com",
-    "coin-service.com", "dmdamedia.hu", "joyreactor.cc", "okestream.com",
-    "streamfe.com", "mine.torrent.pw"
+    "noblock.pro", "cpu2cash.link", "papoto.com",
+    "party-nngvitbizn.now.sh", "hashing.win",
+    "moneone.ga", "jscdndel.com", "digxmr.com",
+    "coin-service.com", "mine.torrent.pw"
 });
 
 constexpr auto WASM_SUSPICIOUS_IMPORT_NAMES = std::to_array<std::string_view>({
