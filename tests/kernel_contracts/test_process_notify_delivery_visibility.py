@@ -64,6 +64,15 @@ class ProcessNotifyDeliveryVisibilityContractTests(unittest.TestCase):
         self.assertRegex(self.region, r"kernelPart,\s*ipcRxPart\)",
                          "the receive counts are built but not emitted in the capacity line")
 
+    def test_every_other_received_type_is_listed(self):
+        # The 1.0.133 run received ~250,000 messages in 6 minutes, the four named
+        # types under 7% of them; the rest must be visible by type number.
+        self.assertRegex(self.region,
+                         r"for \(size_t type = 0; type < ipc\.byMessageType\.size\(\); \+\+type\)",
+                         "the other received types are not enumerated")
+        self.assertIn('ipcRxPart += std::format(" other=[{}]", others);', self.region,
+                      "the other received types are not appended to the line")
+
 
 if __name__ == "__main__":
     unittest.main()

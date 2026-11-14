@@ -8221,6 +8221,24 @@ public:
                 ipc.messagesReceived,
                 rx(FilterMessageType_ScanRequest), rx(FilterMessageType_ProcessNotify),
                 rx(FilterMessageType_ImageLoad), rx(FilterMessageType_RegistryNotify));
+
+            // Every other type that arrived, by its MessageTypes.h number. The
+            // 1.0.133 run received about 250,000 messages in its first 6 minutes
+            // of which the four named above were under 7%, so the bulk of the
+            // channel's traffic was a type nothing reported.
+            std::string others;
+            for (size_t type = 0; type < ipc.byMessageType.size(); ++type) {
+                const uint64_t n = ipc.byMessageType[type];
+                if (n == 0 ||
+                    type == static_cast<size_t>(FilterMessageType_ScanRequest) ||
+                    type == static_cast<size_t>(FilterMessageType_ProcessNotify) ||
+                    type == static_cast<size_t>(FilterMessageType_ImageLoad) ||
+                    type == static_cast<size_t>(FilterMessageType_RegistryNotify)) {
+                    continue;
+                }
+                others += std::format("{}t{}={}", others.empty() ? "" : " ", type, n);
+            }
+            ipcRxPart += std::format(" other=[{}]", others);
         }
         const uint64_t adN   = m_stats.antiDebugProcNotifyCount.load(std::memory_order_relaxed);
         const uint64_t adTot = m_stats.antiDebugProcNotifyTotalUs.load(std::memory_order_relaxed);
