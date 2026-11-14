@@ -5686,6 +5686,20 @@ public:
             return Communication::KernelVerdict::Allow;
         }
 
+        // IMAGE-LOAD VERDICTS ARE REPORTS, NOT BLOCKS, and that is the Windows
+        // contract rather than a limitation of this handler. PsSetLoadImageNotify-
+        // Routine is notification-only (ImageNotify.c:2154,2341: "callbacks are
+        // notification-only ... cannot block loads"), and the dispatcher proves it
+        // end to end: IPCManager's FilterMessageType_ImageLoad case computes this
+        // verdict and never sets needsReply, so the reply block is skipped and the
+        // value is discarded - unlike ProcessNotify, which the kernel waits on.
+        // Every detection below therefore DETECTS and REPORTS: it logs, records
+        // telemetry with actionTaken "Detected", and counts, but it does not and
+        // cannot block the load. Returning Block here would claim an action that
+        // happens nowhere (unlike RegistryNotify, whose verdict mirrors a real
+        // kernel-side STATUS_ACCESS_DENIED), so these paths return Monitor. Real
+        // enforcement of a malicious module is the on-access create/scan path,
+        // which sees the same file when it is opened and CAN block (task 128).
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
 
         // The kernel delivers the image path in NT device form
@@ -5788,8 +5802,9 @@ public:
             }
             else if (sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) {
                 Utils::Logger::Error(
-                    "RealTimeProtection: BLOCKED APT-signed module in PID {}: {} "
-                    "[stolenCert={} riskScore={} anomalies={}]",
+                    "RealTimeProtection: DETECTED APT-signed module in PID {}: {} "
+                    "[stolenCert={} riskScore={} anomalies={}] - image load is "
+                    "notification-only; reported to the SOC, not blocked here",
                     req.processId, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)),
                     sigAnalysis.isStolenCert ? "YES" : "NO",
                     sigAnalysis.riskScore,
@@ -5802,12 +5817,12 @@ public:
                         : "APT.SignatureAnomaly";
                     detection.threatType = "APT";
                     detection.detectionMethod = "DigitalSignatureValidator";
-                    detection.actionTaken = "Blocked";
+                    detection.actionTaken = "Detected";
                     detection.fileHash = Utils::StringUtils::ToNarrow(imagePath);
                     Communication::TelemetryCollector::Instance().RecordDetection(detection);
                 }
 
-                return Communication::KernelVerdict::Block;
+                return Communication::KernelVerdict::Monitor;
             }
 
             // High-risk anomalies (but not critical) → log and flag for deeper scan
@@ -5922,13 +5937,14 @@ public:
                     // Malware-specific packer on DLL load = immediate block
                     if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
                         Utils::Logger::Warn(
-                            "RealTimeProtection: Blocked malware-packed module in PID {}: {} "
-                            "[packer={} severity={} confidence={:.1f}% matches={}]",
+                            "RealTimeProtection: DETECTED malware-packed module in PID {}: {} "
+                            "[packer={} severity={} confidence={:.1f}% matches={}] - reported, "
+                            "not blocked here (image load is notification-only)",
                             req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(packResult.packerName),
                             static_cast<int>(packResult.severity),
                             packResult.packingConfidence * 100.0,
                             packResult.packerMatches.size());
-                        return Communication::KernelVerdict::Block;
+                        return Communication::KernelVerdict::Monitor;
                     }
 
                     if (packResult.packingConfidence > 0.7) {
@@ -5972,8 +5988,9 @@ public:
                         auto driverInfo = ked.ScanDriver(imagePath);
                         if (driverInfo.isVulnerable || driverInfo.isMicrosoftBlocked || driverInfo.isLOLDriver) {
                             Utils::Logger::Error(
-                                "RealTimeProtection: BLOCKED vulnerable driver in PID {}: {} "
-                                "[LOLDriver={} MSBlocked={} sha256={}]",
+                                "RealTimeProtection: DETECTED vulnerable driver in PID {}: {} "
+                                "[LOLDriver={} MSBlocked={} sha256={}] - reported; a driver "
+                                "load cannot be blocked here (image load is notification-only)",
                                 req.processId, Utils::StringUtils::ToNarrow(imagePath),
                                 driverInfo.isLOLDriver ? "YES" : "NO",
                                 driverInfo.isMicrosoftBlocked ? "YES" : "NO",
@@ -5986,7 +6003,7 @@ public:
                                     Exploits::KernelThreatType::VulnerableDriverLoad : Exploits::KernelThreatType::DriverBlocklistViolation));
                                 detection.threatType = "KernelExploit";
                                 detection.detectionMethod = "KernelExploitDetector";
-                                detection.actionTaken = "Blocked";
+                                detection.actionTaken = "Detected";
                                 detection.detectionTime = static_cast<uint64_t>(
                                     std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::system_clock::now().time_since_epoch()).count());
@@ -5995,7 +6012,7 @@ public:
                             }
 
                             m_stats.threatsDetected++;
-                            return Communication::KernelVerdict::Block;
+                            return Communication::KernelVerdict::Monitor;
                         }
 
                         // Check unsigned drivers in strict mode
@@ -6004,10 +6021,11 @@ public:
                             if (currentMode == ProtectionMode::BLOCK_UNKNOWN ||
                                 currentMode == ProtectionMode::BLOCK_SUSPICIOUS) {
                                 Utils::Logger::Warn(
-                                    "RealTimeProtection: Blocked unsigned driver in PID {}: {}",
+                                    "RealTimeProtection: DETECTED unsigned driver in PID {}: {} - "
+                                    "reported, not blocked here (image load is notification-only)",
                                     req.processId, Utils::StringUtils::ToNarrow(imagePath));
                                 m_stats.threatsDetected++;
-                                return Communication::KernelVerdict::Block;
+                                return Communication::KernelVerdict::Monitor;
                             }
                         }
                     }
@@ -6050,10 +6068,11 @@ public:
 
                     auto result = Core::Engine::ScanEngine::Instance().ScanFile(imagePath, context);
                     if (result.verdict == Core::Engine::ScanVerdict::Infected) {
-                        Utils::Logger::Warn("RealTimeProtection: Blocked malicious image load in PID {}: {}",
+                        Utils::Logger::Warn("RealTimeProtection: DETECTED malicious image load in PID {}: {} - "
+                            "reported; blocking happens on the on-access scan of the same file",
                             req.processId, Utils::StringUtils::ToNarrow(imagePath));
                         m_stats.threatsDetected++;
-                        return Communication::KernelVerdict::Block;
+                        return Communication::KernelVerdict::Monitor;
                     }
                 }
             } catch (...) {}

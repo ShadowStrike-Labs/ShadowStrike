@@ -13825,6 +13825,90 @@ class SelfActivityNotFlaggedContractTests(unittest.TestCase):
             "ownHandleOperationsNotFlagged is not declared as an atomic counter")
 
 
+class ImageLoadReportsAreNotBlocksContractTests(unittest.TestCase):
+    """OnKernelImageLoad observes module loads; it cannot block one, so it must
+    not claim it did (task 128).
+
+    PsSetLoadImageNotifyRoutine is notification-only - ImageNotify.c:2154,2341
+    state "callbacks are notification-only ... cannot block loads" - and the
+    dispatcher confirms it end to end: IPCManager's FilterMessageType_ImageLoad
+    case computes a verdict and never sets needsReply, so the reply is never
+    sent and the value is discarded. A handler that logged BLOCKED, recorded
+    actionTaken="Blocked" and returned Block therefore told a SOC that a
+    stolen-certificate APT module had been contained when nothing had touched
+    it. The detection must still fire, count and alert; only the claim must
+    become true. Block -> Monitor changes no enforcement precisely because the
+    verdict is discarded either way - this is a reporting fix, not a coverage
+    change - and the real block of a malicious module is the on-access
+    create/scan path, which sees the same file when it is opened.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        needle = "Communication::KernelVerdict OnKernelImageLoad("
+        assert cpp.count(needle) == 1, (
+            "expected exactly one OnKernelImageLoad definition, found %d"
+            % cpp.count(needle))
+        start = cpp.index(needle)
+        i = cpp.index("{", start)
+        depth = 0
+        while i < len(cpp):
+            if cpp[i] == "{":
+                depth += 1
+            elif cpp[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    cls.body = cpp[start:i + 1]
+                    break
+            i += 1
+        else:
+            raise AssertionError("unterminated OnKernelImageLoad body")
+
+    def test_the_handler_returns_no_block_it_cannot_enforce(self):
+        self.assertEqual(
+            self.body.count("KernelVerdict::Block"), 0,
+            "OnKernelImageLoad still returns Block, but an image-load verdict is "
+            "discarded by the dispatcher (IPCManager never sets needsReply for "
+            "FilterMessageType_ImageLoad) and the kernel callback is "
+            "notification-only, so Block claims an enforcement that never happens")
+
+    def test_no_image_load_detection_is_reported_as_blocked(self):
+        self.assertEqual(
+            self.body.count('actionTaken = "Blocked"'), 0,
+            'a detection on the image-load path records actionTaken="Blocked" '
+            "for an action that cannot occur on this callback")
+        # Shouted BLOCKED and the specific mixed-case "Blocked ..." log claims the
+        # handler used to make. isMicrosoftBlocked / MSBlocked describe the
+        # driver's blocklist STATUS, not an action this product took, so they are
+        # matched exactly rather than by a bare "Blocked" substring.
+        self.assertNotIn(
+            "BLOCKED", self.body,
+            "the image-load handler still logs BLOCKED for a load it cannot block")
+        for claim in ("Blocked malware-packed", "Blocked unsigned driver",
+                      "Blocked malicious image load"):
+            self.assertNotIn(
+                claim, self.body,
+                "the image-load handler still logs %r for a load it cannot block"
+                % claim)
+
+    def test_the_detections_still_fire_and_are_reported_as_detected(self):
+        # The fix corrects the claim; it must not delete coverage. The two
+        # telemetry records (APT stolen-cert / anomaly, and the vulnerable-driver
+        # identification) must survive, now reporting what actually happened.
+        self.assertIn(
+            "APT.StolenCert.", self.body,
+            "the stolen-certificate identification was removed, not relabelled")
+        self.assertGreaterEqual(
+            self.body.count("RecordDetection("), 2,
+            "the image-load detections no longer record telemetry, so the "
+            "detection was discarded rather than reported")
+        self.assertGreaterEqual(
+            self.body.count('actionTaken = "Detected"'), 2,
+            "the image-load detections must report what actually happened: "
+            "detected and reported, not blocked")
+
+
 class HoneypotDeploymentContractTests(unittest.TestCase):
     """A decoy must be created with the one operation that is allowed to succeed.
 
