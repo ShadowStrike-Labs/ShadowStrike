@@ -2213,7 +2213,66 @@ PsipIsWindowsServicingDeletion(
 }
 
 /**
- * @brief TRUE if Path lies under the product's own registered install tree.
+ * @brief TRUE if Path is at or below a registered install-tree prefix: any file
+ *        or subdirectory within the tree, OR the tree's own root directory node.
+ *
+ * The registered prefix is a directory prefix ending in a backslash (the setter
+ * requires it), e.g. \??\C:\...\Phantom\ . RtlPrefixUnicodeString recognizes
+ * every descendant of that - \??\C:\...\Phantom\Drivers, ...\Phantom\foo.exe -
+ * but NOT the root itself: a delete or rename of the directory names it WITHOUT
+ * a trailing backslash (\??\C:\...\Phantom), one WCHAR shorter than the prefix,
+ * so the descendant test alone leaves the product's own install root outside the
+ * match. That gap denied the uninstaller the one directory it could never
+ * remove: the self-protect path blocked RemoveDirectory on the install root with
+ * ACCESS_DENIED while every file and subdirectory under it was removed (task 322,
+ * VM-measured: 42x error 5 on ...\Phantom\, the lone empty folder left behind;
+ * the parent ...\ShadowStrike then survived only because it still held Phantom).
+ *
+ * The exact-root test closes that boundary: compare Path for equality against the
+ * prefix with its single trailing separator removed. Equality, not a prefix, so
+ * only the root node is added and a sibling such as ...\PhantomData does not
+ * match. Pure structural string compares (RtlPrefixUnicodeString /
+ * RtlEqualUnicodeString) over the non-paged global prefix, so callable at any
+ * IRQL. Case-insensitive, like every path compare here.
+ */
+static BOOLEAN
+PsipPathMatchesInstallTreePrefix(
+    _In_ PCUNICODE_STRING Prefix,
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    UNICODE_STRING root;
+
+    if (Prefix->Length < sizeof(WCHAR)) {
+        return FALSE;
+    }
+
+    //
+    // Descendant: a path at or below the prefix (any file or subdirectory).
+    //
+    if (RtlPrefixUnicodeString(Prefix, Path, TRUE)) {
+        return TRUE;
+    }
+
+    //
+    // Exact root node: the prefix ends in a backslash; the root directory names
+    // itself without one, so match Path against the prefix minus that separator.
+    //
+    if (Prefix->Buffer[Prefix->Length / sizeof(WCHAR) - 1] == L'\\') {
+        root.Buffer        = Prefix->Buffer;
+        root.Length        = (USHORT)(Prefix->Length - sizeof(WCHAR));
+        root.MaximumLength = root.Length;
+        if (root.Length > 0 && RtlEqualUnicodeString(&root, Path, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
+ * @brief TRUE if Path is at or below the product's own registered install tree -
+ *        any file or subdirectory within it, or the tree's own root directory.
  *
  * The product's LocalSystem service registers the tree once per boot
  * (ShadowStrikeRegisterProductInstallTree) in the two forms a SetInformation
@@ -2223,9 +2282,12 @@ PsipIsWindowsServicingDeletion(
  * the operation is inside the product's own folder; combined with the
  * Windows-signer gate in PsipIsInstallerTransactionOperation that is the
  * product's own msiexec servicing its own files (it renames each in place to a
- * TBD*.tmp during uninstall), not ransomware touching user data. Lock-free: a
- * tree mid-re-registration (Valid == 0) declines here and the operation is
- * judged by the ordinary rules. Case-insensitive, like every path compare here.
+ * TBD*.tmp during uninstall), not ransomware touching user data. The per-prefix
+ * test is PsipPathMatchesInstallTreePrefix, which matches every descendant AND
+ * the exact root node, so the uninstaller can remove the install root directory
+ * itself and not only its contents (task 322). Lock-free: a tree
+ * mid-re-registration (Valid == 0) declines here and the operation is judged by
+ * the ordinary rules. Case-insensitive, like every path compare here.
  */
 static BOOLEAN
 PsipPathIsUnderProductInstallTree(
@@ -2252,7 +2314,7 @@ PsipPathIsUnderProductInstallTree(
         prefix.Buffer        = (PWCH)g_ProductInstallTree.DeviceForm;
         prefix.Length        = g_ProductInstallTree.DeviceFormLength;
         prefix.MaximumLength = g_ProductInstallTree.DeviceFormLength;
-        if (RtlPrefixUnicodeString(&prefix, Path, TRUE)) {
+        if (PsipPathMatchesInstallTreePrefix(&prefix, Path)) {
             return TRUE;
         }
     }
@@ -2261,7 +2323,7 @@ PsipPathIsUnderProductInstallTree(
         prefix.Buffer        = (PWCH)g_ProductInstallTree.DosForm;
         prefix.Length        = g_ProductInstallTree.DosFormLength;
         prefix.MaximumLength = g_ProductInstallTree.DosFormLength;
-        if (RtlPrefixUnicodeString(&prefix, Path, TRUE)) {
+        if (PsipPathMatchesInstallTreePrefix(&prefix, Path)) {
             return TRUE;
         }
     }

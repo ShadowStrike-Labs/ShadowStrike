@@ -108,6 +108,39 @@ class SelfProtectInstallerExemptionContract(unittest.TestCase):
             "the exemption must NOT accept a third-party Authenticode signer; the "
             "gate is Windows Code Integrity only")
 
+    def _install_tree_match(self) -> str:
+        # The per-prefix matcher and the membership test that calls it. The
+        # matcher name appears first at its definition (no forward declaration);
+        # the slice runs to the next sibling, PsipPathHasVolumeRootConfigMsi.
+        start = self.psi.index("PsipPathMatchesInstallTreePrefix")
+        end = self.psi.index("PsipPathHasVolumeRootConfigMsi", start)
+        return self.psi[start:end]
+
+    def test_install_tree_match_covers_the_root_node(self) -> None:
+        # The registered install-tree prefix ends in a backslash (a directory
+        # prefix). A delete/rename of the install ROOT directory names it without
+        # one, so a descendant-only match left the uninstaller unable to remove
+        # the product's own root folder: the self-protect path blocked it with
+        # ACCESS_DENIED and an empty orphan survived (task 322, VM-measured 42x
+        # error 5 on ...\Phantom\). The membership test must match BOTH a
+        # descendant and the exact root node.
+        fn = self._install_tree_match()
+        self.assertIn(
+            "RtlPrefixUnicodeString", fn,
+            "the descendant match (any file/subdirectory inside the tree) must "
+            "remain")
+        self.assertIn(
+            "RtlEqualUnicodeString", fn,
+            "the install-tree match must ALSO recognize the root directory node "
+            "by exact equality; without it the self-protect path blocks the "
+            "uninstaller's RemoveDirectory on the install root and leaves an "
+            "empty orphan (task 322)")
+        self.assertIn(
+            "sizeof(WCHAR)", fn,
+            "the root node is the registered prefix with its single trailing "
+            "separator removed (PrefixLength - sizeof(WCHAR)); exact equality "
+            "against that adds only the root, never a sibling path")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

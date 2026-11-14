@@ -28208,11 +28208,19 @@ class ProductInstallTreeExemptionTests(unittest.TestCase):
         self.assertIn("return FALSE;", self.match[v:first_read])
 
     def test_matcher_checks_both_registered_forms_as_case_insensitive_prefixes(self):
+        # The membership test runs BOTH registered forms (device + DOS) through
+        # the per-prefix matcher; the matcher does the case-insensitive prefix
+        # compare. (The compare moved into PsipPathMatchesInstallTreePrefix when
+        # the root-node match was added for task 322, but both forms are still
+        # tested and still case-insensitively.)
         self.assertIn("g_ProductInstallTree.DeviceForm", self.match)
         self.assertIn("g_ProductInstallTree.DosForm", self.match)
-        self.assertEqual(self.match.count("RtlPrefixUnicodeString"), 2,
-            "both the device and the DOS prefix must be prefix-tested")
-        self.assertEqual(self.match.count(", TRUE)"), 2, "both compares are case-insensitive")
+        self.assertEqual(self.match.count("PsipPathMatchesInstallTreePrefix(&prefix, Path)"), 2,
+            "both the device and the DOS form must be run through the prefix matcher")
+        matcher = _psi_function(self.psi, "PsipPathMatchesInstallTreePrefix")
+        self.assertTrue(matcher, "PsipPathMatchesInstallTreePrefix body not found")
+        self.assertIn("RtlPrefixUnicodeString(Prefix, Path, TRUE)", matcher,
+            "the descendant prefix compare must be case-insensitive")
 
     def test_setter_requires_a_real_directory_prefix(self):
         # Leading AND trailing backslash plus a length floor: a namespace root such
