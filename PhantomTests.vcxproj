@@ -594,6 +594,7 @@
     <ClCompile Include="tests\unit\core_engine_unit\EmulationEngine_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\MachineLearningDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\PackerUnpacker_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\QuarantineTermination_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\PolymorphicDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\SandboxAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\ThreatDetector_Tests.cpp" />

@@ -332,6 +332,11 @@ namespace {
 [[nodiscard]] bool CanTerminateProcess(uint32_t processId) noexcept {
     if (processId == 0 || processId == 4) return false; // System/Idle
 
+    // Never this process. Quarantining a file this process holds open - the
+    // 1.0.133 VM run convicted the service's own executable (task 385) - must
+    // report the lock, not terminate the product.
+    if (processId == ::GetCurrentProcessId()) return false;
+
     try {
         // Use ProcessUtils to check if this is a system process
         ProcessUtils::ProcessSecurityInfo secInfo{};
@@ -938,9 +943,16 @@ public:
 
             for (auto& proc : processes) {
                 if (!proc.canTerminate) {
-                    SS_LOG_WARN(L"QuarantineManager",
-                        L"QuarantineManager: Cannot terminate system process: %ls (PID %u)",
-                        proc.processName.c_str(), proc.processId);
+                    if (proc.processId == ::GetCurrentProcessId()) {
+                        SS_LOG_WARN(L"QuarantineManager",
+                            L"QuarantineManager: The file is held open by this process itself "
+                            L"(PID %u); not terminating the product",
+                            proc.processId);
+                    } else {
+                        SS_LOG_WARN(L"QuarantineManager",
+                            L"QuarantineManager: Cannot terminate system process: %ls (PID %u)",
+                            proc.processName.c_str(), proc.processId);
+                    }
                     continue;
                 }
 
