@@ -13909,6 +13909,59 @@ class ImageLoadReportsAreNotBlocksContractTests(unittest.TestCase):
             "detected and reported, not blocked")
 
 
+class ProcNotifyPreBudgetCostMeasuredContractTests(unittest.TestCase):
+    """The two unbounded stages that run before any deadline must be measured
+    (task 185).
+
+    AntiDebug::OnKernelProcessNotify and CertificateValidator::OnKernelProcess-
+    Create both run on OnKernelProcessNotify - the callback the kernel blocks
+    CreateProcess on - before the reply horizon exists, and the certificate
+    stage opens the image to build a chain on every creation. The fix (an
+    internal deadline, moving the work to a worker, or documenting it as cheap)
+    cannot be chosen until the per-creation cost is known, so this pins the
+    measurement against being silently dropped. It asserts nothing about the
+    values, which only a field run supplies, and nothing about the stages being
+    gated - they deliberately are not.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_CPP_PATH))
+        cls.hpp = strip_c_comments(read_source(REAL_TIME_PROTECTION_HPP_PATH))
+
+    def test_both_pre_budget_stages_are_timed(self):
+        for counter in ("antiDebugProcNotifyCount", "certProcCreateCount"):
+            self.assertIn(
+                counter + ".fetch_add", self.cpp,
+                "%s is never incremented, so the pre-budget stage it measures is "
+                "not timed on the process-notify callback (task 185)" % counter)
+
+    def test_both_stages_record_the_worst_case_not_only_an_average(self):
+        # The worst case is the freeze-relevant number: an average hides the tail
+        # latency that wedges the callback the kernel is waiting on.
+        for counter in ("antiDebugProcNotifyMaxUs", "certProcCreateMaxUs"):
+            self.assertIn(
+                counter + ".compare_exchange_weak", self.cpp,
+                "%s is not advanced as a high-water mark, so the worst-case cost "
+                "- the one that matters for a freeze - is not captured" % counter)
+
+    def test_the_measurement_is_declared_reported_and_reset(self):
+        for field in ("antiDebugProcNotifyCount", "antiDebugProcNotifyTotalUs",
+                      "antiDebugProcNotifyMaxUs", "certProcCreateCount",
+                      "certProcCreateTotalUs", "certProcCreateMaxUs"):
+            self.assertIn(
+                "std::atomic<uint64_t> " + field, self.hpp,
+                "%s is not declared as an atomic counter in RTPStatistics" % field)
+            self.assertIn(
+                field + " = 0;", self.cpp,
+                "%s is not zeroed in RTPStatistics::Reset, so it survives a reset "
+                "and corrupts any post-reset average" % field)
+        self.assertIn(
+            "procNotifyPreBudgetUs", self.cpp,
+            "the periodic report does not surface the pre-budget stage cost, so "
+            "the measurement never reaches the collected service log")
+
+
 class HoneypotDeploymentContractTests(unittest.TestCase):
     """A decoy must be created with the one operation that is allowed to succeed.
 

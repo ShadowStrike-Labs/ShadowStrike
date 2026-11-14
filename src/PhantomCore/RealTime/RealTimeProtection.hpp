@@ -1110,6 +1110,22 @@ struct alignas(64) RTPStatistics {
     ///        question it exists for.
     std::atomic<uint64_t> processNotifyReplyHorizonExceeded{ 0 };
 
+    /// @brief Cost of the two UNBOUNDED stages that run on OnKernelProcessNotify
+    ///        BEFORE any deadline exists (task 185): AntiDebug::OnKernelProcess-
+    ///        Notify, and CertificateValidator::OnKernelProcessCreate - the
+    ///        latter opens the process image to build a certificate chain on
+    ///        EVERY creation, on the callback the kernel blocks CreateProcess on.
+    ///        Recorded as count, summed microseconds and worst-case microseconds
+    ///        per stage, so a field run can choose between an internal deadline,
+    ///        moving the work to a worker, or accepting it as measured-cheap.
+    ///        MEASUREMENT ONLY: neither stage is gated or changed by this.
+    std::atomic<uint64_t> antiDebugProcNotifyCount{ 0 };
+    std::atomic<uint64_t> antiDebugProcNotifyTotalUs{ 0 };
+    std::atomic<uint64_t> antiDebugProcNotifyMaxUs{ 0 };
+    std::atomic<uint64_t> certProcCreateCount{ 0 };
+    std::atomic<uint64_t> certProcCreateTotalUs{ 0 };
+    std::atomic<uint64_t> certProcCreateMaxUs{ 0 };
+
     /**
      * @brief Blocks a registrant asked for on process TERMINATION, which cannot
      *        be honoured.

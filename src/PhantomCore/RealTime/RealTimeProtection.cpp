@@ -4574,11 +4574,27 @@ public:
         if (Security::AntiDebug::HasInstance() &&
             Security::AntiDebug::Instance().IsInitialized()) {
             try {
+                // Task 185: measure this UNBOUNDED pre-budget stage's cost per
+                // creation. Measurement only - the stage is neither gated nor
+                // moved; that decision waits on these numbers.
+                const auto adStart = std::chrono::steady_clock::now();
                 SS_DIAG_SCOPE("ProcNotify", req.isCreation ? "antidebug-create"
                                                            : "antidebug-exit");
                 Security::AntiDebug::Instance().OnKernelProcessNotify(
                     req.processId, req.parentProcessId,
                     imagePath, static_cast<bool>(req.isCreation));
+                {
+                    const uint64_t us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - adStart).count());
+                    m_stats.antiDebugProcNotifyCount.fetch_add(1, std::memory_order_relaxed);
+                    m_stats.antiDebugProcNotifyTotalUs.fetch_add(us, std::memory_order_relaxed);
+                    uint64_t prev = m_stats.antiDebugProcNotifyMaxUs.load(std::memory_order_relaxed);
+                    while (us > prev &&
+                           !m_stats.antiDebugProcNotifyMaxUs.compare_exchange_weak(
+                               prev, us, std::memory_order_relaxed)) {
+                    }
+                }
             } catch (const std::exception& e) {
                 Utils::Logger::Warn("RealTimeProtection: AntiDebug process notify exception: {}",
                     e.what());
@@ -4593,9 +4609,25 @@ public:
             Security::CertificateValidator::HasInstance() &&
             Security::CertificateValidator::Instance().IsInitialized()) {
             try {
+                // Task 185: measure this UNBOUNDED pre-budget stage's cost per
+                // creation. It opens the image and builds a certificate chain on
+                // every process creation. Measurement only - not gated or moved.
+                const auto cvStart = std::chrono::steady_clock::now();
                 SS_DIAG_SCOPE("ProcNotify", "certvalidator-create");
                 Security::CertificateValidator::Instance().OnKernelProcessCreate(
                     req.processId, req.parentProcessId, imagePath);
+                {
+                    const uint64_t us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - cvStart).count());
+                    m_stats.certProcCreateCount.fetch_add(1, std::memory_order_relaxed);
+                    m_stats.certProcCreateTotalUs.fetch_add(us, std::memory_order_relaxed);
+                    uint64_t prev = m_stats.certProcCreateMaxUs.load(std::memory_order_relaxed);
+                    while (us > prev &&
+                           !m_stats.certProcCreateMaxUs.compare_exchange_weak(
+                               prev, us, std::memory_order_relaxed)) {
+                    }
+                }
             } catch (const std::exception& e) {
                 Utils::Logger::Warn("RealTimeProtection: CertificateValidator process create exception: {}",
                     e.what());
@@ -8159,6 +8191,14 @@ public:
                     ds.TxScanSendDeadlineOverruns);
             }
         }
+        const uint64_t adN   = m_stats.antiDebugProcNotifyCount.load(std::memory_order_relaxed);
+        const uint64_t adTot = m_stats.antiDebugProcNotifyTotalUs.load(std::memory_order_relaxed);
+        const uint64_t adMax = m_stats.antiDebugProcNotifyMaxUs.load(std::memory_order_relaxed);
+        const uint64_t adAvg = adN ? (adTot / adN) : 0ull;
+        const uint64_t cvN   = m_stats.certProcCreateCount.load(std::memory_order_relaxed);
+        const uint64_t cvTot = m_stats.certProcCreateTotalUs.load(std::memory_order_relaxed);
+        const uint64_t cvMax = m_stats.certProcCreateMaxUs.load(std::memory_order_relaxed);
+        const uint64_t cvAvg = cvN ? (cvTot / cvN) : 0ull;
         const auto line = std::format(
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
             "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
@@ -8173,12 +8213,14 @@ public:
             "defenderOperationalWritesIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
             "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={} "
+            "| procNotifyPreBudgetUs avgMax(n): antidebug={}/{}({}) certvalidator={}/{}({}) "
             "| {}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
             exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, defenderOpWrites, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
+            adAvg, adMax, adN, cvAvg, cvMax, cvN,
             kernelPart);
 
         if (newDeepDrops > 0) {
@@ -8768,6 +8810,12 @@ void RTPStatistics::Reset() noexcept {
     defenderOperationalWritesIgnored = 0;
     processBlocksWithheldByMode = 0;
     ownBinaryBlockWithheld = 0;
+    antiDebugProcNotifyCount = 0;
+    antiDebugProcNotifyTotalUs = 0;
+    antiDebugProcNotifyMaxUs = 0;
+    certProcCreateCount = 0;
+    certProcCreateTotalUs = 0;
+    certProcCreateMaxUs = 0;
     excludedByPath = 0;
     excludedByExtension = 0;
     excludedByProcess = 0;
