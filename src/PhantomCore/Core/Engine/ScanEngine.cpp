@@ -746,12 +746,17 @@ public:
 
             // Initialize WhitelistStore (Bloom Filter + Trie + Certificates)
             //
-            // This is the engine's cheapest decision: a hit costs a bloom-filter
-            // probe (sub-microsecond) and lets a known-good file skip the entire
-            // heavy pipeline. With the store closed - which is what happened
-            // while this path was never given a database - every clean file on
-            // the machine paid full analysis, so the missing whitelist was a
-            // performance defect as much as a correctness one.
+            // Stage 1's hash and path lookups are the engine's cheapest decision:
+            // a hit costs a bloom-filter probe (sub-microsecond) and lets a
+            // known-good file skip the heavy pipeline. That fast path is real but
+            // UNPOPULATED on this build - the only seeder is SeedTrustedPublishers
+            // (24 publisher entries), and Stage 1 queries the hash and path
+            // indexes, not publishers, so no file actually takes it yet (see the
+            // Stage 1 comment on why a publisher check does not belong there). What
+            // opening the store buys today is therefore CORRECTNESS, not speed: the
+            // publisher entries feed EvaluatePublisherTrust, the conviction-time
+            // false-positive brake, and a closed store loses that too - which is
+            // what happened while this path was never given a database.
             if (!m_config.whitelistDbPath.empty()) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing WhitelistStore at %hs",
                     StringUtils::ToNarrow(m_config.whitelistDbPath).c_str());
