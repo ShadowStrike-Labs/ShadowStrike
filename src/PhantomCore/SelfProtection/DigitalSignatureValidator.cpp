@@ -2064,6 +2064,32 @@ private:
         return result;
     }
 
+    // Which call in a catalog lookup failed (task 373). The Win32 code alone was
+    // ambiguous: the 1.0.133 run logged 147 lookups failing with 1006
+    // (ERROR_FILE_INVALID) and nothing said whether opening, hashing or
+    // enumerating the file had refused it, because every step writes the same
+    // out-parameter.
+    enum class CatalogLookupStep : uint8_t {
+        None,
+        OpenFile,
+        AcquireContext,
+        CalcHash,
+        EnumCatalog,
+        CatalogInfo,
+    };
+
+    [[nodiscard]] static const char* CatalogLookupStepName(CatalogLookupStep step) noexcept {
+        switch (step) {
+            case CatalogLookupStep::OpenFile:       return "open";
+            case CatalogLookupStep::AcquireContext: return "acquire-context";
+            case CatalogLookupStep::CalcHash:       return "calc-hash";
+            case CatalogLookupStep::EnumCatalog:    return "enum-catalog";
+            case CatalogLookupStep::CatalogInfo:    return "catalog-info";
+            case CatalogLookupStep::None:           break;
+        }
+        return "unknown";
+    }
+
     // Computes the *catalog-membership hash* Windows keys its security catalogs
     // by -- the PE/Authenticode hash produced by CryptCATAdminCalcHashFromFileHandle
     // /2, NOT a flat whole-file digest. This is the ONLY hash that matches
@@ -2075,10 +2101,14 @@ private:
     [[nodiscard]] bool computeCatalogMembershipHash(
         const std::wstring& filePath,
         std::vector<BYTE>& outHash,
-        DWORD& outError
+        DWORD& outError,
+        CatalogLookupStep* outStep = nullptr
     ) noexcept {
         outHash.clear();
         outError = ERROR_SUCCESS;
+        const auto failedAt = [outStep](CatalogLookupStep step) noexcept {
+            if (outStep != nullptr) *outStep = step;
+        };
 
         // FILE_SHARE_WRITE as well: without it the open fails with a sharing
         // violation whenever another process holds the file for writing, and that
@@ -2088,6 +2118,7 @@ private:
             FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) {
             outError = GetLastError();
+            failedAt(CatalogLookupStep::OpenFile);
             return false;
         }
 
@@ -2099,6 +2130,7 @@ private:
             useV2 = false;
             if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
                 outError = GetLastError();
+                failedAt(CatalogLookupStep::AcquireContext);
                 CloseHandle(hFile);
                 return false;
             }
@@ -2116,6 +2148,7 @@ private:
 
         if (!calcOk || hashLen == 0) {
             outError = calcOk ? ERROR_INVALID_DATA : calcError;
+            failedAt(CatalogLookupStep::CalcHash);
             return false;
         }
         outHash.assign(hashBytes, hashBytes + hashLen);
@@ -2133,12 +2166,16 @@ private:
         const std::wstring& filePath,
         std::wstring& outCatalogPath,
         std::vector<BYTE>& outHash,
-        DWORD& outError
+        DWORD& outError,
+        CatalogLookupStep* outStep = nullptr
     ) noexcept {
         outCatalogPath.clear();
         outError = ERROR_SUCCESS;
+        const auto failedAt = [outStep](CatalogLookupStep step) noexcept {
+            if (outStep != nullptr) *outStep = step;
+        };
 
-        if (!computeCatalogMembershipHash(filePath, outHash, outError) || outHash.empty()) {
+        if (!computeCatalogMembershipHash(filePath, outHash, outError, outStep) || outHash.empty()) {
             if (outError == ERROR_SUCCESS) outError = ERROR_INVALID_DATA;
             return CatalogLookup::Failed;
         }
@@ -2151,6 +2188,7 @@ private:
                                           BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
             if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
                 outError = GetLastError();
+                failedAt(CatalogLookupStep::AcquireContext);
                 return CatalogLookup::Failed;
             }
         }
@@ -2166,11 +2204,15 @@ private:
                 outcome = CatalogLookup::Member;
             } else {
                 outError = GetLastError();
+                failedAt(CatalogLookupStep::CatalogInfo);
             }
             CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
         } else {
             outError = GetLastError();
             outcome = ClassifyCatalogEnumMiss(outError);
+            if (outcome == CatalogLookup::Failed) {
+                failedAt(CatalogLookupStep::EnumCatalog);
+            }
         }
 
         CryptCATAdminReleaseContext(hCatAdmin, 0);
@@ -2187,13 +2229,16 @@ private:
         std::wstring catalogPath;
         std::vector<BYTE> catHash;
         DWORD lookupError = ERROR_SUCCESS;
-        const CatalogLookup lookup = resolveCatalogForFile(filePath, catalogPath, catHash, lookupError);
+        CatalogLookupStep failedStep = CatalogLookupStep::None;
+        const CatalogLookup lookup =
+            resolveCatalogForFile(filePath, catalogPath, catHash, lookupError, &failedStep);
         if (lookup == CatalogLookup::Failed) {
             // No answer is not a verdict: Error is neither cached nor read as Unsigned,
             // and trust consumers fail closed on it (task 373).
             m_stats.catalogLookupFailed++;
             m_stats.catalogLookupLastError.store(lookupError, std::memory_order_relaxed);
-            SS_LOG_INFO(LOG_CATEGORY, L"Catalog lookup failed (Win32 %lu), no verdict: %ls",
+            SS_LOG_INFO(LOG_CATEGORY, L"Catalog lookup failed at %hs (Win32 %lu), no verdict: %ls",
+                        CatalogLookupStepName(failedStep),
                         static_cast<unsigned long>(lookupError), filePath.c_str());
             result.result = SignatureValidationResult::Error;
             result.errorMessage = "Catalog lookup failed";
