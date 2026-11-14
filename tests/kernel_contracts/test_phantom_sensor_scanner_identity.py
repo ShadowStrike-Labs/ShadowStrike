@@ -27460,15 +27460,25 @@ class BlockedAttachmentIsReportableContractTests(unittest.TestCase):
             "attachment is blocked while appearing in neither suspiciousDetected nor "
             "cleanDetected and totalScans stops reconciling with them")
 
-    def test_the_band_thresholds_are_unchanged(self):
-        """A visibility fix must not become a threshold change."""
+    def test_the_band_thresholds_hold_and_the_shouldblock_floor_tracks_them(self):
+        """The content-risk band boundaries hold; the ShouldBlock floor tracks the band floor.
+
+        task 272 relabelled the 50-79 band from HighRisk to Suspicious and moved ShouldBlock's
+        Suspicious floor from 70 to 50 so that range still blocks. The band boundaries (80 and
+        50) did not move, and before the move no Suspicious verdict was below 70 (nested archive
+        >=70, macro >=80, the >=80 band), so enforcement is unchanged - only the label and the
+        floor that reads it.
+        """
         source = self._impl_source()
         self.assertIn("result.riskScore >= 80", source,
-                      "the suspicious risk band boundary moved")
+                      "the upper content-risk band boundary moved")
         self.assertIn("result.riskScore >= 50", source,
-                      "the high-risk band boundary moved")
-        self.assertIn("riskScore >= 70", source,
-                      "the ShouldBlock risk boundary for a suspicious verdict moved")
+                      "the lower content-risk band boundary moved")
+        self.assertIn("AttachmentVerdict::Suspicious && riskScore >= 50", source,
+                      "the ShouldBlock floor for a Suspicious verdict is not the 50 band floor")
+        self.assertNotIn("riskScore >= 70", source,
+                         "a stale ShouldBlock floor of 70 remains; the 50-69 band would stop "
+                         "blocking now that it is Suspicious rather than HighRisk")
 
 
 class RecommendationIdentityContractTests(unittest.TestCase):

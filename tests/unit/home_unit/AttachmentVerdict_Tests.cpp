@@ -19,11 +19,12 @@
  * email. The set of blocking verdicts is asserted explicitly so that adding a fourth one forces a
  * decision about notifying on it, rather than repeating the same omission.
  *
- * The 70 boundary inside ShouldBlock is asserted from both sides. Note it is currently unreachable
- * from the risk-band path, because that path only assigns Suspicious at 80 or above - the clause may
- * still be live via the macro and obfuscation checks earlier in the scan. That is filed rather than
- * assumed dead, and the case below pins the predicate's own behaviour regardless of which callers
- * reach it.
+ * The 50 boundary inside ShouldBlock is asserted from both sides. It is the floor of the
+ * content-risk band: AnalyzeAttachment assigns Suspicious at 50 and above, and the 50-79 range -
+ * once mislabelled HighRisk to force it to block - is now Suspicious and blocks via this floor
+ * (task 272). Every other Suspicious verdict (nested archive >=70, macro >=80) is already above
+ * the floor, so the move from 70 to 50 changed no existing outcome. The case below pins the
+ * predicate's own behaviour regardless of which callers reach it.
  */
 
 #include "pch.h"
@@ -66,13 +67,17 @@ TEST(AttachmentVerdictTest, HighRiskBlocksWithoutBeingMalicious) {
         << "HighRisk is reported as confirmed malware, which overstates what was detected";
 }
 
-TEST(AttachmentVerdictTest, SuspiciousBlocksOnlyAboveTheRiskBoundary) {
+TEST(AttachmentVerdictTest, SuspiciousBlocksAtOrAboveTheContentRiskBandFloor) {
     // Asserted from both sides so a one-point move in the boundary fails here rather than silently
-    // changing which attachments are delivered.
-    EXPECT_FALSE(ResultWith(AttachmentVerdict::Suspicious, 69).ShouldBlock())
-        << "a suspicious attachment at risk 69 was blocked";
-    EXPECT_TRUE(ResultWith(AttachmentVerdict::Suspicious, 70).ShouldBlock())
-        << "a suspicious attachment at exactly risk 70 was delivered";
+    // changing which attachments are delivered. task 272: the floor is 50, the point where
+    // AnalyzeAttachment starts assigning Suspicious; the 50-79 range (formerly mislabelled HighRisk)
+    // still blocks through it.
+    EXPECT_FALSE(ResultWith(AttachmentVerdict::Suspicious, 49).ShouldBlock())
+        << "a suspicious attachment below the 50 band floor must be delivered";
+    EXPECT_TRUE(ResultWith(AttachmentVerdict::Suspicious, 50).ShouldBlock())
+        << "the relabelled 50-79 content-risk band stopped blocking";
+    EXPECT_TRUE(ResultWith(AttachmentVerdict::Suspicious, 69).ShouldBlock())
+        << "a suspicious attachment at risk 69 was delivered; this range used to block as HighRisk";
 }
 
 TEST(AttachmentVerdictTest, TheBlockingVerdictsAreExactlyThoseExpected) {

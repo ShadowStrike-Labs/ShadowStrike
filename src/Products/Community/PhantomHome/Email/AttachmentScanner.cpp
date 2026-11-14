@@ -328,9 +328,16 @@ using Json = Utils::JSON::Json;
 }
 
 [[nodiscard]] bool AttachmentScanResult::ShouldBlock() const noexcept {
+    // A Suspicious verdict blocks at or above the content-risk band floor of 50, which is
+    // where AnalyzeAttachment starts assigning Suspicious. The floor was 70 while the 50-79
+    // band was mislabelled HighRisk to force it to block (task 272); now that the band is
+    // Suspicious the floor moves to 50, so the same range still blocks and nothing else
+    // changes - every other Suspicious verdict (nested archive riskScore>=70, macro>=80) is
+    // already above 50. HighRisk here is the dangerous-file-TYPE verdict from the extension
+    // check and blocks on its own.
     return verdict == AttachmentVerdict::Malicious ||
            verdict == AttachmentVerdict::HighRisk ||
-           (verdict == AttachmentVerdict::Suspicious && riskScore >= 70);
+           (verdict == AttachmentVerdict::Suspicious && riskScore >= 50);
 }
 
 [[nodiscard]] std::string AttachmentScanResult::ToJson() const {
@@ -987,13 +994,14 @@ public:
                     result.verdict = AttachmentVerdict::Suspicious;
                     m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
                 } else if (result.riskScore >= 50) {
-                    result.verdict = AttachmentVerdict::HighRisk;
-                    // This band BLOCKS, because ShouldBlock() includes HighRisk, so it must
-                    // also be counted. Without this the attachment is blocked while
-                    // appearing in neither suspiciousDetected nor cleanDetected, and
-                    // totalScans stops reconciling with the detection counters. The verdict
-                    // itself is deliberately left as HighRisk: reassigning it to Suspicious
-                    // would stop the 50-69 range blocking at all, which is a weakening.
+                    result.verdict = AttachmentVerdict::Suspicious;
+                    // task 272: this is a CONTENT-risk score band, not a high-risk file
+                    // TYPE, so it is Suspicious - HighRisk is reserved for dangerous
+                    // extensions (set at the extension check above), which is what that
+                    // verdict's "High-risk file type" documentation means. It still blocks:
+                    // ShouldBlock treats a Suspicious verdict at or above the 50 band floor
+                    // as blocking, so relabelling it does not weaken the 50-69 range the way
+                    // reassigning it would have while ShouldBlock's floor was still 70.
                     m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     m_stats.cleanDetected.fetch_add(1, std::memory_order_relaxed);
