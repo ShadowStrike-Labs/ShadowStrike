@@ -24,7 +24,12 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SCAN_ROOTS = [ROOT / "src", ROOT / "PhantomSensor"]
+# Every first-party C/C++ tree compiled into a shipped binary. PhantomEmulator and
+# PhantomDisassembler are compiled into PhantomCoreLib, and the emulator's built-in
+# pattern table held the second copy of the token that 843374b6 missed by scanning
+# src/ alone.
+SCAN_ROOTS = [ROOT / "src", ROOT / "PhantomSensor", ROOT / "PhantomEmulator",
+              ROOT / "PhantomDisassembler"]
 SUFFIXES = {".c", ".cpp", ".h", ".hpp", ".inl"}
 INJECTION_CPP = ROOT / "src/PhantomCore/Core/Process/ProcessInjectionDetector.cpp"
 

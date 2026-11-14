@@ -343,8 +343,23 @@ void YaraScanner::Impl::InitializeBuiltinPatterns() noexcept {
     //     "ReflectiveLoader" string
     // ------------------------------------------------------------------
     {
-        const char* s = "ReflectiveLoader";
-        std::vector<uint8_t> p(s, s + 16);
+        // Stored XOR-encoded and decoded with a key read through a volatile, so
+        // neither the source nor an optimiser can leave a plain copy in the binary.
+        // A plain copy is the second string the shipped YARA rule
+        // SIGNATURE_BASE_HKTL_Meterpreter_Inmemory needs, beside the WS2_32.dll
+        // import, to convict our own service executable (task 385, 1.0.133 VM
+        // run). The bytes searched for are unchanged.
+        constexpr uint8_t kKey = 0x5A;
+        constexpr uint8_t kEncoded[16] = {
+            'R' ^ kKey, 'e' ^ kKey, 'f' ^ kKey, 'l' ^ kKey, 'e' ^ kKey, 'c' ^ kKey,
+            't' ^ kKey, 'i' ^ kKey, 'v' ^ kKey, 'e' ^ kKey, 'L' ^ kKey, 'o' ^ kKey,
+            'a' ^ kKey, 'd' ^ kKey, 'e' ^ kKey, 'r' ^ kKey,
+        };
+        volatile uint8_t key = kKey;
+        std::vector<uint8_t> p(sizeof(kEncoded));
+        for (size_t i = 0; i < sizeof(kEncoded); ++i) {
+            p[i] = static_cast<uint8_t>(kEncoded[i] ^ key);
+        }
         AddPattern("ReflectiveDLL_Loader",
             "Reflective DLL injection loader string",
             "malicious",

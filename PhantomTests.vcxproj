@@ -592,6 +592,7 @@
     <!-- core_engine_unit -->
     <ClCompile Include="tests\unit\core_engine_unit\BehaviorAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\EmulationEngine_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\EmulatorBuiltinPatterns_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\MachineLearningDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\PackerUnpacker_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\QuarantineTermination_Tests.cpp" />
