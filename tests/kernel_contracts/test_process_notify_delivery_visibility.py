@@ -13,10 +13,13 @@ notification without a log line:
   service  IPCManager counts every received message per type in byMessageType,
            which nothing printed.
 
-The driver already reports NotificationsEnabled, ConnectedClients, the message
-queue totals and the process-exclusion totals in SHADOWSTRIKE_DRIVER_STATUS, which
-this line queries anyway. Printing them beside the per-type receive counts lets one
-VM run name the hop, with no driver change.
+The driver's status reply carries NotificationsEnabled and ConnectedClients, which
+this line queries anyway; printing them beside the per-type receive counts says
+whether the driver is set to send and has a client, and whether anything arrives.
+The struct also declares message-queue and process-exclusion totals, but the
+handler that answers the query (CommPort.c ShadowStrikeHandleQueryDriverStatus)
+never fills them, so they are deliberately not printed: a structural zero would
+read as a measured empty queue.
 """
 import re
 import unittest
@@ -40,12 +43,19 @@ class ProcessNotifyDeliveryVisibilityContractTests(unittest.TestCase):
 
     def test_the_driver_side_gates_are_printed(self):
         for field, member in (("enabled=", "ds.NotificationsEnabled"),
-                              ("clients=", "ds.ConnectedClients"),
-                              ("mqEnq=", "ds.MqTotalEnqueued"),
-                              ("mqDrop=", "ds.MqTotalDropped"),
-                              ("procExcluded=", "ds.ProcExclProcessesExcluded")):
+                              ("clients=", "ds.ConnectedClients")):
             self.assertIn(field, self.region, f"notifyPath field {field} is not printed")
             self.assertIn(member, self.region, f"{member} is not read into the line")
+
+    def test_fields_the_status_reply_never_fills_are_not_printed(self):
+        # CommPort.c ShadowStrikeHandleQueryDriverStatus answers this query; it zeroes
+        # the struct and fills neither the message-queue nor the process-exclusion
+        # totals, so printing them would show a structural zero as if it were a
+        # measured empty queue.
+        for member in ("ds.MqTotalEnqueued", "ds.MqTotalDropped", "ds.MqCurrentDepth",
+                       "ds.ProcExclTotalLookups", "ds.ProcExclProcessesExcluded"):
+            self.assertNotIn(member, self.region,
+                             f"{member} is printed but the status reply never fills it")
 
     def test_user_mode_receive_counts_per_type_are_printed(self):
         self.assertIn("ipcRx: total={} scan={} process={} image={} registry={}", self.region)

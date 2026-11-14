@@ -8192,13 +8192,14 @@ public:
 
                 // Task 386: the driver-side gates on process-notification delivery,
                 // in their own segment so the positional pairing above stays as pinned.
+                // Only the two fields the status reply really carries: the handler
+                // that answers this query (CommPort.c ShadowStrikeHandleQueryDriverStatus)
+                // zeroes the struct and never fills the message-queue or
+                // process-exclusion totals, so printing those read a structural zero
+                // that looked like evidence of an empty queue.
                 kernelPart += std::format(
-                    " | notifyPath: enabled={} clients={} mqEnq={} mqDeq={} mqDrop={} "
-                    "mqDepth={} procExclLookups={} procExcluded={}",
-                    static_cast<unsigned>(ds.NotificationsEnabled), ds.ConnectedClients,
-                    ds.MqTotalEnqueued, ds.MqTotalDequeued, ds.MqTotalDropped,
-                    ds.MqCurrentDepth, ds.ProcExclTotalLookups,
-                    ds.ProcExclProcessesExcluded);
+                    " | notifyPath: enabled={} clients={}",
+                    static_cast<unsigned>(ds.NotificationsEnabled), ds.ConnectedClients);
             }
         }
 
