@@ -476,7 +476,6 @@ A deliberate design goal is a small, permissively licensed dependency set: the s
 |-----------|---------|------|-------|
 | [YARA](https://github.com/VirusTotal/yara) | BSD-3-Clause | Malware pattern matching | 11,053 rules compiled into the shipped database; third-party rule attribution ships with the product |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) 1.20 | MIT | ML inference for PhantomCortex | |
-| [Zydis](https://github.com/zyantific/zydis) | MIT | x86/x64 instruction decoding | **Being removed** — PhantomDisassembler is the in-house replacement |
 | [SQLite](https://sqlite.org) + [SQLiteCpp](https://github.com/SRombauts/SQLiteCpp) | Public domain / MIT | Persistent configuration and event storage | |
 | [nlohmann/json](https://github.com/nlohmann/json) | MIT | JSON parsing | |
 | [pugixml](https://pugixml.org) | MIT | XML parsing | |

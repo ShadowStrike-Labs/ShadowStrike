@@ -162,7 +162,7 @@ The following are in scope for security reports:
 
 The following are **not** considered security vulnerabilities for the purposes of this policy:
 
-- Issues in third-party libraries vendored in the repository (YARA, Zydis, SQLiteCpp, etc.) — report these to the respective upstream projects
+- Issues in third-party libraries vendored in the repository (YARA, SQLiteCpp, etc.) — report these to the respective upstream projects
 - Detection bypasses that require kernel-level access already (if you have kernel access, you have already bypassed endpoint security)
 - Theoretical vulnerabilities with no plausible real-world attack path
 - Issues that only affect the developer's test environment

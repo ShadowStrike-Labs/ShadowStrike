@@ -29,7 +29,6 @@ ShadowStrike/
 │   ├── FuzzyHasher/
 │   ├── tlsh/
 │   ├── YARA/
-│   └── Zydis/
 ├── ShadowStrike/
 ├── src/
 │   ├── AntiEvasion/
@@ -70,4 +69,3 @@ ShadowStrike/
     ├── gtest_framework/
     ├── openssl_lib/
     ├── yara_lib/
-    └── zydis_lib/
