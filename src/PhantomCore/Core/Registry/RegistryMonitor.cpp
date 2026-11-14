@@ -394,6 +394,41 @@ namespace {
         }
     }
 
+// task 374: a write to a Windows Defender key is a DISABLE only when the VALUE turns a
+// protection off or carves a hole in it, or when a key/value is DELETED (definition
+// removal, policy reset). MsMpEng writes its own operational state - signature versions,
+// update timestamps - to these keys constantly, so classifying every Defender-key write
+// as DEFENDER_DISABLE reported Defender's own definition update as a Critical registry
+// threat (the 1.0.125 field run). Classify by the value, not the key or the writer: a
+// signed-writer exemption is unsafe, because reg.exe and PowerShell are Microsoft-signed
+// and are exactly how Defender is switched off.
+[[nodiscard]] bool DefenderWriteIsProtectionImpairing(const RegistryEvent& event) {
+    if (event.operation == RegistryOp::DeleteKey ||
+        event.operation == RegistryOp::DeleteValue) {
+        return true;  // removes protection state / definitions
+    }
+    const std::wstring lowerKey = StringUtils::ToLowerCopy(event.keyPath);
+    if (lowerKey.find(L"\\exclusions") != std::wstring::npos) {
+        return true;  // adding an exclusion is evasion regardless of the value name
+    }
+    static constexpr std::wstring_view kImpairingValues[] = {
+        L"disableantispyware", L"disableantivirus", L"disableroutinelytakingaction",
+        L"servicekeepalive", L"puaprotection", L"tamperprotection",
+        L"disablerealtimemonitoring", L"disablebehaviormonitoring",
+        L"disableonaccessprotection", L"disableioavprotection",
+        L"disablescriptscanning", L"disablescanonrealtimeenable",
+        L"disableblockatfirstseen", L"disableintrusionpreventionsystem",
+        L"spynetreporting", L"submitsamplesconsent", L"disableenhancednotifications",
+    };
+    const std::wstring lowerValue = StringUtils::ToLowerCopy(event.valueName);
+    for (const auto& v : kImpairingValues) {
+        if (lowerValue == v) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -2208,7 +2243,14 @@ private:
             m_stats.securityChanges++;
 
             if (event.keyPath.find(L"Windows Defender") != std::wstring::npos) {
-                return RegistryThreatType::DEFENDER_DISABLE;
+                // task 374: classify by the value written, not the key. A routine Defender
+                // write - MsMpEng updating its own signature/version state - is not a
+                // disable and must not alarm; only a protection-impairing value or a
+                // deletion is DEFENDER_DISABLE (see DefenderWriteIsProtectionImpairing).
+                if (DefenderWriteIsProtectionImpairing(event)) {
+                    return RegistryThreatType::DEFENDER_DISABLE;
+                }
+                return RegistryThreatType::NONE;
             }
             if (event.keyPath.find(L"AMSI") != std::wstring::npos) {
                 return RegistryThreatType::AMSI_BYPASS;
