@@ -83,6 +83,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -460,6 +461,22 @@ public:
 
     /// @brief Flag indicating indexes need rebuild after IOC mutations
     std::atomic<bool> indexDirty{false};
+
+    // ========================================================================
+    // Periodic durability (task 382)
+    // ========================================================================
+    //
+    // Synced indicators live in dirty mapped pages until a flush. The only flush
+    // used to be in Shutdown()/Close(), so a forced reboot, crash or BSOD lost
+    // every indicator synced since the store opened and the store reopened with 0
+    // entries. This thread flushes on config.walFlushInterval so synced intel is
+    // durable within that window however the process dies.
+    //
+    std::thread flushThread;
+    std::mutex flushMutex;
+    std::condition_variable flushCv;
+    bool flushStop = false;                        // guarded by flushMutex
+    std::atomic<uint64_t> periodicFlushCount{0};   // observable for the 382 test
 
     // ========================================================================
     // Helper Methods
@@ -925,6 +942,20 @@ bool ThreatIntelStore::Initialize(const StoreConfig& config) {
             m_impl->stats.totalIOCEntries
         );
 
+        // task 382: wire the advertised WAL flush interval. Without a periodic
+        // flush the only persist was in Shutdown(), so a forced reboot, crash or
+        // BSOD lost every indicator synced since open and the store reopened with
+        // 0 entries. ThreatIntelDatabase::Flush() refreshes the header checksum
+        // before writing, so a periodically-flushed store verifies cleanly on
+        // reopen. The store is always read-write; gate on WAL plus a positive
+        // interval. A read-only database would make Flush() a no-op anyway.
+        if (m_impl->config.enableWAL &&
+            m_impl->config.walFlushInterval.count() > 0) {
+            m_impl->flushStop = false;
+            m_impl->flushThread = std::thread(
+                [this] { PeriodicFlushLoop(m_impl->config.walFlushInterval); });
+        }
+
         return true;
 
     } catch (const std::exception& ex) {
@@ -1160,6 +1191,18 @@ void ThreatIntelStore::Shutdown() {
     // would leave its worker waiting while Stop waits for the worker.
     if (m_impl->feedManager) {
         m_impl->feedManager->Shutdown();
+    }
+
+    // task 382: stop and join the periodic flush thread BEFORE taking rwLock.
+    // The loop calls Flush() under rwLock, so holding rwLock here while joining
+    // would deadlock against a flush already in progress.
+    {
+        std::lock_guard<std::mutex> flk(m_impl->flushMutex);
+        m_impl->flushStop = true;
+    }
+    m_impl->flushCv.notify_all();
+    if (m_impl->flushThread.joinable()) {
+        m_impl->flushThread.join();
     }
 
     std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
@@ -4378,6 +4421,32 @@ void ThreatIntelStore::Flush() noexcept {
             );
         }
     }
+}
+
+void ThreatIntelStore::PeriodicFlushLoop(std::chrono::seconds interval) {
+    // Wait out the interval, waking early only to stop. Flush() runs with the
+    // flush mutex RELEASED: it takes rwLock, and Shutdown() joins this thread
+    // while NOT holding rwLock, so there is no lock-order cycle. wait_for returns
+    // true only when the stop predicate holds, so a timeout (and only a timeout)
+    // performs a flush.
+    std::unique_lock<std::mutex> lk(m_impl->flushMutex);
+    while (!m_impl->flushStop) {
+        if (m_impl->flushCv.wait_for(lk, interval,
+                                     [this] { return m_impl->flushStop; })) {
+            break;  // stop requested
+        }
+        lk.unlock();
+        Flush();
+        m_impl->periodicFlushCount.fetch_add(1, std::memory_order_relaxed);
+        lk.lock();
+    }
+}
+
+uint64_t ThreatIntelStore::GetPeriodicFlushCount() const noexcept {
+    if (!m_impl) {
+        return 0;
+    }
+    return m_impl->periodicFlushCount.load(std::memory_order_relaxed);
 }
 
 /**

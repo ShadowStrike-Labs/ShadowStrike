@@ -2277,4 +2277,47 @@ TEST(ThreatIntelStore_Lifecycle, ADatabaseHeldElsewhereIsNotReplaced) {
 	store->Shutdown();
 }
 
+// ============================================================================
+// Persistence / durability (task 382)
+// ============================================================================
+//
+// Indicators synced after the store opens must survive a crash, forced reboot
+// or BSOD, not only a clean Shutdown. The store advertised a walFlushInterval
+// but never flushed on it, so everything synced since open lived in dirty mapped
+// pages and was lost on a forced reboot; the store reopened with 0 IOC entries.
+// The store now runs a periodic flush honouring that interval.
+
+TEST(ThreatIntelStore_Persistence, PeriodicFlushRunsWithoutACleanShutdown) {
+	auto cfg = ScratchConfig();
+	cfg.enableWAL = true;
+	cfg.walFlushInterval = std::chrono::seconds(1);  // short, for the test
+	cfg.enableAutoFeedUpdate = false;
+
+	auto store = CreateThreatIntelStore();
+	ASSERT_TRUE(store->Initialize(cfg));
+
+	// Dirty content to persist: one malicious hash indicator (the sync path).
+	EXPECT_TRUE(store->AddIOC(
+		IOCType::FileHash,
+		MakeValidSHA256(),
+		ReputationLevel::Malicious,
+		ThreatIntelSource::InternalAnalysis));
+
+	// The periodic flush must fire on its own, with no explicit Flush() or
+	// Shutdown(). Poll with a generous deadline so a loaded host is not flaky.
+	const auto deadline =
+		std::chrono::steady_clock::now() + std::chrono::seconds(20);
+	while (store->GetPeriodicFlushCount() == 0 &&
+	       std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+
+	EXPECT_GT(store->GetPeriodicFlushCount(), 0u)
+		<< "walFlushInterval is advertised but no periodic flush ran; a forced "
+		   "reboot would lose every indicator synced since the store opened "
+		   "(task 382)";
+
+	store->Shutdown();
+}
+
 } // namespace ShadowStrike::ThreatIntel::Tests

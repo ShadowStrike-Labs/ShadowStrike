@@ -1491,6 +1491,16 @@ public:
      * @brief Reset performance counters
      */
     void ResetStatistics() noexcept;
+
+    /**
+     * @brief Number of periodic WAL flushes performed since Initialize (task 382).
+     *
+     * The store flushes on config.walFlushInterval so indicators synced after it
+     * opens are durable within that window even if the process is force-killed,
+     * crashes or BSODs before a clean Shutdown. Exposed so a test can confirm the
+     * periodic flush actually runs rather than being advertised-only.
+     */
+    [[nodiscard]] uint64_t GetPeriodicFlushCount() const noexcept;
     
     // =========================================================================
     // Event Handling
@@ -1523,6 +1533,17 @@ private:
     // Internal implementation using Pimpl pattern for ABI stability
     class Impl;
     std::unique_ptr<Impl> m_impl;
+
+    /**
+     * @brief Background loop that flushes the store every config.walFlushInterval.
+     *
+     * Started by Initialize when the store is writable and WAL is enabled; stopped
+     * and joined by Shutdown before the database is torn down. Each wake calls
+     * Flush(), which refreshes the mapped header checksum and writes dirty pages,
+     * so a reopen after an unclean stop still verifies and reports the synced
+     * entries (task 382).
+     */
+    void PeriodicFlushLoop(std::chrono::seconds interval);
     
     // Atomic initialization flag
     std::atomic<bool> m_isInitialized{false};
