@@ -142,5 +142,19 @@ TEST_F(TrackerParamStripTest, StrippingIsIdempotent) {
                                     "the URL";
 }
 
+TEST_F(TrackerParamStripTest, RefIsPreservedBecauseSomeSitesNeedItFunctionally) {
+    // task 279: 'ref' is a referral tag on many sites but FUNCTIONAL on others - a git host
+    // uses it to select a branch or commit, documentation sites use it for anchored
+    // navigation - so removing it from the default set changes which page the user reaches.
+    // It was dropped from DEFAULT_STRIP_PARAMS; 'ref_src' stays because it is far more
+    // reliably a tracking tag.
+    EXPECT_EQ("https://git.example.com/repo?ref=main",
+              Strip("https://git.example.com/repo?ref=main"))
+        << "'ref' is stripped from the default set, which breaks functional links";
+    EXPECT_EQ("https://example.com/page",
+              Strip("https://example.com/page?ref_src=twsrc"))
+        << "'ref_src' must still be stripped";
+}
+
 }  // namespace
 }  // namespace ShadowStrike::WebBrowser::Test

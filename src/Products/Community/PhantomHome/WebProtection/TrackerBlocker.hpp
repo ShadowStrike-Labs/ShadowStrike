@@ -229,12 +229,12 @@ namespace TrackerBlockerConstants {
     // DEFAULT TRACKING PARAMETERS TO STRIP
     // ========================================================================
 
-    inline constexpr std::array<std::string_view, 25> DEFAULT_STRIP_PARAMS = {
+    inline constexpr std::array<std::string_view, 24> DEFAULT_STRIP_PARAMS = {
         "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
         "utm_id", "utm_cid", "fbclid", "gclid", "gclsrc",
         "dclid", "zanpid", "msclkid", "_ga", "_gl",
         "mc_cid", "mc_eid", "yclid", "wickedid", "igshid",
-        "twclid", "ttclid", "li_fat_id", "ref", "ref_src"
+        "twclid", "ttclid", "li_fat_id", "ref_src"
     };
 
 }  // namespace TrackerBlockerConstants
