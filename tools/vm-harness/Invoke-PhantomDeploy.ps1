@@ -281,6 +281,41 @@ function Assert-ArtifactsSigned {
     Log "Authenticode assertion passed for $($Paths.Count) artifact(s)."
 }
 
+# Refuse to package a binary that a rule we ship would convict (task 385). The
+# shipped YARA rule SIGNATURE_BASE_HKTL_Meterpreter_Inmemory fires on two ascii
+# fullword strings among metsrv.x64.dll, WS2_32.dll and ReflectiveLoader, or on
+# metsrv.x64.dll alone; the service imports WS2_32.dll, so one more is enough. The
+# 1.0.128 and 1.0.133 services carried ReflectiveLoader and the product tried to
+# quarantine itself. The source contract (test_no_self_signature_literals.py) pins
+# the literals out of the trees it scans; this checks the bytes actually shipped,
+# whatever produced them, which is how a second copy in the emulator was found.
+function Assert-NoSelfSignatureTokens {
+    param([Parameter(Mandatory)][string[]]$Paths)
+
+    $tokens = @('ReflectiveLoader', 'metsrv.x64.dll')
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $Paths) {
+        if (-not (Test-Path $p -PathType Leaf)) {
+            $failures.Add("Missing artifact: $p")
+            continue
+        }
+        $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($p))
+        foreach ($token in $tokens) {
+            # YARA fullword: delimited by non-alphanumeric bytes.
+            $rx = '(?<![A-Za-z0-9])' + [regex]::Escape($token) + '(?![A-Za-z0-9])'
+            foreach ($m in [regex]::Matches($text, $rx)) {
+                $failures.Add(('{0} at 0x{1:X}: {2}' -f (Split-Path $p -Leaf), $m.Index, $token))
+            }
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        Die ("Self-signature guard: a shipped binary carries a token a shipped YARA rule " +
+             "keys on, so the product would convict itself: " + ($failures -join '; '))
+    }
+    Log "Self-signature guard passed for $($Paths.Count) binary(ies)."
+}
+
 function Sync-QtRuntimeStaging {
     $qtRoot = if ($env:Qt6_ROOT) { $env:Qt6_ROOT } else { 'C:\Qt\6.7.3\msvc2019_64' }
     $qtBin  = Join-Path $qtRoot 'bin'
@@ -961,6 +996,13 @@ This is exactly what shipped in 1.0.92. Do not work around this check.
 
 Sync-DriverStaging
 Sync-DetectionContentStaging
+
+Assert-NoSelfSignatureTokens -Paths @(
+    (Join-Path $StagingDir 'ShadowStrikePhantomService.exe'),
+    (Join-Path $StagingDir 'ShadowStrikePhantomTray.exe'),
+    (Join-Path $StagingDir 'ShadowStrikePhantomUI.exe'),
+    (Join-Path $StagingDir 'ShadowStrikeDriverResume.exe'),
+    (Join-Path $StagingDir 'drivers\PhantomSensor.sys'))
 
 # -- PACKAGE ------------------------------------------------------------------
 Log "Building MSI..."
