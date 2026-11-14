@@ -978,14 +978,21 @@ DLPScanResult DataLeakProtectionImpl::AnalyzeOutboundData(
         }
 
         if (result.ShouldBlock()) {
-            m_stats.operationsBlocked++;
-
+            // HONESTY (task 271): the clipboard is never cleared - the clearing call in
+            // ClipboardMonitoringThreadFunc is disabled pending an owner ruling on the
+            // false-positive risk of emptying a user's clipboard. So a clipboard leak is
+            // DETECTED, not blocked; counting it in operationsBlocked or a "blocks"
+            // counter would tell a reader the leak was contained when it was not. The
+            // network and file channels do enforce, so they still count as blocks.
             if (channel == ChannelType::Clipboard) {
-                m_stats.clipboardBlocks++;
-            } else if (channel == ChannelType::Network) {
-                m_stats.networkBlocks++;
-            } else if (channel == ChannelType::FileSystem) {
-                m_stats.fileBlocks++;
+                m_stats.clipboardLeaksDetected++;
+            } else {
+                m_stats.operationsBlocked++;
+                if (channel == ChannelType::Network) {
+                    m_stats.networkBlocks++;
+                } else if (channel == ChannelType::FileSystem) {
+                    m_stats.fileBlocks++;
+                }
             }
         } else {
             m_stats.operationsAllowed++;
@@ -1502,7 +1509,7 @@ DLPStatisticsSnapshot DataLeakProtectionImpl::GetStatistics() const {
     snapshot.operationsAllowed = m_stats.operationsAllowed.load(std::memory_order_acquire);
     snapshot.incidentsLogged = m_stats.incidentsLogged.load(std::memory_order_acquire);
     snapshot.bytesScanned = m_stats.bytesScanned.load(std::memory_order_acquire);
-    snapshot.clipboardBlocks = m_stats.clipboardBlocks.load(std::memory_order_acquire);
+    snapshot.clipboardLeaksDetected = m_stats.clipboardLeaksDetected.load(std::memory_order_acquire);
     snapshot.networkBlocks = m_stats.networkBlocks.load(std::memory_order_acquire);
     snapshot.fileBlocks = m_stats.fileBlocks.load(std::memory_order_acquire);
     snapshot.creditCardsDetected = m_stats.creditCardsDetected.load(std::memory_order_acquire);
@@ -1549,10 +1556,14 @@ void DataLeakProtectionImpl::ClipboardMonitoringThreadFunc() {
                 );
 
                 if (result.ShouldBlock()) {
-                    ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Blocked sensitive data in clipboard");
+                    ::ShadowStrike::Utils::Logger::Warn("[DataLeakProtection] Detected sensitive data in clipboard (not prevented; clipboard clearing is disabled - task 271)");
 
-                    // In production, clear clipboard here
-                    // ClearClipboard();
+                    // Enforcement (clearing the clipboard) is deliberately not wired:
+                    // emptying a user's clipboard on a heuristic match is destructive and
+                    // irreversible, so it needs an owner ruling on false-positive
+                    // tolerance (task 271 piece 2). Until then this path reports a
+                    // detection, and the statistics record it as clipboardLeaksDetected
+                    // rather than a block.
                 }
             }
 
@@ -2169,7 +2180,7 @@ void DLPStatistics::Reset() noexcept {
     operationsAllowed.store(0, std::memory_order_release);
     incidentsLogged.store(0, std::memory_order_release);
     bytesScanned.store(0, std::memory_order_release);
-    clipboardBlocks.store(0, std::memory_order_release);
+    clipboardLeaksDetected.store(0, std::memory_order_release);
     networkBlocks.store(0, std::memory_order_release);
     fileBlocks.store(0, std::memory_order_release);
     creditCardsDetected.store(0, std::memory_order_release);
@@ -2197,7 +2208,7 @@ std::string DLPStatistics::ToJson() const {
     j["operationsAllowed"] = operationsAllowed.load(std::memory_order_acquire);
     j["incidentsLogged"] = incidentsLogged.load(std::memory_order_acquire);
     j["bytesScanned"] = bytesScanned.load(std::memory_order_acquire);
-    j["clipboardBlocks"] = clipboardBlocks.load(std::memory_order_acquire);
+    j["clipboardLeaksDetected"] = clipboardLeaksDetected.load(std::memory_order_acquire);
     j["networkBlocks"] = networkBlocks.load(std::memory_order_acquire);
     j["fileBlocks"] = fileBlocks.load(std::memory_order_acquire);
     j["creditCardsDetected"] = creditCardsDetected.load(std::memory_order_acquire);
@@ -2219,7 +2230,7 @@ std::string DLPStatisticsSnapshot::ToJson() const {
     j["operationsAllowed"] = operationsAllowed;
     j["incidentsLogged"] = incidentsLogged;
     j["bytesScanned"] = bytesScanned;
-    j["clipboardBlocks"] = clipboardBlocks;
+    j["clipboardLeaksDetected"] = clipboardLeaksDetected;
     j["networkBlocks"] = networkBlocks;
     j["fileBlocks"] = fileBlocks;
     j["creditCardsDetected"] = creditCardsDetected;

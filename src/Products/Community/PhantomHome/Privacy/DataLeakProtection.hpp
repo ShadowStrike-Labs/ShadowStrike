@@ -523,7 +523,7 @@ struct DLPStatistics {
     std::atomic<uint64_t> operationsAllowed{0};
     std::atomic<uint64_t> incidentsLogged{0};
     std::atomic<uint64_t> bytesScanned{0};
-    std::atomic<uint64_t> clipboardBlocks{0};
+    std::atomic<uint64_t> clipboardLeaksDetected{0};
     std::atomic<uint64_t> networkBlocks{0};
     std::atomic<uint64_t> fileBlocks{0};
     std::atomic<uint64_t> creditCardsDetected{0};
@@ -548,7 +548,7 @@ struct DLPStatisticsSnapshot {
     uint64_t operationsAllowed = 0;
     uint64_t incidentsLogged = 0;
     uint64_t bytesScanned = 0;
-    uint64_t clipboardBlocks = 0;
+    uint64_t clipboardLeaksDetected = 0;
     uint64_t networkBlocks = 0;
     uint64_t fileBlocks = 0;
     uint64_t creditCardsDetected = 0;
