@@ -16,12 +16,18 @@
  * text comparison can.
  *
  * WHAT "PRIVATE OR LOCAL" COVERS:
- *   IPv4  10/8, 172.16/12, 192.168/16 (RFC 1918), 127/8 loopback, 169.254/16 link-local
+ *   IPv4  10/8, 172.16/12, 192.168/16 (RFC 1918), 127/8 loopback, 169.254/16 link-local,
+ *         100.64/10 carrier-grade NAT (RFC 6598)
  *   IPv6  ::1 loopback, fe80::/10 link-local, fc00::/7 unique-local, and an IPv4-mapped
  *         address (::ffff:a.b.c.d) classified by the IPv4 address it carries
  *
- * DELIBERATELY NOT COVERED: 100.64/10 carrier-grade NAT. Whether a CGNAT address seen as the
- * machine's public address is a leak is a product decision (register 340), not arithmetic.
+ * 100.64/10 carrier-grade NAT: covered as private per register 340 item 9 - it is not
+ * internet-routable, so a CGNAT address seen as the machine's "public" address is not a
+ * disclosure of public identity. This only sets the informational isPrivate flag; it does
+ * NOT suppress a VPN leak, because CheckForLeaks decides a leak by comparing the observed
+ * public address against the VPN adapter's address (a mismatch is a leak regardless of
+ * whether the observed address is private), so a CGNAT address seen while the VPN is up
+ * still mismatches and still fires.
  *
  * An IPv6 zone suffix ("fe80::1%12", as Windows reports adapter addresses) is accepted and
  * ignored. Brackets, ports and host names are not addresses and answer false.

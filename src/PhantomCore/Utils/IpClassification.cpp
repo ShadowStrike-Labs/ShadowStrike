@@ -48,6 +48,7 @@ constexpr size_t kMaxLiteral = 64;
            (hostOrder & 0xFFF00000u) == 0xAC100000u ||   // 172.16.0.0/12
            (hostOrder & 0xFFFF0000u) == 0xC0A80000u ||   // 192.168.0.0/16
            (hostOrder & 0xFF000000u) == 0x7F000000u ||   // 127.0.0.0/8
+           (hostOrder & 0xFFC00000u) == 0x64400000u ||   // 100.64.0.0/10 CGNAT (RFC 6598)
            (hostOrder & 0xFFFF0000u) == 0xA9FE0000u;     // 169.254.0.0/16
 }
 

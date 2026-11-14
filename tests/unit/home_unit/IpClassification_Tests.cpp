@@ -114,16 +114,18 @@ TEST(PrivateIpV6Test, OrdinaryGlobalAddressesAreNotPrivate) {
 // Behaviour pinned as measured, with the filing named
 // ============================================================================================
 
-TEST(PrivateIpV6Test, CarrierGradeNatIsNotTreatedAsPrivate) {
-    // PINNED, NOT ENDORSED. 100.64.0.0/10 is RFC 6598 shared address space, used by ISPs for carrier-grade
-    // NAT and not globally routable - but neither implementation in the product classifies it as private.
-    //
-    // Whether a CGNAT address observed as the machine's public address represents a leak is a product
-    // question rather than an arithmetic one, so it is filed rather than changed. If this case now fails,
-    // that decision was taken: update the filing and this case rather than reverting.
-    EXPECT_FALSE(IsPrivateIP("100.64.0.1"))
-        << "carrier-grade NAT is now treated as private - a deliberate decision was made, update the filing";
-    EXPECT_FALSE(IsPrivateIP("100.127.255.254"));
+TEST(PrivateIpV4Test, CarrierGradeNatIsTreatedAsPrivate) {
+    // DECIDED (register 340 item 9). 100.64.0.0/10 is RFC 6598 shared address space, used by
+    // ISPs for carrier-grade NAT and not globally routable, so a CGNAT address observed as the
+    // machine's "public" address is not a disclosure of public identity. This only sets the
+    // informational isPrivate flag; it does NOT suppress a VPN leak, because CheckForLeaks
+    // decides a leak by comparing the observed address against the VPN adapter's address - a
+    // mismatch fires regardless of whether the observed address is private.
+    EXPECT_TRUE(IsPrivateIP("100.64.0.1")) << "100.64.0.1 is the bottom of the CGNAT range";
+    EXPECT_TRUE(IsPrivateIP("100.127.255.254")) << "100.127.255.254 is the top of the CGNAT range";
+    // The /10 boundary holds in both directions.
+    EXPECT_FALSE(IsPrivateIP("100.63.255.255")) << "100.63/x is below 100.64/10";
+    EXPECT_FALSE(IsPrivateIP("100.128.0.0")) << "100.128/x is above 100.64/10";
 }
 
 TEST(PrivateIpV4Test, AnAddressIsParsedBeforeItIsClassified) {
