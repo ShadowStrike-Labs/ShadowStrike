@@ -43,6 +43,7 @@
 #include "YaraRuleStore.hpp"
 
 #include "../Utils/Logger.hpp"
+#include "../Diagnostics/WholeFileAllocationProbe.hpp"
 #include "../Utils/FileUtils.hpp"   // IsContentNotLocalError
 #include "../Utils/FileUtils.hpp"
 #include"../Utils/StringUtils.hpp"
@@ -3845,6 +3846,9 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
 
         SS_LOG_INFO(L"YaraRuleStore",
             L"LoadRulesInternal: loaded %zu YARA rule(s) from the database", indexed);
+
+        ShadowStrike::Diagnostics::WholeFileAllocationProbe::Note(
+            "YaraRuleStore.LoadRulesInternal", yaraData.size());
     }
 
     // ========================================================================

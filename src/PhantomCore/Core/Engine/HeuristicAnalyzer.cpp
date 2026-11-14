@@ -5,6 +5,7 @@
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/MemoryUtils.hpp"
 #include "../../Utils/Logger.hpp"
+#include "../../Diagnostics/WholeFileAllocationProbe.hpp"
 #include "../../Utils/ThreadPool.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
@@ -417,6 +418,8 @@ HeuristicResult HeuristicAnalyzer::AnalyzeFile(const std::wstring& filePath) {
             SS_LOG_WARN(L"HeuristicAnalyzer", L"Failed to read file: %ls", filePath.c_str());
             return result;
         }
+        ShadowStrike::Diagnostics::WholeFileAllocationProbe::Note(
+            "HeuristicAnalyzer.AnalyzeFile", rawData.size());
 
         if (rawData.empty()) {
             result.errorMessage = "File is empty";
@@ -743,6 +746,8 @@ HeuristicResult HeuristicAnalyzer::QuickScan(const std::wstring& filePath) {
             m_impl->m_statistics.analysisFailures.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
+        ShadowStrike::Diagnostics::WholeFileAllocationProbe::Note(
+            "HeuristicAnalyzer.QuickScan", rawData.size());
         if (rawData.empty()) {
             result.errorMessage = "File is empty";
             return result;
@@ -2345,6 +2350,8 @@ double CalculateFileEntropy(const std::wstring& filePath) noexcept {
     try {
         std::vector<std::byte> raw;
         if (!Utils::FileUtils::ReadAllBytes(filePath, raw) || raw.empty()) return 0.0;
+        ShadowStrike::Diagnostics::WholeFileAllocationProbe::Note(
+            "HeuristicAnalyzer.CalculateFileEntropy", raw.size());
         std::span<const uint8_t> data(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
         return HeuristicAnalyzer::Instance().CalculateEntropy(data);
     } catch (...) { return 0.0; }

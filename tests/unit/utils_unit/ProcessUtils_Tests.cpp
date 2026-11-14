@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 #include "../../../src/PhantomCore/Utils/ProcessUtils.hpp"
 #include "../../../src/PhantomCore/Utils/Logger.hpp"
+#include "../../../src/PhantomCore/Diagnostics/WholeFileAllocationProbe.hpp"
 
 #include <string>
 #include <vector>
@@ -812,4 +813,46 @@ TEST_F(ProcessUtilsTest, SessionIdNeedsNoProcessHandle) {
     DWORD expected = 0;
     ASSERT_TRUE(::ProcessIdToSessionId(m_currentPid, &expected));
     EXPECT_EQ(*sess, expected);
+}
+
+// ---------------------------------------------------------------------------
+// WholeFileAllocationProbe (task 238): attribute the service memory peak.
+//
+// The probe samples the working set at each whole-file allocation site and logs
+// a line only when a new high-water mark is reached, so it attributes the peak
+// without flooding the on-access path. The working set is a live process value,
+// so the deterministic test drives RecordSample() with supplied values and
+// checks the two properties the attribution depends on: the high-water mark is
+// monotonic, and a line is emitted only on a material advance.
+// ---------------------------------------------------------------------------
+TEST(WholeFileAllocationProbeTest, TracksHighWaterMarkAndThrottlesLogging) {
+    namespace WFAProbe = ShadowStrike::Diagnostics::WholeFileAllocationProbe;
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[WholeFileAllocationProbe] Testing...");
+
+    WFAProbe::ResetForTesting();
+    EXPECT_EQ(WFAProbe::PeakWorkingSetBytes(), 0ull);
+
+    constexpr std::uint64_t MB = 1024ull * 1024ull;
+
+    // The first material sample logs and sets the peak: 0 -> 100 MB clears the
+    // 32 MB advance threshold.
+    EXPECT_TRUE(WFAProbe::RecordSample("test.first", 100u * 1024u * 1024u, 100ull * MB));
+    EXPECT_EQ(WFAProbe::PeakWorkingSetBytes(), 100ull * MB);
+
+    // A small climb (< 32 MB past the last logged 100 MB) advances the peak but
+    // stays quiet - this is what keeps the probe off the hot path in steady
+    // state.
+    EXPECT_FALSE(WFAProbe::RecordSample("test.small", 4u * 1024u * 1024u, 110ull * MB));
+    EXPECT_EQ(WFAProbe::PeakWorkingSetBytes(), 110ull * MB);
+
+    // A material climb (>= 32 MB past the last logged 100 MB) logs again.
+    EXPECT_TRUE(WFAProbe::RecordSample("test.big", 90u * 1024u * 1024u, 200ull * MB));
+    EXPECT_EQ(WFAProbe::PeakWorkingSetBytes(), 200ull * MB);
+
+    // A drop neither logs nor lowers the monotonic high-water mark.
+    EXPECT_FALSE(WFAProbe::RecordSample("test.drop", 1u * 1024u * 1024u, 50ull * MB));
+    EXPECT_EQ(WFAProbe::PeakWorkingSetBytes(), 200ull * MB);
+
+    WFAProbe::ResetForTesting();
+    EXPECT_EQ(WFAProbe::PeakWorkingSetBytes(), 0ull);
 }

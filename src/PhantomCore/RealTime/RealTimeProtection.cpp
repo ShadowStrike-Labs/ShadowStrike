@@ -38,6 +38,7 @@
 #include "pch.h"
 #include "RealTimeProtection.hpp"
 #include "../Diagnostics/DiagTrace.hpp"
+#include "../Diagnostics/WholeFileAllocationProbe.hpp"
 #include "../Utils/DataStorePaths.hpp"   // SeedSignatureDatabaseFromBaseline
 
 // ============================================================================
@@ -7630,6 +7631,8 @@ public:
                 Utils::FileUtils::Error fileErr;
                 if (Utils::FileUtils::ReadAllBytes(filePath, rawBytes, &fileErr) &&
                     !rawBytes.empty()) {
+                    ShadowStrike::Diagnostics::WholeFileAllocationProbe::Note(
+                        "RealTimeProtection.PhantomCortexDeepScan", rawBytes.size());
                     auto mlVerdict = ShadowStrike::AI::PhantomCortex::Instance().AnalyzeFile(
                         std::span<const uint8_t>(
                             reinterpret_cast<const uint8_t*>(rawBytes.data()),
