@@ -8189,7 +8189,37 @@ public:
                     ds.PcCallbackSamples, cbAvgUs, ds.PcMaxCallbackTimeUs,
                     ds.TxScanSendSamples, txAvgUs, ds.TxScanSendMaxUs,
                     ds.TxScanSendDeadlineOverruns);
+
+                // Task 386: the driver-side gates on process-notification delivery,
+                // in their own segment so the positional pairing above stays as pinned.
+                kernelPart += std::format(
+                    " | notifyPath: enabled={} clients={} mqEnq={} mqDeq={} mqDrop={} "
+                    "mqDepth={} procExclLookups={} procExcluded={}",
+                    static_cast<unsigned>(ds.NotificationsEnabled), ds.ConnectedClients,
+                    ds.MqTotalEnqueued, ds.MqTotalDequeued, ds.MqTotalDropped,
+                    ds.MqCurrentDepth, ds.ProcExclTotalLookups,
+                    ds.ProcExclProcessesExcluded);
             }
+        }
+
+        // TASK 386: WHERE PROCESS NOTIFICATIONS STOP. The 1.0.133 run counted zero
+        // OnKernelProcessNotify calls in 22 minutes while file scans flowed. On the
+        // way up, the driver drops a notification silently when NotificationsEnabled
+        // is off, buffers it in the message queue when no client port is acquired,
+        // and skips a process its exclusions match (the notifyPath fields above);
+        // user mode counts what arrives, per message type, here. Printed side by
+        // side so one run names the hop that loses them.
+        std::string ipcRxPart = "ipcRx=unavailable";
+        if (Communication::IPCManager::HasInstance()) {
+            const auto ipc = Communication::IPCManager::Instance().GetStatistics();
+            const auto rx = [&ipc](size_t type) -> uint64_t {
+                return type < ipc.byMessageType.size() ? ipc.byMessageType[type] : 0;
+            };
+            ipcRxPart = std::format(
+                "ipcRx: total={} scan={} process={} image={} registry={}",
+                ipc.messagesReceived,
+                rx(FilterMessageType_ScanRequest), rx(FilterMessageType_ProcessNotify),
+                rx(FilterMessageType_ImageLoad), rx(FilterMessageType_RegistryNotify));
         }
         const uint64_t adN   = m_stats.antiDebugProcNotifyCount.load(std::memory_order_relaxed);
         const uint64_t adTot = m_stats.antiDebugProcNotifyTotalUs.load(std::memory_order_relaxed);
@@ -8214,14 +8244,14 @@ public:
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
             "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={} "
             "| procNotifyPreBudgetUs avgMax(n): antidebug={}/{}({}) certvalidator={}/{}({}) "
-            "| {}",
+            "| {} | {}",
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
             exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, defenderOpWrites, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             adAvg, adMax, adN, cvAvg, cvMax, cvN,
-            kernelPart);
+            kernelPart, ipcRxPart);
 
         if (newDeepDrops > 0) {
             // Lost coverage. Always a warning, never rate limited here: this is
