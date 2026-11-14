@@ -351,7 +351,12 @@ void TrimVectorToCap(std::vector<T>& v, size_t cap) noexcept {
             return "OpenProcess->VirtualAllocEx->WriteProcessMemory->CreateRemoteThread(LoadLibrary)";
 
         case InjectionType::ReflectiveDLL:
-            return "OpenProcess->VirtualAllocEx->WriteProcessMemory->CreateRemoteThread(ReflectiveLoader)";
+            // The export name is deliberately not spelled as one token. Together with
+            // the WS2_32.dll import, a fullword copy of it in this binary satisfies
+            // the shipped YARA rule SIGNATURE_BASE_HKTL_Meterpreter_Inmemory
+            // ("2 of ($s*)"), and the deferred deep scan then convicted and tried to
+            // quarantine our own service executable (1.0.128 and 1.0.133 VM runs).
+            return "OpenProcess->VirtualAllocEx->WriteProcessMemory->CreateRemoteThread(reflective loader export)";
 
         case InjectionType::ProcessHollowing:
             return "CreateProcess(SUSPENDED)->NtUnmapViewOfSection->VirtualAllocEx->WriteProcessMemory->SetContext->Resume";
