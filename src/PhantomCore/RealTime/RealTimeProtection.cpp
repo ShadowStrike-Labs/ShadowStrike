@@ -4574,9 +4574,11 @@ public:
         if (Security::AntiDebug::HasInstance() &&
             Security::AntiDebug::Instance().IsInitialized()) {
             try {
-                // Task 185: measure this UNBOUNDED pre-budget stage's cost per
-                // creation. Measurement only - the stage is neither gated nor
-                // moved; that decision waits on these numbers.
+                // Task 185, decided by measurement: this stage stays in line. It
+                // is a name comparison against the debugger list (report-only on
+                // a match, no kernel request), measured at avg 5 us / max 17 us
+                // over 22 creations on 1.0.134. The counters stay so a heavier
+                // workload that raises the max is visible on the capacity line.
                 const auto adStart = std::chrono::steady_clock::now();
                 SS_DIAG_SCOPE("ProcNotify", req.isCreation ? "antidebug-create"
                                                            : "antidebug-exit");
@@ -4609,9 +4611,12 @@ public:
             Security::CertificateValidator::HasInstance() &&
             Security::CertificateValidator::Instance().IsInitialized()) {
             try {
-                // Task 185: measure this UNBOUNDED pre-budget stage's cost per
-                // creation. It opens the image and builds a certificate chain on
-                // every process creation. Measurement only - not gated or moved.
+                // Task 185, decided by measurement: this stage stays in line. It
+                // does NOT open the image or build a chain: CertificateValidator::
+                // OnKernelProcessCreate reads DigitalSignatureValidator's verdict
+                // CACHE (a hash lookup and a last-write-time check) and never
+                // verifies in line. Measured avg 1 us / max 2 us over 11 creations
+                // on 1.0.134. The counters stay on the capacity line.
                 const auto cvStart = std::chrono::steady_clock::now();
                 SS_DIAG_SCOPE("ProcNotify", "certvalidator-create");
                 Security::CertificateValidator::Instance().OnKernelProcessCreate(
