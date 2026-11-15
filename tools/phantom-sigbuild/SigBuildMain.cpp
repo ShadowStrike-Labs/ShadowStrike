@@ -150,10 +150,15 @@ void Usage() {
         "  --no-verify          skip reopening the output to prove it loads\n"
         "  --quiet              suppress per-stage progress\n"
         "\n"
+        "Self-scan (no build; verifies the product does not convict itself):\n"
+        "  --scan-db <database> open a finished database read-only and scan against it\n"
+        "  --self-scan <binary> a shipped binary to scan (repeatable); fails on any match\n"
+        "\n"
         "Exit codes: 0 success, 1 usage, 2 import failed, 3 build failed,\n"
         "            4 output did not verify, 5 whitelist build failed,\n"
         "            6 built hashes cannot be found by lookup\n"
-        "            7 built patterns do not match content containing them\n");
+        "            7 built patterns do not match content containing them\n"
+        "            8 a shipped binary is convicted by the shipped database\n");
 }
 
 struct Options {
@@ -171,6 +176,8 @@ struct Options {
     bool                      verify{ true };
     std::wstring              attribution;   // empty => beside the output database
     bool                      quiet{ false };
+    std::wstring              scanDatabase;  // non-empty => self-scan mode, no build
+    std::vector<std::wstring> scanBinaries;  // binaries to scan against scanDatabase
 };
 
 // Expands --content into the individual input lists. Kept a convention rather
@@ -411,10 +418,27 @@ void ExpandContentDirectory(const fs::path& root, Options& opt) {
             opt.verify = false;
         } else if (a == L"--quiet") {
             opt.quiet = true;
+        } else if (a == L"--scan-db") {
+            if (!needValue(i)) { return false; }
+            opt.scanDatabase = argv[++i];
+        } else if (a == L"--self-scan") {
+            if (!needValue(i)) { return false; }
+            opt.scanBinaries.emplace_back(argv[++i]);
         } else {
             Fail("unrecognised argument: %ls", a.c_str());
             return false;
         }
+    }
+
+    // Self-scan mode opens an existing database and scans binaries against it. It
+    // shares none of the build path's requirements (no --out, no inputs), so it is
+    // validated and returned here before any of them are checked.
+    if (!opt.scanDatabase.empty()) {
+        if (opt.scanBinaries.empty()) {
+            Fail("--scan-db requires at least one --self-scan <binary> to scan");
+            return false;
+        }
+        return true;
     }
 
     if (opt.output.empty()) {
@@ -1478,6 +1502,107 @@ void CollectPatternLinesForVerification(const std::vector<std::wstring>& files,
     return ok;
 }
 
+// Scans each shipped binary against the finished signature database and fails if any
+// shipped rule convicts one of our own binaries (task 385 follow-up 1).
+//
+// The deferred deep scan did exactly that in the field: the service binary matched the
+// shipped YARA rule SIGNATURE_BASE_HKTL_Meterpreter_Inmemory and the product tried to
+// quarantine itself and terminate the service. The deploy script's token guard pins
+// only that one rule by its literal strings; this scans the WHOLE shipped database -
+// hashes, patterns and YARA - through the same SignatureStore the product runs at
+// runtime, so a self-match by ANY rule, and task 331's Locky collision class, is caught
+// before the package ships rather than on a customer's machine.
+[[nodiscard]] int RunSelfScan(const Options& opt) {
+    ShadowStrike::SignatureStore::SignatureStore store;
+    const StoreError opened = store.Initialize(opt.scanDatabase, /*readOnly=*/true);
+    if (!opened.IsSuccess()) {
+        Fail("self-scan: cannot open the signature database '%ls': %s",
+             opt.scanDatabase.c_str(), Describe(opened).c_str());
+        return 4;
+    }
+
+    ShadowStrike::SignatureStore::ScanOptions scan{};
+    scan.enableHashLookup  = true;
+    scan.enablePatternScan = true;
+    scan.enableYaraScan    = true;
+    scan.stopOnFirstMatch  = false;   // report every self-match, not just the first
+
+    std::size_t scanned = 0;
+    std::size_t convicted = 0;
+    std::vector<std::string> hits;
+
+    for (const auto& binary : opt.scanBinaries) {
+        std::ifstream in(fs::path(binary), std::ios::binary);
+        if (!in) {
+            Fail("self-scan: cannot open binary '%ls'", binary.c_str());
+            store.Close();
+            return 8;
+        }
+        in.seekg(0, std::ios::end);
+        const std::streamoff size = in.tellg();
+        in.seekg(0, std::ios::beg);
+        if (size <= 0) {
+            Fail("self-scan: binary '%ls' is empty", binary.c_str());
+            store.Close();
+            return 8;
+        }
+        std::vector<uint8_t> bytes(static_cast<std::size_t>(size));
+        in.read(reinterpret_cast<char*>(bytes.data()), size);
+        bytes.resize(static_cast<std::size_t>(in.gcount()));
+
+        const auto result = store.ScanBuffer(bytes, scan);
+
+        // A result with no detections is trustworthy ONLY if the file was examined;
+        // otherwise a clean report is indistinguishable from a scan that never ran, and
+        // a self-scan that silently examines nothing is worse than none.
+        if (!result.WasExamined()) {
+            Fail("self-scan: '%ls' was not examined by the store (state not Examined), "
+                 "so a clean result cannot be trusted", binary.c_str());
+            store.Close();
+            return 8;
+        }
+
+        ++scanned;
+        const std::string leaf = Narrow(fs::path(binary).filename().wstring());
+
+        bool thisConvicted = false;
+        for (const auto& m : result.yaraMatches) {
+            hits.push_back(leaf + " : YARA rule '" + m.ruleName + "'");
+            thisConvicted = true;
+        }
+        for (const auto& m : result.patternMatches) {
+            hits.push_back(leaf + " : pattern '" + m.signatureName + "'");
+            thisConvicted = true;
+        }
+        for (const auto& m : result.hashMatches) {
+            hits.push_back(leaf + " : hash '" + m.signatureName + "'");
+            thisConvicted = true;
+        }
+        if (thisConvicted) {
+            ++convicted;
+        } else {
+            Info("  self-scan  : %s clean", leaf.c_str());
+        }
+    }
+
+    store.Close();
+
+    if (convicted > 0) {
+        Fail("self-scan: %zu shipped binary(ies) are convicted by the shipped detection "
+             "database - the product would try to quarantine itself. Re-encode or reword "
+             "the offending content; do NOT narrow the rule:",
+             convicted);
+        for (const auto& h : hits) {
+            Fail("  self-match : %s", h.c_str());
+        }
+        return 8;
+    }
+
+    Info("  self-scan  : %zu shipped binary(ies) clean against %ls",
+         scanned, opt.scanDatabase.c_str());
+    return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -1487,6 +1612,15 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     Info("phantom-sigbuild");
+
+    // Self-scan mode: no build, just open an existing database and scan binaries
+    // against it. Returns here before any build setup.
+    if (!opt.scanDatabase.empty()) {
+        Info("  mode       : self-scan (%zu binary/ies against %ls)",
+             opt.scanBinaries.size(), opt.scanDatabase.c_str());
+        return RunSelfScan(opt);
+    }
+
     Info("  output     : %ls", opt.output.c_str());
 
     BuildConfiguration cfg;
