@@ -17,16 +17,52 @@
 #include <algorithm>
 #include <regex>
 #include <string>
+#include <filesystem>
+#include <system_error>
 
 #include "../../../src/PhantomCore/Core/Network/URLAnalyzer.hpp"
+#include "../../../src/PhantomCore/Utils/DomainUtils.hpp"
 #include "CoreNetwork_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Network::Test {
+
+// Locates the vendored Public Suffix List without assuming the working directory, matching
+// the DomainUtils test fixture. ParseURL and the DGA scorer decompose through the list
+// (task 261), so a unit run must have it loaded or it falls back to the last-two-labels
+// approximation and the multi-label-suffix behaviour cannot be exercised.
+inline std::wstring LocatePublicSuffixList() {
+    std::error_code ec;
+    std::filesystem::path here = std::filesystem::current_path(ec);
+    for (int depth = 0; depth < 8 && !here.empty(); ++depth) {
+        const std::filesystem::path candidate =
+            here / L"content" / L"psl" / L"public_suffix_list.dat";
+        if (std::filesystem::exists(candidate, ec)) {
+            return candidate.wstring();
+        }
+        if (!here.has_parent_path() || here.parent_path() == here) {
+            break;
+        }
+        here = here.parent_path();
+    }
+    return {};
+}
 
 class URLAnalyzerTest : public ::testing::Test {
 protected:
     ScopedTempDir tempDir{L"ShadowStrike_URLAnalyzerTests_"};
     URLAnalyzer& analyzer = URLAnalyzer::Instance();
+
+    static void SetUpTestSuite() {
+        auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+        if (!psl.IsLoaded()) {
+            const std::wstring path = LocatePublicSuffixList();
+            if (!path.empty()) {
+                (void)psl.LoadFromFile(path);
+            } else {
+                (void)psl.EnsureLoaded();
+            }
+        }
+    }
 
     void SetUp() override {
         analyzer.Shutdown();
@@ -309,6 +345,62 @@ TEST_F(URLAnalyzerTest, ScanAndDiagnosticsContractsStayHealthyWithoutExternalFee
     const std::string report = ReadTextFile(diagnosticsPath);
     EXPECT_NE(report.find("\"module\": \"URLAnalyzer\""), std::string::npos);
     EXPECT_NE(report.find("\"initialized\": true"), std::string::npos);
+}
+
+// Task 261: ParseURL derives the registrable domain and subdomain from the Public Suffix
+// List, so a multi-label suffix (co.uk) is no longer mistaken for a registrable domain.
+TEST_F(URLAnalyzerTest, ParseUrlUsesThePublicSuffixListForMultiLabelSuffixes) {
+    ASSERT_TRUE(ShadowStrike::Utils::Domain::PublicSuffixList::Instance().IsLoaded())
+        << "the vendored Public Suffix List could not be loaded; the decomposition under "
+           "test would silently fall back to the last-two-labels approximation";
+
+    const ParsedURL p = URLAnalyzer::ParseURL("https://login.example.co.uk/account");
+    EXPECT_EQ(p.tld, "uk");                         // final label, for IsSuspiciousTLD
+    EXPECT_EQ(p.effectiveTld, "co.uk");             // the full public suffix
+    EXPECT_EQ(p.registeredDomain, "example.co.uk");
+    EXPECT_EQ(p.subdomain, "login");
+    // Before the fix this parsed as registeredDomain "co.uk" with subdomain
+    // "login.example", so the brand-in-subdomain check fired on a brand's own co.uk
+    // address - a false positive this decomposition removes.
+
+    const ParsedURL bare = URLAnalyzer::ParseURL("https://example.co.uk/");
+    EXPECT_EQ(bare.registeredDomain, "example.co.uk");
+    EXPECT_TRUE(bare.subdomain.empty())
+        << "a registrable domain sitting directly on a multi-label suffix has no subdomain";
+
+    // A single-label suffix is unchanged: the existing component test still expects
+    // tld "com", registeredDomain "example.com", subdomain "sub" for sub.example.com.
+    const ParsedURL dotCom = URLAnalyzer::ParseURL("https://a.b.example.com/");
+    EXPECT_EQ(dotCom.registeredDomain, "example.com");
+    EXPECT_EQ(dotCom.subdomain, "a.b");
+}
+
+// Task 261: the DGA scorer measures the registrant's own label, so neither a multi-label
+// suffix nor a leading subdomain dilutes the character-distribution features, while a
+// high-entropy SUBDOMAIN is still scored so subdomain-based generation is not lost.
+TEST_F(URLAnalyzerTest, DgaScoreMeasuresTheRegistrableLabelAndStillSeesTheSubdomain) {
+    ASSERT_TRUE(ShadowStrike::Utils::Domain::PublicSuffixList::Instance().IsLoaded());
+
+    // A label the generic scorer rates above zero (digit ratio over threshold).
+    const std::string label = "abcdefg1234";
+    const double bare = analyzer.GetDGAScore(label + ".com").first;
+    EXPECT_GT(bare, 0.0) << "the fixture label must score as DGA-like for this test to mean anything";
+
+    // The public suffix does not enter the measurement: a .co.uk name scores exactly as
+    // its .com twin. The old last-label strip measured "abcdefg1234.co", whose longer
+    // string changes the ratios, so this equality is what the fix buys.
+    EXPECT_DOUBLE_EQ(analyzer.GetDGAScore(label + ".co.uk").first, bare);
+
+    // A leading subdomain does not dilute the registrable label.
+    EXPECT_DOUBLE_EQ(analyzer.GetDGAScore("www." + label + ".com").first, bare);
+
+    // Coverage preserved: a high-entropy label in the SUBDOMAIN is still scored (the
+    // registrable label here, "example", is benign), so dropping the subdomain candidate
+    // would lose subdomain-based DGA and fast-flux.
+    EXPECT_DOUBLE_EQ(analyzer.GetDGAScore(label + ".example.com").first, bare);
+
+    // A benign registrable label with no suspicious subdomain stays low.
+    EXPECT_LT(analyzer.GetDGAScore("www.example.com").first, bare);
 }
 
 }  // namespace ShadowStrike::Core::Network::Test

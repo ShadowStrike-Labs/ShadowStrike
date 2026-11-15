@@ -67,6 +67,7 @@
 #include "../../Utils/NetworkUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/CryptoUtils.hpp"
+#include "../../Utils/DomainUtils.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
@@ -1197,74 +1198,118 @@ public:
         return score >= configSnapshot.dgaThreshold;
     }
 
+    // Scores one label for algorithmic-generation features (entropy, consonant and
+    // digit ratios, known DGA families). Called on the registrable label and on the
+    // subdomain separately, so the public suffix never enters the measurement.
+    [[nodiscard]] std::pair<double, std::string> ScoreDgaCandidate(
+        const std::string& label,
+        const URLAnalyzerConfig& cfg) {
+        if (label.length() < URLAnalyzerConstants::DGA_MIN_LENGTH) {
+            return {0.0, ""};
+        }
+
+        // Calculate entropy
+        double entropy = CalculateEntropyInternal(label);
+
+        // Calculate consonant ratio
+        size_t consonantCount = 0;
+        for (char c : label) {
+            if (CONSONANTS.find(c) != std::string::npos) {
+                consonantCount++;
+            }
+        }
+        double consonantRatio = static_cast<double>(consonantCount) / label.length();
+
+        // Calculate digit ratio
+        size_t digitCount = 0;
+        for (char c : label) {
+            if (std::isdigit(static_cast<unsigned char>(c))) {
+                digitCount++;
+            }
+        }
+        double digitRatio = static_cast<double>(digitCount) / label.length();
+
+        // Check against known DGA families
+        for (const auto& family : KNOWN_DGA_FAMILIES) {
+            if (entropy >= family.minEntropy &&
+                consonantRatio >= family.maxConsonantRatio &&
+                label.length() >= family.minLength) {
+
+                double score = 0.0;
+                score += (entropy / 5.0) * 0.4;  // Max entropy ~5.0
+                score += consonantRatio * 0.3;
+                score += (digitRatio > 0.2 ? 0.3 : 0.0);
+
+                return {std::min(score, 1.0), family.name};
+            }
+        }
+
+        // Generic DGA scoring
+        double score = 0.0;
+        if (entropy >= URLAnalyzerConstants::DGA_ENTROPY_THRESHOLD) {
+            score += 0.4;
+        }
+        if (consonantRatio >= URLAnalyzerConstants::DGA_CONSONANT_RATIO) {
+            score += 0.3;
+        }
+        if (digitRatio > 0.3) {
+            score += 0.3;
+        }
+
+        if (score >= cfg.dgaThreshold) {
+            return {score, "Generic"};
+        }
+
+        return {score, ""};
+    }
+
     [[nodiscard]] std::pair<double, std::string> GetDGAScoreInternal(
         const std::string& domain,
         const URLAnalyzerConfig& cfg) {
         try {
-            // Extract domain without TLD
-            std::string domainPart = domain;
-            size_t lastDot = domain.find_last_of('.');
-            if (lastDot != std::string::npos) {
-                domainPart = domain.substr(0, lastDot);
-            }
-
-            if (domainPart.length() < URLAnalyzerConstants::DGA_MIN_LENGTH) {
-                return {0.0, ""};
-            }
-
-            // Calculate entropy
-            double entropy = CalculateEntropyInternal(domainPart);
-
-            // Calculate consonant ratio
-            size_t consonantCount = 0;
-            for (char c : domainPart) {
-                if (CONSONANTS.find(c) != std::string::npos) {
-                    consonantCount++;
+            // Measure the registrant's own label and the subdomain SEPARATELY, and
+            // take the stronger (task 261). Scoring the registrable label alone would
+            // stop a multi-label suffix (co.uk) and a leading "www." from diluting the
+            // character-distribution features, but a DGA that lives in the SUBDOMAIN
+            // (subdomain-based generation, fast-flux) must still be caught - the old
+            // code saw it only because it measured almost the whole host - so the
+            // subdomain is scored as well. IncludePrivate: a dynamic-DNS tenant such as
+            // x7f9q.duckdns.org is its own registrable label, so "x7f9q" is measured,
+            // not "duckdns".
+            std::vector<std::string> candidates;
+            auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+            (void)psl.EnsureLoaded();
+            const ShadowStrike::Utils::Domain::DomainParts parts =
+                psl.Decompose(domain, ShadowStrike::Utils::Domain::SuffixScope::IncludePrivate);
+            if (parts.valid) {
+                if (!parts.registrableLabel.empty()) {
+                    candidates.push_back(parts.registrableLabel);
+                }
+                if (!parts.subdomain.empty()) {
+                    candidates.push_back(parts.subdomain);
                 }
             }
-            double consonantRatio = static_cast<double>(consonantCount) / domainPart.length();
+            if (candidates.empty()) {
+                // List unavailable, or an input with no registrable label (an IP, a
+                // bare label): the previous final-label strip, which is never empty so
+                // a domain the list cannot decompose is still measured rather than
+                // silently scored zero.
+                std::string domainPart = domain;
+                size_t lastDot = domain.find_last_of('.');
+                if (lastDot != std::string::npos) {
+                    domainPart = domain.substr(0, lastDot);
+                }
+                candidates.push_back(domainPart);
+            }
 
-            // Calculate digit ratio
-            size_t digitCount = 0;
-            for (char c : domainPart) {
-                if (std::isdigit(static_cast<unsigned char>(c))) {
-                    digitCount++;
+            std::pair<double, std::string> best{0.0, ""};
+            for (const auto& candidate : candidates) {
+                const auto scored = ScoreDgaCandidate(candidate, cfg);
+                if (scored.first > best.first) {
+                    best = scored;
                 }
             }
-            double digitRatio = static_cast<double>(digitCount) / domainPart.length();
-
-            // Check against known DGA families
-            for (const auto& family : KNOWN_DGA_FAMILIES) {
-                if (entropy >= family.minEntropy &&
-                    consonantRatio >= family.maxConsonantRatio &&
-                    domainPart.length() >= family.minLength) {
-
-                    double score = 0.0;
-                    score += (entropy / 5.0) * 0.4;  // Max entropy ~5.0
-                    score += consonantRatio * 0.3;
-                    score += (digitRatio > 0.2 ? 0.3 : 0.0);
-
-                    return {std::min(score, 1.0), family.name};
-                }
-            }
-
-            // Generic DGA scoring
-            double score = 0.0;
-            if (entropy >= URLAnalyzerConstants::DGA_ENTROPY_THRESHOLD) {
-                score += 0.4;
-            }
-            if (consonantRatio >= URLAnalyzerConstants::DGA_CONSONANT_RATIO) {
-                score += 0.3;
-            }
-            if (digitRatio > 0.3) {
-                score += 0.3;
-            }
-
-            if (score >= cfg.dgaThreshold) {
-                return {score, "Generic"};
-            }
-
-            return {score, ""};
+            return best;
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"GetDGAScoreInternal - Exception: %hs", e.what());
@@ -1698,20 +1743,40 @@ public:
 
             parsed.pathNormalized = parsed.path;
 
-            // Extract domain parts
+            // Extract domain parts. The registrable domain and its subdomain come from
+            // the Public Suffix List (task 261), so a multi-label suffix is not mistaken
+            // for a registrable domain: good.co.uk is the site, not "co.uk" with a
+            // subdomain of "good" - the mistake that made the brand-in-subdomain check
+            // fire on a brand's own co.uk address. tld stays the final label so
+            // IsSuspiciousTLD still tests the real TLD; effectiveTld is the full suffix.
+            // IncludePrivate: a shared-host tenant (a blogspot.com name) is its own
+            // registrable domain and must not inherit the host's.
             std::string domain = parsed.hostNormalized;
             size_t lastDot = domain.find_last_of('.');
             if (lastDot != std::string::npos && lastDot < domain.length() - 1) {
                 parsed.tld = domain.substr(lastDot + 1);
-                parsed.effectiveTld = parsed.tld;
 
-                size_t secondLastDot = (lastDot > 0) ?
-                    domain.find_last_of('.', lastDot - 1) : std::string::npos;
-                if (secondLastDot != std::string::npos) {
-                    parsed.registeredDomain = domain.substr(secondLastDot + 1);
-                    parsed.subdomain = domain.substr(0, secondLastDot);
+                auto& psl = ShadowStrike::Utils::Domain::PublicSuffixList::Instance();
+                (void)psl.EnsureLoaded();
+                const ShadowStrike::Utils::Domain::DomainParts parts =
+                    psl.Decompose(domain, ShadowStrike::Utils::Domain::SuffixScope::IncludePrivate);
+                if (parts.valid && !parts.registrableDomain.empty()) {
+                    parsed.effectiveTld = parts.publicSuffix;
+                    parsed.registeredDomain = parts.registrableDomain;
+                    parsed.subdomain = parts.subdomain;
                 } else {
-                    parsed.registeredDomain = domain;
+                    // List unavailable, or the host is itself a public suffix: the
+                    // previous last-two-labels approximation, correct for a single-label
+                    // suffix and never leaving registeredDomain empty.
+                    parsed.effectiveTld = parsed.tld;
+                    size_t secondLastDot = (lastDot > 0) ?
+                        domain.find_last_of('.', lastDot - 1) : std::string::npos;
+                    if (secondLastDot != std::string::npos) {
+                        parsed.registeredDomain = domain.substr(secondLastDot + 1);
+                        parsed.subdomain = domain.substr(0, secondLastDot);
+                    } else {
+                        parsed.registeredDomain = domain;
+                    }
                 }
             }
 
