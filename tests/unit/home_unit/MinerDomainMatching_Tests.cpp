@@ -150,9 +150,20 @@ TEST(MinerDomainMatching, SitesThatMerelyEmbeddedAMinerAreNoLongerDomainBlocked)
     EXPECT_FALSE(IsKnownMiningDomain("joyreactor.cc"));
     EXPECT_FALSE(IsKnownMiningDomain("bitcoincore.io"));
     EXPECT_FALSE(IsKnownMiningDomain("cookiescript.info"));
-    // Operator infrastructure stays blocked outright.
+    // gus.host was removed after verification (task 311): it resolves to GitHub Pages
+    // today, so it has been repurposed to a live site and an outright block of every
+    // subdomain would be a false positive. A miner served from it is still caught by the
+    // script/WASM analysis.
+    EXPECT_FALSE(IsKnownMiningDomain("gus.host"));
+    EXPECT_FALSE(IsKnownMiningDomain("project.gus.host"));
+    // Operator infrastructure stays blocked outright. rocks.io and ppoi.org were
+    // confirmed as mining services (maltiverse / Malwarebytes); papoto.com is a parked
+    // dead miner, so a block costs nothing and guards against its reuse.
     EXPECT_TRUE(IsKnownMiningDomain("coinhive.com"));
     EXPECT_TRUE(IsKnownMiningDomain("authedmine.com"));
+    EXPECT_TRUE(IsKnownMiningDomain("rocks.io"));
+    EXPECT_TRUE(IsKnownMiningDomain("ppoi.org"));
+    EXPECT_TRUE(IsKnownMiningDomain("papoto.com"));
 }
 
 }  // namespace

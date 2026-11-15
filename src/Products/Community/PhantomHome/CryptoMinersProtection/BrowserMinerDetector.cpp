@@ -614,8 +614,12 @@ constexpr std::array<uint8_t, 4> WASM_MAGIC = {0x00, 0x61, 0x73, 0x6D};
 // and WASM analysis instead, which detects the miner rather than remembering the host.
 // Also removed bitcoincore.io (the legitimate Bitcoin Core project) and
 // cookiescript.info (a cookie-consent CDN, an injection victim not an operator).
-// Still pending verification before beta: rocks.io, ppoi.org, gus.host, papoto.com
-// (short generic names whose subdomain reach is wide).
+// Verified before beta (task 311): rocks.io (maltiverse: CryptoMining hostname) and
+// ppoi.org (Malwarebytes: a Coinhive-style mining service) are operator infrastructure
+// and stay; papoto.com is a dead miner now parked, so a block costs nothing and it
+// stays; gus.host was REMOVED because it resolves to GitHub Pages today, i.e. it has
+// been repurposed to a live site, so an outright block of every subdomain would be a
+// false positive - a miner served from it is still caught by the script/WASM analysis.
 constexpr auto KNOWN_MINING_DOMAINS = std::to_array<std::string_view>({
     "coinhive.com", "coin-hive.com", "authedmine.com", "cryptoloot.pro",
     "crypto-loot.com", "webminepool.com", "webminepool.tk", "jsecoin.com",
@@ -624,7 +628,7 @@ constexpr auto KNOWN_MINING_DOMAINS = std::to_array<std::string_view>({
     "hemnes.win", "cloudcoins.co", "2giga.link", "ad-miner.com",
     "afminer.com", "beatingheart.pro", "bmst.pw", "cnt.statistic.date",
     "coinerra.com", "rocks.io", "ajplugins.com",
-    "static-cnt.bid", "gus.host", "cdn.staticfile.tk", "crypto.csgostash.com",
+    "static-cnt.bid", "cdn.staticfile.tk", "crypto.csgostash.com",
     "noblock.pro", "cpu2cash.link", "papoto.com",
     "party-nngvitbizn.now.sh", "hashing.win",
     "moneone.ga", "jscdndel.com", "digxmr.com",
