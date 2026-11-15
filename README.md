@@ -512,8 +512,8 @@ An alpha under active development. A security product that is vague about its ow
 
 **Verified working, still hardening**
 - **False positives on signed binaries.** Publisher trust is now evaluated at the script-conviction, remediation, registry-write and file-enumeration decision points, each change shipped with contract tests that fail if a detector is weakened rather than made more precise. Remaining false positives are being worked through against field evidence from live endpoints.
-- **Kernel IPC frame robustness.** The encrypted kernel channel is established and carrying scan traffic, but a fraction of frames currently fail integrity checks and are answered fail-open. Every such frame is an unscanned file, and this is treated as a correctness defect, not a performance one.
-- **Cloud-backed files.** Files stored as OneDrive placeholders are currently unreadable by the scanner and are not yet distinguishable from scanned files in the statistics.
+- **Kernel scan capacity under load.** Frame integrity failures on the encrypted kernel channel are fixed: the 1.0.133 field run counted none in 1.59 million received messages, and 1.0.134 none. What remains is capacity. When the user-mode scanner falls behind, the driver's circuit breaker lets a file open proceed without a verdict, counted as `circuitOpen` on the service's capacity line. Every such open is an unscanned file, and this is treated as a correctness defect, not a performance one.
+- **Cloud-backed files.** A OneDrive placeholder whose content is not on the disk is not read, because reading it would force a download. Such files are counted separately (`contentNotLocalNotExamined`) instead of being reported as scanned, and the driver examines a file again at the moment its content becomes local. That rescan has not yet been exercised against a live cloud provider.
 
 **Infrastructure and process**
 - **Kernel testing cannot be automated.** No CI system can load a kernel driver, so integration verification runs as build-deploy-test cycles against real Windows endpoints, analysed from service logs and kernel traces.
