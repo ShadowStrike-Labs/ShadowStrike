@@ -134,7 +134,7 @@ foreach ($name in $Targets.Keys) {
     Write-Host "[INFO] Found: $path  ($sizeMB MB)"
 }
 
-# Validate driver targets – skip gracefully with a warning if not built yet.
+# Validate driver targets - skip gracefully with a warning if not built yet.
 $missingDrivers = @()
 foreach ($name in @($DriverTargets.Keys)) {
     $path = $DriverTargets[$name]
@@ -261,11 +261,11 @@ foreach ($name in $Targets.Keys) {
 Write-Host "[BUNDLE] Signing Burn bundle via detach/sign-engine/reattach..."
 
 try {
-    # Step 1 – Detach engine
+    # Step 1 - Detach engine
     wix burn detach $BundlePath -engine $EngineTemp 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "wix burn detach failed (exit $LASTEXITCODE)" }
 
-    # Step 2 – Sign the detached engine
+    # Step 2 - Sign the detached engine
     $rc = Invoke-Sign -File $EngineTemp -WithTimestamp $timestampReachable
     if ($rc -ne 0 -and $timestampReachable) {
         Write-Host "[WARN] TS sign failed for engine. Retrying without timestamp..." -ForegroundColor Yellow
@@ -273,7 +273,7 @@ try {
     }
     if ($rc -ne 0) { throw "Engine sign failed (exit $rc)" }
 
-    # Step 3 – Reattach signed engine into the final bundle
+    # Step 3 - Reattach signed engine into the final bundle
     wix burn reattach $BundlePath -engine $EngineTemp -o $BundleTmp 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "wix burn reattach failed (exit $LASTEXITCODE)" }
 
@@ -371,7 +371,7 @@ $AllTargets = [ordered]@{}
 foreach ($k in $Targets.Keys) { $AllTargets[$k] = $Targets[$k] }
 # Add driver artifacts if they were signed.
 foreach ($k in $DriverTargets.Keys) { $AllTargets[$k] = $DriverTargets[$k] }
-# NOTE: The bundle EXE is verified differently — its engine is signed internally.
+# NOTE: The bundle EXE is verified differently - its engine is signed internally.
 # Get-AuthenticodeSignature on the outer bundle returns "NotSigned" by design;
 # Burn uses the embedded engine's PE signature for authenticity, not the outer file.
 $AllTargets["ShadowStrikePhantom-Home-Setup.exe"] = $BundlePath
@@ -387,7 +387,7 @@ foreach ($name in $AllTargets.Keys) {
     $signerThumb = if ($authSig.SignerCertificate) { $authSig.SignerCertificate.Thumbprint } else { "" }
 
     if ($isBundleOuter) {
-        # Outer bundle is not directly signed — Burn's internal engine carries the signature.
+        # Outer bundle is not directly signed - Burn's internal engine carries the signature.
         # Treat "NotSigned" as expected for this artifact.
         $structurallyValid = ($authSig.Status -eq "Valid") -or
             ($authSig.Status -eq "UnknownError" -and $signerThumb -eq $devThumb) -or
@@ -403,7 +403,7 @@ foreach ($name in $AllTargets.Keys) {
         $anyFailed = $true
     } else {
         if ($isBundleOuter -and $authSig.Status -eq "NotSigned") {
-            Write-Host "[OK] Bundle engine signed internally (outer EXE unsigned by design — Burn uses engine signature)." -ForegroundColor Green
+            Write-Host "[OK] Bundle engine signed internally (outer EXE unsigned by design - Burn uses engine signature)." -ForegroundColor Green
         } else {
             $chainNote = if ($authSig.Status -eq "Valid") { "chain-trusted" } else { "dev-cert (chain not trusted by design)" }
             Write-Host "[OK] Signature verified ($chainNote): $file" -ForegroundColor Green
