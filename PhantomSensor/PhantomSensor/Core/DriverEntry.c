@@ -3209,6 +3209,47 @@ DriverEntry(
     }
 
     //
+    // Initialize the process-creation monitor state.
+    //
+    // ShadowStrikeRegisterProcessCallbacks (Phase 6, above) arms the
+    // PsSetCreateProcessNotifyRoutineEx callback, but arming the OS callback and
+    // initializing the monitor it drives are two separate steps - and only the
+    // first was ever performed. Nothing set g_ProcessMonitor.Initialized, so
+    // ShadowStrikeProcessNotifyCallback returned at its
+    // '!g_ProcessMonitor.Initialized' gate on every creation, before it ran any
+    // analysis or called PnpSendProcessNotification. That is the task-386 field
+    // result: zero FilterMessageType_ProcessNotify reached user mode across 1.6M
+    // messages while image and registry notifications flowed, because the image
+    // monitor (ImageNotifyInitialize) and registry monitor
+    // (ShadowStrikeInitializeRegistryMonitoring) ARE initialized and this one was
+    // not. The whole kernel process-creation path - PPID-spoof, hollowing,
+    // token/privilege scoring, the user-mode verdict hop - was dark as a result.
+    //
+    // Deferred to the post-init region for the same reason as the workers above:
+    // it caches engine references (ThreatScoring at step 14.22, ProcessAnalyzer at
+    // step 14.19) and arms a periodic cleanup timer, work kept off the quiescent
+    // pre-filtering boot path. The callback has been registered since Phase 6 and
+    // has safely no-oped on the Initialized gate until this point, so there is no
+    // window where a half-initialized monitor is consulted. Best-effort and
+    // non-fatal: on failure the monitor stays dormant exactly as it was before and
+    // the rest of the driver continues. Torn down in ShadowStrikeUnload, after the
+    // callback is unregistered and the process rundown has drained.
+    //
+    {
+        NTSTATUS pmInitStatus = ShadowStrikeInitializeProcessMonitoring();
+        if (!NT_SUCCESS(pmInitStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] WARNING: Post-init "
+                       "ShadowStrikeInitializeProcessMonitoring failed: 0x%08X "
+                       "(process monitoring stays dormant, continuing)\n",
+                       pmInitStatus);
+        } else {
+            ShadowStrikeLogInitStatus("Process Monitoring (post-init)",
+                                      STATUS_SUCCESS);
+        }
+    }
+
+    //
     // Drain any work items queued by foreign agents during their own init
     // phase. Each callback is invoked at PASSIVE_LEVEL; after this point
     // ShadowStrikeQueuePostInitWork() invokes callbacks inline.
@@ -3604,6 +3645,24 @@ ShadowStrikeUnload(
     }
 
     ShadowStrikeUnregisterProcessCallbacks(g_CallbackFlags);
+
+    //
+    // Tear down the process-monitor state that the post-init step initialized.
+    //
+    // Ordering is load-bearing. ShadowStrikeUnregisterProcessCallbacks above
+    // calls PsSetCreateProcessNotifyRoutineEx(Remove), which blocks until every
+    // in-flight ShadowStrikeProcessNotifyCallback has returned, and the global
+    // process rundown was already drained in Step 3. So by this point no callback
+    // can be executing or will start, and it is safe to free the monitor's
+    // lookaside lists and process contexts. It must also run BEFORE TmShutdown
+    // (further below) because ShadowStrikeCleanupProcessMonitoring cancels its
+    // periodic cleanup timer through the TimerManager, which must still be alive.
+    // The cleanup only frees its own state (contexts, lookasides, timer); it does
+    // not call BehaviorEngine/ProcessAnalyzer/ThreatScoring, so the fact that
+    // those were shut down in Step 2 is immaterial. Self-guarded: it no-ops if the
+    // post-init initialization did not run.
+    //
+    ShadowStrikeCleanupProcessMonitoring();
 
     //
     // Step 4: Shutdown self-protection subsystem
