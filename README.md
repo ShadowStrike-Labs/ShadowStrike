@@ -390,6 +390,7 @@ All three tiers share the same kernel sensor, detection engines, AI models, and 
 - Windows SDK 10.0.22621.0+
 - Python 3.10+ with PyTorch (for PhantomCortex training only)
 - Test environment: Windows 10/11 x64 VM with Driver Verifier enabled
+- An antivirus exclusion for the repository root. A security product's source carries the patterns it detects (encoded PowerShell, AMSI-bypass strings, ransomware indicators), and Microsoft Defender has quarantined `src/PhantomCore/Scripts/PowerShellScanner.cpp` straight out of a working tree. The first symptom is a build or contract failure for a source file that "no longer exists", which looks like a defect in whatever change is in flight. From an elevated prompt: `Add-MpPreference -ExclusionPath '<repo root>'`
 
 **Quick build (user-mode only):**
 ```powershell
