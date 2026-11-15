@@ -508,7 +508,7 @@ An alpha under active development. A security product that is vague about its ow
 
 **Not yet shipped to endpoints**
 - **ML models.** The inference bridge is wired into the scan pipeline and four models are trained, but the models are not packaged into the installer and there is no signed model distribution yet, so ML detection is inactive on an installed endpoint.
-- **Detection content is thin.** The shipped database carries 11,053 YARA rules, but the malware hash section holds only EICAR test hashes. Most public malware-hash feeds are licensed for non-commercial use only, which constrains what this project may redistribute; hash content is therefore user-supplied via the updater for now.
+- **Detection content is thin.** The shipped database carries 11,053 YARA rules, but the malware hash section holds only EICAR test hashes. Most public malware-hash feeds are licensed for non-commercial use only, which constrains what this project may redistribute; hash content is therefore user-supplied via the updater for now. Feed API keys are likewise supplied per installation and never shipped; the licensing position is in [docs/ThreatIntel-Feeds.md](docs/ThreatIntel-Feeds.md).
 
 **Verified working, still hardening**
 - **False positives on signed binaries.** Publisher trust is now evaluated at the script-conviction, remediation, registry-write and file-enumeration decision points, each change shipped with contract tests that fail if a detector is weakened rather than made more precise. Remaining false positives are being worked through against field evidence from live endpoints.
