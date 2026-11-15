@@ -455,6 +455,12 @@ struct PhishingAnalysisResult {
     
     /// @brief Confidence score (0-100)
     int confidenceScore = 0;
+
+    /// @brief The phishing threshold isPhishing was decided against. ShouldBlock compares
+    /// against this value, so a configured threshold moves enforcement together with
+    /// detection (task 273). A result not produced by the analyser keeps the documented
+    /// constant.
+    int appliedPhishingThreshold = PhishingConstants::HIGH_CONFIDENCE_THRESHOLD;
     
     /// @brief Risk score (0-100)
     int riskScore = 0;

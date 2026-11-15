@@ -6,25 +6,17 @@
  */
 /**
  * @file PhishingVerdict_Tests.cpp
- * @brief Whether a phishing verdict blocks, and the configured threshold it does not consult.
+ * @brief Whether a phishing verdict blocks, and that it blocks against the threshold it was decided by.
  *
- * PhishingAnalysisResult::ShouldBlock is the enforcement half of the phishing decision. It reads
+ * PhishingAnalysisResult::ShouldBlock is the enforcement half of the phishing decision. The analyser
+ * sets isPhishing against m_config.phishingThreshold, a configurable value validated to the range 0-100.
+ * ShouldBlock used to compare against a second, hardcoded constant of 80, so an administrator who lowered
+ * the threshold to 60 got an email scoring 70 classified, counted and reported as phishing - and
+ * delivered (task 273). The setting moved detection without moving enforcement.
  *
- *     isPhishing && confidenceScore >= PhishingConstants::HIGH_CONFIDENCE_THRESHOLD
- *
- * where the constant is 80. But isPhishing is set by the analyser against m_config.phishingThreshold,
- * a configurable value validated to the range 0-100 with only the constraint that it exceed the
- * suspicious threshold. The two do not agree.
- *
- * So an administrator who lowers the phishing threshold to 60 in order to catch more phishing gets an
- * email scoring 70 marked as phishing, counted in phishingDetected, reported in diagnostics - and NOT
- * blocked. The setting moves detection without moving enforcement, in one direction only: raising the
- * threshold above 80 works, because isPhishing then never becomes true below it.
- *
- * The cases below pin the predicate's own behaviour, including the boundary from both sides. The
- * mismatch with the configured threshold is filed rather than fixed here, because closing it changes
- * what gets blocked for every installation that already lowered the setting, and that is an
- * enforcement change rather than a repair.
+ * The result now carries appliedPhishingThreshold, the threshold its verdict was decided against, and
+ * ShouldBlock compares against that. The default of 80 is unchanged for every installation that never
+ * touched the setting, and a raised threshold still governs blocking.
  */
 
 #include "pch.h"
@@ -32,6 +24,8 @@
 #include <gtest/gtest.h>
 
 #include "Products/Community/PhantomHome/Email/PhishingEmailDetector.hpp"
+
+#include <string>
 
 namespace ShadowStrike::Email::Test {
 namespace {
@@ -43,6 +37,12 @@ namespace {
     return r;
 }
 
+[[nodiscard]] PhishingAnalysisResult ResultWith(bool isPhishing, int confidence, int appliedThreshold) {
+    PhishingAnalysisResult r = ResultWith(isPhishing, confidence);
+    r.appliedPhishingThreshold = appliedThreshold;
+    return r;
+}
+
 TEST(PhishingVerdictTest, ACleanEmailIsNotBlocked) {
     EXPECT_FALSE(ResultWith(false, 0).ShouldBlock());
 }
@@ -51,9 +51,11 @@ TEST(PhishingVerdictTest, AHighConfidencePhishIsBlocked) {
     EXPECT_TRUE(ResultWith(true, 95).ShouldBlock());
 }
 
-TEST(PhishingVerdictTest, TheBlockingBoundaryHoldsFromBothSides) {
-    // 80 is the documented constant. Asserted either side so a one-point move fails here rather than
+TEST(PhishingVerdictTest, TheDefaultBlockingBoundaryHoldsFromBothSides) {
+    // A result that never passed through the analyser keeps the documented constant of 80, which is
+    // also the configuration default. Asserted either side so a one-point move fails here rather than
     // silently changing which mail is delivered.
+    EXPECT_EQ(PhishingConstants::HIGH_CONFIDENCE_THRESHOLD, PhishingAnalysisResult{}.appliedPhishingThreshold);
     EXPECT_FALSE(ResultWith(true, 79).ShouldBlock())
         << "a phishing verdict at 79 confidence was blocked";
     EXPECT_TRUE(ResultWith(true, 80).ShouldBlock())
@@ -65,18 +67,68 @@ TEST(PhishingVerdictTest, ConfidenceAloneDoesNotBlock) {
     // did NOT classify as phishing must not be blocked by score alone.
     EXPECT_FALSE(ResultWith(false, 100).ShouldBlock())
         << "a non-phishing verdict was blocked purely on its confidence score";
+    EXPECT_FALSE(ResultWith(false, 70, 60).ShouldBlock());
 }
 
-TEST(PhishingVerdictTest, ADetectedPhishBelowTheConstantIsNotBlocked) {
-    // THE MISMATCH THIS FILE RECORDS. isPhishing is set against the CONFIGURED threshold, which an
-    // administrator may lower to 60. ShouldBlock compares against the hardcoded 80. This case is the
-    // state an installation with a lowered threshold is in: the email is classified as phishing and
-    // counted as detected, and it is still delivered.
-    const auto detectedButDelivered = ResultWith(true, 70);
-    EXPECT_TRUE(detectedButDelivered.isPhishing);
-    EXPECT_FALSE(detectedButDelivered.ShouldBlock())
-        << "if this now fails, ShouldBlock was made to honour the configured threshold - which is "
-           "the filed fix. Update the filing and this comment rather than reverting.";
+TEST(PhishingVerdictTest, ALoweredThresholdBlocksWhatItDetects) {
+    // Task 273: with the threshold lowered to 60, an email scoring 70 is phishing AND blocked. Before
+    // the fix this case was classified as phishing and delivered.
+    EXPECT_TRUE(ResultWith(true, 70, 60).ShouldBlock())
+        << "a verdict the lowered threshold classifies as phishing was delivered";
+    EXPECT_TRUE(ResultWith(true, 60, 60).ShouldBlock()) << "the lowered boundary is inclusive";
+    EXPECT_FALSE(ResultWith(true, 59, 60).ShouldBlock()) << "a score below the applied threshold blocked";
+}
+
+TEST(PhishingVerdictTest, ARaisedThresholdStillGovernsBlocking) {
+    EXPECT_FALSE(ResultWith(true, 85, 90).ShouldBlock())
+        << "a score below a raised threshold was blocked";
+    EXPECT_TRUE(ResultWith(true, 90, 90).ShouldBlock());
+}
+
+TEST(PhishingVerdictTest, TheAppliedThresholdIsSerialised) {
+    // A stored verdict says which threshold produced it.
+    EXPECT_NE(std::string::npos,
+              ResultWith(true, 70, 60).ToJson().find("\"appliedPhishingThreshold\":60"));
+}
+
+// End to end through the analyser: the configured threshold reaches the result, and a verdict decided
+// against a lowered threshold is enforced. The fixture's score is measured first and the threshold is
+// lowered exactly onto it, so the case discriminates whatever the scoring weights are - provided the
+// score sits below the old constant of 80, which is asserted.
+TEST(PhishingVerdictTest, TheAnalyserEnforcesTheConfiguredThreshold) {
+    auto& detector = PhishingEmailDetector::Instance();
+    if (!detector.IsInitialized()) {
+        ASSERT_TRUE(detector.Initialize());
+    }
+    const PhishingDetectorConfiguration saved = detector.GetConfiguration();
+    struct RestoreConfig {
+        PhishingEmailDetector& d;
+        const PhishingDetectorConfiguration& c;
+        ~RestoreConfig() { (void)d.UpdateConfiguration(c); }
+    } restore{detector, saved};
+
+    const std::string subject = "Urgent: your account has been suspended";
+    const std::string body =
+        "Dear customer, we detected unusual activity. Verify your password immediately at "
+        "http://paypa1-account-verify.example/login or your account will be closed today.";
+    const std::string sender = "security-alert@paypa1-account-verify.example";
+
+    const int score = detector.AnalyzeContent(subject, body, sender).confidenceScore;
+    ASSERT_GE(score, 2) << "the fixture must score high enough to place a threshold on it";
+    ASSERT_LT(score, PhishingConstants::HIGH_CONFIDENCE_THRESHOLD)
+        << "the fixture must score below the old hardcoded 80, or this case cannot discriminate";
+
+    PhishingDetectorConfiguration lowered = saved;
+    lowered.phishingThreshold = score;
+    lowered.suspiciousThreshold = score - 1;
+    ASSERT_TRUE(detector.UpdateConfiguration(lowered));
+
+    const PhishingAnalysisResult r = detector.AnalyzeContent(subject, body, sender);
+    EXPECT_EQ(score, r.appliedPhishingThreshold) << "the configured threshold did not reach the result";
+    EXPECT_TRUE(r.isPhishing);
+    EXPECT_TRUE(r.ShouldBlock())
+        << "a verdict the configured threshold classifies as phishing was delivered (score " << score
+        << ")";
 }
 
 }  // namespace

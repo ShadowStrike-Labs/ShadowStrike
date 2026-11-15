@@ -542,7 +542,10 @@ std::string SenderAnalysisResult::ToJson() const {
 }
 
 bool PhishingAnalysisResult::ShouldBlock() const noexcept {
-    return isPhishing && confidenceScore >= PhishingConstants::HIGH_CONFIDENCE_THRESHOLD;
+    // Enforcement follows the threshold the verdict was decided against rather than a
+    // second, hardcoded constant: an administrator who lowers phishingThreshold to catch
+    // more phishing must also block what the setting now classifies as phishing (task 273).
+    return isPhishing && confidenceScore >= appliedPhishingThreshold;
 }
 
 std::string PhishingAnalysisResult::ToJson() const {
@@ -551,6 +554,7 @@ std::string PhishingAnalysisResult::ToJson() const {
         << "\"verdict\":\"" << GetPhishingVerdictName(verdict).data() << "\""
         << ",\"isPhishing\":" << (isPhishing ? "true" : "false")
         << ",\"confidenceScore\":" << confidenceScore
+        << ",\"appliedPhishingThreshold\":" << appliedPhishingThreshold
         << ",\"riskScore\":" << riskScore
         << ",\"campaignType\":\"" << GetCampaignTypeName(campaignType).data() << "\""
         << ",\"indicators\":" << indicators.ToJson()
@@ -1103,8 +1107,10 @@ public:
             // Classify campaign
             result.campaignType = ClassifyCampaign(result.indicators, subject, body);
 
-            // Determine verdict
-            if (result.confidenceScore >= m_config.phishingThreshold) {
+            // Determine verdict. The configured threshold is read once and travels with the
+            // result, so ShouldBlock enforces exactly the verdict decided here (task 273).
+            result.appliedPhishingThreshold = m_config.phishingThreshold;
+            if (result.confidenceScore >= result.appliedPhishingThreshold) {
                 result.verdict = PhishingVerdict::Phishing;
                 result.isPhishing = true;
                 m_statistics.phishingDetected.fetch_add(1, std::memory_order_relaxed);
