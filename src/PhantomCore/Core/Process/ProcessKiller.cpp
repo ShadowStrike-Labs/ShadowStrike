@@ -1204,23 +1204,13 @@ public:
         result = KillWithMethod(pid, KillMethod::ForceKernel, options, info, creationTime);
         if (result == KillResult::Success || result == KillResult::AlreadyDead) return result;
 
-        // Level 8: Nuclear — kernel driver IOCTL-based termination (PPL bypass)
-        if (m_kernelDriverAvailable) {
-            // First, try to strip PPL via kernel driver so the next attempt can succeed
-            auto prot = GetProtectionInfoInternal(pid);
-            if (prot.level != ProtectionLevel::None) {
-                SS_LOG_INFO(L"ProcessKiller", L"Attempting kernel PPL strip for protected pid %u", pid);
-                RemoveProtectionInternal(pid);
-                // Retry NtTerminateProcess after stripping protection
-                result = KillWithMethod(pid, KillMethod::ForceKernel, options, info, creationTime);
-                if (result == KillResult::Success || result == KillResult::AlreadyDead) return result;
-            }
-
-            result = KillWithMethod(pid, KillMethod::Nuclear, options, info, creationTime);
-            if (result == KillResult::Success || result == KillResult::AlreadyDead) return result;
-        }
-
-        SS_LOG_ERROR(L"ProcessKiller", L"All escalation levels failed for pid %u", pid);
+        // Level 8 would be ring-0 termination of a process user mode cannot kill, such as
+        // a PPL target. The driver implements no such request (task 362), so the ladder
+        // ends at level 7 and says so instead of sending frames nothing handles - see
+        // KillKernelDriver and RemoveProtectionInternal.
+        SS_LOG_ERROR(L"ProcessKiller",
+                     L"All escalation levels failed for pid %u; kernel-assisted termination "
+                     L"is not implemented by the driver", pid);
         return result;
     }
 
@@ -1445,84 +1435,22 @@ public:
         }
     }
 
-    // Level 8: Kernel driver IOCTL — sends termination request to PhantomSensor
-    // which can kill PPL-protected processes from ring-0 via ZwTerminateProcess.
-    [[nodiscard]] KillResult KillKernelDriver(uint32_t pid, uint32_t exitCode, FILETIME expected) {
-        try {
-            if (!m_kernelDriverAvailable) {
-                SS_LOG_WARN(L"ProcessKiller", L"Kernel driver not available for pid %u", pid);
-                return KillResult::Failed;
-            }
-
-            // TOCTOU check: verify the process we are about to ask the driver to kill
-            // is still the same one we initially targeted.
-            if (expected.dwLowDateTime || expected.dwHighDateTime) {
-                ScopedHandle hProbe(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
-                if (hProbe && !CreationTimesMatch(expected, GetProcessCreationTime(hProbe.Get()))) {
-                    SS_LOG_WARN(L"ProcessKiller", L"TOCTOU: PID %u reused (kernel driver path)", pid);
-                    return KillResult::NotFound;
-                }
-            }
-
-            // Build a lightweight control message for the driver.
-            // We reuse the ProcessNotify message type with Create=FALSE to signal
-            // a termination request.  The driver recognizes this as an
-            // authoritative kill order from user-mode when arriving on the
-            // control port (not the notification port).
-#pragma pack(push, 1)
-            struct KernelKillRequest {
-                SHADOWSTRIKE_MESSAGE_HEADER header;
-                UINT32 targetPid;
-                UINT32 requestedExitCode;
-            };
-#pragma pack(pop)
-
-            KernelKillRequest req{};
-            req.header.Magic       = SHADOWSTRIKE_MESSAGE_MAGIC;
-            req.header.Version     = SHADOWSTRIKE_PROTOCOL_VERSION;
-            req.header.MessageType = static_cast<UINT16>(FilterMessageType_ProcessNotify);
-            req.header.TotalSize   = sizeof(KernelKillRequest);
-            req.header.DataSize    = sizeof(req.targetPid) + sizeof(req.requestedExitCode);
-            req.header.Timestamp   = static_cast<UINT64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
-            req.header.Flags       = SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH;
-            req.targetPid          = pid;
-            req.requestedExitCode  = exitCode;
-
-            // Reply buffer: driver sends back a UINT32 NTSTATUS
-            UINT32 replyStatus = 0;
-            size_t replySize = sizeof(replyStatus);
-
-            auto& ipc = ShadowStrike::Communication::IPCManager::Instance();
-            bool sent = ipc.SendToKernel(&req, sizeof(req), &replyStatus, &replySize,
-                                          KillerConstants::DEFAULT_KILL_TIMEOUT_MS);
-
-            if (!sent) {
-                SS_LOG_ERROR(L"ProcessKiller", L"Kernel kill IOCTL send failed for pid %u", pid);
-                return KillResult::Failed;
-            }
-
-            // Check reply from driver
-            if (replySize >= sizeof(UINT32) && replyStatus == 0 /* STATUS_SUCCESS */) {
-                // Verify process is actually gone
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                if (!IsProcessRunning(pid)) {
-                    m_stats.kernelKills++;
-                    SS_LOG_INFO(L"ProcessKiller", L"Process %u terminated (kernel driver IOCTL)", pid);
-                    return KillResult::Success;
-                }
-                SS_LOG_WARN(L"ProcessKiller", L"Kernel driver reported success but pid %u still running", pid);
-                return KillResult::Timeout;
-            }
-
-            SS_LOG_WARN(L"ProcessKiller", L"Kernel driver returned NTSTATUS 0x%08X for pid %u",
-                        replyStatus, pid);
-            return KillResult::Failed;
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ProcessKiller", L"KillKernelDriver exception: %S", e.what());
-            return KillResult::Failed;
-        }
+    // KillMethod::Nuclear: ring-0 termination. NOT IMPLEMENTED BY THE DRIVER (task 362).
+    //
+    // This used to send a ProcessNotify-typed frame as a "kill order". The driver
+    // registers no request handler for that type (MessageHandler.c registers
+    // RegisterProtectedProcess and nothing for ProcessNotify), so the unhandled-message
+    // path answered STATUS_SUCCESS with no output and the kill never happened. A real
+    // implementation needs a dedicated, guarded kernel request - caller verified as the
+    // service, target never critical - which is a driver design change, not a frame.
+    // Until it exists this method reports Failed and says why, and the escalation
+    // ladder stops at level 7.
+    [[nodiscard]] KillResult KillKernelDriver(uint32_t pid, uint32_t /*exitCode*/,
+                                              FILETIME /*expected*/) {
+        SS_LOG_WARN(L"ProcessKiller",
+                    L"Kernel-assisted termination requested for pid %u, but the driver "
+                    L"implements no terminate request", pid);
+        return KillResult::Failed;
     }
 
     // ========================================================================
@@ -1873,11 +1801,9 @@ public:
             (void)EnablePrivilege(SE_DEBUG_PRIVILEGE_NAME);
             ScopedHandle hProcess(OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid));
             if (!hProcess) {
-                // If we can't open the process, try through the kernel driver
-                if (m_kernelDriverAvailable) {
-                    SS_LOG_INFO(L"ProcessKiller", L"Cannot open pid %u for protection removal, trying kernel driver", pid);
-                    return RequestKernelProtectionRemoval(pid);
-                }
+                // No kernel fallback exists: the driver implements no unprotect request
+                // (task 362).
+                SS_LOG_WARN(L"ProcessKiller", L"Cannot open pid %u for protection removal", pid);
                 return false;
             }
 
@@ -1892,62 +1818,15 @@ public:
                 return true;
             }
 
-            // BreakOnTermination clear failed — this is likely a PPL process.
-            // PPL protection can only be stripped from ring-0.
-            if (m_kernelDriverAvailable) {
-                SS_LOG_INFO(L"ProcessKiller", L"Escalating PPL removal to kernel driver for pid %u", pid);
-                return RequestKernelProtectionRemoval(pid);
-            }
-
-            SS_LOG_WARN(L"ProcessKiller", L"Cannot remove protection for pid %u (kernel driver unavailable)", pid);
+            // BreakOnTermination clear failed - this is likely a PPL process, whose
+            // protection can only be stripped from ring 0, and the driver implements no
+            // unprotect request (task 362).
+            SS_LOG_WARN(L"ProcessKiller",
+                        L"Cannot remove protection for pid %u: PPL removal needs ring 0, and "
+                        L"the driver implements no unprotect request", pid);
             return false;
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ProcessKiller", L"RemoveProtectionInternal exception: %S", e.what());
-            return false;
-        }
-    }
-
-    // Request kernel driver to strip PPL from a target process via
-    // the RegisterProtectedProcess message type (repurposed for removal).
-    bool RequestKernelProtectionRemoval(uint32_t pid) {
-        try {
-#pragma pack(push, 1)
-            struct KernelProtectRequest {
-                SHADOWSTRIKE_MESSAGE_HEADER header;
-                UINT32 targetPid;
-                UINT32 action;  // 0 = remove protection, 1 = add protection
-            };
-#pragma pack(pop)
-
-            KernelProtectRequest req{};
-            req.header.Magic       = SHADOWSTRIKE_MESSAGE_MAGIC;
-            req.header.Version     = SHADOWSTRIKE_PROTOCOL_VERSION;
-            req.header.MessageType = static_cast<UINT16>(FilterMessageType_RegisterProtectedProcess);
-            req.header.TotalSize   = sizeof(KernelProtectRequest);
-            req.header.DataSize    = sizeof(req.targetPid) + sizeof(req.action);
-            req.header.Timestamp   = static_cast<UINT64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
-            req.header.Flags       = SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH;
-            req.targetPid          = pid;
-            req.action             = 0; // remove
-
-            UINT32 replyStatus = 0;
-            size_t replySize = sizeof(replyStatus);
-
-            auto& ipc = ShadowStrike::Communication::IPCManager::Instance();
-            bool sent = ipc.SendToKernel(&req, sizeof(req), &replyStatus, &replySize,
-                                          KillerConstants::DEFAULT_KILL_TIMEOUT_MS);
-
-            if (sent && replySize >= sizeof(UINT32) && replyStatus == 0) {
-                SS_LOG_INFO(L"ProcessKiller", L"Kernel driver stripped protection from pid %u", pid);
-                return true;
-            }
-            SS_LOG_WARN(L"ProcessKiller", L"Kernel driver PPL removal failed for pid %u (status=0x%08X)",
-                        pid, replyStatus);
-            return false;
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ProcessKiller", L"RequestKernelProtectionRemoval exception: %S", e.what());
             return false;
         }
     }

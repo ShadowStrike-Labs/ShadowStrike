@@ -48,9 +48,9 @@
  * | 3     | Freeze-Kill             | Suspend all threads, then terminate   |
  * | 4     | Job Object              | Assign to job, terminate via job      |
  * | 5     | Token Manipulation      | Modify token, then terminate          |
- * | 6     | Kernel Direct           | Driver IOCTL for kernel termination   |
- * | 7     | Force Kernel            | ZwTerminateProcess from kernel        |
- * | 8     | Nuclear                 | Kernel memory manipulation            |
+ * | 6     | Kernel Direct           | NtTerminateProcess from user mode     |
+ * | 7     | Force Kernel            | Clear BreakOnTermination, then NtTerm |
+ * | 8     | Nuclear                 | Not implemented by the driver (362)   |
  *
  * ============================================================================
  * ENTERPRISE FEATURES
@@ -218,9 +218,9 @@ enum class KillMethod : uint8_t {
     Freeze = 3,           ///< Suspend all threads, then terminate
     JobObject = 4,        ///< Assign to job and terminate
     TokenManipulation = 5,///< Manipulate token first
-    Kernel = 6,           ///< Use kernel driver
-    ForceKernel = 7,      ///< Aggressive kernel termination
-    Nuclear = 8           ///< Last resort - kernel memory manipulation
+    Kernel = 6,           ///< NtTerminateProcess from user mode
+    ForceKernel = 7,      ///< Clear BreakOnTermination, then NtTerminateProcess
+    Nuclear = 8           ///< Ring-0 termination; the driver implements none, so Failed (task 362)
 };
 
 /**
