@@ -389,7 +389,7 @@ TEST_F(ProcessUtilsTest, GetProcessSecurityInfo_CurrentProcess) {
     ProcessSecurityInfo sec;
     Error err;
     
-    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, &err));
+    ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec, &err, SecurityInfoScope::Full));
     
     EXPECT_FALSE(sec.userSid.empty());
     EXPECT_FALSE(sec.userName.empty());
@@ -703,16 +703,38 @@ TEST_F(ProcessUtilsTest, FullScopeStillResolvesTheAccountName) {
         << "expected DOMAIN\\User form";
 }
 
-TEST_F(ProcessUtilsTest, DefaultScopeIsFullSoExistingCallersAreUnchanged) {
-    SS_LOG_INFO(L"ProcessUtils_Tests", L"[DefaultScopeIsFullSoExistingCallersAreUnchanged] Testing...");
-    // The scope parameter was added with a Full default precisely so that no
-    // pre-existing three-argument caller changed behaviour on the day it landed.
-    // If that default is ever flipped, every such caller silently loses
-    // userName - a silent change of meaning - so pin the default explicitly.
+TEST_F(ProcessUtilsTest, DefaultScopeIsLocalOnlySoANameLookupMustBeRequested) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[DefaultScopeIsLocalOnlySoANameLookupMustBeRequested] Testing...");
+    // Task 138: the account-name lookup is an LSASS RPC that can reach a domain
+    // controller, so it is requested explicitly and never inherited - the rule
+    // task 48 applied to CertificateValidator. The default query answers every
+    // local token fact and leaves userName empty.
     ProcessSecurityInfo sec;
     ASSERT_TRUE(GetProcessSecurityInfo(m_currentPid, sec));
-    EXPECT_FALSE(sec.userName.empty())
-        << "the default scope no longer resolves an account name";
+    EXPECT_TRUE(sec.userName.empty())
+        << "the default scope resolved an account name, so callers inherit a lookup that can leave the machine";
+    EXPECT_TRUE(sec.userSid.starts_with(L"S-1-")) << "the default scope lost the user SID";
+}
+
+TEST_F(ProcessUtilsTest, NameConsumersRequestTheAccountNameExplicitly) {
+    SS_LOG_INFO(L"ProcessUtils_Tests", L"[NameConsumersRequestTheAccountNameExplicitly] Testing...");
+    // Every helper that returns or compares the account name asks for Full
+    // itself, so flipping the default (task 138) did not empty any of them.
+    const auto owner = GetProcessOwner(m_currentPid);
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_NE(owner->find(L'\\'), std::wstring::npos) << "GetProcessOwner lost the DOMAIN\\User name";
+
+    ProcessInfo info;
+    ASSERT_TRUE(GetProcessInfo(m_currentPid, info));
+    EXPECT_EQ(*owner, info.security.userName) << "GetProcessInfo's aggregate lost the account name";
+
+    EnumerationOptions options;
+    options.userFilter = *owner;
+    std::vector<ProcessBasicInfo> mine;
+    ASSERT_TRUE(EnumerateProcesses(mine, options));
+    EXPECT_TRUE(std::any_of(mine.begin(), mine.end(),
+                            [this](const ProcessBasicInfo& p) { return p.pid == m_currentPid; }))
+        << "EnumerateProcesses(userFilter) no longer matches this process by its own account name";
 }
 
 TEST_F(ProcessUtilsTest, ElevationAndSidProjectionsStillAnswerUnderLocalOnly) {

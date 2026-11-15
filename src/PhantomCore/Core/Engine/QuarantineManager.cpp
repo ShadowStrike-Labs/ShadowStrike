@@ -338,10 +338,13 @@ namespace {
     if (processId == ::GetCurrentProcessId()) return false;
 
     try {
-        // Use ProcessUtils to check if this is a system process
+        // Use ProcessUtils to check if this is a system process. isRunningAsSystem is
+        // decided from the token user SID under either scope, so no account-name
+        // lookup is requested (task 138).
         ProcessUtils::ProcessSecurityInfo secInfo{};
         ProcessUtils::Error procErr{};
-        if (ProcessUtils::GetProcessSecurityInfo(processId, secInfo, &procErr)) {
+        if (ProcessUtils::GetProcessSecurityInfo(processId, secInfo, &procErr,
+                                                 ProcessUtils::SecurityInfoScope::LocalOnly)) {
             return !secInfo.isRunningAsSystem;
         }
         return false;

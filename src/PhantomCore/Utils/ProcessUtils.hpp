@@ -413,12 +413,19 @@ namespace ShadowStrike {
             };
 
             /**
-             * @param scope Defaults to Full so that every pre-existing caller
-             *        keeps its exact behaviour. Pass LocalOnly from any path
-             *        that must not block on a name resolution.
+             * @param scope Defaults to LocalOnly (task 138). Behaviour that may
+             *        leave the machine is REQUESTED, never inherited - the same
+             *        rule task 48 applied to CertificateValidator, whose Strict
+             *        default gave every caller who did not think about it a
+             *        synchronous network revocation check. Pass Full only where
+             *        sec.userName or the privilege display names are read: the
+             *        aggregates GetProcessInfo, EnumerateProcesses(userFilter),
+             *        GetProcessOwner, HasProcessPrivilege and GetProcessPrivileges
+             *        do so explicitly. Every other field, including userSid,
+             *        isElevated and isRunningAsSystem, is identical under both.
              */
             bool GetProcessSecurityInfo(ProcessId pid, ProcessSecurityInfo& info, Error* err = nullptr,
-                                        SecurityInfoScope scope = SecurityInfoScope::Full) noexcept;
+                                        SecurityInfoScope scope = SecurityInfoScope::LocalOnly) noexcept;
             bool GetProcessInfo(ProcessId pid, ProcessInfo& info, Error* err = nullptr) noexcept;
 
             // Process Path & Identity

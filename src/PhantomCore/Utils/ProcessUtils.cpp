@@ -860,7 +860,8 @@ namespace ShadowStrike {
                     
                     if (options.userFilter && !options.userFilter->empty()) {
                         ProcessSecurityInfo sec{};
-                        if (GetProcessSecurityInfo(pid, sec, nullptr)) {
+                        // userFilter compares the account NAME, so this query needs Full.
+                        if (GetProcessSecurityInfo(pid, sec, nullptr, SecurityInfoScope::Full)) {
                             if (ToLower(sec.userName) != ToLower(*options.userFilter)) continue;
                         }
                         else {
@@ -1388,7 +1389,7 @@ bool GetProcessInfo(ProcessId pid, ProcessInfo& info, Error* err) noexcept {
     GetProcessMemoryInfo(pid, info.memory, nullptr);
     GetProcessIOCounters(pid, info.io, nullptr);
     GetProcessCpuInfo(pid, info.cpu, nullptr);
-    GetProcessSecurityInfo(pid, info.security, nullptr);
+    GetProcessSecurityInfo(pid, info.security, nullptr, SecurityInfoScope::Full);  // the aggregate includes userName
     EnumerateProcessModules(pid, info.modules, nullptr);
     EnumerateProcessThreads(pid, info.threads, nullptr);
     return true;
@@ -3409,7 +3410,7 @@ bool HasProcessPrivilege(ProcessId pid, std::wstring_view privilegeName, Error* 
     }
 
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) {
+    if (!GetProcessSecurityInfo(pid, sec, err, SecurityInfoScope::Full)) {  // reads privilege display names
         return false;
     }
 
@@ -3434,7 +3435,7 @@ bool GetProcessPrivileges(ProcessId pid, std::vector<std::wstring>& privileges, 
     privileges.clear();
 
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) {
+    if (!GetProcessSecurityInfo(pid, sec, err, SecurityInfoScope::Full)) {  // reads privilege display names
         return false;
     }
 
@@ -4096,7 +4097,7 @@ bool KillAllProcessesByName(std::wstring_view processName, Error* err) noexcept 
 
 std::optional<std::wstring> GetProcessOwner(ProcessId pid, Error* err) noexcept {
     ProcessSecurityInfo sec{};
-    if (!GetProcessSecurityInfo(pid, sec, err)) return std::nullopt;
+    if (!GetProcessSecurityInfo(pid, sec, err, SecurityInfoScope::Full)) return std::nullopt;
     return sec.userName;
 }
 
@@ -4891,7 +4892,7 @@ bool GetProcessInfoWMI(ProcessId pid, ProcessInfo& info, Error* err) noexcept {
     // Fill in additional details using native APIs if available
     GetProcessMemoryInfo(pid, info.memory, nullptr);
     GetProcessCpuInfo(pid, info.cpu, nullptr);
-    GetProcessSecurityInfo(pid, info.security, nullptr);
+    GetProcessSecurityInfo(pid, info.security, nullptr, SecurityInfoScope::Full);  // the aggregate includes userName
     EnumerateProcessModules(pid, info.modules, nullptr);
     EnumerateProcessThreads(pid, info.threads, nullptr);
 

@@ -760,10 +760,13 @@ public:
             result.processInfo.parentPid   = basicInfo.parentPid;
             result.processInfo.commandLine = basicInfo.commandLine;
 
-            // Security info
+            // Security info. Only userSid and isElevated are read, both local token
+            // facts, so the account-name lookup (an LSASS RPC that can reach a domain
+            // controller) is not requested on this per-scan path (task 138).
             Utils::ProcessUtils::ProcessSecurityInfo secInfo;
             if (Utils::ProcessUtils::GetProcessSecurityInfo(
-                    static_cast<Utils::ProcessUtils::ProcessId>(processId), secInfo)) {
+                    static_cast<Utils::ProcessUtils::ProcessId>(processId), secInfo, nullptr,
+                    Utils::ProcessUtils::SecurityInfoScope::LocalOnly)) {
                 result.processInfo.userSid = secInfo.userSid;
                 result.processInfo.isElevated = secInfo.isElevated;
             }
