@@ -71,6 +71,7 @@
 #include "../../Whitelist/WhiteListStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../HashStore/HashStore.hpp"
+#include "../FileSystem/ExecutableAnalyzer.hpp"
 
 // ============================================================================
 // SYSTEM INCLUDES
@@ -100,6 +101,7 @@
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <algorithm>
+#include <mutex>
 #include <thread>
 #include <future>
 #include <queue>
@@ -427,6 +429,54 @@ namespace {
         }
     }
     return false;
+}
+
+// task 374 (remainder): a routine Defender-key write - not protection-impairing - is
+// recorded at Info rather than left silent ONLY when it genuinely came from Defender's
+// own image: an executable under Defender's ACL-protected platform tree whose Microsoft
+// signature verifies. This is NOT a writer exemption - a protection-impairing value is
+// classified DEFENDER_DISABLE above, before this is ever consulted, so a Microsoft-signed
+// reg.exe or PowerShell cannot earn silence on a disable. It only decides Info versus the
+// existing silent NONE for a benign update.
+//
+// The signature check is the offline, cache-only path ExecutableAnalyzer already uses
+// (WTD_REVOKE_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL, measured ~338us, no CryptSvc/network -
+// tasks 48, 185), so it is safe on the latency-critical registry-notification thread. It
+// is reached only on the rare Defender-key branch, and memoised per image path so a
+// signature-update burst from one MsMpEng.exe verifies once rather than once per value.
+[[nodiscard]] bool WriterIsVerifiedDefenderPlatformImage(const std::wstring& processPath) {
+    if (processPath.empty()) {
+        return false;
+    }
+    const std::wstring lower = StringUtils::ToLowerCopy(processPath);
+    const bool underDefenderTree =
+        lower.find(L"\\windows defender\\platform\\") != std::wstring::npos ||
+        lower.find(L"\\program files\\windows defender\\") != std::wstring::npos ||
+        lower.find(L"\\program files (x86)\\windows defender\\") != std::wstring::npos;
+    if (!underDefenderTree) {
+        return false;
+    }
+
+    // Verify once per image path. The burst of values Defender writes during an update
+    // all come from the same MsMpEng.exe, so without this memo each value would repeat
+    // the (offline, ~338us) verification on the critical thread.
+    static std::mutex memoMutex;
+    static std::wstring memoPath;
+    static bool memoSigned = false;
+    {
+        std::lock_guard<std::mutex> guard(memoMutex);
+        if (processPath == memoPath) {
+            return memoSigned;
+        }
+    }
+    const bool microsoftSigned =
+        FileSystem::ExecutableAnalyzer::Instance().VerifySignature(processPath).isMicrosoftSigned;
+    {
+        std::lock_guard<std::mutex> guard(memoMutex);
+        memoPath = processPath;
+        memoSigned = microsoftSigned;
+    }
+    return microsoftSigned;
 }
 
 } // anonymous namespace
@@ -2249,6 +2299,17 @@ private:
                 // deletion is DEFENDER_DISABLE (see DefenderWriteIsProtectionImpairing).
                 if (DefenderWriteIsProtectionImpairing(event)) {
                     return RegistryThreatType::DEFENDER_DISABLE;
+                }
+                // A routine Defender write from Defender's own verified image is
+                // recorded at Info, not left silent, so the audit trail shows the
+                // update happened and that it genuinely came from Defender. A
+                // protection-impairing value was already returned above, so this
+                // records only benign updates and never suppresses a disable.
+                if (WriterIsVerifiedDefenderPlatformImage(event.processPath)) {
+                    SS_LOG_INFO(L"Registry",
+                                L"Routine Windows Defender update from verified Defender "
+                                L"image (PID=%u, value=%ls)",
+                                event.processId, event.valueName.c_str());
                 }
                 return RegistryThreatType::NONE;
             }

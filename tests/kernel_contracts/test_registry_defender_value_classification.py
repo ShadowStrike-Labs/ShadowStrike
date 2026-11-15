@@ -9,6 +9,12 @@ on routine activity. The fix classifies by the value written: only a protection-
 value, an exclusion, or a deletion is a disable. A signed-writer exemption is explicitly
 NOT used, because reg.exe and PowerShell are Microsoft-signed and are how Defender is
 switched off.
+
+Remainder (task 374): a routine, non-impairing Defender write is now recorded at Info -
+rather than left silent - when it came from Defender's own verified image (an executable
+under Defender's platform tree whose Microsoft signature verifies through the offline
+ExecutableAnalyzer path). The impairing-value classification is returned first, so this
+only labels benign updates and can never silence a disable.
 """
 import re
 import unittest
@@ -68,6 +74,59 @@ class RegistryDefenderValueClassificationContractTests(unittest.TestCase):
         self.assertIn(
             "RegistryOp::DeleteValue", body,
             "deleting a Defender value (definition removal) is not treated as impairing")
+
+    # --- task 374 remainder: routine Defender writes from a verified image at Info ---
+
+    def test_routine_defender_write_from_a_verified_image_is_surfaced_at_info(self):
+        self.assertIn(
+            "WriterIsVerifiedDefenderPlatformImage(event.processPath)", self.code,
+            "the Defender branch does not consult the verified-image helper")
+        emitted = re.search(
+            r"WriterIsVerifiedDefenderPlatformImage\(event\.processPath\)\)\s*\{\s*"
+            r"SS_LOG_INFO",
+            self.code, re.S)
+        self.assertIsNotNone(
+            emitted,
+            "a routine Defender write from a verified image is not recorded at Info")
+
+    def test_the_verified_image_helper_requires_the_defender_tree_and_a_signature(self):
+        m = re.search(
+            r"WriterIsVerifiedDefenderPlatformImage\(const std::wstring& processPath\)\s*\{.*?\n\}",
+            self.code, re.S)
+        self.assertIsNotNone(m, "the WriterIsVerifiedDefenderPlatformImage helper was not found")
+        body = m.group(0)
+        self.assertIn(
+            r"\\windows defender\\platform\\", body,
+            "the helper does not scope to Defender's ACL-protected platform tree")
+        self.assertIn(
+            "isMicrosoftSigned", body,
+            "the helper does not require a verified Microsoft signature")
+
+    def test_the_disable_is_returned_before_the_info_path(self):
+        # A signed writer must not silence a disable: the DEFENDER_DISABLE return has to
+        # precede the verified-image Info branch.
+        disable = self.code.find("return RegistryThreatType::DEFENDER_DISABLE;")
+        info = self.code.find("WriterIsVerifiedDefenderPlatformImage(event.processPath)")
+        self.assertGreater(disable, 0, "the DEFENDER_DISABLE return was not found")
+        self.assertGreater(info, 0, "the verified-image Info branch was not found")
+        self.assertLess(
+            disable, info,
+            "the verified-image Info path precedes the DEFENDER_DISABLE return, so a "
+            "Microsoft-signed reg.exe or PowerShell could silence a protection disable")
+
+    def test_the_signature_check_reuses_the_offline_executable_analyzer_path(self):
+        # ExecutableAnalyzer::VerifySignature runs WTD_REVOKE_NONE with
+        # WTD_CACHE_ONLY_URL_RETRIEVAL, so it does no network I/O on the latency-critical
+        # registry thread. The helper must reuse that path, not roll a fresh WinVerifyTrust.
+        self.assertIn(
+            "ExecutableAnalyzer::Instance().VerifySignature", self.code,
+            "the helper does not reuse ExecutableAnalyzer's vetted offline signature path")
+        m = re.search(
+            r"WriterIsVerifiedDefenderPlatformImage\(const std::wstring& processPath\)\s*\{.*?\n\}",
+            self.code, re.S)
+        self.assertNotIn(
+            "WinVerifyTrust", m.group(0),
+            "the helper calls WinVerifyTrust directly instead of the vetted offline path")
 
 
 if __name__ == "__main__":
