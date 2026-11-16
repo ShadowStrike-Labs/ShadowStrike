@@ -422,6 +422,35 @@ public:
     std::chrono::steady_clock::time_point         m_deferredFullLastWarn{};
     uint64_t                                      m_deferredFullSuppressed{ 0 };
 
+    // ---- Off-thread process-notify fan-out (task 186) ----
+    // The ransomware/script process-notify fan-out is reply-independent: its
+    // results never flow through the kernel verdict (the dispatch is void and
+    // OnKernelProcessNotify returns Allow immediately), yet it ran synchronously
+    // on the thread the kernel blocks CreateProcess on - an unbounded tail on the
+    // one path that must stay bounded. It is moved behind this bounded hand-off:
+    // the kernel handler copies the event (ProcessNotifyEvent, strings owned) into
+    // this queue and returns, and ProcessNotifyFanOutLoop drains it off the reply
+    // path.
+    //
+    // A SINGLE worker and a FIFO, not a pool: task 186's ordering requirement is
+    // that a pid's create is processed before its exit (FileBackupManager commits
+    // pending backups on exit and must not run before the create side records). A
+    // single FIFO worker preserves that globally; a pool would interleave and
+    // break it.
+    std::deque<ProcessNotifyEvent>                m_procNotifyQueue;
+    std::mutex                                    m_procNotifyMutex;
+    std::condition_variable                       m_procNotifyCv;
+    std::atomic<bool>                             m_procNotifyStop{ false };
+    std::unique_ptr<std::thread>                  m_procNotifyThread;
+    // High-water depth since the last stats reset, surfaced in ReportCapacity.
+    // Instantaneous depth under-reports a queue that fills and drains between two
+    // samples; the peak is what shows it happened. Same reasoning as the deep-scan
+    // queue's m_deferredHighWater above.
+    size_t                                        m_procNotifyHighWater{ 0 };
+    // Rate limiting for the queue-full report, held under m_procNotifyMutex.
+    std::chrono::steady_clock::time_point         m_procNotifyFullLastWarn{};
+    uint64_t                                      m_procNotifyFullSuppressed{ 0 };
+
     // Files whose Microsoft-signature trust verdict is not yet known.
     //
     // Kept separate from m_deferredQueue on purpose. That queue runs the full
@@ -585,6 +614,7 @@ public:
     uint64_t m_reportBaselineErrors{ 0 };
     uint64_t m_reportBaselineDeepDropped{ 0 };
     uint64_t m_reportBaselineTrustDropped{ 0 };
+    uint64_t m_reportBaselineProcNotifyDropped{ 0 };
     /// @brief The capacity report keeps its OWN scan baseline rather than sharing
     ///        the pipeline report's. Sharing it made the capacity line's
     ///        "did any scanning happen" test depend on which report ran first,
@@ -1177,6 +1207,17 @@ public:
                     "RealTimeProtection: scripts wiring threw - continuing");
             }
 
+            // Start the off-thread process-notify fan-out worker (task 186).
+            // Placed AFTER both subsystems it dispatches into are initialized, so
+            // it can never dispatch into an uninitialized subsystem, and before
+            // Start returns. The handler state was set ACTIVE above; any
+            // process-notify event that arrives before this worker is running
+            // simply waits in the bounded queue until it drains. The worker is
+            // stopped and joined in Stop() before these subsystems are torn down.
+            m_procNotifyStop.store(false, std::memory_order_release);
+            m_procNotifyThread = std::make_unique<std::thread>(
+                &RealTimeProtectionImpl::ProcessNotifyFanOutLoop, this);
+
             return true;
 
         } catch (const std::exception& e) {
@@ -1218,6 +1259,21 @@ public:
             m_deferredScanThread->join();
         }
         m_deferredScanThread.reset();
+
+        // Off-thread process-notify fan-out worker (task 186). Stopped and joined
+        // HERE, in the common head of Stop(), so it is already gone before
+        // StopComponents() below tears down the ransomware/scripts subsystems it
+        // dispatches into (ShutdownRansomwareSubsystem). Woken explicitly like the
+        // deep-scan worker so shutdown is not held up by its one-second wait.
+        // Null-guarded: the focused/fuzzer build never starts it - its Start path
+        // stops at DEGRADED, so OnKernelProcessNotify early-returns and never
+        // enqueues - and this join is then a no-op.
+        m_procNotifyStop.store(true, std::memory_order_release);
+        m_procNotifyCv.notify_all();
+        if (m_procNotifyThread && m_procNotifyThread->joinable()) {
+            m_procNotifyThread->join();
+        }
+        m_procNotifyThread.reset();
 
         // Signature determination worker. Joined here for the same reason as the
         // deep-scan worker, and with the same explicit wake so shutdown is not
@@ -3129,6 +3185,90 @@ public:
         // does not measure what it claims to is worse than no number.
         m_stats.scansDeferred++;
         m_deferredCv.notify_one();
+    }
+
+    // =========================================================================
+    // OFF-THREAD PROCESS-NOTIFY FAN-OUT (task 186)
+    // =========================================================================
+    //
+    // QueueProcessNotify is called from OnKernelProcessNotify in place of the old
+    // synchronous Ransomware::Wiring::DispatchProcessNotify. It copies the event
+    // into a bounded FIFO and returns; ProcessNotifyFanOutLoop runs the fan-out
+    // off the thread the kernel blocks CreateProcess on. See the ProcessNotifyEvent
+    // / AdmitProcessNotifyEvent commentary in RealTimeProtection.hpp for why this
+    // is safe to move (reply-independent) and why it is a FIFO with no dedup
+    // (create-before-exit ordering; an exit must not be collapsed into a create).
+
+    void QueueProcessNotify(ProcessNotifyEvent ev) {
+        // Sized generously. Two events per process lifecycle (create + exit), and
+        // under normal load the worker empties this far faster than it fills, so
+        // the bound engages only under a pathological process storm - where a
+        // counted drop is strictly better than the synchronous predecessor, which
+        // froze every process creation for the duration of the storm.
+        constexpr size_t kMaxProcNotifyQueue = 8192;
+        {
+            std::lock_guard<std::mutex> lock(m_procNotifyMutex);
+            if (Detail::AdmitProcessNotifyEvent(m_procNotifyQueue, std::move(ev),
+                                                kMaxProcNotifyQueue)) {
+                // A dropped event is lost coverage: the ransomware/script fan-out
+                // for it will not run. Counted, never silent, and reported at a
+                // bounded rate - the same treatment the deep-scan queue gives its
+                // drops. The per-pid detector maps the dropped event would have
+                // touched self-evict, so a dropped exit-erase is reclaimed rather
+                // than leaked permanently.
+                m_stats.processNotifyQueueDropped++;
+                ReportQueueFull("process-notify fan-out", kMaxProcNotifyQueue,
+                                m_procNotifyFullLastWarn, m_procNotifyFullSuppressed,
+                                "the ransomware/script fan-out for the dropped event will not run");
+            }
+            if (m_procNotifyQueue.size() > m_procNotifyHighWater) {
+                m_procNotifyHighWater = m_procNotifyQueue.size();
+            }
+        }
+        m_procNotifyCv.notify_one();
+    }
+
+    void ProcessNotifyFanOutLoop() {
+        ::SetThreadDescription(::GetCurrentThread(), L"SS-ProcNotifyFanOut");
+        // NORMAL priority, deliberately NOT below-normal like the deferred
+        // deep-scan worker. This carries time-sensitive detection - a VSS-delete
+        // classification, a malicious script launch - whose value decays as the
+        // just-created process runs, so it must drain promptly. It still never
+        // touches the kernel reply thread, which is the entire point of moving it
+        // here.
+        while (!m_procNotifyStop.load(std::memory_order_acquire)) {
+            ProcessNotifyEvent ev;
+            {
+                std::unique_lock<std::mutex> lock(m_procNotifyMutex);
+                m_procNotifyCv.wait_for(lock, std::chrono::milliseconds(1000), [this] {
+                    return m_procNotifyStop.load(std::memory_order_acquire) ||
+                           !m_procNotifyQueue.empty();
+                });
+                if (m_procNotifyStop.load(std::memory_order_acquire)) break;
+                if (m_procNotifyQueue.empty()) continue;
+                ev = std::move(m_procNotifyQueue.front());
+                m_procNotifyQueue.pop_front();
+            }
+
+            // DispatchProcessNotify is noexcept (RansomwareWiring.hpp): each module
+            // is wrapped at its own aggregator boundary, so a throw cannot reach
+            // here and a try/catch would be dead code. A module that violated that
+            // contract would std::terminate exactly as it does on the synchronous
+            // path today - no worse for having moved threads.
+            {
+                SS_DIAG_SCOPE("ProcNotify", ev.isCreation ? "ransomware-fanout-create"
+                                                          : "ransomware-fanout-exit");
+                Ransomware::Wiring::DispatchProcessNotify(
+                    ev.pid, ev.parentPid, ev.imagePath, ev.commandLine, ev.isCreation);
+            }
+        }
+        // ON STOP, DO NOT DRAIN - mirror the deferred deep-scan worker. Events
+        // still queued at the shutdown instant are dropped. Under normal load this
+        // queue is empty here, so the practical loss is nil. A bounded drain was
+        // considered and rejected: draining up to the cap on the join path could
+        // stall Stop() under a storm-at-shutdown, which the no-hang requirement
+        // forbids, and what it would preserve (per-pid erases, a pending backup
+        // commit) is bounded by the handful of events in flight at that instant.
     }
 
     // =========================================================================
@@ -5692,21 +5832,34 @@ public:
         // call would not defer that work, it would DROP it, which is the one thing
         // a latency bound must never do.
         //
-        // THE COST IS REAL AND UNADDRESSED HERE, STATED PLAINLY RATHER THAN LEFT
-        // FOR SOMEONE TO DISCOVER: this stage is unbounded on the callback the
-        // driver blocks CreateProcess on. Because its results are reply-independent
-        // the correct fix is to stop running it on this thread at all rather than to
-        // skip it under load, and that is an execution-model change with its own
-        // cost/benefit - not something to bolt onto a latency bound. It must be
-        // settled before any further modules are added to this dispatch.
+        // THE COST IS MOVED OFF THIS THREAD (task 186). This stage was unbounded
+        // on the callback the driver blocks CreateProcess on. Because its results
+        // are reply-independent, the fix was to stop running it on this thread at
+        // all rather than to skip it under load: the event is copied into a bounded
+        // FIFO and a dedicated worker (ProcessNotifyFanOutLoop) runs the fan-out
+        // off the reply path. What remains here is only the enqueue - a copy, a
+        // lock, a push - after which the handler returns Allow at once.
+        //
+        // THE SMALL HEAD START THIS INTRODUCES WAS WEIGHED, NOT ASSUMED AWAY. The
+        // synchronous version detected (and, where enabled, terminated) while the
+        // kernel held the process pending our verdict; now the process starts and
+        // the worker acts a queue hop later. For the T1490 case these modules
+        // target, the damage - a VSS shadow delete - requires the created process
+        // to start, initialise and call into the VSS service, tens of milliseconds
+        // at least, whereas the queue hop is sub-millisecond under normal load. So
+        // the detection and any enabled action still land before the delete is
+        // issued. Detection and telemetry are unchanged; only the thread moved.
         // =====================================================================
-        // Braced so the span covers the dispatch and nothing after it.
+        // Copy by value: imagePath and commandLine are locals that are gone by the
+        // time the worker runs, so the event must own its own strings.
         {
-            SS_DIAG_SCOPE("ProcNotify", req.isCreation ? "ransomware-fanout-create"
-                                                       : "ransomware-fanout-exit");
-            Ransomware::Wiring::DispatchProcessNotify(
-                req.processId, req.parentProcessId,
-                imagePath, commandLine, static_cast<bool>(req.isCreation));
+            ProcessNotifyEvent ev;
+            ev.pid         = req.processId;
+            ev.parentPid   = req.parentProcessId;
+            ev.imagePath   = imagePath;
+            ev.commandLine = commandLine;
+            ev.isCreation  = static_cast<bool>(req.isCreation);
+            QueueProcessNotify(std::move(ev));
         }
 
         return Communication::KernelVerdict::Allow;
@@ -8032,8 +8185,16 @@ public:
             trustPeak  = m_sigDetermHighWater;
         }
 
+        size_t procDepth = 0, procPeak = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_procNotifyMutex);
+            procDepth = m_procNotifyQueue.size();
+            procPeak  = m_procNotifyHighWater;
+        }
+
         const uint64_t deepDropped  = m_stats.deepScanQueueDropped.load(std::memory_order_relaxed);
         const uint64_t trustDropped = m_stats.sigDetermQueueDropped.load(std::memory_order_relaxed);
+        const uint64_t procNotifyDropped = m_stats.processNotifyQueueDropped.load(std::memory_order_relaxed);
         const uint64_t cached       = m_stats.signatureVerdictsCached.load(std::memory_order_relaxed);
         const uint64_t metaTrunc    = m_stats.metamorphicTruncated.load(std::memory_order_relaxed);
         const uint64_t vmTrunc      = m_stats.vmEvasionAnalysisTruncated.load(std::memory_order_relaxed);
@@ -8092,10 +8253,12 @@ public:
 
         const uint64_t newDeepDrops  = DeltaSince(deepDropped, m_reportBaselineDeepDropped);
         const uint64_t newTrustDrops = DeltaSince(trustDropped, m_reportBaselineTrustDropped);
+        const uint64_t newProcDrops  = DeltaSince(procNotifyDropped, m_reportBaselineProcNotifyDropped);
 
         const bool somethingToSay =
             saturated || newDeepDrops > 0 || newTrustDrops > 0 ||
-            deepDepth > 0 || trustDepth > 0 ||
+            newProcDrops > 0 ||
+            deepDepth > 0 || trustDepth > 0 || procDepth > 0 ||
             DeltaSince(m_stats.totalScans.load(std::memory_order_relaxed),
                        m_reportBaselineCapacityScans) > 0;
 
@@ -8255,7 +8418,8 @@ public:
         const uint64_t cvAvg = cvN ? (cvTot / cvN) : 0ull;
         const auto line = std::format(
             "RealTimeProtection: capacity - {} | deep={} peak={} dropped={} (+{}) "
-            "| trust={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
+            "| trust={} peak={} dropped={} (+{}) "
+            "| procNotify={} peak={} dropped={} (+{}) | trustVerdictsCached={} "
             "metamorphicTruncated={} packerDeferred={} oversizeDeferred={} "
             "contentNotLocalNotExamined={} "
             "lockedNotExamined={} "
@@ -8272,6 +8436,7 @@ public:
             poolPart,
             deepDepth, deepPeak, deepDropped, newDeepDrops,
             trustDepth, trustPeak, trustDropped, newTrustDrops,
+            procDepth, procPeak, procNotifyDropped, newProcDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
             exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, defenderOpWrites, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             adAvg, adMax, adN, cvAvg, cvMax, cvN,
@@ -8357,6 +8522,7 @@ public:
 
         m_reportBaselineDeepDropped  = deepDropped;
         m_reportBaselineTrustDropped = trustDropped;
+        m_reportBaselineProcNotifyDropped = procNotifyDropped;
         m_reportBaselineCapacityScans =
             m_stats.totalScans.load(std::memory_order_relaxed);
     }
@@ -8897,6 +9063,7 @@ void RTPStatistics::Reset() noexcept {
     oversizeDeferred = 0;
     deepScanQueueDropped = 0;
     sigDetermQueueDropped = 0;
+    processNotifyQueueDropped = 0;
     threatsDetected = 0;
     kernelThreatAlerts = 0;
     kernelTelemetryEvents = 0;

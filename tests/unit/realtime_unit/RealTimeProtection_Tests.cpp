@@ -209,4 +209,103 @@ TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterm
     EXPECT_FALSE(rtp.UnregisterCallback(notificationId));
 }
 
+// ---------------------------------------------------------------------------
+// Task 186: the off-thread process-notify fan-out queue admission policy.
+//
+// AdmitProcessNotifyEvent is the pure, lock-free core of the bounded hand-off
+// that moves the ransomware/script fan-out off the thread the kernel blocks
+// CreateProcess on. These cases pin the three properties task 186 requires of
+// it: a bound that never grows, counted drop-OLDEST on overflow, and FIFO order
+// so a pid's create is drained before its exit (FileBackupManager depends on it).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ProcessNotifyEvent MakeEvent(std::uint32_t pid, bool isCreation) {
+    ProcessNotifyEvent ev;
+    ev.pid = pid;
+    ev.parentPid = 4;
+    ev.imagePath = L"C:\\Windows\\System32\\vssadmin.exe";
+    ev.commandLine = L"vssadmin delete shadows /all /quiet";
+    ev.isCreation = isCreation;
+    return ev;
+}
+
+}  // namespace
+
+TEST(ProcessNotifyQueueAdmission, AdmitsBelowCapacityWithoutDropping) {
+    std::deque<ProcessNotifyEvent> q;
+    EXPECT_FALSE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(100, true), 4));
+    EXPECT_FALSE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(101, true), 4));
+    EXPECT_EQ(2u, q.size());
+    // FIFO: first admitted is at the front, newest at the back.
+    EXPECT_EQ(100u, q.front().pid);
+    EXPECT_EQ(101u, q.back().pid);
+}
+
+TEST(ProcessNotifyQueueAdmission, OverflowDropsTheOldestAndReportsIt) {
+    std::deque<ProcessNotifyEvent> q;
+    constexpr std::size_t cap = 3;
+    EXPECT_FALSE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(1, true), cap));
+    EXPECT_FALSE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(2, true), cap));
+    EXPECT_FALSE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(3, true), cap));
+    EXPECT_EQ(cap, q.size());
+
+    // At capacity, the next admission must evict the OLDEST (pid 1) and say so.
+    EXPECT_TRUE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(4, true), cap));
+    EXPECT_EQ(cap, q.size());      // capped, never grows
+    EXPECT_EQ(2u, q.front().pid);  // pid 1 (oldest) was dropped, not pid 3/4
+    EXPECT_EQ(4u, q.back().pid);   // newest retained
+
+    // A second overflow drops the new oldest (pid 2) and again reports a drop.
+    EXPECT_TRUE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(5, true), cap));
+    EXPECT_EQ(cap, q.size());
+    EXPECT_EQ(3u, q.front().pid);
+    EXPECT_EQ(5u, q.back().pid);
+}
+
+TEST(ProcessNotifyQueueAdmission, DrainsInFifoOrderSoCreatePrecedesExit) {
+    std::deque<ProcessNotifyEvent> q;
+    constexpr std::size_t cap = 8;
+    Detail::AdmitProcessNotifyEvent(q, MakeEvent(10, true),  cap);  // 10 create
+    Detail::AdmitProcessNotifyEvent(q, MakeEvent(11, true),  cap);  // 11 create
+    Detail::AdmitProcessNotifyEvent(q, MakeEvent(10, false), cap);  // 10 exit
+    ASSERT_EQ(3u, q.size());
+
+    // The worker drains front-to-back; pid 10's create must come out before its
+    // exit, the ordering FileBackupManager's exit-side commit depends on.
+    EXPECT_EQ(10u, q[0].pid); EXPECT_TRUE(q[0].isCreation);
+    EXPECT_EQ(11u, q[1].pid); EXPECT_TRUE(q[1].isCreation);
+    EXPECT_EQ(10u, q[2].pid); EXPECT_FALSE(q[2].isCreation);
+}
+
+TEST(ProcessNotifyQueueAdmission, OwnsItsStringsAcrossTheBoundary) {
+    std::deque<ProcessNotifyEvent> q;
+    std::wstring img = L"C:\\Temp\\evil.exe";
+    std::wstring cmd = L"evil.exe --payload";
+    ProcessNotifyEvent ev;
+    ev.pid = 7;
+    ev.isCreation = true;
+    ev.imagePath = img;
+    ev.commandLine = cmd;
+    Detail::AdmitProcessNotifyEvent(q, std::move(ev), 16);
+
+    // Mutate the sources after admission. The queued copy must be unaffected,
+    // because the kernel-handler locals that produced it are gone by the time the
+    // worker runs - a reference or a view would dangle; an owned copy does not.
+    img = L"overwritten";
+    cmd = L"overwritten";
+    ASSERT_EQ(1u, q.size());
+    EXPECT_EQ(L"C:\\Temp\\evil.exe", q.front().imagePath);
+    EXPECT_EQ(L"evil.exe --payload", q.front().commandLine);
+}
+
+TEST(ProcessNotifyQueueAdmission, ZeroCapacityAdmitsNothingAndReportsDrop) {
+    std::deque<ProcessNotifyEvent> q;
+    // Degenerate bound: admit nothing, report a drop, and never pop_front an empty
+    // deque (which would be undefined behaviour).
+    EXPECT_TRUE(Detail::AdmitProcessNotifyEvent(q, MakeEvent(1, true), 0));
+    EXPECT_TRUE(q.empty());
+}
+
 }  // namespace ShadowStrike::RealTime::Tests

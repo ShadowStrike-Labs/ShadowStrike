@@ -198,6 +198,7 @@
 #include <map>
 #include <set>
 #include <queue>
+#include <deque>
 #include <optional>
 #include <variant>
 #include <memory>
@@ -1165,6 +1166,18 @@ struct alignas(64) RTPStatistics {
     ///        overstate the harm and hide the one number that does mean harm.
     std::atomic<uint64_t> sigDetermQueueDropped{ 0 };
 
+    /// @brief Process-notify fan-out events discarded because the off-thread queue
+    ///        was already full. Lost coverage of the SAME class as a dropped deep
+    ///        scan: the ransomware/script fan-out for that event - a VSS-delete
+    ///        classification, a script-launch detection, a per-pid state erase -
+    ///        will not run. Zero under normal load, where the worker empties the
+    ///        queue far faster than it fills; non-zero only under a process storm,
+    ///        where the synchronous predecessor FROZE every process creation
+    ///        instead. A counted drop is the strictly better failure, so it is
+    ///        counted, never silent, and reported at a bounded rate like the
+    ///        deep-scan queue.
+    std::atomic<uint64_t> processNotifyQueueDropped{ 0 };
+
     /// @brief Threats THIS PRODUCT identified.
     ///
     ///        Incremented only where analysis reached a conviction: a scan
@@ -1373,6 +1386,75 @@ using UserNotificationCallback = std::function<void(
  * }
  * @endcode
  */
+
+// ============================================================================
+// OFF-THREAD PROCESS-NOTIFY FAN-OUT (task 186)
+// ============================================================================
+//
+// The ransomware (and, once task 177 lands, script) process-notify fan-out must
+// not run on the thread the kernel blocks CreateProcess on. Its results are
+// reply-independent: the dispatch is void and OnKernelProcessNotify returns
+// Allow on the next statement, so the kernel owes it nothing. Yet it ran
+// synchronously and unbounded on the one path that must stay bounded (the 500 ms
+// PN_VERDICT_REPLY_TIMEOUT_MS reply horizon). It is moved behind a bounded
+// hand-off: the kernel handler copies the event and returns, and a single worker
+// thread drains the queue and runs the fan-out off the reply path.
+//
+// These two declarations are the pure, lock-free core of that hand-off, kept out
+// of the .cpp Impl so the admission policy can be unit-tested without standing up
+// the service.
+
+/// A kernel process create/exit event captured BY VALUE for off-thread fan-out.
+/// The strings are OWNED copies on purpose: the originals are stack locals in
+/// OnKernelProcessNotify (imagePath, commandLine) and are gone by the time the
+/// worker thread runs, so a reference or a view would dangle.
+struct ProcessNotifyEvent {
+    std::uint32_t pid{ 0 };
+    std::uint32_t parentPid{ 0 };
+    std::wstring  imagePath;
+    std::wstring  commandLine;
+    bool          isCreation{ false };
+};
+
+namespace Detail {
+
+/// Admit one event into a bounded FIFO, mirroring the deferred deep-scan queue's
+/// drop-oldest-and-count policy (QueueDeferredDeepScan in RealTimeProtection.cpp).
+///
+/// Returns true iff the queue was already at @p capacity and the OLDEST entry had
+/// to be evicted to make room - the caller counts that drop and reports it at a
+/// bounded rate, exactly as the deep-scan path does. Returns false when the event
+/// was admitted without loss.
+///
+/// NO DEDUPLICATION, unlike the deep-scan queue. That queue keys on path because
+/// one busy file produces many identical opens; here every event is a distinct
+/// point in a pid's lifecycle, and collapsing two would drop a create or an exit.
+/// The exit is what erases per-pid detector state, so dropping it would leak that
+/// state rather than merely delay analysis.
+///
+/// Pure: no locking, no threads, deterministic. The caller holds the queue mutex;
+/// this function only mutates @p queue and reports whether it dropped.
+inline bool AdmitProcessNotifyEvent(std::deque<ProcessNotifyEvent>& queue,
+                                    ProcessNotifyEvent ev,
+                                    std::size_t capacity) noexcept {
+    if (capacity == 0) {
+        // A zero-capacity queue can hold nothing; admitting would grow it without
+        // bound, the exact failure the bound exists to prevent. Report a drop and
+        // queue nothing. Never reached in the product (capacity is a positive
+        // compile-time constant); this only keeps the function total.
+        return true;
+    }
+    bool dropped = false;
+    if (queue.size() >= capacity) {
+        queue.pop_front();  // drop the OLDEST; size >= capacity >= 1, so non-empty
+        dropped = true;
+    }
+    queue.push_back(std::move(ev));
+    return dropped;
+}
+
+}  // namespace Detail
+
 class RealTimeProtection {
 public:
     // ========================================================================
