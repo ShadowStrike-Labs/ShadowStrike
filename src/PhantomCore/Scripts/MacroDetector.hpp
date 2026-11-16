@@ -540,6 +540,12 @@ struct MacroScanResult {
     
     /// @brief Is suspicious (risk >= 50 but not confirmed malicious)
     bool isSuspicious = false;
+
+    /// @brief Originating process id: the process that wrote or owns the scanned
+    ///        document. 0 when unknown (file-backed or service-side scans).
+    ///        Task 180: carried so a detection names the writing process and can
+    ///        be correlated with a process-creation event.
+    std::uint32_t processId = 0;
     
     /// @brief Threat category
     MacroThreatCategory category = MacroThreatCategory::None;
@@ -737,12 +743,16 @@ public:
     // ========================================================================
     
     /// @brief Scan document file
-    [[nodiscard]] MacroScanResult ScanDocument(const std::filesystem::path& path);
+    /// @param processId Originating process id, stamped on the result and named
+    ///        in any alert raised. 0 (default) when unknown.
+    [[nodiscard]] MacroScanResult ScanDocument(const std::filesystem::path& path,
+                                               std::uint32_t processId = 0);
     
     /// @brief Scan document from memory
     [[nodiscard]] MacroScanResult ScanDocument(
         std::span<const uint8_t> content,
-        const std::string& fileName = "memory.doc");
+        const std::string& fileName = "memory.doc",
+        std::uint32_t processId = 0);
     
     /// @brief Quick check if document has macros
     [[nodiscard]] bool HasMacros(const std::filesystem::path& path);

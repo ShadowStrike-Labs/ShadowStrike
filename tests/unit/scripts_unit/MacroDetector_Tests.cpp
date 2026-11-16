@@ -268,4 +268,40 @@ TEST_F(MacroDetectorTest, ConfigurationStatisticsAndSelfTestStayPredictable) {
     EXPECT_GE(statsJson.at("uptimeMs").get<int64_t>(), 0);
 }
 
+// Task 180: a detection must name the process that wrote the document. The pid
+// is stamped before analysis and re-stamped on a content-cache hit.
+TEST_F(MacroDetectorTest, AScanStampsTheWritingProcessOnTheResult) {
+    auto& detector = MacroDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    const std::string bytes = "ss180 not a real document";
+    const std::span<const uint8_t> span(
+        reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    constexpr std::uint32_t kWriter = 4321u;
+    const auto withPid = detector.ScanDocument(span, "sample.docm", kWriter);
+    EXPECT_EQ(kWriter, withPid.processId);
+
+    const auto noPid = detector.ScanDocument(span, "sample.docm");
+    EXPECT_EQ(0u, noPid.processId);
+}
+
+TEST_F(MacroDetectorTest, ACachedVerdictIsStampedWithTheCurrentScansProcess) {
+    auto& detector = MacroDetector::Instance();
+    ASSERT_TRUE(detector.Initialize());
+
+    const fs::path tmp = fs::temp_directory_path() / "ss_macro_180.docm";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        f << "ss180-macro-cache-content";
+    }
+    const auto first = detector.ScanDocument(tmp, 111u);
+    EXPECT_EQ(111u, first.processId);
+    // Same file, same content hash: a cache hit must be attributed to the second
+    // writer, not the first whose verdict the cache holds.
+    const auto second = detector.ScanDocument(tmp, 222u);
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    EXPECT_EQ(222u, second.processId);
+}
+
 }  // namespace ShadowStrike::Scripts::Test

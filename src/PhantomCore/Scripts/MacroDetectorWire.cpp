@@ -39,10 +39,10 @@ void MacroDetector_Shutdown() noexcept {
     }
 }
 
-bool MacroDetector_ScanDocument(const std::wstring& filePath) noexcept {
+bool MacroDetector_ScanDocument(const std::wstring& filePath, std::uint32_t pid) noexcept {
     try {
         const auto result = MacroDetector::Instance().ScanDocument(
-            std::filesystem::path{filePath});
+            std::filesystem::path{filePath}, pid);
         return result.isMalicious;
     } catch (const std::exception& e) {
         Utils::Logger::Warn("ScriptsWiring: Macro ScanDocument exception: {}", e.what());

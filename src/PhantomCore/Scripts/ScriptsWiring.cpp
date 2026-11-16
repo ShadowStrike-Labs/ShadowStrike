@@ -44,7 +44,7 @@ bool VBScriptScanner_ScanFile(const std::wstring& filePath,
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
                                   const std::wstring& lowerExt,
                                   std::uint32_t pid) noexcept;
-bool MacroDetector_ScanDocument(const std::wstring& filePath) noexcept;
+bool MacroDetector_ScanDocument(const std::wstring& filePath, std::uint32_t pid) noexcept;
 
 // Task 177 kernel event fan-out, uniform signature per (module, event) so one
 // table can hold every module. Each is implemented in the matching
@@ -213,7 +213,7 @@ bool DispatchFileScan(std::uint32_t pid,
         ext == L".rtf" || ext == L".dotm" || ext == L".xltm" ||
         ext == L".odt" || ext == L".ods" || ext == L".xll" ||
         ext == L".pub" || ext == L".vsd") {
-        return MacroDetector_ScanDocument(filePath);
+        return MacroDetector_ScanDocument(filePath, pid);
     }
 
     return false;

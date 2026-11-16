@@ -551,9 +551,11 @@ public:
     [[nodiscard]] MacroDetectorConfiguration GetConfiguration() const;
 
     // Scanning
-    [[nodiscard]] MacroScanResult ScanDocument(const std::filesystem::path& path);
+    [[nodiscard]] MacroScanResult ScanDocument(const std::filesystem::path& path,
+                                               std::uint32_t processId = 0);
     [[nodiscard]] MacroScanResult ScanDocument(std::span<const uint8_t> content,
-                                                const std::string& fileName);
+                                                const std::string& fileName,
+                                                std::uint32_t processId = 0);
     [[nodiscard]] bool HasMacros(const std::filesystem::path& path);
     [[nodiscard]] bool HasAutoExecMacros(const std::filesystem::path& path);
     [[nodiscard]] MacroScanResult AnalyzeMacros(const std::filesystem::path& path);
@@ -931,9 +933,11 @@ void MacroDetectorImpl::Shutdown() {
     return m_config;
 }
 
-[[nodiscard]] MacroScanResult MacroDetectorImpl::ScanDocument(const std::filesystem::path& path) {
+[[nodiscard]] MacroScanResult MacroDetectorImpl::ScanDocument(const std::filesystem::path& path,
+                                                              std::uint32_t processId) {
     MacroScanResult result;
     result.filePath = path;
+    result.processId = processId;  // Task 180: carried even on early error paths
     result.scanTime = std::chrono::system_clock::now();
     auto startTime = Clock::now();
 
@@ -1028,6 +1032,10 @@ void MacroDetectorImpl::Shutdown() {
                 result.filePath = path;
                 result.sha256 = sha256Hex;
                 result.fileSize = fileStat.size;
+                // Task 180: the cache is keyed by content hash, so re-stamp the
+                // current scan's process or a second writer of the same document
+                // would be attributed to the first.
+                result.processId = processId;
                 result.scanTime = std::chrono::system_clock::now();
                 auto endTime = Clock::now();
                 result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
@@ -1044,7 +1052,7 @@ void MacroDetectorImpl::Shutdown() {
     );
 
     // Perform scan — delegate to the span overload for all analysis logic
-    result = ScanDocument(contentSpan, path.filename().string());
+    result = ScanDocument(contentSpan, path.filename().string(), processId);
 
     // Restore file-specific metadata that the span overload cannot know
     result.filePath = path;
@@ -1096,11 +1104,15 @@ void MacroDetectorImpl::Shutdown() {
 
 [[nodiscard]] MacroScanResult MacroDetectorImpl::ScanDocument(
     std::span<const uint8_t> content,
-    const std::string& fileName) {
+    const std::string& fileName,
+    std::uint32_t processId) {
 
     MacroScanResult result;
     result.scanTime = std::chrono::system_clock::now();
     result.fileSize = content.size();
+    // Task 180: stamp the writing process before analysis so every exit path and
+    // the raised alert carry it. 0 means unknown.
+    result.processId = processId;
     auto startTime = Clock::now();
 
     if (!m_initialized.load(std::memory_order_acquire)) {
@@ -2819,6 +2831,8 @@ void MacroDetectorImpl::ReportThreatToAlertSystem(const MacroScanResult& result)
         if (!result.detectedFamily.empty()) {
             subject += " [" + result.detectedFamily + "]";
         }
+        // Task 180: name the writing process in the alert.
+        subject += " pid=" + std::to_string(result.processId);
 
         std::string details = result.ToJson();
 
@@ -2959,14 +2973,16 @@ void MacroDetector::Shutdown() {
     return m_impl->GetConfiguration();
 }
 
-[[nodiscard]] MacroScanResult MacroDetector::ScanDocument(const std::filesystem::path& path) {
-    return m_impl->ScanDocument(path);
+[[nodiscard]] MacroScanResult MacroDetector::ScanDocument(const std::filesystem::path& path,
+                                                          std::uint32_t processId) {
+    return m_impl->ScanDocument(path, processId);
 }
 
 [[nodiscard]] MacroScanResult MacroDetector::ScanDocument(
     std::span<const uint8_t> content,
-    const std::string& fileName) {
-    return m_impl->ScanDocument(content, fileName);
+    const std::string& fileName,
+    std::uint32_t processId) {
+    return m_impl->ScanDocument(content, fileName, processId);
 }
 
 [[nodiscard]] bool MacroDetector::HasMacros(const std::filesystem::path& path) {
