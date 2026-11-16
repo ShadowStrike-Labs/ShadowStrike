@@ -1558,17 +1558,28 @@ class SourceContractTests(unittest.TestCase):
         # unreachable writers so the reachable one cannot come back.
         self.assertEqual(
             cpp.count("wasBlocked = true"),
-            2,
-            "SelfDefense gained or lost a block claim. The two expected sites are "
-            "IsAccessAllowed (which returns false to deny) and the kernel "
-            "SelfProtect handler; both are gates, neither is flag-derived.",
+            3,
+            "SelfDefense's block claims are the two unreachable gates (IsAccessAllowed, "
+            "which returns false to deny, and the dormant SelfProtect handler) plus the "
+            "reachable HandleAlert handler, which claims a block only for access the "
+            "kernel actually stripped. A fourth, or a flag-derived one, must not appear.",
         )
         self.assertEqual(
             cpp.count("memoryModificationBlocked.fetch_add"),
-            2,
-            "memoryModificationBlocked must keep exactly its two writers inside "
-            "the access gate and the kernel handler; a third one means an "
-            "observation is being counted as a prevention again.",
+            3,
+            "memoryModificationBlocked has its two unreachable writers (the access gate "
+            "and the dormant SelfProtect handler) plus the reachable HandleAlert handler. "
+            "The reachable one counts a real kernel strip, not an observation; a fourth "
+            "means an observation is being counted as a prevention again.",
+        )
+        # task 166a: the reachable HandleAlert handler must fire a block claim only
+        # when the kernel actually stripped dangerous access, never on a permitted or
+        # merely observed one. It returns early otherwise.
+        self.assertIn(
+            "if (!verdict.wasBlocked) {",
+            cpp,
+            "The HandleAlert handler no longer gates its block claim on a real kernel "
+            "strip, so it can count a permitted access as a prevention.",
         )
         self.assertEqual(
             registry.count("wasBlocked = true"),
@@ -4664,11 +4675,21 @@ class KernelProcessContextRetentionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             self.cpp_code.count("elevated.has_value()"),
-            2,
-            "Both the auto-monitor gate and the token-theft correlation must "
-            "require a measured elevation state. Treating not-determined as "
-            "'not elevated' is what made the correlation fire on every "
-            "elevation-showing token change while claiming kernel evidence.",
+            3,
+            "Three sites must require a measured elevation state: the auto-monitor "
+            "gate (kernel parameter), the lazy-arming candidate selection, and the "
+            "token-theft correlation. Treating not-determined as 'not elevated' is "
+            "what made the correlation fire on every elevation-showing token change.",
+        )
+        # task 184: the stored elevation baseline must come from a real local token
+        # query, never fabricated and never attributed to the kernel notification
+        # (which carries no elevation bit). This is what the monitoring thread uses
+        # to arm token monitoring and to give the cross-correlation a true baseline.
+        self.assertIn(
+            "ProcessUtils::IsProcessElevated(pid)",
+            self.cpp_code,
+            "The lazy elevation baseline has no measured source: the monitoring "
+            "thread must resolve it with a real local token query.",
         )
 
     def test_the_context_map_is_cleared_on_both_lifecycle_transitions(self):
