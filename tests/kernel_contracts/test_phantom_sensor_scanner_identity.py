@@ -4844,22 +4844,56 @@ class ProcessNotifyReplyHorizonContractTests(unittest.TestCase):
                 f"where this handler does its state maintenance.",
             )
 
-        # REGRESSION GUARDS, and labelled as such rather than presented as
-        # discriminators: these two must stay outside every gate.
-        # assertTrue over a boolean, never assertIn against the handler slice - a
-        # containment failure would dump the whole function into the output and
-        # bury the one line that matters.
+        # REGRESSION GUARDS, labelled as such rather than presented as
+        # discriminators. assertTrue over a boolean, never assertIn/assertNotIn
+        # against the handler slice - a containment failure would dump the whole
+        # function into the output and bury the one line that matters.
+        #
+        # The privilege-escalation exit erase stays in the handler, outside every
+        # gate: the driver does not wait on exit, but the erase must still run.
         self.assertTrue(
             "OnKernelProcessExited(req.processId)" in self.handler,
             "The privilege-escalation exit erase is gone from the handler. It is "
             "the only eraser of that per-PID map; without it the map grows one "
             "entry per process creation for the life of the service.",
         )
+
+        # TASK 186 strengthened this very property. The ransomware (and task 177
+        # script) fan-outs are reply-independent, so they were moved OFF the
+        # reply-blocking thread entirely rather than merely left ungated on it.
+        # The handler now hands the event to a bounded queue and returns; the
+        # dispatch runs in ProcessNotifyFanOutLoop. The regression to catch is
+        # therefore twofold: the hand-off must remain in the handler, and neither
+        # fan-out may creep back onto the thread the driver blocks CreateProcess
+        # on.
         self.assertTrue(
-            "Ransomware::Wiring::DispatchProcessNotify(" in self.handler,
-            "The ransomware fan-out has left the handler. Two of its seven "
-            "targets erase per-PID state on exit and a third commits pending "
-            "backups, none of which depends on the kernel verdict.",
+            "QueueProcessNotify(" in self.handler,
+            "The process-notify hand-off is gone from the handler, so the "
+            "off-thread worker is never fed and both fan-outs stop running - "
+            "including the exit-branch per-PID state erases and backup commits.",
+        )
+        self.assertTrue(
+            "Ransomware::Wiring::DispatchProcessNotify(" not in self.handler,
+            "The ransomware fan-out is back on the thread the driver blocks "
+            "CreateProcess on. Task 186 moved it to ProcessNotifyFanOutLoop "
+            "because its work is reply-independent; inlining it here restores the "
+            "unbounded tail on the reply path.",
+        )
+
+        # ...and both fan-outs must actually live in the off-thread worker, not
+        # have vanished. extract_c_function raises if the worker is gone, which is
+        # itself the failure that a lost worker should produce.
+        worker = extract_c_function(self.rtp_cpp, "void ProcessNotifyFanOutLoop")
+        self.assertTrue(
+            "Ransomware::Wiring::DispatchProcessNotify(" in worker,
+            "The ransomware fan-out has left the off-thread worker. The handler "
+            "enqueues events but nothing dispatches them, so the fan-out whose "
+            "targets erase per-PID state and commit backups is silently dead.",
+        )
+        self.assertTrue(
+            "Scripts::Wiring::DispatchProcessNotify(" in worker,
+            "The script-scanner fan-out (task 177) has left the off-thread "
+            "worker, so the six script detectors no longer see process events.",
         )
 
     def test_the_deadline_chain_stays_below_the_driver_wait(self) -> None:
