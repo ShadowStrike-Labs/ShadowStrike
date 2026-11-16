@@ -433,6 +433,7 @@ void WebcamStatistics::Reset() noexcept {
     accessAllowed.store(0, std::memory_order_relaxed);
     accessBlocked.store(0, std::memory_order_relaxed);
     accessPrompted.store(0, std::memory_order_relaxed);
+    unresolvedDecisions.store(0, std::memory_order_relaxed);
     suspiciousAccess.store(0, std::memory_order_relaxed);
     malwareBlocked.store(0, std::memory_order_relaxed);
     ratDetected.store(0, std::memory_order_relaxed);
@@ -448,6 +449,7 @@ std::string WebcamStatistics::ToJson() const {
         {"accessAllowed", accessAllowed.load()},
         {"accessBlocked", accessBlocked.load()},
         {"accessPrompted", accessPrompted.load()},
+        {"unresolvedDecisions", unresolvedDecisions.load()},
         {"suspiciousAccess", suspiciousAccess.load()},
         {"malwareBlocked", malwareBlocked.load()},
         {"ratDetected", ratDetected.load()},
@@ -523,6 +525,10 @@ public:
     std::vector<ErrorCallback> m_errorCallbacks;
     std::mutex m_callbacksMutex;
 
+    /// Rate-limit stamp (steady_clock ms) for the "Prompt mode but no decision
+    /// provider registered" warning, so it cannot spam the log on every access.
+    std::atomic<uint64_t> m_lastPromptWarnMs{0};
+
     /// @brief Cooldown cleanup counter — prune stale entries periodically
     uint32_t m_cooldownCleanupCounter{0};
     static constexpr uint32_t COOLDOWN_CLEANUP_INTERVAL = 64;
@@ -570,7 +576,11 @@ public:
     void InvokeAccessCallbacks(const CameraAccessEvent& event);
     void InvokeDeviceCallbacks(const CameraDevice& device, bool added);
     void InvokeErrorCallbacks(const std::string& message, int code);
-    [[nodiscard]] CameraAccessDecision InvokeDecisionCallbacks(const CameraAccessEvent& event);
+    [[nodiscard]] std::optional<CameraAccessDecision> InvokeDecisionCallbacks(const CameraAccessEvent& event);
+
+    // Rate-limited warning emitted when Prompt mode is active but no decision
+    // provider is registered, so the mode silently cannot prompt.
+    void WarnPromptUnresolvedRateLimited();
 
     // Cooldown check
     [[nodiscard]] bool IsInCooldown(uint32_t processId);
@@ -860,18 +870,31 @@ CameraAccessDecision WebcamProtectorImpl::EvaluateAccessInternal(
                 InvokeAccessCallbacks(event);
                 return CameraAccessDecision::Allow;
 
-            case WebcamProtectionMode::Prompt:
-                // Check callbacks for decision
-                event.decision = InvokeDecisionCallbacks(event);
-                if (event.decision == CameraAccessDecision::Block) {
-                    m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
+            case WebcamProtectionMode::Prompt: {
+                // Consult EVERY registered decision provider (most-secure-wins),
+                // not just the first.
+                const auto engaged = InvokeDecisionCallbacks(event);
+                if (engaged.has_value()) {
+                    event.decision = *engaged;
+                    if (event.decision == CameraAccessDecision::Block) {
+                        m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    m_statistics.accessPrompted.fetch_add(1, std::memory_order_relaxed);
+                    RecordAccessEvent(event);
+                    InvokeAccessCallbacks(event);
+                    return event.decision;
                 }
-                m_statistics.accessPrompted.fetch_add(1, std::memory_order_relaxed);
-                RecordAccessEvent(event);
-                InvokeAccessCallbacks(event);
-                return event.decision;
+                // No provider expressed an actionable opinion. There is no prompt
+                // UI, so "prompt" must NOT become "allow": record it as unresolved,
+                // warn (rate-limited) that the mode cannot prompt without a
+                // provider, and fall through to the same whitelist / temporary-
+                // access / secure-default path as WhitelistOnly below.
+                m_statistics.unresolvedDecisions.fetch_add(1, std::memory_order_relaxed);
+                WarnPromptUnresolvedRateLimited();
+                break;
+            }
 
             case WebcamProtectionMode::WhitelistOnly:
                 break;  // Continue to whitelist check
@@ -1343,21 +1366,93 @@ void WebcamProtectorImpl::InvokeDeviceCallbacks(
     }
 }
 
-CameraAccessDecision WebcamProtectorImpl::InvokeDecisionCallbacks(
+std::optional<CameraAccessDecision> CombineCameraAccessDecisions(
+    const std::vector<std::optional<CameraAccessDecision>>& votes) noexcept
+{
+    // Security order (most secure first): Block > AllowTimed > AllowOnce >
+    // Allow. "Prompt" is not actionable without a prompter UI and a nullopt
+    // vote means "no opinion"; both are ignored so the caller applies its own
+    // secure default rather than silently allowing.
+    const auto rank = [](CameraAccessDecision d) noexcept -> int {
+        switch (d) {
+            case CameraAccessDecision::Block:      return 5;
+            case CameraAccessDecision::AllowTimed: return 2;
+            case CameraAccessDecision::AllowOnce:  return 1;
+            case CameraAccessDecision::Allow:      return 0;
+            case CameraAccessDecision::Prompt:     return -1;
+        }
+        return -1;
+    };
+
+    std::optional<CameraAccessDecision> best;
+    int bestRank = -1;
+    for (const auto& vote : votes) {
+        if (!vote.has_value()) {
+            continue;  // no opinion
+        }
+        const int r = rank(*vote);
+        if (r > bestRank) {
+            bestRank = r;
+            best = *vote;
+        }
+    }
+    return best;
+}
+
+std::optional<CameraAccessDecision> WebcamProtectorImpl::InvokeDecisionCallbacks(
     const CameraAccessEvent& event)
 {
-    std::lock_guard lock(m_callbacksMutex);
-
-    if (m_decisionCallbacks.empty()) {
-        return CameraAccessDecision::Prompt;  // Default to prompt
+    // Snapshot under the lock, invoke outside it: a decision provider must not
+    // be able to deadlock the protector by calling back in, and every provider
+    // is consulted rather than only the first.
+    std::vector<CameraAccessDecisionCallback> providers;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        providers = m_decisionCallbacks;
     }
 
-    // Use first callback's decision
-    try {
-        return m_decisionCallbacks[0](event);
-    } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"WebcamProtector", L"Decision callback error - %hs", e.what());
-        return CameraAccessDecision::Block;  // Fail secure
+    if (providers.empty()) {
+        return std::nullopt;  // no provider registered: no opinion
+    }
+
+    std::vector<std::optional<CameraAccessDecision>> votes;
+    votes.reserve(providers.size());
+    for (const auto& provider : providers) {
+        if (!provider) {
+            continue;
+        }
+        try {
+            votes.push_back(provider(event));
+        } catch (const std::exception& e) {
+            // A throwing provider is treated as an engaged Block, so the stated
+            // fail-secure posture holds by rule rather than by sentinel.
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"Decision callback threw - %hs (treated as Block, fail-secure)", e.what());
+            votes.push_back(CameraAccessDecision::Block);
+        } catch (...) {
+            SS_LOG_ERROR(L"WebcamProtector",
+                L"Decision callback threw unknown exception (treated as Block, fail-secure)");
+            votes.push_back(CameraAccessDecision::Block);
+        }
+    }
+
+    return CombineCameraAccessDecisions(votes);
+}
+
+void WebcamProtectorImpl::WarnPromptUnresolvedRateLimited() {
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    constexpr uint64_t kIntervalMs = 60'000;
+
+    uint64_t last = m_lastPromptWarnMs.load(std::memory_order_relaxed);
+    if (last != 0 && nowMs - last < kIntervalMs) {
+        return;
+    }
+    if (m_lastPromptWarnMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed)) {
+        SS_LOG_WARN(L"WebcamProtector",
+            L"Prompt mode is active but no decision provider is registered; access "
+            L"falls through to the whitelist/secure-default path and the user is never prompted");
     }
 }
 

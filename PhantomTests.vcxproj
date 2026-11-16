@@ -412,6 +412,7 @@
     <ClCompile Include="tests\unit\home_unit\AttachmentFileTyping_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\SpamHiddenText_Tests.cpp" />
     <ClCompile Include="tests\unit\home_unit\MinerDomainMatching_Tests.cpp" />
+    <ClCompile Include="tests\unit\home_unit\PrivacyDecisionCombine_Tests.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\OutlookScanner.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\ThunderbirdScanner.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailProtection.cpp" />

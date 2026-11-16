@@ -476,6 +476,10 @@ struct MicrophoneStatistics {
     std::atomic<uint64_t> accessBlocked{0};
     std::atomic<uint64_t> accessMuted{0};
     std::atomic<uint64_t> accessPrompted{0};
+    /// Prompt mode reached but no provider gave an actionable opinion; counted
+    /// here instead of being silently allowed. Non-zero means the mode cannot
+    /// actually prompt (no decision provider is registered).
+    std::atomic<uint64_t> unresolvedDecisions{0};
     std::atomic<uint64_t> suspiciousAccess{0};
     std::atomic<uint64_t> malwareBlocked{0};
     std::atomic<uint64_t> ratDetected{0};
@@ -501,6 +505,7 @@ struct MicrophoneStatisticsSnapshot {
     uint64_t accessBlocked = 0;
     uint64_t accessMuted = 0;
     uint64_t accessPrompted = 0;
+    uint64_t unresolvedDecisions = 0;
     uint64_t suspiciousAccess = 0;
     uint64_t malwareBlocked = 0;
     uint64_t ratDetected = 0;
@@ -567,8 +572,24 @@ struct MicrophoneConfiguration {
 using AudioAccessCallback = std::function<void(const AudioAccessEvent&)>;
 using StreamCallback = std::function<void(const AudioStreamInfo&)>;
 using AudioDeviceChangeCallback = std::function<void(const AudioDevice&, bool added)>;
-using AudioAccessDecisionCallback = std::function<AudioAccessDecision(const AudioAccessEvent&)>;
+
+/// A decision provider votes on a single access. Returning std::nullopt means
+/// "no opinion" (distinct from Prompt): the guard then applies its own secure
+/// default instead of treating a non-answer as an allow.
+using AudioAccessDecisionCallback =
+    std::function<std::optional<AudioAccessDecision>(const AudioAccessEvent&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+
+/// @brief Combine zero or more decision-provider votes into one decision.
+///
+/// Consults EVERY vote (not just the first) and returns the most-secure
+/// actionable decision. Security order (most secure first):
+///   Block > Mute > AllowTimed > AllowOnce > Allow.
+/// A std::nullopt vote, a "Prompt" vote (not actionable without a prompter UI),
+/// an empty list, or a list with no actionable vote all return std::nullopt,
+/// signalling the caller to apply its secure default rather than allow.
+[[nodiscard]] std::optional<AudioAccessDecision> CombineAudioAccessDecisions(
+    const std::vector<std::optional<AudioAccessDecision>>& votes) noexcept;
 
 // ============================================================================
 // MICROPHONE GUARD CLASS

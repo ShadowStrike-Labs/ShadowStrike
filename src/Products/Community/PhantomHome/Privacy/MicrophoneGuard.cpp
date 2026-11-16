@@ -463,6 +463,7 @@ void MicrophoneStatistics::Reset() noexcept {
     accessBlocked.store(0, std::memory_order_relaxed);
     accessMuted.store(0, std::memory_order_relaxed);
     accessPrompted.store(0, std::memory_order_relaxed);
+    unresolvedDecisions.store(0, std::memory_order_relaxed);
     suspiciousAccess.store(0, std::memory_order_relaxed);
     malwareBlocked.store(0, std::memory_order_relaxed);
     ratDetected.store(0, std::memory_order_relaxed);
@@ -483,6 +484,7 @@ std::string MicrophoneStatistics::ToJson() const {
         {"accessBlocked", accessBlocked.load()},
         {"accessMuted", accessMuted.load()},
         {"accessPrompted", accessPrompted.load()},
+        {"unresolvedDecisions", unresolvedDecisions.load()},
         {"suspiciousAccess", suspiciousAccess.load()},
         {"malwareBlocked", malwareBlocked.load()},
         {"ratDetected", ratDetected.load()},
@@ -501,6 +503,7 @@ MicrophoneStatisticsSnapshot MicrophoneStatistics::TakeSnapshot() const noexcept
     snap.accessBlocked = accessBlocked.load(std::memory_order_relaxed);
     snap.accessMuted = accessMuted.load(std::memory_order_relaxed);
     snap.accessPrompted = accessPrompted.load(std::memory_order_relaxed);
+    snap.unresolvedDecisions = unresolvedDecisions.load(std::memory_order_relaxed);
     snap.suspiciousAccess = suspiciousAccess.load(std::memory_order_relaxed);
     snap.malwareBlocked = malwareBlocked.load(std::memory_order_relaxed);
     snap.ratDetected = ratDetected.load(std::memory_order_relaxed);
@@ -522,6 +525,7 @@ std::string MicrophoneStatisticsSnapshot::ToJson() const {
         {"accessBlocked", accessBlocked},
         {"accessMuted", accessMuted},
         {"accessPrompted", accessPrompted},
+        {"unresolvedDecisions", unresolvedDecisions},
         {"suspiciousAccess", suspiciousAccess},
         {"malwareBlocked", malwareBlocked},
         {"ratDetected", ratDetected},
@@ -607,6 +611,10 @@ public:
     std::vector<ErrorCallback> m_errorCallbacks;
     std::mutex m_callbacksMutex;
 
+    /// Rate-limit stamp (steady_clock ms) for the "Prompt mode but no decision
+    /// provider registered" warning, so it cannot spam the log on every access.
+    std::atomic<uint64_t> m_lastPromptWarnMs{0};
+
     /// @brief Infrastructure integrations
     std::shared_ptr<Whitelist::WhitelistStore> m_whitelistStore;
 
@@ -664,7 +672,11 @@ public:
     void InvokeStreamCallbacks(const AudioStreamInfo& stream);
     void InvokeDeviceCallbacks(const AudioDevice& device, bool added);
     void InvokeErrorCallbacks(const std::string& message, int code);
-    [[nodiscard]] AudioAccessDecision InvokeDecisionCallbacks(const AudioAccessEvent& event);
+    [[nodiscard]] std::optional<AudioAccessDecision> InvokeDecisionCallbacks(const AudioAccessEvent& event);
+
+    // Rate-limited warning emitted when Prompt mode is active but no decision
+    // provider is registered, so the mode silently cannot prompt.
+    void WarnPromptUnresolvedRateLimited();
 };
 
 // ============================================================================
@@ -1035,20 +1047,33 @@ AudioAccessDecision MicrophoneGuardImpl::EvaluateAccessInternal(
                 InvokeAccessCallbacks(event);
                 return AudioAccessDecision::Allow;
 
-            case MicrophoneProtectionMode::Prompt:
-                // Check callbacks for decision
-                event.decision = InvokeDecisionCallbacks(event);
-                if (event.decision == AudioAccessDecision::Block) {
-                    m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
-                } else if (event.decision == AudioAccessDecision::Mute) {
-                    m_statistics.accessMuted.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
+            case MicrophoneProtectionMode::Prompt: {
+                // Consult EVERY registered decision provider (most-secure-wins),
+                // not just the first.
+                const auto engaged = InvokeDecisionCallbacks(event);
+                if (engaged.has_value()) {
+                    event.decision = *engaged;
+                    if (event.decision == AudioAccessDecision::Block) {
+                        m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
+                    } else if (event.decision == AudioAccessDecision::Mute) {
+                        m_statistics.accessMuted.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    m_statistics.accessPrompted.fetch_add(1, std::memory_order_relaxed);
+                    RecordAccessEvent(event);
+                    InvokeAccessCallbacks(event);
+                    return event.decision;
                 }
-                m_statistics.accessPrompted.fetch_add(1, std::memory_order_relaxed);
-                RecordAccessEvent(event);
-                InvokeAccessCallbacks(event);
-                return event.decision;
+                // No provider expressed an actionable opinion. There is no prompt
+                // UI, so "prompt" must NOT become "allow": record it as unresolved,
+                // warn (rate-limited) that the mode cannot prompt without a
+                // provider, and fall through to the same whitelist / temporary-
+                // access / secure-default path as WhitelistOnly below.
+                m_statistics.unresolvedDecisions.fetch_add(1, std::memory_order_relaxed);
+                WarnPromptUnresolvedRateLimited();
+                break;
+            }
 
             case MicrophoneProtectionMode::WhitelistOnly:
                 break;  // Continue to whitelist check
@@ -1706,22 +1731,96 @@ void MicrophoneGuardImpl::InvokeDeviceCallbacks(
     }
 }
 
-AudioAccessDecision MicrophoneGuardImpl::InvokeDecisionCallbacks(
+std::optional<AudioAccessDecision> CombineAudioAccessDecisions(
+    const std::vector<std::optional<AudioAccessDecision>>& votes) noexcept
+{
+    // Security order (most secure first): Block > Mute > AllowTimed > AllowOnce
+    // > Allow. "Prompt" is not actionable without a prompter UI and a nullopt
+    // vote means "no opinion"; both are ignored so the caller applies its own
+    // secure default rather than silently allowing.
+    const auto rank = [](AudioAccessDecision d) noexcept -> int {
+        switch (d) {
+            case AudioAccessDecision::Block:      return 5;
+            case AudioAccessDecision::Mute:       return 4;
+            case AudioAccessDecision::AllowTimed: return 2;
+            case AudioAccessDecision::AllowOnce:  return 1;
+            case AudioAccessDecision::Allow:      return 0;
+            case AudioAccessDecision::Prompt:     return -1;
+        }
+        return -1;
+    };
+
+    std::optional<AudioAccessDecision> best;
+    int bestRank = -1;
+    for (const auto& vote : votes) {
+        if (!vote.has_value()) {
+            continue;  // no opinion
+        }
+        const int r = rank(*vote);
+        if (r > bestRank) {
+            bestRank = r;
+            best = *vote;
+        }
+    }
+    return best;
+}
+
+std::optional<AudioAccessDecision> MicrophoneGuardImpl::InvokeDecisionCallbacks(
     const AudioAccessEvent& event)
 {
-    std::lock_guard lock(m_callbacksMutex);
-
-    if (m_decisionCallbacks.empty()) {
-        return AudioAccessDecision::Prompt;  // Default to prompt
+    // Snapshot under the lock, invoke outside it: a decision provider must not
+    // be able to deadlock the guard by calling back in, and every provider is
+    // consulted rather than only the first.
+    std::vector<AudioAccessDecisionCallback> providers;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        providers = m_decisionCallbacks;
     }
 
-    // Use first callback's decision
-    try {
-        return m_decisionCallbacks[0](event);
-    } catch (const std::exception& e) {
-        Utils::Logger::Error("MicrophoneGuard: Decision callback error - {}",
-                           (e.what()));
-        return AudioAccessDecision::Block;  // Fail secure
+    if (providers.empty()) {
+        return std::nullopt;  // no provider registered: no opinion
+    }
+
+    std::vector<std::optional<AudioAccessDecision>> votes;
+    votes.reserve(providers.size());
+    for (const auto& provider : providers) {
+        if (!provider) {
+            continue;
+        }
+        try {
+            votes.push_back(provider(event));
+        } catch (const std::exception& e) {
+            // A throwing provider is treated as an engaged Block, so the stated
+            // fail-secure posture holds by rule rather than by sentinel.
+            Utils::Logger::Error(
+                "MicrophoneGuard: Decision callback threw - {} (treated as Block, fail-secure)",
+                (e.what()));
+            votes.push_back(AudioAccessDecision::Block);
+        } catch (...) {
+            Utils::Logger::Error(
+                "MicrophoneGuard: Decision callback threw unknown exception (treated as Block, fail-secure)");
+            votes.push_back(AudioAccessDecision::Block);
+        }
+    }
+
+    return CombineAudioAccessDecisions(votes);
+}
+
+void MicrophoneGuardImpl::WarnPromptUnresolvedRateLimited() {
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    constexpr uint64_t kIntervalMs = 60'000;
+
+    uint64_t last = m_lastPromptWarnMs.load(std::memory_order_relaxed);
+    if (last != 0 && nowMs - last < kIntervalMs) {
+        return;
+    }
+    if (m_lastPromptWarnMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed)) {
+        Utils::Logger::Warn(
+            "MicrophoneGuard: Prompt mode is active but no decision provider is "
+            "registered; access falls through to the whitelist/secure-default "
+            "path and the user is never prompted");
     }
 }
 

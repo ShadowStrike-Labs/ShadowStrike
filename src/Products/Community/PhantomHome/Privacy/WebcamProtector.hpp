@@ -415,6 +415,10 @@ struct WebcamStatistics {
     std::atomic<uint64_t> accessAllowed{0};
     std::atomic<uint64_t> accessBlocked{0};
     std::atomic<uint64_t> accessPrompted{0};
+    /// Prompt mode reached but no provider gave an actionable opinion; counted
+    /// here instead of being silently allowed. Non-zero means the mode cannot
+    /// actually prompt (no decision provider is registered).
+    std::atomic<uint64_t> unresolvedDecisions{0};
     std::atomic<uint64_t> suspiciousAccess{0};
     std::atomic<uint64_t> malwareBlocked{0};
     std::atomic<uint64_t> ratDetected{0};
@@ -432,6 +436,7 @@ struct WebcamStatistics {
         , accessAllowed(o.accessAllowed.load(std::memory_order_relaxed))
         , accessBlocked(o.accessBlocked.load(std::memory_order_relaxed))
         , accessPrompted(o.accessPrompted.load(std::memory_order_relaxed))
+        , unresolvedDecisions(o.unresolvedDecisions.load(std::memory_order_relaxed))
         , suspiciousAccess(o.suspiciousAccess.load(std::memory_order_relaxed))
         , malwareBlocked(o.malwareBlocked.load(std::memory_order_relaxed))
         , ratDetected(o.ratDetected.load(std::memory_order_relaxed))
@@ -448,6 +453,7 @@ struct WebcamStatistics {
             accessAllowed.store(o.accessAllowed.load(std::memory_order_relaxed), std::memory_order_relaxed);
             accessBlocked.store(o.accessBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
             accessPrompted.store(o.accessPrompted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            unresolvedDecisions.store(o.unresolvedDecisions.load(std::memory_order_relaxed), std::memory_order_relaxed);
             suspiciousAccess.store(o.suspiciousAccess.load(std::memory_order_relaxed), std::memory_order_relaxed);
             malwareBlocked.store(o.malwareBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ratDetected.store(o.ratDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -518,8 +524,24 @@ struct WebcamConfiguration {
 
 using CameraAccessCallback = std::function<void(const CameraAccessEvent&)>;
 using CameraDeviceChangeCallback = std::function<void(const CameraDevice&, bool added)>;
-using CameraAccessDecisionCallback = std::function<CameraAccessDecision(const CameraAccessEvent&)>;
+
+/// A decision provider votes on a single access. Returning std::nullopt means
+/// "no opinion" (distinct from Prompt): the protector then applies its own
+/// secure default instead of treating a non-answer as an allow.
+using CameraAccessDecisionCallback =
+    std::function<std::optional<CameraAccessDecision>(const CameraAccessEvent&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+
+/// @brief Combine zero or more decision-provider votes into one decision.
+///
+/// Consults EVERY vote (not just the first) and returns the most-secure
+/// actionable decision. Security order (most secure first):
+///   Block > AllowTimed > AllowOnce > Allow.
+/// A std::nullopt vote, a "Prompt" vote (not actionable without a prompter UI),
+/// an empty list, or a list with no actionable vote all return std::nullopt,
+/// signalling the caller to apply its secure default rather than allow.
+[[nodiscard]] std::optional<CameraAccessDecision> CombineCameraAccessDecisions(
+    const std::vector<std::optional<CameraAccessDecision>>& votes) noexcept;
 
 // ============================================================================
 // WEBCAM PROTECTOR CLASS
