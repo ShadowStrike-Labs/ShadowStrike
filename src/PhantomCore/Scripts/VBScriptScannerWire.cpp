@@ -42,18 +42,19 @@ void VBScriptScanner_Shutdown() noexcept {
 }
 
 bool VBScriptScanner_ScanFile(const std::wstring& filePath,
-                              const std::wstring& lowerExt) noexcept {
+                              const std::wstring& lowerExt,
+                              std::uint32_t pid) noexcept {
     try {
         std::filesystem::path p{filePath};
         VBSScanResult result{};
         if (lowerExt == L".vbe") {
-            result = VBScriptScanner::Instance().ScanEncodedVBE(p);
+            result = VBScriptScanner::Instance().ScanEncodedVBE(p, pid);
         } else if (lowerExt == L".wsf" || lowerExt == L".wsh") {
-            result = VBScriptScanner::Instance().ScanWSF(p);
+            result = VBScriptScanner::Instance().ScanWSF(p, pid);
         } else if (lowerExt == L".hta") {
-            result = VBScriptScanner::Instance().ScanHTA(p);
+            result = VBScriptScanner::Instance().ScanHTA(p, pid);
         } else {
-            result = VBScriptScanner::Instance().ScanFile(p);
+            result = VBScriptScanner::Instance().ScanFile(p, pid);
         }
         return result.isMalicious;
     } catch (const std::exception& e) {

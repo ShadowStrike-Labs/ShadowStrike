@@ -421,6 +421,12 @@ struct VBSScanResult {
     
     /// @brief Is malicious
     bool isMalicious = false;
+
+    /// @brief Originating process id: the process that wrote or owns the
+    ///        scanned content. 0 when unknown (file-backed or service-side
+    ///        scans). Task 180: carried so a detection names the writing process
+    ///        and can be correlated with a process-creation event.
+    std::uint32_t processId = 0;
     
     /// @brief Threat category
     VBSThreatCategory category = VBSThreatCategory::None;
@@ -624,21 +630,28 @@ public:
     // ========================================================================
     
     /// @brief Scan VBScript file (auto-detect type)
-    [[nodiscard]] VBSScanResult ScanFile(const std::filesystem::path& path);
+    /// @param processId Originating process id, stamped on the result and named
+    ///        in any alert raised. 0 (default) when unknown.
+    [[nodiscard]] VBSScanResult ScanFile(const std::filesystem::path& path,
+                                         std::uint32_t processId = 0);
     
     /// @brief Scan VBScript source code
     [[nodiscard]] VBSScanResult ScanSource(
         std::string_view source,
-        const std::string& sourceName = "memory.vbs");
+        const std::string& sourceName = "memory.vbs",
+        std::uint32_t processId = 0);
     
     /// @brief Scan encoded VBE file
-    [[nodiscard]] VBSScanResult ScanEncodedVBE(const std::filesystem::path& vbePath);
+    [[nodiscard]] VBSScanResult ScanEncodedVBE(const std::filesystem::path& vbePath,
+                                               std::uint32_t processId = 0);
     
     /// @brief Scan WSF file
-    [[nodiscard]] VBSScanResult ScanWSF(const std::filesystem::path& wsfPath);
+    [[nodiscard]] VBSScanResult ScanWSF(const std::filesystem::path& wsfPath,
+                                        std::uint32_t processId = 0);
     
     /// @brief Scan HTA file (extract VBScript)
-    [[nodiscard]] VBSScanResult ScanHTA(const std::filesystem::path& htaPath);
+    [[nodiscard]] VBSScanResult ScanHTA(const std::filesystem::path& htaPath,
+                                        std::uint32_t processId = 0);
 
     // ========================================================================
     // ANALYSIS

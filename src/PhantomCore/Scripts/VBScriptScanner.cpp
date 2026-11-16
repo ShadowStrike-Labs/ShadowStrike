@@ -1533,13 +1533,19 @@ public:
     // MAIN SCAN LOGIC
     // =========================================================================
 
-    VBSScanResult ScanSource(std::string_view source, const std::string& sourceName) {
+    VBSScanResult ScanSource(std::string_view source, const std::string& sourceName,
+                             std::uint32_t processId = 0) {
         auto startTime = Clock::now();
 
         VBSScanResult result;
         result.scanTime = Now();
         result.fileType = VBSFileType::Memory;
         result.fileSize = source.size();
+        // Task 180: stamp the writing process before any analysis, so every exit
+        // path (including the early-outs below) and the alert raised on a hit
+        // carry it. 0 means unknown, which is the honest value for a content or
+        // service-side scan that has no originating process.
+        result.processId = processId;
 
         // Take a snapshot of config under lock to avoid repeated lock acquisitions
         VBSScannerConfiguration config;
@@ -1597,6 +1603,11 @@ public:
                     // content hash.
                     cached.filePath.clear();
                     cached.scanTime = result.scanTime;
+                    // Task 180: the cache is keyed by content, so without this a
+                    // second writer of the same script would be attributed to the
+                    // FIRST writer. Re-stamp with the current scan's process, as
+                    // the JavaScript slice does for its own cache.
+                    cached.processId = processId;
                     cached.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
                         Clock::now() - startTime);
                     return cached;
@@ -1764,7 +1775,8 @@ public:
                             " family=" + familyStr +
                             " dangerousObjects=" + std::to_string(result.dangerousObjects.size()) +
                             " matchedSigs=" + std::to_string(result.matchedSignatures.size()) +
-                            " obfuscated=" + (obfusc ? "true" : "false");
+                            " obfuscated=" + (obfusc ? "true" : "false") +
+                            " pid=" + std::to_string(result.processId);
 
                         [[maybe_unused]] auto alertId = alertSys.RaiseAlert(
                                 severity,
@@ -1864,10 +1876,11 @@ public:
         return result;
     }
 
-    VBSScanResult ScanFile(const fs::path& path) {
+    VBSScanResult ScanFile(const fs::path& path, std::uint32_t processId = 0) {
         VBSScanResult result;
         result.filePath = path;
         result.scanTime = Now();
+        result.processId = processId;  // Task 180: carried even on early error paths
 
         // Validate path
         if (path.empty()) {
@@ -1964,7 +1977,7 @@ public:
         }
 
         // Scan the content
-        VBSScanResult scanResult = ScanSource(content, path.string());
+        VBSScanResult scanResult = ScanSource(content, path.string(), processId);
 
         // Merge file metadata
         scanResult.filePath = path;
@@ -2469,56 +2482,62 @@ VBSScannerConfiguration VBScriptScanner::GetConfiguration() const {
 // SCANNING
 // ============================================================================
 
-VBSScanResult VBScriptScanner::ScanFile(const fs::path& path) {
+VBSScanResult VBScriptScanner::ScanFile(const fs::path& path, std::uint32_t processId) {
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
         VBSScanResult err;
         err.status = VBSScanStatus::ErrorParsing;
         err.filePath = path;
+        err.processId = processId;
         SS_LOG_ERROR(LOG_CATEGORY, L"ScanFile called before initialization");
         return err;
     }
-    return m_impl->ScanFile(path);
+    return m_impl->ScanFile(path, processId);
 }
 
-VBSScanResult VBScriptScanner::ScanSource(std::string_view source, const std::string& sourceName) {
+VBSScanResult VBScriptScanner::ScanSource(std::string_view source, const std::string& sourceName,
+                                          std::uint32_t processId) {
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
         VBSScanResult err;
         err.status = VBSScanStatus::ErrorParsing;
+        err.processId = processId;
         SS_LOG_ERROR(LOG_CATEGORY, L"ScanSource called before initialization");
         return err;
     }
-    return m_impl->ScanSource(source, sourceName);
+    return m_impl->ScanSource(source, sourceName, processId);
 }
 
-VBSScanResult VBScriptScanner::ScanEncodedVBE(const fs::path& vbePath) {
+VBSScanResult VBScriptScanner::ScanEncodedVBE(const fs::path& vbePath, std::uint32_t processId) {
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
         VBSScanResult err;
         err.status = VBSScanStatus::ErrorParsing;
+        err.processId = processId;
         return err;
     }
-    auto result = m_impl->ScanFile(vbePath);
+    auto result = m_impl->ScanFile(vbePath, processId);
     result.fileType = VBSFileType::VBE;
     return result;
 }
 
-VBSScanResult VBScriptScanner::ScanWSF(const fs::path& wsfPath) {
+VBSScanResult VBScriptScanner::ScanWSF(const fs::path& wsfPath, std::uint32_t processId) {
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
         VBSScanResult err;
         err.status = VBSScanStatus::ErrorParsing;
+        err.processId = processId;
         return err;
     }
-    auto result = m_impl->ScanFile(wsfPath);
+    auto result = m_impl->ScanFile(wsfPath, processId);
     result.fileType = VBSFileType::WSF;
     return result;
 }
 
-VBSScanResult VBScriptScanner::ScanHTA(const fs::path& htaPath) {
+VBSScanResult VBScriptScanner::ScanHTA(const fs::path& htaPath, std::uint32_t processId) {
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
         VBSScanResult err;
         err.status = VBSScanStatus::ErrorParsing;
+        err.processId = processId;
         return err;
     }
-    auto result = m_impl->ScanFile(htaPath);
+    auto result = m_impl->ScanFile(htaPath, processId);
     result.fileType = VBSFileType::HTA;
     return result;
 }

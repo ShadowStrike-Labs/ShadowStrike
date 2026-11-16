@@ -39,7 +39,8 @@ void VBScriptScanner_Shutdown() noexcept;
 bool JavaScriptScanner_ScanFile(const std::wstring& filePath,
                                 std::uint32_t pid) noexcept;
 bool VBScriptScanner_ScanFile(const std::wstring& filePath,
-                              const std::wstring& lowerExt) noexcept;
+                              const std::wstring& lowerExt,
+                              std::uint32_t pid) noexcept;
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
                                   const std::wstring& lowerExt) noexcept;
 bool MacroDetector_ScanDocument(const std::wstring& filePath) noexcept;
@@ -186,10 +187,11 @@ bool DispatchFileScan(std::uint32_t pid,
         return JavaScriptScanner_ScanFile(filePath, pid);
     }
 
-    // VBScript / Windows Script Host / HTA.
+    // VBScript / Windows Script Host / HTA. The originating process is forwarded
+    // (task 180) so a detection names the process that wrote the script.
     if (ext == L".vbs" || ext == L".vbe" || ext == L".wsf" ||
         ext == L".wsh" || ext == L".hta") {
-        return VBScriptScanner_ScanFile(filePath, ext);
+        return VBScriptScanner_ScanFile(filePath, ext, pid);
     }
 
     // Python scripts / bytecode / wheels / eggs.

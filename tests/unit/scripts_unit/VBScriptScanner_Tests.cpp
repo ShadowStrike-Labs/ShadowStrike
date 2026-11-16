@@ -253,4 +253,50 @@ TEST_F(VBScriptScannerTest, UninitializedScanFailsSafelyAndStatisticsCanReset) {
     EXPECT_EQ(resetStats.dangerousObjectsFound, 0u);
 }
 
+// Task 180: a detection must name the process that wrote the script. The pid is
+// stamped before analysis, so it holds for any verdict and both scan entries.
+TEST_F(VBScriptScannerTest, AScanStampsTheWritingProcessOnTheResult) {
+    auto& scanner = VBScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+
+    constexpr std::uint32_t kWriter = 4321u;
+    const auto viaSource = scanner.ScanSource("WScript.Echo \"hi\"", "sample.vbs", kWriter);
+    EXPECT_EQ(kWriter, viaSource.processId);
+
+    // Default stays 0 (unknown) - the honest value for a content or service-side
+    // scan that has no originating process.
+    const auto viaSourceNoPid = scanner.ScanSource("WScript.Echo \"hi\"", "sample.vbs");
+    EXPECT_EQ(0u, viaSourceNoPid.processId);
+}
+
+TEST_F(VBScriptScannerTest, AFileScanCarriesTheWritingProcess) {
+    auto& scanner = VBScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+
+    const fs::path tmp = fs::temp_directory_path() /
+        ("ss_vbs_180_" + std::to_string(::GetCurrentProcessId()) + ".vbs");
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        f << "WScript.Echo \"hi\"";
+    }
+    constexpr std::uint32_t kWriter = 7777u;
+    const auto result = scanner.ScanFile(tmp, kWriter);
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    EXPECT_EQ(kWriter, result.processId);
+}
+
+// Task 180: the scan cache is keyed by content, so a second writer of the same
+// script must be attributed to itself, not to the first writer whose verdict the
+// cache holds. This is the defect the JavaScript slice re-stamp also prevents.
+TEST_F(VBScriptScannerTest, ACachedVerdictIsStampedWithTheCurrentScansProcess) {
+    auto& scanner = VBScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+
+    const auto first = scanner.ScanSource("MsgBox \"ss180-cache\"", "a.vbs", 111u);
+    EXPECT_EQ(111u, first.processId);
+    const auto second = scanner.ScanSource("MsgBox \"ss180-cache\"", "b.vbs", 222u);
+    EXPECT_EQ(222u, second.processId);
+}
+
 }  // namespace ShadowStrike::Scripts::Test
