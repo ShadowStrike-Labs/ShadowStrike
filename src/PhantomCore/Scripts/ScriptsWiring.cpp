@@ -16,9 +16,13 @@
 
 #include "ScriptsWiring.hpp"
 #include "../Utils/Logger.hpp"
+// Diagnostics only. Like RansomwareWiring.cpp, this is NOT one of the per-module
+// Scripts headers the ODR note below forbids: it declares only ShadowStrike::Diag.
+#include "../Diagnostics/DiagTrace.hpp"
 
 #include <algorithm>
 #include <cwctype>
+#include <iterator>
 #include <string>
 
 namespace ShadowStrike::Scripts::Wiring::Internal {
@@ -39,6 +43,46 @@ bool VBScriptScanner_ScanFile(const std::wstring& filePath,
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
                                   const std::wstring& lowerExt) noexcept;
 bool MacroDetector_ScanDocument(const std::wstring& filePath) noexcept;
+
+// Task 177 kernel event fan-out, uniform signature per (module, event) so one
+// table can hold every module. Each is implemented in the matching
+// <Module>Wire.cpp and is noexcept (it shields its module there).
+void PowerShellScanner_OnProcessNotify(std::uint32_t pid, std::uint32_t parentPid,
+                                       const std::wstring& imagePath,
+                                       const std::wstring& commandLine,
+                                       bool isCreation) noexcept;
+void PowerShellScanner_OnImageLoad(std::uint32_t pid, const std::wstring& imagePath,
+                                   std::uintptr_t imageBase, std::size_t imageSize) noexcept;
+void JavaScriptScanner_OnProcessNotify(std::uint32_t pid, std::uint32_t parentPid,
+                                       const std::wstring& imagePath,
+                                       const std::wstring& commandLine,
+                                       bool isCreation) noexcept;
+void JavaScriptScanner_OnImageLoad(std::uint32_t pid, const std::wstring& imagePath,
+                                   std::uintptr_t imageBase, std::size_t imageSize) noexcept;
+void MacroDetector_OnProcessNotify(std::uint32_t pid, std::uint32_t parentPid,
+                                   const std::wstring& imagePath,
+                                   const std::wstring& commandLine,
+                                   bool isCreation) noexcept;
+void MacroDetector_OnImageLoad(std::uint32_t pid, const std::wstring& imagePath,
+                               std::uintptr_t imageBase, std::size_t imageSize) noexcept;
+void AMSIIntegration_OnProcessNotify(std::uint32_t pid, std::uint32_t parentPid,
+                                     const std::wstring& imagePath,
+                                     const std::wstring& commandLine,
+                                     bool isCreation) noexcept;
+void AMSIIntegration_OnImageLoad(std::uint32_t pid, const std::wstring& imagePath,
+                                 std::uintptr_t imageBase, std::size_t imageSize) noexcept;
+void PythonScriptScanner_OnProcessNotify(std::uint32_t pid, std::uint32_t parentPid,
+                                         const std::wstring& imagePath,
+                                         const std::wstring& commandLine,
+                                         bool isCreation) noexcept;
+void PythonScriptScanner_OnImageLoad(std::uint32_t pid, const std::wstring& imagePath,
+                                     std::uintptr_t imageBase, std::size_t imageSize) noexcept;
+void VBScriptScanner_OnProcessNotify(std::uint32_t pid, std::uint32_t parentPid,
+                                     const std::wstring& imagePath,
+                                     const std::wstring& commandLine,
+                                     bool isCreation) noexcept;
+void VBScriptScanner_OnImageLoad(std::uint32_t pid, const std::wstring& imagePath,
+                                 std::uintptr_t imageBase, std::size_t imageSize) noexcept;
 
 }  // namespace ShadowStrike::Scripts::Wiring::Internal
 
@@ -169,6 +213,99 @@ bool DispatchFileScan(std::uint32_t pid,
     }
 
     return false;
+}
+
+// ===========================================================================
+// PROCESS-NOTIFY AND IMAGE-LOAD FAN-OUT (task 177)
+// ===========================================================================
+//
+// One table per event. Each entry pairs a ScriptModule tag with the module's
+// uniform-signature shim from <Module>Wire.cpp. Every shim is noexcept and
+// shields its module, so one misbehaving module cannot stop the rest or take
+// down the off-thread worker. See ScriptsWiring.hpp for why this restores
+// detection and telemetry, NOT enforcement, and where each dispatch runs.
+//
+// THE PIN. The size static_assert catches a module added to the enum but not a
+// table (or a table entry for a module not in the enum). It does NOT catch a
+// table that duplicates one module and drops another, because the count stays
+// right while coverage is wrong - so the FanOutCoverage accessors expose the
+// real coverage and a unit test asserts it equals kScriptFanOutCoverageAll.
+
+namespace {
+
+using Detail::ScriptModule;
+
+using ScriptProcessNotifyFn = void (*)(std::uint32_t, std::uint32_t,
+                                       const std::wstring&, const std::wstring&,
+                                       bool) noexcept;
+using ScriptImageLoadFn = void (*)(std::uint32_t, const std::wstring&,
+                                   std::uintptr_t, std::size_t) noexcept;
+
+struct ProcessNotifyEntry { ScriptModule module; ScriptProcessNotifyFn fn; };
+struct ImageLoadEntry     { ScriptModule module; ScriptImageLoadFn fn; };
+
+constexpr ProcessNotifyEntry kProcessNotifyFanOut[] = {
+    { ScriptModule::PowerShell, &Internal::PowerShellScanner_OnProcessNotify },
+    { ScriptModule::JavaScript, &Internal::JavaScriptScanner_OnProcessNotify },
+    { ScriptModule::Macro,      &Internal::MacroDetector_OnProcessNotify },
+    { ScriptModule::Amsi,       &Internal::AMSIIntegration_OnProcessNotify },
+    { ScriptModule::Python,     &Internal::PythonScriptScanner_OnProcessNotify },
+    { ScriptModule::VBScript,   &Internal::VBScriptScanner_OnProcessNotify },
+};
+static_assert(std::size(kProcessNotifyFanOut) == Detail::kScriptFanOutModuleCount,
+              "every script module must appear in the process-notify fan-out exactly once");
+
+constexpr ImageLoadEntry kImageLoadFanOut[] = {
+    { ScriptModule::PowerShell, &Internal::PowerShellScanner_OnImageLoad },
+    { ScriptModule::JavaScript, &Internal::JavaScriptScanner_OnImageLoad },
+    { ScriptModule::Macro,      &Internal::MacroDetector_OnImageLoad },
+    { ScriptModule::Amsi,       &Internal::AMSIIntegration_OnImageLoad },
+    { ScriptModule::Python,     &Internal::PythonScriptScanner_OnImageLoad },
+    { ScriptModule::VBScript,   &Internal::VBScriptScanner_OnImageLoad },
+};
+static_assert(std::size(kImageLoadFanOut) == Detail::kScriptFanOutModuleCount,
+              "every script module must appear in the image-load fan-out exactly once");
+
+[[nodiscard]] std::uint32_t CoverageOf(const ProcessNotifyEntry (&table)[Detail::kScriptFanOutModuleCount]) noexcept {
+    std::uint32_t mask = 0;
+    for (const auto& e : table) mask |= (std::uint32_t{1} << static_cast<unsigned>(e.module));
+    return mask;
+}
+[[nodiscard]] std::uint32_t CoverageOf(const ImageLoadEntry (&table)[Detail::kScriptFanOutModuleCount]) noexcept {
+    std::uint32_t mask = 0;
+    for (const auto& e : table) mask |= (std::uint32_t{1} << static_cast<unsigned>(e.module));
+    return mask;
+}
+
+}  // namespace
+
+void DispatchProcessNotify(std::uint32_t pid,
+                           std::uint32_t parentPid,
+                           const std::wstring& imagePath,
+                           const std::wstring& commandLine,
+                           bool isCreation) noexcept {
+    SS_DIAG_SCOPE("ScriptFanOut", isCreation ? "procnotify-create" : "procnotify-exit");
+    for (const auto& entry : kProcessNotifyFanOut) {
+        entry.fn(pid, parentPid, imagePath, commandLine, isCreation);
+    }
+}
+
+void DispatchImageLoad(std::uint32_t pid,
+                       const std::wstring& imagePath,
+                       std::uintptr_t imageBase,
+                       std::size_t imageSize) noexcept {
+    SS_DIAG_SCOPE("ScriptFanOut", "imageload");
+    for (const auto& entry : kImageLoadFanOut) {
+        entry.fn(pid, imagePath, imageBase, imageSize);
+    }
+}
+
+std::uint32_t ProcessNotifyFanOutCoverage() noexcept {
+    return CoverageOf(kProcessNotifyFanOut);
+}
+
+std::uint32_t ImageLoadFanOutCoverage() noexcept {
+    return CoverageOf(kImageLoadFanOut);
 }
 
 }  // namespace ShadowStrike::Scripts::Wiring

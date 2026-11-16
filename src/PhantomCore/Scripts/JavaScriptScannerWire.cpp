@@ -51,4 +51,33 @@ bool JavaScriptScanner_ScanFile(const std::wstring& filePath,
     return false;
 }
 
+// Task 177 process-notify / image-load fan-out. Uniform signature across all six
+// modules so ScriptsWiring can hold them in one table; JavaScriptScanner keys on
+// the command line and ignores parentPid.
+void JavaScriptScanner_OnProcessNotify(std::uint32_t pid,
+                                       std::uint32_t parentPid,
+                                       const std::wstring& imagePath,
+                                       const std::wstring& commandLine,
+                                       bool isCreation) noexcept {
+    (void)parentPid;
+    try {
+        JavaScriptScanner::Instance().OnKernelProcessNotify(
+            pid, imagePath, commandLine, isCreation);
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("ScriptsWiring: JS OnKernelProcessNotify exception: {}", e.what());
+    } catch (...) {}
+}
+
+void JavaScriptScanner_OnImageLoad(std::uint32_t pid,
+                                   const std::wstring& imagePath,
+                                   std::uintptr_t imageBase,
+                                   std::size_t imageSize) noexcept {
+    try {
+        JavaScriptScanner::Instance().OnKernelImageLoad(
+            pid, imagePath, static_cast<std::uint64_t>(imageBase), imageSize);
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("ScriptsWiring: JS OnKernelImageLoad exception: {}", e.what());
+    } catch (...) {}
+}
+
 }  // namespace ShadowStrike::Scripts::Wiring::Internal

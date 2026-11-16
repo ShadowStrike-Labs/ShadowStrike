@@ -3261,6 +3261,17 @@ public:
                 Ransomware::Wiring::DispatchProcessNotify(
                     ev.pid, ev.parentPid, ev.imagePath, ev.commandLine, ev.isCreation);
             }
+            // Script-scanner fan-out (task 177) rides the same off-thread worker:
+            // six script detectors (PowerShell/JavaScript/Macro/AMSI/Python/
+            // VBScript) see every process create and exit. Detection and telemetry
+            // only - their block requests go through the broken 158/175 transport,
+            // which the kernel discards.
+            {
+                SS_DIAG_SCOPE("ProcNotify", ev.isCreation ? "script-fanout-create"
+                                                          : "script-fanout-exit");
+                Scripts::Wiring::DispatchProcessNotify(
+                    ev.pid, ev.parentPid, ev.imagePath, ev.commandLine, ev.isCreation);
+            }
         }
         // ON STOP, DO NOT DRAIN - mirror the deferred deep-scan worker. Events
         // still queued at the shutdown instant are dropped. Under normal load this
@@ -6298,6 +6309,16 @@ public:
         // known dropper payloads and update per-process attribution state.
         // =====================================================================
         Ransomware::Wiring::DispatchImageLoad(
+            req.processId, imagePath,
+            static_cast<std::uintptr_t>(req.imageBase),
+            static_cast<std::size_t>(req.imageSize));
+
+        // Script-scanner image-load fan-out (task 177). Runs inline, unlike the
+        // process-notify fan-out: the image-load handler is notification-only (no
+        // kernel reply to block on), and the six modules' image-load handlers are
+        // lightweight name checks (amsi.dll, the PowerShell runtime DLLs, Office
+        // runtime DLLs, JS engines). Detection and telemetry only.
+        Scripts::Wiring::DispatchImageLoad(
             req.processId, imagePath,
             static_cast<std::uintptr_t>(req.imageBase),
             static_cast<std::size_t>(req.imageSize));

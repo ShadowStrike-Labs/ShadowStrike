@@ -62,4 +62,33 @@ bool VBScriptScanner_ScanFile(const std::wstring& filePath,
     return false;
 }
 
+// Task 177 process-notify / image-load fan-out. VBScriptScanner keys on the host
+// image and the parent pid and does not take a command line or an image size, so
+// those uniform-signature arguments are unused here.
+void VBScriptScanner_OnProcessNotify(std::uint32_t pid,
+                                     std::uint32_t parentPid,
+                                     const std::wstring& imagePath,
+                                     const std::wstring& commandLine,
+                                     bool isCreation) noexcept {
+    (void)commandLine;
+    try {
+        VBScriptScanner::Instance().OnKernelProcessNotify(
+            pid, parentPid, imagePath, isCreation);
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("ScriptsWiring: VBS OnKernelProcessNotify exception: {}", e.what());
+    } catch (...) {}
+}
+
+void VBScriptScanner_OnImageLoad(std::uint32_t pid,
+                                 const std::wstring& imagePath,
+                                 std::uintptr_t imageBase,
+                                 std::size_t imageSize) noexcept {
+    (void)imageSize;
+    try {
+        VBScriptScanner::Instance().OnKernelImageLoad(pid, imagePath, imageBase);
+    } catch (const std::exception& e) {
+        Utils::Logger::Warn("ScriptsWiring: VBS OnKernelImageLoad exception: {}", e.what());
+    } catch (...) {}
+}
+
 }  // namespace ShadowStrike::Scripts::Wiring::Internal

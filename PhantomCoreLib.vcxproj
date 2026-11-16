@@ -281,11 +281,13 @@
     <ClCompile Include="src\PhantomCore\RealTime\ProcessCreationMonitor.cpp" />
     <ClCompile Include="src\PhantomCore\RealTime\ZeroHourProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\AMSIIntegration.cpp" />
+    <ClCompile Include="src\PhantomCore\Scripts\AMSIIntegrationWire.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\JavaScriptScanner.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\JavaScriptScannerWire.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\MacroDetector.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\MacroDetectorWire.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\PowerShellScanner.cpp" />
+    <ClCompile Include="src\PhantomCore\Scripts\PowerShellScannerWire.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\PythonScriptScanner.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\PythonScriptScannerWire.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\ScriptsWiring.cpp" />
