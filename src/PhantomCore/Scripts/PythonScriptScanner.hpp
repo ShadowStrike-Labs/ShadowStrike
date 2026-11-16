@@ -478,6 +478,12 @@ struct PythonScanResult {
     
     /// @brief Is malicious
     bool isMalicious = false;
+
+    /// @brief Originating process id: the process that wrote or owns the
+    ///        scanned content. 0 when unknown (file-backed or service-side
+    ///        scans). Task 180: carried so a detection names the writing process
+    ///        and can be correlated with a process-creation event.
+    std::uint32_t processId = 0;
     
     /// @brief Threat category
     PythonThreatCategory category = PythonThreatCategory::None;
@@ -684,7 +690,8 @@ public:
      * @post No script body is written to logs; file content is bounded by configuration before analysis.
      * @thread_safety Thread-safe. Configuration is snapshotted under a shared lock.
      */
-    [[nodiscard]] PythonScanResult ScanFile(const std::filesystem::path& path);
+    [[nodiscard]] PythonScanResult ScanFile(const std::filesystem::path& path,
+                                            std::uint32_t processId = 0);
     
     /**
      * @brief Scan an in-memory Python source buffer.
@@ -695,7 +702,8 @@ public:
      */
     [[nodiscard]] PythonScanResult ScanSource(
         std::string_view source,
-        const std::string& sourceName = "memory.py");
+        const std::string& sourceName = "memory.py",
+        std::uint32_t processId = 0);
     
     /**
      * @brief Scan a packed Python executable or Python-native binary artifact.
@@ -704,7 +712,8 @@ public:
      * @pre Path validation is enforced before file I/O.
      */
     [[nodiscard]] PythonScanResult ScanPyInstallerExe(
-        const std::filesystem::path& exePath);
+        const std::filesystem::path& exePath,
+        std::uint32_t processId = 0);
     
     /**
      * @brief Scan Python bytecode (.pyc/.pyo) without executing or unmarshalling code objects.
@@ -713,7 +722,8 @@ public:
      * @pre Path validation and configured size limits are enforced before reading.
      */
     [[nodiscard]] PythonScanResult ScanBytecode(
-        const std::filesystem::path& pycPath);
+        const std::filesystem::path& pycPath,
+        std::uint32_t processId = 0);
 
     // ========================================================================
     // ANALYSIS

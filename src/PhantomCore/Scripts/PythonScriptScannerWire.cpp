@@ -58,7 +58,8 @@ void PythonScriptScanner_Shutdown() noexcept {
 }
 
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
-                                  const std::wstring& lowerExt) noexcept {
+                                  const std::wstring& lowerExt,
+                                  std::uint32_t pid) noexcept {
     try {
         if (!IsValidWirePath(filePath)) {
             Utils::Logger::Warn("ScriptsWiring: rejected invalid Python scan path");
@@ -67,9 +68,9 @@ bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
         std::filesystem::path p{filePath};
         PythonScanResult result{};
         if (lowerExt == L".pyc" || lowerExt == L".pyo") {
-            result = PythonScriptScanner::Instance().ScanBytecode(p);
+            result = PythonScriptScanner::Instance().ScanBytecode(p, pid);
         } else {
-            result = PythonScriptScanner::Instance().ScanFile(p);
+            result = PythonScriptScanner::Instance().ScanFile(p, pid);
         }
         return result.isMalicious;
     } catch (const std::exception& e) {

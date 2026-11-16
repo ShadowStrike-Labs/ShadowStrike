@@ -569,10 +569,14 @@ public:
     [[nodiscard]] PythonScannerConfiguration GetConfiguration() const;
 
     // Scanning
-    [[nodiscard]] PythonScanResult ScanFile(const std::filesystem::path& path);
-    [[nodiscard]] PythonScanResult ScanSource(std::string_view source, const std::string& sourceName);
-    [[nodiscard]] PythonScanResult ScanPyInstallerExe(const std::filesystem::path& exePath);
-    [[nodiscard]] PythonScanResult ScanBytecode(const std::filesystem::path& pycPath);
+    [[nodiscard]] PythonScanResult ScanFile(const std::filesystem::path& path,
+                                            std::uint32_t processId = 0);
+    [[nodiscard]] PythonScanResult ScanSource(std::string_view source, const std::string& sourceName,
+                                              std::uint32_t processId = 0);
+    [[nodiscard]] PythonScanResult ScanPyInstallerExe(const std::filesystem::path& exePath,
+                                                      std::uint32_t processId = 0);
+    [[nodiscard]] PythonScanResult ScanBytecode(const std::filesystem::path& pycPath,
+                                                std::uint32_t processId = 0);
 
     // Analysis
     [[nodiscard]] PythonArtifactType DetectArtifactType(const std::filesystem::path& path);
@@ -599,7 +603,8 @@ private:
 
     [[nodiscard]] PythonScanResult AnalyzeSource(std::string_view source,
                                                   const std::string& sourceName,
-                                                  PythonArtifactType artifactType);
+                                                  PythonArtifactType artifactType,
+                                                  std::uint32_t processId = 0);
 
     [[nodiscard]] int CalculateRiskScore(const PythonScanResult& result);
     [[nodiscard]] PythonThreatCategory ClassifyThreat(const PythonScanResult& result);
@@ -989,10 +994,11 @@ void PythonScriptScannerImpl::Shutdown() {
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScannerImpl::ScanFile(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path, std::uint32_t processId) {
 
     PythonScanResult result;
     result.filePath = path;
+    result.processId = processId;  // Task 180: carried even on early error paths
     result.scanTime = std::chrono::system_clock::now();
     auto startTime = Clock::now();
 
@@ -1090,14 +1096,14 @@ void PythonScriptScannerImpl::Shutdown() {
             case PythonArtifactType::SourcePy:
             case PythonArtifactType::Notebook: {
                 std::string source(reinterpret_cast<const char*>(content.data()), content.size());
-                result = AnalyzeSource(source, path.filename().string(), detectedType);
+                result = AnalyzeSource(source, path.filename().string(), detectedType, processId);
                 m_stats.sourceFilesScanned.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
 
             case PythonArtifactType::BytecodePyc:
             case PythonArtifactType::OptimizedPyo: {
-                result = ScanBytecode(path);
+                result = ScanBytecode(path, processId);
                 m_stats.bytecodeFilesScanned.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
@@ -1107,14 +1113,14 @@ void PythonScriptScannerImpl::Shutdown() {
             case PythonArtifactType::PackedNuitka:
             case PythonArtifactType::PackedPy2Exe:
             case PythonArtifactType::PackedBBFreeze: {
-                result = ScanPyInstallerExe(path);
+                result = ScanPyInstallerExe(path, processId);
                 m_stats.packedExecutablesScanned.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
 
             default: {
                 std::string source(reinterpret_cast<const char*>(content.data()), content.size());
-                result = AnalyzeSource(source, path.filename().string(), PythonArtifactType::SourcePy);
+                result = AnalyzeSource(source, path.filename().string(), PythonArtifactType::SourcePy, processId);
                 break;
             }
         }
@@ -1166,7 +1172,8 @@ void PythonScriptScannerImpl::Shutdown() {
 
 [[nodiscard]] PythonScanResult PythonScriptScannerImpl::ScanSource(
     std::string_view source,
-    const std::string& sourceName) {
+    const std::string& sourceName,
+    std::uint32_t processId) {
 
     auto startTime = Clock::now();
 
@@ -1191,7 +1198,7 @@ void PythonScriptScannerImpl::Shutdown() {
         return result;
     }
 
-    PythonScanResult result = AnalyzeSource(source, sourceName, PythonArtifactType::SourcePy);
+    PythonScanResult result = AnalyzeSource(source, sourceName, PythonArtifactType::SourcePy, processId);
 
     auto endTime = Clock::now();
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
@@ -1219,10 +1226,11 @@ void PythonScriptScannerImpl::Shutdown() {
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScannerImpl::ScanPyInstallerExe(
-    const std::filesystem::path& exePath) {
+    const std::filesystem::path& exePath, std::uint32_t processId) {
 
     PythonScanResult result;
     result.filePath = exePath;
+    result.processId = processId;  // Task 180
     result.scanTime = std::chrono::system_clock::now();
     result.artifactType = PythonArtifactType::PackedPyInstaller;
 
@@ -1283,7 +1291,8 @@ void PythonScriptScannerImpl::Shutdown() {
             PythonScanResult sourceResult = AnalyzeSource(
                 packedInfo->extractedSource,
                 packedInfo->entryScript,
-                PythonArtifactType::SourcePy
+                PythonArtifactType::SourcePy,
+                processId
             );
 
             // Merge results
@@ -1323,10 +1332,11 @@ void PythonScriptScannerImpl::Shutdown() {
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScannerImpl::ScanBytecode(
-    const std::filesystem::path& pycPath) {
+    const std::filesystem::path& pycPath, std::uint32_t processId) {
 
     PythonScanResult result;
     result.filePath = pycPath;
+    result.processId = processId;  // Task 180
     result.scanTime = std::chrono::system_clock::now();
     result.artifactType = PythonArtifactType::BytecodePyc;
 
@@ -1400,7 +1410,8 @@ void PythonScriptScannerImpl::Shutdown() {
             PythonScanResult sourceResult = AnalyzeSource(
                 *decompiledSource,
                 pycPath.filename().string(),
-                PythonArtifactType::BytecodePyc
+                PythonArtifactType::BytecodePyc,
+                processId
             );
 
             // Merge results
@@ -1437,7 +1448,7 @@ void PythonScriptScannerImpl::Shutdown() {
         PythonScanResult stringsResult = AnalyzeSource(
             bytecodeStrings,
             pycPath.filename().string(),
-            PythonArtifactType::BytecodePyc);
+            PythonArtifactType::BytecodePyc, processId);
         if (stringsResult.riskScore > result.riskScore) {
             result.status = stringsResult.status;
             result.isMalicious = stringsResult.isMalicious;
@@ -1990,12 +2001,16 @@ void PythonScriptScannerImpl::ResetStatistics() {
 [[nodiscard]] PythonScanResult PythonScriptScannerImpl::AnalyzeSource(
     std::string_view source,
     const std::string& sourceName,
-    PythonArtifactType artifactType) {
+    PythonArtifactType artifactType,
+    std::uint32_t processId) {
 
     PythonScanResult result;
     result.scanTime = std::chrono::system_clock::now();
     result.artifactType = artifactType;
     result.fileSize = source.size();
+    // Task 180: stamp the writing process before any analysis so every exit path
+    // and the raised alert carry it. 0 means unknown.
+    result.processId = processId;
 
     if (source.empty()) {
         result.status = PythonScanStatus::Clean;
@@ -2090,7 +2105,8 @@ void PythonScriptScannerImpl::ResetStatistics() {
                     " family=" + familyStr +
                     " suspiciousImports=" + std::to_string(result.suspiciousImports.size()) +
                     " matchedSigs=" + std::to_string(result.matchedSignatures.size()) +
-                    " obfuscated=" + (obfusc ? "true" : "false");
+                    " obfuscated=" + (obfusc ? "true" : "false") +
+                    " pid=" + std::to_string(result.processId);
 
                 [[maybe_unused]] auto alertId =
                     Communication::AlertSystem::Instance().RaiseAlert(
@@ -2756,24 +2772,25 @@ void PythonScriptScanner::Shutdown() {
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScanner::ScanFile(
-    const std::filesystem::path& path) {
-    return m_impl->ScanFile(path);
+    const std::filesystem::path& path, std::uint32_t processId) {
+    return m_impl->ScanFile(path, processId);
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScanner::ScanSource(
     std::string_view source,
-    const std::string& sourceName) {
-    return m_impl->ScanSource(source, sourceName);
+    const std::string& sourceName,
+    std::uint32_t processId) {
+    return m_impl->ScanSource(source, sourceName, processId);
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScanner::ScanPyInstallerExe(
-    const std::filesystem::path& exePath) {
-    return m_impl->ScanPyInstallerExe(exePath);
+    const std::filesystem::path& exePath, std::uint32_t processId) {
+    return m_impl->ScanPyInstallerExe(exePath, processId);
 }
 
 [[nodiscard]] PythonScanResult PythonScriptScanner::ScanBytecode(
-    const std::filesystem::path& pycPath) {
-    return m_impl->ScanBytecode(pycPath);
+    const std::filesystem::path& pycPath, std::uint32_t processId) {
+    return m_impl->ScanBytecode(pycPath, processId);
 }
 
 [[nodiscard]] PythonArtifactType PythonScriptScanner::DetectArtifactType(

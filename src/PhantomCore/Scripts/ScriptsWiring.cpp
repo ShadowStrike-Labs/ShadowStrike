@@ -42,7 +42,8 @@ bool VBScriptScanner_ScanFile(const std::wstring& filePath,
                               const std::wstring& lowerExt,
                               std::uint32_t pid) noexcept;
 bool PythonScriptScanner_ScanFile(const std::wstring& filePath,
-                                  const std::wstring& lowerExt) noexcept;
+                                  const std::wstring& lowerExt,
+                                  std::uint32_t pid) noexcept;
 bool MacroDetector_ScanDocument(const std::wstring& filePath) noexcept;
 
 // Task 177 kernel event fan-out, uniform signature per (module, event) so one
@@ -194,12 +195,13 @@ bool DispatchFileScan(std::uint32_t pid,
         return VBScriptScanner_ScanFile(filePath, ext, pid);
     }
 
-    // Python scripts / bytecode / wheels / eggs.
+    // Python scripts / bytecode / wheels / eggs. The originating process is
+    // forwarded (task 180) so a detection names the process that wrote the file.
     // T3: Add .whl/.egg/.pyd routing as scanner handles them
     if (ext == L".py" || ext == L".pyw" ||
         ext == L".pyc" || ext == L".pyo" || ext == L".pyz" ||
         ext == L".whl" || ext == L".egg" || ext == L".pyd") {
-        return PythonScriptScanner_ScanFile(filePath, ext);
+        return PythonScriptScanner_ScanFile(filePath, ext, pid);
     }
 
     // Microsoft Office macros (legacy + OpenXML + macro-enabled variants).

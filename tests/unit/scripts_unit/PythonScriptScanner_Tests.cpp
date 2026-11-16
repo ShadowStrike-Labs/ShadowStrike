@@ -338,4 +338,31 @@ TEST_F(PythonScriptScannerTest, RepeatedInitializePreservesExistingConfiguration
     EXPECT_TRUE(effectiveConfig.blockObfuscatedScripts);
 }
 
+// Task 180: a detection must name the process that wrote the script. The pid is
+// stamped before analysis, so it holds for any verdict and both scan entries.
+TEST_F(PythonScriptScannerTest, AScanStampsTheWritingProcessOnTheResult) {
+    auto& scanner = PythonScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+
+    constexpr std::uint32_t kWriter = 4321u;
+    const auto viaSource = scanner.ScanSource("print('hi')", "sample.py", kWriter);
+    EXPECT_EQ(kWriter, viaSource.processId);
+
+    // Default stays 0 (unknown) for a content or service-side scan.
+    const auto viaSourceNoPid = scanner.ScanSource("print('hi')", "sample.py");
+    EXPECT_EQ(0u, viaSourceNoPid.processId);
+}
+
+TEST_F(PythonScriptScannerTest, AFileScanCarriesTheWritingProcess) {
+    auto& scanner = PythonScriptScanner::Instance();
+    ASSERT_TRUE(scanner.Initialize());
+
+    const std::string src = "print('hi')";
+    const ScopedTestFile file(L"ss_py_180.py",
+        std::vector<uint8_t>(src.begin(), src.end()));
+    constexpr std::uint32_t kWriter = 7777u;
+    const auto result = scanner.ScanFile(file.path(), kWriter);
+    EXPECT_EQ(kWriter, result.processId);
+}
+
 }  // namespace ShadowStrike::Scripts::Test
