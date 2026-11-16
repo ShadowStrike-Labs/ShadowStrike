@@ -252,33 +252,46 @@ function Get-PhantomGuestBootTime {
 }
 
 function Restart-PhantomGuest {
-    <# Restarts Windows inside the guest and waits until it has really rebooted. #>
+    <#
+        Reboots the guest by a HOST POWER-CYCLE (graceful stop, then start), not an
+        in-guest 'shutdown /r' and not 'vmrun reset'. On this guest VMware Tools does
+        not re-establish its vmrun guest-exec channel after any warm reboot (in-guest
+        or reset), but a full cold power-cycle always brings the channel back - proven
+        across the 1.0.134..1.0.137 runs (task 390). That lets the soak/collect phases
+        run in-line instead of needing a separate cold-boot grab.
+
+        The stop is graceful so a first-run signature-DB seed can flush; a hard stop
+        mid-seed can tear signatures.sdb (task 389). A hard stop is only a bounded
+        last resort, and task 389's checksum verify would reseed a torn DB anyway.
+    #>
     param([int]$TimeoutSec = 900)
     $before = Get-PhantomGuestBootTime
-    Write-VmLog "Restarting guest Windows (booted $($before.ToString('HH:mm:ss')) UTC)"
-    # Primary: shutdown.exe started through the cmd-wrapped guest script path,
-    # which is the launch path proven to work on this guest. Fallbacks only if
-    # the guest is still on the same boot after two minutes.
-    [void](Invoke-PhantomGuestScript -TimeoutSec 60 -AllowFailure -Script 'shutdown.exe /r /t 3 /f /d p:4:1')
+    Write-VmLog "Power-cycling guest (booted $($before.ToString('HH:mm:ss')) UTC)"
+
+    # 1. Graceful stop, bounded. Hard stop only if the guest will not power off.
+    try { Stop-PhantomVm } catch { Write-VmLog "graceful stop: $($_.Exception.Message)" }
+    $stopDeadline = [DateTime]::UtcNow.AddSeconds(240)
+    while ((Test-PhantomVmRunning) -and [DateTime]::UtcNow -lt $stopDeadline) { Start-Sleep -Seconds 5 }
+    if (Test-PhantomVmRunning) {
+        Write-VmLog 'Guest still running after the graceful-stop window - hard stop'
+        try { Stop-PhantomVm -Hard } catch { Write-VmLog "hard stop: $($_.Exception.Message)" }
+        $hardDeadline = [DateTime]::UtcNow.AddSeconds(120)
+        while ((Test-PhantomVmRunning) -and [DateTime]::UtcNow -lt $hardDeadline) { Start-Sleep -Seconds 5 }
+    }
+    if (Test-PhantomVmRunning) { throw "Guest did not power off within the stop window" }
+
+    # 2. Cold boot, then wait for a working guest-exec channel and a new boot time.
+    Start-PhantomVm
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
-    $fallbacks = [System.Collections.Generic.Queue[string]]::new([string[]]@('soft', 'hard'))
-    $nextFallback = [DateTime]::UtcNow.AddSeconds(120)
-    Start-Sleep -Seconds 20
     while ([DateTime]::UtcNow -lt $deadline) {
         try {
             Wait-PhantomVmGuest -TimeoutSec 60
             $now = Get-PhantomGuestBootTime
             if ($now -gt $before.AddSeconds(5)) { Write-VmLog "Guest back up (booted $($now.ToString('HH:mm:ss')) UTC)"; return }
         } catch { }
-        if ([DateTime]::UtcNow -gt $nextFallback -and $fallbacks.Count -gt 0) {
-            $mode = $fallbacks.Dequeue()
-            Write-VmLog "Guest has not restarted yet - vmrun reset $mode"
-            [void](Invoke-Vmrun -Command reset -Arguments @($mode) -TimeoutSec 300)
-            $nextFallback = [DateTime]::UtcNow.AddSeconds(120)
-        }
         Start-Sleep -Seconds 5
     }
-    throw "Guest did not come back from restart within $TimeoutSec s"
+    throw "Guest did not come back from power-cycle within $TimeoutSec s"
 }
 
 Export-ModuleMember -Function Initialize-PhantomVm, Invoke-Vmrun, Test-PhantomVmRunning, Restore-PhantomVmSnapshot,
