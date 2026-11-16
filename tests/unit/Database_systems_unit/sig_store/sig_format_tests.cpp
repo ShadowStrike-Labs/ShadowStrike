@@ -45,11 +45,14 @@
 
 #include <gtest/gtest.h>
 #include "PhantomCore/SignatureStore/SignatureFormat.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <array>
 #include <cstring>
+#include <cstddef>
+#include <vector>
 
 using namespace ShadowStrike::SignatureStore;
 namespace fs = std::filesystem;
@@ -1044,6 +1047,94 @@ TEST(ThreatLevelTest, ValuesAreCorrect) {
     EXPECT_EQ(static_cast<uint8_t>(ThreatLevel::Medium), 50);
     EXPECT_EQ(static_cast<uint8_t>(ThreatLevel::High), 75);
     EXPECT_EQ(static_cast<uint8_t>(ThreatLevel::Critical), 100);
+}
+
+// ============================================================================
+// WHOLE-DATABASE CHECKSUM VERIFICATION (task 389)
+// ============================================================================
+//
+// VerifyDatabaseChecksum reproduces the builder's domain - the 32-byte checksum field
+// zeroed, the entire database SHA-256'd - and compares to the stored value. These cases
+// build a synthetic database, stamp its checksum with a one-shot hash over a
+// field-zeroed copy (an independent path from the function's chunked incremental hash,
+// so the two must agree), and then check the accept/reject behaviour.
+
+namespace {
+
+constexpr size_t kCsOffset = offsetof(SignatureDatabaseHeader, sha256Checksum);
+constexpr size_t kCsSize = 32u;
+
+// One-shot SHA-256 over the buffer with the checksum field zeroed - the reference the
+// function's incremental three-part hash must match.
+std::array<uint8_t, 32> ReferenceChecksum(std::vector<uint8_t> buf) {
+    for (size_t i = 0; i < kCsSize; ++i) buf[kCsOffset + i] = 0u;
+    ShadowStrike::Utils::HashUtils::Hasher h(ShadowStrike::Utils::HashUtils::Algorithm::SHA256);
+    EXPECT_TRUE(h.Init());
+    EXPECT_TRUE(h.Update(buf.data(), buf.size()));
+    std::vector<uint8_t> d;
+    EXPECT_TRUE(h.Final(d));
+    EXPECT_EQ(d.size(), kCsSize);
+    std::array<uint8_t, 32> out{};
+    std::copy_n(d.begin(), kCsSize, out.begin());
+    return out;
+}
+
+// A synthetic, internally-consistent database: valid header fields, non-zero body so a
+// flipped byte is meaningful, and a correctly stamped checksum.
+std::vector<uint8_t> MakeChecksummedDb(size_t size = 3u * 4096u) {
+    std::vector<uint8_t> buf(size, 0u);
+    auto* h = reinterpret_cast<SignatureDatabaseHeader*>(buf.data());
+    h->magic = SIGNATURE_DB_MAGIC;
+    h->versionMajor = SIGNATURE_DB_VERSION_MAJOR;
+    for (size_t i = sizeof(SignatureDatabaseHeader); i < size; ++i) {
+        buf[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
+    }
+    const auto cs = ReferenceChecksum(buf);
+    std::copy(cs.begin(), cs.end(), h->sha256Checksum.begin());
+    return buf;
+}
+
+}  // namespace
+
+TEST(SignatureFormatChecksumTest, VerifiesAnIntactDatabase) {
+    const auto buf = MakeChecksummedDb();
+    EXPECT_TRUE(Format::VerifyDatabaseChecksum(buf.data(), buf.size()))
+        << "the function's chunked incremental hash disagreed with the one-shot reference";
+}
+
+TEST(SignatureFormatChecksumTest, RejectsAFlippedByteInTheBody) {
+    auto buf = MakeChecksummedDb();
+    buf[sizeof(SignatureDatabaseHeader) + 101u] ^= 0xFFu;
+    EXPECT_FALSE(Format::VerifyDatabaseChecksum(buf.data(), buf.size()))
+        << "a corrupted database body was accepted - a torn database would reach libyara";
+}
+
+TEST(SignatureFormatChecksumTest, RejectsAFlippedByteInTheHeader) {
+    auto buf = MakeChecksummedDb();
+    buf[8] ^= 0xFFu;  // inside databaseUuid, outside the checksum field
+    EXPECT_FALSE(Format::VerifyDatabaseChecksum(buf.data(), buf.size()));
+}
+
+TEST(SignatureFormatChecksumTest, AFlipInsideTheChecksumFieldIsNotTheBodyAndStillRejects) {
+    // Corrupting the stored checksum itself must also fail (unless it zeroes the whole
+    // field, which is the unfinalized case tested separately).
+    auto buf = MakeChecksummedDb();
+    buf[kCsOffset] ^= 0x01u;
+    EXPECT_FALSE(Format::VerifyDatabaseChecksum(buf.data(), buf.size()));
+}
+
+TEST(SignatureFormatChecksumTest, SkipsAnUnfinalizedAllZeroChecksum) {
+    auto buf = MakeChecksummedDb();
+    std::fill_n(buf.begin() + static_cast<std::ptrdiff_t>(kCsOffset), kCsSize, uint8_t{0});
+    EXPECT_TRUE(Format::VerifyDatabaseChecksum(buf.data(), buf.size()))
+        << "an all-zero checksum means the database was never finalized and must not be "
+           "treated as corrupt";
+}
+
+TEST(SignatureFormatChecksumTest, RejectsNullOrTooSmall) {
+    EXPECT_FALSE(Format::VerifyDatabaseChecksum(nullptr, 100000u));
+    std::vector<uint8_t> tiny(16u, 0u);
+    EXPECT_FALSE(Format::VerifyDatabaseChecksum(tiny.data(), tiny.size()));
 }
 
 // ============================================================================

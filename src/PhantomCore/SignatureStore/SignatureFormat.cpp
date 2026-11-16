@@ -34,11 +34,13 @@
 #include "SignatureFormat.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/FileUtils.hpp"   // GetContentLocality: a cloud placeholder cannot be mapped
+#include "../Utils/HashUtils.hpp"   // Hasher: whole-database checksum verification (task 389)
 
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <vector>
 #include <cwchar>
 #include <charconv>
 #include <cstdint>   // For SIZE_MAX and standard integer limits
@@ -406,6 +408,77 @@ namespace Format {
         SS_LOG_DEBUG(L"SignatureStore", L"Header validation passed");
         return true;
     }
+
+
+// ============================================================================
+// WHOLE-DATABASE CHECKSUM VERIFICATION (task 389)
+// ============================================================================
+
+bool VerifyDatabaseChecksum(const uint8_t* base, uint64_t fileSize) noexcept {
+    if (base == nullptr || fileSize < sizeof(SignatureDatabaseHeader)) {
+        return false;
+    }
+    const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(base);
+
+    constexpr size_t kChecksumOffset = offsetof(SignatureDatabaseHeader, sha256Checksum);
+    constexpr size_t kChecksumSize   = 32u;
+    static_assert(kChecksumOffset + kChecksumSize <= sizeof(SignatureDatabaseHeader),
+                  "checksum field must lie within the header");
+
+    // An all-zero stored checksum means the database was never finalized; there is
+    // nothing to verify against, so do not treat it as corrupt (matches the whitelist
+    // and threat-intel stores).
+    bool storedAllZero = true;
+    for (size_t i = 0; i < kChecksumSize; ++i) {
+        if (header->sha256Checksum[i] != 0u) { storedAllZero = false; break; }
+    }
+    if (storedAllZero) {
+        return true;
+    }
+
+    Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+    if (!hasher.Init()) {
+        SS_LOG_ERROR(L"SignatureStore", L"VerifyDatabaseChecksum: hasher init failed");
+        return false;
+    }
+
+    // Reproduce the builder's domain: [0, checksumOffset), then 32 zero bytes in place
+    // of the field (as the builder zeroed it before hashing), then the remainder fed in
+    // bounded chunks so a 64 MB database is not copied.
+    static constexpr uint8_t kZeroField[kChecksumSize] = {};
+    if (!hasher.Update(base, kChecksumOffset) ||
+        !hasher.Update(kZeroField, kChecksumSize)) {
+        return false;
+    }
+    uint64_t offset = kChecksumOffset + kChecksumSize;
+    constexpr uint64_t kChunk = 1024ull * 1024ull;
+    while (offset < fileSize) {
+        const uint64_t remaining = fileSize - offset;
+        const size_t chunk = static_cast<size_t>(remaining < kChunk ? remaining : kChunk);
+        if (!hasher.Update(base + offset, chunk)) {
+            return false;
+        }
+        offset += chunk;
+    }
+
+    std::vector<uint8_t> digest;
+    if (!hasher.Final(digest) || digest.size() != kChecksumSize) {
+        return false;
+    }
+
+    // Fixed-time compare. Integrity rather than secrecy, but there is no reason to
+    // branch on where the first differing byte is.
+    uint8_t diff = 0u;
+    for (size_t i = 0; i < kChecksumSize; ++i) {
+        diff |= static_cast<uint8_t>(digest[i] ^ header->sha256Checksum[i]);
+    }
+    if (diff != 0u) {
+        SS_LOG_ERROR(L"SignatureStore",
+            L"VerifyDatabaseChecksum: database checksum mismatch - the database is corrupt");
+        return false;
+    }
+    return true;
+}
 
 
 // ============================================================================

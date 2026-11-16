@@ -3729,6 +3729,30 @@ StoreError YaraRuleStore::LoadRulesInternal() noexcept {
         header->versionMajor, header->versionMinor);
 
     // ========================================================================
+    // WHOLE-DATABASE INTEGRITY (task 389)
+    // ========================================================================
+    // Confirm the entire database matches the SHA-256 the builder stamped, BEFORE any
+    // of its bytes reach libyara's deserializer below. ValidateHeader above checks the
+    // header and the section bounds, but not the contents: a full-size yet internally
+    // torn database (for example a working copy left half-written when the machine lost
+    // power during first-run seeding) passes those checks and then access-violates
+    // inside yr_rules_load_stream, which trusts the offsets it parses, taking the
+    // service down in an SCM restart loop. Refusing a corrupt database here keeps the
+    // service alive on whatever rules were previously loaded. An unfinalized database
+    // (all-zero stored checksum) is allowed through by VerifyDatabaseChecksum.
+    {
+        const auto* dbBase = m_mappedView.GetAt<uint8_t>(0);
+        if (dbBase == nullptr ||
+            !Format::VerifyDatabaseChecksum(dbBase, m_mappedView.fileSize)) {
+            SS_LOG_ERROR(L"YaraRuleStore",
+                L"LoadRulesInternal: database checksum verification failed - refusing to "
+                L"load YARA rules from a corrupt database");
+            return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                               "Database checksum mismatch - corrupt database" };
+        }
+    }
+
+    // ========================================================================
     // LOAD YARA RULES FROM OFFSET
     // ========================================================================
     if (header->yaraRulesOffset == 0 || header->yaraRulesSize == 0) {

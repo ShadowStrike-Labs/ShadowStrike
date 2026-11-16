@@ -660,6 +660,18 @@ namespace Format {
 // Validate database header integrity (fileSize > 0 enables section-within-file bounds checks)
 [[nodiscard]] bool ValidateHeader(const SignatureDatabaseHeader* header, uint64_t fileSize = 0) noexcept;
 
+// Verify the whole-database SHA-256 the builder stamped in the header (task 389). The
+// builder zeroes the 32-byte checksum field and hashes the entire database
+// (SignatureBuilder::ComputeChecksum); this reproduces that domain over the read-only
+// mapping and compares. ValidateHeader checks the header and section bounds but not the
+// contents, so a full-size yet internally torn database (e.g. a working copy left
+// half-written by a power loss) passes it and then access-violates inside libyara's
+// deserializer; this guard refuses it first. An all-zero stored checksum means the
+// database was never finalized and is allowed through (treated as unverifiable, not
+// corrupt), matching the whitelist and threat-intel stores. Returns false only on a
+// definite mismatch, a null base, or a buffer smaller than the header.
+[[nodiscard]] bool VerifyDatabaseChecksum(const uint8_t* base, uint64_t fileSize) noexcept;
+
 // Calculate optimal cache size based on database size
 [[nodiscard]] uint32_t CalculateOptimalCacheSize(uint64_t dbSizeBytes) noexcept;
 
