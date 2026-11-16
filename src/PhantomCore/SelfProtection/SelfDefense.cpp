@@ -441,6 +441,7 @@ public:
     [[nodiscard]] bool SyncProtectedProcessesToKernel();
     [[nodiscard]] bool SyncProductInstallTreeToKernel();
     void OnKernelSelfProtectEventInternal(const void* data, uint32_t size);
+    void OnKernelHandleAlertInternal(const void* data, uint32_t size);
 
 private:
     mutable std::shared_mutex m_mutex;
@@ -3034,12 +3035,17 @@ void SelfDefenseImpl::RegisterKernelHandler() {
     ipc.RegisterGenericHandler("SelfDefense",
         [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* data, size_t size) {
             if (!m_kernelHandlerRegistered.load(std::memory_order_acquire)) return;
-            if (msgType == FilterMessageType_SelfProtectAlert) {
-                OnKernelSelfProtectEventInternal(data, static_cast<uint32_t>(size));
+            // The driver emits FilterMessageType_HandleAlert - a real, shared-struct
+            // message also consumed on this fan-out by RealTimeProtection and
+            // ProcessInjectionDetector. It never emits SelfProtectAlert, which is why
+            // this handler had never run. SelfProtectAlert stays the seam for a future
+            // file/registry self-protect emitter (task 166b).
+            if (msgType == FilterMessageType_HandleAlert) {
+                OnKernelHandleAlertInternal(data, static_cast<uint32_t>(size));
             }
         });
     m_kernelHandlerRegistered.store(true, std::memory_order_release);
-    SS_LOG_INFO(LOG_CATEGORY, L"Kernel SelfProtectAlert handler registered");
+    SS_LOG_INFO(LOG_CATEGORY, L"Kernel HandleAlert handler registered");
 }
 
 void SelfDefenseImpl::UnregisterKernelHandler() {
@@ -3224,6 +3230,101 @@ bool SelfDefenseImpl::SyncProductInstallTreeToKernel() {
     return false;
 }
 
+ProtectedProcessHandleVerdict ClassifyProtectedProcessHandleAlert(
+    uint32_t requestedAccess, uint32_t grantedAccess) noexcept
+{
+    ProtectedProcessHandleVerdict verdict;
+    const uint32_t stripped = requestedAccess & ~grantedAccess;
+    verdict.strippedDangerous = stripped & SelfDefenseConstants::BLOCKED_PROCESS_ACCESS;
+    verdict.wasBlocked = verdict.strippedDangerous != 0;
+
+    // Priority order matches FilterAccessRequest(): CREATE_THREAD (injection) >
+    // VM_WRITE / VM_OPERATION (memory) > TERMINATE > SUSPEND_RESUME.
+    if ((verdict.strippedDangerous & PROCESS_CREATE_THREAD) != 0) {
+        verdict.type = ThreatType::CodeInjection;
+    } else if ((verdict.strippedDangerous & (PROCESS_VM_WRITE | PROCESS_VM_OPERATION)) != 0) {
+        verdict.type = ThreatType::MemoryModification;
+    } else if ((verdict.strippedDangerous & PROCESS_TERMINATE) != 0) {
+        verdict.type = ThreatType::ProcessTermination;
+    } else if ((verdict.strippedDangerous & PROCESS_SUSPEND_RESUME) != 0) {
+        verdict.type = ThreatType::ProcessSuspension;
+    } else {
+        verdict.type = ThreatType::None;  // nothing self-defense-relevant was denied
+    }
+    return verdict;
+}
+
+void SelfDefenseImpl::OnKernelHandleAlertInternal(const void* data, uint32_t size) {
+    // Real kernel message: the shared SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION struct
+    // (PhantomSensor/Shared/MessageProtocol.h), so both sides agree by construction.
+    if (!data || size < sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"Invalid kernel handle alert (size=%u, min=%zu)",
+                    size, sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION));
+        return;
+    }
+    const auto* alert = static_cast<const SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION*>(data);
+    const uint32_t attackerPid = alert->SourceProcessId;
+    const uint32_t targetPid   = alert->TargetProcessId;
+
+    // Our own outbound handle work is not an attack (mirrors RealTimeProtection's
+    // HandleAlert consumer): this service opens broad handles by design and the
+    // kernel object callback scores that shape as suspicious.
+    if (attackerPid == static_cast<uint32_t>(::GetCurrentProcessId())) {
+        return;
+    }
+
+    // Self-defense acts only on the processes it protects. Any other suspicious
+    // handle operation on the same fan-out is ProcessProtection's and
+    // ProcessInjectionDetector's concern, not a self-protection event.
+    if (!IsProcessProtected(targetPid)) {
+        return;
+    }
+
+    // Record only what the kernel actually denied, so the *Blocked counters and
+    // the wasBlocked claim stay truthful. If nothing dangerous was stripped the
+    // access was permitted - not a block.
+    const auto verdict = ClassifyProtectedProcessHandleAlert(
+        alert->RequestedAccess, alert->GrantedAccess);
+    if (!verdict.wasBlocked) {
+        return;
+    }
+
+    ThreatEvent evt;
+    evt.type = verdict.type;
+    switch (verdict.type) {
+        case ThreatType::MemoryModification:
+            m_stats.memoryModificationBlocked.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case ThreatType::ProcessTermination:
+            m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
+            break;
+        default:
+            // CodeInjection is tracked via RecordThreatEvent -> IncrementThreatTypeStat;
+            // ProcessSuspension has no dedicated blocked counter.
+            break;
+    }
+    evt.attackerProcessId = attackerPid;
+    evt.attackerProcessName = GetProcessName(attackerPid);
+    evt.attackerProcessPath = GetProcessImagePath(attackerPid);
+    evt.targetType = ProtectedEntityType::Process;
+    evt.targetIdentifier = std::to_wstring(targetPid);
+    evt.requestedAccess = alert->RequestedAccess;
+    evt.blockedAccess = verdict.strippedDangerous;
+    evt.wasBlocked = true;
+    evt.actionTaken = ThreatResponse::Block;
+    evt.details["suspicion_score"] = std::to_string(alert->SuspicionScore);
+
+    SS_LOG_WARN(LOG_CATEGORY,
+        L"KERNEL: PID %u handle access 0x%08X on protected PID %u - stripped 0x%08X",
+        attackerPid, alert->RequestedAccess, targetPid, verdict.strippedDangerous);
+    RecordThreatEvent(std::move(evt));
+}
+
+// DORMANT until a kernel SelfProtectAlert emitter exists (task 166b). The driver
+// does not emit FilterMessageType_SelfProtectAlert today, so this parser does not
+// run; the live handle-based self-protection feed is OnKernelHandleAlertInternal
+// above. The hand-rolled layout below will be replaced by a shared struct when the
+// file/registry emitter is added.
 void SelfDefenseImpl::OnKernelSelfProtectEventInternal(const void* data, uint32_t size) {
     // Wire format from kernel: [uint32_t attackerPid][uint32_t targetPid]
     //                          [uint32_t accessMask][uint16_t descLen][wchar_t desc[]]

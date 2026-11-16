@@ -92,4 +92,59 @@ TEST(SelfDefenseTests, StatisticsResetAndHelperNamesRemainStable) {
     EXPECT_EQ(GetProtectionLevelName(SelfDefenseLevel::Enhanced), "Enhanced");
 }
 
+// ===========================================================================
+// task 166a: kernel handle-alert access classification (pure)
+// ===========================================================================
+
+TEST(SelfDefenseHandleAlert, CodeInjectionOutranksMemoryAndTermination) {
+    const auto v = ClassifyProtectedProcessHandleAlert(
+        PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_TERMINATE, 0);
+    EXPECT_TRUE(v.wasBlocked);
+    EXPECT_EQ(v.type, ThreatType::CodeInjection);
+    EXPECT_EQ(v.strippedDangerous,
+              static_cast<uint32_t>(PROCESS_CREATE_THREAD | PROCESS_VM_WRITE | PROCESS_TERMINATE));
+}
+
+TEST(SelfDefenseHandleAlert, MemoryModificationOutranksTermination) {
+    const auto v = ClassifyProtectedProcessHandleAlert(PROCESS_VM_WRITE | PROCESS_TERMINATE, 0);
+    EXPECT_EQ(v.type, ThreatType::MemoryModification);
+    EXPECT_TRUE(v.wasBlocked);
+}
+
+TEST(SelfDefenseHandleAlert, TerminationOnlyClassifiesAsTermination) {
+    const auto v = ClassifyProtectedProcessHandleAlert(PROCESS_TERMINATE, 0);
+    EXPECT_EQ(v.type, ThreatType::ProcessTermination);
+    EXPECT_TRUE(v.wasBlocked);
+}
+
+TEST(SelfDefenseHandleAlert, SuspendResumeIsTheResidualClass) {
+    const auto v = ClassifyProtectedProcessHandleAlert(PROCESS_SUSPEND_RESUME, 0);
+    EXPECT_EQ(v.type, ThreatType::ProcessSuspension);
+    EXPECT_TRUE(v.wasBlocked);
+}
+
+TEST(SelfDefenseHandleAlert, GrantedAccessIsNotABlock) {
+    // The kernel granted everything requested: nothing stripped, so not a block.
+    const auto v = ClassifyProtectedProcessHandleAlert(PROCESS_TERMINATE, PROCESS_TERMINATE);
+    EXPECT_FALSE(v.wasBlocked);
+    EXPECT_EQ(v.type, ThreatType::None);
+    EXPECT_EQ(v.strippedDangerous, 0u);
+}
+
+TEST(SelfDefenseHandleAlert, NonDangerousDenialIsNotABlock) {
+    // PROCESS_QUERY_INFORMATION is outside the self-defense dangerous set.
+    const auto v = ClassifyProtectedProcessHandleAlert(PROCESS_QUERY_INFORMATION, 0);
+    EXPECT_FALSE(v.wasBlocked);
+    EXPECT_EQ(v.strippedDangerous, 0u);
+}
+
+TEST(SelfDefenseHandleAlert, OnlyDeniedBitsAreCounted) {
+    // Requested TERMINATE + VM_WRITE but the kernel granted VM_WRITE: only
+    // TERMINATE was stripped, so the verdict is a termination block.
+    const auto v = ClassifyProtectedProcessHandleAlert(
+        PROCESS_TERMINATE | PROCESS_VM_WRITE, PROCESS_VM_WRITE);
+    EXPECT_EQ(v.type, ThreatType::ProcessTermination);
+    EXPECT_EQ(v.strippedDangerous, static_cast<uint32_t>(PROCESS_TERMINATE));
+}
+
 }  // namespace

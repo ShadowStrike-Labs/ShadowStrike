@@ -473,6 +473,26 @@ inline constexpr ThreatType operator|(ThreatType a, ThreatType b) noexcept {
     return static_cast<ThreatType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
+/// @brief Classification of a kernel handle-alert against a protected process.
+struct ProtectedProcessHandleVerdict {
+    ThreatType type = ThreatType::None;   ///< Dominant threat class of the denied access.
+    uint32_t   strippedDangerous = 0;     ///< RequestedAccess & ~GrantedAccess, masked to the
+                                          ///< self-defense dangerous set (BLOCKED_PROCESS_ACCESS).
+    bool       wasBlocked = false;        ///< True iff the kernel actually stripped a dangerous bit.
+};
+
+/// @brief Classify the access a kernel handle-alert reports as denied on a
+///        protected process. Pure: no OS calls, no locks.
+///
+/// Priority order matches FilterAccessRequest(): code injection (CREATE_THREAD)
+/// outranks memory modification (VM_WRITE / VM_OPERATION), which outranks
+/// termination, with suspend/resume as the residual class. Only bits in
+/// SelfDefenseConstants::BLOCKED_PROCESS_ACCESS count as dangerous, so an access
+/// the kernel stripped that is not self-defense-relevant leaves wasBlocked false
+/// (the operation was permitted, not a self-protection block).
+[[nodiscard]] ProtectedProcessHandleVerdict ClassifyProtectedProcessHandleAlert(
+    uint32_t requestedAccess, uint32_t grantedAccess) noexcept;
+
 /**
  * @brief Response to detected threat
  */
