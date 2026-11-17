@@ -657,7 +657,23 @@ typedef struct _SHADOWSTRIKE_THREAD_NOTIFICATION {
     UINT32 CreatorProcessId; // Source Process (Current)
     UINT32 CreatorThreadId;  // Source Thread (Current)
     BOOLEAN IsRemote;        // TRUE if Creator != Target
-    // Additional Context could go here
+
+    //
+    // Kernel injection verdict (task 130). Appended, never reordered: the whole
+    // protocol is #pragma pack(1) and every reader guards on
+    // size >= sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION), so growing the struct at
+    // the tail stays ABI- and version-skew-safe (an older reader simply ignores
+    // the tail; a newer reader against an older sender fails the size guard and
+    // skips). These carry the already-computed result of ThreadNotify.c
+    // TnpAnalyzeThreadCreation so user-mode can raise a precise injection alert
+    // from the driver's start-address/memory analysis instead of guessing from
+    // timing.
+    //
+    UINT8  Reserved0[3];     // pad so the verdict words start 4-byte aligned under pack(1)
+    UINT32 InjectionScore;   // TnpCalculateInjectionScore; >=500 is the kernel's actionable threshold
+    UINT32 Indicators;       // TN_INJECTION_INDICATOR bitmask (remote/unbacked/RWX/shellcode/...)
+    UINT32 RiskLevel;        // TN_RISK_LEVEL: 0 None, 1 Low, 2 Medium, 3 High, 4 Critical
+    UINT64 StartAddress;     // thread start address (user VA), 0 if unavailable
 } SHADOWSTRIKE_THREAD_NOTIFICATION, *PSHADOWSTRIKE_THREAD_NOTIFICATION;
 
 //

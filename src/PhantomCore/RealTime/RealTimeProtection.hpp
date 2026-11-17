@@ -1453,6 +1453,73 @@ inline bool AdmitProcessNotifyEvent(std::deque<ProcessNotifyEvent>& queue,
     return dropped;
 }
 
+/// Map the kernel's thread-injection verdict (forwarded in the tail of
+/// SHADOWSTRIKE_THREAD_NOTIFICATION, task 130) to a user-mode alert decision.
+/// Pure and free of AlertSystem and driver types so the mapping is unit-testable
+/// in isolation.
+///
+/// The driver already analysed the thread start address (unbacked / RWX /
+/// shellcode) and scored it; TnpCalculateRiskLevel maps score >= 500 to High and
+/// >= 700 to Critical, which is exactly the kernel's own actionable threshold
+/// (TN_INJECTION_SCORE_THRESHOLD = 500). An alert is therefore raised only at
+/// High or above: a benign process-startup remote thread scores about 100 (Low)
+/// and is never surfaced. severityRank mirrors TN_RISK_LEVEL (3 High, 4 Critical).
+struct ThreadInjectionVerdict {
+    bool shouldAlert{ false };
+    int severityRank{ 0 };
+    std::string details;
+};
+
+inline ThreadInjectionVerdict EvaluateThreadInjection(std::uint32_t creatorPid,
+                                                      std::uint32_t targetPid,
+                                                      std::uint32_t injectionScore,
+                                                      std::uint32_t indicators,
+                                                      std::uint32_t riskLevel,
+                                                      std::uint64_t startAddress) {
+    ThreadInjectionVerdict v;
+    v.shouldAlert = (riskLevel >= 3u);              // TnRiskHigh
+    v.severityRank = (riskLevel >= 4u) ? 4 : (v.shouldAlert ? 3 : 0);
+    if (!v.shouldAlert) {
+        return v;
+    }
+
+    // Decode the security-relevant indicator bits. The values mirror
+    // TN_INJECTION_INDICATOR in PhantomSensor ThreadNotify.h; it is a stable wire
+    // ABI, so the small duplication here is intentional and low-risk.
+    std::string ind;
+    const auto add = [&ind](bool set, const char* name) {
+        if (set) { if (!ind.empty()) { ind += ","; } ind += name; }
+    };
+    add((indicators & 0x00000001u) != 0u, "remote-thread");
+    add((indicators & 0x00000002u) != 0u, "suspended-start");
+    add((indicators & 0x00000004u) != 0u, "unbacked-start");
+    add((indicators & 0x00000008u) != 0u, "rwx-start");
+    add((indicators & 0x00000080u) != 0u, "cross-session");
+    add((indicators & 0x00004000u) != 0u, "shellcode");
+
+    // Format the start address as hex without pulling in <cstdio>.
+    std::string hex;
+    {
+        std::uint64_t x = startAddress;
+        if (x == 0u) {
+            hex = "0x0";
+        } else {
+            static const char* const kDigits = "0123456789ABCDEF";
+            while (x != 0u) { hex.insert(hex.begin(), kDigits[x & 0xFu]); x >>= 4; }
+            hex = "0x" + hex;
+        }
+    }
+
+    v.details = "Remote-thread injection (T1055.001): injector PID " +
+                std::to_string(creatorPid) + " -> target PID " +
+                std::to_string(targetPid) + " | start: " + hex +
+                " | score: " + std::to_string(injectionScore);
+    if (!ind.empty()) {
+        v.details += " | indicators: " + ind;
+    }
+    return v;
+}
+
 }  // namespace Detail
 
 class RealTimeProtection {

@@ -308,4 +308,50 @@ TEST(ProcessNotifyQueueAdmission, ZeroCapacityAdmitsNothingAndReportsDrop) {
     EXPECT_TRUE(q.empty());
 }
 
+// ---------------------------------------------------------------------------
+// EvaluateThreadInjection maps the kernel's forwarded thread-injection verdict
+// (task 130) to a user-mode alert decision. The driver already scored the thread
+// start address, so user-mode alerts only at the kernel's actionable risk
+// (High/Critical) and names the injector before the target.
+// ---------------------------------------------------------------------------
+TEST(ThreadInjectionVerdictTests, HighRiskAlertsAtHighSeverityAndNamesInjectorThenTarget) {
+    const auto v = Detail::EvaluateThreadInjection(
+        /*creatorPid*/ 1337u, /*targetPid*/ 4242u, /*injectionScore*/ 550u,
+        /*indicators*/ 0x00000004u | 0x00000008u,  // unbacked-start + rwx-start
+        /*riskLevel*/ 3u,                            // TnRiskHigh
+        /*startAddress*/ 0x7ff612340000ull);
+
+    EXPECT_TRUE(v.shouldAlert);
+    EXPECT_EQ(v.severityRank, 3);
+
+    const auto injectorPos = v.details.find("injector PID 1337");
+    const auto targetPos = v.details.find("target PID 4242");
+    EXPECT_NE(injectorPos, std::string::npos);
+    EXPECT_NE(targetPos, std::string::npos);
+    EXPECT_LT(injectorPos, targetPos);
+    EXPECT_NE(v.details.find("unbacked-start"), std::string::npos);
+    EXPECT_NE(v.details.find("rwx-start"), std::string::npos);
+    EXPECT_NE(v.details.find("score: 550"), std::string::npos);
+    EXPECT_NE(v.details.find("0x7FF612340000"), std::string::npos);
+}
+
+TEST(ThreadInjectionVerdictTests, CriticalRiskAlertsAtCriticalSeverity) {
+    const auto v = Detail::EvaluateThreadInjection(
+        10u, 20u, 750u, 0x00004000u /* shellcode */, 4u /* TnRiskCritical */, 0x1000ull);
+    EXPECT_TRUE(v.shouldAlert);
+    EXPECT_EQ(v.severityRank, 4);
+    EXPECT_NE(v.details.find("shellcode"), std::string::npos);
+}
+
+TEST(ThreadInjectionVerdictTests, BelowHighRiskNeverAlerts) {
+    // None(0), Low(1), Medium(2) - benign cross-process threads (e.g. process
+    // startup) land here and must not raise an alert.
+    for (std::uint32_t risk : { 0u, 1u, 2u }) {
+        const auto v = Detail::EvaluateThreadInjection(1u, 2u, 300u, 0x1u, risk, 0x1000ull);
+        EXPECT_FALSE(v.shouldAlert) << "risk=" << risk;
+        EXPECT_EQ(v.severityRank, 0) << "risk=" << risk;
+        EXPECT_TRUE(v.details.empty()) << "risk=" << risk;
+    }
+}
+
 }  // namespace ShadowStrike::RealTime::Tests

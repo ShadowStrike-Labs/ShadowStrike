@@ -1546,7 +1546,11 @@ ShadowStrikeSendThreadNotification(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId,
     _In_ BOOLEAN Create,
-    _In_ BOOLEAN IsRemote
+    _In_ BOOLEAN IsRemote,
+    _In_ ULONG InjectionScore,
+    _In_ ULONG Indicators,
+    _In_ ULONG RiskLevel,
+    _In_opt_ PVOID StartAddress
 )
 {
     NTSTATUS status;
@@ -1615,6 +1619,20 @@ ShadowStrikeSendThreadNotification(
     notification->CreatorProcessId = HandleToULong(PsGetCurrentProcessId());
     notification->CreatorThreadId = HandleToULong(PsGetCurrentThreadId());
     notification->IsRemote = IsRemote;
+
+    //
+    // Kernel injection verdict (task 130). These are the already-computed result
+    // of TnpAnalyzeThreadCreation; forwarding them lets user-mode raise a precise
+    // injection alert instead of re-deriving it from timing. Reserved0 is zeroed
+    // so the wire bytes are deterministic.
+    //
+    notification->Reserved0[0] = 0;
+    notification->Reserved0[1] = 0;
+    notification->Reserved0[2] = 0;
+    notification->InjectionScore = InjectionScore;
+    notification->Indicators = Indicators;
+    notification->RiskLevel = RiskLevel;
+    notification->StartAddress = (UINT64)(ULONG_PTR)StartAddress;
 
     //
     // Send notification

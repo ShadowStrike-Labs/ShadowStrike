@@ -136,7 +136,6 @@
 #include "../Core/Process/ProcessInjectionDetector.hpp"
 #include "../Core/Process/AtomBombingDetector.hpp"
 #include "../Core/Process/ProcessMonitor.hpp"
-#include "../Core/Process/DLLInjectionDetector.hpp"
 #include "../HashStore/HashStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../PatternStore/PatternStore.hpp"
@@ -6505,19 +6504,34 @@ public:
                 if (size >= sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)) {
                     auto* notif = static_cast<const SHADOWSTRIKE_THREAD_NOTIFICATION*>(data);
 
-                    // Forward ALL thread creation events to DLLInjectionDetector
-                    // for remote-thread + module-load correlation.
+                    // Surface the kernel's thread-injection verdict (task 130).
+                    // ThreadNotify.c analysed the thread start address (unbacked /
+                    // RWX / shellcode) and scored it; that precise verdict is
+                    // forwarded in the notification tail. Alert only at the
+                    // kernel's actionable risk (High/Critical) - benign startup
+                    // remote threads score Low and are not surfaced. This replaces
+                    // a dead forward to DLLInjectionDetector (never initialized),
+                    // whose user-mode timing correlation was reverted in favour of
+                    // this kernel verdict.
                     try {
-                        auto& dllDetector = Core::Process::DLLInjectionDetector::Instance();
-                        if (dllDetector.IsInitialized() && dllDetector.IsMonitoring()) {
-                            dllDetector.OnThreadCreate(
-                                notif->ProcessId,
-                                notif->CreatorProcessId,
-                                0 /* startAddress not in this notification struct */);
+                        const auto verdict = Detail::EvaluateThreadInjection(
+                            notif->CreatorProcessId, notif->ProcessId,
+                            notif->InjectionScore, notif->Indicators,
+                            notif->RiskLevel, notif->StartAddress);
+                        if (verdict.shouldAlert) {
+                            (void)Communication::AlertSystem::Instance().RaiseAlert(
+                                (verdict.severityRank >= 4)
+                                    ? Communication::AlertSeverity::Critical
+                                    : Communication::AlertSeverity::High,
+                                Communication::AlertType::ThreatDetection,
+                                "Thread Injection",
+                                verdict.details,
+                                "ThreadInjectionMonitor");
+                            Utils::Logger::Warn("RealTimeProtection: [TID] {}", verdict.details);
                         }
                     } catch (...) {}
 
-                    // Remote thread injection detection (MITRE T1055.003)
+                    // Remote-thread telemetry (MITRE T1055.003), independent of score.
                     if (notif->IsRemote) {
                         Utils::Logger::Warn("RealTimeProtection: Remote thread detected  -  "
                             "Source PID: {} -> Target PID: {}, TID: {}",

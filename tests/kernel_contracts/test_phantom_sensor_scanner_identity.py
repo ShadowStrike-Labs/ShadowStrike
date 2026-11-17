@@ -1825,6 +1825,43 @@ class SourceContractTests(unittest.TestCase):
                 self.assertIn("ShadowStrikeSendNotification(header, totalSize)", body)
                 self.assertIn("SbpAccountNotificationResult(status,", body)
 
+    def test_thread_notification_forwards_the_kernel_injection_verdict(self) -> None:
+        # Task 130: the kernel computes a precise remote-thread injection verdict
+        # (ThreadNotify.c TnpAnalyzeThreadCreation - start address, unbacked / RWX /
+        # shellcode scoring) but historically forwarded only IsRemote to user-mode,
+        # so the service could not raise an accurate injection alert and a reverted
+        # attempt tried to re-derive one from timing. This pins the whole forward:
+        # the wire struct carries the verdict, the sender populates it, and
+        # RealTimeProtection reads it and alerts only on the kernel's own
+        # classification. If any leg is dropped the alert silently goes blind.
+        proto = strip_c_comments(self.message_protocol_h)
+
+        # 1. The wire struct carries the verdict, appended after the original
+        #    fields. Appending (not reordering) is what keeps the pack(1) protocol
+        #    ABI- and version-skew-safe, so the order is pinned too.
+        for decl in ("UINT32 InjectionScore;", "UINT32 Indicators;",
+                     "UINT32 RiskLevel;", "UINT64 StartAddress;"):
+            self.assertIn(decl, proto,
+                          "SHADOWSTRIKE_THREAD_NOTIFICATION must carry " + decl)
+        self.assertLess(
+            proto.index("BOOLEAN IsRemote;"),
+            proto.index("UINT32 InjectionScore;"),
+            "the verdict fields must be APPENDED after IsRemote, never reordered",
+        )
+
+        # 2. The sender populates every verdict field from its parameters.
+        sender = strip_c_comments(
+            extract_c_function(self.scan_bridge_c, "ShadowStrikeSendThreadNotification"))
+        for field in ("InjectionScore", "Indicators", "RiskLevel", "StartAddress"):
+            self.assertIn("notification->" + field + " =", sender,
+                          "ShadowStrikeSendThreadNotification must set " + field)
+
+        # 3. RealTimeProtection raises the alert from the kernel verdict, gated on
+        #    the EvaluateThreadInjection decision (High/Critical only).
+        rtp = strip_c_comments(self.real_time_protection_cpp)
+        self.assertIn("FilterMessageType_ThreadNotify", rtp)
+        self.assertIn("Detail::EvaluateThreadInjection(", rtp)
+
     def test_notification_accounting_separates_undelivered_from_sent(self) -> None:
         executable = strip_c_comments(
             extract_c_function(self.scan_bridge_c, "SbpAccountNotificationResult")

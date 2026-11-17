@@ -632,7 +632,11 @@ ShadowStrikeSendThreadNotification(
     _In_ HANDLE ProcessId,
     _In_ HANDLE ThreadId,
     _In_ BOOLEAN Create,
-    _In_ BOOLEAN IsRemote
+    _In_ BOOLEAN IsRemote,
+    _In_ ULONG InjectionScore,
+    _In_ ULONG Indicators,
+    _In_ ULONG RiskLevel,
+    _In_opt_ PVOID StartAddress
 );
 
 /**

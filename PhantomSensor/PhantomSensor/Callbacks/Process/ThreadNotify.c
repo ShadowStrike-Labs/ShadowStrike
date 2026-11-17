@@ -2894,7 +2894,11 @@ Routine Description:
         Event->TargetProcessId,
         Event->TargetThreadId,
         TRUE,  // Create
-        Event->IsRemote
+        Event->IsRemote,
+        Event->InjectionScore,
+        (ULONG)Event->Indicators,
+        (ULONG)Event->RiskLevel,
+        Event->StartAddress
         );
 
     InterlockedIncrement64(&g_TnMonitor.Stats.AlertsGenerated);
