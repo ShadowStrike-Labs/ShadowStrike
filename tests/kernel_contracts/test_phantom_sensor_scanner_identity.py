@@ -3739,20 +3739,25 @@ class SourceContractTests(unittest.TestCase):
         # The exact surviving expressions, so a revert fails here by name rather
         # than by absence of a pattern. Counted, not assertIn: these haystacks are
         # whole driver sources and assertIn would print them.
-        for label, source, expected in (
+        #
+        # FilterRegistration.c carries the expression TWICE since task 376:
+        # ShadowStrikeQueueRescan and ShadowStrikeQueueDeferredScan both build a
+        # FILE_SCAN_REQUEST, and both correctly assign the byte count copyLen.
+        for label, source, expected, occurrences in (
             ("ScanBridge.c", self.scan_bridge_c,
-             "scanRequest->PathLength = (UINT16)filePathLen;"),
+             "scanRequest->PathLength = (UINT16)filePathLen;", 1),
             ("CommPort.c", self.comm_port_c,
-             "scanRequest->PathLength = (UINT16)nameInfo->Name.Length;"),
+             "scanRequest->PathLength = (UINT16)nameInfo->Name.Length;", 1),
             ("FilterRegistration.c", self.filter_registration_c,
-             "req->PathLength = copyLen;"),
+             "req->PathLength = copyLen;", 2),
         ):
             found = strip_c_comments(source).count(expected)
             self.assertEqual(
                 found,
-                1,
+                occurrences,
                 f"{label} no longer contains the byte-count assignment "
-                f"{expected!r} (found {found} occurrences)",
+                f"{expected!r} the expected number of times "
+                f"(found {found}, expected {occurrences})",
             )
 
         # The frame-size macro was the third statement of the character contract:
@@ -28520,8 +28525,14 @@ class RegisterProtectedPathWiringTests(unittest.TestCase):
         names = [m.group(1) for m in re.finditer(r"FilterMessageType_(\w+)", enum)]
         self.assertIn("RegisterProtectedPath", names)
         self.assertEqual(names[-1], "Max", "Max must stay last")
-        self.assertEqual(names[-2], "RegisterProtectedPath",
-            "the new type must be the last real type, immediately before Max")
+        # Task 376 appended FilterMessageType_DeferredScanRequest after
+        # RegisterProtectedPath, so the most recently added type - the one that
+        # must sit immediately before Max - is now DeferredScanRequest. The
+        # append-only invariant is unchanged; only the newest name moved.
+        self.assertIn("DeferredScanRequest", names)
+        self.assertEqual(names[-2], "DeferredScanRequest",
+            "the most recently appended type must be the last real type, "
+            "immediately before Max")
 
     def test_payload_struct_is_shared_and_bounded(self):
         self.assertIn("SHADOWSTRIKE_REGISTER_PROTECTED_PATH", self.shared)

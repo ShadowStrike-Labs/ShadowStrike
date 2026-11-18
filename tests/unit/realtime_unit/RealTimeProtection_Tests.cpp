@@ -354,4 +354,80 @@ TEST(ThreadInjectionVerdictTests, BelowHighRiskNeverAlerts) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ExtractBoundedWidePath is the parse behind FilterMessageType_DeferredScanRequest
+// (task 376). It reads an untrusted kernel payload, so the bounds arithmetic is
+// the security-critical part: it must never trust the frame's declared length
+// over what was actually delivered - that conflation is the task 91 defect class.
+// ---------------------------------------------------------------------------
+namespace {
+// A payload is [fixedHeaderSize bytes][path as raw UTF-16], no implicit terminator.
+std::vector<std::uint8_t> BuildDeferredPayload(std::size_t fixedHeaderSize,
+                                               const std::wstring& path) {
+    std::vector<std::uint8_t> buf(fixedHeaderSize, 0u);
+    const auto* p = reinterpret_cast<const std::uint8_t*>(path.data());
+    buf.insert(buf.end(), p, p + path.size() * sizeof(wchar_t));
+    return buf;
+}
+}  // namespace
+
+TEST(ExtractBoundedWidePathTests, ReturnsThePathWhenWellFormed) {
+    const std::wstring path = L"\\Device\\HarddiskVolume3\\docs\\invoice.exe";
+    auto buf = BuildDeferredPayload(72, path);
+    auto r = Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72,
+                                            path.size() * sizeof(wchar_t));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, path);
+}
+
+TEST(ExtractBoundedWidePathTests, RejectsNullPayload) {
+    EXPECT_FALSE(Detail::ExtractBoundedWidePath(nullptr, 100, 72, 8).has_value());
+}
+
+TEST(ExtractBoundedWidePathTests, RejectsPayloadShorterThanTheFixedHeader) {
+    std::vector<std::uint8_t> buf(40, 0u);
+    EXPECT_FALSE(Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72, 8).has_value());
+}
+
+TEST(ExtractBoundedWidePathTests, ClampsDeclaredLengthToWhatWasDelivered) {
+    // The frame CLAIMS a 400-byte path but only 3 wchars (6 bytes) followed the
+    // header. Trusting the claim would read ~394 bytes past the buffer; the clamp
+    // must bound the read to the delivered 6 bytes. This is the task 91 defense.
+    const std::wstring path = L"abc";
+    auto buf = BuildDeferredPayload(72, path);
+    auto r = Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72, 400);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, L"abc");
+}
+
+TEST(ExtractBoundedWidePathTests, FloorsAnOddDeclaredLengthToEven) {
+    // 7 is odd and cannot be a whole number of UTF-16 code units; flooring to 6
+    // yields 3 wchars rather than reading a trailing half code unit.
+    const std::wstring path = L"abc";
+    auto buf = BuildDeferredPayload(72, path);
+    auto r = Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72, 7);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, L"abc");
+}
+
+TEST(ExtractBoundedWidePathTests, TrimsTrailingNuls) {
+    const std::wstring path = L"x.exe";
+    auto buf = BuildDeferredPayload(72, path);
+    buf.insert(buf.end(), 2 * sizeof(wchar_t), 0u);   // driver-written terminator(s)
+    auto r = Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72,
+                                            (path.size() + 2) * sizeof(wchar_t));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, L"x.exe");
+}
+
+TEST(ExtractBoundedWidePathTests, RejectsAPathUnderOneWideChar) {
+    std::vector<std::uint8_t> buf(73, 0u);   // one stray byte after the header
+    EXPECT_FALSE(Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72, 1).has_value());
+}
+
+TEST(ExtractBoundedWidePathTests, RejectsAnAllNulPath) {
+    std::vector<std::uint8_t> buf(72 + 4, 0u);   // two NUL wchars, no real content
+    EXPECT_FALSE(Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72, 4).has_value());
+}
+
 }  // namespace ShadowStrike::RealTime::Tests

@@ -214,6 +214,20 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
     //
     FilterMessageType_RegisterProtectedPath,   // Register the product install-tree prefix(es)
 
+    //
+    // Appended here deliberately (see the append-only note above): a kernel ->
+    // user, fire-and-forget request that a file ALLOWED ONTO THE SYSTEM UNSCANNED
+    // - because the scan circuit breaker was open, or a delivered scan timed out
+    // - be re-examined off the blocking path. It carries the same
+    // FILE_SCAN_REQUEST payload as FilterMessageType_ScanRequest, but the service
+    // routes it into the bounded deferred deep-scan queue (QueueDeferredDeepScan)
+    // rather than the synchronous OnKernelFileScan, so it adds no load to the
+    // reply workers that were already saturated when the breaker opened.
+    // RequiresReply is always 0 - the kernel has already allowed the create and
+    // is not waiting for anything. Task 376.
+    //
+    FilterMessageType_DeferredScanRequest,     // Re-examine a file allowed unscanned (circuit open / timeout)
+
     FilterMessageType_Max
 } SHADOWSTRIKE_MESSAGE_TYPE;
 
@@ -361,7 +375,7 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
  * @brief Kernel -> user, unsolicited.
  *
  * Says NOTHING about replies - see the note above. Complete as of
- * FilterMessageType_Max == 47.
+ * FilterMessageType_Max == 48.
  */
 #define SHADOWSTRIKE_IS_NOTIFICATION_MESSAGE(type) \
     ((type) == FilterMessageType_ProcessNotify || \
@@ -387,7 +401,8 @@ typedef enum _SHADOWSTRIKE_MESSAGE_TYPE {
      (type) == FilterMessageType_SelfProtectAlert || \
      (type) == FilterMessageType_ThreatScoreNotify || \
      (type) == FilterMessageType_FileOperationEvent || \
-     (type) == FilterMessageType_RegistryBehavioralAlert)
+     (type) == FilterMessageType_RegistryBehavioralAlert || \
+     (type) == FilterMessageType_DeferredScanRequest)
 
 /**
  * @brief User -> kernel data push.

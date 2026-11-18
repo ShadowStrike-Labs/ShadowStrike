@@ -3060,6 +3060,25 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
             break;
         }
 
+        case FilterMessageType_DeferredScanRequest: {
+            // Task 376: a file allowed unscanned (circuit open / timeout) to be
+            // re-examined off the blocking path. Route to the generic handler,
+            // which queues a background deep scan. No reply is owed - the kernel
+            // already allowed the create and waits for nothing.
+            if (genericHandler) {
+                try {
+                    genericHandler(FilterMessageType_DeferredScanRequest, pPayload, pAppHeader->DataSize);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("[IPCManager] DeferredScanRequest handler exception: {}", e.what());
+                }
+            }
+            auto idx = static_cast<size_t>(FilterMessageType_DeferredScanRequest);
+            if (idx < m_impl->stats.byMessageType.size()) {
+                m_impl->stats.byMessageType[idx].fetch_add(1, std::memory_order_relaxed);
+            }
+            break;
+        }
+
         case FilterMessageType_SyscallAlert: {
             if (genericHandler) {
                 try {

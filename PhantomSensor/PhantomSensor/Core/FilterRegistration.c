@@ -934,6 +934,89 @@ ShadowStrikeQueueRescan(
     return status;
 }
 
+//
+// Task 376 - deferred re-examination of a file allowed onto the system UNSCANNED.
+//
+// PreCreate allows a create without a scan verdict in two saturation cases: the
+// scan circuit breaker is open (SbSendScanRequestEx short-circuits before
+// FltSendMessage), or a delivered scan timed out. Both are deliberate - the
+// breaker exists so a saturated scanner degrades to "not scanned" instead of
+// serialising every open - but before this the file was then never looked at
+// again, which is the coverage hole task 376 closes. This asks the service to
+// re-examine it off the blocking path.
+//
+// Deliberately a DISTINCT message type from the cleanup rescan above:
+// FilterMessageType_DeferredScanRequest routes, in the service, into the bounded
+// background QueueDeferredDeepScan rather than the synchronous OnKernelFileScan,
+// so it never adds work to the reply workers that were already saturated when
+// the breaker opened. Fire-and-forget (RequiresReply = 0): the create is already
+// allowed and nothing waits on this. Storm safety is handled downstream, not
+// here - BpQueueEvent is bounded and non-blocking, and QueueDeferredDeepScan
+// de-duplicates by path, bounds at 4096 and counts drops - so this neither
+// blocks the create path nor needs its own rate limiter, and it issues no file
+// I/O of its own that could re-enter our minifilter. It is kept as its own
+// function rather than folded into ShadowStrikeQueueRescan so the proven rescan
+// path is untouched; the distinct pool tag 'sdQS' keeps the two apart under
+// pool tracking.
+//
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS
+ShadowStrikeQueueDeferredScan(
+    _In_opt_ PCUNICODE_STRING FileName
+    )
+{
+    PFILE_SCAN_REQUEST req = NULL;
+    ULONG reqSize;
+    USHORT copyLen;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (!SHADOWSTRIKE_USER_MODE_CONNECTED()) {
+        return STATUS_PORT_DISCONNECTED;
+    }
+
+    if (FileName == NULL || FileName->Buffer == NULL || FileName->Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Cap path to MAX_PATH (260 WCHARs = 520 bytes); the cap is even so it
+    // cannot split a UTF-16 code unit. PathLength is a BYTE count, matching
+    // copyLen, which is what the service divides by sizeof(WCHAR).
+    //
+    copyLen = (FileName->Length > 520) ? 520 : FileName->Length;
+
+    reqSize = sizeof(FILE_SCAN_REQUEST) + copyLen;
+    req = (PFILE_SCAN_REQUEST)ExAllocatePool2(
+        POOL_FLAG_PAGED, reqSize, 'sdQS');
+    if (req == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(req, sizeof(FILE_SCAN_REQUEST));
+    req->MessageId = SHADOWSTRIKE_NEXT_MESSAGE_ID();
+    req->AccessType = (UINT8)ShadowStrikeAccessRead;
+    req->Priority = 1;
+    req->RequiresReply = 0;
+    req->ProcessId = HandleToULong(PsGetCurrentProcessId());
+    req->PathLength = copyLen;
+
+    RtlCopyMemory(
+        (PUCHAR)req + sizeof(FILE_SCAN_REQUEST),
+        FileName->Buffer,
+        copyLen);
+
+    status = ShadowStrikeBatchSendNotification(
+        (UINT16)FilterMessageType_DeferredScanRequest,
+        req,
+        reqSize);
+
+    ExFreePoolWithTag(req, 'sdQS');
+
+    return status;
+}
+
 // ============================================================================
 // NOTE: ShadowStrikeDeferredScanWorker removed â€” zero callers.
 // Rescan functionality is handled by ShadowStrikeQueueRescan above.

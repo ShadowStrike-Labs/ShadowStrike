@@ -421,6 +421,28 @@ ShadowStrikeQueueRescan(
     _In_opt_ PCUNICODE_STRING FileName
     );
 
+/**
+ * @brief Queue a file for DEFERRED background re-examination (task 376).
+ *
+ * Used when PreCreate allowed a create UNSCANNED because the scan circuit
+ * breaker was open or a delivered scan timed out. Sends a fire-and-forget
+ * FilterMessageType_DeferredScanRequest (RequiresReply = 0) that the service
+ * routes into its bounded background deep-scan queue, NOT the synchronous scan
+ * path, so it adds no load to the already-saturated reply workers.
+ *
+ * @param FileName  File name (NT device path); copied into the request.
+ *
+ * @return STATUS_SUCCESS if queued, STATUS_PORT_DISCONNECTED if no agent is
+ *         connected, error otherwise. Callers on the create hot path should
+ *         ignore the result: this is best-effort and must never fail a create.
+ *
+ * @irql <= APC_LEVEL
+ */
+NTSTATUS
+ShadowStrikeQueueDeferredScan(
+    _In_opt_ PCUNICODE_STRING FileName
+    );
+
 // NOTE: ShadowStrikeDeferredScanWorker removed â€” zero callers.
 // Rescan functionality is handled by ShadowStrikeQueueRescan above.
 

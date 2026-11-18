@@ -6500,6 +6500,54 @@ public:
         }
 
         switch (type) {
+            //
+            // Task 376: a file the kernel allowed onto the system UNSCANNED -
+            // because the scan circuit breaker was open, or a delivered scan
+            // timed out - re-examined off the blocking path. It carries a
+            // FILE_SCAN_REQUEST (the same payload as a synchronous scan request)
+            // but is routed HERE, into the bounded background deep-scan queue,
+            // rather than OnKernelFileScan, so it never adds load to the reply
+            // workers that were already saturated when the breaker opened. No
+            // reply is owed - the create was already allowed in the kernel.
+            //
+            case FilterMessageType_DeferredScanRequest: {
+                m_stats.kernelTelemetryEvents++;
+
+                if (!data || size < sizeof(FILE_SCAN_REQUEST)) {
+                    Utils::Logger::Warn(
+                        "RealTimeProtection: DeferredScanRequest too small ({} bytes, "
+                        "need at least {})",
+                        size, static_cast<uint32_t>(sizeof(FILE_SCAN_REQUEST)));
+                    break;
+                }
+
+                const auto* req = static_cast<const FILE_SCAN_REQUEST*>(data);
+
+                //
+                // Bound the path by BOTH the declared length and what was actually
+                // delivered (Detail::ExtractBoundedWidePath). Trusting PathLength
+                // alone would read past the payload for any frame whose declared
+                // length exceeds its delivered size - the defect class behind
+                // task 91's malformed frames.
+                //
+                auto ntPathOpt = Detail::ExtractBoundedWidePath(
+                    static_cast<const std::uint8_t*>(data), size,
+                    sizeof(FILE_SCAN_REQUEST), req->PathLength);
+                if (!ntPathOpt) {
+                    break;   // malformed, too short, or empty path -> nothing to queue
+                }
+                const std::wstring& ntPath = *ntPathOpt;
+
+                // The kernel sends an NT device path; the deferred scanner opens
+                // it with Win32 APIs, so convert at this boundary exactly as the
+                // synchronous scan path does. Fall back to the NT path if the
+                // conversion yields nothing, rather than dropping the file.
+                std::wstring dosPath = Utils::FileUtils::DevicePathToDosPath(ntPath);
+                QueueDeferredDeepScan(dosPath.empty() ? ntPath : dosPath,
+                                      req->ProcessId);
+                break;
+            }
+
             case FilterMessageType_ThreadNotify: {
                 if (size >= sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)) {
                     auto* notif = static_cast<const SHADOWSTRIKE_THREAD_NOTIFICATION*>(data);

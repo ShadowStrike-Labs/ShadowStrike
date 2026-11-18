@@ -79,6 +79,7 @@ Performance Characteristics:
 #include "../../ETW/ETWConsumer.h"
 #include "../../ETW/ETWProvider.h"
 #include "../../Core/DriverEntry.h"
+#include "../../Core/FilterRegistration.h"
 #include "../../Performance/PerformanceMonitor.h"
 #include "../../Performance/ResourceThrottling.h"
 #include "../../Shared/BehaviorTypes.h"
@@ -2024,6 +2025,20 @@ Return Value:
                             SsPathCacheActionAnnotate,
                             CachePathVolumeSerial);
                     }
+
+                    //
+                    // Task 376: on a delivered-but-unanswered timeout we fail
+                    // open and the file is allowed UNSCANNED. Ask the service to
+                    // re-examine it off the blocking path so the saturation
+                    // window is not a coverage hole. Skipped when fail-closed
+                    // (ShouldBlock set above), because then the file is denied
+                    // and there is nothing on the system to re-examine. Best
+                    // effort and fire-and-forget - the result cannot fail the
+                    // create.
+                    //
+                    if (!ShouldBlock) {
+                        (VOID)ShadowStrikeQueueDeferredScan(&NameInfo->Name);
+                    }
                 } else if (Status == SHADOWSTRIKE_ERROR_CIRCUIT_OPEN) {
                     //
                     // THE SCANNER WAS NEVER ASKED. SbSendScanRequestEx returns
@@ -2070,6 +2085,19 @@ Return Value:
                     //
                     if (!g_PcState.Config.FailOpenOnError) {
                         ShouldBlock = TRUE;
+                    }
+
+                    //
+                    // Task 376: the breaker is open and the file is allowed
+                    // UNSCANNED. Ask the service to re-examine it off the
+                    // blocking path - fire-and-forget, routed to the background
+                    // deep-scan queue rather than the synchronous path that was
+                    // already saturated when the breaker opened. Skipped when
+                    // fail-closed, because then the create is denied and nothing
+                    // reaches the system to re-examine.
+                    //
+                    if (!ShouldBlock) {
+                        (VOID)ShadowStrikeQueueDeferredScan(&NameInfo->Name);
                     }
                 } else {
                     InterlockedIncrement64(&g_PcState.Stats.ScanErrors);

@@ -1453,6 +1453,50 @@ inline bool AdmitProcessNotifyEvent(std::deque<ProcessNotifyEvent>& queue,
     return dropped;
 }
 
+/// Extract a wide (UTF-16) path that trails a fixed-size kernel message header,
+/// bounding it by BOTH the declared length and what was actually delivered.
+///
+/// This is the parse used for FilterMessageType_DeferredScanRequest (task 376),
+/// factored out so the bounds arithmetic is unit-testable without a kernel
+/// message struct in this header. @p declaredPathBytes is the length the frame
+/// claims (FILE_SCAN_REQUEST::PathLength); it is NEVER trusted on its own -
+/// trusting it would read past the payload for any frame whose claim exceeds its
+/// delivered size, the defect class behind task 91's malformed frames.
+///
+/// Returns nullopt for: null buffer, a payload shorter than the fixed header, a
+/// usable path under one wchar_t, or an all-NUL/empty path. Otherwise the path
+/// with any trailing NULs removed. An odd declared length is floored to even,
+/// because a UTF-16 path cannot occupy an odd number of bytes.
+///
+/// Pure: no allocation beyond the returned string, no locking, deterministic.
+inline std::optional<std::wstring> ExtractBoundedWidePath(
+        const std::uint8_t* payload,
+        std::size_t payloadSize,
+        std::size_t fixedHeaderSize,
+        std::size_t declaredPathBytes) {
+    if (payload == nullptr || payloadSize < fixedHeaderSize) {
+        return std::nullopt;
+    }
+    const std::size_t availableBytes = payloadSize - fixedHeaderSize;
+    std::size_t pathBytes = declaredPathBytes;
+    if (pathBytes > availableBytes) {
+        pathBytes = availableBytes;   // clamp the claim to what arrived
+    }
+    pathBytes &= ~static_cast<std::size_t>(1);   // UTF-16: even bytes only
+    if (pathBytes < sizeof(wchar_t)) {
+        return std::nullopt;
+    }
+    const auto* chars = reinterpret_cast<const wchar_t*>(payload + fixedHeaderSize);
+    std::wstring path(chars, pathBytes / sizeof(wchar_t));
+    while (!path.empty() && path.back() == L'\0') {
+        path.pop_back();
+    }
+    if (path.empty()) {
+        return std::nullopt;
+    }
+    return path;
+}
+
 /// Map the kernel's thread-injection verdict (forwarded in the tail of
 /// SHADOWSTRIKE_THREAD_NOTIFICATION, task 130) to a user-mode alert decision.
 /// Pure and free of AlertSystem and driver types so the mapping is unit-testable
