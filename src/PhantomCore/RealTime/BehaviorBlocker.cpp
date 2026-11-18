@@ -57,6 +57,10 @@
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/StringUtils.hpp"
 
+// Shared kernel/user wire protocol: the SHADOWSTRIKE_BEHAVIORAL_ALERT layout and
+// the FilterMessageType_* ids this kernel-alert handler dispatches on (task 388).
+#include "../../../PhantomSensor/Shared/MessageProtocol.h"
+
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
@@ -804,10 +808,10 @@ public:
     // KERNEL EVENT HANDLING
     // ========================================================================
 
-    BlockAction OnKernelBehavioralAlert(BehaviorType type, std::span<const uint8_t> payload) {
+    BlockAction OnKernelBehavioralAlert(uint32_t messageType, std::span<const uint8_t> payload) {
         m_stats.kernelEventsReceived.fetch_add(1, std::memory_order_relaxed);
 
-        constexpr size_t kMinPayload = sizeof(uint32_t) * 2;
+        constexpr size_t kMinPayload = sizeof(uint32_t) * 2;  // ProcessId + ParentProcessId
         if (payload.size() < kMinPayload) {
             SS_LOG_WARN(kLogCategory, L"Kernel payload too small: %zu bytes (min %zu)", payload.size(), kMinPayload);
             return BlockAction::Allow;
@@ -818,14 +822,41 @@ public:
         std::memcpy(&pid, payload.data(), sizeof(uint32_t));
         std::memcpy(&parentPid, payload.data() + sizeof(uint32_t), sizeof(uint32_t));
 
-        SS_LOG_DEBUG(kLogCategory, L"Kernel alert: type=%hs pid=%u ppid=%u payload=%zu bytes",
-            BehaviorTypeToString(type), pid, parentPid, payload.size());
+        //
+        // Risk by feed. This handler is shared by three kernel message types that
+        // do not mean the same thing, so a single constant risk is wrong:
+        //
+        //  - BehavioralAlert is raw ETW telemetry. SHADOWSTRIKE_BEHAVIORAL_ALERT
+        //    carries EventId/Task/Level/Keywords - no score, no behaviour type.
+        //    Mapping every record to High (which this did, for every feed) let a
+        //    process escalate on event VOLUME alone: the 1.0.133 run logged ~1,200
+        //    of these a second on an idle logon screen. It is ranked by the ETW
+        //    Level the kernel forwarded and never exceeds Medium, so one telemetry
+        //    record cannot escalate a chain. Real behavioural verdicts reach the
+        //    chain through dedicated scored feeds (the registry behavioural alert
+        //    carries a Score, the thread-injection verdict a score), not this one.
+        //  - NamedPipeEvent is context, not a detection (named pipes are ordinary),
+        //    so it is Low.
+        //  - RansomwareAlert is a kernel verdict (PostWrite detection) and keeps High.
+        //
+        RiskLevel risk = RiskLevel::High;
+        if (messageType == static_cast<uint32_t>(FilterMessageType_BehavioralAlert)) {
+            risk = RiskLevel::Low;
+            if (payload.size() >= sizeof(SHADOWSTRIKE_BEHAVIORAL_ALERT)) {
+                const auto* alert =
+                    reinterpret_cast<const SHADOWSTRIKE_BEHAVIORAL_ALERT*>(payload.data());
+                // ETW levels: 1 Critical, 2 Error -> Medium; 0/3/4/5 -> Low. Never High.
+                if (alert->Level == 1 || alert->Level == 2) risk = RiskLevel::Medium;
+            }
+        } else if (messageType == static_cast<uint32_t>(FilterMessageType_NamedPipeEvent)) {
+            risk = RiskLevel::Low;
+        }
 
         ProcessBehavior mapped{};
         mapped.processId   = pid;
         mapped.parentPid   = parentPid;
-        mapped.type        = type;
-        mapped.risk        = RiskLevel::High;
+        mapped.type        = BehaviorType::Unknown;  // no feed routed here carries a behaviour type
+        mapped.risk        = risk;
         mapped.timestamp   = NowEpochMs();
 
         auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
@@ -1930,18 +1961,13 @@ void BehaviorBlocker::OnKernelBehavioralAlert(uint32_t messageType,
     auto uint8Payload = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
 
-    // Extract behavior type from payload (third uint32_t field)
-    BehaviorType type = BehaviorType::Unknown;
-    if (payload.size() >= sizeof(uint32_t) * 3) {
-        uint32_t typeValue = 0;
-        std::memcpy(&typeValue, payload.data() + sizeof(uint32_t) * 2, sizeof(uint32_t));
-        if (typeValue <= static_cast<uint32_t>(BehaviorType::Discovery)) {
-            type = static_cast<BehaviorType>(typeValue);
-        }
-    }
-
-    (void)messageType; // Already validated by caller (RTP dispatcher)
-    m_impl->OnKernelBehavioralAlert(type, uint8Payload);
+    // No behaviour type is extracted from the payload. None of the feeds routed
+    // here (BehavioralAlert, NamedPipeEvent, RansomwareAlert) carry one; the old
+    // code read the "third uint32_t" as a type, which is ThreadId (offset 8) in
+    // SHADOWSTRIKE_BEHAVIORAL_ALERT, so the type was a thread id reinterpreted as
+    // an enum - Unknown for every real thread. The impl ranks risk from the
+    // message type (and, for ETW telemetry, the forwarded Level) instead.
+    m_impl->OnKernelBehavioralAlert(messageType, uint8Payload);
 }
 
 // ---- Process Control ----

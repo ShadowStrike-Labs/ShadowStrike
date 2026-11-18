@@ -14,8 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include <vector>
+#include <cstring>
+#include <cstddef>
+
 #include "../../../src/PhantomCore/RealTime/BehaviorBlocker.hpp"
 #include "RealTime_TestUtils.hpp"
+#include "../../../PhantomSensor/Shared/MessageProtocol.h"
 
 namespace ShadowStrike::RealTime::Tests {
 
@@ -263,6 +268,87 @@ TEST_F(BehaviorBlockerTest, CompositeDoesNotEscalateOnTwoMediumEvents) {
     const auto med = ChainEvent(54323, RiskLevel::Medium);
     EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(med));
     EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(med));
+    EXPECT_EQ(0u, blocker.GetStatistics().chainEscalationTerminationsWithheld);
+}
+
+// ----------------------------------------------------------------------------
+// Task 388: the kernel behavioural-alert handler is shared by three feeds that do
+// not mean the same thing. BehavioralAlert is raw ETW telemetry (ranked by its ETW
+// Level, never High), NamedPipeEvent is context (Low), RansomwareAlert is a kernel
+// verdict (High). The old handler mapped every record to High and read the payload's
+// third uint32_t (ThreadId) as a behaviour type. All pids below are far out of range
+// so no case can terminate a real process.
+// ----------------------------------------------------------------------------
+namespace {
+
+// A SHADOWSTRIKE_BEHAVIORAL_ALERT wire payload (56 bytes). threadId sits at offset 8,
+// the field the old handler misread as a behaviour type; etwLevel sits at offset 44.
+std::vector<std::byte> MakeBehavioralAlert(uint32_t pid, uint32_t threadId, uint8_t etwLevel) {
+    std::vector<std::byte> buf(sizeof(SHADOWSTRIKE_BEHAVIORAL_ALERT), std::byte{0});
+    const uint32_t ppid = 1000u;
+    std::memcpy(buf.data() + 0, &pid, sizeof(pid));
+    std::memcpy(buf.data() + 4, &ppid, sizeof(ppid));
+    std::memcpy(buf.data() + 8, &threadId, sizeof(threadId));
+    buf[44] = static_cast<std::byte>(etwLevel);
+    return buf;
+}
+
+// The two ids the handler requires, plus a bait third uint32_t: a reintroduced
+// ThreadId-as-type read would turn thirdWord into a behaviour type.
+std::vector<std::byte> MakeIdPayload(uint32_t pid, uint32_t thirdWord) {
+    std::vector<std::byte> buf(sizeof(uint32_t) * 3, std::byte{0});
+    const uint32_t ppid = 1000u;
+    std::memcpy(buf.data() + 0, &pid, sizeof(pid));
+    std::memcpy(buf.data() + 4, &ppid, sizeof(ppid));
+    std::memcpy(buf.data() + 8, &thirdWord, sizeof(thirdWord));
+    return buf;
+}
+
+}  // namespace
+
+TEST_F(BehaviorBlockerTest, KernelBehavioralAlertTelemetryDoesNotEscalate) {
+    ASSERT_TRUE(blocker.Initialize(ChainTestConfig()));
+    ASSERT_TRUE(blocker.Start());
+
+    // Informational record (ETW level 4) -> Low, and its ThreadId is 3, the value
+    // the old code misread as ProcessInjection. It is type-less Low telemetry:
+    // no chain escalation and no misclassified block.
+    auto info = MakeBehavioralAlert(0x7FFFFFE0u, /*threadId*/3u, /*level*/4u);
+    blocker.OnKernelBehavioralAlert(static_cast<uint32_t>(FilterMessageType_BehavioralAlert), info);
+
+    // Critical level (1) -> Medium, still below the 0.70 escalation threshold.
+    auto crit = MakeBehavioralAlert(0x7FFFFFE1u, 3u, /*level*/1u);
+    blocker.OnKernelBehavioralAlert(static_cast<uint32_t>(FilterMessageType_BehavioralAlert), crit);
+
+    const auto stats = blocker.GetStatistics();
+    EXPECT_EQ(0u, stats.chainEscalationTerminationsWithheld);
+    EXPECT_EQ(0u, stats.threatsBlocked);
+}
+
+TEST_F(BehaviorBlockerTest, KernelRansomwareAlertKeepsVerdictRiskAndIsNotMisclassified) {
+    ASSERT_TRUE(blocker.Initialize(ChainTestConfig()));
+    ASSERT_TRUE(blocker.Start());
+
+    // A ransomware alert is a kernel verdict: it keeps High and escalates the chain
+    // (termination withheld by default policy and counted), so the telemetry fix did
+    // not silence the verdict feed. Its third uint32_t is 3 (ProcessInjection): with
+    // the ThreadId-as-type read removed it is NOT turned into a blocking rule match,
+    // so nothing is blocked (and the chain-escalation path, not a rule, fires).
+    auto alert = MakeIdPayload(0x7FFFFFE2u, /*thirdWord*/3u);
+    blocker.OnKernelBehavioralAlert(static_cast<uint32_t>(FilterMessageType_RansomwareAlert), alert);
+
+    const auto stats = blocker.GetStatistics();
+    EXPECT_EQ(1u, stats.chainEscalationTerminationsWithheld);
+    EXPECT_EQ(0u, stats.threatsBlocked);
+}
+
+TEST_F(BehaviorBlockerTest, KernelNamedPipeEventIsContextNotEscalation) {
+    ASSERT_TRUE(blocker.Initialize(ChainTestConfig()));
+    ASSERT_TRUE(blocker.Start());
+
+    // Named-pipe events are ordinary context, not detections: Low, no escalation.
+    auto pipe = MakeIdPayload(0x7FFFFFE3u, 0u);
+    blocker.OnKernelBehavioralAlert(static_cast<uint32_t>(FilterMessageType_NamedPipeEvent), pipe);
     EXPECT_EQ(0u, blocker.GetStatistics().chainEscalationTerminationsWithheld);
 }
 
