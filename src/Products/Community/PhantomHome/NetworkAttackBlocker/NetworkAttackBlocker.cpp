@@ -60,6 +60,7 @@ using Core::Network::BeaconingAnalysis;
 using Core::Network::DataExfiltrationAnalysis;
 using Core::Network::IPAddress;
 using Core::Network::NetworkMonitor;
+using Core::Network::NetworkMonitorConfig;
 using Core::Network::PortScanAnalysis;
 using Core::Network::ThreatIndicator;
 using Core::Network::BlockReason;
@@ -307,11 +308,30 @@ bool NetworkAttackBlocker::Start() noexcept {
         return true;  // Already running.
     }
 
-    if (!NetworkMonitor::HasInstance()) {
+    // NetworkMonitor is a shared PhantomCore service this module subscribes to for
+    // threat callbacks. Its lifecycle is owned by RealTimeProtection, but the Home
+    // orchestrator's CoreProtections phase can run before RTP reaches its network
+    // init: in the 1.0.142 run NetworkAttackBlocker started about 785 ms before RTP
+    // logged "NetworkMonitor initialized and started", so HasInstance() was still
+    // false here and the module failed to start, silently leaving network-attack
+    // blocking off. NAB therefore ensures its own dependency rather than racing RTP.
+    // Initialize() and Start() are idempotent (they early-return if already
+    // initialized/running) and both callers pass NetworkMonitorConfig::CreateDefault(),
+    // so whichever of RTP or NAB runs first wins and the other is a no-op. Expressing
+    // this as a declared cross-layer dependency in the orchestrator is task 235; this
+    // makes the dependency robust at the point of need in the meantime.
+    auto& nm = NetworkMonitor::Instance();
+    if (!nm.Initialize(NetworkMonitorConfig::CreateDefault())) {
         SS_LOG_ERROR(kLogCategory,
-            L"Start: NetworkMonitor singleton not available; cannot subscribe "
-            L"to threat callbacks. NetworkAttackBlocker requires PhantomCore "
-            L"NetworkMonitor to be initialised before PhantomHome modules start");
+            L"Start: NetworkMonitor initialization failed; cannot subscribe to "
+            L"threat callbacks");
+        m_impl->running.store(false, std::memory_order_release);
+        return false;
+    }
+    if (!nm.Start()) {
+        SS_LOG_ERROR(kLogCategory,
+            L"Start: NetworkMonitor failed to start; cannot subscribe to threat "
+            L"callbacks");
         m_impl->running.store(false, std::memory_order_release);
         return false;
     }
