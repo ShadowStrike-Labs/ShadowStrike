@@ -394,8 +394,8 @@ struct BehaviorBlockerConfig {
     /// @brief Permit a behaviour-chain escalation to terminate a process.
     ///
     /// DEFAULTS TO FALSE, DELIBERATELY. Chain escalation is INFERENCE: the composite
-    /// score is a decayed sum of per-event risk with no named referent, so reaching the
-    /// threshold says "several scored events landed on this pid" and not "this pid is a
+    /// score is a decayed maximum of per-event risk with no named referent, so reaching
+    /// the threshold says "a High-scored event landed on this pid" and not "this pid is a
     /// threat". Terminating on that is irreversible, and TerminateProcessInternal takes
     /// the whole process TREE.
     ///

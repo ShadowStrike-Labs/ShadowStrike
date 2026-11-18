@@ -113,13 +113,13 @@ constexpr uint32_t       kChainAutoEscalateCount   = 3;
 // 300 s window, each carrying a std::string ruleId, across 156 live pids. That
 // is unbounded per-process growth driven by an external rate.
 //
-// THIS CANNOT SUPPRESS AN ESCALATION THAT WOULD OTHERWISE FIRE, which is why it
-// is a safe bound rather than a calibration change. Worst case for a full
-// chain is every event at the lowest non-zero risk (Low = 0.15) and every event
-// aged the full 300 s, giving decay = exp(-0.01 * 300) = 0.0498 and a composite
-// of 256 * 0.15 * 0.0498 = 1.91, still comfortably above the 0.70 threshold.
-// Any chain shorter than this ceiling is unaffected in every respect. So the
-// only chains touched are ones already far past escalating.
+// THIS CANNOT SUPPRESS AN ESCALATION THAT WOULD OTHERWISE FIRE. The composite is
+// the decayed MAXIMUM of the retained events (see UpdateBehaviorChain) and the
+// ceiling evicts the OLDEST events first. An event can only reach the 0.70
+// threshold while recent: a Critical (1.0) needs decay >= 0.70, i.e. age <= ~36 s,
+// and a High (0.70) needs age ~0. A threshold-crossing event is therefore always
+// among the most recent, never among the oldest the ceiling drops, so the bound
+// protects memory without changing any escalation outcome.
 //
 constexpr size_t         kMaxChainEvents           = 256;
 
@@ -1522,12 +1522,23 @@ private:
             chain.events.pop_front();
         }
 
-        // Recalculate composite score with time decay
+        // Composite score with time decay, taken as the decayed MAXIMUM of the
+        // chain's events, not their sum. RiskToScore maps one event into [0,1] -
+        // the same scale escalationThreshold (0.70) is expressed in - so a single
+        // High (0.70) or Critical (1.0) event crosses the threshold and a stream of
+        // lesser events does not. The previous SUM grew without bound in chain
+        // length: 256 High events summed to 179 against a 0.70 threshold, so any
+        // process emitting a steady event stream escalated and the signal carried no
+        // information (an idle logon screen escalated MsMpEng ~1,500 times a second).
+        // Corroboration of several strong events is still captured by the
+        // highRiskCount path below. The max is <= the old sum for every chain, so
+        // this change can only remove an escalation, never introduce one.
         chain.compositeScore = 0.0f;
         for (const auto& e : chain.events) {
-            float ageSec = static_cast<float>(now - e.timestamp) / 1000.0f;
-            float decay  = std::exp(-kDecayLambda * ageSec);
-            chain.compositeScore += e.riskScore * decay;
+            float ageSec  = static_cast<float>(now - e.timestamp) / 1000.0f;
+            float decay   = std::exp(-kDecayLambda * ageSec);
+            float decayed = e.riskScore * decay;
+            if (decayed > chain.compositeScore) chain.compositeScore = decayed;
         }
 
         uint32_t highRiskCount = 0;

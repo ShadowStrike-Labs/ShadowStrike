@@ -198,4 +198,72 @@ TEST_F(BehaviorBlockerTest, LifecycleAndAnalysisGatesPreserveAllowByDefaultBehav
     EXPECT_EQ(ComponentState::Stopped, blocker.GetState());
 }
 
+// ----------------------------------------------------------------------------
+// Task 388: chain-escalation composite is the decayed MAXIMUM, not a SUM.
+//
+// The old composite summed up to 256 decayed per-event scores and compared the
+// total to a single-event 0.70 threshold, so a process escalated on event VOLUME
+// alone: the 1.0.133 run escalated MsMpEng ~1,500 times a second on an idle logon
+// screen. Escalation is observed here through chainEscalationTerminationsWithheld
+// with allowChainEscalationTermination left false (its default), so these tests
+// exercise the real policy path and never terminate a real process.
+// ----------------------------------------------------------------------------
+namespace {
+
+BehaviorBlockerConfig ChainTestConfig() {
+    auto cfg = BehaviorBlockerConfig::CreateDefault();
+    cfg.enableTemporalCorrelation       = true;
+    cfg.allowChainEscalationTermination = false;  // observe via the withheld counter
+    cfg.escalationThreshold             = 0.7f;
+    return cfg;
+}
+
+ProcessBehavior ChainEvent(uint32_t pid, RiskLevel risk) {
+    ProcessBehavior b;
+    b.processId   = pid;
+    b.parentPid   = 1000;
+    b.processPath = L"C:\\test\\subject.exe";
+    b.type        = BehaviorType::Discovery;  // no default rule targets Discovery
+    b.risk        = risk;
+    return b;
+}
+
+}  // namespace
+
+TEST_F(BehaviorBlockerTest, CompositeIsDecayedMaxSoEventVolumeAloneDoesNotEscalate) {
+    ASSERT_TRUE(blocker.Initialize(ChainTestConfig()));
+    ASSERT_TRUE(blocker.Start());
+
+    // 300 back-to-back Low events for one pid. Under the old sum these reached
+    // ~256 * 0.15 = 38, far past 0.70; under the decayed max the composite stays
+    // at 0.15 and never escalates.
+    const auto low = ChainEvent(54321, RiskLevel::Low);
+    for (int i = 0; i < 300; ++i) {
+        EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(low));
+    }
+    EXPECT_EQ(0u, blocker.GetStatistics().chainEscalationTerminationsWithheld);
+}
+
+TEST_F(BehaviorBlockerTest, CompositeStillEscalatesOnASingleHighRiskEvent) {
+    ASSERT_TRUE(blocker.Initialize(ChainTestConfig()));
+    ASSERT_TRUE(blocker.Start());
+
+    // One genuine High event reaches 0.70 == threshold and escalates; the kill is
+    // withheld by default policy and counted. Real verdicts still escalate.
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(ChainEvent(54322, RiskLevel::High)));
+    EXPECT_EQ(1u, blocker.GetStatistics().chainEscalationTerminationsWithheld);
+}
+
+TEST_F(BehaviorBlockerTest, CompositeDoesNotEscalateOnTwoMediumEvents) {
+    ASSERT_TRUE(blocker.Initialize(ChainTestConfig()));
+    ASSERT_TRUE(blocker.Start());
+
+    // Two Medium events: decayed max = 0.35 < 0.70, no escalation. Under the old
+    // sum they totalled 0.70 and escalated - the over-escalation 388 cites.
+    const auto med = ChainEvent(54323, RiskLevel::Medium);
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(med));
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(med));
+    EXPECT_EQ(0u, blocker.GetStatistics().chainEscalationTerminationsWithheld);
+}
+
 }  // namespace ShadowStrike::RealTime::Tests
