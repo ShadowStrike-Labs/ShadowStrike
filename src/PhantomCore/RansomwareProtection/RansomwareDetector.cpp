@@ -397,18 +397,12 @@ public:
             L"=== RANSOMWARE CONFIRMED === PID %u  confidence=%.2f  family=%u",
             pid, event.confidence, static_cast<unsigned>(event.family));
 
-        // 0. Request kernel process block via IPC (fastest path)
-        try {
-            using namespace Communication;
-            if (IPCManager::HasInstance() && IPCManager::Instance().IsFilterPortConnected()) {
-#pragma pack(push, 1)
-                struct { uint32_t msgType; uint32_t pid; } blockReq{0x30, pid};
-#pragma pack(pop)
-                (void)IPCManager::Instance().SendToKernel(&blockReq, sizeof(blockReq));
-            }
-        } catch (...) {}
-
-        // 1. Terminate process tree via ProcessKiller
+        // Terminate the process tree via ProcessKiller - the real enforcement.
+        // There is deliberately no kernel-IPC "block" step: the kernel exposes no
+        // on-demand process-block handler, and the former step-0 send used an
+        // invented 0x30 message type with no SHADOWSTRIKE_MESSAGE_HEADER, so the
+        // driver refused it and it was dead (task 158/361). User-mode termination
+        // is the block, and it is what the stats and logs below record.
         auto killResult = Core::Process::ProcessKiller::TerminateTree(pid);
         if (killResult == Core::Process::KillResult::Success ||
             killResult == Core::Process::KillResult::AlreadyDead) {
@@ -1720,36 +1714,6 @@ void RansomwareDetector::OnKernelImageLoad(uint32_t /*processId*/, std::wstring_
                                             uint64_t /*imageBase*/, size_t /*imageSize*/) {
     // RansomwareDetector operates on file I/O patterns, not image loads.
     // This is a no-op passthrough for kernel bridge API uniformity.
-}
-
-bool RansomwareDetector::RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason) {
-    try {
-        using namespace Communication;
-        if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected()) {
-            SS_LOG_DEBUG(L"RansomwareDetector", L"Kernel IPC not available for process block PID=%u", processId);
-            return false;
-        }
-#pragma pack(push, 1)
-        struct KernelBlockRequest {
-            uint32_t messageType;
-            uint32_t processId;
-            wchar_t  reason[256];
-        };
-#pragma pack(pop)
-        KernelBlockRequest req{};
-        req.messageType = 0x30;
-        req.processId = processId;
-        wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(), _TRUNCATE);
-        req.reason[_countof(req.reason) - 1] = L'\0';
-
-        bool result = IPCManager::Instance().SendToKernel(&req, sizeof(req));
-        if (result)
-            SS_LOG_INFO(L"RansomwareDetector", L"Kernel block requested for PID=%u", processId);
-        return result;
-    } catch (const std::exception& ex) {
-        SS_LOG_ERROR(L"RansomwareDetector", L"RequestKernelProcessBlock error: %hs", ex.what());
-        return false;
-    }
 }
 
 // ============================================================================

@@ -1172,9 +1172,6 @@ public:
     /// @brief Called from kernel image load notify callback.
     void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
                            uint64_t imageBase, size_t imageSize);
-    /// @brief Request kernel to block a process via IPC.
-    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
-                                                 const std::wstring& reason);
 
     // ========================================================================
     // CROSS-MODULE WIRING
