@@ -2331,6 +2331,27 @@ PsipPathIsUnderProductInstallTree(
     return FALSE;
 }
 
+//
+// Task 360: read-only, exported accessor over the one authoritative install-tree
+// matcher above. SelfProtect.c's ShadowStrikeIsPathProtected calls this so the
+// file self-protection gate treats the product's own registered install tree as
+// a protected location, sharing the single source of truth (g_ProductInstallTree,
+// registered once via FilterMessageType_RegisterProtectedPath in both device and
+// \??\ DOS form) rather than keeping a second copy of the tree in the SelfProtect
+// path table. Same lock-free, dual-form, case-insensitive contract as the
+// internal matcher. The file gate's installer/servicing allow
+// (ShadowStrikeIsInstallerServicingOwnTree) still lets the product's own signed
+// uninstall remove the tree, so activating protection does not re-break uninstall.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowStrikeIsPathUnderProductInstallTree(
+    _In_opt_ PCUNICODE_STRING Path
+    )
+{
+    return PsipPathIsUnderProductInstallTree(Path);
+}
+
 /**
  * @brief TRUE if Path names a Config.Msi directory at a volume root.
  *

@@ -27,6 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SELF_PROTECT_C = ROOT / "PhantomSensor" / "PhantomSensor" / "SelfProtection" / "SelfProtect.c"
 PRE_SET_INFO_C = ROOT / "PhantomSensor" / "PhantomSensor" / "Callbacks" / "FileSystem" / "PreSetInfo.c"
+PRE_SET_INFO_H = ROOT / "PhantomSensor" / "PhantomSensor" / "Callbacks" / "FileSystem" / "PreSetInfo.h"
 
 PREDICATE = "ShadowStrikeIsInstallerServicingOwnTree"
 
@@ -140,6 +141,57 @@ class SelfProtectInstallerExemptionContract(unittest.TestCase):
             "the root node is the registered prefix with its single trailing "
             "separator removed (PrefixLength - sizeof(WCHAR)); exact equality "
             "against that adds only the root, never a sibling path")
+
+
+class SelfProtectInstallTreeProtectionContract(unittest.TestCase):
+    """Task 360: the file self-protect gate treats the product's own install tree
+    as a protected location, so tampering with the installed binaries is blocked.
+
+    Before this, ShadowStrikeShouldBlockFileAccess was wired and enabled but inert:
+    ShadowStrikeIsPathProtected only consulted g_ProtectedPaths, which has no
+    producer, so every call returned FALSE. The fix has it also consult the single
+    authoritative install-tree record (g_ProductInstallTree, registered once via
+    FilterMessageType_RegisterProtectedPath) through an exported accessor, rather
+    than keeping a second copy of the tree. The installer/servicing exemption that
+    SelfProtectInstallerExemptionContract pins keeps the product's own signed
+    uninstall working, so activating protection does not re-break task 322/384.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sp = _strip_c_comments(SELF_PROTECT_C.read_text(encoding="utf-8"))
+        cls.psi_c = _strip_c_comments(PRE_SET_INFO_C.read_text(encoding="utf-8"))
+        cls.psi_h = _strip_c_comments(PRE_SET_INFO_H.read_text(encoding="utf-8"))
+
+    def test_is_path_protected_consults_the_install_tree_before_the_empty_table(self) -> None:
+        fn = _slice(self.sp, "ShadowStrikeIsPathProtected",
+                    "ShadowStrikeAddProtectedRegistryKey")
+        i_tree = fn.find("ShadowStrikeIsPathUnderProductInstallTree")
+        i_loop = fn.find("g_ProtectedPaths[i].InUse")
+        self.assertGreaterEqual(
+            i_tree, 0,
+            "ShadowStrikeIsPathProtected no longer consults the install tree, so "
+            "the file self-protect gate is inert again (its path table has no "
+            "producer) - task 360")
+        self.assertGreaterEqual(i_loop, 0, "the path-table loop is missing")
+        self.assertLess(
+            i_tree, i_loop,
+            "the install-tree consult must come BEFORE the path-table loop, so "
+            "protection holds even though the table is empty")
+
+    def test_accessor_delegates_to_the_one_authoritative_matcher(self) -> None:
+        body = _slice(self.psi_c, "ShadowStrikeIsPathUnderProductInstallTree",
+                      "PsipPathHasVolumeRootConfigMsi")
+        self.assertIn(
+            "PsipPathIsUnderProductInstallTree", body,
+            "the exported accessor must delegate to the single authoritative "
+            "matcher, not keep a second copy of the install tree")
+
+    def test_accessor_is_declared_in_the_header(self) -> None:
+        self.assertIn(
+            "ShadowStrikeIsPathUnderProductInstallTree", self.psi_h,
+            "the accessor must be declared in PreSetInfo.h so SelfProtect.c, which "
+            "already includes it, can call it across the module boundary")
 
 
 if __name__ == "__main__":

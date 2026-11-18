@@ -945,6 +945,20 @@ ShadowStrikeIsPathProtected(
         return FALSE;
     }
 
+    //
+    // Task 360: the product's own install tree is a protected location. It is
+    // registered once by the service (task 384's FilterMessageType_RegisterProtectedPath,
+    // held in g_ProductInstallTree in both device and DOS form) and matched by the
+    // one authoritative dual-form, lock-free checker, rather than copied into the
+    // g_ProtectedPaths table under a second name. A non-exempt write or delete to
+    // the product's binaries is therefore blocked by the file gate; the gate's
+    // existing ShadowStrikeIsInstallerServicingOwnTree allow still lets the
+    // product's own signed uninstall remove the tree.
+    //
+    if (ShadowStrikeIsPathUnderProductInstallTree(Path)) {
+        return TRUE;
+    }
+
     oldIrql = ExAcquireSpinLockShared(&g_ProtectedPathLock);
 
     for (i = 0; i < SHADOWSTRIKE_MAX_PROTECTED_PATHS; i++) {

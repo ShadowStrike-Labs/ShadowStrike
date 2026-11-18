@@ -362,6 +362,26 @@ ShadowStrikeIsInstallerServicingOwnTree(
     _In_ HANDLE RequestorPid
     );
 
+/**
+ * @brief TRUE if Path lies under the product's own registered install tree.
+ *
+ * Exposed for SelfProtect.c (ShadowStrikeIsPathProtected, task 360) so the file
+ * self-protection gate shares the single authoritative install-tree record
+ * (g_ProductInstallTree, registered via FilterMessageType_RegisterProtectedPath
+ * in both device and \??\ DOS form) rather than keeping a second copy. Unlike
+ * ShadowStrikeIsInstallerServicingOwnTree this is the membership test ALONE, with
+ * no signer check, because the caller uses it to decide what to PROTECT, not what
+ * to exempt. Lock-free and dual-form; declines while the tree is mid-registration
+ * (Valid == 0). Case-insensitive.
+ *
+ * @irql <= DISPATCH_LEVEL
+ */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN
+ShadowStrikeIsPathUnderProductInstallTree(
+    _In_opt_ PCUNICODE_STRING Path
+    );
+
 #ifdef __cplusplus
 }
 #endif
