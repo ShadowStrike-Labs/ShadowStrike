@@ -57,6 +57,8 @@
 #include "../Behavioral/BehaviorEngine.h"
 #include "../ETW/TelemetryEvents.h"
 #include "../Callbacks/FileSystem/PreSetInfo.h"
+#include "../Callbacks/Registry/RegistryCallback.h"
+#include "../Utilities/ProcessUtils.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, ShadowStrikeInitializeSelfProtection)
@@ -414,6 +416,39 @@ ShadowStrikeInitializeSelfProtection(
     // Mark initialized â€” publish with full barrier
     //
     InterlockedExchange(&g_SelfProtectInitialized, 1);
+
+    //
+    // Task 394: seed the product's own built-in protected registry key. This
+    // runs AFTER the subsystem is marked initialized, which
+    // ShadowStrikeAddProtectedRegistryKey requires. The product's SOFTWARE hive
+    // SHADOWSTRIKE_REG_OUR_SOFTWARE (\REGISTRY\MACHINE\SOFTWARE\ShadowStrike)
+    // holds the product's install state and policy; a non-signed process
+    // deleting or rewriting it is tampering. Registry key native paths are
+    // machine-independent - unlike the install directory (task 384) - so they
+    // are built-in defaults seeded here rather than pushed by the service:
+    // protection exists before the service connects and no user-mode native-path
+    // conversion is needed (cf. task 348). The prefix carries no trailing
+    // separator, so the key itself AND its whole subtree match (the matcher is a
+    // case-insensitive prefix); the Flags field is unused by the registry
+    // decision (it blocks by operation type) and is zero. The driver's own
+    // Services key is deliberately NOT seeded here: its self-protect constant is
+    // stale (it names ShadowStrikeFlt, not the installed PhantomSensor) and its
+    // native form carries the control-set-symlink problem; that protection is
+    // tracked and validated separately.
+    //
+    // ShadowStrikeAddProtectedRegistryKey is NOT in the PAGE section, so calling
+    // it here from this pageable init is safe: this code runs at PASSIVE_LEVEL
+    // and the brief EX_SPIN_LOCK raise happens inside that non-paged callee.
+    //
+    {
+        NTSTATUS seedStatus = ShadowStrikeAddProtectedRegistryKey(
+            SHADOWSTRIKE_REG_OUR_SOFTWARE, 0);
+        if (!NT_SUCCESS(seedStatus)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                       "[ShadowStrike] Failed to seed built-in protected regkey: 0x%08X\n",
+                       seedStatus);
+        }
+    }
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                "[ShadowStrike] Self-protection initialized\n");
@@ -1385,6 +1420,49 @@ ShadowStrikeShouldBlockFileAccess(
 // REGISTRY ACCESS PROTECTION
 // ============================================================================
 
+/**
+ * @brief Windows-signed servicing caller check for the registry self-protect gate.
+ *
+ * Every key in g_ProtectedRegKeys is the product's OWN (seeded built-in at init,
+ * currently the product's SOFTWARE hive). The only legitimate writers to the
+ * product's own keys are the OS servicing stack - msiexec writing and removing
+ * SOFTWARE\ShadowStrike during install/uninstall, and the Service Control Manager
+ * (services.exe) during service configuration - all Windows Code Integrity
+ * signed. Allowing a Windows-signed caller to modify one of OUR OWN protected
+ * keys is the product's own servicing, not tampering: the registry mirror of the
+ * file gate's ShadowStrikeIsInstallerServicingOwnTree (task 322/384). Because the
+ * table holds only our own keys, the signer gate alone scopes the allow; an
+ * unsigned or third-party-signed caller is not exempt and the block stays in
+ * force. The signature query runs only at PASSIVE_LEVEL; declining above it
+ * leaves self-protection in force, which is the safe direction. Registry
+ * callbacks are invoked at PASSIVE_LEVEL, so the real uninstall/servicing path
+ * always reaches the query.
+ */
+static
+BOOLEAN
+SspIsWindowsSignedServicingCaller(
+    _In_ HANDLE RequestorPid
+    )
+{
+    BOOLEAN isSigned = FALSE;
+    SHADOW_SIGNER_TYPE signer = ShadowSignerNone;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;
+    }
+
+    if (!NT_SUCCESS(ShadowStrikeValidateProcessSignature(RequestorPid,
+                                                         &isSigned,
+                                                         &signer)) ||
+        !isSigned) {
+        return FALSE;
+    }
+
+    return (signer == ShadowSignerWindows ||
+            signer == ShadowSignerWinTcb ||
+            signer == ShadowSignerWinSystem);
+}
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN
 ShadowStrikeShouldBlockRegistryAccess(
@@ -1416,6 +1494,22 @@ ShadowStrikeShouldBlockRegistryAccess(
     }
 
     if (!ShadowStrikeIsRegistryKeyProtected(KeyPath)) {
+        SspLeaveOperation();
+        return FALSE;
+    }
+
+    //
+    // Allow the product's own servicing. The keys in g_ProtectedRegKeys are the
+    // product's own (seeded at init), and a Windows Code Integrity signed caller
+    // - msiexec removing SOFTWARE\ShadowStrike during uninstall, or the Service
+    // Control Manager configuring the service - is legitimate servicing, not
+    // tampering. Without this, activating key protection would re-block the
+    // product's own MSI uninstall deleting its keys (the registry analogue of
+    // task 322). Declines above PASSIVE_LEVEL and for any unsigned / third-party
+    // caller, so self-protection stays in force in every other case; see
+    // SspIsWindowsSignedServicingCaller.
+    //
+    if (SspIsWindowsSignedServicingCaller(RequestorPid)) {
         SspLeaveOperation();
         return FALSE;
     }
