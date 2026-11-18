@@ -713,6 +713,7 @@ public:
      */
     struct PublisherTrustDecision {
         bool trusted = false;          ///< A verified signature from a trusted publisher.
+        bool firstParty = false;       ///< The verified signer is the product's OWN code-signing identity (task 385).
         std::wstring signerName;       ///< The signer, for the audit trail. May be empty.
         const char* basis = "";        ///< Why it was trusted, for the log. Never null.
     };

@@ -1397,6 +1397,7 @@ public:
     //
     struct TrustSuppression {
         bool suppress = false;
+        bool firstParty = false;
         std::wstring signerName;
         const char* basis = "";
         /// Why trust was or was not established; logged on every non-suppression so
@@ -1491,6 +1492,7 @@ public:
         // whitelist and cannot be removed by policy.
         if (IsFirstPartySigner(info.signer)) {
             decision.suppress = true;
+            decision.firstParty = true;
             decision.basis = "first-party (own publisher)";
             decision.signerName = info.signer.signerName;
             decision.why = decision.basis;
@@ -5769,6 +5771,7 @@ ScanEngine::PublisherTrustDecision ScanEngine::EvaluatePublisherTrust(
     }
     const auto internal = m_impl->EvaluatePublisherTrust(filePath);
     decision.trusted = internal.suppress;
+    decision.firstParty = internal.firstParty;
     decision.signerName = internal.signerName;
     decision.basis = internal.basis;
     return decision;

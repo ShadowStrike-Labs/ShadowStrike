@@ -430,4 +430,58 @@ TEST(ExtractBoundedWidePathTests, RejectsAnAllNulPath) {
     EXPECT_FALSE(Detail::ExtractBoundedWidePath(buf.data(), buf.size(), 72, 4).has_value());
 }
 
+// =============================================================================
+// Task 385 follow-up 3: verified-own-binary remediation withhold policy.
+//
+// The product's shipped binaries carry the detection strings the shipped rules
+// match (metsrv, ReflectiveLoader, the DITEKSHEN Defender-disable value names),
+// so a deep-scan tier self-matches them - field-measured as 14 YARA convictions
+// of ShadowStrikePhantomService.exe in 22 minutes that tried to quarantine and
+// terminate the service. Detail::WithholdOwnBinaryIdentificationRemediation is
+// the pure policy deciding whether that DESTRUCTIVE action is withheld. Detection
+// is never affected here; only the quarantine/terminate is in question.
+// =============================================================================
+
+TEST(OwnBinaryRemediationWithholdTests, WithholdsOnlyForOwnFirstPartyAndUntampered) {
+    // The one case that withholds: our own install-tree binary, validly signed by
+    // our own identity, with no baseline contradiction.
+    EXPECT_TRUE(Detail::WithholdOwnBinaryIdentificationRemediation(
+        /*own*/ true, /*firstParty*/ true, /*baselineContradicts*/ false));
+}
+
+TEST(OwnBinaryRemediationWithholdTests, RemediatesWhenNotOurOwnPath) {
+    // A foreign binary is never withheld, however it is signed - a signed vendor
+    // file matching a malware rule is the stolen-cert / supply-chain case.
+    EXPECT_FALSE(Detail::WithholdOwnBinaryIdentificationRemediation(false, true, false));
+}
+
+TEST(OwnBinaryRemediationWithholdTests, RemediatesOurPathWhenNotFirstPartySigned) {
+    // A file at our install path but not validly signed by our identity (unsigned
+    // or foreign-signed) is a replacement; it must remediate.
+    EXPECT_FALSE(Detail::WithholdOwnBinaryIdentificationRemediation(true, false, false));
+}
+
+TEST(OwnBinaryRemediationWithholdTests, RemediatesWhenBaselineContradictsEvenIfSigned) {
+    // Our path and signed by our identity, but the on-disk bytes no longer match
+    // the tamper-protection baseline: replaced since install (the stolen-key swap
+    // this third proof defeats). It must remediate.
+    EXPECT_FALSE(Detail::WithholdOwnBinaryIdentificationRemediation(true, true, true));
+}
+
+TEST(OwnBinaryRemediationWithholdTests, EveryProofIsNecessary) {
+    // Exhaustive over the three booleans: the destructive action is withheld in
+    // exactly one of the eight combinations - own AND first-party AND not
+    // contradicted. Any missing proof remediates, so a planted or tampered file
+    // at our own path cannot shelter behind the exemption.
+    for (int bits = 0; bits < 8; ++bits) {
+        const bool own    = (bits & 0b100) != 0;
+        const bool fp     = (bits & 0b010) != 0;
+        const bool contra = (bits & 0b001) != 0;
+        const bool expectWithhold = own && fp && !contra;
+        EXPECT_EQ(Detail::WithholdOwnBinaryIdentificationRemediation(own, fp, contra),
+                  expectWithhold)
+            << "own=" << own << " firstParty=" << fp << " baselineContradicts=" << contra;
+    }
+}
+
 }  // namespace ShadowStrike::RealTime::Tests

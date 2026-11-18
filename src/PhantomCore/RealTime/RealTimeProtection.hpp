@@ -977,6 +977,16 @@ struct alignas(64) RTPStatistics {
     /// System32\urlmon.dll.
     std::atomic<uint64_t> signedFileRemediationWithheld{ 0 };
 
+    /// @brief Deferred-deep-scan remediations withheld because the target was the
+    ///        product's own verified intact binary matched by an IDENTIFICATION
+    ///        (task 385). The shipped binaries carry the detection content the
+    ///        shipped rules match, so a deep-scan tier self-matches them; this
+    ///        counts how often a quarantine/terminate of our OWN binary was
+    ///        withheld. Read in the periodic capacity log so a field run can tell
+    ///        "the engine never self-matched" from "the withhold never ran" - the
+    ///        signedFileRemediationWithheld lesson, a counter nobody read.
+    std::atomic<uint64_t> ownBinaryIdentificationWithheld{ 0 };
+
     /// @brief Registry writes under a watched security key whose VALUE does not
     ///        impair any protection, so they were not reported as defense evasion.
     ///
@@ -1495,6 +1505,45 @@ inline std::optional<std::wstring> ExtractBoundedWidePath(
         return std::nullopt;
     }
     return path;
+}
+
+/// Task 385 follow-up 3. Pure policy for the deferred-deep-scan remediation gate:
+/// given the three independent proofs that a remediation target is the product's
+/// OWN verified intact binary, decide whether an IDENTIFICATION-class detection's
+/// DESTRUCTIVE action (quarantine / terminate) must be withheld. Detection itself
+/// is never affected - it has already been counted and is still logged; only the
+/// destructive action is in question here.
+///
+/// The product's shipped service and driver legitimately carry the very strings
+/// the shipped rules detect (metsrv, ReflectiveLoader, the DITEKSHEN
+/// Defender-disable value names, the VM-evasion driver names), so a deep-scan tier
+/// self-matches them - field-measured as 14 YARA convictions of
+/// ShadowStrikePhantomService.exe in 22 minutes, which tried to quarantine and
+/// terminate the service (task 385). Quarantining our own binary is never a
+/// correct response to the engine recognising its own detection content.
+///
+/// All three proofs must hold, and each is necessary so a planted or trojanised
+/// file at our own path stays fully covered and remediates as before:
+///   @p isOwnInstalledBinary     the path is one of our install-tree binaries;
+///   @p firstPartyVerifiedSigner it carries a VALID signature from our own
+///                               code-signing identity (chain verified, not a
+///                               stolen certificate) - a replacement is unsigned
+///                               or foreign-signed and fails here;
+///   @p baselineContradicts      TRUE iff tamper-protection tracks a baseline for
+///                               this path AND the on-disk bytes no longer match
+///                               it (Modified / Corrupted / Unauthorized); such a
+///                               file was replaced since install and is NOT exempt
+///                               even at our own path. An absent or indeterminate
+///                               baseline does NOT contradict, so a
+///                               tamper-protection outage cannot turn this into
+///                               self-quarantine of a genuine binary.
+///
+/// Pure: no allocation, no locking, deterministic.
+[[nodiscard]] inline bool WithholdOwnBinaryIdentificationRemediation(
+        bool isOwnInstalledBinary,
+        bool firstPartyVerifiedSigner,
+        bool baselineContradicts) noexcept {
+    return isOwnInstalledBinary && firstPartyVerifiedSigner && !baselineContradicts;
 }
 
 /// Map the kernel's thread-injection verdict (forwarded in the tail of

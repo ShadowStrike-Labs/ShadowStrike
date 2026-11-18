@@ -3341,13 +3341,71 @@ public:
         return RealTimeProtection::DetectionSourceIdentifiesThreat(detectionSource);
     }
 
+    // Task 385 follow-up 3. Gathers the three proofs that filePath is the
+    // product's own verified intact binary and defers the composition to the pure,
+    // unit-tested Detail::WithholdOwnBinaryIdentificationRemediation. Order is
+    // cheapest-proof-first: a foreign file returns on the path compare and never
+    // pays for a signature or baseline lookup. Only a DEFINITIVE baseline mismatch
+    // vetoes; an absent or indeterminate baseline (not protected / Unknown /
+    // PendingVerify / repaired) does not, so a TamperProtection outage can never
+    // escalate into quarantining a genuine own binary.
+    [[nodiscard]] bool IsVerifiedOwnBinaryIntact(const std::wstring& filePath) const {
+        const bool ownPath = IsOwnInstalledBinary(filePath);
+        if (!ownPath) {
+            return false;
+        }
+        const bool firstParty =
+            Core::Engine::ScanEngine::Instance().EvaluatePublisherTrust(filePath).firstParty;
+
+        bool baselineContradicts = false;
+        if (Security::TamperProtection::HasInstance() &&
+            Security::TamperProtection::Instance().IsInitialized() &&
+            Security::TamperProtection::Instance().IsFileProtected(filePath)) {
+            const auto vr = Security::TamperProtection::Instance().VerifyFile(filePath);
+            baselineContradicts =
+                (vr.status == Security::IntegrityStatus::Modified ||
+                 vr.status == Security::IntegrityStatus::Corrupted ||
+                 vr.status == Security::IntegrityStatus::Unauthorized);
+        }
+
+        return Detail::WithholdOwnBinaryIdentificationRemediation(
+            ownPath, firstParty, baselineContradicts);
+    }
+
     // Returns true when the destructive action may proceed.
     [[nodiscard]] bool MayRemediateDetectedFile(
         const std::wstring& filePath,
         const Core::Engine::EngineResult& result) {
-        // Checked first, so an identification never pays for a signature lookup
-        // and can never be withheld by this control.
+        // An identification (hash / signature / YARA / threat-intel) names a
+        // specific known-bad thing, so it still remediates even on a signed file -
+        // a signed binary matching a malware signature IS the stolen-cert and
+        // supply-chain case. The ONE exception is the product's OWN verified intact
+        // binary: the shipped service and driver carry the detection strings the
+        // shipped rules match, so a deep-scan tier self-matches them (task 385, 14
+        // convictions of our service in 22 minutes, which tried to quarantine and
+        // terminate it). Withhold the destructive action - and only that - for our
+        // own verified binary; a replaced or tampered file at the same path is NOT
+        // exempt. Detection is still counted and still logged.
         if (DetectionIdentifiesRatherThanInfers(result.detectionSource)) {
+            if (IsVerifiedOwnBinaryIntact(filePath)) {
+                m_stats.ownBinaryIdentificationWithheld++;
+                Utils::Logger::Warn(
+                    "RealTimeProtection: WITHHELD remediation of {} - it is the "
+                    "product's own install-tree binary, validly signed by our "
+                    "code-signing identity and matching its tamper-protection "
+                    "baseline. The identification (source='{}', threat='{}') stands "
+                    "and is reported; the file is NOT quarantined and its process is "
+                    "NOT terminated. The shipped binaries carry the detection "
+                    "content the shipped rules match, so a deep-scan tier "
+                    "self-matches them; quarantining our own service is never a "
+                    "correct response. A binary at this path that is unsigned, "
+                    "foreign-signed, or whose bytes no longer match the baseline is "
+                    "NOT exempt and remediates.",
+                    Utils::StringUtils::ToNarrow(filePath),
+                    result.detectionSource,
+                    result.threatName);
+                return false;
+            }
             return true;
         }
 
@@ -8308,6 +8366,8 @@ public:
         // the control had ever withheld anything.
         const auto signedRemWithheld =
             m_stats.signedFileRemediationWithheld.load(std::memory_order_relaxed);
+        const auto ownBinIdWithheld =
+            m_stats.ownBinaryIdentificationWithheld.load(std::memory_order_relaxed);
         const auto defenderOpWrites =
             m_stats.defenderOperationalWritesIgnored.load(std::memory_order_relaxed);
         const uint64_t ownHandleOps =
@@ -8510,7 +8570,7 @@ public:
             "processNotifyBudgetExceeded={} processNotifyReplyHorizonExceeded={} "
             "processBlocksWithheldByMode={} processExitBlockRequestsIgnored={} "
             "ownBinaryBlockWithheld={} ownHandleOperationsNotFlagged={} "
-            "signedFileRemediationWithheld={} "
+            "signedFileRemediationWithheld={} ownBinaryIdentificationWithheld={} "
             "defenderOperationalWritesIgnored={} "
             "sandboxEvasionCapabilityDetected={} vmEvasionAnalysisTruncated={} "
             "debuggerEvasionAnalysisTruncated={} processEvasionAnalysisTruncated={} environmentEvasionAnalysisTruncated={} networkEvasionAnalysisTruncated={} "
@@ -8521,7 +8581,7 @@ public:
             trustDepth, trustPeak, trustDropped, newTrustDrops,
             procDepth, procPeak, procNotifyDropped, newProcDrops,
             cached, metaTrunc, packerDef, oversize, notLocal, lockedNE, lockedSupp, lockedClear, notifyBudget, replyHorizon, procWithheld,
-            exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, defenderOpWrites, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
+            exitBlockIgn, ownBinWithheld, ownHandleOps, signedRemWithheld, ownBinIdWithheld, defenderOpWrites, sandboxCap, vmTrunc, dbgTrunc, pedTrunc, envTrunc, netTrunc,
             adAvg, adMax, adN, cvAvg, cvMax, cvN,
             kernelPart, ipcRxPart);
 
@@ -9110,6 +9170,7 @@ void RTPStatistics::Reset() noexcept {
     filesCleaned = 0;
     processesTerminated = 0;
     signedFileRemediationWithheld = 0;
+    ownBinaryIdentificationWithheld = 0;
     defenderOperationalWritesIgnored = 0;
     processBlocksWithheldByMode = 0;
     ownBinaryBlockWithheld = 0;
