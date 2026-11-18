@@ -859,9 +859,17 @@ public:
         mapped.risk        = risk;
         mapped.timestamp   = NowEpochMs();
 
-        auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
-        if (pathOpt.has_value()) {
-            mapped.processPath = pathOpt.value();
+        // Resolve the process path only when the event can act or be recorded. A Low
+        // observation - ordinary ETW telemetry, which this feed mostly is - carries no
+        // behaviour type so it matches no rule (every rule is type-specific), and it
+        // cannot escalate (the composite is the decayed max and Low is 0.15 against a
+        // 0.70 threshold). The per-event OpenProcess + QueryFullProcessImageName round
+        // trip, about a thousand a second on the BehavioralAlert feed, is therefore pure
+        // cost on it. Medium and higher events keep the lookup so an escalation record
+        // still names the process.
+        if (static_cast<int>(risk) >= static_cast<int>(RiskLevel::Medium)) {
+            auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
+            mapped.processPath = pathOpt.has_value() ? pathOpt.value() : L"<kernel-event>";
         } else {
             mapped.processPath = L"<kernel-event>";
         }
