@@ -44,6 +44,7 @@
 #include "../Communication/AlertSystem.hpp"
 #include "../Communication/TelemetryCollector.hpp"
 #include "AMSIIntegration.hpp"
+#include "ScriptThreatResponse.hpp"
 
 #ifdef _WIN32
 #include <amsi.h>
@@ -1844,11 +1845,25 @@ public:
             auto cmdResult = scanCommandLine(cmdNarrow, processId);
 
             if (cmdResult.isBlocking()) {
+                // High-confidence conviction on a just-created PowerShell host.
+                // Route through the one confidence-gated response policy: it
+                // terminates the host process tree for a blockable target and
+                // reports-only for System/self or a critical/PPL target, so a
+                // legitimate admin session is never killed (fileless defense,
+                // tasks 158/361).
+                ScriptConviction conviction;
+                conviction.pid          = processId;
+                conviction.module       = Wiring::Detail::ScriptModule::PowerShell;
+                conviction.blockWorthy  = true;  // cmdResult.isBlocking() holds here
+                conviction.suspicious   = (cmdResult.status == ScanStatus::SUSPICIOUS);
+                conviction.riskScore    = cmdResult.riskScore;
+                conviction.processImage = std::wstring(imagePath);
+                conviction.reason       = L"PowerShell threat: " +
+                                          Utils::StringUtils::ToWide(cmdResult.threatName);
+                const auto action = RespondToScriptThreat(conviction);
                 SS_LOG_WARN(LOG_CAT,
-                    L"Kernel-triggered PS scan: BLOCKING PID=%u threat=%hs",
-                    processId, cmdResult.threatName.c_str());
-                (void)requestKernelProcessBlockImpl(processId,
-                    L"PowerShell threat: " + Utils::StringUtils::ToWide(cmdResult.threatName));
+                    L"Kernel-triggered PS scan: PID=%u threat=%hs action=%hs",
+                    processId, cmdResult.threatName.c_str(), ToString(action));
             }
         }
     }
@@ -1901,52 +1916,6 @@ public:
             }
         } catch (...) {
             SS_LOG_ERROR(LOG_CAT, L"Failed to start AMSI monitoring for PID=%u", processId);
-        }
-    }
-
-    [[nodiscard]] bool requestKernelProcessBlockImpl(
-        uint32_t processId,
-        const std::wstring& reason
-    ) noexcept {
-        if (!IsKernelBlockTarget(processId)) {
-            SS_LOG_WARN(LOG_CAT, L"Refusing kernel process block for PID %u", processId);
-            return false;
-        }
-        try {
-            if (!Communication::IPCManager::HasInstance()) return false;
-            auto& ipc = Communication::IPCManager::Instance();
-
-            struct BlockRequest {
-                uint32_t messageType;
-                uint32_t processId;
-                wchar_t  reason[256];
-            };
-
-            BlockRequest req{};
-            req.messageType = PSConstants::KERNEL_MSG_BLOCK_PROCESS;
-            req.processId   = processId;
-            wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(),
-                std::min(reason.size(), size_t(255)));
-
-            bool sent = ipc.SendToKernel(&req, sizeof(req));
-            if (sent) {
-                SS_LOG_WARN(LOG_CAT,
-                    L"Kernel block requested: PID=%u reason=%ls",
-                    processId, req.reason);
-            } else {
-                SS_LOG_ERROR(LOG_CAT,
-                    L"Failed to send kernel block request for PID=%u", processId);
-            }
-            return sent;
-
-        } catch (const std::exception& ex) {
-            SS_LOG_ERROR(LOG_CAT,
-                L"Exception in RequestKernelProcessBlock: %hs", ex.what());
-            return false;
-        } catch (...) {
-            SS_LOG_ERROR(LOG_CAT,
-                L"Unknown exception in RequestKernelProcessBlock PID=%u", processId);
-            return false;
         }
     }
 };
@@ -2032,12 +2001,6 @@ void PowerShellScanner::OnKernelImageLoad(
     uint64_t imageBase,
     size_t imageSize) {
     pImpl->onKernelImageLoadImpl(processId, imagePath, imageBase, imageSize);
-}
-
-bool PowerShellScanner::RequestKernelProcessBlock(
-    uint32_t processId,
-    const std::wstring& reason) {
-    return pImpl->requestKernelProcessBlockImpl(processId, reason);
 }
 
 // ── Cross-Module Wiring delegation ──────────────────────────────────────────

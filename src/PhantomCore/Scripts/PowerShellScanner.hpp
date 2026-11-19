@@ -321,10 +321,6 @@ public:
         uint64_t imageBase,
         size_t imageSize);
 
-    [[nodiscard]] bool RequestKernelProcessBlock(
-        uint32_t processId,
-        const std::wstring& reason);
-
     // ── Cross-Module Wiring ──────────────────────────────────────────────
 
     void ReportThreatToAlertSystem(const ScanResult& result);
