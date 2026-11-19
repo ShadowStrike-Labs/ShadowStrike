@@ -291,6 +291,7 @@
     <ClCompile Include="src\PhantomCore\Scripts\PythonScriptScanner.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\PythonScriptScannerWire.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\ScriptsWiring.cpp" />
+    <ClCompile Include="src\PhantomCore\Scripts\ScriptThreatResponse.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\VBScriptScanner.cpp" />
     <ClCompile Include="src\PhantomCore\Scripts\VBScriptScannerWire.cpp" />
     <ClCompile Include="src\PhantomCore\SelfProtection\AntiDebug.cpp" />

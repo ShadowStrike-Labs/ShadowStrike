@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
   PhantomTests.vcxproj
   ====================
@@ -747,6 +747,7 @@
     <ClCompile Include="tests\unit\scripts_unit\PowerShellScanner_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\PythonScriptScanner_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\ScriptsWiring_Tests.cpp" />
+    <ClCompile Include="tests\unit\scripts_unit\ScriptThreatResponse_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\VBScriptScanner_Tests.cpp" />
     <!-- tests\unit\service_unit -->
     <ClCompile Include="tests\unit\service_unit\AntivirusService_Tests.cpp" />
