@@ -51,6 +51,7 @@
 #include "pch.h"
 #include "PythonScriptScanner.hpp"
 #include "KernelBlockTarget.hpp"
+#include "ScriptThreatResponse.hpp"
 
 // Cross-module wiring
 #include "../Communication/AlertSystem.hpp"
@@ -2147,17 +2148,24 @@ void PythonScriptScannerImpl::ResetStatistics() {
             }
         }
 
-        // Request kernel-level process block for high-risk malicious scripts
+        // High-confidence conviction: enforce through the confidence-gated response
+        // policy. A blockable live host is terminated in user mode (ProcessKiller
+        // tree kill); a file scan with no live pid, System/self or a critical/PPL
+        // target is reported, never killed (tasks 158/361).
         if (result.status == PythonScanStatus::Malicious && result.riskScore >= 90) {
-            if (Communication::IPCManager::HasInstance()) {
-                auto& ipc = Communication::IPCManager::Instance();
-                if (ipc.IsFilterPortConnected()) {
-                    SS_LOG_INFO(L"PythonScanner",
-                        L"High-risk Python malware detected (score=%d), "
-                        L"kernel block available via RequestKernelProcessBlock",
-                        result.riskScore);
-                }
-            }
+            ScriptConviction conviction;
+            conviction.pid          = result.processId;
+            conviction.module       = Wiring::Detail::ScriptModule::Python;
+            conviction.blockWorthy  = result.ShouldBlock();
+            conviction.suspicious   = (result.status == PythonScanStatus::Suspicious);
+            conviction.riskScore    = result.riskScore;
+            conviction.processImage = L"";
+            conviction.reason       = L"Malicious Python: " +
+                                      Utils::StringUtils::ToWide(result.threatName);
+            const auto action = RespondToScriptThreat(conviction);
+            SS_LOG_WARN(L"PythonScanner",
+                L"High-risk Python malware (score=%d) PID=%u action=%hs",
+                result.riskScore, result.processId, ToString(action));
         }
     }
 
@@ -2930,63 +2938,6 @@ void PythonScriptScanner::OnKernelImageLoad(
         pid,
         static_cast<int>(logImagePath.size()), logImagePath.c_str(),
         static_cast<unsigned long long>(imageBase));
-}
-
-[[nodiscard]] bool PythonScriptScanner::RequestKernelProcessBlock(
-    uint32_t pid, std::wstring_view reason)
-{
-    if (!IsKernelBlockTarget(pid)) {
-        SS_LOG_WARN(L"PythonScanner", L"Refusing kernel process block for PID %u", pid);
-        return false;
-    }
-    if (!Communication::IPCManager::HasInstance()) {
-        SS_LOG_WARN(L"PythonScanner",
-            L"Cannot block PID=%u: IPCManager not available", pid);
-        return false;
-    }
-
-    // T1/T4: Validate and sanitize user-controlled reason before IPC/logging.
-    if (reason.size() > PythonConstants::MAX_PATH_LENGTH) {
-        SS_LOG_WARN(L"PythonScanner",
-            L"RequestKernelProcessBlock: reason too long (%zu chars), truncating",
-            reason.size());
-        reason = reason.substr(0, 255);
-    }
-    std::wstring safeReason = SanitizeWideForLog(reason, 255);
-
-    auto& ipc = Communication::IPCManager::Instance();
-    if (!ipc.IsFilterPortConnected()) {
-        SS_LOG_WARN(L"PythonScanner",
-            L"Cannot block PID=%u: kernel filter port not connected", pid);
-        return false;
-    }
-
-#pragma pack(push, 1)
-    struct KernelBlockRequest {
-        uint32_t msgType;       // 0x35 = PythonScanner process block
-        uint32_t targetPid;
-        uint32_t reasonLen;
-        wchar_t  reason[256];
-    };
-#pragma pack(pop)
-
-    KernelBlockRequest req{};
-    req.msgType   = 0x35;
-    req.targetPid = pid;
-
-    auto copyLen = (std::min)(safeReason.size(), static_cast<size_t>(255));
-    std::memcpy(req.reason, safeReason.data(), copyLen * sizeof(wchar_t));
-    req.reason[copyLen] = L'\0';
-    req.reasonLen = static_cast<uint32_t>(copyLen);
-
-    [[maybe_unused]] bool sent = ipc.SendToKernel(&req, sizeof(req));
-
-    SS_LOG_INFO(L"PythonScanner",
-        L"Kernel process block request for PID=%u sent=%d reason=%.*s",
-        pid, sent ? 1 : 0,
-        static_cast<int>(copyLen), safeReason.c_str());
-
-    return sent;
 }
 
 // ============================================================================
