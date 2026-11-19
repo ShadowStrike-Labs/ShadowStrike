@@ -185,9 +185,6 @@ namespace MacroConstants {
     /// @brief Maximum XLL export names per file
     inline constexpr size_t MAX_XLL_EXPORTS = 64;
 
-    /// @brief Kernel bridge message type for process block
-    inline constexpr uint32_t KERNEL_MSG_BLOCK_PROCESS = 0x30;
-    
     /// @brief Maximum VBA project size
     inline constexpr size_t MAX_VBA_PROJECT_SIZE = 50 * 1024 * 1024;
     
@@ -840,11 +837,6 @@ public:
         std::wstring_view imagePath,
         uint64_t imageBase,
         size_t imageSize);
-
-    /// @brief Request kernel-side process block for a malicious macro host.
-    [[nodiscard]] bool RequestKernelProcessBlock(
-        uint32_t processId,
-        const std::wstring& reason);
 
     // ========================================================================
     // CROSS-MODULE WIRING

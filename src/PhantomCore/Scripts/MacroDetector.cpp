@@ -51,6 +51,7 @@
 #include "pch.h"
 #include "MacroDetector.hpp"
 #include "KernelBlockTarget.hpp"
+#include "ScriptThreatResponse.hpp"
 
 // Standard library includes
 #include <algorithm>
@@ -590,8 +591,6 @@ public:
                                std::wstring_view commandLine, bool isCreate);
     void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
                            uint64_t imageBase, size_t imageSize);
-    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
-                                                  const std::wstring& reason);
 
     // Cross-module wiring
     void ReportThreatToAlertSystem(const MacroScanResult& result);
@@ -1092,6 +1091,22 @@ void MacroDetectorImpl::Shutdown() {
     }
     if (result.isMalicious) {
         ReportThreatToBehaviorAnalyzer(result);
+
+        // Enforce through the one confidence-gated response policy (fileless
+        // defense, tasks 158/361): the Office host process tree is terminated in
+        // user mode for a blockable live pid, while a static file scan with no live
+        // pid, System/self or a critical/PPL target is reported, never killed.
+        ScriptConviction conviction;
+        conviction.pid          = result.processId;
+        conviction.module       = Wiring::Detail::ScriptModule::Macro;
+        conviction.blockWorthy  = result.ShouldBlock();
+        conviction.suspicious   = (result.status == MacroScanStatus::Suspicious);
+        conviction.riskScore    = result.riskScore;
+        conviction.reason       = L"Malicious macro: " +
+                                  Utils::StringUtils::ToWide(result.threatName);
+        const auto action = RespondToScriptThreat(conviction);
+        SS_LOG_WARN(L"MacroDetector", L"Macro enforcement PID=%u action=%hs",
+            result.processId, ToString(action));
     }
 
     if (m_config.verboseLogging) {
@@ -2764,55 +2779,6 @@ void MacroDetectorImpl::OnKernelImageLoad(
         imageBase, imageSize);
 }
 
-[[nodiscard]] bool MacroDetectorImpl::RequestKernelProcessBlock(
-    uint32_t processId,
-    const std::wstring& reason) {
-
-    if (!IsKernelBlockTarget(processId)) {
-        SS_LOG_WARN(L"MacroDetector", L"Refusing kernel process block for PID %u", processId);
-        return false;
-    }
-
-    try {
-        if (!Communication::IPCManager::HasInstance()) {
-            SS_LOG_WARN(L"MacroDetector",
-                L"IPCManager not available for kernel block PID=%u", processId);
-            return false;
-        }
-
-        auto& ipc = Communication::IPCManager::Instance();
-
-        struct {
-            uint32_t messageType;
-            uint32_t processId;
-            wchar_t reason[256];
-        } blockRequest{};
-
-        blockRequest.messageType = MacroConstants::KERNEL_MSG_BLOCK_PROCESS;
-        blockRequest.processId = processId;
-        // _countof includes the NUL terminator, so we use _countof - 1 for safe copy
-        wcsncpy_s(blockRequest.reason, _countof(blockRequest.reason),
-                  reason.c_str(), _TRUNCATE);
-
-        if (ipc.SendToKernel(&blockRequest, sizeof(blockRequest))) {
-            SS_LOG_INFO(L"MacroDetector",
-                L"Kernel process block requested PID=%u reason=%ls",
-                processId, reason.c_str());
-            return true;
-        }
-
-        SS_LOG_ERROR(L"MacroDetector",
-            L"Failed to send kernel process block PID=%u", processId);
-        return false;
-
-    } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"MacroDetector",
-            L"Kernel process block exception PID=%u: %hs",
-            processId, e.what());
-        return false;
-    }
-}
-
 // ============================================================================
 // CROSS-MODULE WIRING IMPLEMENTATIONS
 // ============================================================================
@@ -3092,12 +3058,6 @@ void MacroDetector::OnKernelImageLoad(
     uint64_t imageBase,
     size_t imageSize) {
     m_impl->OnKernelImageLoad(processId, imagePath, imageBase, imageSize);
-}
-
-[[nodiscard]] bool MacroDetector::RequestKernelProcessBlock(
-    uint32_t processId,
-    const std::wstring& reason) {
-    return m_impl->RequestKernelProcessBlock(processId, reason);
 }
 
 // ============================================================================
