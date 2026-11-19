@@ -623,8 +623,8 @@ public:
 
                 SS_LOG_WARN(LOG_CAT,
                     L"PowerShell v2 downgrade detected PID=%u", pid);
-
-                notifyKernelBlock(pid, "PowerShell v2 downgrade");
+                // Enforced centrally in finalize(): SCORE_V2_DOWNGRADE carries the
+                // verdict past THRESHOLD_BLOCK, so the response policy acts there.
             }
 
             // ── Encoded command extraction & recursive scan ─────────────
@@ -1362,44 +1362,6 @@ private:
         return false;
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // KERNEL WIRING — notify PhantomSensor via IPC
-    // ════════════════════════════════════════════════════════════════════════
-
-    void notifyKernelBlock(uint32_t pid, const char* reason) const noexcept {
-        if (!IsKernelBlockTarget(pid)) {
-            SS_LOG_WARN(LOG_CAT, L"Refusing kernel block for PID %u (%hs)", pid, reason);
-            return;
-        }
-        try {
-            // Build behavioral alert for kernel
-            // The IPC path sends FilterMessageType_BehavioralAlert which the
-            // kernel driver's BehaviorEngine consumes to apply enforcement.
-            struct AlertMsg {
-                uint32_t messageType;
-                uint32_t processId;
-                uint32_t threatScore;
-                char     reason[128];
-            };
-
-            AlertMsg msg{};
-            msg.messageType = 0x90; // FilterMessageType_BehavioralAlert value
-            msg.processId   = pid;
-            msg.threatScore = 100;
-            strncpy_s(msg.reason, sizeof(msg.reason), reason, _TRUNCATE);
-
-            auto& ipc = Communication::IPCManager::Instance();
-            if (ipc.IsFilterPortConnected()) {
-                (void)ipc.SendToKernel(&msg, sizeof(msg));
-            }
-
-            SS_LOG_WARN(LOG_CAT,
-                L"Kernel notified: block PID=%u reason=%hs", pid, reason);
-        } catch (...) {
-            SS_LOG_ERROR(LOG_CAT, L"Failed to notify kernel for PID=%u", pid);
-        }
-    }
-
     void notifyAmsiBypassDetected(
         uint32_t pid,
         const std::vector<std::string>& techniques
@@ -1621,8 +1583,27 @@ private:
                 L"MALICIOUS: %hs score=%d PID=%u",
                 result.threatName.c_str(), result.riskScore, result.processId);
 
-            // Kernel enforcement; notifyKernelBlock refuses pseudo and own PIDs.
-            notifyKernelBlock(result.processId, result.threatName.c_str());
+            // Enforce through the one confidence-gated response policy (fileless
+            // defense, tasks 158/361): the offending process tree is terminated in
+            // user mode for a blockable live target, while a file scan with no live
+            // pid, System/self or a critical/PPL target is reported, never killed.
+            // finalize() is noexcept, so the conviction build is guarded.
+            try {
+                ScriptConviction conviction;
+                conviction.pid          = result.processId;
+                conviction.module       = Wiring::Detail::ScriptModule::PowerShell;
+                conviction.blockWorthy  = result.isBlocking();
+                conviction.suspicious   = (result.status == ScanStatus::SUSPICIOUS);
+                conviction.riskScore    = result.riskScore;
+                conviction.reason       = L"PowerShell threat: " +
+                                          Utils::StringUtils::ToWide(result.threatName);
+                const auto action = RespondToScriptThreat(conviction);
+                SS_LOG_WARN(LOG_CAT, L"PowerShell enforcement PID=%u action=%hs",
+                    result.processId, ToString(action));
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CAT,
+                    L"PowerShell enforcement failed for PID=%u", result.processId);
+            }
 
             // AlertSystem wiring
             reportThreatToAlertSystem(result);
@@ -1839,32 +1820,12 @@ public:
             static_cast<int>(std::min(imagePath.size(), size_t(260))),
             imagePath.data());
 
-        // Check command line for immediate threats
+        // Scan the command line of the just-created PowerShell host. A malicious
+        // verdict is enforced centrally in finalize() through the confidence-gated
+        // response policy, so no separate block call is needed here (tasks 158/361).
         if (!commandLine.empty()) {
             std::string cmdNarrow = Utils::StringUtils::ToNarrow(commandLine);
-            auto cmdResult = scanCommandLine(cmdNarrow, processId);
-
-            if (cmdResult.isBlocking()) {
-                // High-confidence conviction on a just-created PowerShell host.
-                // Route through the one confidence-gated response policy: it
-                // terminates the host process tree for a blockable target and
-                // reports-only for System/self or a critical/PPL target, so a
-                // legitimate admin session is never killed (fileless defense,
-                // tasks 158/361).
-                ScriptConviction conviction;
-                conviction.pid          = processId;
-                conviction.module       = Wiring::Detail::ScriptModule::PowerShell;
-                conviction.blockWorthy  = true;  // cmdResult.isBlocking() holds here
-                conviction.suspicious   = (cmdResult.status == ScanStatus::SUSPICIOUS);
-                conviction.riskScore    = cmdResult.riskScore;
-                conviction.processImage = std::wstring(imagePath);
-                conviction.reason       = L"PowerShell threat: " +
-                                          Utils::StringUtils::ToWide(cmdResult.threatName);
-                const auto action = RespondToScriptThreat(conviction);
-                SS_LOG_WARN(LOG_CAT,
-                    L"Kernel-triggered PS scan: PID=%u threat=%hs action=%hs",
-                    processId, cmdResult.threatName.c_str(), ToString(action));
-            }
+            (void)scanCommandLine(cmdNarrow, processId);
         }
     }
 
