@@ -39,6 +39,7 @@
 #include "pch.h"
 #include "AMSIIntegration.hpp"
 #include "KernelBlockTarget.hpp"
+#include "ScriptThreatResponse.hpp"
 
 // ============================================================================
 // WINDOWS AMSI SDK
@@ -2213,16 +2214,24 @@ private:
             cfgLock.unlock();
 
             if (shouldTerminate) {
-                // Block-request to kernel is best-effort: capture and
-                // surface the result rather than silently swallowing
-                // [[nodiscard]] from a security-critical primitive.
-                const bool blocked = RequestKernelProcessBlockImpl(pid,
-                    L"Repeated AMSI bypass detected in script host");
-                if (!blocked) {
-                    SS_LOG_ERROR(LOG_CATEGORY,
-                        L"Kernel block request FAILED for PID %u; "
-                        L"manual remediation may be required", pid);
-                }
+                // Cross-process amsi.dll tampering is conviction-grade. Enforce
+                // through the one confidence-gated response policy (fileless
+                // defense, tasks 158/361): the script host tree is terminated in
+                // user mode for a blockable pid, while System/self or a critical/
+                // PPL target is reported, never killed. The operator
+                // terminateOnRepeatedBypass gate above is preserved.
+                ScriptConviction conviction;
+                conviction.pid          = pid;
+                conviction.module       = Wiring::Detail::ScriptModule::Amsi;
+                conviction.blockWorthy  = true;  // tampering confirmed above
+                conviction.suspicious   = false;
+                conviction.riskScore    = 100;
+                conviction.processImage = event.processPath;
+                conviction.reason       = L"Repeated AMSI bypass detected in script host";
+                const auto action = RespondToScriptThreat(conviction);
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"AMSI tampering enforcement PID=%u action=%hs",
+                    pid, ToString(action));
             }
         }
     }
@@ -2336,74 +2345,6 @@ public:
                 L"Whitelist lookup failed (graceful): %hs", e.what());
         }
         return false;
-    }
-
-    [[nodiscard]] bool RequestKernelProcessBlockImpl(uint32_t processId,
-                                                      const std::wstring& reason) {
-        if (!IsKernelBlockTarget(processId)) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Refusing kernel process block for PID %u", processId);
-            return false;
-        }
-        try {
-            if (!Communication::IPCManager::HasInstance()) {
-                SS_LOG_WARN(LOG_CATEGORY,
-                    L"IPCManager not available for kernel process block");
-                return false;
-            }
-            auto& ipc = Communication::IPCManager::Instance();
-            if (!ipc.IsConnected()) {
-                SS_LOG_WARN(LOG_CATEGORY,
-                    L"IPCManager not connected to kernel driver");
-                return false;
-            }
-
-            // Serialize a process block control message as a flat buffer:
-            // [MessageType:uint16(2)] [ProcessId:uint32(4)] [Verdict:uint8(1)]
-            // [ThreatScore:uint8(1)] [ReasonLenWchars:uint16(2)] [Reason:wchar[]]
-            std::wstring truncatedReason = reason.substr(0, 256);
-
-            constexpr size_t kHeaderSize = 2 + 4 + 1 + 1 + 2;
-            size_t reasonBytes = truncatedReason.size() * sizeof(wchar_t);
-            size_t totalSize = kHeaderSize + reasonBytes;
-
-            std::vector<uint8_t> msgBuffer(totalSize, 0);
-            uint8_t* ptr = msgBuffer.data();
-
-            // MessageType: use a reserved value indicating process block
-            auto msgType = static_cast<uint16_t>(Communication::MessageType::ProcessNotify);
-            memcpy(ptr, &msgType, 2); ptr += 2;
-
-            memcpy(ptr, &processId, 4); ptr += 4;
-
-            auto verdict = static_cast<uint8_t>(Communication::ScanVerdict::Block);
-            memcpy(ptr, &verdict, 1); ptr += 1;
-
-            uint8_t threatScore = 100;
-            memcpy(ptr, &threatScore, 1); ptr += 1;
-
-            auto reasonLen = static_cast<uint16_t>(truncatedReason.size());
-            memcpy(ptr, &reasonLen, 2); ptr += 2;
-
-            if (!truncatedReason.empty()) {
-                memcpy(ptr, truncatedReason.data(), reasonBytes);
-            }
-
-            bool sent = ipc.SendToKernel(msgBuffer.data(), msgBuffer.size());
-
-            if (sent) {
-                SS_LOG_INFO(LOG_CATEGORY,
-                    L"Kernel process block requested for PID %u: %ls",
-                    processId, SanitizeForLog(truncatedReason).c_str());
-            } else {
-                SS_LOG_ERROR(LOG_CATEGORY,
-                    L"Failed to send kernel process block for PID %u", processId);
-            }
-            return sent;
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(LOG_CATEGORY,
-                L"Kernel process block exception: %hs", e.what());
-            return false;
-        }
     }
 
     // ========================================================================
@@ -2850,12 +2791,6 @@ void AMSIIntegration::OnKernelImageLoad(uint32_t processId,
                                          uint64_t imageBase,
                                          size_t imageSize) {
     m_impl->OnKernelImageLoadImpl(processId, imagePath, imageBase, imageSize);
-}
-
-[[nodiscard]] bool AMSIIntegration::RequestKernelProcessBlock(
-    uint32_t processId,
-    const std::wstring& reason) {
-    return m_impl->RequestKernelProcessBlockImpl(processId, reason);
 }
 
 // ============================================================================

@@ -772,11 +772,6 @@ public:
                            uint64_t imageBase,
                            size_t imageSize);
 
-    /// @brief Request the kernel driver to block a process (via IPC)
-    /// Used when repeated AMSI bypass is detected and terminateOnRepeatedBypass is enabled.
-    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
-                                                  const std::wstring& reason);
-
     // ========================================================================
     // CROSS-MODULE INTEGRATION
     // ========================================================================
