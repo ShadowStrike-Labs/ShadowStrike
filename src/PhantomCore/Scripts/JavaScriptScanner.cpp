@@ -459,8 +459,6 @@ public:
                                std::wstring_view commandLine, bool isCreate);
     void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
                            uint64_t imageBase, size_t imageSize);
-    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
-                                                  const std::wstring& reason);
 
     // Cross-module wiring
     void ReportThreatToAlertSystem(const JSScanResult& result);
