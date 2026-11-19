@@ -30161,22 +30161,18 @@ class PowerShellScannerPrecisionTests(unittest.TestCase):
 
 
 class ScriptKernelBlocksRefuseOwnProcessTests(unittest.TestCase):
-    """Script scanners never ask the kernel to block PID 0, System or the service (task 368).
+    """A script conviction never terminates PID 0, System or the service (task 368).
 
     AMSI scans of files the service read itself carried GetCurrentProcessId(), and
-    PowerShellScanner asked the kernel to block the service ('block PID=6472').
+    PowerShellScanner asked the kernel to block the service ('block PID=6472'). The
+    per-scanner kernel-block senders are gone (tasks 158/361); every conviction now
+    runs through the one user-mode response policy, which refuses a pseudo/own
+    target before it ever terminates.
     """
 
     S = ROOT / "src/PhantomCore/Scripts"
-    SENDERS = [
-        ("PowerShellScanner.cpp", "notifyKernelBlock"),
-        ("PowerShellScanner.cpp", "requestKernelProcessBlockImpl"),
-        ("AMSIIntegration.cpp", "RequestKernelProcessBlockImpl"),
-        ("JavaScriptScanner.cpp", "JavaScriptScannerImpl::RequestKernelProcessBlock"),
-        ("MacroDetector.cpp", "MacroDetectorImpl::RequestKernelProcessBlock"),
-        ("PythonScriptScanner.cpp", "PythonScriptScanner::RequestKernelProcessBlock"),
-        ("VBScriptScanner.cpp", "VBScriptScanner::RequestKernelProcessBlock"),
-    ]
+    RESPONSE_CPP = S / "ScriptThreatResponse.cpp"
+    RESPONSE_HPP = S / "ScriptThreatResponse.hpp"
 
     def test_guard_refuses_pseudo_and_own_pids(self):
         body = extract_c_function(strip_c_comments(read_source(self.S / "KernelBlockTarget.hpp")),
@@ -30184,11 +30180,20 @@ class ScriptKernelBlocksRefuseOwnProcessTests(unittest.TestCase):
         for term in ("pid != 0", "pid != 4", "::GetCurrentProcessId()"):
             self.assertIn(term, body)
 
-    def test_every_sender_checks_the_target_before_ipc(self):
-        for name, func in self.SENDERS:
-            body = extract_c_function(strip_c_comments(read_source(self.S / name)), func)
-            self.assertIn("IsKernelBlockTarget(", body, f"{name} {func}")
-            self.assertLess(body.index("IsKernelBlockTarget("), body.index("IPCManager"), f"{name} {func}")
+    def test_response_policy_checks_target_before_terminating(self):
+        # The old per-scanner senders each had to call IsKernelBlockTarget before
+        # the IPC send. Those senders are removed; the single enforcement entry,
+        # RespondToScriptThreat, now consults the same guard before any kill.
+        body = extract_c_function(strip_c_comments(read_source(self.RESPONSE_CPP)),
+                                  "RespondToScriptThreat")
+        self.assertIn("IsKernelBlockTarget(c.pid)", body)
+        self.assertLess(body.index("IsKernelBlockTarget("), body.index("TerminateTree("),
+                        "the pseudo/own-pid guard must run before any termination")
+        # Terminate is only chosen for a blockable target, so PID 0/System/self
+        # (IsKernelBlockTarget == false) can never reach TerminateTree.
+        decide = extract_c_function(strip_c_comments(read_source(self.RESPONSE_HPP)),
+                                    "DecideScriptResponse")
+        self.assertIn("targetIsBlockable ? ScriptResponseAction::Terminate", decide)
 
     def test_service_side_amsi_scans_have_no_origin_process(self):
         src = strip_c_comments(read_source(self.S / "AMSIIntegration.cpp"))
