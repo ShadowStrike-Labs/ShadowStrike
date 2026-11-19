@@ -681,10 +681,6 @@ public:
                            uint64_t imageBase,
                            size_t imageSize);
 
-    /// @brief Request kernel driver to terminate a process running malicious JS.
-    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
-                                                  const std::wstring& reason);
-
     // ========================================================================
     // CROSS-MODULE WIRING — enterprise integration
     // ========================================================================

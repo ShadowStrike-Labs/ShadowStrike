@@ -43,6 +43,7 @@
 #include "pch.h"
 #include "JavaScriptScanner.hpp"
 #include "KernelBlockTarget.hpp"
+#include "ScriptThreatResponse.hpp"
 
 #include <regex>
 #include <cmath>
@@ -734,11 +735,6 @@ void JavaScriptScanner::OnKernelImageLoad(
     uint32_t processId, std::wstring_view imagePath,
     uint64_t imageBase, size_t imageSize) {
     m_impl->OnKernelImageLoad(processId, imagePath, imageBase, imageSize);
-}
-
-bool JavaScriptScanner::RequestKernelProcessBlock(
-    uint32_t processId, const std::wstring& reason) {
-    return m_impl->RequestKernelProcessBlock(processId, reason);
 }
 
 // Cross-module wiring wrappers
@@ -2602,11 +2598,19 @@ void JavaScriptScannerImpl::OnKernelProcessNotify(
         if (narrowCmd.size() > MIN_SCRIPT_LENGTH) {
             auto result = ScanContent(narrowCmd, "kernel-cmdline", processId);
             if (result.isMalicious) {
+                ScriptConviction conviction;
+                conviction.pid          = processId;
+                conviction.module       = Wiring::Detail::ScriptModule::JavaScript;
+                conviction.blockWorthy  = result.ShouldBlock();
+                conviction.suspicious   = (result.status == JSScanStatus::Suspicious);
+                conviction.riskScore    = result.riskScore;
+                conviction.processImage = std::wstring(imagePath);
+                conviction.reason       = L"Malicious JavaScript in command line: " +
+                                          Utils::StringUtils::ToWide(result.threatName);
+                const auto action = RespondToScriptThreat(conviction);
                 SS_LOG_WARN(LOG_CATEGORY,
-                    L"Kernel: Malicious JS in command line PID=%u threat=%hs",
-                    processId, result.threatName.c_str());
-                (void)RequestKernelProcessBlock(processId,
-                    L"Malicious JavaScript detected in command line");
+                    L"Kernel: Malicious JS in command line PID=%u threat=%hs action=%hs",
+                    processId, result.threatName.c_str(), ToString(action));
                 ReportThreatToAlertSystem(result);
                 ReportThreatToBehaviorAnalyzer(result);
             }
@@ -2650,59 +2654,6 @@ void JavaScriptScannerImpl::OnKernelImageLoad(
         processId,
         SanitizeForLog(imagePath, 260).c_str(),
         imageBase, imageSize);
-}
-
-bool JavaScriptScannerImpl::RequestKernelProcessBlock(
-    uint32_t processId,
-    const std::wstring& reason) {
-
-    if (!IsKernelBlockTarget(processId)) {
-        SS_LOG_WARN(LOG_CATEGORY,
-            L"Refusing kernel process block for PID %u", processId);
-        return false;
-    }
-
-    try {
-        auto& ipc = Communication::IPCManager::Instance();
-
-        struct {
-            uint32_t messageType;
-            uint32_t processId;
-            wchar_t reason[256];
-        } blockRequest{};
-
-        blockRequest.messageType = 0x30;  // FilterMessageType_RegisterProtectedProcess
-        blockRequest.processId = processId;
-        // Bound the caller-supplied reason to the fixed wchar_t array, leaving
-        // room for the NUL terminator. wcsncpy_s with array-deduced destination
-        // size guarantees the destination is NUL-terminated.
-        const size_t reasonCopyChars =
-            std::min<size_t>(reason.size(),
-                             (sizeof(blockRequest.reason) / sizeof(wchar_t)) - 1);
-        wcsncpy_s(blockRequest.reason, reason.c_str(), reasonCopyChars);
-
-        if (ipc.SendToKernel(&blockRequest, sizeof(blockRequest))) {
-            SS_LOG_INFO(LOG_CATEGORY,
-                L"Kernel process block requested PID=%u reason=%ls",
-                processId,
-                SanitizeForLog(reason, MAX_KERNEL_REASON_CHARS).c_str());
-            return true;
-        }
-
-        SS_LOG_ERROR(LOG_CATEGORY,
-            L"Failed to send kernel process block PID=%u", processId);
-        return false;
-
-    } catch (const std::exception& e) {
-        SS_LOG_ERROR(LOG_CATEGORY,
-            L"Kernel process block exception PID=%u: %hs",
-            processId, e.what());
-        return false;
-    } catch (...) {
-        SS_LOG_ERROR(LOG_CATEGORY,
-            L"Kernel process block unknown exception PID=%u", processId);
-        return false;
-    }
 }
 
 // ============================================================================
