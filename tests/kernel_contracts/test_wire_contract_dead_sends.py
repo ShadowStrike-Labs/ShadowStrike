@@ -57,6 +57,22 @@ class WireContractDeadSendsContract(unittest.TestCase):
             "Core::Process::ProcessKiller::TerminateTree",
     }
 
+    # The six script scanners (tasks 158/361): each convicted a malicious script
+    # and asked the kernel to "block the PID" through a headerless wire struct the
+    # driver refused (0x30/0x31/0x35/0x36/0x90 or a flat ProcessNotify buffer), so a
+    # fileless payload was DETECTED but never STOPPED. Each now routes its conviction
+    # through the one confidence-gated response policy (RespondToScriptThreat), which
+    # terminates the offending process tree in user mode for a blockable target and
+    # reports-only for System/self or a critical/PPL target.
+    SCRIPT_SCANNERS = (
+        "src/PhantomCore/Scripts/PowerShellScanner.cpp",
+        "src/PhantomCore/Scripts/JavaScriptScanner.cpp",
+        "src/PhantomCore/Scripts/VBScriptScanner.cpp",
+        "src/PhantomCore/Scripts/PythonScriptScanner.cpp",
+        "src/PhantomCore/Scripts/MacroDetector.cpp",
+        "src/PhantomCore/Scripts/AMSIIntegration.cpp",
+    )
+
     def test_cleaned_modules_have_no_invented_dead_send(self) -> None:
         for rel in self.CLEANED:
             src = _read(rel)
@@ -75,6 +91,30 @@ class WireContractDeadSendsContract(unittest.TestCase):
                 "%s no longer calls %s - removing the dead kernel send must NOT "
                 "remove the real user-mode enforcement (detection integrity)"
                 % (rel, enforcement))
+
+    def test_script_scanners_have_no_direct_kernel_block(self) -> None:
+        # No script scanner sends to the kernel directly any more, and the dead
+        # block-request helpers are gone. Enforcement is the user-mode response
+        # policy, not a wire send the driver refuses.
+        for rel in self.SCRIPT_SCANNERS:
+            src = _read(rel)
+            for banned in ("SendToKernel",
+                           "RequestKernelProcessBlock",
+                           "notifyKernelBlock"):
+                self.assertNotIn(
+                    banned, src,
+                    "%s still references %s - a script conviction must enforce "
+                    "through RespondToScriptThreat, not a kernel send the driver "
+                    "refuses (task 158/361)" % (rel, banned))
+
+    def test_script_scanners_route_through_response_policy(self) -> None:
+        # Each scanner's conviction path calls the one confidence-gated policy.
+        for rel in self.SCRIPT_SCANNERS:
+            src = _read(rel)
+            self.assertIn(
+                "RespondToScriptThreat", src,
+                "%s no longer routes its conviction through the response policy "
+                "(detection integrity: detected must mean enforced)" % rel)
 
     def test_ransomwaredetector_block_method_is_gone(self) -> None:
         # RansomwareDetector::RequestKernelProcessBlock was uncalled dead code
