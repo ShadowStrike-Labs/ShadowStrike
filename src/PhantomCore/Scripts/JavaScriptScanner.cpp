@@ -1275,6 +1275,23 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         if (result.isMalicious) {
             ReportThreatToAlertSystem(result);
             ReportThreatToBehaviorAnalyzer(result);
+
+            // Enforce through the one confidence-gated response policy (fileless
+            // defense, tasks 158/361). Every entry point (file, memory, string,
+            // kernel command line) funnels through here, so a blockable live host
+            // is terminated in user mode, while a scan with no live pid or a
+            // System/self/critical/PPL target is reported, never killed.
+            ScriptConviction conviction;
+            conviction.pid          = result.processId;
+            conviction.module       = Wiring::Detail::ScriptModule::JavaScript;
+            conviction.blockWorthy  = result.ShouldBlock();
+            conviction.suspicious   = (result.status == JSScanStatus::Suspicious);
+            conviction.riskScore    = result.riskScore;
+            conviction.reason       = L"Malicious JavaScript: " +
+                                      Utils::StringUtils::ToWide(result.threatName);
+            const auto action = RespondToScriptThreat(conviction);
+            SS_LOG_WARN(LOG_CATEGORY, L"JavaScript enforcement PID=%u action=%hs",
+                result.processId, ToString(action));
         } else if (result.status == JSScanStatus::Suspicious && result.riskScore >= 50) {
             ReportThreatToBehaviorAnalyzer(result);
         }
@@ -2590,28 +2607,13 @@ void JavaScriptScannerImpl::OnKernelProcessNotify(
         processId,
         SanitizeForLog(imagePath, 260).c_str());
 
-    // Check command line for inline script or encoded content
+    // Check command line for inline script or encoded content. A malicious verdict
+    // is enforced centrally in ScanContent through the response policy, so this
+    // path needs no separate block call (tasks 158/361).
     if (!commandLine.empty()) {
         std::string narrowCmd = Utils::StringUtils::ToNarrow(commandLine);
         if (narrowCmd.size() > MIN_SCRIPT_LENGTH) {
-            auto result = ScanContent(narrowCmd, "kernel-cmdline", processId);
-            if (result.isMalicious) {
-                ScriptConviction conviction;
-                conviction.pid          = processId;
-                conviction.module       = Wiring::Detail::ScriptModule::JavaScript;
-                conviction.blockWorthy  = result.ShouldBlock();
-                conviction.suspicious   = (result.status == JSScanStatus::Suspicious);
-                conviction.riskScore    = result.riskScore;
-                conviction.processImage = std::wstring(imagePath);
-                conviction.reason       = L"Malicious JavaScript in command line: " +
-                                          Utils::StringUtils::ToWide(result.threatName);
-                const auto action = RespondToScriptThreat(conviction);
-                SS_LOG_WARN(LOG_CATEGORY,
-                    L"Kernel: Malicious JS in command line PID=%u threat=%hs action=%hs",
-                    processId, result.threatName.c_str(), ToString(action));
-                ReportThreatToAlertSystem(result);
-                ReportThreatToBehaviorAnalyzer(result);
-            }
+            (void)ScanContent(narrowCmd, "kernel-cmdline", processId);
         }
     }
 }
