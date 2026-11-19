@@ -43,6 +43,7 @@
 #include "pch.h"
 #include "VBScriptScanner.hpp"
 #include "KernelBlockTarget.hpp"
+#include "ScriptThreatResponse.hpp"
 
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
@@ -1818,19 +1819,24 @@ public:
                     }
                 }
 
-                // Log IPC availability for kernel-level blocking
+                // High-confidence conviction: enforce through the confidence-gated
+                // response policy. A blockable live host is terminated in user mode
+                // (ProcessKiller tree kill); a file scan with no live pid, System/self
+                // or a critical/PPL target is reported, never killed (tasks 158/361).
                 if (result.status == VBSScanStatus::Malicious && result.riskScore >= 90) {
-                    try {
-                        if (Communication::IPCManager::HasInstance()) {
-                            auto& ipc = Communication::IPCManager::Instance();
-                            if (ipc.IsFilterPortConnected()) {
-                                SS_LOG_INFO(LOG_CATEGORY,
-                                    L"High-risk VBScript malware detected (score=%d), "
-                                    L"kernel block available via RequestKernelProcessBlock",
-                                    result.riskScore);
-                            }
-                        }
-                    } catch (...) {}
+                    ScriptConviction conviction;
+                    conviction.pid          = result.processId;
+                    conviction.module       = Wiring::Detail::ScriptModule::VBScript;
+                    conviction.blockWorthy  = result.ShouldBlock();
+                    conviction.suspicious   = (result.status == VBSScanStatus::Suspicious);
+                    conviction.riskScore    = result.riskScore;
+                    conviction.processImage = L"";
+                    conviction.reason       = L"Malicious VBScript: " +
+                                              Utils::StringUtils::ToWide(result.threatName);
+                    const auto action = RespondToScriptThreat(conviction);
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"High-risk VBScript malware (score=%d) PID=%u action=%hs",
+                        result.riskScore, result.processId, ToString(action));
                 }
             }
 
@@ -2704,60 +2710,6 @@ void VBScriptScanner::OnKernelImageLoad(
         pid,
         static_cast<int>(imagePath.size()), imagePath.data(),
         static_cast<unsigned long long>(imageBase));
-}
-
-[[nodiscard]] bool VBScriptScanner::RequestKernelProcessBlock(
-    uint32_t pid, std::wstring_view reason)
-{
-    if (!IsKernelBlockTarget(pid)) {
-        SS_LOG_WARN(LOG_CATEGORY, L"Refusing kernel process block for PID %u", pid);
-        return false;
-    }
-    if (!Communication::IPCManager::HasInstance()) {
-        SS_LOG_WARN(LOG_CATEGORY,
-            L"Cannot block PID=%u: IPCManager not available", pid);
-        return false;
-    }
-
-    try {
-        auto& ipc = Communication::IPCManager::Instance();
-    if (!ipc.IsFilterPortConnected()) {
-        SS_LOG_WARN(LOG_CATEGORY,
-            L"Cannot block PID=%u: kernel filter port not connected", pid);
-        return false;
-    }
-
-#pragma pack(push, 1)
-    struct KernelBlockRequest {
-        uint32_t msgType;       // 0x36 = VBScriptScanner process block
-        uint32_t targetPid;
-        uint32_t reasonLen;
-        wchar_t  reason[256];
-    };
-#pragma pack(pop)
-
-    KernelBlockRequest req{};
-    req.msgType   = 0x36;
-    req.targetPid = pid;
-
-    auto copyLen = (std::min)(reason.size(), static_cast<size_t>(255));
-    std::memcpy(req.reason, reason.data(), copyLen * sizeof(wchar_t));
-    req.reason[copyLen] = L'\0';
-    req.reasonLen = static_cast<uint32_t>(copyLen);
-
-    [[maybe_unused]] bool sent = ipc.SendToKernel(&req, sizeof(req));
-
-    SS_LOG_INFO(LOG_CATEGORY,
-        L"Kernel process block request for PID=%u sent=%d reason=%.*s",
-        pid, sent ? 1 : 0,
-        static_cast<int>(copyLen), reason.data());
-
-    return sent;
-    } catch (const std::exception& e) {
-        SS_LOG_WARN(LOG_CATEGORY,
-            L"RequestKernelProcessBlock failed for PID=%u: %hs", pid, e.what());
-        return false;
-    }
 }
 
 // ============================================================================

@@ -707,7 +707,6 @@ public:
     void OnKernelProcessNotify(uint32_t pid, uint32_t parentPid,
                                std::wstring_view imagePath, bool isCreate);
     void OnKernelImageLoad(uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase);
-    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t pid, std::wstring_view reason);
 
     // ========================================================================
     // CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
